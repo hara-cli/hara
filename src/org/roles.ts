@@ -864,7 +864,7 @@ export function roleToolFilter(role: Role | undefined): ((name: string) => boole
       "read_file", "grep", "glob", "ls", "web_fetch", "web_search", "codebase_search", "todo_write",
       // These mutate only the engine-owned private mailbox/tree and every descendant remains constrained
       // by subagentToolFilter's read-only boundary. They do not grant filesystem or process mutation.
-      "spawn_agent", "send_message", "followup_task", "interrupt_agent", "resume_agent", "list_agents", "wait_agent",
+      "spawn_agent", "send_message", "agent_room", "followup_task", "interrupt_agent", "resume_agent", "list_agents", "wait_agent",
       "inspect_agent_diff",
     ]);
     return (name) => safe.has(name) && declared(name);

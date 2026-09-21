@@ -49,7 +49,7 @@ function memoryStore() {
   };
 }
 
-test("serve persists Agent identity, lists offices, and runs the selected persona", async () => {
+test("serve persists the simplified Agent directory and runs the selected persona", async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-serve-agent-"));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -112,8 +112,74 @@ test("serve persists Agent identity, lists offices, and runs the selected person
     const providerFor = (model) => ({
       id: "fake",
       model,
-      async turn({ system, onText }) {
+      async turn({ system, history, tools, onText }) {
         observedSystems.push(system);
+        const latestUser = [...history].reverse().find((message) => message.role === "user")?.content;
+        if (latestUser === "route this to the internal designer") {
+          const toolResults = history
+            .filter((message) => message.role === "tool")
+            .flatMap((message) => message.results);
+          if (!toolResults.some((result) => result.name === "task_intake")) {
+            return {
+              text: "",
+              toolUses: [{
+                id: "contact-intake",
+                name: "task_intake",
+                input: {
+                  intent: "change",
+                  goal: "send the user's message to the internal Designer Agent",
+                  constraints: ["stay inside the current Space", "do not use an external chat channel"],
+                  acceptance: ["the internal Agent execution segment returns a receipt"],
+                  steps: ["resolve the internal Agent", "send the message", "report the receipt"],
+                },
+              }],
+              stop: "tool_use",
+              usage: { input: 1, output: 1 },
+            };
+          }
+          if (!toolResults.some((result) => result.name === "agent_contact")) {
+            assert.ok(tools.some((tool) => tool.name === "agent_contact"));
+            return {
+              text: "",
+              toolUses: [{
+                id: "contact-message",
+                name: "agent_contact",
+                input: {
+                  action: "message",
+                  recipient: "Designer",
+                  message: "internal hello",
+                },
+              }],
+              stop: "tool_use",
+              usage: { input: 1, output: 1 },
+            };
+          }
+          if (!toolResults.some((result) => result.name === "task_checkpoint")) {
+            const receipt = toolResults.find((result) => result.name === "agent_contact")?.content ?? "";
+            assert.match(receipt, /\"status\":\"completed\"/);
+            return {
+              text: "",
+              toolUses: [{
+                id: "contact-checkpoint",
+                name: "task_checkpoint",
+                input: {
+                  completion: {
+                    state: "verified",
+                    evidence: ["the internal Agent execution returned a completed receipt"],
+                  },
+                },
+              }],
+              stop: "tool_use",
+              usage: { input: 1, output: 1 },
+            };
+          }
+          onText("internal delivery complete");
+          return { text: "internal delivery complete", toolUses: [], stop: "end", usage: { input: 2, output: 1 } };
+        }
+        if (latestUser === "internal hello" && /YOU ARE THE DESIGNER PERSONA/.test(system)) {
+          onText("designer received the message");
+          return { text: "designer received the message", toolUses: [], stop: "end", usage: { input: 2, output: 1 } };
+        }
         onText("done");
         return { text: "done", toolUses: [], stop: "end", usage: { input: 2, output: 1 } };
       },
@@ -155,8 +221,8 @@ test("serve persists Agent identity, lists offices, and runs the selected person
     assert.ok(catalog.result.agents.some((agent) => agent.ref === "global:architect"));
     assert.ok(catalog.result.agents.some((agent) => agent.ref === "alpha:coder"));
     assert.ok(catalog.result.agents.some((agent) => agent.ref === "beta:designer"));
-    assert.ok(catalog.result.offices.some((office) => office.id === "global"));
-    assert.equal(catalog.result.currentOfficeId, "project:alpha");
+    assert.equal(catalog.result.offices, undefined);
+    assert.equal(catalog.result.currentOfficeId, undefined);
     const architectIdentity = catalog.result.agents.find((agent) => agent.ref === "global:architect").identity;
     assert.equal(architectIdentity.displayName, "Ada");
     assert.equal(architectIdentity.title, "Systems Architect");
@@ -170,10 +236,6 @@ test("serve persists Agent identity, lists offices, and runs the selected person
     assert.deepEqual(architect.allowedActions, ["chat", "edit_profile", "archive"]);
     assert.match(architect.revision, /^[a-f0-9]{32}$/);
     assert.doesNotMatch(JSON.stringify(catalog.result.agents), /YOU ARE THE ARCHITECT PERSONA/);
-    assert.deepEqual(
-      catalog.result.offices.find((office) => office.id === "project:alpha").agentRefs,
-      ["main", "alpha:coder", "global:architect"],
-    );
 
     const updatedProfile = await client.call("agents.update-profile", {
       ref: "global:architect",
@@ -371,16 +433,10 @@ test("serve persists Agent identity, lists offices, and runs the selected person
     assert.ok(!rehired.result.catalog.dismissedAgentRefs.includes("global:product-designer"));
     assert.equal(readFileSync(hiredFile, "utf8"), hiredTextBeforeDismissal);
     assert.equal(readFileSync(shadowFile, "utf8"), shadowText);
-    assert.deepEqual(
-      catalog.result.offices.find((office) => office.id === "project:beta").agentRefs,
-      ["main", "beta:designer", "global:architect"],
-    );
-
     const looseCatalog = await client.call("agents.list", { cwd: looseWorkspace });
-    assert.equal(looseCatalog.result.currentOfficeId, "workspace");
     assert.deepEqual(
-      looseCatalog.result.offices.find((office) => office.id === "workspace").agentRefs,
-      ["main", "global:architect", "global:product-designer"],
+      looseCatalog.result.agents.map((agent) => agent.ref),
+      ["main", "global:architect", "global:product-designer", "alpha:coder", "beta:designer"],
     );
 
     const created = await client.call("session.create", {
@@ -432,6 +488,24 @@ test("serve persists Agent identity, lists offices, and runs the selected person
     const main = await client.call("session.create", { cwd: workspace, agentRef: "main" });
     assert.notEqual(main.result.sessionId, sessionId);
     assert.equal(main.result.agentRef, undefined);
+    const internalDelivery = await client.call("session.send", {
+      sessionId: main.result.sessionId,
+      text: "route this to the internal designer",
+    });
+    assert.equal(internalDelivery.result.reply, "internal delivery complete");
+    const afterInternalDelivery = await client.call("session.list", {});
+    const internalDesignerSession = afterInternalDelivery.result.sessions.find((session) => (
+      session.agentRef === "beta:designer"
+      && session.id !== designer.result.sessionId
+      && session.title === "internal hello"
+    ));
+    assert.ok(internalDesignerSession, "internal Agent messaging must create an auditable target execution segment");
+    assert.equal(internalDesignerSession.cwd, realpathSync.native(secondWorkspace));
+    const internalDesignerHistory = await client.call("session.history", {
+      sessionId: internalDesignerSession.id,
+    });
+    assert.equal(internalDesignerHistory.result.history[0].text, "internal hello");
+    assert.equal(internalDesignerHistory.result.history.at(-1).text, "designer received the message");
     const missing = await client.call("session.create", { cwd: workspace, agentRef: "global:missing" });
     assert.equal(missing.error.code, -32602);
   } finally {

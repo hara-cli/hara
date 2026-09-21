@@ -82,6 +82,48 @@ test("Agent mailbox commands are idempotent and fenced to the parent turn", asyn
   }
 });
 
+test("Agent rooms keep one bounded transcript and idempotently fan posts into participant mailboxes", async () => {
+  const release = deferred();
+  const deliveries = new Map();
+  const state = fixture(async (request) => {
+    await release.promise;
+    deliveries.set(request.path, await request.pendingInput());
+    return { status: "completed", text: "room checked" };
+  });
+  try {
+    const controller = state.team.controller();
+    const alpha = await controller.spawn({ taskName: "alpha", message: "wait for room" });
+    const beta = await controller.spawn({ taskName: "beta", message: "wait for room" });
+    const room = await controller.createRoom({ name: "design_review", members: [alpha.id, beta.path] }, "room-create-1");
+    const retried = await controller.createRoom({ name: "design_review", members: [alpha.id, beta.path] }, "room-create-1");
+    assert.equal(retried.id, room.id);
+    assert.deepEqual(room.participantPaths, ["/root", alpha.path, beta.path]);
+
+    await controller.postRoom({ room: room.id, message: "Compare the two approaches." }, "room-post-1");
+    await controller.postRoom({ room: room.id, message: "Compare the two approaches." }, "room-post-1");
+    assert.equal(controller.readRoom(room.id).messageCount, 1);
+    assert.equal(state.team.list().find((agent) => agent.id === alpha.id).pendingMessages, 1);
+    assert.equal(state.team.list().find((agent) => agent.id === beta.id).pendingMessages, 1);
+
+    release.resolve();
+    await Promise.all([
+      controller.wait(alpha.id, 1_000),
+      controller.wait(beta.id, 1_000),
+    ]);
+    assert.match(deliveries.get(alpha.path)[0].content, /Agent room design_review/u);
+    assert.match(deliveries.get(beta.path)[0].content, /Compare the two approaches/u);
+    assert.equal(controller.listRooms().length, 1);
+    const closed = await controller.closeRoom(room.name);
+    assert.ok(closed.closedAt);
+    await assert.rejects(
+      controller.postRoom({ room: room.id, message: "too late" }),
+      /closed/i,
+    );
+  } finally {
+    state.cleanup();
+  }
+});
+
 test("the whole Agent tree reserves and enforces generations, rounds, tools, tokens, and deadline", async () => {
   const observedBudgets = [];
   const state = fixture(async (request) => {
@@ -430,6 +472,81 @@ test("nested Agents receive a scoped controller and the durable tree enforces ma
   }
 });
 
+test("native Agents can delegate only to coding runtimes granted by root", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-agent-runtime-grants-"));
+  const home = join(root, "home");
+  const repo = join(root, "repo");
+  mkdirSync(home);
+  mkdirSync(repo);
+  runGit(repo, "init", "-q");
+  runGit(repo, "config", "user.email", "test@example.test");
+  runGit(repo, "config", "user.name", "Hara Test");
+  writeFileSync(join(repo, "fixture.txt"), "base\n");
+  runGit(repo, "add", "fixture.txt");
+  runGit(repo, "commit", "-qm", "base");
+
+  const requests = [];
+  const team = new DurableAgentTeam({
+    sessionId: "runtime-grant-session",
+    store: new AgentTeamStore(home),
+    worktreeManager: new AgentWorktreeManager(repo, home, "runtime-grant-session"),
+    executor: async (request) => {
+      requests.push({ path: request.path, runtime: request.runtime });
+      return { status: "completed", text: `${request.runtime} complete` };
+    },
+  });
+  try {
+    const rootController = team.controller();
+    const delegator = await rootController.spawn({
+      taskName: "delegator",
+      message: "Coordinate coding work.",
+      runtimeGrants: ["codex"],
+    });
+    await rootController.wait(delegator.id, 2_000);
+    assert.deepEqual(delegator.runtimeGrants, ["codex"]);
+
+    const scoped = team.controller(delegator.path);
+    assert.deepEqual(scoped.runtimeGrants, ["codex"]);
+    const codex = await scoped.spawn({
+      taskName: "codex_worker",
+      message: "Implement one bounded change.",
+      runtime: "codex",
+    });
+    await scoped.wait(codex.id, 2_000);
+    assert.equal(codex.runtime, "codex");
+    assert.equal(codex.workspace.mode, "isolated-write");
+    await assert.rejects(
+      async () => scoped.applyDiff(codex.id),
+      /only \/root may apply/i,
+      "a background coordinator cannot silently merge its coding worker into the user's source checkout",
+    );
+
+    await assert.rejects(
+      scoped.spawn({ taskName: "claude_worker", message: "Should be denied.", runtime: "claude" }),
+      /has not been granted the claude coding runtime/i,
+    );
+    await assert.rejects(
+      scoped.spawn({ taskName: "grant_forward", message: "Should be denied.", runtimeGrants: ["codex"] }),
+      /only \/root may grant coding runtimes/i,
+    );
+
+    const ungranted = await rootController.spawn({ taskName: "observer", message: "Review only." });
+    await rootController.wait(ungranted.id, 2_000);
+    await assert.rejects(
+      team.controller(ungranted.path).spawn({
+        taskName: "ungranted_codex",
+        message: "Should be denied.",
+        runtime: "codex",
+      }),
+      /has not been granted the codex coding runtime/i,
+    );
+    assert.deepEqual(requests.map((request) => request.runtime), ["hara", "codex", "hara"]);
+  } finally {
+    team.close();
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("writable Agent generations stay isolated until their owned Diff is manually applied or rejected", async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-agent-team-worktree-"));
   const home = join(root, "home");
@@ -444,6 +561,7 @@ test("writable Agent generations stay isolated until their owned Diff is manuall
   runGit(repo, "commit", "-qm", "base");
   const sessionId = "worktree-team-session";
   const worktreeManager = new AgentWorktreeManager(repo, home, sessionId);
+  const externalRequests = [];
   const team = new DurableAgentTeam({
     sessionId,
     store: new AgentTeamStore(home),
@@ -451,6 +569,15 @@ test("writable Agent generations stay isolated until their owned Diff is manuall
     executor: async (request) => {
       assert.equal(request.workspace?.mode, "isolated-write");
       assert.notEqual(request.workspace?.cwd, repo);
+      if (request.runtime === "codex") {
+        externalRequests.push(request);
+        return {
+          status: "completed",
+          text: "Codex implementation ready",
+          runtimeSessionId: `ext_runtime_${"a".repeat(24)}`,
+        };
+      }
+      assert.equal(request.runtime, "hara");
       writeFileSync(join(request.workspace.cwd, "owned.txt"), "child\n");
       return { status: "completed", text: "implementation ready" };
     },
@@ -495,6 +622,20 @@ test("writable Agent generations stay isolated until their owned Diff is manuall
     assert.equal(readFileSync(join(repo, "owned.txt"), "utf8"), "child\n");
     const rejectedPath = worktreeManager.prepare(rejectedAgent.id).path;
     assert.equal(existsSync(rejectedPath), true);
+
+    const external = await controller.spawn({
+      taskName: "codex_impl",
+      message: "inspect the repository",
+      runtime: "codex",
+    });
+    assert.equal(external.runtime, "codex");
+    assert.equal(external.workspace.mode, "isolated-write");
+    await controller.wait(external.id, 5_000);
+    await controller.followup(external.id, "continue in the same coding session");
+    await controller.wait(external.id, 5_000);
+    assert.equal(externalRequests.length, 2);
+    assert.equal(externalRequests[0].runtimeSessionId, undefined);
+    assert.equal(externalRequests[1].runtimeSessionId, `ext_runtime_${"a".repeat(24)}`);
     assert.equal(team.removeStoredState(), true);
     assert.equal(existsSync(appliedPath), false);
     assert.equal(existsSync(rejectedPath), false);

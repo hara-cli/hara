@@ -181,7 +181,100 @@ const rootProvider = () => {
   };
 };
 
-const deps = (provider, store, home, spawned) => ({
+const externalRootProvider = () => {
+  let round = 0;
+  return {
+    id: "fake",
+    model: "fake-1",
+    async turn({ onText }) {
+      round += 1;
+      if (round === 1) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "brief-external-1",
+            name: "task_intake",
+            input: {
+              intent: "change",
+              goal: "ask one isolated Codex Agent to review the repository and continue the same session once",
+              constraints: ["do not modify the source checkout"],
+              acceptance: ["both generations complete through one opaque runtime session"],
+              steps: ["spawn Codex", "wait", "send one follow-up", "wait"],
+            },
+          }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
+      if (round === 2) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "spawn-external-1",
+            name: "spawn_agent",
+            input: {
+              task_name: "codex_review",
+              message: "Review the bounded fixture without editing it.",
+              runtime: "codex",
+            },
+          }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
+      if (round === 3 || round === 5) {
+        return {
+          text: "",
+          toolUses: [{
+            id: `wait-external-${round}`,
+            name: "wait_agent",
+            input: { target: "/root/codex_review", timeout_ms: 1_000 },
+          }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
+      if (round === 4) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "followup-external-1",
+            name: "followup_task",
+            input: { target: "/root/codex_review", message: "Confirm the same conclusion." },
+          }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
+      if (round === 6) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "checkpoint-external-1",
+            name: "task_checkpoint",
+            input: {
+              completion: {
+                state: "verified",
+                evidence: ["both Codex Agent generations settled through the same durable runtime identity"],
+              },
+            },
+          }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
+      onText("external delegation complete");
+      return {
+        text: "external delegation complete",
+        toolUses: [],
+        stop: "end",
+        usage: { input: 1, output: 1 },
+      };
+    },
+  };
+};
+
+const deps = (provider, store, home, spawned, externalSessions) => ({
   version: "0.0.0-test",
   providerId: "fake",
   model: "fake-1",
@@ -223,6 +316,7 @@ const deps = (provider, store, home, spawned) => ({
   store,
   quietDiscovery: true,
   agentTeamHome: home,
+  ...(externalSessions ? { externalSessions } : {}),
   spaces: () => ({
     activeId: "personal",
     activeProfileId: "personal",
@@ -260,6 +354,213 @@ const deps = (provider, store, home, spawned) => ({
       agentProfilePermission: "edit",
     }],
   }),
+});
+
+test("Serve exposes user-driven Agent members, direct messages, and bounded group rooms", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-serve-agent-room-rpc-"));
+  const home = join(root, "home");
+  const repo = join(root, "repo");
+  mkdirSync(home);
+  mkdirSync(repo);
+  const store = memStore();
+  const spawned = [];
+  let server;
+  let client;
+  const waitFor = async (predicate) => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const value = await predicate();
+      if (value) return value;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error("timed out waiting for Agent room state");
+  };
+  try {
+    server = await startServe(
+      { host: "127.0.0.1", port: 0, token: "tok", cwd: repo },
+      deps(rootProvider(), store, home, spawned),
+    );
+    client = await connect(server.port);
+    const initialized = await client.call("initialize", { token: "tok" });
+    for (const method of [
+      "session.agents.spawn",
+      "session.agents.message",
+      "session.agent-rooms.create",
+      "session.agent-rooms.read",
+      "session.agent-rooms.post",
+      "session.agent-rooms.close",
+    ]) assert.ok(initialized.result.capabilities.methods.includes(method), method);
+
+    const created = await client.call("session.create");
+    const sessionId = created.result.sessionId;
+    const alphaCommand = "00000000-0000-4000-8000-000000000001";
+    const alpha = await client.call("session.agents.spawn", {
+      sessionId,
+      taskName: "alpha",
+      message: "Own the API review.",
+      runtime: "hara",
+      runtimeGrants: ["codex"],
+      commandId: alphaCommand,
+    });
+    assert.equal(alpha.error, undefined, JSON.stringify(alpha));
+    const alphaRetry = await client.call("session.agents.spawn", {
+      sessionId,
+      taskName: "alpha",
+      message: "Own the API review.",
+      runtime: "hara",
+      runtimeGrants: ["codex"],
+      commandId: alphaCommand,
+    });
+    assert.equal(alphaRetry.result.agent.id, alpha.result.agent.id);
+    assert.deepEqual(alpha.result.agent.runtimeGrants, ["codex"]);
+    const conflictingRetry = await client.call("session.agents.spawn", {
+      sessionId,
+      taskName: "alpha_other",
+      message: "Different request.",
+      runtime: "hara",
+      commandId: alphaCommand,
+    });
+    assert.match(conflictingRetry.error.message, /different request/i);
+
+    const beta = await client.call("session.agents.spawn", {
+      sessionId,
+      taskName: "beta",
+      message: "Own the UI review.",
+      runtime: "hara",
+      commandId: "00000000-0000-4000-8000-000000000002",
+    });
+    await waitFor(async () => {
+      const listed = await client.call("session.agents.list", { sessionId });
+      return listed.result.agents.length === 2
+        && listed.result.agents.every((agent) => agent.status === "completed")
+        ? listed.result
+        : null;
+    });
+    const listed = await client.call("session.agents.list", { sessionId });
+    assert.deepEqual(listed.result.agents.find((agent) => agent.id === alpha.result.agent.id).runtimeGrants, ["codex"]);
+    assert.deepEqual(listed.result.agents.find((agent) => agent.id === beta.result.agent.id).runtimeGrants, []);
+
+    const roomCreated = await client.call("session.agent-rooms.create", {
+      sessionId,
+      name: "release_review",
+      members: [alpha.result.agent.id, beta.result.agent.id],
+      commandId: "00000000-0000-4000-8000-000000000003",
+    });
+    assert.deepEqual(roomCreated.result.room.participantPaths, ["/root", "/root/alpha", "/root/beta"]);
+    const posted = await client.call("session.agent-rooms.post", {
+      sessionId,
+      room: roomCreated.result.room.id,
+      message: "Compare the API and UI risks, then report separately.",
+      wake: true,
+      commandId: "00000000-0000-4000-8000-000000000004",
+    });
+    assert.equal(posted.result.room.messages[0].sourcePath, "/root");
+
+    const room = await waitFor(async () => {
+      const read = await client.call("session.agent-rooms.read", {
+        sessionId,
+        room: roomCreated.result.room.id,
+        limit: 50,
+      });
+      return read.result.room.messages.length >= 3 ? read.result.room : null;
+    });
+    assert.deepEqual(new Set(room.messages.map((message) => message.sourcePath)), new Set(["/root", "/root/alpha", "/root/beta"]));
+    assert.ok(room.messages.filter((message) => message.sourcePath !== "/root").every((message) => /child conclusion/.test(message.content)));
+
+    const direct = await client.call("session.agents.message", {
+      sessionId,
+      target: alpha.result.agent.id,
+      message: "Now focus only on compatibility.",
+      wake: true,
+      commandId: "00000000-0000-4000-8000-000000000005",
+    });
+    assert.equal(direct.error, undefined, JSON.stringify(direct));
+    await waitFor(async () => {
+      const listed = await client.call("session.agents.list", { sessionId });
+      return listed.result.agents.find((agent) => agent.id === alpha.result.agent.id)?.generation === 3;
+    });
+
+    const closed = await client.call("session.agent-rooms.close", {
+      sessionId,
+      room: roomCreated.result.room.id,
+    });
+    assert.equal(typeof closed.result.room.closedAt, "string");
+  } finally {
+    client?.ws.close();
+    await server?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Serve routes approved Codex Agents through one isolated Hara Live continuation", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-serve-external-agent-team-"));
+  const home = join(root, "home");
+  const repo = join(root, "repo");
+  mkdirSync(home);
+  mkdirSync(repo);
+  const runGit = (...args) => {
+    const result = spawnSync("git", args, { cwd: repo, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || `git ${args[0]} failed`);
+  };
+  runGit("init", "-q");
+  runGit("config", "user.email", "test@example.test");
+  runGit("config", "user.name", "Hara Test");
+  writeFileSync(join(repo, "owned.txt"), "source\n");
+  runGit("add", "owned.txt");
+  runGit("commit", "-qm", "base");
+  const runtimeId = `ext_runtime_${"c".repeat(24)}`;
+  const calls = [];
+  let runtimeCwd = "";
+  const externalSessions = {
+    async createSession(input) {
+      calls.push(["create", input]);
+      runtimeCwd = input.cwd;
+      return { session: { id: runtimeId }, messages: [], readOnly: false, controlMode: "live" };
+    },
+    async readSession(id) { calls.push(["read", id]); },
+    async submit(id, text) {
+      calls.push(["submit", id, text]);
+      return { sessionId: id, turnId: `turn-${calls.length}`, status: "completed", reply: "reviewed" };
+    },
+    async terminalInput(id, text) { calls.push(["terminal-input", id, text]); },
+    async interrupt(id) { calls.push(["interrupt", id]); },
+    async close() { calls.push(["close"]); },
+  };
+  const store = memStore();
+  let server;
+  let client;
+  try {
+    server = await startServe(
+      { host: "127.0.0.1", port: 0, token: "tok", cwd: repo },
+      deps(externalRootProvider(), store, home, [], externalSessions),
+    );
+    client = await connect(server.port);
+    await client.call("initialize", { token: "tok" });
+    const created = await client.call("session.create");
+    const sending = client.call("session.send", {
+      sessionId: created.result.sessionId,
+      text: "Ask Codex to review this fixture twice in the same isolated session.",
+    });
+    const approval = await client.waitEvent("approval.request");
+    assert.match(approval.params.question, /spawn_agent|Codex|coding runtime/i);
+    await client.call("approval.reply", { approvalId: approval.params.approvalId, allow: true });
+    const sent = await sending;
+    assert.equal(sent.error, undefined, JSON.stringify(sent));
+
+    const listed = await client.call("session.agents.list", { sessionId: created.result.sessionId });
+    assert.equal(listed.result.agents[0].runtime, "codex");
+    assert.equal(listed.result.agents[0].generation, 2);
+    assert.equal(listed.result.agents[0].status, "completed");
+    assert.deepEqual(listed.result.rooms, []);
+    assert.notEqual(runtimeCwd, repo);
+    assert.equal(calls.filter((entry) => entry[0] === "create").length, 1);
+    assert.equal(calls.filter((entry) => entry[0] === "read").length, 1);
+    assert.equal(calls.filter((entry) => entry[0] === "submit").length, 2);
+    assert.equal(readFileSync(join(repo, "owned.txt"), "utf8"), "source\n");
+  } finally {
+    client?.ws.close();
+    await server?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("Serve exposes a durable Agent tree and restores it after reconnect", { timeout: 20_000 }, async () => {

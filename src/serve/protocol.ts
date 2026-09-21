@@ -78,9 +78,25 @@
 //                                                        place or copied with the optional fork operation.
 //   session.create    {cwd?,approval?,agentRef?} → {sessionId,title,cwd,model,profileId,spaceId,
 //                                                   approval,updatedAt,source,agentRef?}
-//   agents.list       {cwd?,sessionId?}          → {agents,offices,currentOfficeId}
-//   session.agents.list {sessionId}              → {sessionId,agents,budget}; budget is the model-context-
+//   agents.list       {cwd?,sessionId?}          → {agents,dismissedAgentRefs}
+//   session.agents.list {sessionId}              → {sessionId,agents,rooms,budget}; budget is the model-context-
 //                                                   aware shared generations/rounds/tools/token/deadline fence.
+//   session.agents.spawn {sessionId,taskName,message,agentRef?,runtime?,workspace?,runtimeGrants?,commandId,controlLease?}
+//                                                   → {sessionId,agent}; creates one durable team member. Codex and
+//                                                     Claude always use an Agent-owned isolated worktree. A root-
+//                                                     granted Hara Agent may itself delegate to those runtimes;
+//                                                     the durable grant authorizes bounded launches, while only
+//                                                     /root can inspect and manually apply the resulting Diff.
+//   session.agents.message {sessionId,target,message,wake?,commandId,controlLease?}
+//                                                   → {sessionId,agent}; wake defaults true and continues the same
+//                                                     opaque Codex/Claude runtime when present.
+//   session.agents.interrupt {sessionId,target,controlLease?} → {sessionId,agent}
+//   session.agent-rooms.create {sessionId,name,members,commandId,controlLease?} → {sessionId,room}
+//   session.agent-rooms.read {sessionId,room,limit?} → {sessionId,room}
+//   session.agent-rooms.post {sessionId,room,message,wake?,commandId,controlLease?} → {sessionId,room}
+//                                                     Root/user posts wake idle members once; Agent posts never do,
+//                                                     preventing autonomous reply loops.
+//   session.agent-rooms.close {sessionId,room,controlLease?} → {sessionId,room}
 //   session.resume    {sessionId,approval?}      → {sessionId,model,profileId,approval,history:[{role,text}]}
 //                                                    approval only migrates legacy sessions with no saved choice.
 //   session.pause     {sessionId,controlLease?}  → {sessionId,state:"paused",suspensionId,runtimeCursor}

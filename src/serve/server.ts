@@ -24,6 +24,7 @@ import { homedir, platform } from "node:os";
 import { basename, isAbsolute, join, relative, sep } from "node:path";
 import "../tools/all.js"; // register the full built-in toolset — serve must work as a standalone entry
 import { pruneStoredToolResults } from "../tools/result-limit.js";
+import type { Tool } from "../tools/registry.js";
 import { createServeRuntimeLogger, serveRuntimeFailureCategory } from "./runtime-log.js";
 import { runAgent, type RunOpts, type RunProgressEvent, type RunRuntimeItemEvent } from "../agent/loop.js";
 import {
@@ -292,6 +293,7 @@ import {
   type ValidatedSessionAttachments,
 } from "./attachments.js";
 import { createExternalSessionRegistry } from "../external-sessions/registry.js";
+import { executeExternalCodingAgent } from "../subagent/external.js";
 import {
   ExternalSessionInputError,
   type ExternalRuntimeLaunchOptions,
@@ -583,19 +585,8 @@ export interface ServeAgentInfo {
   revision?: string;
 }
 
-export interface ServeAgentOffice {
-  id: string;
-  name: string;
-  cwd: string;
-  kind: "workspace" | "project" | "lobby";
-  project?: string;
-  agentRefs: string[];
-}
-
 export interface ServeAgentCatalog {
   agents: ServeAgentInfo[];
-  offices: ServeAgentOffice[];
-  currentOfficeId: string;
   /** Qualified Personal refs hidden from the active directory; source prompts and history remain intact. */
   dismissedAgentRefs: string[];
 }
@@ -609,25 +600,10 @@ interface ResolvedServeAgent {
 
 const SAFE_AGENT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 const SERVE_AGENT_LIMIT = 512;
-const SERVE_OFFICE_LIMIT = 128;
-const SERVE_OFFICE_AGENT_LIMIT = 24;
+const SERVE_PROJECT_LIMIT = 128;
 
 function failClosedSpaceId(profileId?: string): string {
   return profileId && profileId !== "personal" ? `org-profile:${profileId}` : "personal";
-}
-
-function boundedOfficeAgentRefs(...groups: string[][]): string[] {
-  const refs = ["main"];
-  const seen = new Set(refs);
-  for (const group of groups) {
-    for (const ref of group) {
-      if (seen.has(ref)) continue;
-      seen.add(ref);
-      refs.push(ref);
-      if (refs.length >= SERVE_OFFICE_AGENT_LIMIT) return refs;
-    }
-  }
-  return refs;
 }
 
 function canonicalAgentRef(entry: AgentIndexEntry): string {
@@ -677,7 +653,7 @@ function serveAgentCatalog(cwd: string, profileId: string | undefined, spaceId: 
   const projects = [
     ...(currentProject ? [currentProject] : []),
     ...allProjects.filter((project) => project.name !== currentProject?.name),
-  ].slice(0, SERVE_OFFICE_LIMIT);
+  ].slice(0, SERVE_PROJECT_LIMIT);
   const visibleProjectNames = new Set(projects.map((project) => project.name));
   const indexed = buildAgentsIndex(profileId)
     .filter((entry) => SAFE_AGENT_NAME.test(entry.name) && (!entry.project || visibleProjectNames.has(entry.project)))
@@ -746,45 +722,8 @@ function serveAgentCatalog(cwd: string, profileId: string | undefined, spaceId: 
     });
   }
 
-  const globalAgentRefs = agents
-    .filter((agent) => agent.scope === "global")
-    .map((agent) => agent.ref);
-  const projectOffices: ServeAgentOffice[] = projects.map((project) => ({
-    id: `project:${project.name}`,
-    name: project.name,
-    cwd: project.path,
-    kind: "project",
-    project: project.name,
-    agentRefs: boundedOfficeAgentRefs(
-      agents.filter((agent) => agent.project === project.name).map((agent) => agent.ref),
-      globalAgentRefs,
-    ),
-  }));
-  const currentOffice: ServeAgentOffice = currentProject
-    ? projectOffices.find((office) => office.project === currentProject.name)!
-    : {
-        id: "workspace",
-        name: basename(cwd) || "Workspace",
-        cwd,
-        kind: "workspace",
-        agentRefs: boundedOfficeAgentRefs(globalAgentRefs),
-      };
-  const lobby: ServeAgentOffice = {
-    id: "global",
-    name: "Hara Lobby",
-    cwd,
-    kind: "lobby",
-    agentRefs: boundedOfficeAgentRefs(globalAgentRefs),
-  };
-  const offices = [
-    currentOffice,
-    ...(currentOffice.id === lobby.id ? [] : [lobby]),
-    ...projectOffices.filter((office) => office.id !== currentOffice.id),
-  ];
   return {
     agents,
-    offices,
-    currentOfficeId: currentOffice.id,
     dismissedAgentRefs: spaceId === "personal" ? [...dismissedAgentRefs()].sort() : [],
   };
 }
@@ -1864,6 +1803,100 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     session.meta.provider = fresh.id;
     return true;
   };
+  /** Create one execution segment behind a persistent Agent contact. The user-facing contact remains
+   * stable while model, workspace, approval and transcript ownership stay frozen per segment. */
+  const createAgentContactSession = async (
+    source: ServeSession,
+    requestedAgentRef: string,
+  ): Promise<ServeSession> => {
+    const sourceBinding = sessionSpaceBinding(source.meta);
+    const identityProfileId = sourceBinding.runtime.organizationProfileId ?? sourceBinding.profileId;
+    let resolved = resolveServeAgent(
+      requestedAgentRef,
+      source.meta.cwd,
+      identityProfileId,
+    );
+    if (!resolved) throw new Error(`Agent '${requestedAgentRef}' is no longer available`);
+    if ("ambiguous" in resolved) {
+      throw new Error(`Agent '${requestedAgentRef}' is ambiguous; choose one of: ${resolved.ambiguous.join(", ")}`);
+    }
+    const cwd = resolved.cwd;
+    const routeBefore = runtimeInfo(cwd, undefined, sourceBinding.profileId, sourceBinding.spaceId);
+    if (
+      (routeBefore.profileId && routeBefore.profileId !== sourceBinding.profileId)
+      || (routeBefore.spaceId ?? failClosedSpaceId(sourceBinding.profileId)) !== sourceBinding.spaceId
+    ) {
+      throw new SessionSpaceBoundaryError("the Agent workspace is not authorized in this Space");
+    }
+    let provider = await deps.buildSessionProvider(cwd, sourceBinding.profileId, sourceBinding.spaceId);
+    if (!provider) throw new Error("the Agent model connection is not authenticated");
+    // A company provider refresh can update the current Agent bundle. Re-resolve after the asynchronous
+    // boundary and refuse to combine an old persona with a new workspace or organization policy.
+    const refreshed = resolveServeAgent(requestedAgentRef, cwd, identityProfileId);
+    if (
+      !refreshed
+      || "ambiguous" in refreshed
+      || refreshed.ref !== resolved.ref
+      || canonicalProjectPath(refreshed.cwd) !== canonicalProjectPath(cwd)
+    ) {
+      throw new Error(`Agent '${requestedAgentRef}' changed while its connection was being synchronized`);
+    }
+    resolved = refreshed;
+    const roleModel = effectiveRoleModel(resolved.role.model, provider.model);
+    const selectedModel = roleModel ?? provider.model;
+    const selectedRuntime = runtimeInfo(
+      cwd,
+      selectedModel,
+      sourceBinding.profileId,
+      sourceBinding.spaceId,
+    );
+    const roleReasoningEffort = resolved.role.reasoningEffort;
+    if (roleReasoningEffort && !selectedRuntime.effortLevels.includes(roleReasoningEffort)) {
+      throw new Error(
+        `Agent '${resolved.ref}' requires unsupported reasoning effort '${roleReasoningEffort}' for model '${selectedModel}'`,
+      );
+    }
+    const effort = roleReasoningEffort ?? selectedRuntime.defaultReasoningEffort ?? null;
+    if (roleModel || roleReasoningEffort) {
+      const roleProvider = deps.buildProviderFor
+        ? await deps.buildProviderFor(
+            selectedModel,
+            effort,
+            cwd,
+            sourceBinding.profileId,
+            sourceBinding.spaceId,
+          )
+        : null;
+      if (!roleProvider) {
+        throw new Error(`Agent '${resolved.ref}' requires unavailable model '${selectedModel}'`);
+      }
+      provider = roleProvider;
+    }
+    const routeAfter = runtimeInfo(
+      cwd,
+      provider.model,
+      sourceBinding.profileId,
+      sourceBinding.spaceId,
+    );
+    if (
+      (routeAfter.profileId && routeAfter.profileId !== sourceBinding.profileId)
+      || (routeAfter.spaceId ?? failClosedSpaceId(sourceBinding.profileId)) !== sourceBinding.spaceId
+    ) {
+      throw new SessionSpaceBoundaryError("the Agent workspace route changed before the conversation started");
+    }
+    return hub.create({
+      cwd,
+      profileId: sourceBinding.profileId,
+      spaceId: sourceBinding.spaceId,
+      provider,
+      providerId: provider.id,
+      model: provider.model,
+      effort,
+      approval: source.approval,
+      projectContext: loadAgentContext(cwd) || undefined,
+      agentRef: resolved.ref,
+    });
+  };
   const roleForSession = (session: ServeSession): Role | undefined => {
     if (!session.meta.agentRef) return undefined;
     const runtime = runtimeInfo(session.meta.cwd, session.meta.model, session.meta.profileId, session.meta.spaceId);
@@ -2378,25 +2411,73 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         session.meta.id,
       ),
       executor: async (request) => {
-        sessionSpaceBinding(session.meta);
+        const binding = sessionSpaceBinding(session.meta);
         const taskId = session.task?.id;
         const turnId = session.task?.turnId;
+        const recordLifecycle = (event: SubagentLifecycleEvent): void => {
+          if (!taskId || !turnId) return;
+          publishSubagentRuntimeItem(session, { taskId, turnId }, event, request.generation);
+          const snapshot = workforceLedger.recordSubagent(
+            session.meta.id,
+            taskId,
+            turnId,
+            event,
+          );
+          if (snapshot) broadcast("event.workforce_state", { ...snapshot });
+        };
         const observers = {
           onProviderTurn: (turn: Promise<unknown>) => observeProviderTurn(session, turn),
           onToolRun: (toolRun: Promise<unknown>, tool: { name: string }) =>
             observeToolRun(session, toolRun, tool),
-          onSubagentLifecycle: (event: Parameters<NonNullable<SubagentLifecycleObserver>>[0]) => {
-            if (!taskId || !turnId) return;
-            publishSubagentRuntimeItem(session, { taskId, turnId }, event, request.generation);
-            const snapshot = workforceLedger.recordSubagent(
-              session.meta.id,
-              taskId,
-              turnId,
-              event,
-            );
-            if (snapshot) broadcast("event.workforce_state", { ...snapshot });
-          },
+          onSubagentLifecycle: recordLifecycle,
         };
+        if (request.runtime !== "hara") {
+          if (binding.spaceId !== "personal") {
+            return {
+              status: "error",
+              text: "",
+              error: "Local Codex and Claude coding runtimes are available only in Personal Space.",
+            };
+          }
+          const now = new Date().toISOString();
+          const providerId = `hara-live-${request.runtime}`;
+          recordLifecycle({
+            id: request.id,
+            providerId,
+            ...(request.role ? { role: request.role } : {}),
+            state: "working",
+            queuedAt: now,
+            startedAt: now,
+          });
+          try {
+            const result = await executeExternalCodingAgent(request, externalSessions);
+            const endedAt = new Date().toISOString();
+            recordLifecycle({
+              id: request.id,
+              providerId,
+              ...(request.role ? { role: request.role } : {}),
+              state: result.status === "completed"
+                ? "completed"
+                : result.status === "cancelled" ? "cancelled" : "failed",
+              queuedAt: now,
+              startedAt: now,
+              endedAt,
+            });
+            sessionSpaceBinding(session.meta);
+            return result;
+          } catch (error) {
+            recordLifecycle({
+              id: request.id,
+              providerId,
+              ...(request.role ? { role: request.role } : {}),
+              state: request.signal.aborted ? "cancelled" : "failed",
+              queuedAt: now,
+              startedAt: now,
+              endedAt: new Date().toISOString(),
+            });
+            throw error;
+          }
+        }
         if (deps.spawnSubagentResult) {
           const result = await deps.spawnSubagentResult(
             session.provider,
@@ -2975,6 +3056,146 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         : undefined;
       sessionSpaceBinding(s.meta);
       const sessionRoleToolFilter = roleToolFilter(sessionRole);
+      const agentContactTool: Tool | undefined = s.meta.agentRef ? undefined : {
+        name: "agent_contact",
+        description:
+          "List or message persistent Hara Agent contacts in the current Space. "
+          + "When the user names an internal Agent, use this before channel_message; channel_message is only for external Feishu/WeChat recipients. "
+          + "Each message starts an auditable execution segment in that Agent's authorized workspace while the UI keeps one stable Agent contact.",
+        input_schema: {
+          type: "object",
+          properties: {
+            action: {
+              type: "string",
+              enum: ["list", "message"],
+              description: "List available internal Agents or send one a message.",
+            },
+            recipient: {
+              type: "string",
+              description: "Exact Agent ref, internal name, or display name. Required for message.",
+            },
+            message: {
+              type: "string",
+              description: "Message/task for the Agent. Required for message.",
+            },
+          },
+          required: ["action"],
+        },
+        kind: "read",
+        classify: () => ({ effect: "state", concurrencySafe: false }),
+        run: async (input, toolContext) => {
+          const binding = sessionSpaceBinding(s.meta);
+          const identityProfileId = binding.runtime.organizationProfileId ?? binding.profileId;
+          const contacts = serveAgentCatalog(s.meta.cwd, identityProfileId, binding.spaceId).agents
+            .filter((agent) => agent.ref !== "main" && agent.allowedActions.includes("chat"));
+          if (input?.action === "list") {
+            return JSON.stringify({
+              contacts: contacts.map((agent) => ({
+                ref: agent.ref,
+                name: agent.name,
+                displayName: agent.identity.displayName,
+                title: agent.identity.title,
+                workspace: basename(agent.home),
+              })),
+            });
+          }
+          if (input?.action !== "message") {
+            return "Error: action must be 'list' or 'message'.";
+          }
+          const recipient = typeof input.recipient === "string" ? input.recipient.trim() : "";
+          const message = typeof input.message === "string" ? input.message.trim() : "";
+          if (!recipient || recipient.length > 180) {
+            return "Error: recipient must be a non-empty Agent ref or name of at most 180 characters.";
+          }
+          if (!message || message.length > 32_000) {
+            return "Error: message must contain 1 to 32000 characters.";
+          }
+          const key = recipient.toLocaleLowerCase();
+          const matches = contacts.filter((agent) => [
+            agent.ref,
+            agent.name,
+            agent.identity.displayName,
+          ].some((value) => value.trim().toLocaleLowerCase() === key));
+          if (matches.length === 0) {
+            return JSON.stringify({
+              status: "not_found",
+              recipient,
+              instruction: "Call agent_contact with action=list and choose an exact internal Agent.",
+            });
+          }
+          if (matches.length > 1) {
+            return JSON.stringify({
+              status: "ambiguous",
+              recipient,
+              choices: matches.map((agent) => ({ ref: agent.ref, displayName: agent.identity.displayName })),
+            });
+          }
+          if (toolContext.signal?.aborted) return "Error: Agent message cancelled before delivery.";
+          const contact = matches[0]!;
+          let target: ServeSession | undefined;
+          try {
+            target = await createAgentContactSession(s, contact.ref);
+            broadcast("event.session_changed", {
+              sessionId: target.meta.id,
+              change: "created",
+              historyRefreshRequired: false,
+              agentRef: contact.ref,
+            });
+            const cancelTarget = (): void => {
+              target?.abort?.abort(new Error("the parent Agent conversation was interrupted"));
+            };
+            toolContext.signal?.addEventListener("abort", cancelTarget, { once: true });
+            try {
+              const result = await runTurn(target, message, undefined, true, message);
+              broadcast("event.session_changed", {
+                sessionId: target.meta.id,
+                change: "agent_contact_completed",
+                historyRefreshRequired: false,
+                agentRef: contact.ref,
+              });
+              return JSON.stringify({
+                status: "completed",
+                recipient: { ref: contact.ref, displayName: contact.identity.displayName },
+                sessionId: target.meta.id,
+                reply: redactSensitiveText(result.reply).text.slice(0, 8_000),
+              });
+            } finally {
+              toolContext.signal?.removeEventListener("abort", cancelTarget);
+            }
+          } catch (error) {
+            if (target) {
+              broadcast("event.session_changed", {
+                sessionId: target.meta.id,
+                change: "agent_contact_failed",
+                historyRefreshRequired: false,
+                agentRef: contact.ref,
+              });
+            }
+            // Provider failures can contain endpoints, account identifiers, or accidentally echoed
+            // credentials. Classify them for the parent Agent; the target transcript keeps the ordinary
+            // typed failure lifecycle, while this cross-Agent receipt never relays the upstream body.
+            const safeDiagnostic = redactSensitiveText(error instanceof Error ? error.message : String(error)).text;
+            const authenticationFailure = /(?:\b(?:401|403)\b|unauthori[sz]ed|forbidden|auth(?:entication)?|credential|api[ _-]?key)/iu
+              .test(safeDiagnostic);
+            const spaceFailure = /(?:Space|workspace).*(?:authoriz|route|changed)|organization/iu.test(safeDiagnostic);
+            return JSON.stringify({
+              status: toolContext.signal?.aborted ? "cancelled" : "failed",
+              recipient: { ref: contact.ref, displayName: contact.identity.displayName },
+              ...(target ? { sessionId: target.meta.id } : {}),
+              reasonCode: toolContext.signal?.aborted
+                ? "cancelled"
+                : authenticationFailure
+                  ? "model_authentication_failed"
+                  : spaceFailure ? "workspace_not_authorized" : "agent_execution_failed",
+              instruction: authenticationFailure
+                ? "Open Models & connections, update this Agent's account, or switch to an available connection before retrying."
+                : spaceFailure
+                  ? "Open the Agent conversation and explicitly authorize an available workspace in the current Space."
+                  : "Open the Agent conversation to review its task state and retry.",
+            });
+          }
+        },
+      };
       const turnGuardian = deps.buildGuardian
         ? await deps.buildGuardian(s.meta.cwd, s.meta.profileId, s.meta.spaceId)
         : deps.guardian;
@@ -3208,6 +3429,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         ...(sessionRole ? { systemOverride: sessionRole.system } : {}),
         ...(sessionRoleToolFilter ? { toolFilter: sessionRoleToolFilter } : {}),
         ...(sessionRole?.readOnly ? { hooks: false } : {}),
+        ...(agentContactTool ? { extraTools: [agentContactTool] } : {}),
         ...(slashSkillPolicy ? { skillPolicies: [slashSkillPolicy] } : {}),
         taskIntake: {
           task: s.task,
@@ -4331,7 +4553,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           const methods = [
             "server.shutdown",
             "events.replay", "events.ack", "events.snapshot",
-            "session.list", "session.create", "session.resume", "session.pause", "session.migration.prepare", "session.migration.resume", "session.history", "session.runtime.replay", "session.agents.list", "session.submit", "session.send", "session.steer", "session.interrupt", "session.control.acquire", "session.control.release", "session.set-model", "session.set-approval",
+            "session.list", "session.create", "session.resume", "session.pause", "session.migration.prepare", "session.migration.resume", "session.history", "session.runtime.replay", "session.agents.list", "session.agents.spawn", "session.agents.message", "session.agents.interrupt", "session.agent-rooms.create", "session.agent-rooms.read", "session.agent-rooms.post", "session.agent-rooms.close", "session.submit", "session.send", "session.steer", "session.interrupt", "session.control.acquire", "session.control.release", "session.set-model", "session.set-approval",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
             "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.resume", "external.sessions.fork",
@@ -4908,11 +5130,180 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.NO_SESSION, "resume the session before listing its Agent team"));
             }
             sessionSpaceBinding(session.meta);
+            const team = agentTeamFor(session);
             return reply(rpcResult(id!, {
               sessionId: session.meta.id,
-              agents: agentTeamFor(session).list(),
-              budget: agentTeamFor(session).budget(),
+              agents: team.list(),
+              rooms: team.controller("/root").listRooms(),
+              budget: team.budget(),
             }));
+          }
+          case "session.agents.spawn": {
+            if (
+              typeof p.sessionId !== "string"
+              || typeof p.taskName !== "string"
+              || typeof p.message !== "string"
+              || !validSessionCommandId(p.commandId)
+            ) return reply(rpcError(id, ERR.PARAMS, "sessionId, taskName, message, and UUID commandId are required"));
+            if (p.taskName.length > 48 || p.message.length > 32_000) {
+              return reply(rpcError(id, ERR.PARAMS, "Agent taskName or message exceeds its bounded limit"));
+            }
+            if (p.agentRef !== undefined && (typeof p.agentRef !== "string" || p.agentRef.length > 180)) {
+              return reply(rpcError(id, ERR.PARAMS, "agentRef must be a bounded Agent address"));
+            }
+            const runtime = p.runtime ?? "hara";
+            if (runtime !== "hara" && runtime !== "codex" && runtime !== "claude") {
+              return reply(rpcError(id, ERR.PARAMS, "runtime must be hara, codex, or claude"));
+            }
+            const workspace = p.workspace ?? (runtime === "hara" ? "read-only" : "isolated-write");
+            if (workspace !== "read-only" && workspace !== "isolated-write") {
+              return reply(rpcError(id, ERR.PARAMS, "workspace must be read-only or isolated-write"));
+            }
+            const runtimeGrants = p.runtimeGrants ?? [];
+            if (
+              !Array.isArray(runtimeGrants)
+              || runtimeGrants.length > 2
+              || runtimeGrants.some((grant: unknown) => grant !== "codex" && grant !== "claude")
+            ) return reply(rpcError(id, ERR.PARAMS, "runtimeGrants may contain only codex and claude"));
+            if (runtime !== "hara" && runtimeGrants.length > 0) {
+              return reply(rpcError(id, ERR.PARAMS, "only a Hara Agent can receive coding runtime grants"));
+            }
+            const session = hub.get(p.sessionId);
+            if (!session) return reply(rpcError(id, ERR.NO_SESSION, "resume the session before starting an Agent"));
+            authorizeSessionMutation(ws, session.meta.id, p);
+            const binding = sessionSpaceBinding(session.meta);
+            if (runtime !== "hara" && binding.spaceId !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "Codex and Claude runtimes are available only in Personal Space"));
+            }
+            if (runtimeGrants.length > 0 && binding.spaceId !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "coding runtime grants are available only in Personal Space"));
+            }
+            let role: string | undefined;
+            if (p.agentRef !== undefined && p.agentRef !== "main") {
+              const currentRuntime = runtimeInfo(
+                session.meta.cwd,
+                session.meta.model,
+                session.meta.profileId,
+                session.meta.spaceId,
+              );
+              const resolved = resolveServeAgent(
+                p.agentRef,
+                session.meta.cwd,
+                currentRuntime.organizationProfileId ?? session.meta.profileId,
+              );
+              if (!resolved) return reply(rpcError(id, ERR.PARAMS, `Agent '${p.agentRef}' is unavailable`));
+              if ("ambiguous" in resolved) {
+                return reply(rpcError(id, ERR.CONFLICT, `Agent '${p.agentRef}' is ambiguous; use a qualified Agent address`));
+              }
+              if (canonicalProjectPath(resolved.cwd) !== canonicalProjectPath(session.meta.cwd)) {
+                return reply(rpcError(id, ERR.CONFLICT, "Agent group members must share the session workspace"));
+              }
+              role = resolved.ref;
+            }
+            const agent = await agentTeamFor(session).controller("/root").spawn({
+              taskName: p.taskName,
+              message: p.message,
+              ...(role ? { role } : {}),
+              runtime,
+              workspace,
+              runtimeGrants,
+            }, p.commandId);
+            return reply(rpcResult(id!, { sessionId: session.meta.id, agent }));
+          }
+          case "session.agents.message": {
+            if (
+              typeof p.sessionId !== "string"
+              || typeof p.target !== "string"
+              || typeof p.message !== "string"
+              || !validSessionCommandId(p.commandId)
+            ) return reply(rpcError(id, ERR.PARAMS, "sessionId, target, message, and UUID commandId are required"));
+            if (p.target.length > 220 || p.message.length > 16_000) {
+              return reply(rpcError(id, ERR.PARAMS, "Agent target or message exceeds its bounded limit"));
+            }
+            const session = hub.get(p.sessionId);
+            if (!session) return reply(rpcError(id, ERR.NO_SESSION, "resume the session before messaging an Agent"));
+            authorizeSessionMutation(ws, session.meta.id, p);
+            sessionSpaceBinding(session.meta);
+            const controller = agentTeamFor(session).controller("/root");
+            const agent = p.wake === false
+              ? await controller.sendMessage(p.target, p.message, p.commandId)
+              : await controller.followup(p.target, p.message, p.commandId);
+            return reply(rpcResult(id!, { sessionId: session.meta.id, agent }));
+          }
+          case "session.agents.interrupt": {
+            if (typeof p.sessionId !== "string" || typeof p.target !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId and target are required"));
+            }
+            const session = hub.get(p.sessionId);
+            if (!session) return reply(rpcError(id, ERR.NO_SESSION, "resume the session before interrupting an Agent"));
+            authorizeSessionMutation(ws, session.meta.id, p);
+            sessionSpaceBinding(session.meta);
+            const agent = await agentTeamFor(session).controller("/root").interrupt(p.target);
+            return reply(rpcResult(id!, { sessionId: session.meta.id, agent }));
+          }
+          case "session.agent-rooms.create": {
+            if (
+              typeof p.sessionId !== "string"
+              || typeof p.name !== "string"
+              || !Array.isArray(p.members)
+              || p.members.some((member: unknown) => typeof member !== "string")
+              || !validSessionCommandId(p.commandId)
+            ) return reply(rpcError(id, ERR.PARAMS, "sessionId, name, members, and UUID commandId are required"));
+            if (p.members.length < 1 || p.members.length > 7) {
+              return reply(rpcError(id, ERR.PARAMS, "Agent rooms require 1-7 selected Agent members"));
+            }
+            const session = hub.get(p.sessionId);
+            if (!session) return reply(rpcError(id, ERR.NO_SESSION, "resume the session before creating an Agent room"));
+            authorizeSessionMutation(ws, session.meta.id, p);
+            sessionSpaceBinding(session.meta);
+            const room = await agentTeamFor(session).controller("/root").createRoom({
+              name: p.name,
+              members: p.members,
+            }, p.commandId);
+            return reply(rpcResult(id!, { sessionId: session.meta.id, room }));
+          }
+          case "session.agent-rooms.read": {
+            if (typeof p.sessionId !== "string" || typeof p.room !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId and room are required"));
+            }
+            if (p.limit !== undefined && (!Number.isInteger(p.limit) || p.limit < 1 || p.limit > 50)) {
+              return reply(rpcError(id, ERR.PARAMS, "limit must be an integer from 1 to 50"));
+            }
+            const session = hub.get(p.sessionId);
+            if (!session) return reply(rpcError(id, ERR.NO_SESSION, "resume the session before reading an Agent room"));
+            sessionSpaceBinding(session.meta);
+            const room = agentTeamFor(session).controller("/root").readRoom(p.room, p.limit);
+            return reply(rpcResult(id!, { sessionId: session.meta.id, room }));
+          }
+          case "session.agent-rooms.post": {
+            if (
+              typeof p.sessionId !== "string"
+              || typeof p.room !== "string"
+              || typeof p.message !== "string"
+              || !validSessionCommandId(p.commandId)
+            ) return reply(rpcError(id, ERR.PARAMS, "sessionId, room, message, and UUID commandId are required"));
+            if (p.message.length > 4_000) return reply(rpcError(id, ERR.PARAMS, "Agent room message exceeds 4,000 characters"));
+            const session = hub.get(p.sessionId);
+            if (!session) return reply(rpcError(id, ERR.NO_SESSION, "resume the session before posting to an Agent room"));
+            authorizeSessionMutation(ws, session.meta.id, p);
+            sessionSpaceBinding(session.meta);
+            const room = await agentTeamFor(session).controller("/root").postRoom({
+              room: p.room,
+              message: p.message,
+              wake: p.wake !== false,
+            }, p.commandId);
+            return reply(rpcResult(id!, { sessionId: session.meta.id, room }));
+          }
+          case "session.agent-rooms.close": {
+            if (typeof p.sessionId !== "string" || typeof p.room !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId and room are required"));
+            }
+            const session = hub.get(p.sessionId);
+            if (!session) return reply(rpcError(id, ERR.NO_SESSION, "resume the session before closing an Agent room"));
+            authorizeSessionMutation(ws, session.meta.id, p);
+            sessionSpaceBinding(session.meta);
+            const room = await agentTeamFor(session).controller("/root").closeRoom(p.room);
+            return reply(rpcResult(id!, { sessionId: session.meta.id, room }));
           }
           case "external.sources.list": {
             if (externalSessionSpaceId() !== "personal") {

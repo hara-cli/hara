@@ -20,6 +20,10 @@ const MAX_AGENTS = 64;
 const MAX_AGENT_DEPTH = 4;
 const MAX_INSTRUCTIONS = 64;
 const MAX_MAILBOX_MESSAGES = 64;
+const MAX_ROOMS = 16;
+const MAX_ROOM_PARTICIPANTS = 8;
+const MAX_ROOM_MESSAGES = 32;
+const MAX_ROOM_MESSAGE_CHARS = 4_000;
 const MAX_ASSIGNMENT_CHARS = 32_000;
 const MAX_MESSAGE_CHARS = 16_000;
 const MAX_RESULT_CHARS = 64_000;
@@ -27,14 +31,18 @@ const MAX_ROLE_CHARS = 128;
 const MAX_TOTAL_INSTRUCTION_CHARS = 256_000;
 const MAX_WAIT_MS = 5 * 60_000;
 const TASK_NAME = /^[a-z][a-z0-9_-]{0,47}$/;
+const ROOM_NAME = /^[a-z][a-z0-9_-]{0,47}$/;
 const AGENT_PATH = /^\/root(?:\/[a-z][a-z0-9_-]{0,47}){1,4}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const COMMIT = /^[0-9a-f]{40,64}$/u;
 const WORKSPACE_ID = /^aw_[a-f0-9]{40}$/u;
 const PATCH_HASH = /^[a-f0-9]{64}$/u;
+const RUNTIME_SESSION_ID = /^ext_runtime_[a-f0-9]{24}$/u;
 const MAX_DIFF_PATHS = 256;
 
 export type AgentWorkspaceMode = "read-only" | "isolated-write";
+export type AgentRuntime = "hara" | "codex" | "claude";
+export type AgentCodingRuntime = Exclude<AgentRuntime, "hara">;
 export type AgentWorkspaceState = "pending" | "ready" | "changes" | "applying" | "applied" | "rejected" | "error";
 
 interface AgentTeamWorkspaceRecord {
@@ -180,9 +188,14 @@ interface AgentTeamRecord {
   path: string;
   name: string;
   parentPath: string;
+  spawnCommandId?: string;
+  spawnRequestHash?: string;
   parentTurnId?: string;
   rootTurnId?: string;
   role?: string;
+  runtime: AgentRuntime;
+  runtimeGrants: AgentCodingRuntime[];
+  runtimeSessionId?: string;
   status: AgentTeamStatus;
   generation: number;
   assignment: string;
@@ -201,12 +214,60 @@ interface AgentTeamRecord {
   workspace?: AgentTeamWorkspaceRecord;
 }
 
+interface AgentRoomMessageRecord {
+  id: string;
+  sourcePath: string;
+  recipientPaths: string[];
+  content: string;
+  commandId: string;
+  requestHash: string;
+  rootTurnId?: string;
+  createdAt: string;
+}
+
+interface AgentRoomRecord {
+  id: string;
+  name: string;
+  ownerPath: string;
+  participantPaths: string[];
+  createCommandId: string;
+  createRequestHash: string;
+  createdAt: string;
+  updatedAt: string;
+  closedAt?: string;
+  messages: AgentRoomMessageRecord[];
+}
+
+export interface AgentRoomView {
+  id: string;
+  name: string;
+  ownerPath: string;
+  participantPaths: string[];
+  createdAt: string;
+  updatedAt: string;
+  closedAt?: string;
+  messageCount: number;
+}
+
+export interface AgentRoomMessageView {
+  id: string;
+  sourcePath: string;
+  recipientPaths: string[];
+  content: string;
+  createdAt: string;
+}
+
+export interface AgentRoomReadView extends AgentRoomView {
+  messages: AgentRoomMessageView[];
+}
+
 interface AgentTeamSnapshot {
   version: typeof TEAM_VERSION;
   sessionId: string;
   revision: number;
   updatedAt: string;
   agents: AgentTeamRecord[];
+  rooms: AgentRoomRecord[];
   budget?: AgentTeamBudget;
 }
 
@@ -218,6 +279,8 @@ export interface AgentTeamAgentView {
   parentTurnId?: string;
   rootTurnId?: string;
   role?: string;
+  runtime: AgentRuntime;
+  runtimeGrants: AgentCodingRuntime[];
   status: AgentTeamStatus;
   generation: number;
   createdAt: string;
@@ -246,6 +309,8 @@ export interface AgentTeamExecutionResult {
   error?: string;
   usage?: AgentTeamUsage;
   metrics?: AgentTeamExecutionMetrics;
+  /** Opaque Hara-owned continuation id for a Codex/Claude runtime. Provider-native ids stay hidden. */
+  runtimeSessionId?: string;
 }
 
 export interface AgentTeamExecutionRequest {
@@ -254,6 +319,8 @@ export interface AgentTeamExecutionRequest {
   parentPath: string;
   role?: string;
   generation: number;
+  runtime: AgentRuntime;
+  runtimeSessionId?: string;
   task: string;
   signal: AbortSignal;
   controller: AgentTeamController;
@@ -271,7 +338,15 @@ export interface AgentTeamExecutionRequest {
 
 export interface AgentTeamController {
   readonly path: string;
-  spawn(input: { taskName: string; message: string; role?: string; workspace?: AgentWorkspaceMode }): Promise<AgentTeamAgentView>;
+  readonly runtimeGrants: readonly AgentCodingRuntime[];
+  spawn(input: {
+    taskName: string;
+    message: string;
+    role?: string;
+    workspace?: AgentWorkspaceMode;
+    runtime?: AgentRuntime;
+    runtimeGrants?: AgentCodingRuntime[];
+  }, commandId?: string): Promise<AgentTeamAgentView>;
   sendMessage(target: string, message: string, commandId?: string): Promise<AgentTeamAgentView>;
   followup(target: string, message: string, commandId?: string): Promise<AgentTeamAgentView>;
   interrupt(target: string): Promise<AgentTeamAgentView>;
@@ -281,6 +356,11 @@ export interface AgentTeamController {
   inspectDiff(target: string): Promise<AgentTeamDiffView>;
   applyDiff(target: string): Promise<AgentTeamWorkspaceView>;
   rejectDiff(target: string): Promise<AgentTeamWorkspaceView>;
+  createRoom(input: { name: string; members: string[] }, commandId?: string): Promise<AgentRoomView>;
+  postRoom(input: { room: string; message: string; wake?: boolean }, commandId?: string): Promise<AgentRoomReadView>;
+  listRooms(): AgentRoomView[];
+  readRoom(room: string, limit?: number): AgentRoomReadView;
+  closeRoom(room: string): Promise<AgentRoomView>;
 }
 
 export interface DurableAgentTeamOptions {
@@ -329,6 +409,32 @@ function mailboxRequestHash(input: {
   return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
 
+function spawnRequestHash(input: {
+  parentPath: string;
+  taskName: string;
+  message: string;
+  role?: string;
+  workspace: AgentWorkspaceMode;
+  runtime: AgentRuntime;
+  runtimeGrants: AgentCodingRuntime[];
+  parentTurnId?: string;
+  rootTurnId?: string;
+}): string {
+  return createHash("sha256").update(JSON.stringify(input)).digest("hex");
+}
+
+function roomRequestHash(input: {
+  roomId?: string;
+  roomName?: string;
+  sourcePath: string;
+  participantPaths?: string[];
+  message?: string;
+  wake?: boolean;
+  rootTurnId?: string;
+}): string {
+  return createHash("sha256").update(JSON.stringify(input)).digest("hex");
+}
+
 function safeText(value: unknown, max: number, field: string): string {
   if (typeof value !== "string") throw new Error(field + " must be a string");
   const normalized = value.replace(/\0/g, "").trim();
@@ -345,6 +451,19 @@ function safeResultText(value: unknown, max: number): string | undefined {
 function safeRole(value: unknown): string | undefined {
   if (value === undefined) return undefined;
   return safeText(value, MAX_ROLE_CHARS, "role");
+}
+
+function normalizeRuntimeGrants(value: unknown): AgentCodingRuntime[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 2) throw new Error("Agent coding runtime grants are invalid");
+  const grants: AgentCodingRuntime[] = [];
+  for (const runtime of value) {
+    if (runtime !== "codex" && runtime !== "claude") {
+      throw new Error("Agent coding runtime grants may contain only codex or claude");
+    }
+    if (!grants.includes(runtime)) grants.push(runtime);
+  }
+  return grants;
 }
 
 function validUsage(value: unknown): value is AgentTeamUsage {
@@ -567,6 +686,91 @@ function parseMailbox(value: unknown): AgentMailboxMessage[] {
   });
 }
 
+function parseRooms(value: unknown): AgentRoomRecord[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > MAX_ROOMS) {
+    throw new Error("agent room state is invalid or too large");
+  }
+  return value.map((room): AgentRoomRecord => {
+    if (!plainObject(room) || !UUID.test(String(room.id ?? ""))) {
+      throw new Error("agent room id is invalid");
+    }
+    if (typeof room.name !== "string" || !ROOM_NAME.test(room.name)) {
+      throw new Error("agent room name is invalid");
+    }
+    if (!validSourcePath(room.ownerPath)) throw new Error("agent room owner is invalid");
+    if (!validProvenanceId(room.createCommandId) || !/^[0-9a-f]{64}$/u.test(String(room.createRequestHash ?? ""))) {
+      throw new Error("agent room creation receipt is invalid");
+    }
+    if (
+      !Array.isArray(room.participantPaths)
+      || room.participantPaths.length < 2
+      || room.participantPaths.length > MAX_ROOM_PARTICIPANTS
+      || room.participantPaths.some((path) => !validSourcePath(path))
+      || new Set(room.participantPaths).size !== room.participantPaths.length
+      || !room.participantPaths.includes("/root")
+      || !room.participantPaths.includes(room.ownerPath)
+    ) throw new Error("agent room participants are invalid");
+    const participantPaths = [...room.participantPaths] as string[];
+    if (!validIso(room.createdAt) || !validIso(room.updatedAt)) {
+      throw new Error("agent room timestamps are invalid");
+    }
+    if (room.closedAt !== undefined && !validIso(room.closedAt)) {
+      throw new Error("agent room close timestamp is invalid");
+    }
+    if (!Array.isArray(room.messages) || room.messages.length > MAX_ROOM_MESSAGES) {
+      throw new Error("agent room message history is invalid or too large");
+    }
+    const messages = room.messages.map((message): AgentRoomMessageRecord => {
+      if (!plainObject(message) || !UUID.test(String(message.id ?? ""))) {
+        throw new Error("agent room message id is invalid");
+      }
+      if (!validSourcePath(message.sourcePath) || !participantPaths.includes(message.sourcePath)) {
+        throw new Error("agent room message source is invalid");
+      }
+      if (
+        !Array.isArray(message.recipientPaths)
+        || message.recipientPaths.length > MAX_ROOM_PARTICIPANTS - 1
+        || message.recipientPaths.some((path) => !validSourcePath(path) || !participantPaths.includes(path))
+        || new Set(message.recipientPaths).size !== message.recipientPaths.length
+      ) throw new Error("agent room message recipients are invalid");
+      if (!safeStoredString(message.content, MAX_ROOM_MESSAGE_CHARS) || !message.content.trim()) {
+        throw new Error("agent room message content is invalid");
+      }
+      if (!validProvenanceId(message.commandId)) throw new Error("agent room command id is invalid");
+      if (!/^[0-9a-f]{64}$/u.test(String(message.requestHash ?? ""))) {
+        throw new Error("agent room request hash is invalid");
+      }
+      if (message.rootTurnId !== undefined && !validProvenanceId(message.rootTurnId)) {
+        throw new Error("agent room root turn is invalid");
+      }
+      if (!validIso(message.createdAt)) throw new Error("agent room message timestamp is invalid");
+      return {
+        id: String(message.id),
+        sourcePath: message.sourcePath,
+        recipientPaths: [...message.recipientPaths] as string[],
+        content: message.content,
+        commandId: String(message.commandId),
+        requestHash: String(message.requestHash),
+        ...(message.rootTurnId !== undefined ? { rootTurnId: String(message.rootTurnId) } : {}),
+        createdAt: String(message.createdAt),
+      };
+    });
+    return {
+      id: String(room.id),
+      name: room.name,
+      ownerPath: room.ownerPath,
+      participantPaths,
+      createCommandId: String(room.createCommandId),
+      createRequestHash: String(room.createRequestHash),
+      createdAt: String(room.createdAt),
+      updatedAt: String(room.updatedAt),
+      ...(room.closedAt !== undefined ? { closedAt: String(room.closedAt) } : {}),
+      messages,
+    };
+  });
+}
+
 function parseRecord(value: unknown): AgentTeamRecord {
   if (!plainObject(value)) throw new Error("agent team record is invalid");
   if (!UUID.test(String(value.id ?? ""))) throw new Error("agent team id is invalid");
@@ -584,8 +788,31 @@ function parseRecord(value: unknown): AgentTeamRecord {
       throw new Error("agent team " + field + " is invalid");
     }
   }
+  if ((value.spawnCommandId === undefined) !== (value.spawnRequestHash === undefined)) {
+    throw new Error("agent spawn idempotency receipt is incomplete");
+  }
+  if (value.spawnCommandId !== undefined && !validProvenanceId(value.spawnCommandId)) {
+    throw new Error("agent spawn command id is invalid");
+  }
+  if (value.spawnRequestHash !== undefined && !/^[0-9a-f]{64}$/u.test(String(value.spawnRequestHash))) {
+    throw new Error("agent spawn request hash is invalid");
+  }
   if (value.role !== undefined && !safeStoredString(value.role, MAX_ROLE_CHARS)) {
     throw new Error("agent team role is invalid");
+  }
+  const runtime = value.runtime === undefined ? "hara" : String(value.runtime);
+  if (runtime !== "hara" && runtime !== "codex" && runtime !== "claude") {
+    throw new Error("agent runtime is invalid");
+  }
+  if (value.runtimeSessionId !== undefined && !RUNTIME_SESSION_ID.test(String(value.runtimeSessionId))) {
+    throw new Error("agent runtime session id is invalid");
+  }
+  if (runtime === "hara" && value.runtimeSessionId !== undefined) {
+    throw new Error("agent runtime session ownership is invalid");
+  }
+  const runtimeGrants = normalizeRuntimeGrants(value.runtimeGrants);
+  if (runtime !== "hara" && runtimeGrants.length > 0) {
+    throw new Error("external coding Agents cannot re-delegate coding runtimes");
   }
   if (typeof value.status !== "string" || !TEAM_STATUSES.has(value.status as AgentTeamStatus)) {
     throw new Error("agent team status is invalid");
@@ -631,9 +858,14 @@ function parseRecord(value: unknown): AgentTeamRecord {
     path: value.path,
     name: value.name,
     parentPath: value.parentPath,
+    ...(value.spawnCommandId !== undefined ? { spawnCommandId: String(value.spawnCommandId) } : {}),
+    ...(value.spawnRequestHash !== undefined ? { spawnRequestHash: String(value.spawnRequestHash) } : {}),
     ...(value.parentTurnId !== undefined ? { parentTurnId: String(value.parentTurnId) } : {}),
     ...(value.rootTurnId !== undefined ? { rootTurnId: String(value.rootTurnId) } : {}),
     ...(value.role !== undefined ? { role: String(value.role) } : {}),
+    runtime: runtime as AgentRuntime,
+    runtimeGrants,
+    ...(value.runtimeSessionId !== undefined ? { runtimeSessionId: String(value.runtimeSessionId) } : {}),
     status: value.status as AgentTeamStatus,
     generation: Number(value.generation),
     assignment: value.assignment,
@@ -660,7 +892,7 @@ function parseRecord(value: unknown): AgentTeamRecord {
 }
 
 function emptySnapshot(sessionId: string): AgentTeamSnapshot {
-  return { version: TEAM_VERSION, sessionId, revision: 0, updatedAt: iso(), agents: [] };
+  return { version: TEAM_VERSION, sessionId, revision: 0, updatedAt: iso(), agents: [], rooms: [] };
 }
 
 function parseSnapshot(text: string, sessionId: string): AgentTeamSnapshot {
@@ -680,11 +912,22 @@ function parseSnapshot(text: string, sessionId: string): AgentTeamSnapshot {
     throw new Error("agent team state exceeds the agent limit");
   }
   const agents = value.agents.map(parseRecord);
+  const rooms = parseRooms(value.rooms);
   if (new Set(agents.map((agent) => agent.id)).size !== agents.length) {
     throw new Error("agent team contains duplicate ids");
   }
   if (new Set(agents.map((agent) => agent.path)).size !== agents.length) {
     throw new Error("agent team contains duplicate paths");
+  }
+  if (new Set(rooms.map((room) => room.id)).size !== rooms.length) {
+    throw new Error("agent team contains duplicate room ids");
+  }
+  if (new Set(rooms.map((room) => room.name)).size !== rooms.length) {
+    throw new Error("agent team contains duplicate room names");
+  }
+  const knownPaths = new Set(["/root", ...agents.map((agent) => agent.path)]);
+  if (rooms.some((room) => room.participantPaths.some((path) => !knownPaths.has(path)))) {
+    throw new Error("agent room references an unknown participant");
   }
   return {
     version: TEAM_VERSION,
@@ -692,6 +935,7 @@ function parseSnapshot(text: string, sessionId: string): AgentTeamSnapshot {
     revision: Number(value.revision),
     updatedAt: value.updatedAt,
     agents,
+    rooms,
     ...(value.budget !== undefined ? { budget: parseBudget(value.budget)! } : {}),
   };
 }
@@ -787,6 +1031,8 @@ function viewOf(record: AgentTeamRecord): AgentTeamAgentView {
     ...(record.parentTurnId ? { parentTurnId: record.parentTurnId } : {}),
     ...(record.rootTurnId ? { rootTurnId: record.rootTurnId } : {}),
     ...(record.role ? { role: record.role } : {}),
+    runtime: record.runtime,
+    runtimeGrants: [...record.runtimeGrants],
     status: record.status,
     generation: record.generation,
     createdAt: record.createdAt,
@@ -802,12 +1048,46 @@ function viewOf(record: AgentTeamRecord): AgentTeamAgentView {
   };
 }
 
+function roomViewOf(room: AgentRoomRecord): AgentRoomView {
+  return {
+    id: room.id,
+    name: room.name,
+    ownerPath: room.ownerPath,
+    participantPaths: [...room.participantPaths],
+    createdAt: room.createdAt,
+    updatedAt: room.updatedAt,
+    ...(room.closedAt ? { closedAt: room.closedAt } : {}),
+    messageCount: room.messages.length,
+  };
+}
+
+function roomReadViewOf(room: AgentRoomRecord, limit = 20): AgentRoomReadView {
+  const bounded = Math.max(1, Math.min(50, Math.floor(limit)));
+  return {
+    ...roomViewOf(room),
+    messages: room.messages.slice(-bounded).map((message) => ({
+      id: message.id,
+      sourcePath: message.sourcePath,
+      recipientPaths: [...message.recipientPaths],
+      content: message.content,
+      createdAt: message.createdAt,
+    })),
+  };
+}
+
 function terminal(status: AgentTeamStatus): boolean {
   return status === "completed" || status === "failed" || status === "cancelled" || status === "interrupted";
 }
 
 function executionPrompt(record: AgentTeamRecord): string {
   const sections = ["Initial assignment:\n" + record.assignment];
+  if (record.runtime === "hara" && record.runtimeGrants.length > 0) {
+    sections.push(
+      "Granted coding runtimes:\n"
+      + record.runtimeGrants.map((runtime) => `- ${runtime}: use spawn_agent with runtime '${runtime}' for bounded coding work in an isolated Worktree`).join("\n")
+      + "\nThis user-granted capability is the authorization for bounded launches. You cannot apply a coding Agent's Diff; report it to /root for inspection and manual application.",
+    );
+  }
   if (record.instructions.length > 1) {
     sections.push(
       "Accepted follow-up context:\n"
@@ -1114,6 +1394,21 @@ export class DurableAgentTeam {
     return record;
   }
 
+  private resolveRoom(refValue: string): AgentRoomRecord {
+    this.ensureLoaded();
+    const ref = typeof refValue === "string" ? refValue.trim() : "";
+    if (!ref || ref.length > 220) throw new Error("Agent room must be a bounded id or name");
+    const room = this.snapshot!.rooms.find((candidate) => candidate.id === ref || candidate.name === ref);
+    if (!room) throw new Error("no Agent room '" + ref + "' exists in this session");
+    return room;
+  }
+
+  private assertRoomAccess(sourcePath: string, room: AgentRoomRecord): void {
+    if (!room.participantPaths.includes(sourcePath)) {
+      throw new Error("Agent '" + sourcePath + "' is not a participant in room '" + room.name + "'");
+    }
+  }
+
   controller(
     path = "/root",
     provenance: { parentTurnId?: string; rootTurnId?: string } = {},
@@ -1128,11 +1423,15 @@ export class DurableAgentTeam {
     if (path === "/root" && provenance.rootTurnId !== undefined) {
       this.adoptRootTurn(provenance.rootTurnId);
     }
+    const runtimeGrants: readonly AgentCodingRuntime[] = path === "/root"
+      ? ["codex", "claude"]
+      : [...this.resolve(path).runtimeGrants];
     return {
       path,
-      spawn: (input) => {
+      runtimeGrants,
+      spawn: (input, commandId) => {
         this.assertControllerFence(path, provenance);
-        return this.spawn(path, input, provenance);
+        return this.spawn(path, input, provenance, commandId);
       },
       sendMessage: (target, message, commandId) => {
         this.assertControllerFence(path, provenance);
@@ -1158,11 +1457,27 @@ export class DurableAgentTeam {
       },
       applyDiff: (target) => {
         this.assertControllerFence(path, provenance);
+        if (path !== "/root") throw new Error("Only /root may apply an Agent-owned Diff to the source workspace");
         return this.applyDiff(target, provenance);
       },
       rejectDiff: (target) => {
         this.assertControllerFence(path, provenance);
+        if (path !== "/root") throw new Error("Only /root may reject an Agent-owned Diff");
         return this.rejectDiff(target, provenance);
+      },
+      createRoom: (input, commandId) => {
+        this.assertControllerFence(path, provenance);
+        return this.createRoom(path, input, provenance, commandId);
+      },
+      postRoom: (input, commandId) => {
+        this.assertControllerFence(path, provenance);
+        return this.postRoom(path, input, provenance, commandId);
+      },
+      listRooms: () => this.listRooms(path),
+      readRoom: (room, limit) => this.readRoom(path, room, limit),
+      closeRoom: (room) => {
+        this.assertControllerFence(path, provenance);
+        return this.closeRoom(path, room, provenance);
       },
     };
   }
@@ -1212,10 +1527,242 @@ export class DurableAgentTeam {
     return this.snapshot!.agents.map(viewOf).sort((left, right) => left.path.localeCompare(right.path));
   }
 
+  private async createRoom(
+    sourcePath: string,
+    input: { name: string; members: string[] },
+    provenance: { rootTurnId?: string },
+    commandId?: string,
+  ): Promise<AgentRoomView> {
+    if (this.closed) throw new Error("Agent team is closed");
+    if (this.draining) throw new Error("Agent team is paused for a Serve handoff");
+    const name = typeof input.name === "string" ? input.name.trim() : "";
+    if (!ROOM_NAME.test(name)) {
+      throw new Error("room name must start with a lowercase letter and contain only lowercase letters, digits, _ or - (max 48)");
+    }
+    if (!Array.isArray(input.members) || input.members.length > MAX_ROOM_PARTICIPANTS) {
+      throw new Error("Agent room members must be a bounded list");
+    }
+    const resolvedMembers = input.members.map((member) => this.resolve(String(member)));
+    for (const member of resolvedMembers) this.assertTargetTurn(member, provenance);
+    const participantPaths = [...new Set(["/root", sourcePath, ...resolvedMembers.map((member) => member.path)])];
+    if (participantPaths.length < 2 || participantPaths.length > MAX_ROOM_PARTICIPANTS) {
+      throw new Error(`Agent rooms require 2-${MAX_ROOM_PARTICIPANTS} unique participants including /root`);
+    }
+    const stableCommandId = commandId?.trim() || randomUUID();
+    if (!validProvenanceId(stableCommandId)) throw new Error("Agent room command id is invalid");
+    const requestHash = roomRequestHash({
+      roomName: name,
+      sourcePath,
+      participantPaths,
+      ...(provenance.rootTurnId ? { rootTurnId: provenance.rootTurnId } : {}),
+    });
+    let roomId = "";
+    this.ensureLoaded();
+    this.snapshot = this.options.store.update(this.options.sessionId, (draft) => {
+      const prior = draft.rooms.find((room) => room.createCommandId === stableCommandId);
+      if (prior) {
+        if (prior.createRequestHash !== requestHash) {
+          throw new Error("Agent room command id was already used with a different request");
+        }
+        roomId = prior.id;
+        return;
+      }
+      if (draft.rooms.length >= MAX_ROOMS) throw new Error(`Agent room limit reached (${MAX_ROOMS})`);
+      if (draft.rooms.some((room) => room.name === name)) {
+        throw new Error("Agent room '" + name + "' already exists");
+      }
+      const now = iso();
+      roomId = randomUUID();
+      draft.rooms.push({
+        id: roomId,
+        name,
+        ownerPath: sourcePath,
+        participantPaths,
+        createCommandId: stableCommandId,
+        createRequestHash: requestHash,
+        createdAt: now,
+        updatedAt: now,
+        messages: [],
+      });
+    });
+    const room = this.snapshot.rooms.find((candidate) => candidate.id === roomId);
+    if (!room) throw new Error("Agent room creation was not committed");
+    return roomViewOf(room);
+  }
+
+  private async postRoom(
+    sourcePath: string,
+    input: { room: string; message: string; wake?: boolean },
+    provenance: { parentTurnId?: string; rootTurnId?: string },
+    commandId?: string,
+  ): Promise<AgentRoomReadView> {
+    if (this.closed) throw new Error("Agent team is closed");
+    if (this.draining) throw new Error("Agent team is paused for a Serve handoff");
+    const selected = this.resolveRoom(input.room);
+    this.assertRoomAccess(sourcePath, selected);
+    if (selected.closedAt) throw new Error("Agent room '" + selected.name + "' is closed");
+    const content = safeText(input.message, MAX_ROOM_MESSAGE_CHARS, "message");
+    const wake = input.wake === true;
+    if (wake && sourcePath !== "/root") {
+      throw new Error("Only /root may wake idle room participants");
+    }
+    const recipients = selected.participantPaths.filter((path) => path !== "/root" && path !== sourcePath);
+    const recipientRecords = recipients.map((path) => this.resolve(path));
+    for (const recipient of recipientRecords) this.assertTargetTurn(recipient, provenance);
+    const stableCommandId = commandId?.trim() || randomUUID();
+    if (!validProvenanceId(stableCommandId)) throw new Error("Agent room command id is invalid");
+    const requestHash = roomRequestHash({
+      roomId: selected.id,
+      sourcePath,
+      message: content,
+      ...(wake ? { wake: true } : {}),
+      ...(provenance.rootTurnId ? { rootTurnId: provenance.rootTurnId } : {}),
+    });
+    const queued: Array<{ agentId: string; messageId: string }> = [];
+    let duplicate = false;
+    this.snapshot = this.options.store.update(this.options.sessionId, (draft) => {
+      const prior = draft.rooms.flatMap((room) => room.messages)
+        .find((message) => message.commandId === stableCommandId);
+      if (prior) {
+        if (prior.requestHash !== requestHash) {
+          throw new Error("Agent room command id was already used with a different request");
+        }
+        duplicate = true;
+        return;
+      }
+      const room = draft.rooms.find((candidate) => candidate.id === selected.id);
+      if (!room || room.closedAt) throw new Error("Agent room is no longer active");
+      if (room.messages.length >= MAX_ROOM_MESSAGES) {
+        throw new Error(`Agent room message limit reached (${MAX_ROOM_MESSAGES}); close it and start a focused room`);
+      }
+      const now = iso();
+      for (const recipientId of recipientRecords.map((record) => record.id)) {
+        const record = draft.agents.find((candidate) => candidate.id === recipientId);
+        if (!record) throw new Error("Agent room participant disappeared");
+        if (record.instructions.length >= MAX_INSTRUCTIONS) throw new Error("Agent instruction history is full");
+        if (record.mailbox.length >= MAX_MAILBOX_MESSAGES) throw new Error("Agent mailbox is full");
+        const delivery = `[Agent room ${room.name} from ${sourcePath}]\n${content}\n\nReply with agent_room action 'post' and room '${room.id}'.`;
+        const total = record.instructions.reduce((sum, item) => sum + item.length, 0) + delivery.length;
+        if (total > MAX_TOTAL_INSTRUCTION_CHARS) {
+          throw new Error("Agent instruction history exceeds the durable limit");
+        }
+        const mailboxCommandId = "room:" + createHash("sha256")
+          .update(stableCommandId + "\0" + record.id)
+          .digest("hex");
+        const mailboxHash = mailboxRequestHash({
+          sourcePath,
+          targetId: record.id,
+          message: delivery,
+          kind: wake ? "followup" : "message",
+          ...(provenance.parentTurnId ? { parentTurnId: provenance.parentTurnId } : {}),
+          ...(provenance.rootTurnId ? { rootTurnId: provenance.rootTurnId } : {}),
+        });
+        const messageId = randomUUID();
+        record.instructions.push(delivery);
+        record.mailbox.push({
+          id: messageId,
+          sourcePath,
+          content: delivery,
+          kind: wake ? "followup" : "message",
+          commandId: mailboxCommandId,
+          requestHash: mailboxHash,
+          ...(provenance.parentTurnId ? { parentTurnId: provenance.parentTurnId } : {}),
+          ...(provenance.rootTurnId ? { rootTurnId: provenance.rootTurnId } : {}),
+          createdAt: now,
+          state: "pending",
+          acceptedGeneration: record.generation,
+        });
+        record.updatedAt = now;
+        queued.push({ agentId: record.id, messageId });
+      }
+      room.messages.push({
+        id: randomUUID(),
+        sourcePath,
+        recipientPaths: recipients,
+        content,
+        commandId: stableCommandId,
+        requestHash,
+        ...(provenance.rootTurnId ? { rootTurnId: provenance.rootTurnId } : {}),
+        createdAt: now,
+      });
+      room.updatedAt = now;
+    });
+    if (!duplicate) {
+      for (const item of queued) {
+        const record = this.snapshot.agents.find((candidate) => candidate.id === item.agentId);
+        const message = record?.mailbox.find((candidate) => candidate.id === item.messageId);
+        if (!record || !message) continue;
+        this.publish(record);
+        this.publishMailbox(record, message, "queued");
+      }
+      if (wake) {
+        for (const item of queued) {
+          try {
+            this.launchPendingFollowup(item.agentId);
+          } catch {
+            // The post is already durable. A participant that cannot reserve another bounded generation
+            // remains visibly idle with a pending message instead of rolling back the shared transcript.
+          }
+        }
+      }
+    }
+    return roomReadViewOf(this.resolveRoom(selected.id));
+  }
+
+  private listRooms(sourcePath: string): AgentRoomView[] {
+    this.ensureLoaded();
+    return this.snapshot!.rooms
+      .filter((room) => room.participantPaths.includes(sourcePath))
+      .map(roomViewOf)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  }
+
+  private readRoom(sourcePath: string, roomRef: string, limit = 20): AgentRoomReadView {
+    const room = this.resolveRoom(roomRef);
+    this.assertRoomAccess(sourcePath, room);
+    return roomReadViewOf(room, limit);
+  }
+
+  private async closeRoom(
+    sourcePath: string,
+    roomRef: string,
+    provenance: { rootTurnId?: string },
+  ): Promise<AgentRoomView> {
+    if (this.closed) throw new Error("Agent team is closed");
+    if (this.draining) throw new Error("Agent team is paused for a Serve handoff");
+    const selected = this.resolveRoom(roomRef);
+    this.assertRoomAccess(sourcePath, selected);
+    if (sourcePath !== "/root" && selected.ownerPath !== sourcePath) {
+      throw new Error("Only /root or the room owner can close an Agent room");
+    }
+    for (const path of selected.participantPaths) {
+      if (path === "/root") continue;
+      this.assertTargetTurn(this.resolve(path), provenance);
+    }
+    if (selected.closedAt) return roomViewOf(selected);
+    this.snapshot = this.options.store.update(this.options.sessionId, (draft) => {
+      const room = draft.rooms.find((candidate) => candidate.id === selected.id);
+      if (!room) throw new Error("Agent room disappeared before close");
+      if (!room.closedAt) {
+        room.closedAt = iso();
+        room.updatedAt = room.closedAt;
+      }
+    });
+    return roomViewOf(this.resolveRoom(selected.id));
+  }
+
   private async spawn(
     parentPath: string,
-    input: { taskName: string; message: string; role?: string; workspace?: AgentWorkspaceMode },
+    input: {
+      taskName: string;
+      message: string;
+      role?: string;
+      workspace?: AgentWorkspaceMode;
+      runtime?: AgentRuntime;
+      runtimeGrants?: AgentCodingRuntime[];
+    },
     provenance: { parentTurnId?: string; rootTurnId?: string },
+    commandId?: string,
   ): Promise<AgentTeamAgentView> {
     if (this.closed) throw new Error("Agent team is closed");
     if (this.draining) throw new Error("Agent team is paused for a Serve handoff");
@@ -1227,10 +1774,43 @@ export class DurableAgentTeam {
     }
     const message = safeText(input.message, MAX_ASSIGNMENT_CHARS, "message");
     const role = safeRole(input.role);
-    const workspace = input.workspace ?? "read-only";
+    const runtime = input.runtime ?? "hara";
+    if (runtime !== "hara" && runtime !== "codex" && runtime !== "claude") {
+      throw new Error("Agent runtime must be 'hara', 'codex', or 'claude'");
+    }
+    const workspace = input.workspace ?? (runtime === "hara" ? "read-only" : "isolated-write");
     if (workspace !== "read-only" && workspace !== "isolated-write") {
       throw new Error("Agent workspace must be 'read-only' or 'isolated-write'");
     }
+    if (runtime !== "hara" && workspace !== "isolated-write") {
+      throw new Error("Codex and Claude Agents must use an isolated-write workspace");
+    }
+    if (parentPath !== "/root" && runtime !== "hara") {
+      const parent = this.resolve(parentPath);
+      if (!parent.runtimeGrants.includes(runtime)) {
+        throw new Error(`Agent '${parentPath}' has not been granted the ${runtime} coding runtime`);
+      }
+    }
+    const runtimeGrants = normalizeRuntimeGrants(input.runtimeGrants);
+    if (runtime !== "hara" && runtimeGrants.length > 0) {
+      throw new Error("Codex and Claude Agents cannot re-delegate coding runtimes");
+    }
+    if (parentPath !== "/root" && runtimeGrants.length > 0) {
+      throw new Error("Only /root may grant coding runtimes to a Hara Agent");
+    }
+    const stableCommandId = commandId?.trim() || randomUUID();
+    if (!validProvenanceId(stableCommandId)) throw new Error("Agent spawn command id is invalid");
+    const requestHash = spawnRequestHash({
+      parentPath,
+      taskName,
+      message,
+      ...(role ? { role } : {}),
+      workspace,
+      runtime,
+      runtimeGrants,
+      ...(provenance.parentTurnId ? { parentTurnId: provenance.parentTurnId } : {}),
+      ...(provenance.rootTurnId ? { rootTurnId: provenance.rootTurnId } : {}),
+    });
     if (workspace === "isolated-write") this.worktreeManager();
     const path = parentPath + "/" + taskName;
     if (!AGENT_PATH.test(path) || pathDepth(path) > MAX_AGENT_DEPTH) {
@@ -1238,7 +1818,17 @@ export class DurableAgentTeam {
     }
     this.ensureLoaded();
     let createdId = "";
+    let duplicate = false;
     this.snapshot = this.options.store.update(this.options.sessionId, (draft) => {
+      const prior = draft.agents.find((agent) => agent.spawnCommandId === stableCommandId);
+      if (prior) {
+        if (prior.spawnRequestHash !== requestHash) {
+          throw new Error("Agent spawn command id was already used with a different request");
+        }
+        createdId = prior.id;
+        duplicate = true;
+        return;
+      }
       if (draft.agents.length >= MAX_AGENTS) throw new Error("Agent team limit reached (" + String(MAX_AGENTS) + ")");
       if (draft.agents.some((agent) => agent.path === path)) {
         throw new Error("Agent '" + path + "' already exists; use followup_task or resume_agent");
@@ -1250,9 +1840,13 @@ export class DurableAgentTeam {
         path,
         name: taskName,
         parentPath,
+        spawnCommandId: stableCommandId,
+        spawnRequestHash: requestHash,
         ...(provenance.parentTurnId ? { parentTurnId: provenance.parentTurnId } : {}),
         ...(provenance.rootTurnId ? { rootTurnId: provenance.rootTurnId } : {}),
         ...(role ? { role } : {}),
+        runtime,
+        runtimeGrants,
         status: "queued",
         generation: 1,
         assignment: message,
@@ -1269,6 +1863,7 @@ export class DurableAgentTeam {
       this.reserveExecutionBudget(record, draft, provenance.rootTurnId);
     });
     const committed = this.current(createdId);
+    if (duplicate) return viewOf(committed);
     this.publish(committed);
     this.launch(committed.id, false);
     return viewOf(this.current(committed.id));
@@ -1474,6 +2069,8 @@ export class DurableAgentTeam {
         parentPath: working.parentPath,
         ...(working.role ? { role: working.role } : {}),
         generation,
+        runtime: working.runtime,
+        ...(working.runtimeSessionId ? { runtimeSessionId: working.runtimeSessionId } : {}),
         task,
         signal: controller.signal,
         controller: this.controller(working.path, {
@@ -1561,7 +2158,7 @@ export class DurableAgentTeam {
         }) || treeLimitReached;
       }
     }
-    this.change(id, (record) => {
+    const settled = this.change(id, (record) => {
       if (record.generation !== generation) return;
       const cancelled =
         controller.signal.aborted
@@ -1572,6 +2169,12 @@ export class DurableAgentTeam {
       const model = safeResultText(result.model, 512);
       if (model) record.model = model;
       if (result.usage && validUsage(result.usage)) record.usage = { ...result.usage };
+      if (result.runtimeSessionId !== undefined) {
+        if (record.runtime === "hara" || !RUNTIME_SESSION_ID.test(result.runtimeSessionId)) {
+          throw new Error("Agent executor returned an invalid runtime session");
+        }
+        record.runtimeSessionId = result.runtimeSessionId;
+      }
       const output = safeResultText(result.text, MAX_RESULT_CHARS);
       const error = safeResultText(result.error, MAX_RESULT_CHARS);
       if (output) record.result = output;
@@ -1584,6 +2187,7 @@ export class DurableAgentTeam {
       else if (result.status !== "completed") record.error = "Agent ended with status " + result.status + ".";
       else delete record.error;
     });
+    this.recordRoomResult(settled);
   }
 
   private async drainMailbox(id: string, generation: number): Promise<AgentMailboxDelivery[]> {
@@ -1611,6 +2215,91 @@ export class DurableAgentTeam {
       this.publishMailbox(updated, message, "completed");
     }
     return deliveries;
+  }
+
+  /** Preserve every settled participant contribution in its open room transcript. Delivery to peers is
+   * passive: working peers can consume it at their next boundary, while idle peers are never woken by an
+   * Agent result. This keeps group collaboration useful without creating autonomous reply loops. */
+  private recordRoomResult(settled: AgentTeamRecord): void {
+    const raw = settled.result?.trim()
+      || (settled.error?.trim() ? `Agent ended without a result: ${settled.error.trim()}` : "");
+    const content = safeResultText(raw, MAX_ROOM_MESSAGE_CHARS);
+    if (!content) return;
+    const commandId = `result:${settled.id}:${settled.generation}`;
+    const queued: Array<{ agentId: string; messageId: string }> = [];
+    try {
+      this.snapshot = this.options.store.update(this.options.sessionId, (draft) => {
+        for (const room of draft.rooms) {
+          if (room.closedAt || !room.participantPaths.includes(settled.path)) continue;
+          if (room.messages.some((message) => message.commandId === commandId)) continue;
+          if (room.messages.some((message) => message.sourcePath === settled.path && message.content === content)) continue;
+          if (room.messages.length >= MAX_ROOM_MESSAGES) continue;
+          const now = iso();
+          const recipients = room.participantPaths.filter((path) => path !== "/root" && path !== settled.path);
+          const requestHash = roomRequestHash({
+            roomId: room.id,
+            sourcePath: settled.path,
+            message: content,
+            ...(settled.rootTurnId ? { rootTurnId: settled.rootTurnId } : {}),
+          });
+          for (const recipientPath of recipients) {
+            const record = draft.agents.find((candidate) => candidate.path === recipientPath);
+            if (!record || record.instructions.length >= MAX_INSTRUCTIONS || record.mailbox.length >= MAX_MAILBOX_MESSAGES) {
+              continue;
+            }
+            const delivery = `[Agent room ${room.name} from ${settled.path}]\n${content}`;
+            const total = record.instructions.reduce((sum, item) => sum + item.length, 0) + delivery.length;
+            if (total > MAX_TOTAL_INSTRUCTION_CHARS) continue;
+            const mailboxCommandId = "room-result:" + createHash("sha256")
+              .update(commandId + "\0" + room.id + "\0" + record.id)
+              .digest("hex");
+            const messageId = randomUUID();
+            record.instructions.push(delivery);
+            record.mailbox.push({
+              id: messageId,
+              sourcePath: settled.path,
+              content: delivery,
+              kind: "message",
+              commandId: mailboxCommandId,
+              requestHash: mailboxRequestHash({
+                sourcePath: settled.path,
+                targetId: record.id,
+                message: delivery,
+                kind: "message",
+                ...(settled.rootTurnId ? { rootTurnId: settled.rootTurnId } : {}),
+              }),
+              ...(settled.rootTurnId ? { rootTurnId: settled.rootTurnId } : {}),
+              createdAt: now,
+              state: "pending",
+              acceptedGeneration: record.generation,
+            });
+            record.updatedAt = now;
+            queued.push({ agentId: record.id, messageId });
+          }
+          room.messages.push({
+            id: randomUUID(),
+            sourcePath: settled.path,
+            recipientPaths: recipients,
+            content,
+            commandId,
+            requestHash,
+            ...(settled.rootTurnId ? { rootTurnId: settled.rootTurnId } : {}),
+            createdAt: now,
+          });
+          room.updatedAt = now;
+        }
+      });
+    } catch {
+      // A full room or mailbox cannot retroactively fail an otherwise completed Agent generation.
+      return;
+    }
+    for (const item of queued) {
+      const record = this.snapshot.agents.find((candidate) => candidate.id === item.agentId);
+      const message = record?.mailbox.find((candidate) => candidate.id === item.messageId);
+      if (!record || !message) continue;
+      this.publish(record);
+      this.publishMailbox(record, message, "queued");
+    }
   }
 
   private recordWorkspaceDiff(

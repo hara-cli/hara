@@ -115,6 +115,7 @@ const RUNTIME_HELPER_TOOLS = new Set(["tool_search", "tool_result_read"]);
 const DURABLE_AGENT_TEAM_TOOLS = new Set([
   "spawn_agent",
   "send_message",
+  "agent_room",
   "followup_task",
   "interrupt_agent",
   "resume_agent",
@@ -369,7 +370,10 @@ yourself before acting. Role-based \`agent\` calls stay read-only; the main agen
 sessions where \`spawn_agent\` is available, use it instead of one-shot \`agent\` for delegated work that may
 need progress inspection, follow-up guidance, interruption, or restart recovery. Its children remain read-only:
 use \`list_agents\`, \`wait_agent\`, \`send_message\`, \`followup_task\`, \`interrupt_agent\`, and
-\`resume_agent\` rather than inventing status or spawning a duplicate child. Messages the user sends
+\`resume_agent\` rather than inventing status or spawning a duplicate child. Use \`agent_room\` only when
+several existing Agents need one shared, bounded discussion log; prefer direct messages for one recipient.
+For an explicitly approved Personal Space coding task, the root Agent may spawn runtime \`codex\` or \`claude\`; Hara keeps
+that runtime inside an Agent-owned worktree and the parent must inspect and apply its Diff. Messages the user sends
 mid-task arrive marked as interjections — triage them (refine current / queue as todo / urgent-switch)
 instead of blindly folding everything into the current task; the todo list is your task queue. For a multi-step task, call \`todo_write\` to plan a short checklist and keep it updated as
 you go (one item in_progress at a time) — skip it for trivial one-step tasks. You have a persistent

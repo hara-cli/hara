@@ -205,6 +205,9 @@ import {
   type AgentTeamExecutionMetrics,
 } from "./subagent/team.js";
 import { AgentWorktreeManager } from "./subagent/worktree.js";
+import { executeExternalCodingAgent } from "./subagent/external.js";
+import { createExternalSessionRegistry } from "./external-sessions/registry.js";
+import type { ExternalSessionService } from "./external-sessions/types.js";
 import {
   overrideProviderTarget,
   profileByIdForConfig,
@@ -1698,7 +1701,9 @@ function spaceDirectorySnapshot(targetCwd: string) {
   const spaces = [
     {
       id: PERSONAL_ID,
-      name: personalRoute.label || "Personal",
+      // A Space is a durable data boundary, not the currently selected provider route. Keep the
+      // connection label in model routing so Desktop never presents “MiniMax Token Plan” as a Space.
+      name: "Personal",
       kind: "personal" as const,
       profileId: personalRoute.id,
       profileIds: personalProfileIds,
@@ -7608,6 +7613,11 @@ program.action(async (opts) => {
   const interactiveAgentTaskIds = new Map<string, string>();
   if (task) interactiveAgentTaskIds.set(task.turnId, task.id);
   const interactiveWorkspaceStates = new Map<string, RunRuntimeItemEvent["state"]>();
+  let interactiveExternalSessions: ExternalSessionService | undefined;
+  const externalSessionsForAgents = (): ExternalSessionService => {
+    interactiveExternalSessions ??= createExternalSessionRegistry({ haraVersion: HARA_RUNTIME_VERSION });
+    return interactiveExternalSessions;
+  };
   try {
     for (const item of replaySessionJournal(readSessionJournal(meta.id).events).runtimeItems) {
       if (item.kind === "diff" && item.name === "agent_worktree_diff") {
@@ -7685,23 +7695,70 @@ program.action(async (opts) => {
       const rootTurnId = agent?.rootTurnId ?? task?.turnId;
       const taskId = rootTurnId ? interactiveAgentTaskIds.get(rootTurnId) : undefined;
       assertInteractiveAudience();
-      const observers = {
-        onSubagentLifecycle: (event: Parameters<NonNullable<SubagentLifecycleObserver>>[0]) => {
-          if (!taskId || !rootTurnId) return;
-          recordSessionRuntimeItem({
-            sessionId: meta.id,
-            taskId,
-            turnId: rootTurnId,
-            itemId: `agent:${event.id}:${request.generation}`,
-            kind: "agent",
-            state: event.state === "working" ? "started" : event.state,
-            role: "agent",
-            provider: event.providerId,
-            generation: request.generation,
-            at: event.endedAt ?? event.startedAt ?? event.queuedAt,
-          });
-        },
+      const recordLifecycle = (event: Parameters<NonNullable<SubagentLifecycleObserver>>[0]): void => {
+        if (!taskId || !rootTurnId) return;
+        recordSessionRuntimeItem({
+          sessionId: meta.id,
+          taskId,
+          turnId: rootTurnId,
+          itemId: `agent:${event.id}:${request.generation}`,
+          kind: "agent",
+          state: event.state === "working" ? "started" : event.state,
+          role: "agent",
+          provider: event.providerId,
+          generation: request.generation,
+          at: event.endedAt ?? event.startedAt ?? event.queuedAt,
+        });
       };
+      const observers = {
+        onSubagentLifecycle: recordLifecycle,
+      };
+      if (request.runtime !== "hara") {
+        if (meta.spaceId !== "personal") {
+          return {
+            status: "error" as const,
+            text: "",
+            error: "Local Codex and Claude coding runtimes are available only in Personal Space.",
+          };
+        }
+        const now = new Date().toISOString();
+        const providerId = `hara-live-${request.runtime}`;
+        recordLifecycle({
+          id: request.id,
+          providerId,
+          ...(request.role ? { role: request.role } : {}),
+          state: "working",
+          queuedAt: now,
+          startedAt: now,
+        });
+        try {
+          const result = await executeExternalCodingAgent(request, externalSessionsForAgents());
+          recordLifecycle({
+            id: request.id,
+            providerId,
+            ...(request.role ? { role: request.role } : {}),
+            state: result.status === "completed"
+              ? "completed"
+              : result.status === "cancelled" ? "cancelled" : "failed",
+            queuedAt: now,
+            startedAt: now,
+            endedAt: new Date().toISOString(),
+          });
+          assertInteractiveAudience();
+          return result;
+        } catch (error) {
+          recordLifecycle({
+            id: request.id,
+            providerId,
+            ...(request.role ? { role: request.role } : {}),
+            state: request.signal.aborted ? "cancelled" : "failed",
+            queuedAt: now,
+            startedAt: now,
+            endedAt: new Date().toISOString(),
+          });
+          throw error;
+        }
+      }
       const result = await runSubagentResult(
         cfg,
         provider,
@@ -7790,6 +7847,7 @@ program.action(async (opts) => {
     interactiveAgentShutdown = (async () => {
       const quiet = await interactiveAgentTeam.interruptAllAndWait(10_000);
       interactiveAgentTeam.close();
+      await interactiveExternalSessions?.close().catch(() => undefined);
       return quiet;
     })();
     return interactiveAgentShutdown;
@@ -7802,7 +7860,10 @@ program.action(async (opts) => {
       out(c.yellow("Hara saved the active Agent tree as interrupted after its shutdown deadline. Resume a child explicitly in the next session.\n"));
     }
   };
-  process.on("exit", () => interactiveAgentTeam.close());
+  process.on("exit", () => {
+    interactiveAgentTeam.close();
+    void interactiveExternalSessions?.close().catch(() => undefined);
+  });
   let requestedWorkspaceSwitch: string | null = null;
   let requestedSessionSwitch: { id: string; cwd: string; kind: "resume" | "workspace-transfer"; historyCount?: number } | null = null;
   const queueWorkspaceSwitch = (target: string): string => {

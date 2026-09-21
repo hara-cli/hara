@@ -20,7 +20,10 @@ function json(value: unknown): string {
 registerTool({
   name: "spawn_agent",
   description:
-    "Start a durable child Agent in the background and return its stable id/path immediately. It is READ-ONLY by default. "
+    "Start a durable child Agent in the background and return its stable id/path immediately. runtime defaults to hara. "
+    + "runtime codex or claude starts that coding agent inside a private Git worktree. The root run requires a fresh "
+    + "approval; a child Hara Agent may launch only a runtime the user already granted to that Agent. "
+    + "Native Hara Agents are READ-ONLY by default. "
     + "Use workspace:'isolated-write' only for an implementation task: Hara gives that child a private Git worktree, "
     + "allows only bounded native file edits, and requires inspect_agent_diff + apply_agent_diff before source files change. "
     + "Use a short lowercase task_name unique under the current Agent. Use list_agents/wait_agent for progress; "
@@ -35,6 +38,11 @@ registerTool({
       },
       message: { type: "string", description: "bounded self-contained assignment" },
       role: { type: "string", description: "optional Hara specialist role id" },
+      runtime: {
+        type: "string",
+        enum: ["hara", "codex", "claude"],
+        description: "execution runtime; codex/claude automatically require isolated-write",
+      },
       workspace: {
         type: "string",
         enum: ["read-only", "isolated-write"],
@@ -45,12 +53,32 @@ registerTool({
   },
   kind: "read",
   concurrencySafe: false,
-  classify: stateOperation,
+  classify: (input, ctx) => (
+    (input?.runtime === "codex" || input?.runtime === "claude")
+    && ctx.spaceId === "personal"
+  )
+    ? {
+        effect: "exec" as const,
+        concurrencySafe: false,
+        approvalKind: "exec" as const,
+        ...(ctx.agentTeam?.path === "/root" ? { requiresExplicitApproval: true } : {}),
+      }
+    : stateOperation(),
   async run(input, ctx) {
     const team = unavailable(ctx);
     if (typeof team === "string") return team;
     if (typeof input.task_name !== "string" || typeof input.message !== "string") {
       return "Error: spawn_agent needs task_name and message.";
+    }
+    const runtime = typeof input.runtime === "string" ? input.runtime : "hara";
+    if (runtime !== "hara" && runtime !== "codex" && runtime !== "claude") {
+      return "Error: runtime must be hara, codex, or claude.";
+    }
+    if (runtime !== "hara" && ctx.spaceId !== "personal") {
+      return "Error: local Codex and Claude coding runtimes are available only in Personal Space.";
+    }
+    if (runtime !== "hara" && !team.runtimeGrants.includes(runtime)) {
+      return `Error: Agent '${team.path}' has not been granted the ${runtime} coding runtime.`;
     }
     try {
       return json(await team.spawn({
@@ -58,7 +86,71 @@ registerTool({
         message: input.message,
         ...(typeof input.role === "string" ? { role: input.role } : {}),
         ...(typeof input.workspace === "string" ? { workspace: input.workspace } : {}),
-      }));
+        runtime,
+      }, ctx.toolCallId));
+    } catch (error) {
+      return boundedError(error);
+    }
+  },
+});
+
+registerTool({
+  name: "agent_room",
+  description:
+    "Create or use a small durable Agent group room. A room keeps one ordered, auditable transcript while "
+    + "delivering each post to the other Agent participants' mailboxes. Idle Agents are not auto-restarted, "
+    + "which prevents unbounded chat loops; use followup_task when an idle participant must act. "
+    + "Actions: create, post, list, read, close.",
+  input_schema: {
+    type: "object",
+    properties: {
+      action: { type: "string", enum: ["create", "post", "list", "read", "close"] },
+      room: { type: "string", description: "room id or name for post/read/close" },
+      name: { type: "string", description: "lowercase room name for create" },
+      members: {
+        type: "array",
+        items: { type: "string" },
+        maxItems: 8,
+        description: "Agent ids, full paths, or unambiguous task names for create",
+      },
+      message: { type: "string", description: "message for post" },
+      limit: { type: "number", minimum: 1, maximum: 50, description: "recent messages for read" },
+    },
+    required: ["action"],
+  },
+  kind: "read",
+  concurrencySafe: false,
+  classify: stateOperation,
+  async run(input, ctx) {
+    const team = unavailable(ctx);
+    if (typeof team === "string") return team;
+    const action = typeof input.action === "string" ? input.action : "";
+    try {
+      if (action === "list") return json({ rooms: team.listRooms() });
+      if (action === "create") {
+        if (typeof input.name !== "string" || !Array.isArray(input.members)) {
+          return "Error: agent_room create needs name and members.";
+        }
+        return json(await team.createRoom({
+          name: input.name,
+          members: input.members.filter((member: unknown): member is string => typeof member === "string"),
+        }, ctx.toolCallId));
+      }
+      if (action === "post") {
+        if (typeof input.room !== "string" || typeof input.message !== "string") {
+          return "Error: agent_room post needs room and message.";
+        }
+        return json(await team.postRoom({ room: input.room, message: input.message }, ctx.toolCallId));
+      }
+      if (action === "read") {
+        if (typeof input.room !== "string") return "Error: agent_room read needs room.";
+        return json(team.readRoom(input.room, typeof input.limit === "number" ? input.limit : undefined));
+      }
+      if (action === "close") {
+        if (typeof input.room !== "string") return "Error: agent_room close needs room.";
+        return json(await team.closeRoom(input.room));
+      }
+      return "Error: agent_room action must be create, post, list, read, or close.";
     } catch (error) {
       return boundedError(error);
     }
