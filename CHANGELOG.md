@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.179.0 — 2026-09-22 — Agent rooms and governed coding delegation
+
+- Add bounded Agent rooms to interactive CLI and Serve sessions. The root Agent can gather existing members,
+  post one idempotent group message, and retain each ordered reply in the same room while direct instructions
+  continue to use the recipient's durable mailbox and parent-turn boundary.
+- Let an explicitly authorized Personal Space Hara Agent delegate a concrete coding assignment to Codex or
+  Claude Code. Each external worker runs in an Agent-owned isolated Worktree; its result remains subordinate to
+  the parent session and the parent must review and apply the resulting Diff.
+- Expose typed Agent team, direct-message, room, runtime-grant, interruption, and lifecycle methods through
+  `hara serve` for Desktop. Stable command identities make retried room creation and posts idempotent, while
+  room membership, message length, history, wakeups, generation count, and execution budget remain bounded.
+- Keep Personal Space naming independent of the selected model connection, so provider plan labels remain model
+  routing metadata instead of appearing as user or organization identity.
+
 ## 0.178.3 — 2026-09-17 — restore Windows standalone chat replies
 
 - Re-enter the Windows Bun standalone through `hara.exe` itself instead of forwarding Bun's synthetic
