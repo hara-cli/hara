@@ -425,6 +425,12 @@ the configured vision-first model, or otherwise by the multimodal conversation m
 neither option cannot perform visual screen control. The same Desktop card can explicitly install Hara's pinned,
 isolated structured-browser backend for accessibility-tree navigation, forms, uploads, and post-action verification;
 it does not reuse another browser's login state.
+**Jev Action Guard** (opt-in): Hara can use TypeSafe Jev as a structured judgment layer for consequential
+computer/browser actions and external message/file delivery. Set `decisionEngine typesafe`, start with
+`decisionMode shadow`, and provide `TYPESAFE_API_KEY` outside the chat; merely exporting a key never enables
+the feature. `advisory` turns uncertain/block judgments into a fresh human review, while `enforce` can block
+and falls back to review if Jev is unavailable. Jev never bypasses deterministic denies, organization policy,
+application allowlists, or existing approval gates. See [the recording and verification guide](docs/jev-action-guard-experience.md).
 **Sessions and task execution**: conversations are saved automatically — `-c` / `--resume <id>` or
 `hara resume <id>` to continue, `hara sessions` to list, `hara export [id] [--out file]` to render one as a
 Markdown transcript. The current task is persisted separately with stable task/turn identity and recovers as

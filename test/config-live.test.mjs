@@ -151,6 +151,58 @@ test("loadConfig: blank env/project routing values do not hide global credential
   }
 });
 
+test("loadConfig: TypeSafe decision engine is explicit and supports ephemeral environment overrides", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-config-decision-"));
+  const home = join(root, "home");
+  mkdirSync(join(home, ".hara"), { recursive: true });
+  const configFile = join(home, ".hara", "config.json");
+  const saved = {
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
+    HARA_DECISION_ENGINE: process.env.HARA_DECISION_ENGINE,
+    HARA_DECISION_MODE: process.env.HARA_DECISION_MODE,
+    HARA_DECISION_MODEL: process.env.HARA_DECISION_MODEL,
+    HARA_DECISION_BASE_URL: process.env.HARA_DECISION_BASE_URL,
+    HARA_DECISION_API_KEY: process.env.HARA_DECISION_API_KEY,
+    TYPESAFE_API_KEY: process.env.TYPESAFE_API_KEY,
+  };
+  try {
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    for (const key of Object.keys(saved).filter((key) => key.startsWith("HARA_DECISION_") || key === "TYPESAFE_API_KEY")) {
+      delete process.env[key];
+    }
+    writeFileSync(configFile, JSON.stringify({
+      decisionApiKey: "stored-jev-key",
+      decisionMode: "enforce",
+    }));
+    let cfg = loadConfig();
+    assert.equal(cfg.decisionEngine, "off", "a key alone never opts task state into an external judge");
+    assert.equal(cfg.decisionMode, "enforce");
+    assert.equal(cfg.decisionModel, "jev-latest");
+    assert.equal(cfg.decisionBaseURL, "https://api.typesafe.ai");
+    assert.equal(cfg.decisionApiKey, "stored-jev-key");
+
+    process.env.HARA_DECISION_ENGINE = "typesafe";
+    process.env.HARA_DECISION_MODE = "shadow";
+    process.env.HARA_DECISION_MODEL = "jev-pinned";
+    process.env.HARA_DECISION_BASE_URL = "https://decision.example";
+    process.env.HARA_DECISION_API_KEY = "environment-jev-key";
+    cfg = loadConfig();
+    assert.equal(cfg.decisionEngine, "typesafe");
+    assert.equal(cfg.decisionMode, "shadow");
+    assert.equal(cfg.decisionModel, "jev-pinned");
+    assert.equal(cfg.decisionBaseURL, "https://decision.example");
+    assert.equal(cfg.decisionApiKey, "environment-jev-key");
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("loadConfig: autoContinue defaults on and an explicit environment value overrides global config", () => {
   const root = mkdtempSync(join(tmpdir(), "hara-config-auto-continue-"));
   const home = join(root, "home");
@@ -1079,6 +1131,7 @@ test("config get masks every API key and authenticated proxy URL", () => {
     embedApiKey: "embed-secret-2345",
     routeApiKey: "route-secret-3456",
     fallbackApiKey: "fallback-secret-4567",
+    decisionApiKey: "decision-secret-5678",
     proxy: "http://proxy-user:proxy-password@127.0.0.1:7890",
   };
   writeFileSync(join(home, ".hara", "config.json"), JSON.stringify(secrets));
@@ -1090,7 +1143,7 @@ test("config get masks every API key and authenticated proxy URL", () => {
     timeout: 10_000,
   });
   try {
-    for (const key of ["visionApiKey", "embedApiKey", "routeApiKey", "fallbackApiKey"]) {
+    for (const key of ["visionApiKey", "embedApiKey", "routeApiKey", "fallbackApiKey", "decisionApiKey"]) {
       const result = run(key);
       assert.equal(result.status, 0, result.stderr || result.stdout);
       assert.match(result.stdout, /^••••/u);

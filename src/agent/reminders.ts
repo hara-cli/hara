@@ -9,6 +9,12 @@
 
 const DEFAULT_SCOPE = "default";
 const queues = new Map<string, string[]>();
+const SYSTEM_REMINDER = /^\s*<system-reminder>[\s\S]*<\/system-reminder>\s*$/u;
+
+/** Internal model context must never be projected as a user-authored transcript message. */
+export function isSystemReminderContent(content: unknown): boolean {
+  return typeof content === "string" && SYSTEM_REMINDER.test(content);
+}
 
 function scopeKey(scope?: string): string {
   return scope?.trim() || DEFAULT_SCOPE;

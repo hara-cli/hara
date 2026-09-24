@@ -39,6 +39,32 @@ function stableFailureSignal(content: string): string | undefined {
   return undefined;
 }
 
+function policyBoundarySignal(content: string): { key: string; label: string } | undefined {
+  const understanding = /Understanding gate:\s*task brief intent is '([^'\r\n]{1,40})'/iu.exec(content)?.[1];
+  if (understanding) {
+    return {
+      key: `understanding:${understanding.toLowerCase()}`,
+      label: `task understanding gate (intent '${understanding}')`,
+    };
+  }
+  if (/Capability preflight gate:/iu.test(content)) {
+    return { key: "capability-preflight", label: "capability preflight gate" };
+  }
+  if (/Runtime tool policy denied/iu.test(content)) {
+    return { key: "runtime-tool-policy", label: "runtime tool policy" };
+  }
+  if (/Organization policy (?:denied|requires)/iu.test(content)) {
+    return { key: "organization-policy", label: "organization policy boundary" };
+  }
+  if (/Denied by a permission rule/iu.test(content)) {
+    return { key: "permission-rule", label: "project permission rule" };
+  }
+  if (/Trusted extension blocked/iu.test(content)) {
+    return { key: "trusted-extension", label: "trusted extension boundary" };
+  }
+  return undefined;
+}
+
 export interface PythonSyntaxDiagnostic {
   kind: "SyntaxError" | "IndentationError" | "TabError";
   /** Omitted for stdin/string compilation diagnostics such as File "<stdin>". */
@@ -209,7 +235,7 @@ export interface FailureIdentity {
   semantic: boolean;
   /** No-progress failures allowed before the run-level breaker stops another model round. */
   hardStopAfter: number;
-  kind: "exact" | "home_boundary" | "empty_recall" | "access_boundary" | "strategy";
+  kind: "exact" | "home_boundary" | "empty_recall" | "access_boundary" | "policy_boundary" | "strategy";
 }
 
 /** All no-progress failure identities. Exact calls warn on the second attempt and stop on the third;
@@ -233,6 +259,18 @@ export function failureIdentities(
       // A second variant cannot discover authority by probing and must stop before a long 401/403 loop.
       hardStopAfter: 2,
       kind: "access_boundary",
+    }];
+  }
+  const policyBoundary = failed ? policyBoundarySignal(content) : undefined;
+  if (policyBoundary) {
+    return [{
+      key: `root-cause:policy-boundary:${policyBoundary.key}`,
+      label: policyBoundary.label,
+      semantic: true,
+      // One rejection explains the required state repair. Two more attempts are enough to prove that
+      // changing commands is not repairing that state, matching the three-turn blocked audit boundary.
+      hardStopAfter: 3,
+      kind: "policy_boundary",
     }];
   }
   if (failed && isHomeWorkspaceBoundaryFailure(content)) {
@@ -301,10 +339,13 @@ export function recordCall(name: string, input: unknown, content: string, isErro
   const identities = failureIdentities(name, input, content, isError);
   const seen = scopedSeen(scope);
   if (!failed) {
-    // A successful unrelated read cannot grant credentials or visibility. Preserve access boundaries so
-    // alternating a 401/403 with harmless successful probes still receives one recovery attempt at most.
-    // All ordinary failure streaks keep their historical "success resets" behavior.
-    for (const [key, streak] of seen) if (streak.kind !== "access_boundary") seen.delete(key);
+    // A successful unrelated read cannot grant credentials, authority, or repair task classification.
+    // A successful task_intake is the one explicit state transition that may clear an understanding gate.
+    for (const [key, streak] of seen) {
+      const keep = streak.kind === "access_boundary"
+        || (streak.kind === "policy_boundary" && name !== "task_intake");
+      if (!keep) seen.delete(key);
+    }
     return "";
   }
   const next = identities.map((identity) => {
@@ -324,6 +365,7 @@ export function recordCall(name: string, input: unknown, content: string, isErro
   const selected = semantic?.identity.kind === "home_boundary"
     || semantic?.identity.kind === "empty_recall"
     || semantic?.identity.kind === "access_boundary"
+    || semantic?.identity.kind === "policy_boundary"
     ? semantic
     : exact && exact.streak.fails >= exact.identity.hardStopAfter
       ? exact
@@ -370,6 +412,19 @@ export function recordCall(name: string, input: unknown, content: string, isErro
     return (
       `\n\n⟳ hara: ${identity.label} persisted across ${s.fails} attempts — stop tool calls now. ` +
       "The user must see the access boundary and the exact supported recovery action before this task resumes."
+    );
+  }
+  if (identity.kind === "policy_boundary") {
+    if (s.fails < identity.hardStopAfter) {
+      return (
+        `\n\n⟳ hara: ${identity.label} blocked ${s.fails} attempted action${s.fails === 1 ? "" : "s"}. ` +
+        "Changing shell, Python, or tool arguments cannot bypass this state. Repair the named task_intake, " +
+        "capability, or policy state before another side effect; otherwise checkpoint the observed boundary."
+      );
+    }
+    return (
+      `\n\n⟳ hara: ${identity.label} blocked ${s.fails} attempted actions without a state repair — stop this run now. ` +
+      "Do not try another command variant. Preserve the task and report the exact supported recovery path."
     );
   }
   if (identity.kind === "strategy") {

@@ -47,6 +47,8 @@ export type ProviderId =
   | "hara-gateway";
 export type ApprovalMode = "suggest" | "auto-edit" | "full-auto";
 export type VisionModelSource = "current" | "custom";
+export type DecisionEngineId = "off" | "typesafe";
+export type DecisionMode = "shadow" | "advisory" | "enforce";
 
 export interface McpServerConfig {
   command: string;
@@ -143,6 +145,15 @@ export interface HaraConfig {
    *  ONLY on genuinely dangerous actions (rm -rf, dd, curl|sh, sudo, force-push, out-of-project writes, …)
    *  so normal work is untouched (zero added latency). "off" disables it. Also switchable via HARA_GUARDIAN. */
   guardian: "on" | "off";
+  /** Optional structured decision engine shared by consequential computer, browser, connector and
+   * external-communication actions. It is independent of the conversation-model provider. `shadow`
+   * records Jev's opinion without changing behavior; `advisory` can require a human review; `enforce`
+   * can block, but can never bypass deterministic policy or an existing approval requirement. */
+  decisionEngine: DecisionEngineId;
+  decisionMode: DecisionMode;
+  decisionModel: string;
+  decisionBaseURL: string;
+  decisionApiKey: string | undefined;
   /** ping when a (non-trivial) turn finishes: off | bell (terminal BEL) | system (OS notification + bell) */
   notify: NotifyMode;
   /** Hard active provider/tool ceiling for one run; engine-owned human waits are excluded (default 30 minutes). */
@@ -297,7 +308,7 @@ export function providerCatalog(): ProviderCatalogEntry[] {
   }));
 }
 
-export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionSource", "visionProvider", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "guardian", "notify", "runTimeoutMs", "maxAgentRounds", "autoContinue", "vimMode", "autoCompact", "fileCheckpoints", "updateCheck", "proxy", "packageRegistry", "fallbackModel", "fallbackProvider", "fallbackBaseURL", "fallbackApiKey", "fallbackConnectionIds", "reasoningEffort"] as const;
+export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionSource", "visionProvider", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "guardian", "decisionEngine", "decisionMode", "decisionModel", "decisionBaseURL", "decisionApiKey", "notify", "runTimeoutMs", "maxAgentRounds", "autoContinue", "vimMode", "autoCompact", "fileCheckpoints", "updateCheck", "proxy", "packageRegistry", "fallbackModel", "fallbackProvider", "fallbackBaseURL", "fallbackApiKey", "fallbackConnectionIds", "reasoningEffort"] as const;
 export const MAX_FALLBACK_CONNECTIONS = 4;
 export const REASONING_EFFORTS: NonNullable<HaraConfig["reasoningEffort"]>[] = [
   "off",
@@ -311,6 +322,8 @@ export const REASONING_EFFORTS: NonNullable<HaraConfig["reasoningEffort"]>[] = [
 export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-auto"];
 export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
 export const COMPUTER_USE_MODES: HaraConfig["computerUse"][] = ["off", "read", "click", "full"];
+export const DECISION_ENGINES: DecisionEngineId[] = ["off", "typesafe"];
+export const DECISION_MODES: DecisionMode[] = ["shadow", "advisory", "enforce"];
 const PROJECT_ROOT_MARKERS = [".git", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", ".hg"];
 const MAX_PROJECT_CONFIG_BYTES = 256 * 1024;
 const MAX_GLOBAL_CONFIG_BYTES = 1024 * 1024;
@@ -429,6 +442,7 @@ const ROUTING_CONFIG_KEYS = new Set([
   "visionApiKey", "visionModel", "visionSource", "visionProvider", "visionBaseURL",
   "embedProvider", "embedApiKey", "embedModel", "embedBaseURL",
   "routeApiKey", "routeModel", "routeBaseURL",
+  "decisionEngine", "decisionMode", "decisionApiKey", "decisionModel", "decisionBaseURL",
 ]);
 
 /** Empty routing values are not meaningful credentials/endpoints. Ignore them at each precedence layer so
@@ -846,6 +860,28 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
   // Guardian: default ON; env HARA_GUARDIAN=0/off/false or config guardian:"off" disables it.
   const guardianRaw = process.env.HARA_GUARDIAN ?? merged.guardian;
   const guardian: "on" | "off" = guardianRaw === "0" || guardianRaw === "off" || guardianRaw === "false" ? "off" : "on";
+  // Jev is opt-in even when a TypeSafe key exists: merely exporting a credential must never start sending
+  // task/action summaries to another service. Environment variables are useful for ephemeral demos and CI;
+  // the same settings can be stored globally for Desktop/serve via `hara config set`.
+  const requestedDecisionEngine = nonBlankEnv(process.env.HARA_DECISION_ENGINE) ?? merged.decisionEngine ?? "off";
+  const decisionEngine: DecisionEngineId = DECISION_ENGINES.includes(requestedDecisionEngine as DecisionEngineId)
+    ? requestedDecisionEngine as DecisionEngineId
+    : "off";
+  const requestedDecisionMode = nonBlankEnv(process.env.HARA_DECISION_MODE) ?? merged.decisionMode ?? "shadow";
+  const decisionMode: DecisionMode = DECISION_MODES.includes(requestedDecisionMode as DecisionMode)
+    ? requestedDecisionMode as DecisionMode
+    : "shadow";
+  const decisionModel = nonBlankEnv(process.env.HARA_DECISION_MODEL)
+    ?? nonBlankEnv(process.env.TYPESAFE_MODEL)
+    ?? merged.decisionModel
+    ?? "jev-latest";
+  const decisionBaseURL = nonBlankEnv(process.env.HARA_DECISION_BASE_URL)
+    ?? nonBlankEnv(process.env.TYPESAFE_BASE_URL)
+    ?? merged.decisionBaseURL
+    ?? "https://api.typesafe.ai";
+  const decisionApiKey = nonBlankEnv(process.env.HARA_DECISION_API_KEY)
+    ?? nonBlankEnv(process.env.TYPESAFE_API_KEY)
+    ?? merged.decisionApiKey;
   const notify = (process.env.HARA_NOTIFY ?? merged.notify ?? "off") as NotifyMode;
   const runTimeoutMs = agentRunTimeoutMs(process.env.HARA_RUN_TIMEOUT_MS ?? merged.runTimeoutMs);
   const maxAgentRounds = agentMaxRounds(process.env.HARA_MAX_AGENT_ROUNDS ?? merged.maxAgentRounds);
@@ -888,7 +924,7 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
     ? (reasoningRaw as NonNullable<HaraConfig["reasoningEffort"]>)
     : undefined;
 
-  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionSource, visionProvider, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, hooks, notify, runTimeoutMs, maxAgentRounds, autoContinue, vimMode, autoCompact, fileCheckpoints, updateCheck, proxy, packageRegistry, fallbackModel, fallbackProvider, fallbackBaseURL, fallbackApiKey, fallbackConnectionIds, reasoningEffort, mcpServers, cwd: effectiveCwd };
+  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionSource, visionProvider, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, decisionEngine, decisionMode, decisionModel, decisionBaseURL, decisionApiKey, hooks, notify, runTimeoutMs, maxAgentRounds, autoContinue, vimMode, autoCompact, fileCheckpoints, updateCheck, proxy, packageRegistry, fallbackModel, fallbackProvider, fallbackBaseURL, fallbackApiKey, fallbackConnectionIds, reasoningEffort, mcpServers, cwd: effectiveCwd };
 }
 
 export function providerEnvKey(provider: ProviderId): string {

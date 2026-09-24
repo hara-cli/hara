@@ -20,12 +20,42 @@ import { resolve, isAbsolute, relative, sep, win32 } from "node:path";
 import type { Provider, NeutralMsg } from "../providers/types.js";
 import { boundedProviderTurn } from "../providers/bounded-turn.js";
 import { canonicalize, splitCompound } from "./permissions.js";
+import { redactSensitiveText } from "./secrets.js";
+import {
+  judgeActionWithTypeSafe,
+  type ActionDecision,
+  type DecisionMode,
+  type FetchLike,
+  type TypeSafeDecisionConfig,
+} from "../decision/typesafe.js";
 
 export type RiskLevel = "low" | "high";
 export type GuardianDecision = "allow" | "block";
 export interface GuardianVerdict {
   decision: GuardianDecision;
   reason: string;
+}
+
+export interface ActionGuardVerdict {
+  decision: ActionDecision;
+  reason: string;
+  source: "guardian" | "typesafe" | "combined";
+  mode?: DecisionMode;
+  observedDecision?: ActionDecision;
+  confidence?: number;
+  probabilities?: Partial<Record<ActionDecision, number>>;
+  model?: string;
+  elapsedMs?: number;
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+  };
+  unavailable?: boolean;
+}
+
+export interface ActionGuardDecisionEngine {
+  engine: "typesafe";
+  config: TypeSafeDecisionConfig;
 }
 
 // ── Deterministic risk classifier ────────────────────────────────────────────────────────────────────
@@ -65,6 +95,13 @@ function isDestructiveCommand(canonical: string): boolean {
   }
   // Destructive git tree resets / clean.
   if (/\bgit\s+clean\b[^\n]*-[a-z]*f/.test(c) && /-[a-z]*d/.test(c)) return true;
+  // Docker data destruction. These can wipe stopped containers, images, networks, build cache and named
+  // volumes across unrelated projects. Keep ordinary scoped `docker compose down` low; `-v` is the boundary.
+  if (/\bdocker\s+system\s+prune\b/i.test(c)) return true;
+  if (/\bdocker\s+(?:container|image|builder|network|volume)\s+prune\b/i.test(c)) return true;
+  if (/\bdocker\s+(?:container\s+)?rm\b[^\n]*(?:--force\b|(^|\s)-f\b)/i.test(c)) return true;
+  if (/\bdocker\s+volume\s+(?:rm|remove)\b/i.test(c)) return true;
+  if (/\b(?:docker\s+compose|docker-compose)\s+down\b[^\n]*(?:--volumes\b|(^|\s)-v\b)/i.test(c)) return true;
   // History overwrite: `> /path` (truncation) onto a system/absolute-outside path is handled by the
   // out-of-project write check below (redirection carries a path); nothing extra here.
   return false;
@@ -125,14 +162,44 @@ export function classifyRisk(
   toolKind: string | undefined,
   input: Record<string, unknown>,
   cwd: string,
-): { level: RiskLevel; reason: string } {
-  if (toolKind === "read" || !input) return { level: "low", reason: "" };
+): { level: RiskLevel; reason: string; category: string } {
+  if (!input) return { level: "low", reason: "", category: "read" };
+
+  // A message/file leaving Hara is externally visible even though the delivery implementation is local.
+  // Listing destinations is read-only; sending crosses the same global Action Guard boundary for every IM.
+  if (toolName === "channel_message" && String(input.action ?? "").toLowerCase() === "send") {
+    const target = String(input.target ?? "").trim().toLowerCase();
+    const platform = target.includes(":") ? target.slice(0, target.indexOf(":")) : "external";
+    return {
+      level: "high",
+      reason: `external communication through ${/^[a-z0-9_-]{1,32}$/u.test(platform) ? platform : "a connected channel"}`,
+      category: "external_communication",
+    };
+  }
+  if (toolName === "send_file") {
+    return { level: "high", reason: "sends a local file outside the current process", category: "external_communication" };
+  }
+
+  // Read-only perception remains zero-latency. Click/type/key/activation can change another application;
+  // opening a real browser changes an external UI surface and therefore also enters the shared boundary.
+  if (toolName === "computer") {
+    const action = String(input.action ?? "").toLowerCase();
+    if (action === "screenshot" || action === "find" || action === "move") {
+      return { level: "low", reason: "", category: "computer_read" };
+    }
+    return { level: "high", reason: `computer action '${action || "unknown"}' affects another application`, category: "computer_action" };
+  }
+  if (toolName === "open_browser") {
+    return { level: "high", reason: "opens an external browser surface", category: "browser_navigation" };
+  }
+
+  if (toolKind === "read") return { level: "low", reason: "", category: "read" };
 
   if (toolKind === "edit") {
     for (const p of editPaths(toolName, input)) {
-      if (isOutsideRoot(p, cwd)) return { level: "high", reason: `writes/deletes outside the project root: ${p}` };
+      if (isOutsideRoot(p, cwd)) return { level: "high", reason: `writes/deletes outside the project root: ${p}`, category: "filesystem_outside_workspace" };
     }
-    return { level: "low", reason: "" };
+    return { level: "low", reason: "", category: "workspace_edit" };
   }
 
   if (toolKind === "exec" && typeof input.command === "string") {
@@ -140,21 +207,64 @@ export function classifyRisk(
     const whole = canonicalize(command);
     // Whole-command check FIRST — catches cross-part shapes a compound split would hide (curl … | sh, where
     // the danger is the pipe connecting two individually-benign parts).
-    if (isDestructiveCommand(whole)) return { level: "high", reason: `destructive/irreversible command: ${whole.slice(0, 120)}` };
+    if (isDestructiveCommand(whole)) return { level: "high", reason: `destructive/irreversible command: ${whole.slice(0, 120)}`, category: "destructive_command" };
     // Then per-part: strictest part wins; if we can't safely parse it, fall back to the whole canonical form.
     const parts = splitCompound(command) ?? [whole];
     for (const part of parts) {
-      if (isDestructiveCommand(part)) return { level: "high", reason: `destructive/irreversible command: ${part.slice(0, 120)}` };
+      if (isDestructiveCommand(part)) return { level: "high", reason: `destructive/irreversible command: ${part.slice(0, 120)}`, category: "destructive_command" };
       for (const t of redirectionTargets(part)) {
-        if (isOutsideRoot(t, cwd)) return { level: "high", reason: `writes outside the project root via redirection: ${t}` };
-        if (SYSTEM_ROOTS.test(t)) return { level: "high", reason: `writes to a system path: ${t}` };
+        if (isOutsideRoot(t, cwd)) return { level: "high", reason: `writes outside the project root via redirection: ${t}`, category: "filesystem_outside_workspace" };
+        if (SYSTEM_ROOTS.test(t)) return { level: "high", reason: `writes to a system path: ${t}`, category: "filesystem_system" };
       }
     }
-    return { level: "low", reason: "" };
+    return { level: "low", reason: "", category: "command" };
   }
 
   // computer / unknown non-read kinds are already gated hard elsewhere (always-confirm); leave them to that.
-  return { level: "low", reason: "" };
+  return { level: "low", reason: "", category: "other" };
+}
+
+function safeExternalTarget(value: unknown): string {
+  const target = String(value ?? "").trim().toLowerCase();
+  const separator = target.indexOf(":");
+  // A target without an explicit `kind:id` prefix might itself be a phone number, username or chat id.
+  // Never pass it through merely because it is syntactically short and simple.
+  if (separator <= 0) return "external";
+  const kind = target.slice(0, separator);
+  return /^[a-z][a-z0-9_-]{0,31}$/u.test(kind) ? kind : "external";
+}
+
+function safeUrl(value: unknown): string {
+  try {
+    const url = new URL(String(value ?? ""));
+    return `${url.protocol}//${url.host}${url.pathname}`.slice(0, 400);
+  } catch {
+    return "invalid-or-omitted-url";
+  }
+}
+
+/** Minimal, bounded action state for semantic judgment. Recipient/account ids and URL queries are omitted;
+ * credential-shaped content is redacted before it can leave the process. */
+export function guardianActionDetail(toolName: string, input: Record<string, unknown>): string {
+  let detail = "";
+  if (toolName === "channel_message") {
+    detail = `operation=${String(input.action ?? "")} channel=${safeExternalTarget(input.target)} message=${String(input.text ?? "")}`;
+  } else if (toolName === "send_file") {
+    detail = "operation=send-file target=current-chat";
+  } else if (toolName === "computer") {
+    detail = [
+      `operation=${String(input.action ?? "")}`,
+      input.app ? `app=${String(input.app)}` : "",
+      input.target ? `target=${String(input.target)}` : "",
+      input.text ? `text=${String(input.text)}` : "",
+      input.keys ? `keys=${String(input.keys)}` : "",
+    ].filter(Boolean).join(" ");
+  } else if (toolName === "open_browser") {
+    detail = `operation=open-browser url=${safeUrl(input.url)}`;
+  } else {
+    detail = String(input.command ?? input.path ?? input.url ?? input.action ?? "");
+  }
+  return redactSensitiveText(detail.replace(/\s+/gu, " ").trim()).text.slice(0, 900);
 }
 
 // ── LLM veto (conservative; high-risk only) ──────────────────────────────────────────────────────────
@@ -249,6 +359,123 @@ export async function guardianVeto(
   } catch {
     return { decision: "allow", reason: "" }; // fail-open on timeout/abort/throw
   }
+}
+
+function jevReason(decision: ActionDecision, confidence: number): string {
+  const pct = Math.round(confidence * 100);
+  if (decision === "block") return `Jev classified this action as clearly unauthorized or misaligned (${pct}% confidence)`;
+  if (decision === "review") return `Jev found this action ambiguous or consequential (${pct}% confidence)`;
+  return `Jev found this action aligned with the current task (${pct}% confidence)`;
+}
+
+/**
+ * Unified semantic layer for a deterministically high-risk action.
+ *
+ * - no decision engine: preserve the existing cheap-model Guardian behavior;
+ * - shadow: run Jev and expose its receipt, but the existing Guardian remains authoritative;
+ * - advisory: Jev review/block requests a human check, never a hard semantic block;
+ * - enforce: Jev block is authoritative, review requires a real human channel, and an unavailable Jev
+ *   becomes review instead of silently granting authority.
+ *
+ * Deterministic deny rules and ordinary approval policy live outside this function and always remain in
+ * force. A Jev allow can therefore never expand Hara's authority.
+ */
+export async function evaluateActionGuard(
+  provider: Provider | null | undefined,
+  decisionEngine: ActionGuardDecisionEngine | undefined,
+  action: { tool: string; category: string; detail: string; classifierReason: string },
+  history: NeutralMsg[],
+  opts: {
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    onProviderTurn?: (turn: Promise<unknown>) => void;
+    decisionFetch?: FetchLike;
+  } = {},
+): Promise<ActionGuardVerdict> {
+  if (!decisionEngine) {
+    const legacy = await guardianVeto(provider, action, history, opts);
+    return { ...legacy, source: "guardian" };
+  }
+
+  const mode = decisionEngine.config.mode;
+  // Shadow intentionally pays for both calls so it can compare Jev with today's behavior. Once promoted to
+  // advisory/enforce, Jev replaces the free-form semantic call; this is the latency/token saving. Advisory
+  // falls back to the prior Guardian only when Jev itself is unavailable.
+  const legacyPromise = mode === "shadow"
+    ? guardianVeto(provider, action, history, opts)
+    : undefined;
+  const task = taskSummary(history);
+  let observed: Awaited<ReturnType<typeof judgeActionWithTypeSafe>> | undefined;
+  try {
+    observed = await judgeActionWithTypeSafe(
+      decisionEngine.config,
+      {
+        task,
+        tool: action.tool,
+        category: action.category,
+        classifierReason: action.classifierReason,
+        detail: action.detail,
+      },
+      { timeoutMs: opts.timeoutMs, signal: opts.signal, fetch: opts.decisionFetch },
+    );
+  } catch {
+    // The mode-specific fallback below owns availability semantics.
+  }
+
+  // Shadow means exactly no behavior change: the previous Guardian verdict stays authoritative.
+  if (mode === "shadow") {
+    const legacy = await legacyPromise!;
+    return {
+      ...legacy,
+      source: observed ? "combined" : "guardian",
+      mode,
+      ...(observed
+        ? {
+            observedDecision: observed.choice,
+            confidence: observed.confidence,
+            probabilities: observed.probabilities,
+            model: observed.model,
+            elapsedMs: observed.elapsedMs,
+            usage: observed.usage,
+          }
+        : { unavailable: true }),
+    };
+  }
+
+  if (!observed) {
+    if (mode === "enforce") {
+      return {
+        decision: "review",
+        reason: "Jev was unavailable; enforce mode requires a human review before this action",
+        source: "typesafe",
+        mode,
+        unavailable: true,
+      };
+    }
+    const legacy = await guardianVeto(provider, action, history, opts);
+    return {
+      ...legacy,
+      source: "guardian",
+      mode,
+      unavailable: true,
+    };
+  }
+
+  const shared = {
+    reason: jevReason(observed.decision, observed.confidence),
+    source: "typesafe" as const,
+    mode,
+    observedDecision: observed.choice,
+    confidence: observed.confidence,
+    probabilities: observed.probabilities,
+    model: observed.model,
+    elapsedMs: observed.elapsedMs,
+    usage: observed.usage,
+  };
+  if (mode === "advisory" && observed.decision === "block") {
+    return { ...shared, decision: "review" };
+  }
+  return { ...shared, decision: observed.decision };
 }
 
 // ── Circuit-breaker (deterministic, hard stop) ─────────────────────────────────────────────────────────

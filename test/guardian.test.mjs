@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   classifyRisk,
+  evaluateActionGuard,
+  guardianActionDetail,
   isOutsideRoot,
   editPaths,
   parseVerdict,
@@ -68,8 +70,47 @@ test("classifyRisk: destructive/irreversible bash → high", () => {
   hi("chmod -R 777 /");
   hi("chown -R root ~");
   hi("killall node");
+  hi("docker system prune -af --volumes");
+  hi("docker container prune -f");
+  hi("docker image prune -a -f");
+  hi("docker rm -f abandoned-container");
+  hi("docker volume rm shared-data");
+  hi("docker compose down -v");
+  hi("docker-compose down --volumes");
   // compound: strictest part wins
   hi("npm run build && rm -rf /tmp/../etc && echo done");
+});
+
+test("classifyRisk: external messages and consequential computer actions share the global boundary", () => {
+  assert.equal(classifyRisk("channel_message", "exec", { action: "list" }, CWD).level, "low");
+  assert.deepEqual(
+    classifyRisk("channel_message", "exec", { action: "send", target: "weixin:private-peer", text: "hello" }, CWD),
+    { level: "high", reason: "external communication through weixin", category: "external_communication" },
+  );
+  assert.equal(classifyRisk("send_file", "exec", { path: "/tmp/report.pdf" }, CWD).level, "high");
+  assert.equal(classifyRisk("computer", "computer", { action: "screenshot" }, CWD).level, "low");
+  assert.equal(classifyRisk("computer", "computer", { action: "find", target: "Send" }, CWD).level, "low");
+  assert.equal(classifyRisk("computer", "computer", { action: "type", text: "hello" }, CWD).level, "high");
+  assert.equal(classifyRisk("open_browser", "computer", { url: "https://example.com" }, CWD).level, "high");
+});
+
+test("guardianActionDetail: external identifiers and credentials never enter semantic decision state", () => {
+  const detail = guardianActionDetail("channel_message", {
+    action: "send",
+    target: "weixin:private-peer-123",
+    text: "Use apiKey=sk-secretsecret for the demo",
+  });
+  assert.match(detail, /channel=weixin/u);
+  assert.doesNotMatch(detail, /private-peer-123/u);
+  assert.doesNotMatch(detail, /sk-secretsecret/u);
+  assert.match(detail, /apiKey=\*\*\*/u);
+  const opaqueTarget = guardianActionDetail("channel_message", {
+    action: "send",
+    target: "13800138000",
+    text: "hello",
+  });
+  assert.match(opaqueTarget, /channel=external/u);
+  assert.doesNotMatch(opaqueTarget, /13800138000/u);
 });
 
 test("classifyRisk: writes/deletes outside the project root → high", () => {
@@ -159,6 +200,73 @@ test("guardianVeto: fail-open on error, throw, timeout, and no-provider", async 
     "allow",
   );
   assert.ok(Date.now() - stuckAt < 500, "guardian has a hard boundary even when abort is ignored");
+});
+
+test("evaluateActionGuard: Jev shadow observes without changing the existing verdict", async () => {
+  const provider = mockProvider({ text: '{"decision":"block","reason":"legacy block"}' });
+  const decisionFetch = async () => new Response(JSON.stringify({
+    answers: {
+      action_guard: {
+        choice: "allow",
+        confidence: 0.92,
+        probabilities: { allow: 0.92, review: 0.06, block: 0.02 },
+      },
+    },
+  }), { status: 200, headers: { "content-type": "application/json" } });
+  const verdict = await evaluateActionGuard(
+    provider,
+    { engine: "typesafe", config: { mode: "shadow", apiKey: "test", baseURL: "https://typesafe.example" } },
+    { tool: "channel_message", category: "external_communication", detail: "operation=send channel=weixin message=hello", classifierReason: "external communication" },
+    [{ role: "user", content: "send hello" }],
+    { decisionFetch },
+  );
+  assert.equal(verdict.decision, "block");
+  assert.equal(verdict.observedDecision, "allow");
+  assert.equal(verdict.mode, "shadow");
+  assert.equal(provider.calls, 1, "shadow preserves the baseline Guardian call for comparison");
+});
+
+test("evaluateActionGuard: advisory converts a Jev block to human review", async () => {
+  const provider = mockProvider({ text: '{"decision":"allow","reason":""}' });
+  const decisionFetch = async () => new Response(JSON.stringify({
+    answers: { action_guard: { choice: "block", confidence: 0.88 } },
+  }), { status: 200, headers: { "content-type": "application/json" } });
+  const verdict = await evaluateActionGuard(
+    provider,
+    { engine: "typesafe", config: { mode: "advisory", apiKey: "test", baseURL: "https://typesafe.example" } },
+    { tool: "computer", category: "computer_action", detail: "operation=click target=Send", classifierReason: "computer click" },
+    [{ role: "user", content: "draft a message but do not send it" }],
+    { decisionFetch },
+  );
+  assert.equal(verdict.decision, "review");
+  assert.equal(verdict.observedDecision, "block");
+  assert.equal(provider.calls, 0, "active Jev modes replace the free-form Guardian call");
+});
+
+test("evaluateActionGuard: enforce fails closed to review when Jev is unavailable", async () => {
+  const provider = mockProvider({ text: '{"decision":"allow","reason":""}' });
+  const verdict = await evaluateActionGuard(
+    provider,
+    { engine: "typesafe", config: { mode: "enforce" } },
+    { tool: "computer", category: "computer_action", detail: "operation=click", classifierReason: "computer click" },
+    [{ role: "user", content: "click submit" }],
+  );
+  assert.equal(verdict.decision, "review");
+  assert.equal(verdict.unavailable, true);
+  assert.equal(provider.calls, 0, "enforce mode fails closed without spending a fallback model call");
+});
+
+test("evaluateActionGuard: advisory falls back to the existing Guardian when Jev is unavailable", async () => {
+  const provider = mockProvider({ text: '{"decision":"block","reason":"fallback guard"}' });
+  const verdict = await evaluateActionGuard(
+    provider,
+    { engine: "typesafe", config: { mode: "advisory" } },
+    { tool: "computer", category: "computer_action", detail: "operation=click", classifierReason: "computer click" },
+    [{ role: "user", content: "click submit" }],
+  );
+  assert.equal(verdict.decision, "block");
+  assert.equal(verdict.unavailable, true);
+  assert.equal(provider.calls, 1);
 });
 
 // ── (e) circuit-breaker trips after N blocks ────────────────────────────────────────────────────────────

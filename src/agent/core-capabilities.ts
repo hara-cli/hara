@@ -1,12 +1,11 @@
 import type { NeutralMsg } from "../providers/types.js";
-
-const SYSTEM_REMINDER = /^\s*<system-reminder>[\s\S]*<\/system-reminder>\s*$/u;
+import { isSystemReminderContent } from "./reminders.js";
 
 /** The most recent message authored by the person, excluding engine-injected reminder envelopes. */
 export function lastGenuineUserText(history: NeutralMsg[]): string {
   for (let index = history.length - 1; index >= 0; index--) {
     const message = history[index];
-    if (message.role !== "user" || SYSTEM_REMINDER.test(message.content)) continue;
+    if (message.role !== "user" || isSystemReminderContent(message.content)) continue;
     return message.content;
   }
   return "";
@@ -25,7 +24,7 @@ const INTERACTION =
 function openedBrowserSinceLatestUser(history: NeutralMsg[]): boolean {
   for (let index = history.length - 1; index >= 0; index--) {
     const message = history[index];
-    if (message.role === "user" && !SYSTEM_REMINDER.test(message.content)) return false;
+    if (message.role === "user" && !isSystemReminderContent(message.content)) return false;
     if (message.role === "assistant" && message.toolUses.some((tool) => tool.name === "open_browser")) return true;
     if (message.role === "tool" && message.results.some((result) => result.name === "open_browser")) return true;
   }

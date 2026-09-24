@@ -5,6 +5,23 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.180.0 — 2026-09-24 — governed local WeChat scenes and global action judgment
+
+- Add a local WeChat group Agent scene for Hara Desktop. Assist mode prepares a reviewable draft; explicitly
+  armed Managed mode can reply only inside the freshly confirmed visible group, with wake-name filtering,
+  rate limits, inbound deduplication, redacted audit records, and fail-closed conversation revalidation.
+- Bundle the audited Jev WeChat perception bridge and its private RapidOCR runtime path. Chinese group text no
+  longer depends on macOS Vision support, and a draft that lands one frame before OCR catches up receives a
+  bounded exact readback before Hara attempts the single verified Send action.
+- Add the opt-in TypeSafe Jev Action Guard as one global structured judgment layer for consequential Computer
+  Use, browser, connector, file-delivery, and external-message actions. Shadow, advisory, and enforce modes
+  remain subordinate to deterministic denies, organization policy, application allowlists, and human approval.
+- Keep provider-only `<system-reminder>` context out of Desktop/Mobile-visible history, and group repeated
+  understanding, capability, runtime, organization, permission, and trusted-extension failures by root cause so
+  changing command arguments cannot keep an Agent in an unproductive loop.
+- Let Desktop test the QR-linked WeChat owner connection with one fixed diagnostic message while keeping owner
+  private-chat control separate from the local group Agent scene.
+
 ## 0.179.0 — 2026-09-22 — Agent rooms and governed coding delegation
 
 - Add bounded Agent rooms to interactive CLI and Serve sessions. The root Agent can gather existing members,

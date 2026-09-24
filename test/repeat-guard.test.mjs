@@ -95,6 +95,27 @@ test("an unrelated success cannot erase an authentication or authorization bound
   assert.equal(identity.hardStopAfter, 2);
 });
 
+test("changed commands cannot evade one unresolved Hara policy boundary", () => {
+  const failure = "Understanding gate: task brief intent is 'investigate', so this side effect was NOT executed.";
+  const first = recordCall("bash", { command: "python3 scripts/a.py" }, failure, true);
+  assert.match(first, /task understanding gate.*blocked 1 attempted action/is);
+  assert.equal(recordCall("read_file", { path: "README.md" }, "project documentation"), "");
+  const second = recordCall("python", { code: "run_b()" }, failure, true);
+  assert.match(second, /blocked 2 attempted actions.*cannot bypass this state/is);
+  const third = recordCall("bash", { command: "python3 scripts/c.py" }, failure, true);
+  assert.match(third, /blocked 3 attempted actions.*stop this run now/is);
+  const identity = failureIdentities("bash", { command: "anything" }, failure, true)[0];
+  assert.equal(identity.kind, "policy_boundary");
+  assert.equal(identity.hardStopAfter, 3);
+
+  assert.equal(recordCall("task_intake", { intent: "change" }, "task brief accepted"), "");
+  assert.match(
+    recordCall("bash", { command: "python3 scripts/d.py" }, failure, true),
+    /blocked 1 attempted action/is,
+    "an accepted task-intake transition starts a fresh policy audit",
+  );
+});
+
 test("2nd identical failure warns; 1st doesn't; different args are a different call", () => {
   const args = { command: "git pull origin main" };
   assert.equal(recordCall("bash", args, "Command failed: exit code 128"), "", "first failure: no warning yet");

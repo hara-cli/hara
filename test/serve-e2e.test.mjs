@@ -22,12 +22,13 @@ import {
 import { addJob, cronDir, findJob, loadJobs, removeJob, saveJobs } from "../dist/cron/store.js";
 import { createTaskExecution, finishTaskExecution } from "../dist/session/task.js";
 import { INTERJECT_PREFIX } from "../dist/agent/reminders.js";
-import { orgRolesDir } from "../dist/org/roles.js";
+import { createNativeGlobalAgent, orgRolesDir } from "../dist/org/roles.js";
 import { registerTool } from "../dist/tools/registry.js";
 
 test("serve client history hides internal steering triage wrappers", () => {
   const history = historyForClient([
     { role: "user", content: "original request" },
+    { role: "user", content: "<system-reminder>internal checkpoint</system-reminder>" },
     { role: "user", content: `${INTERJECT_PREFIX}\n\nonly the user's refinement` },
     { role: "assistant", text: "done", toolUses: [], stop: "end" },
   ]);
@@ -629,6 +630,327 @@ test("serve e2e: Desktop negotiates and edits core Computer Use policy", { timeo
     assert.equal(installed.result.restartRequired, true);
   } finally {
     client.close();
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: Desktop manages Jev policy and sends only a fixed WeChat connection test", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-decision-settings-"));
+  const state = {
+    engine: "typesafe",
+    mode: "shadow",
+    model: "jev-latest",
+    baseURL: "https://api.typesafe.ai",
+    credential: "stored",
+    engineEditable: true,
+    modeEditable: true,
+    modelEditable: true,
+    baseURLEditable: true,
+    credentialEditable: true,
+  };
+  const calls = [];
+  const deps = {
+    ...baseDeps(textProvider, memStore()),
+    decisionSettings: () => state,
+    saveDecisionSettings: (input, cwd) => {
+      calls.push(["save", input, cwd]);
+      return { ...state, engine: input.engine, mode: input.mode, model: input.model, baseURL: input.baseURL };
+    },
+    testDecisionSettings: async (input, cwd) => {
+      calls.push(["decision-test", input, cwd]);
+      return { ok: true, decision: "allow", confidence: 0.98, model: input.model, elapsedMs: 12 };
+    },
+    testGateway: async (platform) => {
+      calls.push(["gateway-test", platform]);
+      return { platform: "weixin", delivered: true, testedAt: 123 };
+    },
+  };
+  const server = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const client = await connect(server.port);
+  try {
+    const initialized = await client.call("initialize", { token: "tok" });
+    for (const method of ["settings.decision.get", "settings.decision.save", "settings.decision.test", "settings.gateways.test"]) {
+      assert.ok(initialized.result.capabilities.methods.includes(method), `${method} advertised`);
+    }
+    assert.ok(initialized.result.capabilities.features.includes("action-guard.settings.v1"));
+    assert.deepEqual((await client.call("settings.decision.get", {})).result, state);
+    const saved = await client.call("settings.decision.save", {
+      engine: "typesafe",
+      mode: "advisory",
+      model: "jev-latest",
+      baseURL: "https://api.typesafe.ai",
+      apiKey: "write-only-key",
+    });
+    assert.equal(saved.result.mode, "advisory");
+    assert.equal(JSON.stringify(saved.result).includes("write-only-key"), false);
+    const tested = await client.call("settings.decision.test", { model: "jev-latest" });
+    assert.equal(tested.result.ok, true);
+    assert.deepEqual((await client.call("settings.gateways.test", { platform: "weixin" })).result, {
+      platform: "weixin",
+      delivered: true,
+      testedAt: 123,
+    });
+    assert.equal((await client.call("settings.gateways.test", { platform: "feishu" })).error.code, -32602);
+    assert.deepEqual(calls, [
+      ["save", {
+        engine: "typesafe",
+        mode: "advisory",
+        model: "jev-latest",
+        baseURL: "https://api.typesafe.ai",
+        apiKey: "write-only-key",
+      }, dir],
+      ["decision-test", { model: "jev-latest" }, dir],
+      ["gateway-test", "weixin"],
+    ]);
+  } finally {
+    client.close();
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: local WeChat group scene is explicit, bounded, and separately controlled", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-wechat-group-"));
+  const status = {
+    supported: true,
+    helper: "ready",
+    configured: true,
+    active: false,
+    agentRef: "main",
+    trigger: "manual",
+    mode: "assist",
+    managedTrigger: "mention",
+    managedMentionName: "",
+    managedArmed: false,
+    screenCapture: "granted",
+    accessibility: "required",
+    wechat: "running",
+  };
+  const preview = {
+    scanId: "11111111-1111-4111-8111-111111111111",
+    conversation: "产品讨论群",
+    messages: [{ side: "them", sender: "小林", text: "今天发版吗？", confidence: 0.99 }],
+    latestIncoming: { side: "them", sender: "小林", text: "今天发版吗？", confidence: 0.99 },
+    observedAt: 123,
+    changed: true,
+  };
+  const calls = [];
+  let providerInput;
+  const draftProvider = {
+    ...textProvider,
+    async turn(input) {
+      providerInput = input;
+      return {
+        text: "可以，完成验证后今天发版。",
+        toolUses: [],
+        stop: "end",
+        usage: { input: 12, output: 8 },
+      };
+    },
+  };
+  const store = memStore();
+  const deps = {
+    ...baseDeps(draftProvider, store),
+    wechatGroupStatus: async () => status,
+    saveWechatGroupSettings: (input) => {
+      calls.push(["save", input]);
+      return {
+        version: 4,
+        agentRef: input.agentRef,
+        trigger: "manual",
+        mode: "assist",
+        managedTrigger: "mention",
+        managedMentionName: input.managedMentionName ?? "",
+      };
+    },
+    prepareWechatGroupRuntime: async () => ({ ...status, helper: "ready" }),
+    requestWechatGroupPermissions: async () => ({
+      ...status,
+      screenCapture: "granted",
+      accessibility: "granted",
+    }),
+    startWechatGroupScene: async (cwd, confirmGroup, confirmManaged) => {
+      calls.push(["start", cwd, confirmGroup, confirmManaged]);
+      return { status: { ...status, active: true, conversation: preview.conversation }, preview };
+    },
+    stopWechatGroupScene: () => ({ ...status, active: false }),
+    scanWechatGroupScene: async (cwd) => {
+      calls.push(["scan", cwd]);
+      return preview;
+    },
+    wechatGroupReplyContext: () => ({
+      scanId: preview.scanId,
+      agentRef: "main",
+      cwd: dir,
+      conversation: preview.conversation,
+      messages: preview.messages,
+      latestIncoming: preview.latestIncoming,
+      managed: false,
+    }),
+    rememberWechatGroupDraft: (scanId, text) => {
+      calls.push(["remember", scanId, text]);
+      return {
+        draftId: "22222222-2222-4222-8222-222222222222",
+        scanId,
+        conversation: preview.conversation,
+        text,
+        generatedAt: 124,
+      };
+    },
+    fillWechatGroupDraft: async (draftId) => {
+      calls.push(["fill", draftId]);
+      return { filled: true, reviewRequired: false, reason: "filled without sending" };
+    },
+    wechatGroupManagedActive: () => false,
+    claimWechatGroupManagedScan: () => ({ action: "idle", reason: "not armed" }),
+    pauseWechatGroupManaged: () => {},
+    sendWechatGroupManagedDraft: async () => ({ sent: true, reason: "fixture" }),
+  };
+  const server = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const client = await connect(server.port);
+  try {
+    const initialized = await client.call("initialize", { token: "tok" });
+    for (const method of [
+      "settings.wechat-group.get",
+      "settings.wechat-group.save",
+      "settings.wechat-group.prepare",
+      "settings.wechat-group.permissions.request",
+      "settings.wechat-group.start",
+      "settings.wechat-group.stop",
+      "settings.wechat-group.scan",
+      "settings.wechat-group.reply",
+      "settings.wechat-group.fill",
+    ]) assert.ok(initialized.result.capabilities.methods.includes(method), `${method} advertised`);
+    assert.ok(initialized.result.capabilities.features.includes("wechat-group.local-agent.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("wechat-group.managed-send.v1"));
+
+    assert.equal((await client.call("settings.wechat-group.get", {})).result.helper, "ready");
+    assert.equal(
+      (await client.call("settings.wechat-group.permissions.request", {})).result.screenCapture,
+      "granted",
+    );
+    assert.equal((await client.call("settings.wechat-group.save", {
+      agentRef: "main",
+      mode: "managed",
+      managedTrigger: "mention",
+      managedMentionName: "小南",
+    })).result.helper, "ready");
+    assert.equal((await client.call("settings.wechat-group.start", { confirmGroup: false })).error.code, -32602);
+    const started = await client.call("settings.wechat-group.start", { confirmGroup: true, cwd: dir });
+    assert.equal(started.result.preview.conversation, "产品讨论群");
+    assert.equal((await client.call("settings.wechat-group.scan", { cwd: dir })).result.scanId, preview.scanId);
+    const drafted = await client.call("settings.wechat-group.reply", { scanId: preview.scanId });
+    assert.equal(drafted.result.text, "可以，完成验证后今天发版。");
+    assert.deepEqual(providerInput.tools, [], "the group drafting turn never receives executable tools");
+    assert.match(providerInput.system, /will not be sent automatically/);
+    assert.match(providerInput.history[0].content, /Visible conversation: 产品讨论群/);
+    assert.equal(store.list().length, 0, "group observation is not persisted as a Hara conversation");
+    const filled = await client.call("settings.wechat-group.fill", {
+      draftId: "22222222-2222-4222-8222-222222222222",
+    });
+    assert.equal(filled.result.filled, true);
+    assert.equal(filled.result.reviewRequired, false);
+    assert.equal(filled.result.reason, "filled without sending");
+    assert.deepEqual(calls, [
+      ["save", { agentRef: "main", mode: "managed", managedTrigger: "mention", managedMentionName: "小南" }],
+      ["start", dir, true, false],
+      ["scan", dir],
+      ["remember", preview.scanId, "可以，完成验证后今天发版。"],
+      ["fill", "22222222-2222-4222-8222-222222222222"],
+    ]);
+  } finally {
+    client.close();
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: armed managed WeChat mode drafts without tools and sends one claimed observation", { timeout: 12000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-wechat-managed-"));
+  const preview = {
+    scanId: "33333333-3333-4333-8333-333333333333",
+    conversation: "托管测试群",
+    messages: [{ side: "them", sender: "小林", text: "@Hara 今天发版吗？", confidence: 0.99 }],
+    latestIncoming: { side: "them", sender: "小林", text: "@Hara 今天发版吗？", confidence: 0.99 },
+    observedAt: 200,
+    changed: true,
+  };
+  const events = [];
+  let claimed = false;
+  let providerInput;
+  const provider = {
+    ...textProvider,
+    async turn(input) {
+      providerInput = input;
+      return {
+        text: "可以，验证完成后发布。",
+        toolUses: [],
+        stop: "end",
+        usage: { input: 10, output: 6 },
+      };
+    },
+  };
+  const deps = {
+    ...baseDeps(provider, memStore()),
+    wechatGroupStatus: async () => ({
+      supported: true,
+      helper: "ready",
+      configured: true,
+      active: true,
+      agentRef: "main",
+      trigger: "manual",
+      mode: "managed",
+      managedTrigger: "mention",
+      managedMentionName: "",
+      managedArmed: true,
+      screenCapture: "granted",
+      accessibility: "granted",
+      wechat: "running",
+      conversation: preview.conversation,
+    }),
+    scanWechatGroupScene: async () => preview,
+    wechatGroupManagedActive: () => true,
+    wechatGroupReplyContext: () => ({
+      scanId: preview.scanId,
+      agentRef: "main",
+      cwd: dir,
+      conversation: preview.conversation,
+      messages: preview.messages,
+      latestIncoming: preview.latestIncoming,
+      managed: true,
+    }),
+    claimWechatGroupManagedScan: (_scanId, aliases) => {
+      events.push(["claim", aliases]);
+      if (claimed) return { action: "idle", reason: "handled" };
+      claimed = true;
+      return { action: "reply", reason: "new mention" };
+    },
+    rememberWechatGroupDraft: (scanId, text) => ({
+      draftId: "44444444-4444-4444-8444-444444444444",
+      scanId,
+      conversation: preview.conversation,
+      text,
+      generatedAt: 201,
+    }),
+    sendWechatGroupManagedDraft: async (draftId) => {
+      events.push(["send", draftId]);
+      return { sent: true, reason: "verified" };
+    },
+    pauseWechatGroupManaged: (reason, scanId) => events.push(["pause", reason, scanId]),
+  };
+  const server = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  try {
+    const deadline = Date.now() + 6_000;
+    while (!events.some((event) => event[0] === "send") && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(events.some((event) => event[0] === "send"), "the managed worker sent its claimed draft");
+    assert.equal(events.some((event) => event[0] === "pause"), false);
+    assert.ok(events.find((event) => event[0] === "claim")[1].includes("Hara"));
+    assert.deepEqual(providerInput.tools, []);
+    assert.match(providerInput.system, /may be sent automatically/);
+  } finally {
     await server.close();
     rmSync(dir, { recursive: true, force: true });
   }

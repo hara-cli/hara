@@ -68,6 +68,15 @@ export interface WeixinCreds {
   user_id: string;
 }
 
+export const WEIXIN_CONNECTION_TEST_TEXT =
+  "Hara 微信场景连接测试成功。此消息仅用于验证 Hara Desktop 与已绑定微信的发送链路。";
+
+export interface WeixinConnectionTestResult {
+  platform: "weixin";
+  delivered: true;
+  testedAt: number;
+}
+
 export type WeixinCredentialInspection =
   | { state: "ready"; credentials: WeixinCreds }
   | { state: "missing" | "unreadable" };
@@ -249,6 +258,13 @@ export function isSessionExpired(ret: number, errcode: number, errmsg: string): 
   return (errmsg || "").toLowerCase() === "unknown error";
 }
 
+/** `prepare failed` means iLink rejected the saved reply context. It is not an ordinary frequency limit:
+ * retrying the same stale token only delays the same failure, while a tokenless proactive push is outside
+ * the documented reply path. Require one fresh inbound owner message and fail with a recovery action. */
+export function isWeixinContextRejected(ret: number, errcode: number, errmsg: string): boolean {
+  return ret === RATE_LIMIT && errcode === 0 && (errmsg || "").trim().toLowerCase() === "prepare failed";
+}
+
 // ── HTTP + state ──────────────────────────────────────────────────────────────
 
 const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
@@ -309,6 +325,17 @@ export function weixinKnownPeers(accountId: string): string[] {
   } catch {
     return [];
   }
+}
+
+/** Resolve the QR-login owner without falling back to another recent DM. A connection test is an external
+ * effect, so an ambiguous recipient must fail closed instead of messaging a colleague or another authorized
+ * sender. The raw identifier never crosses the CLI/Desktop boundary. */
+export function weixinOwnerTestPeer(credentials: WeixinCreds, knownPeers: readonly string[]): string {
+  const owner = credentials.user_id.trim();
+  if (!owner || !knownPeers.includes(owner)) {
+    throw new Error("send Hara a direct WeChat message from the account that linked it before running the connection test");
+  }
+  return owner;
 }
 
 function validWeixinCredentials(value: unknown): value is WeixinCreds {
@@ -692,6 +719,10 @@ async function sendChunk(
     resp = await post(undefined);
     [ret, errcode, errmsg] = [num(resp.ret), num(resp.errcode), str(resp.errmsg ?? resp.msg)];
   }
+  if (isWeixinContextRejected(ret, errcode, errmsg)) {
+    tokenStore.del(peer);
+    throw new Error("WeChat reply context expired; send Hara a fresh message from the QR-linked owner chat, then retry the connection test");
+  }
   // Rate-limit (ret=-2, empty errmsg): iLink throttles cold/rapid proactive pushes. Back off and retry a few
   // times instead of silently dropping the message — the reused clientId dedups so a retry can't double-send.
   for (let attempt = 0; ret === RATE_LIMIT && errcode === 0 && attempt < 3; attempt++) {
@@ -983,4 +1014,13 @@ export function weixinAdapter(creds: WeixinCreds): ChatAdapter {
       }
     },
   };
+}
+
+/** Send one fixed, content-free diagnostic to the account that scanned Hara's WeChat QR code. */
+export async function testWeixinOwnerConnection(): Promise<WeixinConnectionTestResult> {
+  const credentials = loadWeixinCreds();
+  if (!credentials) throw new Error("WeChat is not linked");
+  const peer = weixinOwnerTestPeer(credentials, weixinKnownPeers(credentials.account_id));
+  await weixinAdapter(credentials).send(peer, WEIXIN_CONNECTION_TEST_TEXT);
+  return { platform: "weixin", delivered: true, testedAt: Date.now() };
 }

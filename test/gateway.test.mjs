@@ -24,7 +24,7 @@ import {
 import { GatewayQueueClosedError, GatewayQueueFullError, KeyedSerialQueue, canonicalGatewayPlatform, compactGatewayCodingOutput, gatewayAdmissionKey, gatewayCodingDisplayId, gatewayStatus, parseCommand, parseGatewayCodingCommand, resolveGatewayCodingSession, isAllowed, resolveAllowlist, cleanReply, shouldDownloadInboundMedia } from "../dist/gateway/serve.js";
 import { GatewayLoginManager } from "../dist/gateway/login.js";
 import { chatCodingSession, chatContext, chatCd, newChatSession, ownsChatSession, resolveOwnedSessionId, setChatCodingSession, setChatSession, setChatAgent, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
-import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs, startWeixinLoginSession, weixinAdapter, weixinClientId } from "../dist/gateway/weixin.js";
+import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, isWeixinContextRejected, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs, startWeixinLoginSession, weixinAdapter, weixinClientId, weixinOwnerTestPeer, WEIXIN_CONNECTION_TEST_TEXT } from "../dist/gateway/weixin.js";
 import { synthesize, ttsConfigFromEnv, ttsCleanText, ttsTimeoutMs } from "../dist/gateway/tts.js";
 import { deliverResult } from "../dist/cron/deliver.js";
 
@@ -1521,12 +1521,40 @@ test("weixin isSessionExpired: -14, or -2 + 'unknown error'; genuine -2 rate-lim
   assert.equal(isSessionExpired(0, 0, ""), false);
 });
 
+test("weixin prepare-failed is a stale reply context, not a retryable frequency limit", () => {
+  assert.equal(isWeixinContextRejected(-2, 0, "prepare failed"), true);
+  assert.equal(isWeixinContextRejected(-2, 0, "PREPARE FAILED"), true);
+  assert.equal(isWeixinContextRejected(-2, 0, "freq limit"), false);
+  assert.equal(isWeixinContextRejected(0, 0, "prepare failed"), false);
+});
+
 test("weixin outbound client ids are stable for effect retries and opaque", () => {
   const first = weixinClientId("credential-scoped-effect");
   assert.equal(first, weixinClientId("credential-scoped-effect"));
   assert.notEqual(first, weixinClientId("another-effect"));
   assert.match(first, /^hara-weixin-[a-f0-9]{32}$/);
   assert.equal(first.includes("credential"), false);
+});
+
+test("weixin connection diagnostics target only the QR-login owner and use fixed content", () => {
+  const credentials = {
+    account_id: "bot-account",
+    token: "private-token",
+    base_url: "https://ilinkai.weixin.qq.com",
+    user_id: "owner@im.wechat",
+  };
+  assert.equal(
+    weixinOwnerTestPeer(credentials, ["colleague@im.wechat", "owner@im.wechat"]),
+    "owner@im.wechat",
+  );
+  assert.throws(
+    () => weixinOwnerTestPeer(credentials, ["colleague@im.wechat"]),
+    /account that linked it/,
+  );
+  assert.equal(
+    WEIXIN_CONNECTION_TEST_TEXT,
+    "Hara 微信场景连接测试成功。此消息仅用于验证 Hara Desktop 与已绑定微信的发送链路。",
+  );
 });
 
 test("weixin adapter forwards a stable effect id into the platform client_id", async () => {

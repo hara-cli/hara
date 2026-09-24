@@ -49,6 +49,8 @@ import {
   APPROVAL_MODES,
   SANDBOX_MODES,
   COMPUTER_USE_MODES,
+  DECISION_ENGINES,
+  DECISION_MODES,
   MAX_FALLBACK_CONNECTIONS,
   REASONING_EFFORTS,
   type HaraConfig,
@@ -235,6 +237,7 @@ import { listJobs, tailJob, killJob } from "./exec/jobs.js";
 import { readModelContextFileSync } from "./fs-read.js";
 import { MIN_NODE_VERSION, unsupportedNodeMessage } from "./runtime.js";
 import { redactKnownSecrets, redactSensitiveText } from "./security/secrets.js";
+import type { ActionGuardDecisionEngine } from "./security/guardian.js";
 import { normalizePackageRegistry } from "./package-registry.js";
 import {
   ackDeskTask,
@@ -409,6 +412,11 @@ import {
   computerSettingsSnapshot,
   saveComputerSettings as saveComputerSettingsPolicy,
 } from "./computer-settings.js";
+import {
+  decisionSettingsSnapshot,
+  saveDecisionSettings,
+  testDecisionSettings,
+} from "./decision-settings.js";
 import "./tools/open-directory.js"; // register safe Finder/File Explorer directory opening
 import "./tools/open-browser.js"; // register safe real-browser navigation for website/UI testing
 import { HARA_RUNTIME_VERSION } from "./version.js";
@@ -792,7 +800,7 @@ async function buildGuardian(
   primary: Provider | null,
   boundProfileId?: string,
   boundSpaceId?: string,
-): Promise<{ provider: Provider | null; enabled: boolean } | undefined> {
+): Promise<{ provider: Provider | null; enabled: boolean; decision?: ActionGuardDecisionEngine } | undefined> {
   if (cfg.guardian === "off") return undefined;
   let gp: Provider | null = primary;
   if (cfg.routeModel && cfg.routeModel !== primary?.model) {
@@ -802,7 +810,19 @@ async function buildGuardian(
       ...(cfg.routeApiKey ? { apiKey: cfg.routeApiKey } : {}),
     }, boundProfileId, boundSpaceId)) ?? primary;
   }
-  return { provider: gp, enabled: true };
+  const decision: ActionGuardDecisionEngine | undefined = cfg.decisionEngine === "typesafe"
+    ? {
+        engine: "typesafe",
+        config: {
+          mode: cfg.decisionMode,
+          apiKey: cfg.decisionApiKey,
+          baseURL: cfg.decisionBaseURL,
+          model: cfg.decisionModel,
+          proxy: cfg.proxy,
+        },
+      }
+    : undefined;
+  return { provider: gp, enabled: true, ...(decision ? { decision } : {}) };
 }
 
 const warnedFallbackRoutes = new Set<string>();
@@ -3419,6 +3439,7 @@ function runDoctor(cfg: HaraConfig): string {
     `${dot} search ${c.dim("lexical (always on)")}${live.embedProvider === "off" ? c.dim(" · semantic off (hara config set embedProvider ollama|qwen)") : c.dim(" · semantic ") + c.bold(live.embedProvider) + (() => { const idx = ["repo", "assets", "memory"].filter((n) => indexExists(n, live.cwd)); return c.dim(" · indexed: ") + (idx.length ? c.green(idx.join(", ")) : c.yellow("none — run: hara index --all")); })()}`,
     `${dot} images ${imageStatus}`,
     `${dot} screen ${live.computerUse === "off" ? c.dim("off (hara config set computerUse read|click|full)") : c.bold(live.computerUse) + c.dim(` · ${computerBackends()}${live.computerApps.length ? " · apps: " + live.computerApps.join(", ") : " · no app allowlist"}`)}`,
+    `${dot} action-guard ${live.decisionEngine === "off" ? c.dim("built-in · Jev off (hara config set decisionEngine typesafe)") : c.bold(`TypeSafe ${live.decisionMode}`) + c.dim(` · ${live.decisionModel} · ${live.decisionApiKey ? "credential configured" : "credential missing"}`)}`,
     `${dot} plugins ${(() => { const inst = listInstalled(); const on = enabledPlugins().length; return inst.length ? c.dim(`${on}/${inst.length} enabled: ${inst.map((p) => p.name).slice(0, 6).join(", ")}`) : c.dim("none — hara plugin add <source>"); })()}`,
     `${dot} mcp ${c.dim(`client: ${Object.keys({ ...pluginMcpServers(), ...live.mcpServers }).length} server(s) · serve: ${mcpServeToolNames().length} read tools via \`hara mcp\``)}`,
     `${dot} hooks ${(() => { const ph = pluginHooks(); const pre = (live.hooks.PreToolUse ?? []).length + (ph.PreToolUse ?? []).length; const post = (live.hooks.PostToolUse ?? []).length + (ph.PostToolUse ?? []).length; return pre + post ? c.dim(`${pre} pre · ${post} post`) : c.dim("none — config.json \"hooks\""); })()}`,
@@ -4437,6 +4458,19 @@ gatewayCommand
     }
   });
 
+gatewayCommand
+  .command("test")
+  .description("send one fixed diagnostic message to the WeChat account that linked Hara")
+  .action(async (_opts, command) => {
+    const platform = command.parent?.opts().platform as string | undefined;
+    if (platform !== "weixin") {
+      throw new Error("gateway connection testing currently requires `hara gateway --platform weixin test`");
+    }
+    const weixin = await import("./gateway/weixin.js");
+    const result = await weixin.testWeixinOwnerConnection();
+    out(c.green("✓ WeChat owner connection test delivered") + c.dim(` · ${new Date(result.testedAt).toISOString()}\n`));
+  });
+
 gatewayCommand.action(async (opts) => {
   const mod = await import("./gateway/serve.js");
   const platform = opts.platform || "telegram";
@@ -4517,6 +4551,7 @@ program
     const { startServe } = await import("./serve/server.js");
     const { GatewayLoginManager } = await import("./gateway/login.js");
     const { GatewaySupervisor } = await import("./gateway/supervisor.js");
+    const { WeChatGroupSceneController } = await import("./wechat-group-scene.js");
     const { MobileDesktopAuthorizationCoordinator } = await import("./mobile/desktop-authorization.js");
     const { MobilePairingCoordinator } = await import("./mobile/pairing.js");
     const { MobileRelaySupervisor } = await import("./mobile/relay-supervisor.js");
@@ -4529,6 +4564,7 @@ program
     const gatewaySupervisor = new GatewaySupervisor({
       log: (message) => process.stderr.write(`${message}\n`),
     });
+    const wechatGroupScene = new WeChatGroupSceneController();
     const mobileDesktopAuthorization = new MobileDesktopAuthorizationCoordinator();
     const mobilePairing = new MobilePairingCoordinator();
     const mobileRelay = new MobileRelaySupervisor({
@@ -4785,6 +4821,25 @@ program
           saveComputerSettingsPolicy(input, settingsCwd);
           return computerSettingsFor(settingsCwd);
         },
+        decisionSettings: (targetCwd) => decisionSettingsSnapshot(targetCwd ?? cwd),
+        saveDecisionSettings: (input, targetCwd) => saveDecisionSettings(input, targetCwd ?? cwd),
+        testDecisionSettings: (input, targetCwd) => testDecisionSettings(input, targetCwd ?? cwd),
+        wechatGroupStatus: () => wechatGroupScene.status(),
+        saveWechatGroupSettings: (input) => wechatGroupScene.save(input),
+        prepareWechatGroupRuntime: () => wechatGroupScene.prepare(),
+        requestWechatGroupPermissions: () => wechatGroupScene.requestPermissions(),
+        startWechatGroupScene: (targetCwd, confirmGroup, confirmManaged) => (
+          wechatGroupScene.start(targetCwd, confirmGroup, confirmManaged)
+        ),
+        stopWechatGroupScene: () => wechatGroupScene.stop(),
+        scanWechatGroupScene: (targetCwd) => wechatGroupScene.scan(targetCwd),
+        wechatGroupReplyContext: (scanId) => wechatGroupScene.replyContext(scanId),
+        rememberWechatGroupDraft: (scanId, text) => wechatGroupScene.rememberDraft(scanId, text),
+        fillWechatGroupDraft: (draftId) => wechatGroupScene.fill(draftId),
+        wechatGroupManagedActive: () => wechatGroupScene.managedActive(),
+        claimWechatGroupManagedScan: (scanId, aliases) => wechatGroupScene.managedClaim(scanId, aliases),
+        pauseWechatGroupManaged: (reason, scanId, category) => wechatGroupScene.pauseManaged(reason, scanId, category),
+        sendWechatGroupManagedDraft: (draftId) => wechatGroupScene.sendManaged(draftId),
         installCoreBrowser: () => {
           let browser = listInstalled().find((plugin) => plugin.name === "browser");
           if (!browser || browser.version !== "0.2.0") browser = installPlugin("bundled:browser");
@@ -4815,7 +4870,15 @@ program
         gatewayStatuses: () => gatewaySupervisor.list(["weixin", "feishu"]),
         startGateway: (platform) => gatewaySupervisor.start(platform),
         stopGateway: (platform) => gatewaySupervisor.stop(platform),
-        closeGateways: () => gatewaySupervisor.close(),
+        testGateway: async (platform) => {
+          if (platform !== "weixin") throw new Error("only WeChat connection testing is supported");
+          const weixin = await import("./gateway/weixin.js");
+          return weixin.testWeixinOwnerConnection();
+        },
+        closeGateways: async () => {
+          wechatGroupScene.stop();
+          await gatewaySupervisor.close();
+        },
         approveGatewayAuthorization: async (platform, requestId) => {
           const gateway = await import("./gateway/serve.js");
           const approved = await gateway.approveGatewaySenderAuthorization(platform, requestId);
@@ -6260,6 +6323,33 @@ config
       out(c.red(`Invalid computer-use mode. One of: ${COMPUTER_USE_MODES.join(", ")}.\n`));
       process.exit(1);
     }
+    if (key === "decisionEngine" && !DECISION_ENGINES.includes(value as typeof DECISION_ENGINES[number])) {
+      out(c.red(`Invalid decision engine. One of: ${DECISION_ENGINES.join(", ")}.\n`));
+      process.exit(1);
+    }
+    if (key === "decisionMode" && !DECISION_MODES.includes(value as typeof DECISION_MODES[number])) {
+      out(c.red(`Invalid decision mode. One of: ${DECISION_MODES.join(", ")}.\n`));
+      process.exit(1);
+    }
+    if (key === "decisionModel" && (!value.trim() || value.length > 256 || /[\u0000-\u001f\u007f]/u.test(value))) {
+      out(c.red("Invalid decision model. Use a non-empty model id without control characters.\n"));
+      process.exit(1);
+    }
+    if (key === "decisionBaseURL") {
+      try {
+        const parsed = new URL(value);
+        if (
+          (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+          || parsed.username
+          || parsed.password
+          || parsed.search
+          || parsed.hash
+        ) throw new Error("invalid decision endpoint");
+      } catch {
+        out(c.red("Invalid decisionBaseURL. Use an HTTP(S) origin or path without credentials, query, or fragment.\n"));
+        process.exit(1);
+      }
+    }
     if (key === "reasoningEffort" && !REASONING_EFFORTS.includes(value as typeof REASONING_EFFORTS[number])) {
       out(c.red(`Invalid reasoning effort. One of: ${REASONING_EFFORTS.join(", ")}.\n`));
       process.exit(1);
@@ -6330,6 +6420,8 @@ config
           `timeout:  ${raw.runTimeoutMs ?? "(default 30m)"}\n` +
           `rounds:   ${raw.maxAgentRounds ?? "(default 64)"}\n` +
           `continue: ${raw.autoContinue ?? "(default true)"}\n` +
+          `decision: ${raw.decisionEngine ?? "(default off)"} · ${raw.decisionMode ?? "(default shadow)"} · ${raw.decisionModel ?? "(default jev-latest)"}\n` +
+          `decisionKey: ${maskKey(raw.decisionApiKey)}\n` +
           `proxy:    ${maskProxy(raw.proxy)}\n` +
           `apiKey:   ${maskKey(raw.apiKey)}\n`,
       );

@@ -31,7 +31,16 @@ import {
   type ProjectApprovalPolicy,
   type ProjectApprovalScope,
 } from "../security/project-approvals.js";
-import { classifyRisk, guardianVeto, guardianEnabled, newBreaker, recordBlock, type BreakerState } from "../security/guardian.js";
+import {
+  classifyRisk,
+  evaluateActionGuard,
+  guardianActionDetail,
+  guardianEnabled,
+  newBreaker,
+  recordBlock,
+  type ActionGuardDecisionEngine,
+  type BreakerState,
+} from "../security/guardian.js";
 import {
   failureIdentities,
   looksFailed,
@@ -629,7 +638,7 @@ export interface RunOpts {
    *  veto + a hard circuit-breaker, layered on top of permission rules / PreToolUse hooks / approval gate.
    *  `provider` is the cheap model used for the veto (fail-open if absent/glitchy). Normal (low-risk) tools
    *  never touch it — zero added latency. Absent → guardian off. */
-  guardian?: { provider?: Provider | null; enabled?: boolean };
+  guardian?: { provider?: Provider | null; enabled?: boolean; decision?: ActionGuardDecisionEngine };
 }
 
 export interface RunRuntimeItemEvent {
@@ -2354,10 +2363,11 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
             "Repair using this exact text with materially different edit arguments, then validate syntax before execution."
           );
         }
-        // Preserve authorization/authentication boundaries across unrelated successful reads. A harmless
-        // probe cannot grant authority, while all other failure families retain the normal success reset.
+        // Preserve authorization/authentication and internal policy boundaries across unrelated successful
+        // reads. Only task_intake can repair an understanding gate; harmless probes cannot grant authority.
         for (const key of life.failedCalls.keys()) {
-          if (life.failedCallKinds.get(key) === "access_boundary") continue;
+          const kind = life.failedCallKinds.get(key);
+          if (kind === "access_boundary" || (kind === "policy_boundary" && name !== "task_intake")) continue;
           life.failedCalls.delete(key);
           life.failedCallKinds.delete(key);
         }
@@ -2622,23 +2632,24 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         });
         continue;
       }
+      let actionGuardReviewReason: string | undefined;
       // Guardian layer — runs AFTER permission rules, alongside/just before the confirm gate. The
       // deterministic classifier short-circuits FIRST: read tools, in-project edits, and ordinary shell
-      // commands classify `low` (pure Node, no LLM) and skip everything below — zero added latency. Only a
-      // genuinely HIGH-RISK action pays for a cheap-model veto, and that veto fails OPEN on any glitch.
+      // commands classify `low` (pure Node, no model) and skip everything below — zero added latency. A
+      // configured Jev engine shares this boundary across computer use and external communication; its
+      // allow verdict can never bypass deterministic policy or the ordinary approval gate below.
       if (guardianOn && !breakerHalt) {
         const risk = classifyRisk(tu.name, approvalKind, input, ctx.cwd);
         if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return finalizeStoppedToolRound();
         if (risk.level === "high") {
           const safeRiskReason = redactToolSubprocessOutput(risk.reason);
-          const detail = redactToolSubprocessOutput(
-            String(input.command ?? input.path ?? "").replace(/\s+/g, " ").trim().slice(0, 400),
-          );
-          let verdictResult: Awaited<ReturnType<typeof guardianVeto>> | typeof RUN_STOPPED;
+          const detail = guardianActionDetail(tu.name, input);
+          let verdictResult: Awaited<ReturnType<typeof evaluateActionGuard>> | typeof RUN_STOPPED;
           try {
-            const guardianTurn = Promise.resolve().then(() => guardianVeto(
+            const guardianTurn = Promise.resolve().then(() => evaluateActionGuard(
               opts.guardian!.provider,
-              { tool: tu.name, detail, classifierReason: safeRiskReason },
+              opts.guardian!.decision,
+              { tool: tu.name, category: risk.category, detail, classifierReason: safeRiskReason },
               history,
               { signal: runSignal, onProviderTurn: opts.onProviderTurn },
             ));
@@ -2650,15 +2661,36 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           if (verdictResult === RUN_STOPPED) return finalizeStoppedToolRound();
           if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return finalizeStoppedToolRound();
           const verdict = verdictResult;
+          if (verdict.mode) {
+            const observed = verdict.unavailable
+              ? "unavailable"
+              : verdict.observedDecision ?? verdict.decision;
+            const confidence = verdict.confidence === undefined
+              ? ""
+              : ` ${Math.round(verdict.confidence * 100)}%`;
+            const latency = verdict.elapsedMs === undefined ? "" : ` · ${verdict.elapsedMs}ms`;
+            const model = verdict.model ? ` · ${verdict.model}` : "";
+            const note = `Jev ${verdict.mode} · ${observed}${confidence} · effective ${verdict.decision}${latency}${model}`;
+            if (!opts.quiet) {
+              if (sink) sink.notice(note);
+              else out(c.dim(`  ${note}\n`));
+            }
+            emitRuntimeItem(opts, {
+              itemId: randomUUID(),
+              kind: "control",
+              state: verdict.decision === "block" ? "denied" : "completed",
+              name: `action_guard:typesafe:${verdict.mode}:${observed}:${verdict.decision}`,
+            });
+          }
           if (verdict.decision === "block") {
             const tripped = recordBlock(breaker); // deterministic circuit-breaker: N blocks → hard stop
             plans.push({
               tu,
               tool,
-              denied: `Guardian blocked this high-risk action: ${verdict.reason || safeRiskReason}. Reconsider and take a safer in-scope step. If the exact high-risk action remains necessary, record an evidenced destructive_confirmation dependency instead of transferring execution instructions to the user.`,
+              denied: `Action Guard blocked this high-risk action: ${verdict.reason || safeRiskReason}. Reconsider and take a safer in-scope step. If the exact high-risk action remains necessary, record an evidenced destructive_confirmation dependency instead of transferring execution instructions to the user.`,
             });
             if (!opts.quiet) {
-              const note = `⛔ guardian blocked ${tu.name} — ${verdict.reason || safeRiskReason}`;
+              const note = `⛔ Action Guard blocked ${tu.name} — ${verdict.reason || safeRiskReason}`;
               if (sink) sink.notice(note);
               else out(c.yellow(`  ${note}\n`));
             }
@@ -2692,6 +2724,19 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
             }
             continue;
           }
+          if (verdict.decision === "review") {
+            if (!opts.approvalChannel) {
+              plans.push({
+                tu,
+                tool,
+                denied:
+                  `Action Guard requires a live human review before this high-risk action (${verdict.reason || safeRiskReason}), `
+                  + "but this run has no approval channel. The action was not executed.",
+              });
+              continue;
+            }
+            actionGuardReviewReason = verdict.reason || safeRiskReason;
+          }
         }
       }
       let approvalScope: ProjectApprovalScope | undefined;
@@ -2706,7 +2751,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         approvalScope
         && (opts.autoApprove?.has(approvalScope.key) || opts.projectApprovals?.has(approvalScope.key)),
       );
-      const shouldConfirm = alwaysGate || organizationApprovalRequired || (
+      const shouldConfirm = Boolean(actionGuardReviewReason) || alwaysGate || organizationApprovalRequired || (
         cmdDecision !== "allow"
         && needsConfirm(approvalKind, opts.approval)
         && !scopeAlreadyApproved
@@ -2715,10 +2760,11 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         let replyResult: boolean | "always" | typeof RUN_STOPPED;
         try {
           const scopeHint = approvalScope ? `\n${approvalScope.summary}` : "";
+          const guardHint = actionGuardReviewReason ? `\nAction Guard: ${actionGuardReviewReason}` : "";
           replyResult = await bounded(waitForHuman(opts, life, () => Promise.resolve().then(() => opts.confirm(
-            `${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?${scopeHint}`,
+            `${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?${guardHint}${scopeHint}`,
             runSignal,
-            { allowAlways: Boolean(approvalScope) && !alwaysGate && !organizationApprovalRequired },
+            { allowAlways: Boolean(approvalScope) && !actionGuardReviewReason && !alwaysGate && !organizationApprovalRequired },
           ))));
         } catch (error) {
           if (runSignal.aborted) return finalizeStoppedToolRound();
@@ -2730,7 +2776,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           plans.push({ tu, tool, denied: "User denied this action." });
           continue;
         }
-        if (reply === "always" && approvalScope && !alwaysGate && !organizationApprovalRequired) {
+        if (reply === "always" && approvalScope && !actionGuardReviewReason && !alwaysGate && !organizationApprovalRequired) {
           opts.autoApprove?.add(approvalScope.key);
           try {
             if (!opts.projectApprovals) throw new Error("no durable project approval policy is attached");

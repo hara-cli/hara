@@ -2203,6 +2203,61 @@ test("a synchronous guardian overrun cannot approve and start the guarded side e
   assert.equal(toolRuns, 0);
 });
 
+test("Jev enforce mode cannot send an external message headlessly when the judge is unavailable", async () => {
+  let toolRuns = 0;
+  let rounds = 0;
+  const provider = {
+    id: "message-main",
+    model: "message-main",
+    async turn() {
+      rounds += 1;
+      return rounds === 1
+        ? {
+            text: "",
+            toolUses: [{
+              id: "message-1",
+              name: "channel_message",
+              input: { action: "send", target: "weixin:test-peer", text: "hello" },
+            }],
+            stop: "tool_use",
+          }
+        : { text: "not sent", toolUses: [], stop: "end" };
+    },
+  };
+  const legacyGuardian = {
+    id: "legacy-guardian",
+    model: "legacy-guardian",
+    async turn() {
+      return { text: '{"decision":"allow","reason":""}', toolUses: [], stop: "end" };
+    },
+  };
+  const history = [{ role: "user", content: "send a test message" }];
+  const outcome = await runAgent(history, base(provider, {
+    approvalChannel: false,
+    quiet: true,
+    guardian: {
+      enabled: true,
+      provider: legacyGuardian,
+      decision: { engine: "typesafe", config: { mode: "enforce" } },
+    },
+    extraTools: [{
+      name: "channel_message",
+      description: "test external message",
+      input_schema: {
+        type: "object",
+        properties: { action: { type: "string" }, target: { type: "string" }, text: { type: "string" } },
+        required: ["action", "target", "text"],
+      },
+      kind: "exec",
+      classify: () => ({ effect: "exec", concurrencySafe: false, approvalKind: "exec" }),
+      async run() { toolRuns += 1; return "sent"; },
+    }],
+  }));
+  assert.equal(outcome.status, "completed");
+  assert.equal(toolRuns, 0);
+  assert.match(history.find((message) => message.role === "tool").results[0].content, /requires a live human review/u);
+});
+
 test("the real ask_user integration publishes awaiting_user and restores streaming", async () => {
   setTurnPhase("idle");
   const seen = [];
