@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.181.0 — 2026-09-26 — durable coding sessions under the Hara root orchestrator
+
+- Define Hara as the permanent root orchestrator rather than a dismissible hired Agent. The root keeps the
+  user's conversation and final integration authority while coordinating native Hara Agents, Codex, and
+  Claude Code through one explicit capability contract.
+- Pre-create a persistent provider conversation whenever Hara starts a Codex or Claude Code terminal, then
+  retain only Hara-owned opaque continuation links. If the live terminal or computer restarts, the next Agent
+  instruction rebuilds a terminal around the same provider conversation instead of silently starting over.
+- Add `hara coding sessions` and `hara coding resume <opaque-id>` so users can continue the exact linked Codex
+  or Claude Code conversation in their own terminal without exposing provider-native session identifiers.
+- Persist provider continuity with each delegated coding Agent, reject runtime/provider mismatches, and recover
+  only after an authoritative missing-terminal result so transient transport failures cannot create duplicate
+  controllers for one coding session.
+
 ## 0.180.0 — 2026-09-24 — governed local WeChat scenes and global action judgment
 
 - Add a local WeChat group Agent scene for Hara Desktop. Assist mode prepares a reviewable draft; explicitly
