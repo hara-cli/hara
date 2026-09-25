@@ -7,20 +7,24 @@ import type {
   SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { redactSensitiveText } from "../security/secrets.js";
-import type { ExternalSessionOwnershipStore } from "./identity.js";
+import { opaqueProviderSessionId, type ExternalSessionOwnershipStore } from "./identity.js";
 import {
   probeExternalCommand,
   resolveExternalCommandRuntime,
+  runExternalCommandAttached,
   runExternalCommandCapture,
   type ExternalCommandOptions,
 } from "./process.js";
 import type {
   ExternalSessionAdapter,
+  ExternalSessionAdapterCreateInput,
   ExternalSessionAdapterPage,
   ExternalSessionForkResult,
   ExternalSessionInfo,
   ExternalSessionMessage,
+  ExternalProviderTerminalResult,
   ExternalSessionReadResult,
+  ExternalRuntimePreparedSession,
   ExternalSessionSourceInfo,
   ExternalTurnResult,
   ExternalTurnSink,
@@ -86,7 +90,7 @@ const extractMessageText = (payload: unknown): string => {
 
 const mapSession = (session: SDKSessionInfo, identityKey: Buffer): ExternalSessionInfo | null => {
   if (typeof session.sessionId !== "string" || !session.sessionId) return null;
-  const id = `ext_claude_${digest("session", session.sessionId, identityKey)}`;
+  const id = opaqueProviderSessionId("claude", session.sessionId, identityKey);
   const cwd = typeof session.cwd === "string" && session.cwd ? session.cwd : "";
   const workspaceName = cwd ? basename(cwd) || "Workspace" : "Workspace";
   // `summary` and `firstPrompt` are transcript previews, not safe list metadata. Only an explicit
@@ -225,6 +229,60 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
     const ref = this.refs.get(sessionId);
     if (!ref) throw new Error("external Claude session is no longer in the current device index; refresh the list");
     return ref;
+  }
+
+  async prepareRuntimeSession(
+    _input: Omit<ExternalSessionAdapterCreateInput, "prepare">,
+  ): Promise<ExternalRuntimePreparedSession> {
+    const nativeSessionId = randomUUID();
+    const providerSessionId = opaqueProviderSessionId("claude", nativeSessionId, this.options.identityKey);
+    let settled = false;
+    return {
+      providerSessionId,
+      nativeSessionId,
+      nativeLaunchMode: "create",
+      commit: () => {
+        if (settled) return;
+        settled = true;
+        this.options.ownership?.add("claude", providerSessionId);
+      },
+      rollback: async () => {
+        settled = true;
+      },
+    };
+  }
+
+  async prepareRuntimeContinuation(
+    sessionId: string,
+    input: Omit<ExternalSessionAdapterCreateInput, "prepare">,
+  ): Promise<ExternalRuntimePreparedSession> {
+    const ref = this.ref(sessionId);
+    if (!ref.cwd || ref.cwd !== input.cwd) {
+      throw new Error("the saved Claude Code session belongs to a different workspace");
+    }
+    await this.requireAuthentication();
+    let committed = false;
+    return {
+      providerSessionId: sessionId,
+      nativeSessionId: ref.nativeId,
+      nativeLaunchMode: "resume",
+      commit: () => {
+        if (committed) return;
+        committed = true;
+        ref.owned = true;
+        this.options.ownership?.add("claude", sessionId);
+      },
+      // The provider history predates this replacement terminal and is never rolled back with it.
+      rollback: async () => undefined,
+    };
+  }
+
+  async resumeInTerminal(sessionId: string): Promise<ExternalProviderTerminalResult> {
+    const ref = this.ref(sessionId);
+    const result = await runExternalCommandAttached(this.options, ["--resume", ref.nativeId], {
+      ...(ref.cwd ? { cwd: ref.cwd } : {}),
+    });
+    return { sessionId, sourceId: "claude", ...result };
   }
 
   async list(input: { cursor?: string; limit: number; search?: string }): Promise<ExternalSessionAdapterPage> {

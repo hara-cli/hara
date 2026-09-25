@@ -29,6 +29,177 @@ for continuing an unfinished task rather than switching a saved session.
 
 ---
 
+## [FEAT-20260923-002] custom-wechat-group-wake-name
+
+**Logged**: 2026-09-23T21:00:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: frontend
+
+### Requested Capability
+
+Let a managed local WeChat group choose the exact group-visible name that members will `@` to wake its
+Agent, rather than hard-coding `@Hara` or the internal Agent identity.
+
+### User Context
+
+The identity visible inside a real WeChat group may be a company assistant name such as `小南`. The WeChat
+group title and the Agent wake name are separate concepts: the title is discovered and bound by Hara as a
+safety boundary, while the wake name is a user-owned interaction choice.
+
+### Complexity Estimate
+
+medium
+
+### Suggested Implementation
+
+Persist one normalized wake name without the leading `@`, expose it through the authenticated settings RPC,
+require a true mention boundary when matching, keep selected-Agent aliases only as the empty-value fallback,
+and migrate older settings without changing their behavior.
+
+### Metadata
+
+- Frequency: first_time
+- Related Features: local WeChat group Agent, Managed mode, group binding
+
+### Resolution
+
+Implemented settings v4, authenticated RPC/Desktop controls, strict `@` boundary matching, legacy migration,
+and visible ignored-message feedback. Local source and the refreshed development sidecar are verified; this
+entry does not claim a tagged public release.
+
+---
+
+## [FR-20260920-AGENT-CONVERSATION-AND-COMPUTER] Productize Agents as conversations with computers
+
+**Logged**: 2026-09-20T23:59:00+08:00
+**Priority**: high
+**Status**: pending
+**Area**: product-architecture
+
+### Requested Capability
+
+Evolve Hara toward Grok Bot's useful interaction model: persistent Agent direct chats, visible Agent group
+chats and handoffs, local execution, optional container management, and one live computer/terminal surface,
+without restoring desk pets or an Agent Office simulation.
+
+### User Context
+
+The installed Grok Bot demonstrates that users understand Agents best as chat contacts. Individual Bots can
+message one another, groups preserve visible handoffs, and the right-side computer panel exposes real work.
+Hara now has durable Agent mailboxes/rooms and approved Codex/Claude Worktrees in Core, but Desktop and Mobile
+do not expose `session.agents.list` or room transcripts as first-class conversations. The current Desktop
+Groups area is organization Desk/task management, not Agent group chat. Docker is only reachable through
+generic shell execution and lacks typed inventory, policy, receipts, and destructive-operation guards.
+
+### Complexity Estimate
+
+complex
+
+### Suggested Implementation
+
+Promote Agent conversations and rooms into an authenticated Serve surface with explicit wake/turn leases,
+mention routing, bounded hops, durable message receipts, and one owner per stage. Add Desktop/Mobile thin
+clients for direct chats, groups, approvals, terminal/browser observation, and contextual computer takeover.
+Implement container management as an optional typed capability/plugin: read-only inventory by default;
+explicit approval and immutable target binding for mutations; destructive confirmation for remove/prune,
+volumes, and Compose teardown. Keep organization work/task management as a separate product area.
+
+### Metadata
+
+- Frequency: recurring
+- Related Features: Agent catalog, Agent room, mailbox, Hara Live, Mobile Relay, computer use, cron
+- Related Files: src/subagent/team.ts, src/serve/server.ts, ../hara-desktop/src/client.ts,
+  ../hara-desktop/src/Groups.tsx, ../hara-mobile/src/services/cloudCompanionGateway.ts
+- Requested By: user
+
+---
+
+## [FR-20260920-BOUNDED-AGENT-ROOM-AND-CODING-RUNTIME] Bounded Agent rooms and Codex/Claude execution
+
+**Logged**: 2026-09-20T00:00:00+08:00
+**Priority**: high
+**Status**: completed
+**Area**: agent-runtime
+
+### Requested Capability
+
+Let newly created Hara Agents exchange messages in a small group, and let a parent Hara Agent explicitly
+start Codex or Claude Code to work on code without introducing another office/game-style orchestration UI.
+
+### User Context
+
+The useful OpenClaw pattern is Agent-to-Agent routing plus coding-agent control. Hara already had stronger
+durable identity, mailbox, Worktree, Diff, approval, and terminal-session primitives, but they were not
+joined into one product path. The deprecated Agent-office projection also remained in the Engine after the
+simplified Desktop stopped rendering it.
+
+### Complexity Estimate
+
+complex
+
+### Resolution
+
+- Added one bounded `agent_room` tool with durable ordered history, participant limits, idempotent posts,
+  mailbox fan-out, ownership checks, close semantics, and no automatic idle-Agent wake loop.
+- Extended `spawn_agent` with approved Personal-Space `codex` and `claude` runtimes. Each runtime owns an
+  isolated Git Worktree, persists one opaque Hara Live continuation ID, accepts bounded in-flight messages,
+  and still requires parent Diff inspection/application.
+- Kept company Spaces fail-closed and removed deprecated Engine `offices`/`currentOfficeId` computation while
+  preserving the complete Agent directory and the separate document-focused Hara Office product.
+- Verified the implementation with the full feedback evaluation and 1,755 project tests.
+
+### Metadata
+
+- Frequency: recurring
+- Related Features: durable Agent tree, Hara Live, Agent mailbox, isolated Worktree, Diff review
+- Related Files: src/subagent/team.ts, src/subagent/external.ts, src/tools/collaboration.ts, src/serve/server.ts
+- Requested By: user
+
+---
+
+## [FR-20260910-COMPUTER-USE-PARITY] Productize browser and desktop computer control
+
+**Logged**: 2026-09-10T18:16:00+08:00
+**Priority**: high
+**Status**: in_progress
+**Area**: frontend
+
+### Requested Capability
+
+Bring the useful Codex Computer Use experience into Hara: a discoverable Desktop capability that can inspect
+screens, click, type, scroll, upload, and verify browser or desktop UI work, with per-application permissions
+and an explicit boundary for sensitive actions. Repair the current Browser Use path that reports no interaction
+tools or stalls on an unapproved browser connection.
+
+### User Context
+
+Hara Desktop 0.1.158 / Engine 0.171.0 opened a trademark application URL but then told the user it had no
+click/input/screenshot/upload capability. The underlying Windows `computer` tool and Playwright browser plugin
+already exist, but deferred-tool discovery, binary bundling, installation, permission status, and Desktop setup
+are not a coherent product flow.
+
+### Complexity Estimate
+
+complex
+
+### Suggested Implementation
+
+Auto-route web/GUI intents to the appropriate deferred capability; package the isolated browser as a reviewed,
+pinned bundled plugin; add Desktop install/enable/status UI; expose computer-control mode and app allow-list
+through authenticated Serve RPC; keep screenshots and action receipts in one deterministic loop; and require
+fresh confirmation for login, upload, submit, payment, account, or security boundaries.
+
+### Metadata
+
+- Frequency: recurring
+- Related Features: computer tool, browser plugin, tool_search, Desktop security settings, MCP
+- Related Files: src/tools/computer.ts, src/agent/loop.ts, src/plugins/bundled.ts, src/serve/server.ts,
+  hara-desktop/src/App.tsx, hara-desktop/src/client.ts
+- Requested By: user and Hara feedback group
+
+---
+
 ## [FR-20260715-INTERACTION-TASK-SEPARATION] Persist task execution independently from conversation history
 
 **Logged**: 2026-07-15T17:40:00+08:00

@@ -180,6 +180,46 @@ export async function spawnExternalCommandDetached(
 }
 
 /**
+ * Hand the caller's real terminal to a verified provider CLI. Arguments may contain provider-native
+ * identifiers, so this helper returns only exit metadata and never logs or echoes the argv.
+ */
+export async function runExternalCommandAttached(
+  options: ExternalCommandOptions,
+  args: readonly string[],
+  run: Pick<ExternalCommandRunOptions, "cwd"> = {},
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  const spawnProcess = options.spawnProcess ?? defaultSpawn;
+  const launch = resolveExternalCommandLaunch(options.command, options.env ?? process.env);
+  if (!launch) throw new Error("external session adapter command was not found");
+  const cwd = run.cwd && isAbsolute(run.cwd) ? run.cwd : undefined;
+  return await new Promise((resolve, reject) => {
+    let child: ChildProcess;
+    try {
+      child = spawnProcess(launch.command, [...(options.argsPrefix ?? []), ...args], {
+        stdio: "inherit",
+        env: externalLaunchEnv(options.env ?? process.env, launch.runtimeBin),
+        windowsHide: false,
+        ...(cwd ? { cwd } : {}),
+      });
+    } catch {
+      reject(new Error("external session terminal could not start"));
+      return;
+    }
+    let settled = false;
+    child.once("error", () => {
+      if (settled) return;
+      settled = true;
+      reject(new Error("external session terminal could not start"));
+    });
+    child.once("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      resolve({ code, signal });
+    });
+  });
+}
+
+/**
  * Run one bounded provider-management command without retaining or returning its output. This is used for
  * lifecycle operations such as starting Codex's official local App Server daemon. Provider stderr can
  * contain paths or account details, so callers receive only the exit status.

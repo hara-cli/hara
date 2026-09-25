@@ -638,6 +638,13 @@ export interface ServeAgentInfo {
   /** Space that owns the Agent catalog entry and every conversation created from it. */
   spaceId: string;
   owner: "personal" | "organization" | "external";
+  /** The permanent Hara coordinator is a product/system identity, not a dismissible hire. */
+  systemRole?: "root_orchestrator";
+  /** Public capability contract for the root coordinator. Provider-native ids remain Serve-private. */
+  coordination?: {
+    runtimes: Array<"hara" | "codex" | "claude">;
+    durableRuntimeSessions: boolean;
+  };
   allowedActions: Array<"chat" | "edit_profile" | "archive">;
   /** Optimistic-concurrency token for editable public identity metadata. */
   revision?: string;
@@ -744,6 +751,11 @@ function serveAgentCatalog(cwd: string, profileId: string | undefined, spaceId: 
     scope: "main",
     spaceId,
     owner: spaceId === "personal" ? "personal" : "organization",
+    systemRole: "root_orchestrator",
+    coordination: {
+      runtimes: spaceId === "personal" ? ["hara", "codex", "claude"] : ["hara"],
+      durableRuntimeSessions: true,
+    },
     allowedActions: spaceId === "personal" ? ["chat", "edit_profile"] : ["chat"],
     ...(spaceId === "personal" ? { revision: mainAgentIdentityRevision() } : {}),
   }];

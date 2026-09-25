@@ -1,4 +1,8 @@
-import type { ExternalSessionService, ExternalTurnSink } from "../external-sessions/types.js";
+import {
+  ExternalRuntimeSessionGoneError,
+  type ExternalSessionService,
+  type ExternalTurnSink,
+} from "../external-sessions/types.js";
 import { redactSensitiveText } from "../security/secrets.js";
 import type { AgentTeamExecutionRequest, AgentTeamExecutionResult } from "./team.js";
 
@@ -51,6 +55,7 @@ export async function executeExternalCodingAgent(
   if (request.signal.aborted) return { status: "cancelled", text: "" };
 
   let runtimeSessionId = request.runtimeSessionId;
+  let providerSessionId = request.providerSessionId;
   if (!runtimeSessionId) {
     const created = await service.createSession({
       sourceId: "runtime",
@@ -62,13 +67,41 @@ export async function executeExternalCodingAgent(
         : { permissionMode: "acceptEdits" },
     });
     runtimeSessionId = created.session.id;
+    providerSessionId = created.session.providerSessionId;
   } else {
     // Rehydrate the runtime adapter after a Hara restart before attempting continuation.
-    await service.readSession(runtimeSessionId);
+    try {
+      const live = await service.readSession(runtimeSessionId);
+      providerSessionId ??= live.session.providerSessionId;
+    } catch (error) {
+      // Rebuild only after an authoritative missing-terminal result. Transport/read failures remain
+      // failures so a transient outage can never create two controllers for one provider session.
+      if (!(error instanceof ExternalRuntimeSessionGoneError) || !providerSessionId) throw error;
+      const recovered = await service.recoverRuntimeSession({
+        sourceId: "runtime",
+        cwd: request.workspace.cwd,
+        agentKind: request.runtime,
+        providerSessionId,
+        title: `${request.runtime === "codex" ? "Codex" : "Claude"} · ${request.path}`,
+        launch: request.runtime === "codex"
+          ? { sandboxMode: "workspace-write" }
+          : { permissionMode: "acceptEdits" },
+      });
+      runtimeSessionId = recovered.session.id;
+      providerSessionId = recovered.session.providerSessionId ?? providerSessionId;
+      observer.notice?.(
+        `Hara restored the same ${request.runtime === "codex" ? "Codex" : "Claude Code"} conversation in a new local terminal.`,
+      );
+    }
   }
   if (request.signal.aborted) {
     await service.interrupt(runtimeSessionId).catch(() => undefined);
-    return { status: "cancelled", text: "", runtimeSessionId };
+    return {
+      status: "cancelled",
+      text: "",
+      runtimeSessionId,
+      ...(providerSessionId ? { providerSessionId } : {}),
+    };
   }
 
   const metrics = { providerRounds: 1, toolCalls: 0, inputTokens: 0, outputTokens: 0 };
@@ -79,6 +112,7 @@ export async function executeExternalCodingAgent(
       error: "Agent tree execution budget reached before the external coding turn",
       metrics,
       runtimeSessionId,
+      ...(providerSessionId ? { providerSessionId } : {}),
     };
   }
 
@@ -141,6 +175,7 @@ export async function executeExternalCodingAgent(
         error: safeError(error, "external coding Agent failed before completion"),
         metrics,
         runtimeSessionId,
+        ...(providerSessionId ? { providerSessionId } : {}),
       };
     }
     await stopMailboxPump();
@@ -152,6 +187,7 @@ export async function executeExternalCodingAgent(
         model: `${request.runtime} coding runtime`,
         metrics,
         runtimeSessionId,
+        ...(providerSessionId ? { providerSessionId } : {}),
       };
     }
     return {
@@ -165,6 +201,7 @@ export async function executeExternalCodingAgent(
       ...(turn.error ? { error: safeError(turn.error, "external coding Agent turn failed") } : {}),
       metrics,
       runtimeSessionId,
+      ...(providerSessionId ? { providerSessionId } : {}),
     };
   } finally {
     request.signal.removeEventListener("abort", abort);

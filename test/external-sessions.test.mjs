@@ -321,23 +321,55 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
     assert.equal(source.capabilities.remove, true);
     assert.deepEqual((await adapter.list({ limit: 10 })).sessions, []);
 
+    const providerSessionId = `ext_codex_${"d".repeat(24)}`;
+    let preparedCommitted = 0;
+    let preparedRolledBack = 0;
+    let preparedCwd = "";
     const created = await adapter.create({
       cwd: root,
       agentKind: "codex",
       title: "Release worker",
       launch: { model: "gpt-5.6-terra", effort: "high", sandboxMode: "read-only", serviceTier: "fast" },
+      prepare: async (cwd) => {
+        preparedCwd = cwd;
+        return {
+          providerSessionId,
+          nativeSessionId: "provider-native-thread-secret",
+          nativeLaunchMode: "resume",
+          commit: () => { preparedCommitted += 1; },
+          rollback: async () => { preparedRolledBack += 1; },
+        };
+      },
     });
     assert.equal(created.readOnly, false);
     assert.equal(created.controlMode, "live");
     assert.equal(created.session.sourceId, "runtime");
     assert.equal(created.session.agentKind, "codex");
+    assert.equal(created.session.providerSessionId, providerSessionId);
+    assert.equal(preparedCwd, realpathSync(root));
+    assert.equal(preparedCommitted, 1);
+    assert.equal(preparedRolledBack, 0);
     assert.match(created.session.id, /^ext_runtime_[a-f0-9]{24}$/);
     assert.equal(created.session.workspaceName, basename(root));
     assert.deepEqual(created.messages.map(({ role, text }) => [role, text]), [["assistant", "codex ready"]]);
     assert.deepEqual(JSON.parse(readFileSync(statePath, "utf8")).providerArgs, [
       "-c", "check_for_update_on_startup=false", "--no-alt-screen", "-a", "never", "-s", "read-only",
       "-m", "gpt-5.6-terra", "-c", 'model_reasoning_effort="high"', "-c", 'service_tier="fast"',
+      "resume", "provider-native-thread-secret",
     ]);
+    const runtimeLinks = readFileSync(join(root, ".hara", "external-sessions", "runtime-links.json"), "utf8");
+    assert.match(runtimeLinks, new RegExp(providerSessionId));
+    assert.doesNotMatch(runtimeLinks, /provider-native-thread-secret/);
+
+    const restartedAdapter = new HaraRuntimeAdapter({
+      command: process.execPath,
+      argsPrefix: [fixture],
+      timeoutMs: 3_000,
+      identityKey: Buffer.alloc(32, 23),
+      identityHome: root,
+      runtimeRoot: join(root, "runtime"),
+    });
+    assert.equal((await restartedAdapter.list({ limit: 10 })).sessions[0]?.providerSessionId, providerSessionId);
 
     const snapshot = await adapter.terminalSnapshot(created.session.id);
     assert.equal(snapshot.sessionId, created.session.id);
@@ -417,6 +449,26 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
     assert.equal(JSON.parse(readFileSync(statePath, "utf8")).closedWorkspace, "native-workspace");
     assert.deepEqual((await adapter.list({ limit: 10 })).sessions, []);
     await assert.rejects(adapter.read(created.session.id), /no longer available/);
+
+    const claudeProviderSessionId = `ext_claude_${"e".repeat(24)}`;
+    const recoveredClaude = await adapter.create({
+      cwd: root,
+      agentKind: "claude",
+      title: "Recovered Claude worker",
+      launch: { permissionMode: "acceptEdits" },
+      prepare: async () => ({
+        providerSessionId: claudeProviderSessionId,
+        nativeSessionId: "provider-native-claude-secret",
+        nativeLaunchMode: "resume",
+        commit: () => {},
+        rollback: async () => {},
+      }),
+    });
+    assert.equal(recoveredClaude.session.providerSessionId, claudeProviderSessionId);
+    assert.deepEqual(JSON.parse(readFileSync(statePath, "utf8")).providerArgs, [
+      "--permission-mode", "acceptEdits", "--resume", "provider-native-claude-secret",
+    ]);
+    await adapter.remove(recoveredClaude.session.id);
   } finally {
     if (existsSync(statePath)) {
       const state = JSON.parse(readFileSync(statePath, "utf8"));
@@ -465,6 +517,115 @@ test("one incompatible external adapter degrades locally instead of failing the 
   assert.equal(codex?.reason, "probe_failed");
   assert.equal(codex?.capabilities.listMetadata, false);
   assert.doesNotMatch(JSON.stringify(result), /code 2|exited before replying/i);
+});
+
+test("the registry joins Hara Live to provider recovery and resolves exact terminal resumes internally", async () => {
+  const runtimeId = `ext_runtime_${"a".repeat(24)}`;
+  const recoveredRuntimeId = `ext_runtime_${"c".repeat(24)}`;
+  const providerId = `ext_codex_${"b".repeat(24)}`;
+  const events = [];
+  let runtimeCreates = 0;
+  const capabilities = {
+    listMetadata: true,
+    read: true,
+    create: true,
+    fork: false,
+    resume: true,
+    observeLive: true,
+    submit: true,
+    steer: false,
+    interrupt: true,
+  };
+  const runtime = {
+    id: "runtime",
+    async inspect() { return { id: "runtime", label: "Hara Live", state: "ready", capabilities }; },
+    async list() { return { sessions: [] }; },
+    async create(input) {
+      const prepared = await input.prepare("/tmp");
+      events.push(["prepared", prepared.providerSessionId]);
+      prepared.commit();
+      runtimeCreates += 1;
+      return {
+        session: {
+          id: runtimeCreates === 1 ? runtimeId : recoveredRuntimeId,
+          sourceId: "runtime",
+          providerSessionId: prepared.providerSessionId,
+        },
+        messages: [], readOnly: false, controlMode: "live",
+      };
+    },
+  };
+  const codex = {
+    id: "codex",
+    async inspect() { return { id: "codex", label: "Codex", state: "ready", capabilities }; },
+    async list() {
+      events.push(["indexed", providerId]);
+      return { sessions: [{ id: providerId }] };
+    },
+    async prepareRuntimeSession() {
+      return {
+        providerSessionId: providerId,
+        nativeSessionId: "must-stay-inside-core",
+        nativeLaunchMode: "resume",
+        commit: () => events.push(["committed", providerId]),
+        rollback: async () => events.push(["rolled-back", providerId]),
+      };
+    },
+    async prepareRuntimeContinuation(sessionId, input) {
+      events.push(["continued", sessionId, input.cwd]);
+      return {
+        providerSessionId: sessionId,
+        nativeSessionId: "must-stay-inside-core",
+        nativeLaunchMode: "resume",
+        commit: () => events.push(["continuation-committed", sessionId]),
+        rollback: async () => events.push(["continuation-rolled-back", sessionId]),
+      };
+    },
+    async resumeInTerminal(sessionId) {
+      events.push(["resumed", sessionId]);
+      return { sessionId, sourceId: "codex", code: 0, signal: null };
+    },
+  };
+  const registry = new ExternalSessionRegistry({
+    haraVersion: "0.0.0-test",
+    adapters: [runtime, codex],
+  });
+  const created = await registry.createSession({ sourceId: "runtime", cwd: "/tmp", agentKind: "codex" });
+  assert.equal(created.session.providerSessionId, providerId);
+  await assert.rejects(
+    registry.recoverRuntimeSession({
+      sourceId: "runtime",
+      cwd: "/tmp",
+      agentKind: "claude",
+      providerSessionId: providerId,
+    }),
+    /does not match/,
+  );
+  const recovered = await registry.recoverRuntimeSession({
+    sourceId: "runtime",
+    cwd: "/tmp",
+    agentKind: "codex",
+    providerSessionId: providerId,
+  });
+  assert.equal(recovered.session.id, recoveredRuntimeId);
+  assert.equal(recovered.session.providerSessionId, providerId);
+  assert.deepEqual(await registry.resumeInTerminal(providerId), {
+    sessionId: providerId,
+    sourceId: "codex",
+    code: 0,
+    signal: null,
+  });
+  assert.deepEqual(events, [
+    ["prepared", providerId],
+    ["committed", providerId],
+    ["indexed", providerId],
+    ["continued", providerId, "/tmp"],
+    ["prepared", providerId],
+    ["continuation-committed", providerId],
+    ["indexed", providerId],
+    ["resumed", providerId],
+  ]);
+  assert.doesNotMatch(JSON.stringify({ created, events }), /must-stay-inside-core/);
 });
 
 test("Codex App Server metadata is normalized and provider cursors remain server-owned", async () => {
@@ -568,6 +729,83 @@ test("Codex App Server metadata is normalized and provider cursors remain server
     assert.equal(statSync(identityPath).mode & 0o777, 0o600);
     const identityFile = readFileSync(identityPath, "utf8");
     assert.doesNotMatch(identityFile, /019-provider-native|\/Users\/example\/work|secret-project/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Hara pre-creates one persistent Codex thread and resumes it from only the opaque id", {
+  skip: process.platform === "win32" ? "attached POSIX provider fixture" : false,
+}, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-external-codex-recovery-"));
+  try {
+    const resumeArgsPath = join(root, "resume-args.json");
+    const fixture = join(root, "fake-codex-recovery.mjs");
+    writeFileSync(fixture, `
+      import { writeFileSync } from "node:fs";
+      import { createInterface } from "node:readline";
+      const args = process.argv.slice(2);
+      if (args.includes("--version")) {
+        process.stdout.write("codex-cli 9.9.9\\n");
+      } else if (args[0] === "resume") {
+        writeFileSync(${JSON.stringify(resumeArgsPath)}, JSON.stringify(args));
+      } else {
+        const lines = createInterface({ input: process.stdin });
+        const reply = (id, result) => process.stdout.write(JSON.stringify({ id, result }) + "\\n");
+        lines.on("line", (line) => {
+          const request = JSON.parse(line);
+          if (request.method === "initialize") reply(request.id, { userAgent: "fixture" });
+          if (request.method === "thread/start") reply(request.id, { thread: {
+            id: "provider-native-thread-secret", cwd: request.params.cwd, name: "Hara worker",
+            createdAt: 1780000000, updatedAt: 1780000000, status: { type: "idle" },
+            source: "appServer", ephemeral: false
+          } });
+        });
+      }
+    `);
+    const added = [];
+    const adapter = new CodexAppServerAdapter({
+      command: process.execPath,
+      argsPrefix: [fixture],
+      timeoutMs: 3_000,
+      haraVersion: "0.0.0-test",
+      identityKey: Buffer.alloc(32, 31),
+      ownership: { has: () => false, add: (sourceId, sessionId) => added.push([sourceId, sessionId]) },
+      managedDaemon: false,
+    });
+    const prepared = await adapter.prepareRuntimeSession({
+      cwd: root,
+      agentKind: "codex",
+      launch: { sandboxMode: "workspace-write", effort: "high" },
+    });
+    assert.match(prepared.providerSessionId, /^ext_codex_[a-f0-9]{24}$/);
+    prepared.commit();
+    assert.deepEqual(added, [["codex", prepared.providerSessionId]]);
+    const continuation = await adapter.prepareRuntimeContinuation(prepared.providerSessionId, {
+      cwd: root,
+      agentKind: "codex",
+      launch: { sandboxMode: "workspace-write" },
+    });
+    assert.equal(continuation.nativeLaunchMode, "resume");
+    assert.equal(continuation.nativeSessionId, "provider-native-thread-secret");
+    await continuation.rollback();
+    await assert.rejects(
+      adapter.prepareRuntimeContinuation(prepared.providerSessionId, {
+        cwd: join(root, "other"),
+        agentKind: "codex",
+      }),
+      /different workspace/,
+    );
+
+    const resumed = await adapter.resumeInTerminal(prepared.providerSessionId);
+    assert.deepEqual(resumed, {
+      sessionId: prepared.providerSessionId,
+      sourceId: "codex",
+      code: 0,
+      signal: null,
+    });
+    assert.deepEqual(JSON.parse(readFileSync(resumeArgsPath, "utf8")), ["resume", "provider-native-thread-secret"]);
+    assert.doesNotMatch(JSON.stringify(resumed), /provider-native-thread-secret/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -908,6 +1146,18 @@ test("Claude official Agent SDK resumes the selected original session without a 
   const listed = await adapter.list({ limit: 10 });
   const sourceId = listed.sessions[0].id;
   assert.match(listed.sessions[1].title, /^Claude session · [A-F0-9]{6}$/);
+  const continuation = await adapter.prepareRuntimeContinuation(sourceId, {
+    cwd: source.cwd,
+    agentKind: "claude",
+    launch: { permissionMode: "acceptEdits" },
+  });
+  assert.equal(continuation.nativeLaunchMode, "resume");
+  assert.equal(continuation.nativeSessionId, source.sessionId);
+  await continuation.rollback();
+  await assert.rejects(
+    adapter.prepareRuntimeContinuation(sourceId, { cwd: "/workspace/other", agentKind: "claude" }),
+    /different workspace/,
+  );
   const read = await adapter.read(sourceId);
   assert.equal(read.readOnly, true);
   assert.deepEqual(read.messages.map((message) => message.text), ["question", "answer"]);

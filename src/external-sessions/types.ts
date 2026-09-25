@@ -85,6 +85,12 @@ export interface ExternalSessionInfo {
   origin?: "cli" | "vscode" | "exec" | "appServer" | "subAgent" | "haraRuntime" | "unknown";
   /** Present for Hara Live relay sessions; never inferred from transcript text. */
   agentKind?: ExternalRuntimeAgentKind | "other";
+  /**
+   * Present only when Hara Live pre-created the provider conversation. This is another Hara-owned
+   * opaque digest, never the provider-native thread/session id. It remains usable after the live
+   * terminal ends, including after a computer restart.
+   */
+  providerSessionId?: string;
   ephemeral: boolean;
 }
 
@@ -159,6 +165,11 @@ export interface ExternalSessionCreateInput {
   agentKind: ExternalRuntimeAgentKind;
   title?: string;
   launch?: ExternalRuntimeLaunchOptions;
+}
+
+/** Core-only request to rebuild a lost Hara Live terminal around the same provider conversation. */
+export interface ExternalRuntimeRecoverInput extends ExternalSessionCreateInput {
+  providerSessionId: string;
 }
 
 export interface ExternalTerminalSnapshot {
@@ -241,11 +252,39 @@ export interface ExternalSessionAdapterPage {
   nextCursor?: string;
 }
 
+/** Core-only launch material. Native ids and lifecycle callbacks must never cross Serve. */
+export interface ExternalRuntimePreparedSession {
+  providerSessionId: string;
+  nativeSessionId: string;
+  /** Claude creates a reserved UUID with `--session-id`; all existing conversations use resume. */
+  nativeLaunchMode: "create" | "resume";
+  commit(): void;
+  rollback(): Promise<void>;
+}
+
+/** Internal create input used by the registry to join Hara Live and a provider-native session. */
+export interface ExternalSessionAdapterCreateInput extends Omit<ExternalSessionCreateInput, "sourceId"> {
+  /** Runtime supplies the verified real path so the provider session and terminal share one cwd. */
+  prepare?: (cwd: string) => Promise<ExternalRuntimePreparedSession>;
+}
+
+export interface ExternalProviderTerminalResult {
+  sessionId: string;
+  sourceId: "codex" | "claude";
+  code: number | null;
+  signal: NodeJS.Signals | null;
+}
+
 export interface ExternalSessionAdapter {
   readonly id: ExternalSessionSourceId;
   inspect(): Promise<ExternalSessionSourceInfo>;
   list(input: { cursor?: string; limit: number; search?: string }): Promise<ExternalSessionAdapterPage>;
-  create?(input: Omit<ExternalSessionCreateInput, "sourceId">): Promise<ExternalSessionReadResult>;
+  create?(input: ExternalSessionAdapterCreateInput): Promise<ExternalSessionReadResult>;
+  prepareRuntimeSession?(input: Omit<ExternalSessionCreateInput, "sourceId">): Promise<ExternalRuntimePreparedSession>;
+  prepareRuntimeContinuation?(
+    sessionId: string,
+    input: Omit<ExternalSessionCreateInput, "sourceId">,
+  ): Promise<ExternalRuntimePreparedSession>;
   read?(sessionId: string): Promise<ExternalSessionReadResult>;
   resume?(sessionId: string): Promise<ExternalSessionReadResult>;
   fork?(sessionId: string): Promise<ExternalSessionForkResult>;
@@ -262,6 +301,7 @@ export interface ExternalSessionAdapter {
     sink: ExternalTerminalStreamSink,
   ): Promise<ExternalTerminalStream>;
   openNativeTerminal?(sessionId: string, input: ExternalNativeTerminalOpenInput): Promise<ExternalNativeTerminalResult>;
+  resumeInTerminal?(sessionId: string): Promise<ExternalProviderTerminalResult>;
   close?(): Promise<void>;
 }
 
@@ -269,6 +309,7 @@ export interface ExternalSessionService {
   listSources(): Promise<{ sources: ExternalSessionSourceInfo[] }>;
   listSessions(input?: ExternalSessionListInput): Promise<ExternalSessionListResult>;
   createSession(input: ExternalSessionCreateInput): Promise<ExternalSessionReadResult>;
+  recoverRuntimeSession(input: ExternalRuntimeRecoverInput): Promise<ExternalSessionReadResult>;
   readSession(sessionId: string): Promise<ExternalSessionReadResult>;
   resumeSession(sessionId: string): Promise<ExternalSessionReadResult>;
   forkSession(sessionId: string): Promise<ExternalSessionForkResult>;
@@ -285,7 +326,12 @@ export interface ExternalSessionService {
     sink: ExternalTerminalStreamSink,
   ): Promise<ExternalTerminalStream>;
   openNativeTerminal(sessionId: string, input: ExternalNativeTerminalOpenInput): Promise<ExternalNativeTerminalResult>;
+  /** Resolve a Hara opaque id inside Core and inherit the current terminal into the exact provider session. */
+  resumeInTerminal(sessionId: string): Promise<ExternalProviderTerminalResult>;
   close(): Promise<void>;
 }
 
 export class ExternalSessionInputError extends Error {}
+
+/** A typed signal that only means the Hara Live terminal identity is authoritatively gone. */
+export class ExternalRuntimeSessionGoneError extends ExternalSessionInputError {}

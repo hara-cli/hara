@@ -516,7 +516,10 @@ test("Serve routes approved Codex Agents through one isolated Hara Live continua
       runtimeCwd = input.cwd;
       return { session: { id: runtimeId }, messages: [], readOnly: false, controlMode: "live" };
     },
-    async readSession(id) { calls.push(["read", id]); },
+    async readSession(id) {
+      calls.push(["read", id]);
+      return { session: { id }, messages: [], readOnly: false, controlMode: "live" };
+    },
     async submit(id, text) {
       calls.push(["submit", id, text]);
       return { sessionId: id, turnId: `turn-${calls.length}`, status: "completed", reply: "reviewed" };

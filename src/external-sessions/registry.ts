@@ -12,9 +12,11 @@ import {
   type ExternalSessionListInput,
   type ExternalSessionListResult,
   type ExternalSessionReadResult,
+  type ExternalRuntimeRecoverInput,
   type ExternalSessionService,
   type ExternalSessionSourceInfo,
   type ExternalSessionSourceId,
+  type ExternalProviderTerminalResult,
   type ExternalSteerResult,
   type ExternalTerminalKey,
   type ExternalNativeTerminalOpenInput,
@@ -196,11 +198,50 @@ export class ExternalSessionRegistry implements ExternalSessionService {
     }
     const adapter = this.adapters.get(input.sourceId);
     if (!adapter?.create) throw new ExternalSessionInputError("Hara Live runtime is unavailable");
+    const providerAdapter = this.adapters.get(input.agentKind);
     return await adapter.create({
       cwd: input.cwd,
       agentKind: input.agentKind,
       ...(input.title !== undefined ? { title: input.title } : {}),
       ...(input.launch !== undefined ? { launch: input.launch } : {}),
+      ...(providerAdapter?.prepareRuntimeSession ? {
+        prepare: (cwd: string) => providerAdapter.prepareRuntimeSession!({
+          cwd,
+          agentKind: input.agentKind,
+          ...(input.title !== undefined ? { title: input.title } : {}),
+          ...(input.launch !== undefined ? { launch: input.launch } : {}),
+        }),
+      } : {}),
+    });
+  }
+
+  async recoverRuntimeSession(input: ExternalRuntimeRecoverInput): Promise<ExternalSessionReadResult> {
+    if (!input || input.sourceId !== "runtime") {
+      throw new ExternalSessionInputError("only Hara Live can recover a terminal relay session");
+    }
+    const runtimeAdapter = this.adapters.get("runtime");
+    if (!runtimeAdapter?.create) throw new ExternalSessionInputError("Hara Live runtime is unavailable");
+    const providerAdapter = this.adapterForSession(input.providerSessionId);
+    if (providerAdapter.id !== input.agentKind) {
+      throw new ExternalSessionInputError("the provider session does not match the requested coding runtime");
+    }
+    if (!providerAdapter.prepareRuntimeContinuation) {
+      throw new ExternalSessionInputError("this provider cannot restore a Hara Live terminal");
+    }
+    return await runtimeAdapter.create({
+      cwd: input.cwd,
+      agentKind: input.agentKind,
+      ...(input.title !== undefined ? { title: input.title } : {}),
+      ...(input.launch !== undefined ? { launch: input.launch } : {}),
+      prepare: async (cwd: string) => {
+        await this.indexProviderSession(input.providerSessionId, providerAdapter);
+        return await providerAdapter.prepareRuntimeContinuation!(input.providerSessionId, {
+          cwd,
+          agentKind: input.agentKind,
+          ...(input.title !== undefined ? { title: input.title } : {}),
+          ...(input.launch !== undefined ? { launch: input.launch } : {}),
+        });
+      },
     });
   }
 
@@ -316,6 +357,44 @@ export class ExternalSessionRegistry implements ExternalSessionService {
       throw new ExternalSessionInputError("this external session does not support a native terminal handoff");
     }
     return await adapter.openNativeTerminal(sessionId, input);
+  }
+
+  private async indexProviderSession(
+    sessionId: string,
+    adapter: ExternalSessionAdapter,
+  ): Promise<void> {
+    let cursor: string | undefined;
+    for (let pageNumber = 0; pageNumber < 50; pageNumber += 1) {
+      const page = await adapter.list({ limit: 100, ...(cursor ? { cursor } : {}) });
+      if (page.sessions.some((session) => session.id === sessionId)) return;
+      if (!page.nextCursor) break;
+      cursor = page.nextCursor;
+    }
+    throw new ExternalSessionInputError("the provider session is no longer available on this device");
+  }
+
+  async resumeInTerminal(sessionId: string): Promise<ExternalProviderTerminalResult> {
+    let targetId = sessionId;
+    let adapter = this.adapterForSession(targetId);
+    if (adapter.id === "runtime") {
+      if (!adapter.read) throw new ExternalSessionInputError("the Hara Live session cannot be inspected");
+      const live = await adapter.read(targetId);
+      if (!live.session.providerSessionId) {
+        throw new ExternalSessionInputError(
+          "this older Hara Live session has no persistent provider recovery link; use its live terminal while it remains available",
+        );
+      }
+      targetId = live.session.providerSessionId;
+      adapter = this.adapterForSession(targetId);
+    }
+    if (adapter.id !== "codex" && adapter.id !== "claude") {
+      throw new ExternalSessionInputError("this external session does not have a provider terminal");
+    }
+    if (!adapter.resumeInTerminal) {
+      throw new ExternalSessionInputError("this provider does not support terminal recovery");
+    }
+    await this.indexProviderSession(targetId, adapter);
+    return await adapter.resumeInTerminal(targetId);
   }
 
   async close(): Promise<void> {

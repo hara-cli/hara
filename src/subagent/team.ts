@@ -38,6 +38,7 @@ const COMMIT = /^[0-9a-f]{40,64}$/u;
 const WORKSPACE_ID = /^aw_[a-f0-9]{40}$/u;
 const PATCH_HASH = /^[a-f0-9]{64}$/u;
 const RUNTIME_SESSION_ID = /^ext_runtime_[a-f0-9]{24}$/u;
+const PROVIDER_SESSION_ID = /^ext_(codex|claude)_[a-f0-9]{24}$/u;
 const MAX_DIFF_PATHS = 256;
 
 export type AgentWorkspaceMode = "read-only" | "isolated-write";
@@ -196,6 +197,7 @@ interface AgentTeamRecord {
   runtime: AgentRuntime;
   runtimeGrants: AgentCodingRuntime[];
   runtimeSessionId?: string;
+  providerSessionId?: string;
   status: AgentTeamStatus;
   generation: number;
   assignment: string;
@@ -281,6 +283,11 @@ export interface AgentTeamAgentView {
   role?: string;
   runtime: AgentRuntime;
   runtimeGrants: AgentCodingRuntime[];
+  /** Hara-owned opaque continuation id. Lets trusted clients reopen the exact coding session without
+   * exposing the provider-native thread/session id. */
+  runtimeSessionId?: string;
+  /** Hara-owned provider-history id. Unlike the live runtime id, this survives a terminal or device restart. */
+  providerSessionId?: string;
   status: AgentTeamStatus;
   generation: number;
   createdAt: string;
@@ -311,6 +318,8 @@ export interface AgentTeamExecutionResult {
   metrics?: AgentTeamExecutionMetrics;
   /** Opaque Hara-owned continuation id for a Codex/Claude runtime. Provider-native ids stay hidden. */
   runtimeSessionId?: string;
+  /** Opaque Hara-owned id for exact provider-native recovery after the live terminal is gone. */
+  providerSessionId?: string;
 }
 
 export interface AgentTeamExecutionRequest {
@@ -321,6 +330,7 @@ export interface AgentTeamExecutionRequest {
   generation: number;
   runtime: AgentRuntime;
   runtimeSessionId?: string;
+  providerSessionId?: string;
   task: string;
   signal: AbortSignal;
   controller: AgentTeamController;
@@ -810,6 +820,15 @@ function parseRecord(value: unknown): AgentTeamRecord {
   if (runtime === "hara" && value.runtimeSessionId !== undefined) {
     throw new Error("agent runtime session ownership is invalid");
   }
+  if (value.providerSessionId !== undefined) {
+    const providerSessionId = String(value.providerSessionId);
+    if (!PROVIDER_SESSION_ID.test(providerSessionId) || !providerSessionId.startsWith(`ext_${runtime}_`)) {
+      throw new Error("agent provider session id is invalid");
+    }
+  }
+  if (runtime === "hara" && value.providerSessionId !== undefined) {
+    throw new Error("agent provider session ownership is invalid");
+  }
   const runtimeGrants = normalizeRuntimeGrants(value.runtimeGrants);
   if (runtime !== "hara" && runtimeGrants.length > 0) {
     throw new Error("external coding Agents cannot re-delegate coding runtimes");
@@ -866,6 +885,7 @@ function parseRecord(value: unknown): AgentTeamRecord {
     runtime: runtime as AgentRuntime,
     runtimeGrants,
     ...(value.runtimeSessionId !== undefined ? { runtimeSessionId: String(value.runtimeSessionId) } : {}),
+    ...(value.providerSessionId !== undefined ? { providerSessionId: String(value.providerSessionId) } : {}),
     status: value.status as AgentTeamStatus,
     generation: Number(value.generation),
     assignment: value.assignment,
@@ -1033,6 +1053,8 @@ function viewOf(record: AgentTeamRecord): AgentTeamAgentView {
     ...(record.role ? { role: record.role } : {}),
     runtime: record.runtime,
     runtimeGrants: [...record.runtimeGrants],
+    ...(record.runtimeSessionId ? { runtimeSessionId: record.runtimeSessionId } : {}),
+    ...(record.providerSessionId ? { providerSessionId: record.providerSessionId } : {}),
     status: record.status,
     generation: record.generation,
     createdAt: record.createdAt,
@@ -2071,6 +2093,7 @@ export class DurableAgentTeam {
         generation,
         runtime: working.runtime,
         ...(working.runtimeSessionId ? { runtimeSessionId: working.runtimeSessionId } : {}),
+        ...(working.providerSessionId ? { providerSessionId: working.providerSessionId } : {}),
         task,
         signal: controller.signal,
         controller: this.controller(working.path, {
@@ -2174,6 +2197,16 @@ export class DurableAgentTeam {
           throw new Error("Agent executor returned an invalid runtime session");
         }
         record.runtimeSessionId = result.runtimeSessionId;
+      }
+      if (result.providerSessionId !== undefined) {
+        if (
+          record.runtime === "hara"
+          || !PROVIDER_SESSION_ID.test(result.providerSessionId)
+          || !result.providerSessionId.startsWith(`ext_${record.runtime}_`)
+        ) {
+          throw new Error("Agent executor returned an invalid provider session");
+        }
+        record.providerSessionId = result.providerSessionId;
       }
       const output = safeResultText(result.text, MAX_RESULT_CHARS);
       const error = safeResultText(result.error, MAX_RESULT_CHARS);

@@ -223,6 +223,14 @@ test("serve persists the simplified Agent directory and runs the selected person
     assert.ok(catalog.result.agents.some((agent) => agent.ref === "beta:designer"));
     assert.equal(catalog.result.offices, undefined);
     assert.equal(catalog.result.currentOfficeId, undefined);
+    const mainAgent = catalog.result.agents.find((agent) => agent.ref === "main");
+    assert.equal(mainAgent.systemRole, "root_orchestrator");
+    assert.deepEqual(mainAgent.coordination, {
+      runtimes: ["hara", "codex", "claude"],
+      durableRuntimeSessions: true,
+    });
+    assert.deepEqual(mainAgent.allowedActions, ["chat", "edit_profile"]);
+    assert.ok(!mainAgent.allowedActions.includes("archive"));
     const architectIdentity = catalog.result.agents.find((agent) => agent.ref === "global:architect").identity;
     assert.equal(architectIdentity.displayName, "Ada");
     assert.equal(architectIdentity.title, "Systems Architect");
@@ -273,7 +281,6 @@ test("serve persists the simplified Agent directory and runs the selected person
     });
     assert.equal(staleUpdate.error.code, -32005);
 
-    const mainAgent = catalog.result.agents.find((agent) => agent.ref === "main");
     const rejectedMainExecution = await client.call("agents.update-profile", {
       ref: "main",
       expectedRevision: mainAgent.revision,

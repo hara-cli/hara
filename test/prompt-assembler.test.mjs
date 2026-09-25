@@ -167,3 +167,11 @@ test("gateway prompt identifies the actual execution host and treats location co
     else process.env.HARA_GATEWAY = originalGateway;
   }
 });
+
+test("the main Hara prompt owns orchestration and durable Codex / Claude Code continuity", () => {
+  const prompt = composeSystem("/workspace/project").text;
+  assert.match(prompt, /permanent root orchestrator/);
+  assert.match(prompt, /Codex and Claude Code are supervised coding runtimes/);
+  assert.match(prompt, /continue that same durable Agent/);
+  assert.match(prompt, /provider CLI's\s+own resume history/);
+});

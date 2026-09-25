@@ -12,11 +12,15 @@ import {
   type ExternalCommandOptions,
 } from "./process.js";
 import { HerdrTerminalStream } from "./terminal-stream.js";
+import { ExternalRuntimeLinkStore } from "./identity.js";
 import {
   ExternalSessionInputError,
+  ExternalRuntimeSessionGoneError,
   type ExternalRuntimeAgentKind,
   type ExternalRuntimeLaunchOptions,
+  type ExternalRuntimePreparedSession,
   type ExternalSessionAdapter,
+  type ExternalSessionAdapterCreateInput,
   type ExternalSessionAdapterPage,
   type ExternalSessionInfo,
   type ExternalSessionMessage,
@@ -165,6 +169,8 @@ const isServerAbsent = (result: ExternalCommandCaptureResult): boolean => (
 const launchArguments = (
   agentKind: ExternalRuntimeAgentKind,
   input: ExternalRuntimeLaunchOptions | undefined,
+  nativeSessionId?: string,
+  nativeLaunchMode?: ExternalRuntimePreparedSession["nativeLaunchMode"],
 ): string[] => {
   const launch = input ?? {};
   if (launch.model !== undefined && !SAFE_MODEL_ID.test(launch.model)) {
@@ -193,6 +199,10 @@ const launchArguments = (
     if (launch.model) args.push("-m", launch.model);
     if (launch.effort) args.push("-c", `model_reasoning_effort=\"${launch.effort}\"`);
     if (launch.serviceTier === "fast") args.push("-c", "service_tier=\"fast\"");
+    if (nativeSessionId) {
+      if (nativeLaunchMode !== "resume") throw new ExternalSessionInputError("Codex native session launch mode is invalid");
+      args.push("resume", nativeSessionId);
+    }
     return args;
   }
 
@@ -208,6 +218,11 @@ const launchArguments = (
   const args = ["--permission-mode", launch.permissionMode ?? "acceptEdits"];
   if (launch.model) args.push("--model", launch.model);
   if (launch.effort) args.push("--effort", launch.effort);
+  if (nativeSessionId) {
+    if (nativeLaunchMode === "resume") args.push("--resume", nativeSessionId);
+    else if (nativeLaunchMode === "create") args.push("--session-id", nativeSessionId);
+    else throw new ExternalSessionInputError("Claude Code native session launch mode is invalid");
+  }
   return args;
 };
 
@@ -217,6 +232,7 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
   private readonly runtimeRoot: string;
   private readonly refs = new Map<string, RuntimeRef>();
   private readonly firstSeen = new Map<string, string>();
+  private readonly links: ExternalRuntimeLinkStore;
   private readonly running = new Map<string, RunningTurn>();
   private readonly terminalStreams = new Set<ExternalTerminalStream>();
   private serverStart?: Promise<boolean>;
@@ -242,6 +258,7 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
     };
     this.runtimeRoot = options.runtimeRoot
       ?? join(options.identityHome ?? homedir(), ".hara", "external-sessions", "runtime");
+    this.links = new ExternalRuntimeLinkStore(options.identityHome);
   }
 
   async inspect(): Promise<ExternalSessionSourceInfo> {
@@ -297,6 +314,7 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
       updatedAt: now,
       origin: "haraRuntime",
       agentKind,
+      ...(this.links.get(id) ? { providerSessionId: this.links.get(id) } : {}),
       ephemeral: false,
     };
     const ref = {
@@ -348,10 +366,22 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
     const existing = this.refs.get(sessionId);
     // Pane ids are native runtime handles and may eventually be reused. Revalidate the terminal identity
     // before every operation so a stale opaque Hara id can never read from or send input to another pane.
-    if (existing) return await this.currentAgent(existing);
-    await this.listNative();
-    const discovered = this.refs.get(sessionId);
-    if (!discovered) throw new ExternalSessionInputError("Hara Live session is no longer available");
+    if (existing) {
+      try {
+        return await this.currentAgent(existing);
+      } catch {
+        // A failed point lookup is not enough to create a replacement. Confirm against the complete
+        // runtime index; only an authoritative absence becomes the typed recovery signal.
+        const listed = await this.listNative();
+        const rediscovered = listed.find((candidate) => candidate.info.id === sessionId);
+        if (rediscovered) return await this.currentAgent(rediscovered);
+        this.refs.delete(sessionId);
+        throw new ExternalRuntimeSessionGoneError("Hara Live session is no longer available");
+      }
+    }
+    const listed = await this.listNative();
+    const discovered = listed.find((candidate) => candidate.info.id === sessionId);
+    if (!discovered) throw new ExternalRuntimeSessionGoneError("Hara Live session is no longer available");
     return await this.currentAgent(discovered);
   }
 
@@ -492,12 +522,7 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
     return started;
   }
 
-  async create(input: {
-    cwd: string;
-    agentKind: ExternalRuntimeAgentKind;
-    title?: string;
-    launch?: ExternalRuntimeLaunchOptions;
-  }): Promise<ExternalSessionReadResult> {
+  async create(input: ExternalSessionAdapterCreateInput): Promise<ExternalSessionReadResult> {
     if (!isAbsolute(input.cwd)) throw new ExternalSessionInputError("runtime workspace must be an absolute directory");
     let cwd: string;
     try {
@@ -525,8 +550,20 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
       : "";
     if (!paneId || !workspaceId) throw new Error("Hara Live could not create a workspace");
 
+    let prepared: ExternalRuntimePreparedSession | undefined;
+    try {
+      prepared = await input.prepare?.(cwd);
+    } catch {
+      await runExternalCommandCapture(this.command, ["workspace", "close", workspaceId], { timeoutMs: 5_000 });
+      throw new Error(`Hara Live could not prepare a persistent ${input.agentKind === "codex" ? "Codex" : "Claude Code"} session`);
+    }
     const name = `hara-${input.agentKind}-${randomBytes(3).toString("hex")}`;
-    const providerArgs = launchArguments(input.agentKind, input.launch);
+    const providerArgs = launchArguments(
+      input.agentKind,
+      input.launch,
+      prepared?.nativeSessionId,
+      prepared?.nativeLaunchMode,
+    );
     const started = await runExternalCommandCapture(this.command, [
       "agent", "start", name,
       "--kind", input.agentKind,
@@ -540,11 +577,27 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
       // This workspace was created by the current operation and has never held user work, so closing it
       // is a safe rollback. Failure to roll back is intentionally ignored; the runtime remains inspectable.
       await runExternalCommandCapture(this.command, ["workspace", "close", workspaceId], { timeoutMs: 5_000 });
+      await prepared?.rollback().catch(() => undefined);
       const safeReason = started.ok ? "invalid_response" : started.errorCode ?? "command_failed";
       throw new Error(`Hara Live could not start ${input.agentKind === "codex" ? "Codex" : "Claude Code"} (${safeReason})`);
     }
     const ref = this.remember(agent as HerdrAgent);
-    if (!ref) throw new Error("Hara Live returned an invalid agent session");
+    if (!ref) {
+      await prepared?.rollback().catch(() => undefined);
+      throw new Error("Hara Live returned an invalid agent session");
+    }
+    if (prepared) {
+      try {
+        prepared.commit();
+        this.links.set(ref.info.id, prepared.providerSessionId);
+        ref.info = { ...ref.info, providerSessionId: prepared.providerSessionId };
+        this.refs.set(ref.info.id, ref);
+      } catch {
+        // The provider process is already live. Preserve the usable terminal, but never claim durable
+        // recovery unless both ownership and the opaque link were committed successfully.
+        ref.info = { ...ref.info };
+      }
+    }
     return await this.read(ref.info.id);
   }
 

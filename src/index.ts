@@ -3644,6 +3644,68 @@ program
     }
   });
 
+const codingCmd = program.command("coding").description(
+  "inspect and recover Codex / Claude Code sessions through Hara-owned opaque ids",
+);
+
+codingCmd
+  .command("sessions")
+  .alias("ls")
+  .description("list provider sessions that can be resumed without exposing native session ids")
+  .option("--provider <codex|claude>", "show only one provider")
+  .action(async (localOpts: { provider?: string }) => {
+    const requested = localOpts.provider?.trim().toLowerCase();
+    if (requested && requested !== "codex" && requested !== "claude") {
+      out(c.red("Provider must be 'codex' or 'claude'.\n"));
+      process.exitCode = 2;
+      return;
+    }
+    const service = createExternalSessionRegistry({ haraVersion: HARA_RUNTIME_VERSION });
+    try {
+      const sourceIds = requested ? [requested as "codex" | "claude"] : ["codex", "claude"] as const;
+      let shown = 0;
+      for (const sourceId of sourceIds) {
+        const result = await service.listSessions({ sourceId, limit: 100 });
+        for (const session of result.sessions) {
+          shown += 1;
+          out(`${c.bold(session.id)}  ${c.dim(session.updatedAt.slice(0, 16).replace("T", " "))}  ${c.dim(sourceId)}  ${session.title}\n`);
+          out(`          ${c.dim(session.workspaceName)}\n`);
+        }
+        if (result.page.hasMore) out(c.dim(`(${sourceId}: showing the 100 most recent sessions)\n`));
+      }
+      if (!shown) out(c.dim("No recoverable Codex or Claude Code sessions were found on this device.\n"));
+      else out(c.dim("\nResume exactly:  hara coding resume <opaque-id>\n"));
+    } catch (error) {
+      const message = redactSensitiveText(error instanceof Error ? error.message : String(error)).text;
+      out(c.red(`Could not list coding sessions: ${message || "provider session index is unavailable"}\n`));
+      process.exitCode = 1;
+    } finally {
+      await service.close().catch(() => undefined);
+    }
+  });
+
+codingCmd
+  .command("resume <id>")
+  .description("open the exact provider session in this terminal from a Hara opaque id")
+  .action(async (sessionId: string) => {
+    const service = createExternalSessionRegistry({ haraVersion: HARA_RUNTIME_VERSION });
+    try {
+      const result = await service.resumeInTerminal(sessionId);
+      if (result.signal) {
+        out(c.yellow(`${result.sourceId === "codex" ? "Codex" : "Claude Code"} stopped by ${result.signal}.\n`));
+        process.exitCode = 1;
+      } else if (result.code) {
+        process.exitCode = result.code;
+      }
+    } catch (error) {
+      const message = redactSensitiveText(error instanceof Error ? error.message : String(error)).text;
+      out(c.red(`Could not resume coding session: ${message || "provider session is unavailable"}\n`));
+      process.exitCode = 1;
+    } finally {
+      await service.close().catch(() => undefined);
+    }
+  });
+
 program
   .command("org <task...>")
   .description("dispatch a task to the owning role and run it (--review loops a reviewer until it approves)")

@@ -1,11 +1,12 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import { redactSensitiveText } from "../security/secrets.js";
-import type { ExternalSessionOwnershipStore } from "./identity.js";
+import { opaqueProviderSessionId, type ExternalSessionOwnershipStore } from "./identity.js";
 import {
   ExternalJsonlRpcRequestError,
   JsonlRpcClient,
   probeExternalCommand,
+  runExternalCommandAttached,
   runExternalCommandStatus,
   runJsonlRpcSequence,
   type ExternalCommandOptions,
@@ -17,7 +18,10 @@ import type {
   ExternalSessionForkResult,
   ExternalSessionInfo,
   ExternalSessionMessage,
+  ExternalSessionAdapterCreateInput,
+  ExternalProviderTerminalResult,
   ExternalSessionReadResult,
+  ExternalRuntimePreparedSession,
   ExternalSessionSourceInfo,
   ExternalSteerResult,
   ExternalTurnResult,
@@ -126,7 +130,7 @@ const externalThread = (value: unknown, identityKey: Buffer): CodexNativeRef | n
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const thread = value as CodexThread;
   if (typeof thread.id !== "string" || !thread.id || typeof thread.cwd !== "string" || !thread.cwd) return null;
-  const id = `ext_codex_${digest("session", thread.id, identityKey)}`;
+  const id = opaqueProviderSessionId("codex", thread.id, identityKey);
   const workspaceName = basename(thread.cwd) || "Workspace";
   const info: ExternalSessionInfo = {
     id,
@@ -325,6 +329,97 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
     const ref = this.refs.get(sessionId);
     if (!ref) throw new Error("external Codex session is no longer in the current device index; refresh the list");
     return ref;
+  }
+
+  async prepareRuntimeSession(
+    input: Omit<ExternalSessionAdapterCreateInput, "prepare">,
+  ): Promise<ExternalRuntimePreparedSession> {
+    const launch = input.launch ?? {};
+    const result = await runJsonlRpcSequence<CodexThreadResponse>({
+      ...this.options,
+      appServerArgs: await this.appServerArgs(),
+      timeoutMs: this.options.timeoutMs ?? 30_000,
+      requests: this.initializeRequests({
+        id: 2,
+        method: "thread/start",
+        params: {
+          cwd: input.cwd,
+          approvalPolicy: "never",
+          approvalsReviewer: "user",
+          sandbox: launch.sandboxMode ?? "workspace-write",
+          ephemeral: false,
+          ...(launch.model ? { model: launch.model } : {}),
+          ...(launch.serviceTier ? { serviceTier: launch.serviceTier } : {}),
+          ...(launch.effort ? { config: { model_reasoning_effort: launch.effort } } : {}),
+        },
+      }, { experimentalApi: true }),
+      resultId: 2,
+      maxOutputBytes: 16 * 1024 * 1024,
+    });
+    const mapped = externalThread(result.thread, this.options.identityKey);
+    if (!mapped || mapped.cwd !== input.cwd) {
+      throw new Error("Codex did not create the requested persistent session");
+    }
+    this.refs.set(mapped.info.id, mapped);
+    let settled = false;
+    return {
+      providerSessionId: mapped.info.id,
+      nativeSessionId: mapped.nativeId,
+      nativeLaunchMode: "resume",
+      commit: () => {
+        if (settled) return;
+        settled = true;
+        mapped.owned = true;
+        this.options.ownership?.add("codex", mapped.info.id);
+      },
+      rollback: async () => {
+        if (settled) return;
+        settled = true;
+        this.refs.delete(mapped.info.id);
+        await runJsonlRpcSequence<Record<string, never>>({
+          ...this.options,
+          appServerArgs: await this.appServerArgs(),
+          timeoutMs: this.options.timeoutMs ?? 30_000,
+          requests: this.initializeRequests({
+            id: 2,
+            method: "thread/delete",
+            params: { threadId: mapped.nativeId },
+          }, { experimentalApi: true }),
+          resultId: 2,
+          maxOutputBytes: 4 * 1024 * 1024,
+        }).then(() => undefined, () => undefined);
+      },
+    };
+  }
+
+  async prepareRuntimeContinuation(
+    sessionId: string,
+    input: Omit<ExternalSessionAdapterCreateInput, "prepare">,
+  ): Promise<ExternalRuntimePreparedSession> {
+    const ref = this.ref(sessionId);
+    if (ref.cwd !== input.cwd) {
+      throw new Error("the saved Codex session belongs to a different workspace");
+    }
+    let committed = false;
+    return {
+      providerSessionId: sessionId,
+      nativeSessionId: ref.nativeId,
+      nativeLaunchMode: "resume",
+      commit: () => {
+        if (committed) return;
+        committed = true;
+        ref.owned = true;
+        this.options.ownership?.add("codex", sessionId);
+      },
+      // Recovery never owns creation of the provider history, so a failed terminal launch must not delete it.
+      rollback: async () => undefined,
+    };
+  }
+
+  async resumeInTerminal(sessionId: string): Promise<ExternalProviderTerminalResult> {
+    const ref = this.ref(sessionId);
+    const result = await runExternalCommandAttached(this.options, ["resume", ref.nativeId], { cwd: ref.cwd });
+    return { sessionId, sourceId: "codex", ...result };
   }
 
   private initializeRequests(

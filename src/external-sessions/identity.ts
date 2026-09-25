@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import {
   bindPrivateHaraStateFile,
@@ -24,9 +24,34 @@ interface StoredExternalSessionOwnership {
   }>;
 }
 
+interface StoredExternalRuntimeLinks {
+  version: 1;
+  links: Array<{
+    runtimeSessionId: string;
+    providerSessionId: string;
+    createdAt: string;
+  }>;
+}
+
 const MAX_OWNED_SESSIONS = 5_000;
 const MAX_OWNERSHIP_FILE_BYTES = 2 * 1024 * 1024;
 const OPAQUE_ID = /^ext_(codex|claude)_[a-f0-9]{24}$/;
+const RUNTIME_OPAQUE_ID = /^ext_runtime_[a-f0-9]{24}$/;
+const MAX_RUNTIME_LINKS = 5_000;
+const MAX_RUNTIME_LINKS_FILE_BYTES = 2 * 1024 * 1024;
+
+/** Derive the renderer-safe id used by the matching provider adapter. */
+export function opaqueProviderSessionId(
+  sourceId: "codex" | "claude",
+  nativeSessionId: string,
+  identityKey: Buffer,
+): string {
+  const digest = createHmac("sha256", identityKey)
+    .update(`hara.external.${sourceId}.session\0${nativeSessionId}`, "utf8")
+    .digest("hex")
+    .slice(0, 24);
+  return `ext_${sourceId}_${digest}`;
+}
 
 const decodeIdentity = (text: string): Buffer => {
   let parsed: unknown;
@@ -133,5 +158,78 @@ export class ExternalSessionOwnershipStore {
       this.owned.clear();
       for (const entry of next.sessions) this.owned.add(entry.id);
     }, { busyMessage: "external session ownership registry is busy; retry the operation" });
+  }
+}
+
+const parseRuntimeLinks = (text: string): StoredExternalRuntimeLinks => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("external runtime link registry is invalid JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("external runtime link registry has an invalid shape");
+  }
+  const value = parsed as Partial<StoredExternalRuntimeLinks>;
+  if (value.version !== 1 || !Array.isArray(value.links) || value.links.length > MAX_RUNTIME_LINKS) {
+    throw new Error("external runtime link registry is invalid");
+  }
+  const links: StoredExternalRuntimeLinks["links"] = [];
+  const seen = new Set<string>();
+  for (const entry of value.links) {
+    if (
+      !entry
+      || typeof entry !== "object"
+      || !RUNTIME_OPAQUE_ID.test(entry.runtimeSessionId)
+      || !OPAQUE_ID.test(entry.providerSessionId)
+      || typeof entry.createdAt !== "string"
+      || Number.isNaN(Date.parse(entry.createdAt))
+      || seen.has(entry.runtimeSessionId)
+    ) throw new Error("external runtime link registry contains an invalid entry");
+    seen.add(entry.runtimeSessionId);
+    links.push({ ...entry });
+  }
+  return { version: 1, links };
+};
+
+/**
+ * Durable bridge from a live Hara terminal to provider history. Both sides are keyed opaque ids;
+ * provider-native ids and paths are deliberately never written to this file.
+ */
+export class ExternalRuntimeLinkStore {
+  private readonly links = new Map<string, string>();
+
+  constructor(private readonly home = homedir()) {
+    const binding = bindPrivateHaraStateFile(home, ["external-sessions"], "runtime-links.json");
+    const snapshot = readPrivateStateFileSnapshotSync(binding.path, MAX_RUNTIME_LINKS_FILE_BYTES);
+    if (snapshot) {
+      for (const entry of parseRuntimeLinks(snapshot.text).links) {
+        this.links.set(entry.runtimeSessionId, entry.providerSessionId);
+      }
+    }
+  }
+
+  get(runtimeSessionId: string): string | undefined {
+    return this.links.get(runtimeSessionId);
+  }
+
+  set(runtimeSessionId: string, providerSessionId: string): void {
+    if (!RUNTIME_OPAQUE_ID.test(runtimeSessionId) || !OPAQUE_ID.test(providerSessionId)) {
+      throw new Error("cannot persist an invalid external runtime link");
+    }
+    withPrivateStateLockSync(this.home, ["external-sessions"], "runtime-links", () => {
+      const binding = bindPrivateHaraStateFile(this.home, ["external-sessions"], "runtime-links.json");
+      const snapshot = readPrivateStateFileSnapshotSync(binding.path, MAX_RUNTIME_LINKS_FILE_BYTES);
+      const value = snapshot ? parseRuntimeLinks(snapshot.text) : { version: 1 as const, links: [] };
+      const links = value.links.filter((entry) => entry.runtimeSessionId !== runtimeSessionId);
+      links.push({ runtimeSessionId, providerSessionId, createdAt: new Date().toISOString() });
+      const next: StoredExternalRuntimeLinks = { version: 1, links: links.slice(-MAX_RUNTIME_LINKS) };
+      writePrivateStateFileSync(binding, `${JSON.stringify(next, null, 2)}\n`, snapshot
+        ? { expectedText: snapshot.text }
+        : { expectedMissing: true });
+      this.links.clear();
+      for (const entry of next.links) this.links.set(entry.runtimeSessionId, entry.providerSessionId);
+    }, { busyMessage: "external runtime link registry is busy; retry the operation" });
   }
 }

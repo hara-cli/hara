@@ -575,6 +575,7 @@ test("writable Agent generations stay isolated until their owned Diff is manuall
           status: "completed",
           text: "Codex implementation ready",
           runtimeSessionId: `ext_runtime_${"a".repeat(24)}`,
+          providerSessionId: `ext_codex_${"b".repeat(24)}`,
         };
       }
       assert.equal(request.runtime, "hara");
@@ -631,11 +632,26 @@ test("writable Agent generations stay isolated until their owned Diff is manuall
     assert.equal(external.runtime, "codex");
     assert.equal(external.workspace.mode, "isolated-write");
     await controller.wait(external.id, 5_000);
+    assert.equal(
+      controller.list().find((agent) => agent.id === external.id)?.runtimeSessionId,
+      `ext_runtime_${"a".repeat(24)}`,
+      "the public team view keeps an opaque link to the exact provider runtime session",
+    );
+    assert.equal(
+      controller.list().find((agent) => agent.id === external.id)?.providerSessionId,
+      `ext_codex_${"b".repeat(24)}`,
+      "the public team view keeps a separate restart-safe provider history link",
+    );
+    const persistedExternal = new AgentTeamStore(home).load(sessionId).agents
+      .find((agent) => agent.id === external.id);
+    assert.equal(persistedExternal?.runtimeSessionId, `ext_runtime_${"a".repeat(24)}`);
+    assert.equal(persistedExternal?.providerSessionId, `ext_codex_${"b".repeat(24)}`);
     await controller.followup(external.id, "continue in the same coding session");
     await controller.wait(external.id, 5_000);
     assert.equal(externalRequests.length, 2);
     assert.equal(externalRequests[0].runtimeSessionId, undefined);
     assert.equal(externalRequests[1].runtimeSessionId, `ext_runtime_${"a".repeat(24)}`);
+    assert.equal(externalRequests[1].providerSessionId, `ext_codex_${"b".repeat(24)}`);
     assert.equal(team.removeStoredState(), true);
     assert.equal(existsSync(appliedPath), false);
     assert.equal(existsSync(rejectedPath), false);

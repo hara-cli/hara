@@ -44,6 +44,125 @@ optional signed capability rather than adding its approximately 206 MB native bi
 
 ---
 
+## [LRN-20260923-003] architecture
+
+**Logged**: 2026-09-23T22:10:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: agent-runtime
+
+### Summary
+
+Provider-only context and user-authored conversation are different data planes; an internal reminder must
+remain available to the model without ever becoming a visible user message. Deterministic policy failures
+must also be grouped by root cause rather than by changing shell or Python arguments.
+
+### Resolution
+
+Serve now removes complete `<system-reminder>` envelopes from every Desktop/Mobile history projection while
+retaining them in private provider history. Desktop independently filters reminders returned by older Engines.
+The repeat guard now coalesces understanding, capability, runtime, organization, permission, and trusted-
+extension gates across command variants and stops after three unresolved attempts; a successful `task_intake`
+transition starts a fresh understanding-gate audit. Focused Engine and Desktop regressions pass locally.
+
+### Metadata
+
+- Source: user_feedback
+- Related Files: src/agent/reminders.ts, src/agent/repeat-guard.ts, src/serve/server.ts, hara-desktop/src/user-visible-text.ts
+- Tags: codex, transcript, system-context, progress, policy-gate, no-progress
+- Pattern-Key: architecture.private_model_context_and_root_cause_progress
+- Recurrence-Count: 1
+
+---
+
+## [LRN-20260923-002] correction
+
+**Logged**: 2026-09-23T21:00:00+08:00
+**Priority**: critical
+**Status**: resolved
+**Area**: backend
+
+### Summary
+
+OCR confidence and OCR readback uncertainty must not be mistaken for conversation identity changes or a
+safe-to-retry input failure. Dynamic controls must also be verified at the stage where they are usable:
+WeChat can render Send in a disabled state while the editor is empty and enable it only after text lands.
+
+### Details
+
+The local WeChat bridge included per-capture confidence decimals in its conversation digest. An unchanged
+screen could therefore produce a different digest between the managed scan and pre-send revalidation,
+pausing a correctly bound group as though the user had switched chats. On macOS 27, the visual fill path also
+used Apple's Vision OCR for Chinese readback even though the scanning path had already switched to RapidOCR;
+text could visibly land while Hara reported failure and left the same draft retryable.
+
+### Suggested Action
+
+Build safety identity only from normalized title/message content, sender and side; keep confidence as telemetry.
+Use one OCR backend for both scan and input verification on affected systems. When input events occurred but
+readback remains uncertain, consume the one-shot draft and surface a review-required result so retry cannot
+duplicate text. Preflight should prove only the empty input route; resolve and revalidate Send after the
+draft has been filled and verified.
+
+### Metadata
+
+- Source: user_feedback
+- Related Files: scripts/jev-wechat-bridge.py, src/wechat-group-scene.ts
+- Tags: wechat, ocr, digest, managed-mode, idempotency
+- Pattern-Key: computer_use.uncertain_write_must_not_remain_retryable
+- Recurrence-Count: 2
+- Last-Seen: 2026-09-24
+
+### Resolution
+
+The stable digest now excludes confidence, macOS 27 input readback uses the same RapidOCR path as scanning,
+and an attempted-but-unconfirmed fill is consumed as a review state. Managed delivery also performs a
+read-only route preflight, supports the guarded visual writer when WeChat hides its AX editor, revalidates
+title plus digest immediately before the single Send press, and pauses without retrying an uncertain result.
+The preflight now accepts a verified empty input even when Send is visible-but-disabled, then resolves the
+enabled control after the draft lands through scoped Accessibility or a single OCR-verified label.
+Real-device follow-up showed that a Unicode draft can visibly land one frame before RapidOCR catches up;
+managed delivery now performs a bounded exact readback after that uncertain writer result and proceeds only
+when the newly visible text exactly contains the draft that was written into a previously empty input.
+Controller, bridge-simulation, Serve, and Desktop regression tests passed locally; no public release is
+implied by this learning entry.
+
+---
+
+## [LRN-20260923-WECHAT-MANAGED-INBOUND-IDENTITY] best_practice
+
+**Logged**: 2026-09-23T16:40:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: wechat-group
+
+### Summary
+
+Managed chat deduplication must identify the visible incoming-message sequence, not the whole conversation
+digest. An Agent's own outgoing reply changes the whole digest and can otherwise retrigger the old incoming
+message.
+
+### Suggested Action
+
+Keep the stale-window send check on the full conversation digest, but use a separate hash of incoming
+sender/text observations for trigger deduplication. Require the newest classified visible message to be
+incoming before claiming an automatic reply, and regression-test the post-send view.
+
+### Metadata
+
+- Source: implementation_review
+- Related Files: `src/wechat-group-scene.ts`, `test/wechat-group-scene.test.mjs`
+- Tags: wechat, managed-mode, deduplication, auto-reply, safety
+- Pattern-Key: messaging.auto_reply_dedupe_on_inbound_identity
+- Recurrence-Count: 1
+
+### Resolution
+
+Managed mode now separates its inbound observation key from the full stale-window digest and ignores the
+conversation update caused by its own verified outgoing reply.
+
+---
+
 ## [LRN-20260830-PERSONAL-SPACE-OWNS-ONE-CONNECTION] correction
 
 **Logged**: 2026-08-30T09:00:00+08:00
@@ -159,7 +278,7 @@ message IDs for thread closure. Fall back to UI only if the user explicitly chan
 
 **Logged**: 2026-08-14T00:00:00+08:00
 **Priority**: high
-**Status**: pending
+**Status**: resolved
 **Area**: architecture
 
 ### Summary
@@ -193,6 +312,14 @@ handoff.
 - Tags: subagent, sessions, lifecycle, authority, persistence, concurrency
 - Pattern-Key: architecture.subagent_durable_child_runtime
 - Recurrence-Count: 1
+
+### Resolution
+
+- **Resolved**: 2026-09-20T00:00:00+08:00
+- **Notes**: Durable Agent trees now own stable lineage, idempotent mailboxes, root-turn fences, whole-tree
+  budgets, restart recovery, bounded rooms, isolated writable Worktrees, reviewed Diff application, and
+  approved Personal-Space Codex/Claude continuations through Hara Live. The older one-shot `agent` helper
+  remains only as a narrow compatibility path rather than becoming a second orchestration system.
 
 ---
 
@@ -725,5 +852,49 @@ reset/remaining state for admission or switching, and show unavailable when the 
 - **Notes**: Split provider-neutral execution safety from provider/Control-native accounting, exposed the
   accounting authority per catalog entry and saved connection, removed hard-coded subscription formulas from
   setup and roadmap text, and gated automatic usage failover on a fresh authoritative exhaustion snapshot.
+
+---
+
+## [LRN-20260915-WINDOWS-BUN-VIRTUAL-ENTRY] knowledge_gap
+
+**Logged**: 2026-09-15T14:12:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: runtime
+
+### Summary
+
+Bun 1.3.9 Windows standalone binaries expose their compiled entry as `B:/~BUN/...`, not the POSIX
+`/$bunfs/...` form used by the existing Hara self-invocation discriminator.
+
+### Details
+
+HARA-FB-001363 showed both Feishu and WeChat transports online while every agent-backed message failed before
+provider startup with Commander's `too many arguments` error. The gateway parent had forwarded
+`B:/~BUN/root/cli.js` as a real CLI argument when spawning the same standalone executable.
+
+HARA-FB-001381 independently reported the same Desktop-visible behavior and exact Windows virtual entry,
+confirming that both managed chat transports share the affected standalone self-reentry boundary.
+
+### Suggested Action
+
+Treat both virtual-entry forms as compiled Bun internals, keep plain Bun script entries, and exercise actual
+native standalone self-reentry in every platform CI lane so future runtime path changes fail before release.
+
+### Metadata
+
+- Source: user_feedback
+- Related Files: `src/cron/runner.ts`, `scripts/standalone-boundary-smoke.mjs`, `test/self-invoke.test.mjs`
+- Tags: bun, windows, standalone, gateway, argv, self-invocation
+- Pattern-Key: runtime.bun_virtual_entry_is_platform_specific
+- Recurrence-Count: 2
+- First-Seen: 2026-09-15
+- Last-Seen: 2026-09-16
+
+### Resolution
+
+- **Resolved**: 2026-09-15T14:12:00+08:00
+- **Notes**: Added the Windows virtual-entry discriminator, exact regression cases, and a native standalone
+  cron self-reentry smoke shared by Windows, Linux, and Darwin CI.
 
 ---

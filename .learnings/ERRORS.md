@@ -1,5 +1,1086 @@
 # Errors
 
+## [ERR-20260911-015] Pinned Node PATH omitted the preferred search binary
+
+**Logged**: 2026-09-11T07:05:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tooling
+
+### Summary
+
+A read-only security search selected the repository-pinned Node runtime with a minimal explicit `PATH`, but
+that path did not contain `rg`, so the preferred search command was unavailable. No product state changed.
+
+### Resolution
+
+When using the pinned runtime path, first tolerate an unavailable `rg` and fall back directly to `git grep`
+for tracked source or another bounded search tool. Do not broaden the runtime path merely to find a helper.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes with the minimal pinned runtime path
+- Related Files: `src/security/sensitive-files.ts`
+- Tags: tooling, search, node-path
+- Pattern-Key: tooling.search_falls_back_when_pinned_path_omits_rg
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260925-SYSTEM-PROMPT-BACKTICK] Unescaped tool-name markup ended a TypeScript template string
+
+**Logged**: 2026-09-25T12:00:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: backend
+
+### Summary
+
+Markdown backticks added inside Hara's template-literal system prompt prematurely closed the TypeScript string.
+
+### Error
+
+~~~text
+src/agent/loop.ts(229,25): error TS1005: ',' expected.
+src/agent/loop.ts(229,36): error TS1005: ',' expected.
+~~~
+
+### Resolution
+
+Use plain wording for inline tool names inside long template-literal prompts unless the backticks are explicitly
+escaped and covered by a build. The prompt now says “the spawn_agent tool”.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `src/agent/loop.ts`
+- Tags: typescript, template-literal, system-prompt
+- Pattern-Key: prompts.template_literals_avoid_unescaped_backticks
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260925-WRAPPED-PROMPT-ASSERTION] Prompt regression assertion assumed prose stayed on one line
+
+**Logged**: 2026-09-25T12:05:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+A prompt-content regression test used a literal space across intentionally wrapped source lines, so it rejected
+the correct assembled prompt even though every required phrase was present.
+
+### Error
+
+~~~text
+The input did not match /provider CLI's own resume history/
+Actual prompt contained "provider CLI's\nown resume history".
+~~~
+
+### Resolution
+
+Use `\s+` for semantic assertions spanning formatted prose lines; keep exact matching for identifiers and policy tokens.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `test/prompt-assembler.test.mjs`
+- Tags: tests, regex, system-prompt
+- Pattern-Key: tests.prompt_prose_matches_wrapped_whitespace
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260923-WECHAT-TCC-CALLER-IDENTITY] environment
+
+**Logged**: 2026-09-23T16:42:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: wechat-group
+
+### Summary
+
+A shell-launched read-only bridge probe reported `screen-recording-required` even though the packaged Hara
+application had already been granted Screen Recording.
+
+### Error
+
+~~~text
+screen-recording-required
+~~~
+
+### Resolution
+
+Treat macOS TCC grants as caller/application-identity specific. Use controller and packaged-app checks as
+the authoritative live path; do not infer that a Terminal-launched Python probe inherits Hara's grant or
+weaken permissions to make the probe pass.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `scripts/jev-wechat-bridge.py`, `src/wechat-group-scene.ts`
+- Tags: macos, tcc, screen-recording, wechat, diagnostics
+- Pattern-Key: macos.tcc_grants_follow_caller_identity
+- Recurrence-Count: 2
+- Last-Seen: 2026-09-23
+
+---
+## [ERR-20260922-WECHAT-BRIDGE-NARROWING] External bridge JSON was asserted before runtime validation
+
+**Logged**: 2026-09-22T23:24:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: backend
+
+### Summary
+
+The first WeChat group-scene build failed because a generic JSON object was directly asserted as the
+typed Jev bridge status/scan response under TypeScript 6 strict checking.
+
+### Error
+
+```text
+TS2352: Conversion of type 'Record<string, unknown>' to type 'BridgeStatus' may be a mistake
+TS2352: Conversion of type 'Record<string, unknown>' to type 'BridgeScan' may be a mistake
+```
+
+### Context
+
+- Command: `source ~/.nvm/nvm.sh && nvm use 22 && npm run build`
+- The child-process boundary correctly parsed JSON as an object, but still needed field-level validation
+  before application code could rely on the discriminant and payload.
+
+### Suggested Fix
+
+Add runtime normalizers for bridge status and scan results, then keep all later code on validated types.
+
+### Resolution
+
+Added field-level bridge status/scan normalizers. The CLI build, focused bridge tests, and the real
+WebSocket Serve regression now pass under Node 22.23.1.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: `src/wechat-group-scene.ts`
+- Tags: typescript, external-json, validation, wechat
+
+---
+
+## [ERR-20260923-WECHAT-RUNTIME-NONEMPTY] Jev runtime preparation initially rejected its own embedded files
+
+**Logged**: 2026-09-23T00:00:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: backend
+
+### Summary
+
+The first isolated macOS runtime preflight materialized the embedded Jev sources before creating the
+virtual environment, and `uv venv` refused the resulting non-empty target directory.
+
+### Error
+
+```text
+uv::venv::creation × Failed to create virtualenv
+```
+
+### Resolution
+
+Create the private environment with `uv venv --allow-existing`. This deliberately preserves Hara's
+embedded, integrity-checked Jev directory and also makes repeated Prepare actions idempotent.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `src/wechat-group-scene.ts`
+- Tags: uv, venv, embedded-runtime, wechat
+- Pattern-Key: runtime.uv_venv_allow_owned_embedded_files
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260923-TEST-ORCHESTRATOR-PAREN] Parallel focused-test wrapper had an unmatched parenthesis
+
+**Logged**: 2026-09-23T00:00:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tooling
+
+### Summary
+
+One JavaScript tool-orchestration snippet closed the command array but not `Promise.all`, so no test
+process started.
+
+### Resolution
+
+Corrected the wrapper and reran both focused suites; all CLI and Desktop cases passed. Prefer a named
+command array before `Promise.all` when the wrapper grows beyond one line.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: no after correction
+- Related Files: none
+- Tags: tooling, test-runner, orchestration
+- Pattern-Key: tooling.parallel_exec_parentheses
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260923-WECHAT-OCR-TITLE-MUTATION] Message extraction invalidated the later group-title lookup
+
+**Logged**: 2026-09-23T12:20:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: backend
+
+### Summary
+
+The real macOS group scan saw both the header and six message blocks, but returned an empty conversation
+title. Jev's `extract_messages` converts every selected block from bottom-origin to top-origin in place;
+`read_conversation` asked those same mutated blocks for the header title afterward.
+
+### Resolution
+
+The narrow Hara bridge now passes shallow block copies into Jev's message extractor, preserving the raw
+Vision observations for the independent title check. A redacted live scan then returned a non-empty title,
+six messages, and a 64-character digest without logging chat text. The macOS 27 Fast-recognizer fallback
+remains scoped to that OS version.
+
+### Metadata
+
+- Source: live_integration_failure
+- Reproducible: yes
+- Related Files: `scripts/jev-wechat-bridge.py`, `src/embedded/jev-wechat.ts`
+- Tags: wechat, vision, ocr, coordinates, mutation
+- Pattern-Key: integration.copy_external_observations_before_mutating_extraction
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260922-RUNSHELL-CANCEL-RACE] Nested sandbox prevented the macOS shell-cancellation test from starting
+
+**Logged**: 2026-09-22T20:41:51+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+The full `agent-limits` test file passed the new Jev Action Guard case but one existing `runShell`
+cancellation test could not start its inner `sandbox-exec` inside the tool sandbox.
+
+### Error
+
+~~~text
+runShell cancellation terminates the owned foreground command
+expected /interrupted by agent run deadline or cancellation/
+actual Error: exit code 71
+sandbox-exec: sandbox_apply: Operation not permitted
+~~~
+
+### Context
+
+- Command: Node 22.23.1 `node --test test/agent-limits.test.mjs`
+- The failure happened after 62 passing cases; the new Jev headless external-message test passed.
+- The failing test and `src/sandbox.ts` were not changed by the Jev work.
+- An unrestricted rerun of the exact named test passed, proving this was nested sandbox denial rather than
+  an application cancellation race.
+
+### Suggested Fix
+
+Run macOS tests that intentionally invoke Hara's own `sandbox-exec` outside the outer workspace sandbox;
+retain the sandboxed failure as an environment diagnostic, not an application regression.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes (inside the outer sandbox only)
+- Related Files: `test/agent-limits.test.mjs`, `src/sandbox.ts`
+- Tags: cancellation, child-process, race, flaky-test
+- Pattern-Key: runtime.shell_abort_close_race
+- Recurrence-Count: 1
+
+### Resolution
+
+- **Resolved**: 2026-09-22T20:43:00+08:00
+- **Notes**: The exact test passed outside the outer sandbox (351 ms); no `src/sandbox.ts` change was needed.
+
+---
+
+## [ERR-20260920-CUA-ELEMENT-INDEX] CUA click used an object instead of an integer element index
+
+**Logged**: 2026-09-20T23:58:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tooling
+
+### Summary
+
+The native-app automation click API expects the accessibility element index as an integer, not an object
+containing an `id` field.
+
+### Error
+
+~~~text
+elementIndex must be an integer
+~~~
+
+### Context
+
+- Attempted `app.click({ id: 6 })` while inspecting the installed Grok Bot UI.
+- The accessibility snapshot labels controls by integer index.
+- After a stale-tree notice, `app.getState()` was also unavailable; refreshing a native app snapshot uses
+  `cua.getApp("Grok Bot")` again.
+
+### Suggested Fix
+
+Pass the element index directly, for example `app.click(6)`. If the accessibility tree becomes stale,
+refresh it with `cua.getApp(...)` rather than calling a nonexistent `app.getState()` method.
+
+### Metadata
+
+- Source: external_tool_failure
+- Reproducible: yes
+- Related Files: none
+- Tags: cua, accessibility, ui-automation
+- Pattern-Key: tooling.cua_click_uses_integer_element_index
+- Recurrence-Count: 1
+
+### Resolution
+
+Corrected the call shape and continued the read-only product inspection.
+
+---
+
+## [ERR-20260920-DOCKER-DESTRUCTIVE-RISK] Docker destructive commands bypass the high-risk classifier
+
+**Logged**: 2026-09-20T23:59:00+08:00
+**Priority**: critical
+**Status**: pending
+**Area**: security
+
+### Summary
+
+Destructive Docker operations are classified as low risk by the generic shell Guardian, so full-auto does
+not receive the stronger destructive-action boundary Hara applies to filesystem wipes and force pushes.
+
+### Error
+
+~~~text
+docker system prune -af --volumes -> low
+docker rm -f production-db          -> low
+docker volume rm customer-data      -> low
+docker compose down -v              -> low
+~~~
+
+### Context
+
+- Reproduced against the current 0.178.1 build through `classifyRisk("bash", "exec", ...)`.
+- Hara has no first-class container operation type; every Docker operation arrives as generic shell text.
+- The issue was reported to the canonical Hara feedback group as message
+  `om_x100b643451ed8ca0c1644d8661a61ed` without claiming a fix or release.
+
+### Suggested Fix
+
+Add deterministic Docker/Compose destructive-shape classification with regression tests. A later
+first-class container capability should bind operations to daemon, project, immutable container/volume IDs,
+and require explicit approval for remove, prune, force, volume deletion, and `down -v`.
+
+### Metadata
+
+- Source: simplify-and-harden
+- Reproducible: yes
+- Related Files: src/security/guardian.ts, src/tools/builtin.ts, test/guardian.test.mjs
+- Tags: docker, containers, destructive-actions, guardian, full-auto
+- Pattern-Key: harden.container_mutations_need_typed_risk_boundary
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260920-EXTERNAL-AGENT-MISSING-COMPLETION-RECEIPT] Serve fixture omitted the verified completion checkpoint
+
+**Logged**: 2026-09-20T00:00:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+The external Agent Serve fixture performed an approved runtime action and then ended without recording the
+accepted completion evidence, so Hara correctly retained a resumable checkpoint instead of claiming success.
+
+### Error
+
+~~~text
+Work was performed, but the accepted completion checks were not verified.
+~~~
+
+### Resolution
+
+Make the fixture submit a verified `task_checkpoint` after both external generations settle and before its final answer.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `test/serve-agent-team.test.mjs`
+- Tags: completion-receipt, task-checkpoint, external-agent, tests
+- Pattern-Key: tests.side_effect_fixture_needs_verified_completion_receipt
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260920-EXTERNAL-AGENT-INTAKE-INTENT] External runtime test used investigate intent for a side effect
+
+**Logged**: 2026-09-20T00:00:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+Starting an isolated Codex/Claude runtime is an execution side effect even when its assignment is read-only.
+The first Serve fixture classified the task as `investigate`, so Hara correctly blocked it before approval.
+
+### Error
+
+~~~text
+timed out waiting for approval.request
+~~~
+
+### Resolution
+
+Use `task_intake` intent `change` for the explicit runtime-start operation while retaining the no-source-edit constraint.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `test/serve-agent-team.test.mjs`, `src/agent/loop.ts`
+- Tags: task-intake, external-agent, approval, tests
+- Pattern-Key: task_intake.external_runtime_start_is_change
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260920-AGENT-DIRECTORY-OFFICE-ASSERTION] Office removal test accidentally expected project Agents to disappear
+
+**Logged**: 2026-09-20T00:00:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+The first simplified-directory assertion conflated deleting deprecated office/lobby grouping with narrowing
+the underlying Agent catalog to the current workspace.
+
+### Error
+
+~~~text
+Expected only main/global Agents, but alpha:coder and beta:designer correctly remained discoverable.
+~~~
+
+### Resolution
+
+Keep the complete bounded Agent directory and assert that only `offices` and `currentOfficeId` disappear.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `src/serve/server.ts`, `test/serve-agent-identity.test.mjs`
+- Tags: simplification, agent-directory, compatibility, tests
+- Pattern-Key: simplify.remove_presentation_grouping_not_domain_entities
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260920-EXTERNAL-AGENT-POLL-UNREF] Active external Agent mailbox poll did not retain the event loop
+
+**Logged**: 2026-09-20T00:00:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: backend
+
+### Summary
+
+The first external Agent mailbox pump used an unreferenced timer. A real provider subprocess usually kept
+Node alive, but an in-memory adapter exposed that the active turn itself did not own a live event-loop handle.
+
+### Error
+
+~~~text
+Promise resolution is still pending but the event loop has already resolved
+~~~
+
+### Resolution
+
+Keep the short polling timer referenced while the external turn is active. The turn's `finally` block aborts
+the pump and clears the timer immediately, so shutdown remains bounded without relying on another process handle.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `src/subagent/external.ts`, `test/external-subagent.test.mjs`
+- Tags: event-loop, timer, external-agent, mailbox
+- Pattern-Key: async.active_operation_must_own_referenced_wait
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260920-AGENT-ROOM-UNKNOWN-NARROWING] First Agent room build exposed captured-property narrowing gaps
+
+**Logged**: 2026-09-20T00:00:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: backend
+
+### Summary
+
+TypeScript did not preserve an `unknown` object property's array narrowing inside nested callbacks, and a
+tool input callback inherited `any` from the registry boundary.
+
+### Error
+
+~~~text
+src/subagent/team.ts: 'room.participantPaths' is of type 'unknown'
+src/tools/collaboration.ts: Parameter 'member' implicitly has an 'any' type
+~~~
+
+### Resolution
+
+Capture the validated participant array in a typed local before nested message parsing, and type the tool
+boundary callback input as `unknown` before its string predicate.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `src/subagent/team.ts`, `src/tools/collaboration.ts`
+- Tags: typescript, validation, unknown, tool-boundary
+- Pattern-Key: typescript.capture_validated_unknown_before_nested_callback
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260913-DESKTOP-AUTH-REGION-CHECK-HUNK] Region check landed in the status parser
+
+**Logged**: 2026-09-13T18:30:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: mobile-account-client
+
+### Summary
+
+A broad patch anchor inserted the exchange-only `login.account.region` assertion into the status method,
+where `login` does not exist. TypeScript stopped the build before any generated artifact or release changed.
+
+### Resolution
+
+Remove the assertion from `inspectDesktopAuthorization` and place it directly beside the parsed login in
+`exchangeDesktopAuthorization`. Rebuild before continuing with protocol integration.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: src/mobile/account-client.ts
+- Tags: typescript, patching, mobile-authorization
+- Pattern-Key: patch.use_method_specific_context_for_repeated_validation_hunks
+
+---
+
+## [ERR-20260912-NPM-SHEBANG-NODE11] NVM npm executable inherited the legacy system Node
+
+**Logged**: 2026-09-12T12:00:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+Invoking the absolute NVM `npm` executable was not sufficient in this non-interactive shell because its
+`#!/usr/bin/env node` shebang still resolved the workstation's legacy Node 11.
+
+### Error
+
+```text
+Error: Cannot find module 'node:path'
+```
+
+### Context
+
+- Command: `/Users/zhujianbo/.nvm/versions/node/v22.23.1/bin/npm run build`
+- The npm script path was correct, but `env node` resolved outside that NVM runtime.
+
+### Suggested Fix
+
+Give npm and every child script a minimal PATH whose first entry is the approved Node runtime:
+`/usr/bin/env PATH=.../node/v22.23.1/bin:/usr/local/bin:/usr/bin:/bin npm <args>`.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: AGENTS.md, package.json
+- Tags: node, npm, nvm, non-interactive-shell
+- Pattern-Key: tooling.invoke_npm_cli_with_pinned_node
+
+### Resolution
+
+- **Resolved**: 2026-09-12T12:00:00+08:00
+- **Notes**: The explicit minimal PATH made both npm and its `tsc`/`node` child scripts use Node 22.
+
+### Recurrence on 2026-09-12T23:56:00+08:00
+
+The first cron-diagnostics build used unqualified `npm run build`, so npm again inherited system Node 11
+and failed before TypeScript started. Re-run the unchanged gate with the Node 22.23.1 bin directory first in
+PATH; no product output from the failed invocation is valid.
+
+---
+
+## [ERR-20260910-NPM-PUBLISH-PDF-TIMEOUT] Publish runner hit the Presentation PDF safety timeout
+
+**Logged**: 2026-09-10T22:13:08+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: release-verification
+
+### Summary
+
+The first `v0.172.0` npm publish attempt passed the build and 1,694 tests but one unrelated Presentation
+Artifact PDF export reached its 60-second safety deadline on the shared Linux runner. A second attempt hit a
+different unreferenced-timer cancellation in the Agent-limits file. The identical full suite passed locally,
+and the Linux plus both Darwin release-asset jobs passed the same source revision.
+
+### Error
+
+```text
+Presentation PDF export failed: Presentation PDF rendering timed out safely.
+tests 1701; pass 1694; fail 1; skipped 6
+```
+
+### Suggested Fix
+
+Keep the publish gate strict and rerun its failed job; do not bypass the suite or publish manually. If this
+recurs, distinguish renderer startup/output progress from a hung process and make the CI budget load-aware
+without weakening the verified-PDF completion boundary.
+
+### Metadata
+
+- Source: error
+- Reproducible: not locally; first CI attempt only
+- Related Files: src/presentations/pdf.ts, test/presentations.test.mjs, .github/workflows/publish-npm.yml
+- Tags: npm, publish, chromium, pdf, timeout, ci
+- See Also: ERR-20260812-CHROMIUM-PDF-PROCESS-STAYS-OPEN
+- Pattern-Key: release.retry_strict_gate_after_isolated_shared_runner_timeout
+- Recurrence-Count: 3
+
+### Resolution
+
+- **Resolved**: 2026-09-10T22:18:00+08:00
+- **Notes**: Kept the publish gate unchanged and reran only its failed job. Attempt 3 passed all tests and the
+  dependency audit, published `@nanhara/hara@0.172.0`, and the exact package metadata became readable from the
+  official npm registry. No manual publish or test bypass was used.
+
+---
+
+## [ERR-20260910-NPM-PACK-HOME-CACHE] Package dry-run could not write the user npm cache
+
+**Logged**: 2026-09-10T22:00:55+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: release-verification
+
+### Summary
+
+`npm pack --dry-run` completed its prepare build but failed when npm tried to create a temporary file under
+the user-level cache, which is outside the managed workspace write boundary.
+
+### Error
+
+```text
+npm error code EPERM
+npm error syscall open
+npm error path /Users/zhujianbo/.npm/_cacache/tmp/…
+```
+
+### Suggested Fix
+
+Run non-publishing package inspection with a task-scoped cache under `/private/tmp`; do not change ownership
+or permissions of the developer's global npm cache as part of a release.
+
+### Metadata
+
+- Source: error
+- Reproducible: yes in the managed workspace sandbox
+- Related Files: package.json
+- Tags: npm, pack, cache, sandbox, release
+- Pattern-Key: release.use_isolated_npm_cache_for_pack_inspection
+- Recurrence-Count: 2
+- Last-Seen: 2026-09-11
+
+### Resolution
+
+- **Resolved**: 2026-09-10T22:00:55+08:00
+- **Notes**: Re-ran the same dry-run with an isolated `/private/tmp` npm cache.
+
+---
+
+## [ERR-20260910-TREE-BUDGET-MINIMUM-RESERVATION] Token reservation rejected a valid small final generation
+
+**Logged**: 2026-09-10T11:18:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: Agent runtime
+
+### Summary
+
+The tree allocator required at least 1,000 remaining tokens before starting any generation. After a bounded
+first generation, 600 tokens remained—enough for a valid short finish—but admission rejected it early.
+
+### Error
+
+```text
+Agent tree token limit reached
+```
+
+### Suggested Fix
+
+Allow a reservation of the exact positive remainder. Enforce the real aggregate ceiling after each provider
+boundary, retain truthful overshoot usage for a single indivisible response, and forbid every later boundary.
+
+### Metadata
+
+- Source: test_failure
+- Reproducible: yes
+- Related Files: src/subagent/team.ts, test/agent-team.test.mjs
+- Tags: agents, token-budget, reservation, boundary
+- Pattern-Key: budget.reserve_positive_remainder_without_artificial_floor
+- Recurrence-Count: 1
+
+### Resolution
+
+- **Resolved**: 2026-09-10T11:20:00+08:00
+- **Notes**: Admission now rejects only an exhausted token remainder; per-model defaults remain conservatively sized.
+
+---
+
+## [ERR-20260910-NODE11-READONLY-PROBE] Read-only package probe resolved the legacy system Node
+
+**Logged**: 2026-09-10T18:12:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+A package metadata probe invoked unqualified `node`/`npm`, so the non-interactive shell resolved Node 11
+instead of the repository-required Node 22.23.1.
+
+### Error
+
+```text
+SyntaxError: Unexpected token .
+Error: Cannot find module 'node:path'
+```
+
+### Context
+
+- The optional-chaining probe and `npm view` command were valid on the supported runtime.
+- The failure happened before any Hara source or external state changed.
+
+### Suggested Fix
+
+Use `/Users/zhujianbo/.nvm/versions/node/v22.23.1/bin/node` explicitly, or prepend that directory to
+`PATH`, before every npm, Node, TypeScript, Next.js, or package metadata command.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: AGENTS.md, package.json
+- See Also: global Node toolchain working convention
+
+### Resolution
+
+- **Resolved**: 2026-09-10T18:14:00+08:00
+- **Notes**: Re-ran the package probe with the pinned Node 22 binary and the npm query with an explicit Node 22 PATH.
+
+---
+
+## [ERR-20260910-BROWSER-REMOTE-DEBUG] Browser Use timed out behind an unapproved Chrome connection
+
+**Logged**: 2026-09-10T18:16:00+08:00
+**Priority**: high
+**Status**: pending
+**Area**: config
+
+### Summary
+
+The installed Browser Use CLI could start its harness, but it could not obtain a Chrome CDP session because
+Chrome's “Allow remote debugging?” prompt had not been approved. The subsequent `page_info()` call timed out.
+
+### Error
+
+```text
+Chrome is asking "Allow remote debugging?"
+RuntimeError: Runtime.evaluate timed out
+```
+
+### Context
+
+- `browser-use --doctor` reported no running daemon and zero active browser connections.
+- `uv tool list` confirmed browser-use 0.13.8 is installed.
+- No account page was opened and no browser data was read.
+
+### Suggested Fix
+
+Require an explicit user-approved browser connection step, surface the pending Chrome permission in Hara
+instead of timing out, and do not conflate this local Browser Use harness with Hara's Playwright MCP plugin.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: plugins/browser/.hara-plugin/plugin.json, src/plugins/bundled.ts
+- Tags: browser-use, chrome, cdp, permission, timeout
+
+---
+
+## [ERR-20260910-SEGMENT-BOUNDARY-DUPLICATE] Adjacent excerpts made one source line look duplicated
+
+**Logged**: 2026-09-10T00:00:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: source-inspection
+
+### Summary
+
+Two consecutive `sed` excerpts shared a boundary line in one combined tool output. I interpreted the repeated
+display as a duplicate object key and attempted an unnecessary patch; `apply_patch` correctly rejected it.
+
+### Suggested Fix
+
+When combined excerpts meet at a boundary, confirm suspected duplication with one numbered, non-overlapping
+excerpt (or `rg -n`) before editing.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: src/serve/server.ts
+- Tags: inspection, excerpt, apply-patch
+- Pattern-Key: inspect.confirm_duplicate_across_excerpt_boundaries
+- Recurrence-Count: 1
+
+### Resolution
+
+- **Resolved**: 2026-09-10T00:00:00+08:00
+- **Notes**: A single `nl -ba` excerpt confirmed there was only one source line; no product change was made.
+
+---
+
+## [ERR-20260910-AGENT-DRAIN-UNREF] Handoff drain timeout did not keep its awaited boundary alive
+
+**Logged**: 2026-09-10T00:00:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: agent-runtime
+
+### Summary
+
+The first Agent-tree handoff drain unref'ed the timer that its public Promise was awaiting. In a headless
+process with no other referenced handles, Node could finish the event loop before reporting the drain timeout.
+
+### Error
+
+```text
+Promise resolution is still pending but the event loop has already resolved
+```
+
+### Suggested Fix
+
+Timers that define a caller-visible safety deadline must stay referenced until the Promise settles. Only
+background observation timers may be unref'ed.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: src/subagent/team.ts, test/agent-team.test.mjs
+- Tags: agent, migration, timeout, node
+- Pattern-Key: runtime.keep_awaited_safety_deadline_referenced
+
+### Resolution
+
+- **Resolved**: 2026-09-10T00:00:00+08:00
+- **Notes**: Kept the bounded handoff timer referenced and retained the non-cooperative-child regression test.
+
+---
+
+## [ERR-20260910-SERVE-LOG-EVENT] New pause path used an unregistered runtime log event
+
+**Logged**: 2026-09-10T00:00:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: serve-runtime
+
+### Summary
+
+The first pause/migration build used `turn.suspending`, but the privacy-reviewed runtime logger permits
+only its closed event vocabulary.
+
+### Error
+
+```text
+TS2345: Argument of type 'turn.suspending' is not assignable to parameter of type 'ServeRuntimeEvent'.
+```
+
+### Suggested Fix
+
+Use the existing `turn.interrupted` diagnostic event and express pause/migration semantics in the durable
+typed runtime-item journal.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: src/serve/server.ts, src/serve/runtime-log.ts
+- Tags: serve, migration, logging, typescript
+- Pattern-Key: serve.keep_runtime_log_vocabulary_closed
+
+### Resolution
+
+- **Resolved**: 2026-09-10T00:00:00+08:00
+- **Notes**: Reused the existing cancellation category; no private payload fields were added.
+
+---
+
+## [ERR-20260910-SYNC-GUARD-ASYNC-ASSERTION] Parent-turn guard threw before the Promise assertion owned the call
+
+**Logged**: 2026-09-10T10:42:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+The scoped controller deliberately validates stale parent authority synchronously before starting an async
+mailbox operation. A test passed the already-invoked call to `assert.rejects`, so the intended rejection
+escaped the assertion and cleanup removed state while cancellation was still settling.
+
+### Error
+
+```text
+Agent controller belongs to a previous parent turn; refresh the Agent tree before mutating it
+```
+
+### Suggested Fix
+
+Pass an async function to rejection assertions when an API has synchronous admission guards, and await the
+cancelled background generation before deleting its temporary durable store.
+
+### Metadata
+
+- Source: test_failure
+- Reproducible: yes
+- Related Files: test/agent-team.test.mjs, src/subagent/team.ts
+- Tags: tests, async, parent-turn, cleanup
+- Pattern-Key: tests.assert_sync_or_async_guard_with_function
+- Recurrence-Count: 1
+
+### Resolution
+
+- **Resolved**: 2026-09-10T10:45:00+08:00
+- **Notes**: The rejection callbacks now own invocation and teardown waits for the cancelled Agent generation.
+
+---
+
+## [ERR-20260910-SERVE-RUNTIME-TIMESTAMP-BOUNDARY] Serve-owned runtime items used the Agent-emitter type directly
+
+**Logged**: 2026-09-10T10:20:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: TypeScript
+
+### Summary
+
+The Agent loop emits fully materialized runtime items with an `at` timestamp, while Serve also originates
+user, steering, and control items that intentionally rely on the shared publication boundary to stamp time.
+Typing that boundary as the already-materialized event made every Serve-owned call fail compilation.
+
+### Error
+
+```text
+TS2345: Property 'at' is missing in type ... but required in type 'RunRuntimeItemEvent'.
+```
+
+### Suggested Fix
+
+Keep the core observer strict, but type the publication helper like the core emitter: `at` is optional at
+entry and is normalized exactly once before persistence and broadcast.
+
+### Metadata
+
+- Source: build_failure
+- Reproducible: yes
+- Related Files: src/agent/loop.ts, src/serve/server.ts
+- Tags: typescript, event-journal, timestamp, boundary
+- Pattern-Key: events.normalize_timestamp_at_publication_boundary
+- Recurrence-Count: 1
+
+### Resolution
+
+- **Resolved**: 2026-09-10T10:22:00+08:00
+- **Notes**: Serve now accepts an optional timestamp and publishes a complete event; the build passes.
+
+---
+
+## [ERR-20260910-CLOSURE-NULL-NARROWING] Conditional spread did not preserve a nullable session across a callback
+
+**Logged**: 2026-09-10T10:05:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: TypeScript
+
+### Summary
+
+The headless runtime-journal callback was created only when session metadata existed, but TypeScript correctly
+did not carry that outer narrowing into the later callback body because the captured binding was nullable.
+
+### Error
+
+```text
+src/index.ts(6630,28): error TS18047: 'meta' is possibly 'null'.
+```
+
+### Suggested Fix
+
+Capture an immutable non-null identifier before creating a long-lived callback, or use an explicit assertion
+inside a conditional spread whose condition proves the callback cannot be constructed for a null session.
+
+### Metadata
+
+- Source: build_failure
+- Reproducible: yes
+- Related Files: src/index.ts
+- Tags: typescript, closure, narrowing, runtime-journal
+- Pattern-Key: typescript.capture_narrowed_value_before_callback
+- Recurrence-Count: 1
+
+### Resolution
+
+- **Resolved**: 2026-09-10T10:07:00+08:00
+- **Notes**: The callback now references the session ID only inside the guarded construction path; the build and
+  focused runtime-journal suite pass.
+
+---
+
 ## [ERR-20260830-NPM-PACK-CACHE-OWNERSHIP] Release pack checks must not depend on the shared npm cache
 
 **Logged**: 2026-08-30T10:20:00+08:00
@@ -26,6 +1107,242 @@ cache under the system temporary directory. The same 0.156.1 package dry-run the
 - Pattern-Key: release.npm_pack_uses_task_private_cache
 - Recurrence-Count: 4
 - Last-Seen: 2026-09-04
+
+---
+
+## [ERR-20260910-CONNECTION-HEALTH-REGISTRY-BOUNDARY] Compatibility read the global circuit instead of the provider's registry
+
+**Logged**: 2026-09-10T09:30:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: provider routing
+
+### Summary
+
+A circuit unit test injected a deterministic registry into the provider wrapper, but the compatibility gate
+looked up only the production singleton. The wrapper correctly opened the injected circuit while fallback still
+observed an unrelated healthy global state.
+
+### Suggested Fix
+
+Expose a read-only `connectionHealth()` accessor on the decorated provider and prefer it at compatibility
+boundaries; keep the global registry only as a production fallback. When stateful collaborators are injectable,
+all readers must use the same injected instance as writers.
+
+### Metadata
+
+- Source: test_failure
+- Reproducible: yes
+- Related Files: src/providers/connection-health.ts, src/providers/types.ts
+- Tags: provider, circuit-breaker, dependency-injection, tests
+- Pattern-Key: provider.health_reader_uses_decorated_registry
+- Recurrence-Count: 1
+
+### Resolution
+
+- **Resolved**: 2026-09-10T09:35:00+08:00
+- **Notes**: The provider decorator publishes the accessor and all compatibility checks use it first.
+
+---
+
+## [ERR-20260910-OFFICIAL-DOC-OPEN-BOUNDARY] Several official provider documentation pages could not be opened by the web harness
+
+**Logged**: 2026-09-10T09:10:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: documentation verification
+
+### Summary
+
+Direct opens of official Volcengine, MiniMax, and Alibaba model pages returned the harness's safe-open error,
+so they could not be treated as newly verified web evidence during the capability audit.
+
+### Suggested Fix
+
+Use the versioned provider documentation already copied into this repository for those providers, label it as
+the source, and keep the live account-scoped `/models` catalog authoritative. Never promote a search snippet or
+memory into a capability claim when the primary page was not readable.
+
+### Metadata
+
+- Source: external_tool_failure
+- Reproducible: provider-dependent
+- Related Files: provider-docs/, docs/codex-runtime-learning-audit.md
+- Tags: docs, providers, capability-catalog, verification
+- Pattern-Key: docs.unreadable_primary_falls_back_to_versioned_local_copy
+- Recurrence-Count: 1
+
+### Resolution
+
+- **Resolved**: 2026-09-10T09:15:00+08:00
+- **Notes**: Model capability assertions use local official copies plus live catalogs; no unsupported entitlement
+  was inferred from static documentation.
+
+---
+
+## [ERR-20260909-DISCRIMINATED-EVENT-CONSTRUCTION] Conditional object spread widened a journal event union
+
+**Logged**: 2026-09-09T15:30:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: TypeScript
+
+### Summary
+
+A single object literal used a union-valued `state` plus conditional spreads for three compaction event
+variants. TypeScript could not prove that `reason` belonged only to `failed` or installation fields only to
+`installed`, so the build rejected the callback despite the runtime branches being mutually exclusive.
+
+### Error
+
+```text
+TS2322: Type '"started" | "installed" | "failed"' is not assignable to type '"failed"'.
+```
+
+### Suggested Fix
+
+Construct discriminated event variants in explicit branches and return a complete object from each branch.
+Do not rely on conditional object spreads to preserve discriminant/payload correlation.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: src/session/store.ts
+- Tags: typescript, discriminated-union, journal
+- Pattern-Key: typescript.construct_discriminated_events_in_explicit_branches
+- Recurrence-Count: 1
+
+### Resolution
+
+- **Resolved**: 2026-09-09T15:31:00+08:00
+- **Notes**: Split started, installed, and failed construction into explicit returns; the Node 22 build passed.
+
+---
+
+## [ERR-20260909-NODE-PATH-CHILD-SCRIPTS] Absolute npm launcher still inherited legacy Node for package scripts
+
+**Logged**: 2026-09-09T11:46:47+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+Launching npm's CLI file with an absolute Node 22 executable did not force npm lifecycle child processes to
+use Node 22; their `#!/usr/bin/env node` still resolved the workstation's legacy Node 11 from `PATH`.
+
+### Error
+
+```text
+node_modules/typescript/lib/_tsc.js:92
+  for (let i = startIndex ?? 0; i < array.length; i++) {
+                           ^
+SyntaxError: Unexpected token ?
+```
+
+### Context
+
+- Command used an absolute Node 22 binary to start `npm-cli.js run build`.
+- The spawned `tsc` shim resolved `node` independently through the unchanged shell `PATH`.
+
+### Suggested Fix
+
+Prepend the repository-approved Node 22.23.1 `bin` directory to `PATH` for the entire npm command so npm,
+package shims, and nested Node scripts all resolve the same runtime.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: AGENTS.md, package.json
+- Tags: node, nvm, npm, lifecycle, tests
+- Pattern-Key: toolchain.prepend_node_bin_for_npm_lifecycle
+- Recurrence-Count: 1
+
+### Resolution
+
+- **Resolved**: 2026-09-09T11:46:47+08:00
+- **Notes**: Subsequent verification uses an explicit Node 22.23.1 PATH prefix for the full npm process tree.
+
+---
+
+## [ERR-20260909-NESTED-HARA-GIT-ROOT] Git inspection started at the non-repository workspace root
+
+**Logged**: 2026-09-09T12:25:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: development-workflow
+
+### Summary
+
+The Hara workspace contains independent project repositories, but the first status/diff check after context
+continuation ran from `/Users/zhujianbo/work/projects/hara`, which is not itself a Git repository.
+
+### Error
+
+```text
+fatal: not a git repository (or any of the parent directories): .git
+```
+
+### Suggested Fix
+
+Resolve the concrete project boundary before Git operations. For CLI work, run Git from the `hara-cli`
+subdirectory and use `git diff --name-only` to prove the change set does not overlap Desktop, Mobile, or brand
+assets owned by another work window.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: AGENTS.md
+- Tags: git, monorepo-workspace, concurrent-work
+- Pattern-Key: tooling.resolve_nested_git_root_before_diff
+- Recurrence-Count: 1
+
+### Resolution
+
+- **Resolved**: 2026-09-09T12:25:00+08:00
+- **Notes**: All subsequent status, diff, build, and test commands ran from the `hara-cli` repository.
+
+---
+
+## [ERR-20260909-SESSION-TEST-REAL-HOME] Session fixture wrote into the developer's real Hara state
+
+**Logged**: 2026-09-09T11:46:47+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+One session receipt test created its project in `/tmp` but left `HOME` unchanged, so `saveSession` targeted the
+developer's real `~/.hara/sessions` directory. The sandbox blocked the write with EPERM.
+
+### Error
+
+```text
+EPERM: operation not permitted, chmod '/Users/zhujianbo/.hara/sessions'
+```
+
+### Suggested Fix
+
+Every persistence fixture must set both `HOME` and `USERPROFILE` to a unique temporary directory and restore
+them in `finally`; direct test commands that can load Hara configuration must also use
+`--import ./test/setup-isolated-home.mjs`, matching `npm test`. Tests must never depend on or mutate the
+operator's real Hara state.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: test/session.test.mjs
+- Tags: tests, isolation, session, home, security
+- Pattern-Key: tests.isolate_hara_home_for_persistence
+- Recurrence-Count: 2
+- Last-Seen: 2026-09-09
+
+### Resolution
+
+- **Resolved**: 2026-09-09T11:46:47+08:00
+- **Notes**: The fixture creates its project under a temporary HOME; direct aggregate test runs also load the
+  repository's isolated-HOME setup before importing modules that inspect private Hara state.
 
 ---
 
@@ -662,10 +1979,11 @@ follow-up used file-scoped patches and preserved the original working tree.
 
 - Source: command_failure
 - Reproducible: yes
-- Related Files: src/session/task.ts
+- Related Files: src/session/task.ts, .learnings/ERRORS.md
 - Tags: apply-patch, atomic-edit, workflow
 - Pattern-Key: editing.apply_patch_one_operation_per_file
-- Recurrence-Count: 1
+- Recurrence-Count: 2
+- Last-Seen: 2026-09-09
 
 ---
 
@@ -747,10 +2065,13 @@ credentials are reported as `process-only` merely to work around the sandbox.
 
 - Source: command_failure
 - Reproducible: yes in the outer restricted sandbox
-- Related Files: src/gateway/serve.ts
+- Related Files: src/gateway/serve.ts, src/config.ts
 - Tags: gateway, sandbox, permissions, operations
 - Pattern-Key: gateway.status_fchmod_eperm_requires_host_boundary
-- Recurrence-Count: 1
+- Recurrence-Count: 2
+- Recurrence-Note: On 2026-09-22, the source-built `hara doctor` hit the same `fchmod` boundary while
+  initializing private Hara state; the authoritative host-boundary rerun is required before treating it as
+  a product regression.
 
 ---
 
@@ -864,7 +2185,9 @@ concurrency; parallelizing whole stress suites tests machine saturation rather t
 - Related Files: test/config-live.test.mjs, src/security/private-state.ts
 - Tags: tests, concurrency, stress, timeout
 - Pattern-Key: tests.serialize_independent_multiprocess_stress_suites
-- Recurrence-Count: 1
+- Recurrence-Count: 2
+- Last-Seen: 2026-09-26
+- See Also: full-suite `agent-limits` cancellation under default file concurrency; standalone file passed 66/66
 
 ---
 
@@ -1434,10 +2757,11 @@ original secret. Rerun the complete release suite after correcting the fixture.
 
 - Source: command_failure
 - Reproducible: yes
-- Related Files: test/provider-bounded-turn.test.mjs, src/security/secrets.ts
+- Related Files: test/provider-bounded-turn.test.mjs, test/serve-e2e.test.mjs, src/security/secrets.ts
 - Tags: tests, redaction, release-gate
 - Pattern-Key: test.assert_safe_redaction_semantics_not_invented_placeholder
-- Recurrence-Count: 1
+- Recurrence-Count: 2
+- Last-Seen: 2026-09-12
 
 ---
 
@@ -1517,7 +2841,8 @@ Confirm the run head SHA before using any workflow result as release evidence.
 - Related Files: .github/workflows/publish-npm.yml, .github/workflows/release.yml
 - Tags: github, actions, tls, release-verification
 - Pattern-Key: release.retry_read_only_github_status_not_tag_push
-- Recurrence-Count: 1
+- Recurrence-Count: 2
+- Last-Seen: 2026-09-24
 
 ---
 
@@ -1881,13 +3206,21 @@ inside the sandbox so policy logic still has a fast hermetic check.
 The 2026-08-10 CLI 0.145.0 standalone Serve release smoke reached the same pre-application
 `listen EPERM` boundary; rerun that exact smoke with narrowly scoped host loopback access.
 
+On 2026-09-09 the approval-journal Serve run reached the same boundary. Two narrowly scoped
+host-loopback escalation reviews then timed out before process creation; preserve the passing build and
+non-listening tests, request explicit approval, and rerun the unchanged command rather than weakening the
+listener or treating the review timeout as a product failure.
+
+After the user explicitly continued, the unchanged host-loopback run passed all 67 focused Serve tests;
+the full Node 22.23.1 suite then passed 1,661 tests with zero failures and one existing platform skip.
+
 ### Metadata
 - Reproducible: yes
 - Related Files: test/serve-e2e.test.mjs
 - Tags: test, websocket, sandbox, loopback
 - Pattern-Key: tests.serve_e2e_requires_host_loopback
-- Recurrence-Count: 4
-- Last-Seen: 2026-08-10
+- Recurrence-Count: 5
+- Last-Seen: 2026-09-09
 
 ### Resolution
 - **Resolved**: 2026-08-05T22:00:00+08:00
@@ -2086,7 +3419,29 @@ sandbox.
 - Related Files: test/serve-e2e.test.mjs
 - Tags: websocket, loopback, home-isolation, sandbox
 - Pattern-Key: tests.serve_e2e_requires_loopback_and_isolated_home
-- Recurrence-Count: 1
+- Recurrence-Count: 5
+- Last-Seen: 2026-09-12
+
+The same boundary recurred when a focused collaboration-tool test was invoked without the repository's
+`--import ./test/setup-isolated-home.mjs` preload. The test then reached the real HOME and failed at the
+private-state `fchmod` guard. This is not a parallel-test race: focused commands that initialize Hara tools
+must use the same isolated-HOME preload as `npm test`.
+
+### Recurrence on 2026-09-11 (HARA-FB-001136)
+
+The exact v0.172.0 no-progress Serve regression used the required isolated-home preload but was still denied
+at `listen(127.0.0.1)` with `EPERM`, before any watchdog or RPC assertion ran. Keep the 44 non-listening
+ticket regressions as passes and leave this host-boundary integration gate to protected CI; do not weaken the
+loopback-only Serve contract or classify the environment denial as a product failure.
+
+### Recurrence on 2026-09-12 (HARA-FB-001309)
+
+The first focused Mobile pairing Serve run omitted `--import ./test/setup-isolated-home.mjs`; all Serve cases
+then reached the workstation's real private-state path and failed at `fchmod` before their RPC assertions. Keep
+the private-state guard intact and rerun only the Mobile pairing case with the repository preload; any remaining
+loopback denial is an environment result rather than a pairing regression. The corrected one-case rerun did
+isolate private state and then stopped at the managed sandbox's `listen(127.0.0.1)` boundary before the RPC
+assertion, confirming that protected CI or an authorized host boundary remains the required integration gate.
 
 ---
 
@@ -2264,7 +3619,9 @@ the complete tests, production audit, pack dry run, and standalone binary smoke 
 ### Resolution
 - **Resolved**: 2026-08-04T16:41:00+08:00
 - **Notes**: Locked fast-uri 3.1.5, hono 4.12.34, ip-address 10.3.1, and undici 7.29.0 from the
-  official registry; the package-lock update and install audit both reported zero vulnerabilities.
+  official registry; the package-lock update and install audit both reported zero vulnerabilities. Seen again
+  during the 0.170.0 gate on 2026-09-10 when three new Hono advisories affected versions through 4.13.4;
+  the release remained untagged until the override was advanced to the official patched 4.13.7 and all gates reran.
 
 ---
 
@@ -3064,13 +4421,30 @@ The current release preflight reproduced the identical restricted-run signature:
 denied with `listen EPERM`, the cancellation fixture received sandbox exit code 71, and the browser PDF
 fixture could not launch. Rerun the unchanged suite through the approved host boundary before judging code.
 
+### Follow-up 2026-09-09
+
+The restricted full suite again produced the established paired signature: loopback-backed web/WeCom tests
+failed with `listen EPERM`, and the nested Seatbelt cancellation fixture observed exit code 71. At the approved
+host boundary those failures disappeared. One unrelated enrollment file then reached the suite-wide 120-second
+deadline under full parallel load; its unchanged focused rerun passed 18/18 in 9.6 seconds. Keep release
+verification pending until a final complete run is green, but do not attribute either environment signature to
+the typed session-journal change. The final unchanged host-boundary rerun completed with 1,660 passed, zero
+failed, and zero cancelled.
+
+### Follow-up 2026-09-15 (HARA-FB-001363)
+
+The restricted full suite reproduced the same `listen EPERM` and nested sandbox exit-code 71 signatures. Heavy
+parallel filesystem and process tests also exhausted several suite-wide timing windows. The ticket-specific
+self-invocation, gateway-process, and both cron suites passed serially under pinned Node 22.23.1; retain the
+native Windows standalone and complete-suite gates for protected CI.
+
 ### Metadata
 - Source: test_environment_failure
 - Related Files: test/web.test.mjs, test/wecom-gateway.test.mjs, test/serve-e2e.test.mjs
 - Tags: tests, sandbox, loopback
 - Pattern-Key: tests.full_suite_requires_loopback_permission
-- Recurrence-Count: 11
-- Last-Seen: 2026-09-01
+- Recurrence-Count: 13
+- Last-Seen: 2026-09-15
 
 ---
 
@@ -3541,8 +4915,8 @@ drop `--import ./test/setup-isolated-home.mjs`, and do not interpret sandbox `EP
 - Related Files: test/serve-e2e.test.mjs, test/setup-isolated-home.mjs
 - Tags: tests, sandbox, loopback, code-review
 - See Also: ERR-20260724-FOCUSED-TEST-MISSED-HOME-PRELOAD
-- Recurrence-Count: 3
-- Last-Seen: 2026-07-25
+- Recurrence-Count: 4
+- Last-Seen: 2026-09-12
 
 ---
 
@@ -3622,7 +4996,12 @@ when selecting only one test file.
 - Related Files: package.json, test/setup-isolated-home.mjs
 - Tags: tests, home-isolation, serve, loopback
 - Pattern-Key: tests.preserve_repository_preload_for_focused_runs
-- Recurrence-Count: 1
+- Recurrence-Count: 2
+- Last-Seen: 2026-09-23
+
+The boundary recurred during focused reminder regressions when the direct `node --test` command omitted the
+repository preload and reached the operator's real private-state root before failing at `fchmod`. The unchanged
+suite passed with `--import ./test/setup-isolated-home.mjs`; keep that preload on every direct Hara test run.
 
 ---
 
@@ -3805,11 +5184,19 @@ already completed zero-vulnerability audit while `package-lock.json` is unchange
 denied by the approval boundary. On 2026-07-26, the same sandbox DNS boundary recurred; the exact
 official-registry audit was rerun with approved network access and found 0 vulnerabilities.
 
+### Follow-up
+
+- **Seen again**: 2026-09-13T16:24:00+08:00
+- **Context**: The Hara 0.175.0 release gate again inherited the mixed-ownership user cache for
+  `npm pack --dry-run`, while the official Registry audit was blocked by managed-sandbox DNS.
+- **Resolution**: Re-run the unchanged gates with a unique `/private/tmp` npm cache and approved
+  read-only Registry network access; do not change ownership of the user's global cache.
+
 ### Metadata
 
 - Pattern-Key: release.npm_audit_requires_approved_network
-- Recurrence-Count: 2
-- Last-Seen: 2026-07-26
+- Recurrence-Count: 3
+- Last-Seen: 2026-09-13
 
 ---
 
@@ -3962,9 +5349,9 @@ as an environment limitation rather than a product regression.
 - Reproducible: yes
 - Tags: tests, sandbox, loopback
 - Pattern-Key: test.managed_sandbox_blocks_loopback_listen
-- Recurrence-Count: 2
+- Recurrence-Count: 3
 - First-Seen: 2026-07-20
-- Last-Seen: 2026-08-06
+- Last-Seen: 2026-09-23
 
 ---
 
@@ -6660,7 +8047,15 @@ handshakes and always clean up interactive fixtures in `finally`. The same run a
 latency-budgeted cron preview can correctly return fewer than three entries with `nextRunDeferred: true`;
 tests must assert that documented partial-result contract instead of assuming an unloaded host.
 
-Metadata: recurrence 2, last seen 2026-07-27, Intel CI.
+### 0.180.0 follow-up
+
+The release-class Intel lane again sampled the unchanged TUI todo panel through a fixed render window and
+missed the post-turn panel, while all other 1,790 tests passed and the same full suite passed on the pinned
+Node lane, Node 24, the npm publication gate, and local macOS. Retry the failed Intel job once to distinguish
+runner contention; replace this assertion with a bounded observable-state handshake in the next maintenance
+change instead of weakening product behavior or repeatedly rerunning a real deterministic failure.
+
+Metadata: recurrence 3, last seen 2026-09-24, Intel CI.
 
 ---
 
@@ -7035,7 +8430,10 @@ including a shim reached by an absolute path.
 - **Seen again**: 2026-08-24T17:47:00+08:00 while verifying public npm metadata for CLI 0.152.1. A
   standalone `npm view` omitted the pinned PATH and failed on Node 11 before making a registry claim.
   Re-running with Node 22.23.1 first returned version 0.152.1 and the expected package integrity.
-- **Recurrence-Count**: 2
+- **Seen again**: 2026-09-14T08:44:11+08:00 while verifying public npm metadata for CLI 0.177.1. A
+  standalone `npm view` again omitted the pinned PATH and failed on `node:path`; the immediate Node
+  22 rerun reached the public registry normally while the newly published version was still processing.
+- **Recurrence-Count**: 3
 
 ---
 
@@ -7173,6 +8571,18 @@ Discover repository-specific pin files with `rg --files` before reading them. Fo
 Desktop's exact Node/Bun pins where the coupled workflow requires them and CLI's declared Node engine plus
 the already verified release toolchain elsewhere.
 
+### Recurrence on 2026-09-11 (HARA-FB-001136)
+
+An exact-tag preflight again tried `git show v0.172.0:.node-version` before checking whether the CLI owns that
+file. The read failed without changing repository state. Use the verified Desktop 22.23.1 runtime for the
+coupled regression and treat CLI's `package.json` engine declaration as its repository-local requirement.
+
+### Recurrence on 2026-09-16 (HARA-FB-001381)
+
+A combined CLI toolchain probe again tried to read Desktop-style `.node-version` and `.bun-version` files
+before confirming that this repository owns them. The read-only failures changed no state; use CLI's declared
+Node engine and the coupled Desktop/release workflow pins after discovering the available files.
+
 ### Metadata
 
 - Source: command_failure
@@ -7180,7 +8590,9 @@ the already verified release toolchain elsewhere.
 - Related Files: package.json, ../hara-desktop/.node-version, ../hara-desktop/.bun-version
 - Tags: release, toolchain, node, bun, discovery
 - Pattern-Key: tooling.discover_repo_pin_files_before_reading
-- Recurrence-Count: 1
+- Recurrence-Count: 5
+- First-Seen: 2026-08-06
+- Last-Seen: 2026-09-16
 
 ---
 
@@ -7367,7 +8779,9 @@ process list merely to make release diagnostics more convenient.
 - Related Files: AGENTS.md
 - Tags: sandbox, ps, git-push, diagnostics
 - Pattern-Key: sandbox.process_listing_requires_narrow_approved_diagnostic
-- Recurrence-Count: 1
+- Recurrence-Count: 2
+- First-Seen: 2026-08-06
+- Last-Seen: 2026-09-11
 
 ---
 
@@ -7456,6 +8870,10 @@ its device-stable identity under `~/.hara`: the sandbox rejected `fchmod` before
 The unchanged probe passed at the approved host boundary with both sources ready. Keep the private directory
 mode checks strict and move real-Home probes to that boundary.
 
+It recurred on 2026-09-10 when the Serve end-to-end suite imported the external-session registry before its
+test-local temporary home was established. The managed sandbox rejected `fchmod` before the automation RPC
+assertions ran. Keep the permission guard unchanged and run this fixture at the approved host/CI boundary.
+
 ### Metadata
 
 - Source: command_failure
@@ -7463,8 +8881,8 @@ mode checks strict and move real-Home probes to that boundary.
 - Related Files: test/presentations.test.mjs, src/security/private-state.ts, src/external-sessions/identity.ts
 - Tags: tests, sandbox, artifact, permissions, fchmod
 - Pattern-Key: test.managed_sandbox_blocks_artifact_fchmod
-- Recurrence-Count: 2
-- Last-Seen: 2026-08-29
+- Recurrence-Count: 3
+- Last-Seen: 2026-09-10
 
 ---
 ## [ERR-20260810-CROSS-SHELL-WARNING-ASSERTION] Warning copy assertion used the wrong phrase order
@@ -7723,6 +9141,12 @@ Re-run tests that intentionally exercise Hara's own macOS Seatbelt boundary outs
 sandbox. The same focused test passed there; do not weaken Hara's sandbox or broaden the assertion to accept
 exit 71.
 
+### Recurrence on 2026-09-11T04:14:01+08:00
+
+The isolated CLI `v0.166.1` regression run for HARA-FB-001064 again reached the nested Seatbelt fixture and
+received exit 71. All ticket-specific repeat-guard assertions passed; rerun only the exact ticket patterns
+inside the managed sandbox and keep this unrelated platform fixture out of the acceptance claim.
+
 ### Metadata
 
 - Source: command_failure
@@ -7730,8 +9154,8 @@ exit 71.
 - Related Files: src/sandbox.ts, test/agent-limits.test.mjs
 - Tags: tests, macos, sandbox, seatbelt
 - Pattern-Key: tests.nested_seatbelt_requires_unsandboxed_runner
-- Recurrence-Count: 3
-- Last-Seen: 2026-09-01
+- Recurrence-Count: 4
+- Last-Seen: 2026-09-11
 
 ---
 
@@ -7822,11 +9246,11 @@ weaken localhost integration coverage to accommodate the outer sandbox.
 
 - Source: command_failure
 - Reproducible: yes, only in the outer restricted sandbox
-- Related Files: test/deepseek-factory.test.mjs, test/web.test.mjs, test/wecom-gateway.test.mjs, test/serve-agent-identity.test.mjs
+- Related Files: test/deepseek-factory.test.mjs, test/provider-target.test.mjs, test/web.test.mjs, test/wecom-gateway.test.mjs, test/serve-agent-identity.test.mjs, test/serve-agent-team.test.mjs, test/serve-external-sessions.test.mjs
 - Tags: tests, sandbox, loopback, websocket, http
 - Pattern-Key: tests.loopback_fixtures_require_release_runner
-- Recurrence-Count: 5
-- Last-Seen: 2026-09-09
+- Recurrence-Count: 7
+- Last-Seen: 2026-09-20
 
 ---
 
@@ -7971,5 +9395,465 @@ and report the local runtime limitation separately.
 
 - **Resolved**: 2026-09-09T01:53:51+08:00
 - **Notes**: The public OCI index returned amd64 and arm64 manifests; the release image job had already passed.
+
+---
+
+## [ERR-20260911-C4E] Isolated-clone command used its not-yet-created directory as workdir
+
+**Logged**: 2026-09-11T08:30:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+An exact-tag verification command set the process working directory to the intended clone before `git clone`
+had created that directory, so the command runner rejected process creation and no subcommand ran.
+
+### Error
+
+```text
+CreateProcess failed: No such file or directory
+```
+
+### Resolution
+
+Create the unique temporary parent first, run `git clone` from that existing parent, and only then start a
+separate command with the clone as its explicit workdir. The failed attempt changed no repository state.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: package.json
+- Tags: isolated-clone, workdir, tests, orchestration
+- Pattern-Key: tooling.create_clone_before_selecting_clone_workdir
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260912-ZSH-GLOB] Optional test glob was expanded by zsh before ripgrep
+
+**Logged**: 2026-09-12T23:51:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tooling
+
+### Summary
+
+A read-only source search passed `test/desktop*.test.mjs` as an unquoted positional path. No matching file
+exists in this repository, so zsh aborted the whole command before ripgrep searched the valid paths.
+
+### Resolution
+
+Use concrete directories with `rg --glob`, or obtain candidates from `rg --files` before a second search.
+Never pass an optional unquoted wildcard as a shell positional argument.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes under zsh
+- Related Files: `test/`
+- Tags: zsh, glob, ripgrep, diagnostics
+- Pattern-Key: tooling.zsh_optional_globs_must_not_be_positional
+- Recurrence-Count: 3
+- Last-Seen: 2026-09-15
+
+---
+
+## [ERR-20260913-MOBILE-SERVE-FCHMOD] Focused Mobile Serve test blocked before assertions by managed sandbox
+
+**Logged**: 2026-09-13T16:00:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+The focused Mobile pairing/publication Serve test could not tighten an isolated private-state file descriptor inside the managed workspace sandbox.
+
+### Error
+```
+EPERM: operation not permitted, fchmod
+```
+
+### Context
+- Command: `node --test --test-name-pattern='Mobile QR pairing' test/serve-e2e.test.mjs`
+- The failure occurred in `tightenPrivateDescriptorMode` before the Mobile RPC assertions ran.
+- TypeScript compilation and the non-network Mobile companion suite passed in the same workspace.
+
+### Suggested Fix
+Run this existing private-state/loopback integration suite outside the managed filesystem sandbox. Keep the production permission checks unchanged.
+
+### Metadata
+- Reproducible: sandbox-dependent
+- Related Files: src/security/private-state.ts, test/serve-e2e.test.mjs
+- See Also: ERR-20260808-ARTIFACT-FCHMOD-SANDBOX
+
+### Resolution
+- **Resolved**: 2026-09-13T16:00:00+08:00
+- **Notes**: Classified as the previously documented managed-sandbox limitation; the exact test is rerun with the approved host test boundary.
+
+---
+
+## [ERR-20260913-GITHUB-RELEASE-500] GitHub Release creation and failed-job rerun returned HTTP 500
+
+**Logged**: 2026-09-13T17:01:00+08:00
+**Priority**: medium
+**Status**: pending
+**Area**: release
+
+### Summary
+
+The `v0.175.1` release matrix built, tested, signed, executed, and uploaded all four standalone binaries,
+but the GitHub control plane returned HTTP 500 while `gh release create` created the immutable Release.
+The first `gh run rerun --failed` request also returned HTTP 500.
+
+### Resolution Strategy
+
+Keep the verified tag and artifacts unchanged. Retry only the failed idempotent publication job after a
+bounded delay; its existing-release branch must compare every remote SHA-256 before accepting a retry.
+Do not move the tag, rebuild a different asset set, or manually bypass the workflow.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: transient GitHub API failure
+- Related Files: .github/workflows/release.yml
+- Tags: github-actions, release, http-500, idempotency, retry
+- Pattern-Key: release.retry_idempotent_publish_after_github_control_plane_500
+- Recurrence-Count: 1
+
+---
+
+## 2026-09-13 — npm pack cannot use the sandboxed user cache
+
+- Context: Hara CLI 0.176.0 release dry-run after all tests passed.
+- Symptom: `npm pack --dry-run` failed with EPERM under `~/.npm/_cacache/tmp`.
+- Cause: the managed workspace cannot write the user npm cache; the package build itself completed.
+- Resolution: rerun the dry-run with a task-specific cache under `/tmp` and keep the user cache unchanged.
+
+---
+
+## 2026-09-14 — GHCR manifest lookup needs the approved network boundary
+
+- Context: public verification of `ghcr.io/hara-cli/hara:0.177.0` after the release workflow completed.
+- Symptom: sandboxed `docker manifest inspect` failed because `ghcr.io` DNS was unavailable.
+- Cause: the managed network sandbox, rather than a missing published image.
+- Resolution: rerun the same read-only manifest inspection through the approved external-network boundary; the multi-architecture OCI index was present for amd64 and arm64.
+- Pattern-Key: tooling.ghcr_read_only_verification_requires_external_network
+
+---
+
+## [ERR-20260914-GATEWAY-PS-SANDBOX] macOS gateway identity test could not invoke ps
+
+**Logged**: 2026-09-14T16:30:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+The focused gateway suite passed the new direct-message access regressions, but the existing macOS timezone
+stability test received a null process identity because the managed sandbox prevented the ps probe.
+
+### Error
+
+~~~text
+AssertionError: assert.ok(utc)
+~~~
+
+### Resolution
+
+Treat this as an environment-blocked existing assertion, not a product failure. Retain the process identity
+check and rerun the exact test in the protected host CI lane where macOS process inspection is permitted.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes in the managed sandbox
+- Related Files: src/process-identity.ts, test/gateway-runtime-state.test.mjs
+- Tags: macos, ps, sandbox, gateway, tests
+- Pattern-Key: tests.gateway_process_identity_requires_ps_permission
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260915-BUN-PATH] Bun is not available on the non-interactive shell PATH
+
+**Logged**: 2026-09-15T13:54:37+08:00
+**Priority**: low
+**Status**: pending
+**Area**: tests
+
+### Summary
+
+A read-only Bun version preflight for the Windows standalone gateway regression returned `command not found`.
+
+### Error
+
+~~~text
+zsh:1: command not found: bun
+~~~
+
+### Context
+
+- The HARA-FB-001363 diagnosis needs the Bun 1.3.9 standalone boundary, but this checkout does not pin a local Bun path and the non-interactive shell does not expose Bun.
+- Source and Node-based regression tests can still run; a native Windows standalone smoke requires the protected CI toolchain.
+
+### Suggested Fix
+
+Use the repository workflow's pinned Bun 1.3.9 in CI for the Windows standalone smoke. Do not install or select an unpinned global Bun merely to bypass the preflight.
+
+### Recurrence on 2026-09-16 (HARA-FB-001381)
+
+The duplicate Windows standalone gateway report hit the same bare-Bun preflight failure. Keep source and
+Node regressions on Node 22.23.1, and leave native Windows Bun 1.3.9 execution to the protected CI lane.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `.github/workflows/ci.yml`, `scripts/build-binary.ts`
+- Tags: bun, path, windows, standalone, toolchain
+- Pattern-Key: tooling.bun_missing_from_noninteractive_path
+- Recurrence-Count: 2
+- First-Seen: 2026-09-15
+- Last-Seen: 2026-09-16
+
+---
+
+## [ERR-20260915-TEMP-CLEANUP] Shell policy rejected force-style temporary cleanup
+
+**Logged**: 2026-09-15T14:14:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tooling
+
+### Summary
+
+The shell policy rejected `rm -rf` even though every target was a uniquely named HARA-FB-001363 temporary
+attachment or message export.
+
+### Error
+
+~~~text
+rm -f style commands are not permitted. Use a safer approach
+~~~
+
+### Resolution
+
+Removed only the exact task-owned directory and files through Python `Path`/`shutil`, with type checks before
+each operation. No repository or user-owned source path was included.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `/tmp/hara-fb-001363-*`
+- Tags: cleanup, shell-policy, temporary-files
+- Pattern-Key: tooling.use_typed_cleanup_for_task_temp_files
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260916-WEB-RELEASE-OPEN] Browser could not open official release endpoints directly
+
+**Logged**: 2026-09-16T18:20:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: release-validation
+
+### Summary
+
+A read-only current-release check could not open the official GitHub latest-release redirect or npm registry
+metadata URL through the browsing tool.
+
+### Error
+
+~~~text
+GitHub direct open: cache miss
+npm registry direct open: URL is not safe to open
+~~~
+
+### Suggested Fix
+
+Use an official-domain-limited search or a supported repository API/CLI read. Keep the local signed tag and
+Desktop sidecar locks as bounded evidence if the online source remains unavailable; do not infer a release.
+
+### Metadata
+
+- Source: external_tool_failure
+- Reproducible: unknown
+- Related Files: `package.json`, `../hara-desktop/src-tauri/binaries/SIDECAR_VERSION`
+- Tags: web, github, npm, release-verification
+- Pattern-Key: tooling.web_direct_open_may_require_search_discovery
+- Recurrence-Count: 1
+
+### Resolution
+
+An official-domain-limited search reached npm's package page and confirmed 0.178.1 as the current published
+Engine version. The failed direct opens were not treated as release evidence.
+
+---
+
+## [ERR-20260916-GH-CLI-MISSING] GitHub CLI was unavailable for release verification
+
+**Logged**: 2026-09-16T18:24:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: release-validation
+
+### Summary
+
+A read-only fallback query attempted to use GitHub CLI, but `gh` is not installed in this environment.
+
+### Error
+
+~~~text
+gh: command not found
+~~~
+
+### Resolution
+
+Do not install an extra client for this issue. Use the official npm package page plus local protected tag and
+sidecar-lock evidence, and keep the unavailable GitHub live check explicit.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `package.json`, `../hara-desktop/src-tauri/binaries/SIDECAR_VERSION`
+- Tags: github-cli, release-verification, tooling
+- Pattern-Key: tooling.do_not_assume_gh_is_installed
+- Recurrence-Count: 1
+
+---
+## [ERR-20260922-CUA-NATIVE-PIPE] Native Computer Use pipe failed before Terminal selection
+
+**Logged**: 2026-09-22T19:10:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tooling
+
+### Summary
+
+The first read-only Computer Use call (`getApp("Terminal")`) failed during native pipe startup, before any
+application action occurred.
+
+### Error
+
+```
+Sky Computer Use native pipe startup failed
+```
+
+### Resolution
+
+Use the bounded macOS Terminal AppleScript and `screencapture` fallback for this local-only recording. Keep
+the demo window isolated and do not weaken Hara or macOS permissions to make the unavailable pipe work.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: unknown
+- Related Files: scripts/demo-jev-action-guard.mjs
+- Tags: cua, macos, terminal, screen-recording
+
+---
+
+## [ERR-20260923-PYCOMPILE-CACHE-BOUNDARY] Python syntax check tried to write outside the managed workspace
+
+**Logged**: 2026-09-23T22:20:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tooling
+
+### Summary
+
+`python -m py_compile` selected Apple's user cache under `~/Library/Caches`, which is outside the managed
+workspace write boundary. The source file was valid; only bytecode-cache creation was denied.
+
+### Error
+
+~~~text
+PermissionError: [Errno 1] Operation not permitted: '~/Library/Caches/com.apple.python/...'
+~~~
+
+### Resolution
+
+Set `PYTHONPYCACHEPREFIX` to a task-scoped directory under `/private/tmp` for syntax-only Python checks.
+The bounded rerun completed successfully.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `scripts/jev-wechat-bridge.py`
+- Tags: python, pycompile, cache, sandbox
+- Pattern-Key: tooling.python_compile_uses_task_private_cache
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260924-NPM-PACK-CACHE-OWNERSHIP] npm pack could not use the inherited global cache
+
+**Logged**: 2026-09-24T11:00:55+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: release-validation
+
+### Summary
+
+The post-version-bump `npm pack --dry-run` reached npm packaging after a successful build, but the inherited
+user cache contained root-owned entries and could not create its temporary package file.
+
+### Error
+
+~~~text
+npm error code EPERM
+npm error syscall open
+npm error path ~/.npm/_cacache/tmp/...
+~~~
+
+### Resolution
+
+Do not change global cache ownership during a release. Rerun the deterministic dry pack with a task-private
+cache under `/private/tmp`, leaving the user's shared npm directory untouched.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `package.json`, `package-lock.json`
+- Tags: npm, pack, cache, release
+- Pattern-Key: tooling.npm_release_checks_use_task_private_cache
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260924-RELEASE-TAG-HASH-TYPO] Release tag command used an invented full commit hash
+
+**Logged**: 2026-09-24T11:08:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: release-validation
+
+### Summary
+
+The first local `v0.180.0` tag command expanded a displayed short hash by hand instead of reading Git's
+authoritative full object ID. Git rejected the nonexistent object before creating or pushing a tag.
+
+### Resolution
+
+Never hand-complete a short object ID. Tag the already-verified `HEAD` directly, or obtain the exact object
+with `git rev-parse HEAD` and use that unchanged.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `.git/refs/tags`
+- Tags: git, tag, release, integrity
+- Pattern-Key: release.tags_use_verified_head_not_manual_hashes
+- Recurrence-Count: 1
 
 ---
