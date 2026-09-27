@@ -22,7 +22,7 @@
   separate `memory_*` layer retains curated facts/preferences, while `/evolve status|now` distills reviewable
   candidates and verified skills without rewriting product code, permissions, config, or system prompts.
 - **Multi-provider, all streamed** — Anthropic (Claude), Volcengine Ark Agent Plan, or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI), with live Markdown answers while provider reasoning stays private.
-- **Delegate to other agents** — the **`external_agent`** tool hands a self-contained task to **Claude Code** or **Codex** running headless, and returns the result — so you pick the best engine per task. It is a trusted extension outside Hara's protected-file boundary: every interactive call requires confirmation, and non-interactive use is disabled by default.
+- **Delegate to other coding runtimes** — the **`external_agent`** tool hands a self-contained task to **Claude Code**, **Codex**, or provider-neutral **OpenCode** running headless, and returns the result. OpenCode runs with a Hara-owned fail-closed permission overlay (`plan` for read-only, edit-only `build` for workspace-write, and no shell until the user explicitly grants full trust). Every external runtime remains outside Hara's protected-file boundary, so each interactive call requires confirmation and non-interactive use is disabled by default.
 - **Honest under a slow network** — a live "waiting for the model… Ns" status, a stall watchdog that
   auto-fails-over instead of hanging, terminal-native bracketed paste, big pastes folding to a token, and a
   startup update notice — the terminal never feels dead.

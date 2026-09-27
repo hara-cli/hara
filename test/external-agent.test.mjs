@@ -154,6 +154,52 @@ test("buildExternalArgv: codex --sandbox maps from sandbox/trust, --cd = cwd", (
   assert.equal(danger.args.at(-1), "danger-full-access"); // only at trust=full
 });
 
+test("buildExternalArgv: opencode stays pure and receives a fail-closed permission overlay", () => {
+  const ro = buildExternalArgv("opencode", "inspect this repo", {
+    cwd: "/proj",
+    sandbox: "read-only",
+    trust: "gated",
+    model: "openai/gpt-5.4",
+  });
+  assert.deepEqual(ro.args, [
+    "--pure",
+    "run",
+    "--dir",
+    "/proj",
+    "--agent",
+    "plan",
+    "--model",
+    "openai/gpt-5.4",
+    "--",
+    "inspect this repo",
+  ]);
+  const roPermission = JSON.parse(ro.env.OPENCODE_PERMISSION);
+  assert.equal(Object.keys(roPermission)[0], "*", "OpenCode's fallback rule stays before explicit overrides");
+  assert.equal(roPermission["*"], "deny");
+  assert.equal(roPermission.read, "allow");
+  assert.equal(roPermission.edit, "deny");
+  assert.equal(roPermission.bash, "deny");
+  assert.equal(roPermission.external_directory, "deny");
+
+  const write = buildExternalArgv("opencode", "fix it", {
+    cwd: "/proj",
+    sandbox: "workspace-write",
+    trust: "gated",
+  });
+  assert.ok(write.args.includes("build"));
+  assert.equal(JSON.parse(write.env.OPENCODE_PERMISSION).edit, "allow");
+  assert.equal(JSON.parse(write.env.OPENCODE_PERMISSION).bash, "deny");
+
+  const full = buildExternalArgv("opencode", "own the task", {
+    cwd: "/proj",
+    sandbox: "read-only",
+    trust: "full",
+  });
+  assert.ok(full.args.includes("--auto"));
+  assert.ok(full.args.includes("build"));
+  assert.deepEqual(JSON.parse(full.env.OPENCODE_PERMISSION), { "*": "allow" });
+});
+
 test("buildExternalArgv: unknown backend → null", () => {
   assert.equal(buildExternalArgv("gemini", "x", { cwd: "/w", sandbox: "off", trust: "gated" }), null);
 });

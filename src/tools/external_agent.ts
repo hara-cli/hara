@@ -1,6 +1,6 @@
-// external_agent — delegate a self-contained task to an EXTERNAL coding-agent CLI (claude-code / codex / …)
+// external_agent — delegate a self-contained task to an EXTERNAL coding-agent CLI (Claude Code / Codex / OpenCode)
 // running headless on the host, and return its final text. Inspired by openclaw's ACP subagent feature, but
-// zero-dep: we drive each agent's native headless flag (`claude -p`, `codex exec`) over node:child_process
+// zero-dep: we drive each agent's native headless flag (`claude -p`, `codex exec`, `opencode run`) over node:child_process
 // instead of the heavy ACP/acpx stack.
 //
 // Safety: kind:"exec" → inherits the loop's approval gate. It can read/write/run on the host, so it is the most
@@ -30,9 +30,42 @@ export interface ExternalArgvOpts {
   trust: Trust;
 }
 
+export interface ExternalSpawnSpec {
+  cmd: string;
+  args: string[];
+  /** Invocation-only policy. It is merged after Hara scrubs inherited secret/injection variables. */
+  env?: Record<string, string>;
+}
+
+/** OpenCode is a provider-neutral coding runtime, not an OS sandbox. Keep Hara's outer approval as the
+ * authority and overlay a deterministic, fail-closed permission set for every gated invocation. The
+ * wildcard must remain first: OpenCode evaluates the last matching rule, so explicit capabilities below
+ * override the fallback without allowing a user config to silently broaden this run. */
+function openCodePermissionOverlay(o: ExternalArgvOpts): Record<string, unknown> {
+  if (o.trust === "full") return { "*": "allow" };
+  const canEdit = o.sandbox === "workspace-write";
+  return {
+    "*": "deny",
+    read: "allow",
+    glob: "allow",
+    grep: "allow",
+    list: "allow",
+    lsp: "allow",
+    todoread: "allow",
+    todowrite: "allow",
+    edit: canEdit ? "allow" : "deny",
+    bash: "deny",
+    task: "deny",
+    external_directory: "deny",
+    webfetch: "deny",
+    websearch: "deny",
+    question: "deny",
+  };
+}
+
 /** Pure: build the spawn (cmd, args) for a backend, or null if unknown. Maps hara's sandbox/trust → the agent's
  *  own permission flags; the dangerous bypass/full-access modes are only reachable at trust "full". */
-export function buildExternalArgv(backend: string, task: string, o: ExternalArgvOpts): { cmd: string; args: string[] } | null {
+export function buildExternalArgv(backend: string, task: string, o: ExternalArgvOpts): ExternalSpawnSpec | null {
   if (backend === "claude") {
     const mode = o.trust === "full" ? "bypassPermissions" : o.sandbox === "workspace-write" ? "acceptEdits" : "plan";
     return { cmd: "claude", args: ["-p", task, "--output-format", "text", ...(o.model ? ["--model", o.model] : []), "--permission-mode", mode] };
@@ -41,10 +74,32 @@ export function buildExternalArgv(backend: string, task: string, o: ExternalArgv
     const sb = o.trust === "full" ? "danger-full-access" : o.sandbox === "workspace-write" ? "workspace-write" : "read-only";
     return { cmd: "codex", args: ["exec", task, "--cd", o.cwd, ...(o.model ? ["-m", o.model] : []), "--sandbox", sb] };
   }
+  if (backend === "opencode") {
+    const agent = o.trust === "full" || o.sandbox === "workspace-write" ? "build" : "plan";
+    return {
+      cmd: "opencode",
+      args: [
+        "--pure",
+        "run",
+        "--dir",
+        o.cwd,
+        "--agent",
+        agent,
+        ...(o.model ? ["--model", o.model] : []),
+        ...(o.trust === "full" ? ["--auto"] : []),
+        "--",
+        task,
+      ],
+      env: {
+        OPENCODE_PERMISSION: JSON.stringify(openCodePermissionOverlay(o)),
+      },
+    };
+  }
   return null;
 }
 
-const BUILTIN_BACKENDS = ["claude", "codex"];
+// Preserve the established native-runtime preference when Hara is asked to choose automatically.
+const BUILTIN_BACKENDS = ["claude", "codex", "opencode"];
 const EXTERNAL_CAPTURE_PER_STREAM = 2 * 1024 * 1024;
 const EXTERNAL_OUTPUT_KILL_LIMIT = 4 * 1024 * 1024;
 
@@ -122,10 +177,10 @@ function resolveTrust(): Trust {
 registerTool({
   name: "external_agent",
   description:
-    "Delegate a self-contained coding task to an EXTERNAL agent CLI — `claude` (Claude Code) or `codex` — " +
+    "Delegate a self-contained coding task to an EXTERNAL agent CLI — `claude` (Claude Code), `codex`, or provider-neutral `opencode` — " +
     "running headless in the current directory, and return its result. Use for heavy, isolated work you want " +
     "another agent to own end-to-end. It can read/write/run on the host, so it's gated by approval. " +
-    "Args: task (required), backend (claude|codex; default = first installed), model (optional).",
+    "Args: task (required), backend (claude|codex|opencode; default = first installed), model (optional; OpenCode uses provider/model).",
   kind: "exec", // → approval gate; never exposed to read-only fan-out sub-agents
   visibility: "deferred",
   requiresProjectWorkspace: true,
@@ -134,7 +189,7 @@ registerTool({
     type: "object",
     properties: {
       task: { type: "string", description: "the self-contained task for the external agent" },
-      backend: { type: "string", description: "claude | codex (default: first available on PATH)" },
+      backend: { type: "string", description: "claude | codex | opencode (default: first available on PATH)" },
       model: { type: "string", description: "optional model id override for the external agent" },
       timeout_ms: { type: "number", description: "hard cap in ms (default 600000, max 1800000)" },
     },
@@ -184,7 +239,7 @@ registerTool({
       try {
         child = crossSpawn(built.cmd, built.args, {
           cwd: ctx.cwd,
-          env: toolSubprocessEnv(),
+          env: toolSubprocessEnv(process.env, built.env),
           detached: processGroup,
         });
       } catch (error) {

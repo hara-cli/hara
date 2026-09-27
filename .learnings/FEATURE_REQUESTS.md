@@ -29,6 +29,40 @@ for continuing an unfinished task rather than switching a saved session.
 
 ---
 
+## [FR-20260927-OPENCODE-INTERNAL-RUNTIME] Provider-neutral OpenCode runtime behind Hara conversations
+
+**Logged**: 2026-09-27T16:00:00+08:00
+**Priority**: high
+**Status**: stage_1_implemented
+**Area**: coding-runtime
+
+### Requested Capability
+
+Make code work a Hara-internal capability rather than forcing users to operate a separate Codex, Claude
+Code, or OpenCode interface. Preserve native subscription connections while offering one Hara conversation,
+permission system, Agent orchestrator, durable session, Desktop/Mobile control plane, and natural chat UX.
+
+### Stage 1
+
+Added bounded OpenCode delegation to `external_agent`, with Hara approval, pure mode, deterministic
+permission overlays, model routing in `provider/model` form, output bounds, redaction, cancellation, and
+process-tree cleanup inherited from the existing trusted-extension boundary.
+
+### Next Stage
+
+Implement the Hara-owned durable OpenCode adapter described in
+`docs/opencode-runtime-learning-audit.md`, using a loopback managed server or ACP while keeping native IDs
+and credentials behind Serve.
+
+### Metadata
+
+- Frequency: first_time
+- Related Features: external_agent, Hara Live, provider connections, Desktop chat, Mobile relay
+- Related Files: `src/tools/external_agent.ts`, `docs/opencode-runtime-learning-audit.md`
+- Requested By: user
+
+---
+
 ## [FEAT-20260923-002] custom-wechat-group-wake-name
 
 **Logged**: 2026-09-23T21:00:00+08:00

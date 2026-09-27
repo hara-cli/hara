@@ -28,6 +28,66 @@ for tracked source or another bounded search tool. Do not broaden the runtime pa
 
 ---
 
+## [ERR-20260927-CLI-FULL-TEST-SANDBOX] Full CLI suite needs loopback and real child-process semantics
+
+**Logged**: 2026-09-27T16:30:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: testing
+
+### Summary
+
+The first full `npm test` run executed inside the restricted workspace sandbox. Tests that intentionally
+bind loopback ports failed with `listen EPERM`, and the foreground-process cancellation assertion observed
+the sandbox wrapper's exit code instead of Hara's cancellation result. The OpenCode-focused tests were not
+affected.
+
+### Resolution
+
+Rerun the complete Hara CLI suite with the existing approved `npm test` command outside the restricted
+sandbox. The authoritative run passed all 1,797 tests; keep focused pure-unit tests in the sandbox when
+possible, but use the unrestricted test profile for the full integration suite.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes in the restricted sandbox
+- Related Files: `test/web.test.mjs`, `test/wecom-gateway.test.mjs`, `test/agent-limits.test.mjs`
+- Tags: testing, sandbox, loopback, child-process
+- Pattern-Key: testing.full_cli_suite_requires_loopback_profile
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260927-WRONG-REPO-TEST-PATH] Looked for a Desktop collaboration test under hara-cli
+
+**Logged**: 2026-09-27T16:00:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: repository-navigation
+
+### Summary
+
+During the OpenCode/Hara runtime audit, an inspection command tried to read
+`hara-cli/test/agent-collaboration.test.mjs`. The test belongs to `hara-desktop/test`, so the path did not
+exist. No source or user data was changed.
+
+### Resolution
+
+Resolve cross-repository references with `rg --files` from the Hara workspace before opening a presumed
+test path.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `hara-desktop/test/agent-collaboration.test.mjs`
+- Tags: tooling, repository, path
+- Pattern-Key: tooling.resolve_cross_repo_paths_before_read
+- Recurrence-Count: 1
+
+---
+
 ## [ERR-20260925-SYSTEM-PROMPT-BACKTICK] Unescaped tool-name markup ended a TypeScript template string
 
 **Logged**: 2026-09-25T12:00:00+08:00
