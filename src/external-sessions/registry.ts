@@ -3,6 +3,7 @@ import { CodexAppServerAdapter } from "./codex.js";
 import { ClaudeAgentSdkAdapter } from "./claude.js";
 import { HaraRuntimeAdapter } from "./runtime.js";
 import { OpenCodeRuntimeAdapter } from "./opencode.js";
+import { haraCodeRuntimeCommand } from "../opencode-runtime.js";
 import { ExternalSessionOwnershipStore, externalSessionIdentityKey } from "./identity.js";
 import type { ExternalCommandOptions } from "./process.js";
 import {
@@ -94,7 +95,7 @@ export class ExternalSessionRegistry implements ExternalSessionService {
           ownership,
         }),
         new OpenCodeRuntimeAdapter({
-          command: options.opencode?.command ?? "opencode",
+          command: options.opencode?.command ?? haraCodeRuntimeCommand(),
           argsPrefix: options.opencode?.argsPrefix,
           spawnProcess: options.opencode?.spawnProcess,
           timeoutMs: options.opencode?.timeoutMs,

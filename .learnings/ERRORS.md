@@ -1,5 +1,35 @@
 # Errors
 
+## [ERR-20260929-CLI-CHILD-NODE-PATH] full-suite child CLIs inherited an older Node binary
+
+**Logged**: 2026-09-29T03:02:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tooling
+
+### Summary
+
+Launching npm's CLI with the pinned Node executable selected Node 22.23.1 for the parent test runner, but
+did not change `PATH`. Integration tests that intentionally spawn Hara through its normal `env node`
+bootstrap therefore found the workstation's older Node 22.22.3 and failed the supported-runtime guard.
+
+### Resolution
+
+For release-class tests, put the repository-approved Node `bin` directory first in `PATH` for the entire
+process tree in addition to invoking the matching npm. The unchanged full suite then passed 1,798 tests with
+zero failures and one platform skip.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes when the parent executable and child `PATH` disagree
+- Related Files: `runtime-bootstrap.cjs`, `test/config-live.test.mjs`
+- Tags: node, path, child-process, release-testing
+- Pattern-Key: tooling.release_tests_pin_node_for_entire_process_tree
+- Recurrence-Count: 1
+
+---
+
 ## [ERR-20260911-015] Pinned Node PATH omitted the preferred search binary
 
 **Logged**: 2026-09-11T07:05:00+08:00
@@ -25,6 +55,74 @@ for tracked source or another bounded search tool. Do not broaden the runtime pa
 - Tags: tooling, search, node-path
 - Pattern-Key: tooling.search_falls_back_when_pinned_path_omits_rg
 - Recurrence-Count: 1
+
+---
+
+## [ERR-20260929-INHERITED-RUNTIME-GRANTS-FENCE] inherited coding runtimes tripped the explicit-grant fence
+
+**Logged**: 2026-09-29T02:20:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: backend
+
+### Summary
+
+The first automatic coding-runtime inheritance change reused a validation branch that was intended only for
+explicit child grants, so a nested Hara Agent could not create another Hara Agent.
+
+### Error
+
+~~~text
+Only /root may grant coding runtimes to a Hara Agent
+~~~
+
+### Resolution
+
+Apply the root-only fence only when `input.runtimeGrants` was explicitly supplied. Automatically inherited
+availability now flows down the Hara Agent tree, while explicit re-granting by a child remains blocked.
+
+### Metadata
+
+- Source: test_failure
+- Reproducible: yes
+- Related Files: `src/subagent/team.ts`, `test/agent-team.test.mjs`
+- Tags: agents, inheritance, coding-runtime, authorization
+- Pattern-Key: agents.distinguish_inherited_capability_from_explicit_grant
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260929-HARA-WORKSPACE-NOT-GIT-ROOT] repository status was requested from the workspace container
+
+**Logged**: 2026-09-29T02:13:50+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tooling
+
+### Summary
+
+The Hara workspace directory contains several sibling repositories but is not itself a Git repository.
+
+### Error
+
+~~~text
+fatal: not a git repository (or any of the parent directories): .git
+~~~
+
+### Context
+
+- `git status --short` was run from `/Users/zhujianbo/work/projects/hara` before checking the actual repository roots.
+
+### Suggested Fix
+
+Run Git checks independently from `hara-cli`, `hara-desktop`, or the specific sibling repository in scope.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: `../hara-desktop/.git`, `.git`
+- Tags: git, workspace, verification
+- Pattern-Key: tooling.hara_workspace_contains_sibling_repositories
 
 ---
 
@@ -55,7 +153,8 @@ possible, but use the unrestricted test profile for the full integration suite.
 - Related Files: `test/web.test.mjs`, `test/wecom-gateway.test.mjs`, `test/agent-limits.test.mjs`
 - Tags: testing, sandbox, loopback, child-process
 - Pattern-Key: testing.full_cli_suite_requires_loopback_profile
-- Recurrence-Count: 1
+- Recurrence-Count: 3
+- Last-Seen: 2026-09-29
 
 ---
 
@@ -9914,6 +10013,41 @@ with `git rev-parse HEAD` and use that unchanged.
 - Related Files: `.git/refs/tags`
 - Tags: git, tag, release, integrity
 - Pattern-Key: release.tags_use_verified_head_not_manual_hashes
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260929-CLI-NODE-VERSION-FILE] Hara CLI verification assumed Desktop's `.node-version`
+
+**Logged**: 2026-09-29T01:08:22+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tooling
+
+### Summary
+
+A combined CLI verification command tried to read `.node-version`, but only Hara Desktop pins that file;
+Hara CLI declares its minimum runtime in `package.json#engines.node`.
+
+### Error
+
+~~~text
+cat: .node-version: No such file or directory
+No .nvmrc file found
+~~~
+
+### Resolution
+
+For Hara CLI, select the repository-required Node 22.23.1 explicitly (or derive the lower bound from
+`package.json#engines.node`). Reserve `.node-version` reads for repositories that actually commit it.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `package.json`, `../hara-desktop/.node-version`
+- Tags: node, nvm, verification, monorepo
+- Pattern-Key: tooling.node_version_source_is_repository_specific
 - Recurrence-Count: 1
 
 ---

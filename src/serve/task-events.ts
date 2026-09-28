@@ -74,6 +74,7 @@ export interface TaskLifecycleEvent {
         kind: "missing_secret" | "missing_authority" | "physical_action" | "material_choice" | "external_state" | "destructive_confirmation";
         detail: string;
         evidence: string[];
+        options?: string[];
         capability?: string;
         manualAction?: {
           command?: string;
@@ -189,6 +190,14 @@ export function taskLifecycleEvent(
                       kind: persisted.completion.dependency.kind,
                       detail: bounded(persisted.completion.dependency.detail, 500)!,
                       evidence: persisted.completion.dependency.evidence.map((item) => item.slice(0, 1_000)),
+                      ...(persisted.completion.dependency.options?.length
+                        ? {
+                            options: persisted.completion.dependency.options
+                              .map((item) => bounded(item, 300))
+                              .filter((item): item is string => !!item)
+                              .slice(0, 8),
+                          }
+                        : {}),
                       ...(persisted.completion.dependency.capability
                         ? { capability: persisted.completion.dependency.capability }
                         : {}),

@@ -384,6 +384,9 @@ export interface DurableAgentTeamOptions {
   currentRootTurnId?: () => string | undefined;
   /** Resolved only when a new parent turn adopts the tree, so model/connection changes affect new work. */
   limits?: Partial<AgentTeamLimits> | (() => Partial<AgentTeamLimits>);
+  /** Coding executors the current host/space may offer through a just-in-time approval. Hara Agents inherit
+   * this availability automatically; it is not a per-Agent preference the user must configure. */
+  codingRuntimes?: readonly AgentCodingRuntime[] | (() => readonly AgentCodingRuntime[]);
   /** Lazily constructed because ordinary/read-only sessions need not be Git repositories. */
   worktreeManager?: AgentWorktreeManager | (() => AgentWorktreeManager);
 }
@@ -1105,9 +1108,9 @@ function executionPrompt(record: AgentTeamRecord): string {
   const sections = ["Initial assignment:\n" + record.assignment];
   if (record.runtime === "hara" && record.runtimeGrants.length > 0) {
     sections.push(
-      "Granted coding runtimes:\n"
+      "Available coding executors:\n"
       + record.runtimeGrants.map((runtime) => `- ${runtime}: use spawn_agent with runtime '${runtime}' for bounded coding work in an isolated Worktree`).join("\n")
-      + "\nThis user-granted capability is the authorization for bounded launches. You cannot apply a coding Agent's Diff; report it to /root for inspection and manual application.",
+      + "\nChoose an executor only when the assignment benefits from coding work; do not ask the user to configure one in advance. Every launch still pauses for just-in-time user approval. You cannot apply a coding Agent's Diff; report it to /root for inspection and manual application.",
     );
   }
   if (record.instructions.length > 1) {
@@ -1156,6 +1159,13 @@ export class DurableAgentTeam {
       ? this.options.limits()
       : this.options.limits;
     return normalizeTeamLimits(configured);
+  }
+
+  private codingRuntimes(): AgentCodingRuntime[] {
+    const configured = typeof this.options.codingRuntimes === "function"
+      ? this.options.codingRuntimes()
+      : this.options.codingRuntimes;
+    return normalizeRuntimeGrants(configured === undefined ? ["codex", "claude"] : [...configured]);
   }
 
   private newBudget(rootTurnId?: string): AgentTeamBudget {
@@ -1446,7 +1456,7 @@ export class DurableAgentTeam {
       this.adoptRootTurn(provenance.rootTurnId);
     }
     const runtimeGrants: readonly AgentCodingRuntime[] = path === "/root"
-      ? ["codex", "claude"]
+      ? this.codingRuntimes()
       : [...this.resolve(path).runtimeGrants];
     return {
       path,
@@ -1813,11 +1823,15 @@ export class DurableAgentTeam {
         throw new Error(`Agent '${parentPath}' has not been granted the ${runtime} coding runtime`);
       }
     }
-    const runtimeGrants = normalizeRuntimeGrants(input.runtimeGrants);
+    const runtimeGrants = runtime === "hara" && input.runtimeGrants === undefined
+      ? (parentPath === "/root"
+          ? this.codingRuntimes()
+          : [...this.resolve(parentPath).runtimeGrants])
+      : normalizeRuntimeGrants(input.runtimeGrants);
     if (runtime !== "hara" && runtimeGrants.length > 0) {
       throw new Error("Codex and Claude Agents cannot re-delegate coding runtimes");
     }
-    if (parentPath !== "/root" && runtimeGrants.length > 0) {
+    if (parentPath !== "/root" && input.runtimeGrants !== undefined && runtimeGrants.length > 0) {
       throw new Error("Only /root may grant coding runtimes to a Hara Agent");
     }
     const stableCommandId = commandId?.trim() || randomUUID();

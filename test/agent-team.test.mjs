@@ -472,7 +472,7 @@ test("nested Agents receive a scoped controller and the durable tree enforces ma
   }
 });
 
-test("native Agents can delegate only to coding runtimes granted by root", async () => {
+test("native Agents inherit eligible coding runtimes while explicit policy can still narrow them", async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-agent-runtime-grants-"));
   const home = join(root, "home");
   const repo = join(root, "repo");
@@ -500,13 +500,12 @@ test("native Agents can delegate only to coding runtimes granted by root", async
     const delegator = await rootController.spawn({
       taskName: "delegator",
       message: "Coordinate coding work.",
-      runtimeGrants: ["codex"],
     });
     await rootController.wait(delegator.id, 2_000);
-    assert.deepEqual(delegator.runtimeGrants, ["codex"]);
+    assert.deepEqual(delegator.runtimeGrants, ["codex", "claude"]);
 
     const scoped = team.controller(delegator.path);
-    assert.deepEqual(scoped.runtimeGrants, ["codex"]);
+    assert.deepEqual(scoped.runtimeGrants, ["codex", "claude"]);
     const codex = await scoped.spawn({
       taskName: "codex_worker",
       message: "Implement one bounded change.",
@@ -521,26 +520,33 @@ test("native Agents can delegate only to coding runtimes granted by root", async
       "a background coordinator cannot silently merge its coding worker into the user's source checkout",
     );
 
-    await assert.rejects(
-      scoped.spawn({ taskName: "claude_worker", message: "Should be denied.", runtime: "claude" }),
-      /has not been granted the claude coding runtime/i,
-    );
+    const claude = await scoped.spawn({
+      taskName: "claude_worker",
+      message: "Implement another bounded change.",
+      runtime: "claude",
+    });
+    await scoped.wait(claude.id, 2_000);
+    assert.equal(claude.runtime, "claude");
     await assert.rejects(
       scoped.spawn({ taskName: "grant_forward", message: "Should be denied.", runtimeGrants: ["codex"] }),
       /only \/root may grant coding runtimes/i,
     );
 
-    const ungranted = await rootController.spawn({ taskName: "observer", message: "Review only." });
-    await rootController.wait(ungranted.id, 2_000);
+    const restricted = await rootController.spawn({
+      taskName: "observer",
+      message: "Review only.",
+      runtimeGrants: ["codex"],
+    });
+    await rootController.wait(restricted.id, 2_000);
     await assert.rejects(
-      team.controller(ungranted.path).spawn({
-        taskName: "ungranted_codex",
+      team.controller(restricted.path).spawn({
+        taskName: "restricted_claude",
         message: "Should be denied.",
-        runtime: "codex",
+        runtime: "claude",
       }),
-      /has not been granted the codex coding runtime/i,
+      /has not been granted the claude coding runtime/i,
     );
-    assert.deepEqual(requests.map((request) => request.runtime), ["hara", "codex", "hara"]);
+    assert.deepEqual(requests.map((request) => request.runtime), ["hara", "codex", "claude", "hara"]);
   } finally {
     team.close();
     rmSync(root, { force: true, recursive: true });

@@ -20,6 +20,11 @@ The durable product boundary is a **Hara-owned coding runtime**:
 4. A user changes connection or runtime only when needed; ordinary requests such as “修复这个项目” are
    routed by Hara from capability, authentication, policy, health, and workspace state.
 
+Runtime selection is not an Agent-profile setting. A user creates or talks to a Hara Agent and describes the
+goal; the Agent may add Hara Code Runtime, Codex, or Claude Code when execution requires it. A consequential
+launch produces an in-context approval card at that moment. The creation UI must not ask the user to assign
+an executor or maintain standing Codex/Claude checkboxes.
+
 This provides functional transparency without falsely promising credential transparency.
 
 ## Authentication finding
@@ -71,6 +76,13 @@ Therefore Hara must use two paths:
 This stage makes OpenCode useful to Hara immediately, but this one-shot delegation path itself is not a
 durable Hara Live session and must not be advertised as one.
 
+Desktop distributions bundle the checksum-pinned OpenCode executable under the product-neutral name
+**Hara Code Runtime** and pass its absolute path to the Hara Engine. Users do not install or update a
+second application, and Hara never relies on a project-local executable or an ambient Desktop `PATH`.
+The upstream version, archive digest, source URL, and MIT notice remain part of the Desktop release
+provenance. Standalone Hara CLI keeps an explicit PATH fallback because npm/standalone installations do
+not own a native application bundle.
+
 ### Stage 2 — first-class OpenCode sessions (phase 1 implemented)
 
 Hara's protected external-session boundary now has a first-class `opencode` source:
@@ -82,7 +94,8 @@ Hara's protected external-session boundary now has a first-class `opencode` sour
   reopen in the native terminal; ownership survives Hara restarts.
 - Every managed turn launches OpenCode with `--pure`, an invocation-only deny-by-default Hara agent, a
   bounded/redacted event stream, and rejection of unsafe session-level permission overrides.
-- Missing OpenCode is a capability state, not an application failure; Codex and Claude Code remain usable.
+- A missing bundled runtime is a package-integrity capability state, not an application crash; Codex and
+  Claude Code remain usable while Desktop offers repair/reinstall guidance.
 - This phase uses a short-lived OpenCode process for each submitted turn and is intentionally Desktop/local
   only. It does not yet auto-link an OpenCode session to the root Hara conversation or expose it through
   Mobile Relay.
@@ -123,9 +136,11 @@ The root Hara Agent chooses a coding runtime from policy and capability:
 4. Fall back only to a healthy compatible connection after a user-visible route receipt; never send a model
    to another vendor's endpoint.
 5. Keep one Hara conversation even when multiple execution segments or child Agents are involved.
+6. Automatically inherit eligible coding executors across Hara Agent delegation, but require a fresh
+   just-in-time approval whenever any Agent actually launches Codex or Claude Code.
 
-The composer should say which connection will be used only when that information helps a decision. It
-should not make users choose an engine for every message.
+The composer should say which connection will be used only when that information helps a decision. Agent
+creation and ordinary messages must not require users to choose or pre-authorize an engine.
 
 ## Chat presentation implications
 
@@ -141,7 +156,8 @@ Runtime unification succeeds only if execution looks like part of a normal conve
 
 ## Non-goals
 
-- Copying the OpenCode monorepo into Hara.
+- Copying the OpenCode monorepo into Hara. Desktop redistributes a pinned upstream executable plus its
+  license and provenance instead.
 - Replacing Hara's Agent/team/task model with OpenCode Agents.
 - Importing Codex or Claude credentials without explicit provider authorization.
 - Running OpenCode with `--auto` merely because a Hara conversation uses automatic edits.

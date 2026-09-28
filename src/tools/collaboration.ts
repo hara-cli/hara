@@ -21,8 +21,9 @@ registerTool({
   name: "spawn_agent",
   description:
     "Start a durable child Agent in the background and return its stable id/path immediately. runtime defaults to hara. "
-    + "runtime codex or claude starts that coding agent inside a private Git worktree. The root run requires a fresh "
-    + "approval; a child Hara Agent may launch only a runtime the user already granted to that Agent. "
+    + "Choose runtime codex or claude when the assignment needs a specialist coding executor; Hara discovers and routes "
+    + "that capability from the conversation, so never ask the user to configure a runtime on the Agent first. Every "
+    + "coding launch requires fresh just-in-time approval and runs inside a private Git worktree. "
     + "Native Hara Agents are READ-ONLY by default. "
     + "Use workspace:'isolated-write' only for an implementation task: Hara gives that child a private Git worktree, "
     + "allows only bounded native file edits, and requires inspect_agent_diff + apply_agent_diff before source files change. "
@@ -61,7 +62,7 @@ registerTool({
         effect: "exec" as const,
         concurrencySafe: false,
         approvalKind: "exec" as const,
-        ...(ctx.agentTeam?.path === "/root" ? { requiresExplicitApproval: true } : {}),
+        requiresExplicitApproval: true,
       }
     : stateOperation(),
   async run(input, ctx) {
@@ -78,7 +79,7 @@ registerTool({
       return "Error: local Codex and Claude coding runtimes are available only in Personal Space.";
     }
     if (runtime !== "hara" && !team.runtimeGrants.includes(runtime)) {
-      return `Error: Agent '${team.path}' has not been granted the ${runtime} coding runtime.`;
+      return `Error: the ${runtime} coding runtime is unavailable in this space.`;
     }
     try {
       return json(await team.spawn({

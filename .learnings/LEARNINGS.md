@@ -4,7 +4,7 @@
 
 **Logged**: 2026-08-28T00:00:00+08:00
 **Priority**: high
-**Status**: in_progress
+**Status**: resolved
 **Area**: architecture
 
 ### Summary
@@ -41,6 +41,51 @@ optional signed capability rather than adding its approximately 206 MB native bi
 - Tags: codex, claude, sessions, identity, lifecycle, mobile, tenancy
 - Pattern-Key: architecture.external_sessions_one_authority_fork_first
 - Recurrence-Count: 1
+
+---
+
+## [LRN-20260929-JIT-CODING-RUNTIME-ROUTING] correction
+
+**Logged**: 2026-09-29T02:13:50+08:00
+**Priority**: high
+**Status**: in_progress
+**Area**: frontend
+
+### Summary
+
+Hara users should not preconfigure a Codex or Claude Code runtime on each Agent; the Agent should select a
+coding executor from the conversation and request approval only when it actually launches one.
+
+### Details
+
+The previous Agent collaboration surface exposed runtime selection and persistent Codex/Claude grant
+checkboxes while creating a Hara Agent. That models an internal routing decision as user setup. OpenBot and
+Grok Bot establish the clearer interaction: the user talks to an Agent, the Agent decides when specialist
+coding execution is warranted, and the consequential launch is reviewed in context. Hara should preserve its
+permission boundary without forcing a separate setup step.
+
+### Suggested Action
+
+Keep Hara Agents as persistent identities, automatically inherit eligible local coding runtimes, remove
+runtime/grant setup from the Agent creation UI, and require a just-in-time approval card for every Codex or
+Claude Code launch. Keep the bundled OpenCode executable product-neutral as Hara Code Runtime.
+
+### Metadata
+
+- Source: user_feedback
+- Related Files: `src/subagent/team.ts`, `src/tools/collaboration.ts`, `../hara-desktop/src/AgentCollaborationSurface.tsx`
+- Tags: agents, codex, claude-code, opencode, routing, approval, ux
+- Pattern-Key: agents.runtime_selection_is_jit_not_profile_setup
+- Recurrence-Count: 1
+- First-Seen: 2026-09-29
+- Last-Seen: 2026-09-29
+
+### Resolution
+
+- **Resolved**: 2026-09-29T02:45:00+08:00
+- **Notes**: Removed runtime selection and standing Codex/Claude grant controls from Desktop Agent creation,
+  made eligible Hara Agents inherit available coding executors automatically, and changed every actual
+  Codex/Claude launch to require a fresh in-context approval. Added CLI, Serve, and Desktop regression tests.
 
 ---
 

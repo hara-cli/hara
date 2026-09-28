@@ -155,12 +155,16 @@ test("buildExternalArgv: codex --sandbox maps from sandbox/trust, --cd = cwd", (
 });
 
 test("buildExternalArgv: opencode stays pure and receives a fail-closed permission overlay", () => {
+  const previousRuntime = process.env.HARA_CODE_RUNTIME_PATH;
+  process.env.HARA_CODE_RUNTIME_PATH = "/opt/hara/hara-code-runtime";
+  try {
   const ro = buildExternalArgv("opencode", "inspect this repo", {
     cwd: "/proj",
     sandbox: "read-only",
     trust: "gated",
     model: "openai/gpt-5.4",
   });
+  assert.equal(ro.cmd, "/opt/hara/hara-code-runtime");
   assert.deepEqual(ro.args, [
     "--pure",
     "run",
@@ -198,6 +202,10 @@ test("buildExternalArgv: opencode stays pure and receives a fail-closed permissi
   assert.ok(full.args.includes("--auto"));
   assert.ok(full.args.includes("build"));
   assert.deepEqual(JSON.parse(full.env.OPENCODE_PERMISSION), { "*": "allow" });
+  } finally {
+    if (previousRuntime === undefined) delete process.env.HARA_CODE_RUNTIME_PATH;
+    else process.env.HARA_CODE_RUNTIME_PATH = previousRuntime;
+  }
 });
 
 test("buildExternalArgv: unknown backend → null", () => {

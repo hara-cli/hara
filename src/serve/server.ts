@@ -305,8 +305,10 @@ import {
   finishTaskExecution,
   newSteerInteraction,
   newTurnInteraction,
+  recordAwaitingTaskDecision,
   recordTaskSteering,
   requestsTaskContinuation,
+  taskAwaitsUserDecision,
   taskExecutionContext,
   type TaskInteraction,
 } from "../session/task.js";
@@ -2639,6 +2641,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       sessionId: session.meta.id,
       store: agentTeamStore,
       currentRootTurnId: () => session.task?.turnId,
+      codingRuntimes: () => sessionSpaceBinding(session.meta).spaceId === "personal"
+        ? ["codex", "claude"]
+        : [],
       limits: () => {
         const perRun = deps.runLimits?.(session.meta.cwd) ?? { timeoutMs: 8 * 60_000, maxRounds: 24 };
         const modelWindow = session.provider.connection?.capabilities.contextWindowTokens
@@ -3089,11 +3094,17 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     let executionContext: string;
     try {
       const recoveredSteering = materializePendingSteering(s);
+      const answeringDurableQuestion = !forceNewTask && taskAwaitsUserDecision(s.task);
       interaction = !forceNewTask && s.task && s.task.status !== "completed" &&
-        (recoveredSteering.length > 0 || requestsTaskContinuation(text))
+        (recoveredSteering.length > 0 || answeringDurableQuestion || requestsTaskContinuation(text))
         ? newSteerInteraction(s.task.turnId)
         : newTurnInteraction();
       if (interaction.kind === "steer") {
+        if (answeringDurableQuestion) {
+          const recorded = recordAwaitingTaskDecision(s.task, displayText);
+          if (!recorded.ok) throw new Error(recorded.reason);
+          s.task = recorded.task;
+        }
         const continued = continueTaskExecution(s.task, interaction);
         if (!continued.ok) throw new Error(continued.reason);
         s.task = continued.task;
@@ -5448,13 +5459,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (workspace !== "read-only" && workspace !== "isolated-write") {
               return reply(rpcError(id, ERR.PARAMS, "workspace must be read-only or isolated-write"));
             }
-            const runtimeGrants = p.runtimeGrants ?? [];
+            const runtimeGrants = p.runtimeGrants;
             if (
-              !Array.isArray(runtimeGrants)
-              || runtimeGrants.length > 2
-              || runtimeGrants.some((grant: unknown) => grant !== "codex" && grant !== "claude")
+              runtimeGrants !== undefined
+              && (!Array.isArray(runtimeGrants)
+                || runtimeGrants.length > 2
+                || runtimeGrants.some((grant: unknown) => grant !== "codex" && grant !== "claude"))
             ) return reply(rpcError(id, ERR.PARAMS, "runtimeGrants may contain only codex and claude"));
-            if (runtime !== "hara" && runtimeGrants.length > 0) {
+            if (runtime !== "hara" && runtimeGrants !== undefined && runtimeGrants.length > 0) {
               return reply(rpcError(id, ERR.PARAMS, "only a Hara Agent can receive coding runtime grants"));
             }
             const session = hub.get(p.sessionId);
@@ -5464,7 +5476,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (runtime !== "hara" && binding.spaceId !== "personal") {
               return reply(rpcError(id, ERR.UNAUTHORIZED, "Codex and Claude runtimes are available only in Personal Space"));
             }
-            if (runtimeGrants.length > 0 && binding.spaceId !== "personal") {
+            if (runtimeGrants !== undefined && runtimeGrants.length > 0 && binding.spaceId !== "personal") {
               return reply(rpcError(id, ERR.UNAUTHORIZED, "coding runtime grants are available only in Personal Space"));
             }
             let role: string | undefined;
@@ -5495,7 +5507,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               ...(role ? { role } : {}),
               runtime,
               workspace,
-              runtimeGrants,
+              ...(runtimeGrants !== undefined ? { runtimeGrants } : {}),
             }, p.commandId);
             return reply(rpcResult(id!, { sessionId: session.meta.id, agent }));
           }

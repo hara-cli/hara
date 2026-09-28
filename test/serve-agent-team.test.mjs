@@ -437,7 +437,11 @@ test("Serve exposes user-driven Agent members, direct messages, and bounded grou
     });
     const listed = await client.call("session.agents.list", { sessionId });
     assert.deepEqual(listed.result.agents.find((agent) => agent.id === alpha.result.agent.id).runtimeGrants, ["codex"]);
-    assert.deepEqual(listed.result.agents.find((agent) => agent.id === beta.result.agent.id).runtimeGrants, []);
+    assert.deepEqual(
+      listed.result.agents.find((agent) => agent.id === beta.result.agent.id).runtimeGrants,
+      ["codex", "claude"],
+      "a Personal-space Hara Agent inherits eligible coding executors without a separate setup step",
+    );
 
     const roomCreated = await client.call("session.agent-rooms.create", {
       sessionId,

@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.182.0 — 2026-09-29 — automatic coding execution and conversational decisions
+
+- Let users talk only to a Hara Agent. Eligible Personal Space Agents now discover and select Codex or
+  Claude Code when a task benefits from specialist coding work, without per-Agent runtime setup or standing
+  grant checkboxes. Every actual coding launch still requires fresh in-context approval and stays isolated.
+- Resolve the provider-neutral Hara Code Runtime from the checksum-pinned executable bundled by Desktop, while
+  retaining an explicit OpenCode PATH fallback for standalone CLI installations. Both one-shot delegation and
+  durable external sessions use the same fail-closed resolver.
+- Preserve structured material-choice options in Serve lifecycle events and treat the user's answer as a
+  continuation of the same durable task. Numeric choices retain their stable option label and decision receipt
+  instead of silently starting an unrelated task.
+
 ## 0.181.0 — 2026-09-26 — durable coding sessions under the Hara root orchestrator
 
 - Define Hara as the permanent root orchestrator rather than a dismissible hired Agent. The root keeps the

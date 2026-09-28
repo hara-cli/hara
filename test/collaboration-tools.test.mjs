@@ -205,7 +205,7 @@ test("local coding runtimes fail closed outside Personal Space without requestin
   assert.equal(calls.length, 0);
 });
 
-test("a Hara Agent can invoke only explicitly granted coding runtimes", async () => {
+test("a Hara Agent routes to eligible coding runtimes with just-in-time approval", async () => {
   const calls = [];
   const ctx = {
     cwd: process.cwd(),
@@ -218,7 +218,8 @@ test("a Hara Agent can invoke only explicitly granted coding runtimes", async ()
     effect: "exec",
     concurrencySafe: false,
     approvalKind: "exec",
-  }, "the user's durable per-Agent grant authorizes bounded child launches without a fake headless prompt");
+    requiresExplicitApproval: true,
+  }, "every coding launch gets an in-context approval instead of a separate Agent setup step");
   const codex = JSON.parse(await spawn.run({
     task_name: "codex_fix",
     message: "Implement the bounded fix.",
@@ -236,7 +237,7 @@ test("a Hara Agent can invoke only explicitly granted coding runtimes", async ()
     message: "Implement the bounded fix.",
     runtime: "claude",
   }, ctx);
-  assert.match(claude, /has not been granted the claude coding runtime/i);
+  assert.match(claude, /claude coding runtime is unavailable in this space/i);
   assert.equal(calls.length, 1, "an ungranted runtime never reaches the team controller");
 });
 

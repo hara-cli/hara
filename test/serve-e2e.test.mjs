@@ -20,7 +20,7 @@ import {
   validSessionCommandId,
 } from "../dist/serve/server.js";
 import { addJob, cronDir, findJob, loadJobs, removeJob, saveJobs } from "../dist/cron/store.js";
-import { createTaskExecution, finishTaskExecution } from "../dist/session/task.js";
+import { applyTaskCheckpoint, createTaskExecution, finishTaskExecution } from "../dist/session/task.js";
 import { INTERJECT_PREFIX } from "../dist/agent/reminders.js";
 import { createNativeGlobalAgent, orgRolesDir } from "../dist/org/roles.js";
 import { registerTool } from "../dist/tools/registry.js";
@@ -5161,6 +5161,82 @@ test("serve e2e: a fresh checkpoint crosses the cumulative task boundary automat
     );
   } finally {
     c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: a reply to a durable material choice resumes the same task and retains the stable option", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-material-choice-"));
+  const store = memStore();
+  const sessionId = randomUUID();
+  const original = createTaskExecution("route the verified report", randomUUID(), "2026-09-28T00:00:00.000Z");
+  const waiting = applyTaskCheckpoint(original, {
+    completion: {
+      state: "awaiting_user",
+      evidence: ["the destination must be selected before delivery"],
+      dependency: {
+        kind: "material_choice",
+        detail: "Which team should receive the report?",
+        evidence: ["the user has not selected one of the available destinations"],
+        options: ["Operations", "Engineering"],
+      },
+    },
+  }, "2026-09-28T00:01:00.000Z");
+  assert.equal(waiting.ok, true);
+  const paused = finishTaskExecution(
+    waiting.task,
+    { status: "completed" },
+    [],
+    false,
+    "2026-09-28T00:02:00.000Z",
+  );
+  assert.equal(paused.status, "paused");
+  store.saved.set(sessionId, {
+    meta: {
+      id: sessionId,
+      cwd: dir,
+      profileId: "personal",
+      spaceId: "personal",
+      provider: "fake",
+      model: "fake-1",
+      title: "report routing",
+      createdAt: "2026-09-28T00:00:00.000Z",
+      updatedAt: "2026-09-28T00:02:00.000Z",
+      source: "interactive",
+    },
+    history: [{ role: "user", content: "route the verified report" }],
+    task: paused,
+  });
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ onText }) {
+      onText("The report will go to Engineering.");
+      return {
+        text: "The report will go to Engineering.",
+        toolUses: [],
+        stop: "end",
+        usage: { input: 1, output: 1 },
+      };
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  const client = await connect(srv.port);
+  try {
+    await client.call("initialize", { token: "tok" });
+    assert.equal((await client.call("session.resume", { sessionId })).error, undefined);
+    const submitted = await client.call("session.send", { sessionId, text: "2" });
+    assert.equal(submitted.error, undefined);
+    assert.equal(submitted.result.taskId, original.id, "the answer must not create a replacement task");
+    assert.notEqual(submitted.result.turnId, original.turnId, "the resumed tranche receives a fresh turn identity");
+    const saved = store.saved.get(sessionId);
+    assert.equal(saved.task.decisions.length, 1);
+    assert.equal(saved.task.decisions[0].turnId, original.turnId, "the receipt stays linked to the turn that asked");
+    assert.equal(saved.task.decisions[0].question, "Which team should receive the report?");
+    assert.equal(saved.task.decisions[0].answer, "Engineering", "numeric choices retain the stable option label");
+  } finally {
+    client.close();
     await srv.close();
     rmSync(dir, { recursive: true, force: true });
   }

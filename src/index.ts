@@ -7833,6 +7833,7 @@ program.action(async (opts) => {
     sessionId: meta.id,
     store: new AgentTeamStore(homedir()),
     currentRootTurnId: () => task?.turnId,
+    codingRuntimes: () => meta.spaceId === "personal" ? ["codex", "claude"] : [],
     limits: () => {
       const perAgentRounds = Math.max(1, Math.min(24, cfg.maxAgentRounds));
       const modelWindow = provider.connection?.capabilities.contextWindowTokens
