@@ -5,7 +5,7 @@
  * objects must stay behind the Serve boundary. Desktop and future mobile clients receive only this
  * deliberately small projection.
  */
-export type ExternalSessionSourceId = "codex" | "claude" | "runtime";
+export type ExternalSessionSourceId = "codex" | "claude" | "opencode" | "runtime";
 
 export type ExternalRuntimeAgentKind = "codex" | "claude";
 
@@ -270,7 +270,7 @@ export interface ExternalSessionAdapterCreateInput extends Omit<ExternalSessionC
 
 export interface ExternalProviderTerminalResult {
   sessionId: string;
-  sourceId: "codex" | "claude";
+  sourceId: "codex" | "claude" | "opencode";
   code: number | null;
   signal: NodeJS.Signals | null;
 }

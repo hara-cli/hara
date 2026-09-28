@@ -19,7 +19,7 @@ interface StoredExternalSessionOwnership {
   version: 1;
   sessions: Array<{
     id: string;
-    sourceId: "codex" | "claude";
+    sourceId: "codex" | "claude" | "opencode";
     createdAt: string;
   }>;
 }
@@ -35,14 +35,14 @@ interface StoredExternalRuntimeLinks {
 
 const MAX_OWNED_SESSIONS = 5_000;
 const MAX_OWNERSHIP_FILE_BYTES = 2 * 1024 * 1024;
-const OPAQUE_ID = /^ext_(codex|claude)_[a-f0-9]{24}$/;
+const OPAQUE_ID = /^ext_(codex|claude|opencode)_[a-f0-9]{24}$/;
 const RUNTIME_OPAQUE_ID = /^ext_runtime_[a-f0-9]{24}$/;
 const MAX_RUNTIME_LINKS = 5_000;
 const MAX_RUNTIME_LINKS_FILE_BYTES = 2 * 1024 * 1024;
 
 /** Derive the renderer-safe id used by the matching provider adapter. */
 export function opaqueProviderSessionId(
-  sourceId: "codex" | "claude",
+  sourceId: "codex" | "claude" | "opencode",
   nativeSessionId: string,
   identityKey: Buffer,
 ): string {
@@ -109,7 +109,7 @@ const parseOwnership = (text: string): StoredExternalSessionOwnership => {
       !entry
       || typeof entry !== "object"
       || !OPAQUE_ID.test(entry.id)
-      || (entry.sourceId !== "codex" && entry.sourceId !== "claude")
+      || (entry.sourceId !== "codex" && entry.sourceId !== "claude" && entry.sourceId !== "opencode")
       || !entry.id.startsWith(`ext_${entry.sourceId}_`)
       || typeof entry.createdAt !== "string"
       || Number.isNaN(Date.parse(entry.createdAt))
@@ -137,7 +137,7 @@ export class ExternalSessionOwnershipStore {
     return this.owned.has(sessionId);
   }
 
-  add(sourceId: "codex" | "claude", sessionId: string): void {
+  add(sourceId: "codex" | "claude" | "opencode", sessionId: string): void {
     if (!OPAQUE_ID.test(sessionId) || !sessionId.startsWith(`ext_${sourceId}_`)) {
       throw new Error("cannot persist an invalid external session ownership id");
     }

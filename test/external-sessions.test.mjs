@@ -8,7 +8,9 @@ import test from "node:test";
 import { ClaudeAgentSdkAdapter } from "../dist/external-sessions/claude.js";
 import { CodexAppServerAdapter } from "../dist/external-sessions/codex.js";
 import { HaraRuntimeAdapter } from "../dist/external-sessions/runtime.js";
+import { OpenCodeRuntimeAdapter } from "../dist/external-sessions/opencode.js";
 import { ExternalSessionRegistry } from "../dist/external-sessions/registry.js";
+import { ExternalSessionOwnershipStore } from "../dist/external-sessions/identity.js";
 import { HerdrTerminalStream } from "../dist/external-sessions/terminal-stream.js";
 import {
   JsonlRpcClient,
@@ -82,6 +84,160 @@ test("an explicit CLI prepends its verified sibling runtime directory", {
     assert.deepEqual(result, { installed: true });
     assert.equal(childPath.split(":")[0], runtimeBin);
     assert.equal(childPath.split(":").filter((entry) => entry === runtimeBin).length, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode sessions stay opaque while Hara can claim, stream, and interrupt a guarded continuation", {
+  skip: process.platform === "win32" ? "POSIX process-group interruption fixture" : false,
+}, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-opencode-session-"));
+  const statePath = join(root, "state.json");
+  const nativeId = "ses_native_open_code_secret";
+  try {
+    const fixture = join(root, "fake-opencode.mjs");
+    writeFileSync(fixture, `
+      import { existsSync, readFileSync, writeFileSync } from "node:fs";
+      const statePath = ${JSON.stringify(statePath)};
+      const nativeId = ${JSON.stringify(nativeId)};
+      const root = ${JSON.stringify(root)};
+      const readState = () => existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : {};
+      const writeState = (patch) => writeFileSync(statePath, JSON.stringify({ ...readState(), ...patch }));
+      const raw = process.argv.slice(2);
+      if (raw.includes("--version")) {
+        process.stdout.write("opencode 1.18.32\\n");
+        process.exit(0);
+      }
+      const args = raw[0] === "--pure" ? raw.slice(1) : raw;
+      if (args[0] === "session" && args[1] === "list") {
+        process.stdout.write(JSON.stringify([{
+          id: nativeId,
+          title: "Guarded coding session",
+          updated: 1789876543000,
+          created: 1789876500000,
+          projectId: "project-secret",
+          directory: root,
+        }]));
+      } else if (args[0] === "export") {
+        const state = readState();
+        process.stdout.write(JSON.stringify({
+          info: {
+            id: nativeId,
+            permission: state.unsafe ? [{ permission: "bash", pattern: "*", action: "allow" }] : [],
+          },
+          messages: [
+            { info: { id: "msg_user_1", role: "user" }, parts: [{ type: "text", text: "inspect the code" }] },
+            { info: { id: "msg_assistant_1", role: "assistant" }, parts: [{ type: "text", text: "I found the issue" }] },
+          ],
+        }));
+      } else if (args[0] === "run") {
+        const message = args.at(-1);
+        writeState({
+          runArgs: args,
+          config: process.env.OPENCODE_CONFIG_CONTENT,
+          permission: process.env.OPENCODE_PERMISSION,
+          runningPid: process.pid,
+        });
+        if (message === "wait for interrupt") {
+          setInterval(() => {}, 60_000);
+        } else {
+          process.stdout.write(JSON.stringify({
+            type: "tool_use", timestamp: Date.now(), sessionID: nativeId,
+            part: { tool: "edit", state: { status: "completed", title: "Updated src/index.ts" } },
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "text", timestamp: Date.now(), sessionID: nativeId,
+            part: { type: "text", text: "Done without exposing sk-proj-abcdefghijklmnopqrstuvwxyz0123456789" },
+          }) + "\\n");
+        }
+      } else if (args[0] === root && args[1] === "--session") {
+        writeState({ terminalArgs: args });
+      } else {
+        process.exit(2);
+      }
+    `);
+
+    const ownership = new ExternalSessionOwnershipStore(root);
+    const adapter = new OpenCodeRuntimeAdapter({
+      command: process.execPath,
+      argsPrefix: [fixture],
+      timeoutMs: 5_000,
+      identityKey: Buffer.alloc(32, 41),
+      ownership,
+    });
+    const source = await adapter.inspect();
+    assert.equal(source.id, "opencode");
+    assert.equal(source.state, "ready");
+    assert.equal(source.capabilities.submit, true);
+    assert.equal(source.capabilities.steer, false);
+
+    const listed = await adapter.list({ limit: 10, search: "guarded" });
+    assert.equal(listed.sessions.length, 1);
+    const sessionId = listed.sessions[0].id;
+    assert.match(sessionId, /^ext_opencode_[a-f0-9]{24}$/);
+    assert.equal(listed.sessions[0].sourceId, "opencode");
+    assert.doesNotMatch(JSON.stringify(listed), /ses_native_open_code_secret/);
+    assert.equal(JSON.stringify(listed).includes(root), false, "the full workspace path must stay behind Core");
+
+    const history = await adapter.read(sessionId);
+    assert.equal(history.readOnly, true);
+    assert.equal(history.controlMode, "history");
+    assert.deepEqual(history.messages.map(({ role, text }) => [role, text]), [
+      ["user", "inspect the code"],
+      ["assistant", "I found the issue"],
+    ]);
+
+    const resumed = await adapter.resume(sessionId);
+    assert.equal(resumed.readOnly, false);
+    assert.equal(resumed.controlMode, "managed");
+    const ownershipFile = readFileSync(join(root, ".hara", "external-sessions", "ownership.json"), "utf8");
+    assert.match(ownershipFile, /"sourceId": "opencode"/);
+    assert.match(ownershipFile, new RegExp(sessionId));
+    assert.doesNotMatch(ownershipFile, /ses_native_open_code_secret/);
+    const streamed = [];
+    const tools = [];
+    const turn = await adapter.submit(sessionId, "make the fix", {
+      text: (text) => streamed.push(text),
+      tool: (name, preview) => tools.push([name, preview]),
+      notice: () => {},
+      confirm: async () => false,
+    });
+    assert.equal(turn.status, "completed");
+    assert.deepEqual(tools, [["edit", "Updated src/index.ts"]]);
+    assert.equal(streamed.length, 1);
+    assert.doesNotMatch(streamed[0], /sk-proj-/);
+    assert.match(streamed[0], /\*\*\*/);
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.deepEqual(state.runArgs.slice(0, 10), [
+      "run", "--dir", root, "--format", "json", "--session", nativeId, "--agent", "hara-guarded", "--",
+    ]);
+    assert.equal(JSON.parse(state.permission)["*"], "deny");
+    const guardedConfig = JSON.parse(state.config);
+    assert.equal(guardedConfig.agent["hara-guarded"].permission["*"], "deny");
+    assert.equal(guardedConfig.agent["hara-guarded"].permission.edit, "allow");
+    assert.equal(guardedConfig.agent["hara-guarded"].permission.bash, "deny");
+    assert.equal(guardedConfig.agent["hara-guarded"].permission.external_directory, "deny");
+
+    const pending = adapter.submit(sessionId, "wait for interrupt", {
+      text: () => {}, tool: () => {}, notice: () => {}, confirm: async () => false,
+    });
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const current = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : {};
+      if (current.runArgs?.at(-1) === "wait for interrupt") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await adapter.interrupt(sessionId);
+    assert.equal((await pending).status, "interrupted");
+
+    writeFileSync(statePath, JSON.stringify({ ...JSON.parse(readFileSync(statePath, "utf8")), unsafe: true }));
+    await assert.rejects(
+      adapter.submit(sessionId, "unsafe continuation", {
+        text: () => {}, tool: () => {}, notice: () => {}, confirm: async () => false,
+      }),
+      /permission overrides/,
+    );
+    await adapter.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -682,9 +838,10 @@ test("Codex App Server metadata is normalized and provider cursors remain server
       identityHome: root,
       codex: { command: process.execPath, argsPrefix: [fixture], timeoutMs: 3_000 },
       claude: { command: "definitely-missing-claude-test-command", timeoutMs: 500 },
+      opencode: { command: "definitely-missing-opencode-test-command", timeoutMs: 500 },
     });
     const first = await registry.listSessions({ sourceId: "codex", limit: 1 });
-    assert.deepEqual(first.sources.map((source) => source.id), ["runtime", "codex", "claude"]);
+    assert.deepEqual(first.sources.map((source) => source.id), ["runtime", "codex", "claude", "opencode"]);
     assert.equal(first.sessions.length, 1);
     assert.equal(first.sessions[0].title, "Release audit");
     assert.equal(first.sessions[0].workspaceName, "secret-project");
@@ -716,6 +873,7 @@ test("Codex App Server metadata is normalized and provider cursors remain server
       identityHome: root,
       codex: { command: process.execPath, argsPrefix: [fixture], timeoutMs: 3_000 },
       claude: { command: "definitely-missing-claude-test-command", timeoutMs: 500 },
+      opencode: { command: "definitely-missing-opencode-test-command", timeoutMs: 500 },
     });
     const afterRestart = await restartedRegistry.listSessions({ sourceId: "codex", limit: 1 });
     assert.equal(

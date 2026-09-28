@@ -68,12 +68,28 @@ Therefore Hara must use two paths:
 - The established native preference order remains Claude Code → Codex → OpenCode when the caller does not
   choose a backend.
 
-This stage makes OpenCode useful to Hara immediately, but it is not represented as a durable Hara Live
-session and must not be advertised as one.
+This stage makes OpenCode useful to Hara immediately, but this one-shot delegation path itself is not a
+durable Hara Live session and must not be advertised as one.
 
-### Stage 2 — Hara-owned OpenCode runtime
+### Stage 2 — first-class OpenCode sessions (phase 1 implemented)
 
-Add a `CodingRuntimeAdapter` contract shared by native Codex, native Claude Code, and OpenCode:
+Hara's protected external-session boundary now has a first-class `opencode` source:
+
+- Desktop and `hara coding sessions --provider opencode` can list OpenCode sessions using Hara-owned
+  opaque IDs; native IDs and absolute workspace paths remain behind Serve.
+- History is read-only until the user explicitly resumes/claims the selected session through Hara.
+- A claimed session can receive a guarded turn, stream normalized text/tool events, be interrupted, and
+  reopen in the native terminal; ownership survives Hara restarts.
+- Every managed turn launches OpenCode with `--pure`, an invocation-only deny-by-default Hara agent, a
+  bounded/redacted event stream, and rejection of unsafe session-level permission overrides.
+- Missing OpenCode is a capability state, not an application failure; Codex and Claude Code remain usable.
+- This phase uses a short-lived OpenCode process for each submitted turn and is intentionally Desktop/local
+  only. It does not yet auto-link an OpenCode session to the root Hara conversation or expose it through
+  Mobile Relay.
+
+The phase-1 adapter exposes the same Hara session operations where the provider can implement them safely.
+The remaining durable-runtime work is to finish a shared `CodingRuntimeAdapter` contract for native Codex,
+native Claude Code, and OpenCode:
 
 ```text
 inspect / authenticate / create / read / submit / steer / interrupt / fork / close
@@ -83,8 +99,8 @@ inspect / authenticate / create / read / submit / steer / interrupt / fork / clo
            Hara journal → Desktop / Mobile / Relay replay
 ```
 
-The OpenCode implementation should manage one local headless server per compatible runtime version or
-profile, not one process per chat message. Requirements:
+The next phase should replace the process-per-turn bridge with one local headless server per compatible
+runtime version or profile. Remaining requirements:
 
 - loopback-only listener and random owner-only launch password;
 - exact version/capability negotiation before use;
@@ -144,4 +160,3 @@ Runtime unification succeeds only if execution looks like part of a normal conve
 6. Switching Codex ↔ Claude Code ↔ OpenCode never silently changes the model vendor or endpoint.
 7. The UI presents one conversation with natural Agent presence; runtime details remain inspectable but
    secondary.
-

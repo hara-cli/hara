@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { CodexAppServerAdapter } from "./codex.js";
 import { ClaudeAgentSdkAdapter } from "./claude.js";
 import { HaraRuntimeAdapter } from "./runtime.js";
+import { OpenCodeRuntimeAdapter } from "./opencode.js";
 import { ExternalSessionOwnershipStore, externalSessionIdentityKey } from "./identity.js";
 import type { ExternalCommandOptions } from "./process.js";
 import {
@@ -32,7 +33,7 @@ import {
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
 const CURSOR_TTL_MS = 10 * 60 * 1_000;
-const SOURCE_ORDER: ExternalSessionSourceId[] = ["runtime", "codex", "claude"];
+const SOURCE_ORDER: ExternalSessionSourceId[] = ["runtime", "codex", "claude", "opencode"];
 
 interface CursorRecord {
   sourceId: ExternalSessionSourceId;
@@ -48,6 +49,7 @@ export interface ExternalSessionRegistryOptions {
   identityHome?: string;
   codex?: Partial<ExternalCommandOptions> & { managedDaemon?: boolean };
   claude?: Partial<ExternalCommandOptions>;
+  opencode?: Partial<ExternalCommandOptions>;
   runtime?: Partial<ExternalCommandOptions> & { sessionName?: string; runtimeRoot?: string };
 }
 
@@ -88,6 +90,15 @@ export class ExternalSessionRegistry implements ExternalSessionService {
           spawnProcess: options.claude?.spawnProcess,
           timeoutMs: options.claude?.timeoutMs,
           env: options.claude?.env,
+          identityKey,
+          ownership,
+        }),
+        new OpenCodeRuntimeAdapter({
+          command: options.opencode?.command ?? "opencode",
+          argsPrefix: options.opencode?.argsPrefix,
+          spawnProcess: options.opencode?.spawnProcess,
+          timeoutMs: options.opencode?.timeoutMs,
+          env: options.opencode?.env,
           identityKey,
           ownership,
         }),
@@ -246,12 +257,14 @@ export class ExternalSessionRegistry implements ExternalSessionService {
   }
 
   private adapterForSession(sessionId: string): ExternalSessionAdapter {
-    if (typeof sessionId !== "string" || !/^ext_(?:codex|claude|runtime)_[a-f0-9]{24}$/.test(sessionId)) {
+    if (typeof sessionId !== "string" || !/^ext_(?:codex|claude|opencode|runtime)_[a-f0-9]{24}$/.test(sessionId)) {
       throw new ExternalSessionInputError("external session id is invalid");
     }
     const sourceId: ExternalSessionSourceId = sessionId.startsWith("ext_codex_")
       ? "codex"
-      : sessionId.startsWith("ext_claude_") ? "claude" : "runtime";
+      : sessionId.startsWith("ext_claude_")
+        ? "claude"
+        : sessionId.startsWith("ext_opencode_") ? "opencode" : "runtime";
     const adapter = this.adapters.get(sourceId);
     if (!adapter) throw new ExternalSessionInputError("external session source is unavailable");
     return adapter;
@@ -387,7 +400,7 @@ export class ExternalSessionRegistry implements ExternalSessionService {
       targetId = live.session.providerSessionId;
       adapter = this.adapterForSession(targetId);
     }
-    if (adapter.id !== "codex" && adapter.id !== "claude") {
+    if (adapter.id !== "codex" && adapter.id !== "claude" && adapter.id !== "opencode") {
       throw new ExternalSessionInputError("this external session does not have a provider terminal");
     }
     if (!adapter.resumeInTerminal) {

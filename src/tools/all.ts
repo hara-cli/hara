@@ -20,7 +20,7 @@ import "./todo.js"; // todo_write
 import "./task.js"; // task (project-level persistent task pool)
 import "./send.js"; // send_file (self-gates on HARA_GATEWAY)
 import "./channel-message.js"; // connected Feishu/WeChat gateways; credentials stay in their owner process
-import "./external_agent.js"; // external_agent (claude-code / codex delegation)
+import "./external_agent.js"; // external_agent (Claude Code / Codex / OpenCode delegation)
 import "./ask_user.js"; // ask_user
 import "./cron.js"; // cronjob
 import "./computer.js"; // computer (desktop control; self-gates on config)

@@ -43,6 +43,10 @@ export interface ExternalCommandRunOptions {
   timeoutMs?: number;
   maxOutputBytes?: number;
   cwd?: string;
+  /** Abort a long-running provider turn and terminate its complete process group. */
+  signal?: AbortSignal;
+  /** Observe bounded stdout while retaining the same total output limit and redaction boundary. */
+  onStdout?: (chunk: string) => void;
   /** Preserve bounded stdout on a non-zero exit only for callers that parse a documented structured
    * response. It must never be forwarded to users or diagnostics because provider output may hold account data. */
   retainStdoutOnFailure?: boolean;
@@ -75,6 +79,9 @@ export async function runExternalCommandCapture(
   const processGroup = platform() !== "win32";
   const launch = resolveExternalCommandLaunch(options.command, options.env ?? process.env);
   if (!launch) return { ok: false, stdout: "", code: null, timedOut: false, errorCode: "command_not_found" };
+  if (run.signal?.aborted) {
+    return { ok: false, stdout: "", code: null, timedOut: false, errorCode: "interrupted" };
+  }
   const cwd = run.cwd && isAbsolute(run.cwd) ? run.cwd : undefined;
 
   return await new Promise((resolve) => {
@@ -96,10 +103,15 @@ export async function runExternalCommandCapture(
     let stdout = "";
     let stderr = "";
     let outputBytes = 0;
+    const abort = (): void => {
+      terminateSubprocessTree(child, { force: true, processGroup });
+      finish({ ok: false, stdout: "", code: null, timedOut: false, errorCode: "interrupted" });
+    };
     const finish = (result: ExternalCommandCaptureResult): void => {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      run.signal?.removeEventListener("abort", abort);
       resolve(result);
     };
     const timer = setTimeout(() => {
@@ -107,6 +119,11 @@ export async function runExternalCommandCapture(
       finish({ ok: false, stdout: "", code: null, timedOut: true, errorCode: "timeout" });
     }, timeoutMs);
     timer.unref();
+    run.signal?.addEventListener("abort", abort, { once: true });
+    if (run.signal?.aborted) {
+      abort();
+      return;
+    }
     child.stdout?.on("data", (chunk: Buffer) => {
       if (done) return;
       outputBytes += chunk.length;
@@ -115,7 +132,14 @@ export async function runExternalCommandCapture(
         finish({ ok: false, stdout: "", code: null, timedOut: false, errorCode: "output_limit" });
         return;
       }
-      stdout = boundedAppend(stdout, chunk.toString(), maxOutputBytes);
+      const text = chunk.toString();
+      stdout = boundedAppend(stdout, text, maxOutputBytes);
+      try {
+        run.onStdout?.(text);
+      } catch {
+        terminateSubprocessTree(child, { force: true, processGroup });
+        finish({ ok: false, stdout: "", code: null, timedOut: false, errorCode: "output_handler_failed" });
+      }
     });
     child.stderr?.on("data", (chunk: Buffer) => {
       stderr = boundedAppend(stderr, chunk.toString(), 64 * 1024);

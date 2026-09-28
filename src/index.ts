@@ -404,7 +404,7 @@ import { clearTodos, disposeTodoScope, restoreTodos, onTodosChange } from "./too
 import "./tools/task.js"; // register task (project-level durable task pool)
 import "./tools/send.js"; // register send_file (self-gates on HARA_GATEWAY — pushes a file to the chat)
 import "./tools/channel-message.js"; // register credential-preserving Feishu/WeChat cross-channel delivery
-import "./tools/external_agent.js"; // register external_agent (delegate to claude-code / codex headless)
+import "./tools/external_agent.js"; // register external_agent (delegate to Claude Code / Codex / OpenCode headless)
 import "./tools/ask_user.js"; // register ask_user (pause mid-turn to ask the user a structured question)
 import "./tools/cron.js"; // register cronjob (model-facing scheduler — "remind me every morning" just works)
 import { computerBackends } from "./tools/computer.js"; // register the computer tool + expose the backend probe
@@ -3645,24 +3645,26 @@ program
   });
 
 const codingCmd = program.command("coding").description(
-  "inspect and recover Codex / Claude Code sessions through Hara-owned opaque ids",
+  "inspect and recover Codex / Claude Code / OpenCode sessions through Hara-owned opaque ids",
 );
 
 codingCmd
   .command("sessions")
   .alias("ls")
   .description("list provider sessions that can be resumed without exposing native session ids")
-  .option("--provider <codex|claude>", "show only one provider")
+  .option("--provider <codex|claude|opencode>", "show only one provider")
   .action(async (localOpts: { provider?: string }) => {
     const requested = localOpts.provider?.trim().toLowerCase();
-    if (requested && requested !== "codex" && requested !== "claude") {
-      out(c.red("Provider must be 'codex' or 'claude'.\n"));
+    if (requested && requested !== "codex" && requested !== "claude" && requested !== "opencode") {
+      out(c.red("Provider must be 'codex', 'claude', or 'opencode'.\n"));
       process.exitCode = 2;
       return;
     }
     const service = createExternalSessionRegistry({ haraVersion: HARA_RUNTIME_VERSION });
     try {
-      const sourceIds = requested ? [requested as "codex" | "claude"] : ["codex", "claude"] as const;
+      const sourceIds = requested
+        ? [requested as "codex" | "claude" | "opencode"]
+        : ["codex", "claude", "opencode"] as const;
       let shown = 0;
       for (const sourceId of sourceIds) {
         const result = await service.listSessions({ sourceId, limit: 100 });
@@ -3673,7 +3675,7 @@ codingCmd
         }
         if (result.page.hasMore) out(c.dim(`(${sourceId}: showing the 100 most recent sessions)\n`));
       }
-      if (!shown) out(c.dim("No recoverable Codex or Claude Code sessions were found on this device.\n"));
+      if (!shown) out(c.dim("No recoverable Codex, Claude Code, or OpenCode sessions were found on this device.\n"));
       else out(c.dim("\nResume exactly:  hara coding resume <opaque-id>\n"));
     } catch (error) {
       const message = redactSensitiveText(error instanceof Error ? error.message : String(error)).text;
@@ -3692,7 +3694,10 @@ codingCmd
     try {
       const result = await service.resumeInTerminal(sessionId);
       if (result.signal) {
-        out(c.yellow(`${result.sourceId === "codex" ? "Codex" : "Claude Code"} stopped by ${result.signal}.\n`));
+        const sourceLabel = result.sourceId === "codex"
+          ? "Codex"
+          : result.sourceId === "opencode" ? "OpenCode" : "Claude Code";
+        out(c.yellow(`${sourceLabel} stopped by ${result.signal}.\n`));
         process.exitCode = 1;
       } else if (result.code) {
         process.exitCode = result.code;

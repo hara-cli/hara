@@ -455,6 +455,8 @@ test("Serve advertises a Personal-only external session interaction surface", as
     assert.equal(initialized.result.capabilities.limits.externalCommandResultBytes, 256 * 1024);
     const listed = await client.call("external.sessions.list", { sourceId: "codex" });
     assert.equal(listed.result.sessions[0].id, sessionId);
+    const openCodeListed = await client.call("external.sessions.list", { sourceId: "opencode" });
+    assert.equal(openCodeListed.error, undefined, "OpenCode is a valid Personal Space session source");
     const read = await client.call("external.sessions.read", { sessionId });
     assert.equal(read.result.messages[0].text, "existing reply");
     assert.equal(read.result.readOnly, true);
