@@ -385,16 +385,19 @@ test("App select: numbered options — typing a number picks it directly", async
   const { lastFrame, stdin, unmount } = render(
     React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
   );
-  await tick();
-  stdin.write("go");
-  await tick();
-  stdin.write("\r");
-  await tick();
-  assert.ok(strip(lastFrame()).includes("2. beta"), "options are numbered");
-  stdin.write("3"); // type the number → picks the third directly, no Enter
-  await tick(80);
-  assert.equal(choice, "c", "typing 3 selected the third option");
-  unmount();
+  try {
+    stdin.write("go");
+    await waitUntil(() => strip(lastFrame()).includes("go"), "task text was not rendered before submit");
+    stdin.write("\r");
+    await waitUntil(
+      () => strip(lastFrame()).includes("2. beta"),
+      "numbered selector did not mount before direct numeric selection",
+    );
+    stdin.write("3"); // type the number → picks the third directly, no Enter
+    await waitUntil(() => choice === "c", "typing 3 did not select the third option");
+  } finally {
+    unmount();
+  }
 });
 
 test("App ask_user (h.ask) with options: shows numbered menu + a 'type my own' escape, returns picked option", async () => {
