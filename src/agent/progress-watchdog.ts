@@ -12,6 +12,9 @@ export const UNATTENDED_PROGRESS_STOP_ROUNDS = 8;
  * attached and unattended runs alike: either can otherwise burn hundreds of thousands of tokens while
  * changing tool inputs without advancing a verified checkpoint. */
 export const UNATTENDED_NO_PROGRESS_TOKEN_LIMIT = 200_000;
+/** Once the hard token boundary is reached, two closed rounds without durable evidence are enough to
+ * stop. Waiting for a third round used to overshoot the boundary by one complete 50k+ context replay. */
+export const TOKEN_BUDGET_STALE_ROUNDS = 2;
 
 const MAX_OBSERVATIONS = 128;
 const MAX_CALL_IDENTITIES = 128;
@@ -343,7 +346,7 @@ export class AgentProgressWatchdog {
       trigger = "similar_tool_evidence";
     } else if (
       totalTokens >= UNATTENDED_NO_PROGRESS_TOKEN_LIMIT
-      && this.checkpointStaleRounds >= 3
+      && this.checkpointStaleRounds >= TOKEN_BUDGET_STALE_ROUNDS
     ) {
       trigger = "unattended_token_budget";
     } else if (

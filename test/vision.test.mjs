@@ -44,6 +44,11 @@ test("classifyVision: vision-capable families → 'vision'", () => {
   V("volcengine-agent-plan", "doubao-seed-2.1-turbo");
   V("volcengine-agent-plan", "kimi-k2.7-code");
   V("volcengine-agent-plan", "kimi-k3");
+  V("volcengine-coding-plan", "ark-code-latest");
+  V("volcengine-coding-plan", "doubao-seed-2.1-pro");
+  V("volcengine-coding-plan", "doubao-seed-2.1-lite");
+  V("volcengine-coding-plan", "deepseek-v4.1-flash");
+  V("volcengine-coding-plan", "kimi-k2.8-preview");
   V("openai", "deepseek-vl2");
   V("deepseek", "deepseek-v4-flash-vision-exp");
   V("openai", "gemini-2.5-pro");
@@ -79,6 +84,8 @@ test("classifyVision: text-only families → 'text'", () => {
   T("openai", "glm-4.7");
   T("openai", "minimax-m2.5");
   T("openai", "kimi-k2"); // older Kimi (k2.5 is the vision one)
+  T("volcengine-coding-plan", "glm-5.3");
+  T("volcengine-coding-plan", "deepseek-v4-pro");
 });
 
 test("classifyVision: genuinely unknown models → 'unknown' (ask the user)", () => {

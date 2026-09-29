@@ -172,6 +172,7 @@ export function createOpenDirectoryTool(launcher: DirectoryLauncher = launchDire
       },
       required: ["path"],
     },
+    visibility: "deferred",
     kind: "read",
     classify: () => ({ effect: "interactive", concurrencySafe: false }),
     async run(input, ctx) {

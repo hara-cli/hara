@@ -18,7 +18,12 @@ test("subscription notes preserve each provider's native accounting authority", 
   assert.match(volcengine.metering, /not a Fuel Point or billing calculation/);
   assert.match(volcengine.models, /live account catalog is authoritative/);
 
-  const rendered = [alibaba, minimax, volcengine].flatMap((note) => Object.values(note)).join("\n");
+  const codingPlan = planNote("volcengine-coding-plan");
+  assert.match(codingPlan.metering, /Volcengine Ark is authoritative/);
+  assert.match(codingPlan.models, /ark-code-latest/);
+  assert.match(codingPlan.models, /Never use auto as a wire model id/);
+
+  const rendered = [alibaba, minimax, volcengine, codingPlan].flatMap((note) => Object.values(note)).join("\n");
   assert.doesNotMatch(
     rendered,
     /5-hour|weekly|monthly|half price|cheapest|15:00|17:30/i,
@@ -41,4 +46,5 @@ test("setup renders authority, visibility, then model guidance", () => {
   // MiniMax has no model decision to make yet — one entry in its catalog.
   assert.equal(planNoteLines("minimax-token-plan").length, 2);
   assert.equal(planNoteLines("volcengine-agent-plan").length, 3);
+  assert.equal(planNoteLines("volcengine-coding-plan").length, 3);
 });

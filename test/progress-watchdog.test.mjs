@@ -231,3 +231,29 @@ test("an attached 200k-token run also pauses instead of only printing warnings",
   assert.equal(decision.state.tokens.total, 210_000);
   assert.equal(decision.state.checkpointStaleRounds, 3);
 });
+
+test("the token boundary does not spend a third stale context replay", () => {
+  const watchdog = new AgentProgressWatchdog({ unattended: false });
+  const samples = [
+    { input: 46_995, output: 1_169 },
+    { input: 48_221, output: 474 },
+    { input: 49_217, output: 886 },
+    { input: 51_245, output: 151 },
+    { input: 52_133, output: 827 },
+  ];
+  let totalInput = 0;
+  let totalOutput = 0;
+  let decision;
+  for (const [index, sample] of samples.entries()) {
+    totalInput += sample.input;
+    totalOutput += sample.output;
+    decision = watchdog.recordRound(round({
+      observations: [{ name: `measured_${index + 1}`, input: {}, content: `state-${index + 1}` }],
+      usage: { input: totalInput, output: totalOutput },
+    }));
+  }
+  assert.equal(decision.stop, true);
+  assert.equal(decision.state.trigger, "unattended_token_budget");
+  assert.equal(decision.state.tokens.total, 251_318);
+  assert.equal(decision.state.checkpointStaleRounds, 5);
+});

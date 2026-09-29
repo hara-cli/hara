@@ -157,7 +157,7 @@ export function createOpenAIProvider(opts: {
       const acc = new Map<number, { id: string; name: string; args: string }>();
       let reasoning = "";
       let finish: string | undefined;
-      let usage = { input: 0, output: 0 };
+      let usage: NonNullable<TurnResult["usage"]> = { input: 0, output: 0 };
       try {
         const stream = await sendWithReasoningFallback(
           reasoningRoute,
@@ -190,7 +190,16 @@ export function createOpenAIProvider(opts: {
             }
           }
           if (choice?.finish_reason) finish = choice.finish_reason;
-          if (chunk.usage) usage = { input: chunk.usage.prompt_tokens ?? 0, output: chunk.usage.completion_tokens ?? 0 };
+          if (chunk.usage) {
+            const cachedInput = chunk.usage.prompt_tokens_details?.cached_tokens;
+            const reasoningOutput = chunk.usage.completion_tokens_details?.reasoning_tokens;
+            usage = {
+              input: chunk.usage.prompt_tokens ?? 0,
+              output: chunk.usage.completion_tokens ?? 0,
+              ...(Number.isFinite(cachedInput) && cachedInput >= 0 ? { cachedInput } : {}),
+              ...(Number.isFinite(reasoningOutput) && reasoningOutput >= 0 ? { reasoningOutput } : {}),
+            };
+          }
         }
       } catch (e: any) {
         if (signal?.aborted) return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };

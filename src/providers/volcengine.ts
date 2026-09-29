@@ -1,10 +1,16 @@
 const VOLCENGINE_AGENT_PLAN_HOST = "ark.cn-beijing.volces.com";
 const VOLCENGINE_AGENT_PLAN_PATH = "/api/plan/v3";
+const VOLCENGINE_CODING_PLAN_PATH = "/api/coding/v3";
 
 /** Fixed Codex/Responses endpoint for Volcengine Ark Agent Plan (Beijing). Agent Plan keys are scoped to
  * this subscription route and must not be mixed with pay-as-you-go Ark API endpoints. */
 export const VOLCENGINE_AGENT_PLAN_BASE_URL =
   `https://${VOLCENGINE_AGENT_PLAN_HOST}${VOLCENGINE_AGENT_PLAN_PATH}`;
+
+/** Fixed OpenAI/Responses endpoint for Volcengine Ark Coding Plan (Beijing). The ordinary Ark `/api/v3`
+ * endpoint is intentionally not accepted: requests there are outside the Coding Plan allowance. */
+export const VOLCENGINE_CODING_PLAN_BASE_URL =
+  `https://${VOLCENGINE_AGENT_PLAN_HOST}${VOLCENGINE_CODING_PLAN_PATH}`;
 
 /** Ark documents `ark-code-latest` as the stable Codex-compatible alias. Some otherwise valid Agent Plan
  * keys currently reject the newer `auto` router id with a model-capability 404, so Hara may use this alias
@@ -31,12 +37,38 @@ export const VOLCENGINE_AGENT_PLAN_MODELS = Object.freeze([
   "glm-latest",
 ]);
 
+/** Current Coding Plan conversation-model catalog documented by Volcengine (verified 2026-09-29).
+ * `auto` is not a valid wire model id on this plan; `ark-code-latest` delegates selection (including Auto)
+ * to the Ark console. Embedding and sunset models deliberately stay out of the conversation picker. */
+export const VOLCENGINE_CODING_PLAN_MODELS = Object.freeze([
+  "ark-code-latest",
+  "doubao-seed-evolving",
+  "doubao-seed-2.1-pro",
+  "doubao-seed-2.1-lite",
+  "doubao-seed-2.0-mini",
+  "minimax-m3",
+  "glm-5.3",
+  "glm-latest",
+  "glm-5.3-flash",
+  "deepseek-v4.1-flash",
+  "deepseek-v4-flash",
+  "deepseek-v4-pro",
+  "kimi-k2.7-code",
+  "kimi-k2.8-preview",
+  "kimi-k3",
+]);
+
 /** Exact built-in model knowledge used by safety-sensitive routing. Live discovery may expose newer
  * conversation ids for an explicit user choice, but discovery alone does not prove their tool/image/context
  * capabilities, so an unknown id must not silently inherit this release's Agent Plan capability matrix. */
 export function isKnownVolcengineAgentPlanModel(model: string): boolean {
   const id = model.trim().toLowerCase().split("/").at(-1) ?? model.trim().toLowerCase();
   return VOLCENGINE_AGENT_PLAN_MODELS.some((candidate) => candidate.toLowerCase() === id);
+}
+
+export function isKnownVolcengineCodingPlanModel(model: string): boolean {
+  const id = model.trim().toLowerCase().split("/").at(-1) ?? model.trim().toLowerCase();
+  return VOLCENGINE_CODING_PLAN_MODELS.some((candidate) => candidate.toLowerCase() === id);
 }
 
 export function isOfficialVolcengineAgentPlanEndpoint(baseURL: string | undefined): boolean {
@@ -54,6 +86,21 @@ export function isOfficialVolcengineAgentPlanEndpoint(baseURL: string | undefine
   }
 }
 
+export function isOfficialVolcengineCodingPlanEndpoint(baseURL: string | undefined): boolean {
+  if (!baseURL) return false;
+  try {
+    const url = new URL(baseURL);
+    return url.protocol === "https:"
+      && url.hostname.toLowerCase().replace(/\.$/, "") === VOLCENGINE_AGENT_PLAN_HOST
+      && url.port === ""
+      && url.username === ""
+      && url.password === ""
+      && url.pathname.replace(/\/+$/, "") === VOLCENGINE_CODING_PLAN_PATH;
+  } catch {
+    return false;
+  }
+}
+
 /** `/models` may also enumerate embedding, image, video, and speech models. Those belong to separate
  * capability surfaces, not Hara's conversation model picker. Unknown future text models remain visible. */
 export function isVolcengineAgentPlanInteractiveModel(model: string): boolean {
@@ -63,6 +110,17 @@ export function isVolcengineAgentPlanInteractiveModel(model: string): boolean {
     || /(?:seedream|seedance)/.test(id)
     || /-(?:tts|asr)(?:-|$)/.test(id)
   );
+}
+
+export function isVolcengineCodingPlanSupersededModel(model: string): boolean {
+  const id = model.trim().toLowerCase().split("/").at(-1) ?? model.trim().toLowerCase();
+  return id === "doubao-seed-2.0-lite" || id === "doubao-seed-2.1-turbo";
+}
+
+export function isVolcengineCodingPlanInteractiveModel(model: string): boolean {
+  const id = model.trim().toLowerCase().split("/").at(-1) ?? model.trim().toLowerCase();
+  return isVolcengineAgentPlanInteractiveModel(model)
+    && id !== "auto";
 }
 
 /** glm-5.3 is explicitly always-thinking on Agent Plan. Other current text models use Ark's documented

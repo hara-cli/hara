@@ -28,6 +28,11 @@ const NOTES: Partial<Record<ProviderId, PlanNote>> = {
     visibility: "Check remaining allowance and reset state in Ark. Hara will show unavailable rather than estimate them when no authenticated usage adapter is available.",
     models: "Use auto for Ark-managed routing, or choose an entitled explicit model when a session must stay pinned; the live account catalog is authoritative.",
   },
+  "volcengine-coding-plan": {
+    metering: "Volcengine Ark is authoritative for this account's Coding Plan allowance, coefficients, windows, and exhaustion state; Hara request tokens are context telemetry, not a billing calculation.",
+    visibility: "Check remaining allowance and reset state in Ark. Hara will show unavailable rather than estimate them when no authenticated usage adapter is available.",
+    models: "Use ark-code-latest for Ark-console model selection (including Auto), or pin an entitled Model Name. Never use auto as a wire model id on Coding Plan.",
+  },
 };
 
 export function planNote(provider: ProviderId | string | undefined): PlanNote | undefined {

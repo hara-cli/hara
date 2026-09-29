@@ -28,6 +28,8 @@ import {
 import {
   VOLCENGINE_AGENT_PLAN_BASE_URL,
   VOLCENGINE_AGENT_PLAN_MODELS,
+  VOLCENGINE_CODING_PLAN_BASE_URL,
+  VOLCENGINE_CODING_PLAN_MODELS,
 } from "./providers/volcengine.js";
 import { providerAccounting, type ProviderAccountingDescriptor } from "./providers/accounting.js";
 
@@ -36,6 +38,7 @@ export type ProviderId =
   | "token-plan"
   | "minimax-token-plan"
   | "volcengine-agent-plan"
+  | "volcengine-coding-plan"
   | "qwen"
   | "qwen-oauth"
   | "openai"
@@ -186,6 +189,11 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
     baseURL: VOLCENGINE_AGENT_PLAN_BASE_URL,
     envKey: "ARK_API_KEY",
   },
+  "volcengine-coding-plan": {
+    model: "ark-code-latest",
+    baseURL: VOLCENGINE_CODING_PLAN_BASE_URL,
+    envKey: "ARK_API_KEY",
+  },
   qwen: {
     model: "qwen-plus",
     baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -265,6 +273,13 @@ const PROVIDER_LABELS: Record<ProviderId, Omit<ProviderCatalogEntry, "id" | "def
     auth: "api-key",
     customBaseURL: false,
     knownModels: VOLCENGINE_AGENT_PLAN_MODELS,
+  },
+  "volcengine-coding-plan": {
+    label: "Volcengine Ark Coding Plan",
+    location: "cloud",
+    auth: "api-key",
+    customBaseURL: false,
+    knownModels: VOLCENGINE_CODING_PLAN_MODELS,
   },
   openai: { label: "OpenAI / compatible", location: "cloud", auth: "api-key", customBaseURL: true },
   qwen: { label: "Qwen (legacy DashScope)", location: "cloud", auth: "api-key", customBaseURL: true, legacy: true },
@@ -655,6 +670,18 @@ function cleanProviderBaseURL(provider: ProviderId, value: string | undefined): 
       throw new Error(`volcengine-agent-plan uses the fixed Beijing endpoint ${VOLCENGINE_AGENT_PLAN_BASE_URL}`);
     }
     return VOLCENGINE_AGENT_PLAN_BASE_URL;
+  }
+  if (provider === "volcengine-coding-plan") {
+    const expected = new URL(VOLCENGINE_CODING_PLAN_BASE_URL);
+    const pathname = url.pathname.replace(/\/+$/, "");
+    if (
+      url.protocol !== expected.protocol
+      || url.host.toLowerCase() !== expected.host.toLowerCase()
+      || pathname !== expected.pathname.replace(/\/+$/, "")
+    ) {
+      throw new Error(`volcengine-coding-plan uses the fixed Beijing endpoint ${VOLCENGINE_CODING_PLAN_BASE_URL}`);
+    }
+    return VOLCENGINE_CODING_PLAN_BASE_URL;
   }
   return normalized;
 }

@@ -108,6 +108,7 @@ registerTool({
     },
     required: ["path"],
   },
+  visibility: "deferred",
   kind: "read",
   concurrencySafe: false,
   requiresProjectWorkspace: true,

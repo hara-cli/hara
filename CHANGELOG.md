@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.183.0 — 2026-09-30 — Ark Coding Plan and leaner Agent turns
+
+- Add Volcengine Ark Coding Plan as a separate subscription connection with its fixed Beijing Responses
+  endpoint, `ark-code-latest` console-managed Auto route, current conversation-model catalog, and route-scoped
+  modality, context, health, and failover checks. Sunset and vector-only models stay out of new selections.
+- Reduce ordinary Agent prompt cost by keeping presentation, image inspection, visual preview, directory reveal,
+  persistent-task, memory-write, and skill-creation schemas deferred until the current user intent needs them.
+- Report cumulative model I/O separately from physical request count, latest request context, cached input, and
+  reasoning output. These remain transport diagnostics and are never presented as a universal subscription bill.
+- Stop a stalled run sooner after it crosses the 200k model-I/O safety boundary, and keep Codex or Claude Code
+  runtime records classified as Code tasks instead of conversational Hara Agent members.
+- Refresh the HTTP and IP-classification dependencies used at network trust boundaries; the production dependency
+  audit is clean for this release.
+
 ## 0.182.0 — 2026-09-29 — automatic coding execution and conversational decisions
 
 - Let users talk only to a Hara Agent. Eligible Personal Space Agents now discover and select Codex or

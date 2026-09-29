@@ -5662,6 +5662,8 @@ test("serve automatically compacts a completed Desktop turn without replacing it
     assert.equal(second.result.reply, "answer-2", "the user receives the completed turn, never the summary text");
     assert.equal(calls, 3, "the second completed turn triggered exactly one bounded compaction call");
     assert.equal(second.result.usage.input, 90, "internal compaction usage remains visible in turn accounting");
+    assert.equal(second.result.usage.requests, 2, "the visible turn distinguishes two physical model calls from cumulative I/O");
+    assert.equal(second.result.usage.lastInput, 15, "latest context reports the summarizer request, not the cumulative total");
     assert.ok(store.saved.get(sid).history[0].content.startsWith("Execution checkpoint"));
     assert.deepEqual(compactionEvents.map((event) => event.state), ["started", "installed"]);
     assert.equal(compactionEvents[0].attemptId, compactionEvents[1].attemptId);
@@ -5678,6 +5680,8 @@ test("serve automatically compacts a completed Desktop turn without replacing it
     assert.equal(third.result.reply, "answer-4", "a failed automatic summary never fails the completed task reply");
     assert.equal(calls, 5, "the failed summarizer is attempted once without recursively retrying");
     assert.equal(third.result.usage.input, 85, "a provider-reported failed summarizer request is still accounted");
+    assert.equal(third.result.usage.requests, 2);
+    assert.equal(third.result.usage.lastInput, 10, "a failed provider response with usage still remains the latest request context");
     assert.ok(store.saved.get(sid).history.some((message) => message.content === "three"));
     assert.deepEqual(compactionEvents.map((event) => event.state), ["started", "installed", "started", "failed"]);
     assert.equal(compactionEvents[2].attemptId, compactionEvents[3].attemptId);

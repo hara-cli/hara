@@ -43,6 +43,7 @@ registerTool({
     },
     required: ["url"],
   },
+  visibility: "deferred",
   kind: "edit",
   requiresProjectWorkspace: true,
   classify() {

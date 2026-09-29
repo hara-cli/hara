@@ -11,6 +11,7 @@ import { isOfficialTokenPlanOpenAIEndpoint } from "./alibaba.js";
 import { resolvePlatform } from "./registry.js";
 import {
   isOfficialVolcengineAgentPlanEndpoint,
+  isOfficialVolcengineCodingPlanEndpoint,
   isVolcengineAgentPlanUnsupportedModelError,
   VOLCENGINE_AGENT_PLAN_AUTO_FALLBACK_MODEL,
 } from "./volcengine.js";
@@ -104,6 +105,7 @@ export async function createProviderForTarget(
   if (wire === "responses") {
     const alibabaTokenPlan = isOfficialTokenPlanOpenAIEndpoint(baseURL);
     const volcengineAgentPlan = isOfficialVolcengineAgentPlanEndpoint(baseURL);
+    const volcengineCodingPlan = isOfficialVolcengineCodingPlanEndpoint(baseURL);
     const responseOptions = {
       apiKey: transportKey,
       model,
@@ -114,7 +116,7 @@ export async function createProviderForTarget(
       supportsImages: !/^deepseek-/i.test(model) || deepSeekResponsesSupportsImages(model),
       ...(options.reasoningAdvisory ? { reasoningAdvisory: true } : {}),
       ...(alibabaTokenPlan ? { store: false, dashscopeSessionCache: true } : {}),
-      ...(volcengineAgentPlan ? { store: false } : {}),
+      ...(volcengineAgentPlan || volcengineCodingPlan ? { store: false } : {}),
       omitAuthorization: providerIsLocal(provider),
       fetch,
     };

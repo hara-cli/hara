@@ -44,8 +44,9 @@ export function contextWindow(model: string): number {
   if (/^(?:qwen3-max-2026-01-23|qwen3-coder-next)(?:-|$)/.test(m) || /^kimi-k2\.5(?:-|$)/.test(m)) return 262_144;
   if (/^glm-5\.3(?:-|$)/.test(m) || /^glm-latest(?:-|$)/.test(m)) return 1_024_000;
   if (/^glm-(?:5|4\.7)(?:-|$)/.test(m)) return 202_752;
-  if (/^deepseek-v4-(?:flash|pro)(?:-|$)/.test(m) || /^kimi-k3(?:-|$)/.test(m)) return 1_024_000;
+  if (/^deepseek-v4(?:\.1)?-(?:flash|pro)(?:-|$)/.test(m) || /^kimi-k3(?:-|$)/.test(m)) return 1_024_000;
   if (/^doubao-seed-evolving(?:-|$)/.test(m)) return 1_024_000;
+  if (/^doubao-seed-2\.1-(?:pro|lite)(?:-|$)/.test(m) || /^kimi-k2\.8-preview(?:-|$)/.test(m)) return 1_024_000;
   if (/^doubao-seed-2\.(?:0-(?:mini|lite)|1-turbo)(?:-|$)/.test(m) || /^kimi-k2\.7-code(?:-|$)/.test(m)) return 256_000;
   if (/^minimax-m3(?:-|$)/.test(m)) return 1_000_000;
   if (/^minimax-m2\.5(?:-|$)/.test(m)) return 196_608;

@@ -458,6 +458,7 @@ registerTool({
     },
     required: ["action"],
   },
+  visibility: "deferred",
   kind: "edit",
   classify(input) {
     return input?.action === "list"

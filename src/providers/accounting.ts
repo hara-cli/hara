@@ -58,6 +58,7 @@ const SUBSCRIPTION_PROVIDERS = new Set([
   "token-plan",
   "minimax-token-plan",
   "volcengine-agent-plan",
+  "volcengine-coding-plan",
 ]);
 
 const LOCAL_PROVIDERS = new Set(["ollama", "lmstudio"]);

@@ -86,7 +86,14 @@ export interface TurnResult {
   errorMetadata?: ProviderErrorMetadata;
   /** Request transport token telemetry for context sizing and diagnostics only.
    * It is not billable cost, subscription credit usage, or remaining entitlement. */
-  usage?: { input: number; output: number };
+  usage?: {
+    input: number;
+    output: number;
+    /** Input tokens served from a provider cache. This remains transport telemetry, not a bill. */
+    cachedInput?: number;
+    /** Output tokens consumed by provider reasoning, when the endpoint reports the split. */
+    reasoningOutput?: number;
+  };
 }
 
 export interface ProviderErrorMetadata {

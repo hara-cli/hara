@@ -3071,7 +3071,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     displayText = text,
   ): Promise<{
     reply: string;
-    usage: { input: number; output: number };
+    usage: {
+      input: number;
+      output: number;
+      requests: number;
+      lastInput: number;
+      cachedInput?: number;
+      reasoningOutput?: number;
+    };
     ctx: { lastInput: number; window: number; pct: number };
     taskId: string;
     turnId: string;
@@ -3165,7 +3172,27 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     emitTaskState({ state: "running", phase: "starting" });
     let lastRunProgress: RunProgressEvent | undefined;
     let historyStart = s.history.length;
-    const before = { input: s.stats.input, output: s.stats.output };
+    const before = {
+      input: s.stats.input,
+      output: s.stats.output,
+      providerCalls: s.stats.providerCalls ?? 0,
+      cachedInput: s.stats.cachedInput ?? 0,
+      reasoningOutput: s.stats.reasoningOutput ?? 0,
+    };
+    const turnUsage = () => {
+      const cachedInput = (s.stats.cachedInput ?? 0) - before.cachedInput;
+      const reasoningOutput = (s.stats.reasoningOutput ?? 0) - before.reasoningOutput;
+      const requests = (s.stats.providerCalls ?? 0) - before.providerCalls;
+      return {
+        input: s.stats.input - before.input,
+        output: s.stats.output - before.output,
+        requests,
+        // A turn that never crossed the provider boundary must not inherit the previous turn's context.
+        lastInput: requests > 0 ? (s.stats.lastRequestInput ?? s.stats.lastInput ?? 0) : 0,
+        ...(cachedInput > 0 ? { cachedInput } : {}),
+        ...(reasoningOutput > 0 ? { reasoningOutput } : {}),
+      };
+    };
     const sink: UiSink = {
       text: (d) => {
         emitTaskState({ state: "running", phase: "responding" });
@@ -3773,7 +3800,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         ...(lastRunProgress ? { progress: lastRunProgress } : {}),
       }, s.meta.todos);
       if (outcome.status !== "completed") {
-        const usage = { input: s.stats.input - before.input, output: s.stats.output - before.output };
+        const usage = turnUsage();
         // context watermark rides along with every turn end (codex thread/tokenUsage/updated pattern) —
         // clients render a meter without an extra round-trip.
         const ctx = ctxOf(s);
@@ -3863,7 +3890,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           text: "(auto-compact failed — conversation was kept; use Compact or start a new conversation)",
         });
       }
-      const usage = { input: s.stats.input - before.input, output: s.stats.output - before.output };
+      const usage = turnUsage();
       const ctx = ctxOf(s);
       broadcast("event.turn_end", { sessionId, taskId: s.task!.id, turnId: s.task!.turnId, reply, usage, ctx });
       runtimeLog("turn.completed", { sessionId, durationMs: Date.now() - runtimeStartedAt });
@@ -4701,6 +4728,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       // history remains in place. Keep lastInput unchanged until replacement succeeds.
       s.stats.input += r.usage?.input ?? 0;
       s.stats.output += r.usage?.output ?? 0;
+      s.stats.providerCalls = (s.stats.providerCalls ?? 0) + 1;
+      if (r.usage) {
+        s.stats.lastRequestInput = r.usage.input;
+        s.stats.cachedInput = (s.stats.cachedInput ?? 0) + (r.usage.cachedInput ?? 0);
+        s.stats.reasoningOutput = (s.stats.reasoningOutput ?? 0) + (r.usage.reasoningOutput ?? 0);
+      }
       if (controller.signal.aborted) {
         recordFailure(timedOut ? "timeout" : "interrupted");
         return null;

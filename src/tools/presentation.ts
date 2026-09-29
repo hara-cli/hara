@@ -190,6 +190,7 @@ registerTool({
     },
     required: ["action"],
   },
+  visibility: "deferred",
   kind: "edit",
   classify(input) {
     if (input?.action === "list" || input?.action === "get") {

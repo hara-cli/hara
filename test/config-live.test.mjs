@@ -921,6 +921,30 @@ test("provider catalog: Volcengine Agent Plan exposes its fixed Codex Responses 
   assert.equal(volcengine?.knownModels?.some((model) => /seedream|seedance|embedding|tts|asr/i.test(model)), false);
 });
 
+test("provider catalog: Volcengine Coding Plan is separate and excludes sunset/vector ids", () => {
+  const codingPlan = providerCatalog().find((provider) => provider.id === "volcengine-coding-plan");
+  assert.deepEqual(
+    {
+      auth: codingPlan?.auth,
+      baseURL: codingPlan?.defaultBaseURL,
+      model: codingPlan?.defaultModel,
+      customBaseURL: codingPlan?.customBaseURL,
+    },
+    {
+      auth: "api-key",
+      baseURL: "https://ark.cn-beijing.volces.com/api/coding/v3",
+      model: "ark-code-latest",
+      customBaseURL: false,
+    },
+  );
+  assert.ok(codingPlan?.knownModels?.includes("doubao-seed-2.1-pro"));
+  assert.ok(codingPlan?.knownModels?.includes("deepseek-v4.1-flash"));
+  assert.ok(codingPlan?.knownModels?.includes("kimi-k2.8-preview"));
+  for (const hidden of ["auto", "doubao-seed-2.0-lite", "doubao-seed-2.1-turbo", "doubao-embedding-vision"]) {
+    assert.equal(codingPlan?.knownModels?.includes(hidden), false, hidden);
+  }
+});
+
 test("provider catalog exposes accounting authority without inventing one billing formula", () => {
   const catalog = providerCatalog();
   assert.deepEqual(catalog.find((provider) => provider.id === "token-plan")?.accounting, {
@@ -991,6 +1015,30 @@ test("provider settings pin Volcengine Agent Plan credentials to the official Be
     }),
     /fixed Beijing endpoint/,
   );
+});
+
+test("provider settings pin Volcengine Coding Plan credentials to its official Coding endpoint", () => {
+  assert.equal(
+    normalizePersonalProviderConfig({
+      provider: "volcengine-coding-plan",
+      model: "ark-code-latest",
+      baseURL: "https://ark.cn-beijing.volces.com/api/coding/v3/",
+    }).baseURL,
+    "https://ark.cn-beijing.volces.com/api/coding/v3",
+  );
+  for (const baseURL of [
+    "https://ark.cn-beijing.volces.com/api/v3",
+    "https://ark.cn-beijing.volces.com/api/plan/v3",
+  ]) {
+    assert.throws(
+      () => normalizePersonalProviderConfig({
+        provider: "volcengine-coding-plan",
+        model: "ark-code-latest",
+        baseURL,
+      }),
+      /fixed Beijing endpoint/,
+    );
+  }
 });
 
 test("provider settings validation keeps local endpoints loopback-only and cloud HTTP secure", () => {

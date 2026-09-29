@@ -416,9 +416,17 @@ export function createResponsesProvider(opts: {
       }
 
       if (terminalResponse?.usage) {
+        const cachedInput = terminalResponse.usage.input_tokens_details?.cached_tokens;
+        const reasoningOutput = terminalResponse.usage.output_tokens_details?.reasoning_tokens;
         usage = {
           input: terminalResponse.usage.input_tokens ?? 0,
           output: terminalResponse.usage.output_tokens ?? 0,
+          ...(typeof cachedInput === "number" && Number.isFinite(cachedInput) && cachedInput >= 0
+            ? { cachedInput: Math.floor(cachedInput) }
+            : {}),
+          ...(typeof reasoningOutput === "number" && Number.isFinite(reasoningOutput) && reasoningOutput >= 0
+            ? { reasoningOutput: Math.floor(reasoningOutput) }
+            : {}),
         };
       }
       if (streamFailure) return { text, toolUses: [], stop: "error", errorMsg: streamFailure, usage };

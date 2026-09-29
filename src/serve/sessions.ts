@@ -80,7 +80,15 @@ export interface ServeSession {
   provider: Provider;
   approval: ApprovalMode;
   autoApprove: Set<string>; // opaque project-scope grants accepted while this session is attached
-  stats: { input: number; output: number; lastInput?: number };
+  stats: {
+    input: number;
+    output: number;
+    lastInput?: number;
+    lastRequestInput?: number;
+    providerCalls?: number;
+    cachedInput?: number;
+    reasoningOutput?: number;
+  };
   projectContext?: string;
   /** This live attachment came from persisted history (resume/fork), not a fresh empty session. */
   continuationSession: boolean;

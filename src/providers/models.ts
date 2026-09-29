@@ -14,8 +14,12 @@ import {
 } from "./minimax.js";
 import {
   isOfficialVolcengineAgentPlanEndpoint,
+  isOfficialVolcengineCodingPlanEndpoint,
   isVolcengineAgentPlanInteractiveModel,
+  isVolcengineCodingPlanInteractiveModel,
+  isVolcengineCodingPlanSupersededModel,
   VOLCENGINE_AGENT_PLAN_MODELS,
+  VOLCENGINE_CODING_PLAN_MODELS,
 } from "./volcengine.js";
 
 // Alibaba Coding Plan's documented exact ids (verified 2026-07-18). Live `/models` remains authoritative;
@@ -66,6 +70,12 @@ export function volcengineAgentPlanFallbackModels(baseURL: string | undefined): 
     : [];
 }
 
+export function volcengineCodingPlanFallbackModels(baseURL: string | undefined): string[] {
+  return isOfficialVolcengineCodingPlanEndpoint(baseURL)
+    ? [...VOLCENGINE_CODING_PLAN_MODELS]
+    : [];
+}
+
 /** Hara's model picker is an Agent/conversation surface. Capability-specific endpoints such as
  * embeddings, rerankers, speech, image/video generation and realtime voice belong in their own tools,
  * while multimodal conversation models (VL/vision models) deliberately remain selectable. */
@@ -99,6 +109,7 @@ export async function listModels(
     ...deepSeekFallbackModels(baseURL),
     ...miniMaxFallbackModels(baseURL),
     ...volcengineAgentPlanFallbackModels(baseURL),
+    ...volcengineCodingPlanFallbackModels(baseURL),
   ];
   try {
     const url = baseURL.replace(/\/+$/, "") + "/models";
@@ -118,6 +129,10 @@ export async function listModels(
           && (!isTokenPlanSupersededModel(id) || id === keep))
       : isOfficialVolcengineAgentPlanEndpoint(baseURL)
         ? discovered.filter(isVolcengineAgentPlanInteractiveModel)
+      : isOfficialVolcengineCodingPlanEndpoint(baseURL)
+        ? discovered.filter((id) =>
+            isVolcengineCodingPlanInteractiveModel(id)
+            && (!isVolcengineCodingPlanSupersededModel(id) || id === keep))
       : discovered;
     return selectable.length ? selectable : fallback;
   } catch {

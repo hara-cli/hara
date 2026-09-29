@@ -13,6 +13,13 @@ test("accounting descriptors separate vendor subscriptions, managed Control, BYO
     haraMayInferBillingFromTransportTokens: false,
     failoverPolicy: "authoritative-exhaustion-only",
   });
+  assert.deepEqual(providerAccounting("volcengine-coding-plan"), {
+    authority: "provider",
+    mode: "subscription",
+    usageReadMethod: "provider-console",
+    haraMayInferBillingFromTransportTokens: false,
+    failoverPolicy: "authoritative-exhaustion-only",
+  });
   assert.deepEqual(providerAccounting("hara-gateway"), {
     authority: "organization",
     mode: "managed",

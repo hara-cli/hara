@@ -276,10 +276,11 @@ test("Token Plan off uses the Responses-native none level", async () => {
   const mock = await listen([completed([], {
     input_tokens: 2,
     output_tokens: 1,
+    input_tokens_details: { cached_tokens: 1 },
     output_tokens_details: { reasoning_tokens: 0 },
   }, 0)]);
   try {
-    await createResponsesProvider({
+    const result = await createResponsesProvider({
       apiKey: "test-key",
       baseURL: mock.baseURL,
       model: "qwen3.7-plus",
@@ -294,6 +295,7 @@ test("Token Plan off uses the Responses-native none level", async () => {
     assert.deepEqual(mock.requests[0].body.reasoning, { effort: "none" });
     assert.equal(mock.requests[0].body.store, false, "Hara owns durable history locally");
     assert.equal(mock.requests[0].sessionCache, "enable");
+    assert.deepEqual(result.usage, { input: 2, output: 1, cachedInput: 1, reasoningOutput: 0 });
   } finally {
     await new Promise((resolve) => mock.server.close(resolve));
   }

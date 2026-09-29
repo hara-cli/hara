@@ -1,5 +1,91 @@
 # Errors
 
+## [ERR-20260930-EXTERNAL-SESSION-FIXTURE-PARTIAL-JSON] concurrent test read observed a partially written fixture state file
+
+**Logged**: 2026-09-30T00:20:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: testing
+
+### Summary
+
+The full CLI suite's fake OpenCode process rewrote its JSON state file in place while the parent test polled
+that same file. Under full-suite process pressure, the reader once observed the truncate/write window and
+failed with `Unexpected end of JSON input`; the isolated file immediately passed 17/17.
+
+### Resolution
+
+Write the fixture state to a same-directory temporary file and atomically rename it over the prior state.
+This keeps every polling read on either the complete previous document or the complete next document.
+
+### Metadata
+
+- Source: test_failure
+- Reproducible: timing-dependent under concurrent full-suite load
+- Related Files: `test/external-sessions.test.mjs`
+- Tags: tests, concurrency, json, atomic-write, opencode
+- Pattern-Key: testing.shared_fixture_state_uses_atomic_replace
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260929-LOCALHOST-TEST-SANDBOX] provider tests could not bind a loopback port in the restricted sandbox
+
+**Logged**: 2026-09-29T22:05:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: testing
+
+### Summary
+
+The Responses transport tests create a temporary HTTP server on `127.0.0.1`. The build and pure tests passed,
+but the restricted sandbox rejected every server bind with `listen EPERM`.
+
+### Resolution
+
+Rerun only the affected local-loopback test file with the approved `node --test` escalation. All 14 tests
+then passed; the failure was environmental rather than a product regression.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes in the restricted sandbox
+- Related Files: `test/responses-provider.test.mjs`
+- Tags: tests, sandbox, localhost
+- Pattern-Key: testing.loopback_server_requires_approved_test_boundary
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260929-SHELL-BACKTICK-PATTERN] a quoted search pattern accidentally invoked command substitution
+
+**Logged**: 2026-09-29T22:07:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tooling
+
+### Summary
+
+A read-only `rg` pattern containing Markdown backticks was placed inside a double-quoted shell argument.
+Zsh treated the backticked words as commands, producing non-interactive Codex/Claude CLI errors before the
+intended search continued.
+
+### Resolution
+
+Never place backticks inside double-quoted shell command arguments. Use single-quoted literal patterns or
+search for the surrounding identifier without Markdown delimiters.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes
+- Related Files: `src/agent/loop.ts`, `src/tools/collaboration.ts`
+- Tags: shell, quoting, search
+- Pattern-Key: tooling.literal_search_patterns_use_single_quotes
+- Recurrence-Count: 1
+
+---
+
 ## [ERR-20260929-CLI-CHILD-NODE-PATH] full-suite child CLIs inherited an older Node binary
 
 **Logged**: 2026-09-29T03:02:00+08:00

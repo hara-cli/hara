@@ -7,8 +7,10 @@ import { resolvePlatform, type WireApi } from "./registry.js";
 import type { ProviderTarget } from "./target.js";
 import type { NeutralMsg, Provider, ToolSpec, TurnArgs, TurnResult } from "./types.js";
 import {
+  isKnownVolcengineCodingPlanModel,
   isKnownVolcengineAgentPlanModel,
   isVolcengineAgentPlanInteractiveModel,
+  isVolcengineCodingPlanInteractiveModel,
 } from "./volcengine.js";
 
 export type CapabilitySupport = "supported" | "unsupported" | "unknown";
@@ -76,9 +78,9 @@ function hasKnownContextWindow(model: string): boolean {
     || /^qwen3\.(?:8-(?:max|flash)|7-(?:max|plus|flash)|6-(?:plus|flash))(?:-|$)/.test(id)
     || /^(?:qwen3-max-2026-01-23|qwen3-coder-(?:next|plus)|kimi-k2\.5)(?:-|$)/.test(id)
     || /^glm-(?:5(?:\.3)?|4\.7)(?:-|$)/.test(id)
-    || /^deepseek-v4-(?:flash|pro)(?:-|$)|^kimi-k3(?:-|$)/.test(id)
-    || /^doubao-seed-(?:evolving|2\.(?:0-(?:mini|lite)|1-turbo))(?:-|$)/.test(id)
-    || /^kimi-k2\.7-code(?:-|$)|^minimax-m(?:3|2\.5)(?:-|$)/.test(id)
+    || /^deepseek-v4(?:\.1)?-(?:flash|pro)(?:-|$)|^kimi-k3(?:-|$)/.test(id)
+    || /^doubao-seed-(?:evolving|2\.(?:0-(?:mini|lite)|1-(?:turbo|pro|lite)))(?:-|$)/.test(id)
+    || /^kimi-k2\.(?:7-code|8-preview)(?:-|$)|^minimax-m(?:3|2\.5)(?:-|$)/.test(id)
     || /qwen3\.6[-:]27b/.test(id);
 }
 
@@ -92,6 +94,10 @@ function knownToolCalling(provider: string, model: string): CapabilitySupport {
   if (provider === "volcengine-agent-plan") {
     if (!isVolcengineAgentPlanInteractiveModel(model)) return "unsupported";
     return isKnownVolcengineAgentPlanModel(model) ? "supported" : "unknown";
+  }
+  if (provider === "volcengine-coding-plan") {
+    if (!isVolcengineCodingPlanInteractiveModel(model)) return "unsupported";
+    return isKnownVolcengineCodingPlanModel(model) ? "supported" : "unknown";
   }
   if (
     provider === "anthropic"

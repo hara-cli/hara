@@ -98,12 +98,16 @@ test("OpenCode sessions stay opaque while Hara can claim, stream, and interrupt 
   try {
     const fixture = join(root, "fake-opencode.mjs");
     writeFileSync(fixture, `
-      import { existsSync, readFileSync, writeFileSync } from "node:fs";
+      import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
       const statePath = ${JSON.stringify(statePath)};
       const nativeId = ${JSON.stringify(nativeId)};
       const root = ${JSON.stringify(root)};
       const readState = () => existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : {};
-      const writeState = (patch) => writeFileSync(statePath, JSON.stringify({ ...readState(), ...patch }));
+      const writeState = (patch) => {
+        const temporary = statePath + "." + process.pid + ".tmp";
+        writeFileSync(temporary, JSON.stringify({ ...readState(), ...patch }));
+        renameSync(temporary, statePath);
+      };
       const raw = process.argv.slice(2);
       if (raw.includes("--version")) {
         process.stdout.write("opencode 1.18.32\\n");

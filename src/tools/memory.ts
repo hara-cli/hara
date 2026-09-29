@@ -96,6 +96,7 @@ registerTool({
     },
     required: ["content"],
   },
+  visibility: "deferred",
   kind: "edit",
   async run(input, ctx) {
     const content = String(input.content ?? "").trim();
@@ -136,6 +137,7 @@ registerTool({
     },
     required: ["name", "description", "body"],
   },
+  visibility: "deferred",
   kind: "edit",
   async run(input, ctx) {
     const slug = String(input.name ?? "")
@@ -224,6 +226,7 @@ registerTool({
     },
     required: ["match"],
   },
+  visibility: "deferred",
   kind: "edit",
   async run(input, ctx) {
     const target = asTarget(input.target);

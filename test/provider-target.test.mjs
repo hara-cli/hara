@@ -277,6 +277,24 @@ test("legacy OpenAI profiles on the exact Volcengine Agent Plan endpoint canonic
   });
 });
 
+test("legacy OpenAI profiles on the exact Volcengine Coding Plan endpoint canonicalize without losing their saved key", () => {
+  const target = resolveByokProviderTarget(personalConfig, {
+    id: "legacy-volcengine-coding",
+    kind: "byok",
+    label: "Ark Coding Plan",
+    provider: "openai",
+    apiKey: "saved-coding-plan-key",
+    baseURL: "https://ark.cn-beijing.volces.com/api/coding/v3",
+    defaultModel: "ark-code-latest",
+  }, false, {});
+  assert.deepEqual(target, {
+    provider: "volcengine-coding-plan",
+    apiKey: "saved-coding-plan-key",
+    baseURL: "https://ark.cn-beijing.volces.com/api/coding/v3",
+    model: "ark-code-latest",
+  });
+});
+
 test("local targets discard flat and environment cloud credentials", () => {
   const target = resolveByokProviderTarget(
     {

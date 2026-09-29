@@ -190,7 +190,12 @@ export function createAnthropicProvider(opts: { apiKey: string; model: string; b
       // cached session under-reported context fullness badly (ctx% stayed tiny → auto-compact never
       // fired → overflow). Total context = fresh + cache_creation + cache_read (CC's zY5 equivalent).
       const u = msg.usage as { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } | undefined;
-      const usage = { input: (u?.input_tokens ?? 0) + (u?.cache_creation_input_tokens ?? 0) + (u?.cache_read_input_tokens ?? 0), output: u?.output_tokens ?? 0 };
+      const cachedInput = u?.cache_read_input_tokens;
+      const usage: NonNullable<TurnResult["usage"]> = {
+        input: (u?.input_tokens ?? 0) + (u?.cache_creation_input_tokens ?? 0) + (cachedInput ?? 0),
+        output: u?.output_tokens ?? 0,
+        ...(Number.isFinite(cachedInput) && cachedInput! >= 0 ? { cachedInput } : {}),
+      };
       return { text, toolUses, stop, usage };
     },
   };

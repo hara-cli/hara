@@ -12,6 +12,7 @@ import {
   isInteractiveConversationModel,
   miniMaxFallbackModels,
   volcengineAgentPlanFallbackModels,
+  volcengineCodingPlanFallbackModels,
 } from "../dist/providers/models.js";
 import {
   TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS,
@@ -24,6 +25,8 @@ import { MINIMAX_TOKEN_PLAN_MODELS } from "../dist/providers/minimax.js";
 import {
   VOLCENGINE_AGENT_PLAN_BASE_URL,
   VOLCENGINE_AGENT_PLAN_MODELS,
+  VOLCENGINE_CODING_PLAN_BASE_URL,
+  VOLCENGINE_CODING_PLAN_MODELS,
 } from "../dist/providers/volcengine.js";
 
 test("levelsFor: binary thinking styles → off/on; graded → full dial; DeepSeek uses off plus native low/high/max; none → nothing", () => {
@@ -275,6 +278,46 @@ test("Volcengine Agent Plan discovery keeps agent models and filters separate me
   assert.deepEqual(
     await listModels(VOLCENGINE_AGENT_PLAN_BASE_URL, "k", live),
     ["ark-code-latest", "future-code-model", "glm-5.3-flash"],
+  );
+});
+
+test("Volcengine Coding Plan exposes only current conversation models on its separate endpoint", async () => {
+  assert.equal(VOLCENGINE_CODING_PLAN_MODELS[0], "ark-code-latest");
+  assert.ok(VOLCENGINE_CODING_PLAN_MODELS.includes("doubao-seed-2.1-pro"));
+  assert.ok(VOLCENGINE_CODING_PLAN_MODELS.includes("deepseek-v4.1-flash"));
+  assert.ok(VOLCENGINE_CODING_PLAN_MODELS.includes("kimi-k2.8-preview"));
+  for (const hidden of ["auto", "doubao-seed-2.0-lite", "doubao-seed-2.1-turbo", "doubao-embedding-vision"]) {
+    assert.equal(VOLCENGINE_CODING_PLAN_MODELS.includes(hidden), false, hidden);
+  }
+  assert.deepEqual(
+    volcengineCodingPlanFallbackModels(VOLCENGINE_CODING_PLAN_BASE_URL),
+    [...VOLCENGINE_CODING_PLAN_MODELS],
+  );
+  assert.deepEqual(volcengineCodingPlanFallbackModels("https://ark.cn-beijing.volces.com/api/v3"), []);
+  assert.deepEqual(volcengineCodingPlanFallbackModels("https://ark.cn-beijing.volces.com/api/plan/v3"), []);
+
+  const live = async () => ({
+    ok: true,
+    json: async () => ({
+      data: [
+        { id: "ark-code-latest" },
+        { id: "deepseek-v4.1-flash" },
+        { id: "future-code-model" },
+        { id: "auto" },
+        { id: "doubao-seed-2.0-lite" },
+        { id: "doubao-seed-2.1-turbo" },
+        { id: "doubao-embedding-vision" },
+      ],
+    }),
+  });
+  assert.deepEqual(
+    await listModels(VOLCENGINE_CODING_PLAN_BASE_URL, "k", live),
+    ["ark-code-latest", "deepseek-v4.1-flash", "future-code-model"],
+  );
+  assert.deepEqual(
+    await listModels(VOLCENGINE_CODING_PLAN_BASE_URL, "k", live, "doubao-seed-2.0-lite"),
+    ["ark-code-latest", "deepseek-v4.1-flash", "doubao-seed-2.0-lite", "future-code-model"],
+    "an existing sunset selection remains recoverable but is hidden for new choices",
   );
 });
 

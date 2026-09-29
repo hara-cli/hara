@@ -387,8 +387,9 @@ need progress inspection, follow-up guidance, interruption, or restart recovery.
 use \`list_agents\`, \`wait_agent\`, \`send_message\`, \`followup_task\`, \`interrupt_agent\`, and
 \`resume_agent\` rather than inventing status or spawning a duplicate child. Use \`agent_room\` only when
 several existing Agents need one shared, bounded discussion log; prefer direct messages for one recipient.
-For an explicitly approved Personal Space coding task, the root Agent may spawn runtime \`codex\` or \`claude\`; Hara keeps
-that runtime inside an Agent-owned worktree and the parent must inspect and apply its Diff. Messages the user sends
+For an explicitly approved Personal Space coding task, the root Agent may launch runtime \`codex\` or \`claude\` through
+the current spawn transport. Treat that runtime-backed record as a Code task, not a conversational member; Hara keeps it
+inside an Agent-owned worktree and the parent must inspect and apply its Diff. Messages the user sends
 mid-task arrive marked as interjections — triage them (refine current / queue as todo / urgent-switch)
 instead of blindly folding everything into the current task; the todo list is your task queue. For a multi-step task, call \`todo_write\` to plan a short checklist and keep it updated as
 you go (one item in_progress at a time) — skip it for trivial one-step tasks. You have a persistent
@@ -583,7 +584,17 @@ export interface RunOpts {
     /** Persist cumulative provider-round usage at every closed run boundary. */
     onRoundUsage?: (task: TaskExecution) => void;
   };
-  stats?: { input: number; output: number; lastInput?: number };
+  stats?: {
+    input: number;
+    output: number;
+    lastInput?: number;
+    /** Input tokens reported by the most recent physical provider request. Unlike lastInput, this is
+     * never replaced with a post-compaction working-set estimate. */
+    lastRequestInput?: number;
+    providerCalls?: number;
+    cachedInput?: number;
+    reasoningOutput?: number;
+  };
   /** role persona used instead of the default hara system prompt */
   systemOverride?: string;
   /** Version of the Control bundle from which systemOverride/toolFilter were resolved. If a fresh policy
@@ -1889,10 +1900,14 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           : "completed",
       ...(providerErrorKind ? { errorKind: providerErrorKind } : {}),
     });
+    if (opts.stats) opts.stats.providerCalls = (opts.stats.providerCalls ?? 0) + 1;
     if (r.usage && opts.stats) {
       opts.stats.input += r.usage.input;
       opts.stats.output += r.usage.output;
       opts.stats.lastInput = r.usage.input;
+      opts.stats.lastRequestInput = r.usage.input;
+      opts.stats.cachedInput = (opts.stats.cachedInput ?? 0) + (r.usage.cachedInput ?? 0);
+      opts.stats.reasoningOutput = (opts.stats.reasoningOutput ?? 0) + (r.usage.reasoningOutput ?? 0);
     }
     // A provider may ignore AbortSignal and return a perfectly valid-looking tool_use after cancellation.
     // The original run signal is authoritative: do not append/approve/execute any late response.

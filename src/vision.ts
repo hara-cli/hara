@@ -61,6 +61,7 @@ const MODEL_VISION_MAP: { rx: RegExp; cap: "vision" | "text" }[] = [
   { rx: /^doubao-seed-2\.1-turbo(?:-|$)/i, cap: "vision" },
   // DeepSeek (the exact official V4 vision model and VL families first, then the text families)
   { rx: /^deepseek-v4-flash-vision-exp$/i, cap: "vision" },
+  { rx: /^deepseek-v4\.1-flash(?:-|$)/i, cap: "vision" },
   { rx: /deepseek.*vl/i, cap: "vision" },
   { rx: /deepseek/i, cap: "text" },
   // Google
@@ -73,7 +74,7 @@ const MODEL_VISION_MAP: { rx: RegExp; cap: "vision" | "text" }[] = [
   { rx: /llama-?3\.2-(?:11|90)b|llama.*vision|llama-?4/i, cap: "vision" },
   { rx: /llama|codellama/i, cap: "text" },
   // Moonshot / Kimi — K3 and K2.7 Code accept image input on Agent Plan (K2.7 also accepts video).
-  { rx: /^kimi-(?:k3|k2\.7-code)(?:-|$)|kimi-?k?2\.5|kimi.*vl|moonshot.*(?:vl|vision)/i, cap: "vision" },
+  { rx: /^kimi-(?:k3|k2\.(?:7-code|8-preview))(?:-|$)|kimi-?k?2\.5|kimi.*vl|moonshot.*(?:vl|vision)/i, cap: "vision" },
   { rx: /kimi|moonshot/i, cap: "text" },
   // xAI Grok
   { rx: /grok.*vision|grok-[\d.]*v\b|grok-4/i, cap: "vision" },
@@ -96,6 +97,15 @@ export function classifyVision(provider: string, model: string, overrides: Recor
   if (o === "no") return "text";
   if (provider === "anthropic") return "vision";
   const m = model || "";
+  const id = m.trim().toLowerCase().split("/").at(-1) ?? m.trim().toLowerCase();
+  // The same Ark model id can have different stable input guarantees on Agent Plan and Coding Plan.
+  // Keep this route-scoped so Coding Plan improvements never silently widen an older Agent Plan route.
+  if (provider === "volcengine-coding-plan") {
+    if (/^(?:ark-code-latest|doubao-seed-(?:evolving|2\.(?:0-mini|1-(?:pro|lite)))|minimax-m3|glm-5\.3-flash|deepseek-v4\.1-flash|kimi-(?:k2\.(?:7-code|8-preview)|k3))$/.test(id)) {
+      return "vision";
+    }
+    if (/^(?:glm-(?:5\.3|latest)|deepseek-v4-(?:flash|pro))$/.test(id)) return "text";
+  }
   for (const r of MODEL_VISION_MAP) if (r.rx.test(m)) return r.cap;
   return "unknown";
 }

@@ -25,6 +25,19 @@ goal; the Agent may add Hara Code Runtime, Codex, or Claude Code when execution 
 launch produces an in-context approval card at that moment. The creation UI must not ask the user to assign
 an executor or maintain standing Codex/Claude checkboxes.
 
+### Transitional product projection (implemented 2026-09-29)
+
+The existing Agent-team journal still stores native Codex and Claude launches as runtime-backed member records
+for wire and recovery compatibility. Desktop no longer presents those records as people: Hara runtimes populate
+the member and group-chat surfaces, while Codex/Claude records appear under a separate **Code tasks** section with
+status, Diff, live-terminal continuation, interrupt, and CLI recovery actions. Existing saved sessions remain
+readable and resumable. A future journal schema may rename the underlying record without another product-level
+migration.
+
+This separation is an invariant, not just copy: rooms accept conversational Hara Agents only, and direct Agent
+chat never selects a native coding runtime. The root Hara Agent remains the owner of the user conversation and
+plain-language outcome.
+
 This provides functional transparency without falsely promising credential transparency.
 
 ## Authentication finding
@@ -153,6 +166,19 @@ Runtime unification succeeds only if execution looks like part of a normal conve
 - internal reminders, routing envelopes, provider IDs, and native session IDs are never rendered;
 - a completed turn ends with a plain-language Agent reply, even when OpenCode performed the code work;
 - recovery after reconnect restores the exact visible message and execution receipt without duplicate text.
+
+## Model-I/O budget implications
+
+Hara reports per-turn **cumulative model I/O** separately from request count and the latest request context.
+Provider-reported cached input and reasoning output are retained when available; they are not silently treated as
+one context-window percentage or a universal billing formula. Long-tail schemas such as presentations, image
+inspection, visual preview, directory reveal, persistent project tasks, memory mutation, and skill creation stay
+deferred on unrelated turns and are activated deterministically for explicit intent (or through `tool_search`).
+This reduces the ordinary eager schema payload while preserving the authorization boundary.
+
+When a task has crossed 200k cumulative logical model-I/O without durable progress, two consecutive stale
+checkpoint rounds are sufficient to pause. The runtime must not buy an extra full-context provider call merely
+to rediscover the same stalled state.
 
 ## Non-goals
 

@@ -106,6 +106,31 @@ test("model capabilities preserve current multimodal and text-only boundaries", 
     "unknown",
     "a newly discovered model stays directly selectable without inheriting unverified tool capability",
   );
+
+  const codingArk = providerModelCapabilities({
+    provider: "volcengine-coding-plan",
+    baseURL: "https://ark.cn-beijing.volces.com/api/coding/v3",
+    model: "ark-code-latest",
+  });
+  assert.equal(codingArk.wireApi, "responses");
+  assert.equal(codingArk.imageInput, "supported");
+  assert.equal(codingArk.toolCalling, "supported");
+  assert.equal(codingArk.contextWindowTokens, undefined, "the console-selected backing model can change");
+
+  const codingPro = providerModelCapabilities({
+    provider: "volcengine-coding-plan",
+    baseURL: "https://ark.cn-beijing.volces.com/api/coding/v3",
+    model: "doubao-seed-2.1-pro",
+  });
+  assert.equal(codingPro.imageInput, "supported");
+  assert.equal(codingPro.contextWindowTokens, 1_024_000);
+
+  const codingEmbedding = providerModelCapabilities({
+    provider: "volcengine-coding-plan",
+    baseURL: "https://ark.cn-beijing.volces.com/api/coding/v3",
+    model: "doubao-embedding-vision",
+  });
+  assert.equal(codingEmbedding.toolCalling, "unsupported");
 });
 
 test("a circuit is isolated by exact credential/model route and recovers through one half-open probe", () => {
