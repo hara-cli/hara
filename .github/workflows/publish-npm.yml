@@ -1,10 +1,10 @@
 # Publish @nanhara/hara to npm. Fires on a version tag push (v*) — so "release to GitHub" (push a tag, or cut a
-# GitHub Release, which creates the tag) also ships to npm — plus a manual "Run workflow" button. Auth uses the
-# repo's .npmrc (`//registry.npmjs.org/:_authToken=${NPM_TOKEN}`) resolved from the NPM_TOKEN repo secret — which
-# must be an npm granular token with publish rights to @nanhara AND 2FA bypass (CI can't answer an OTP prompt).
+# GitHub Release, which creates the tag) also ships to npm — plus a manual "Run workflow" button. Publishing uses
+# npm Trusted Publishing (GitHub OIDC), so the workflow never stores or receives a long-lived npm write token.
+# The @nanhara/hara package must trust hara-cli/hara + publish-npm.yml and allow direct `npm publish`.
 #
 # Idempotent: if package.json's version is already on npm, the run exits green ("nothing to publish") instead of
-# failing — so re-runs and dispatch-tests are safe, and a green run still proves the token authenticated.
+# failing — so re-runs and dispatch-tests are safe, and a green run still proves OIDC authentication succeeded.
 name: publish-npm
 
 on:
@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish:
@@ -25,6 +26,8 @@ jobs:
         with:
           node-version: "22"
           registry-url: https://registry.npmjs.org/
+      - name: Use an npm CLI with Trusted Publishing support
+        run: npm install --global npm@11.6.2
       - name: Verify tag matches the package version
         if: github.event_name == 'push'
         shell: bash
@@ -36,9 +39,6 @@ jobs:
         run: bash .github/scripts/audit-production.sh
       - run: npm test
       - name: Publish to npm (idempotent)
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set +e
           out=$(npm publish --registry https://registry.npmjs.org/ 2>&1); code=$?
