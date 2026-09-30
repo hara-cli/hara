@@ -118,7 +118,7 @@ reported version `0.183.1` successfully.
 
 **Logged**: 2026-09-30T14:18:00+08:00
 **Priority**: high
-**Status**: in_progress
+**Status**: resolved
 **Area**: deployment
 
 ### Summary
@@ -138,7 +138,9 @@ E401 Unauthorized - GET https://registry.npmjs.org/-/whoami
 
 Replace long-lived `NPM_TOKEN` publishing with npm Trusted Publishing for the exact GitHub repository and
 workflow. Require `id-token: write`, use an npm CLI with OIDC support, remove write-token environment
-variables, and verify the public registry version before announcing npm availability.
+variables, and verify the public registry version before announcing npm availability. The `v0.183.2` tag
+completed the token-free OIDC exchange, signed and published provenance, and received npm's accepted publish
+receipt; after public-registry installation was verified, the obsolete GitHub `NPM_TOKEN` secret was removed.
 
 ### Metadata
 
