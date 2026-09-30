@@ -22,12 +22,17 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
-          node-version: "22"
-          registry-url: https://registry.npmjs.org/
+          node-version: "24.15.0"
+          package-manager-cache: false
       - name: Use an npm CLI with Trusted Publishing support
-        run: npm install --global npm@11.6.2
+        run: npm install --global npm@12.1.0
+      - name: Verify the token-free OIDC environment
+        shell: bash
+        run: |
+          [[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]] || { echo "GitHub OIDC is unavailable" >&2; exit 1; }
+          [[ -z "${NODE_AUTH_TOKEN:-}" ]] || { echo "refusing token auth in the Trusted Publishing job" >&2; exit 1; }
       - name: Verify tag matches the package version
         if: github.event_name == 'push'
         shell: bash

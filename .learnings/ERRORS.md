@@ -1,5 +1,35 @@
 # Errors
 
+## [ERR-20260930-SETUP-NODE-DUMMY-TOKEN-BLOCKED-OIDC] setup-node v5 masked npm Trusted Publishing with dummy token auth
+
+**Logged**: 2026-09-30T15:55:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: deployment
+
+### Summary
+
+The first tag run with `id-token: write` still returned npm `E404`. Its publish step exposed setup-node's
+non-secret `XXXXX-XXXXX-XXXXX-XXXXX` fallback as `NODE_AUTH_TOKEN`, so npm attempted unusable token auth
+instead of exchanging the GitHub OIDC identity.
+
+### Resolution
+
+Use `actions/setup-node@v7`, which removed the dummy token fallback; do not ask setup-node to create a registry
+auth file for this public package; disable package-manager caching; use the current pinned npm CLI; and fail
+before packing if the OIDC request URL is absent or `NODE_AUTH_TOKEN` is unexpectedly present.
+
+### Metadata
+
+- Source: external_api_failure
+- Reproducible: yes with setup-node v5 and no real token
+- Related Files: `.github/workflows/publish-npm.yml`
+- Tags: npm, oidc, setup-node, github-actions, release
+- Pattern-Key: deployment.oidc_publish_jobs_reject_dummy_or_long_lived_token_auth
+- Recurrence-Count: 1
+
+---
+
 ## [ERR-20260930-NPM-PACK-CACHE-OWNERSHIP] default npm cache blocked the release pack gate
 
 **Logged**: 2026-09-30T15:43:00+08:00
