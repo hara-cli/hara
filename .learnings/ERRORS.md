@@ -1,5 +1,98 @@
 # Errors
 
+## [ERR-20260930-NPM-PACK-CACHE-OWNERSHIP] default npm cache blocked the release pack gate
+
+**Logged**: 2026-09-30T15:43:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tooling
+
+### Summary
+
+`npm pack --dry-run` could not open a root-owned temporary entry under the workstation's shared npm cache.
+No package artifact was published or changed.
+
+### Resolution
+
+Run the read-only pack gate with a fresh task-scoped cache under `/private/tmp`; the same package then packed
+successfully without changing ownership of the user's shared cache.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes with the shared cache
+- Related Files: `package.json`, `package-lock.json`
+- Tags: npm, cache, permissions, release
+- Pattern-Key: tooling.release_pack_uses_task_scoped_cache_when_shared_cache_is_unwritable
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260930-BUN-PATH-OMITTED] release binary smoke initially omitted the installed Bun directory
+
+**Logged**: 2026-09-30T15:47:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tooling
+
+### Summary
+
+The first local `npm run build:binary` used a deliberately minimal release `PATH`, but omitted the existing
+`~/.bun/bin` installation and stopped with `bun: command not found`.
+
+### Resolution
+
+Add the known Bun installation directory to the bounded release `PATH`; the standalone binary built and
+reported version `0.183.1` successfully.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes with the incomplete PATH
+- Related Files: `scripts/build-binary.ts`
+- Tags: bun, path, binary, release
+- Pattern-Key: tooling.release_binary_path_includes_pinned_node_and_installed_bun
+- Recurrence-Count: 1
+
+---
+
+## [ERR-20260930-NPM-PUBLISH-LONG-LIVED-TOKEN] npm release depended on an invalid long-lived write token
+
+**Logged**: 2026-09-30T14:18:00+08:00
+**Priority**: high
+**Status**: in_progress
+**Area**: deployment
+
+### Summary
+
+The `v0.183.0` GitHub release and standalone artifacts succeeded, but both npm publish attempts failed while
+the public registry remained on `0.182.0`. The repository secret metadata still pointed to the July token,
+and the corresponding npm authentication state returned `E401 Unauthorized`.
+
+### Error
+
+~~~text
+E404 Not Found - PUT https://registry.npmjs.org/@nanhara%2fhara
+E401 Unauthorized - GET https://registry.npmjs.org/-/whoami
+~~~
+
+### Resolution
+
+Replace long-lived `NPM_TOKEN` publishing with npm Trusted Publishing for the exact GitHub repository and
+workflow. Require `id-token: write`, use an npm CLI with OIDC support, remove write-token environment
+variables, and verify the public registry version before announcing npm availability.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes with the invalid repository secret
+- Related Files: `.github/workflows/publish-npm.yml`
+- Tags: npm, release, oidc, credentials, github-actions
+- Pattern-Key: deployment.prefer_short_lived_oidc_over_registry_write_tokens
+- Recurrence-Count: 1
+
+---
+
 ## [ERR-20260930-EXTERNAL-SESSION-FIXTURE-PARTIAL-JSON] concurrent test read observed a partially written fixture state file
 
 **Logged**: 2026-09-30T00:20:00+08:00

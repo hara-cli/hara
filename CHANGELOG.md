@@ -5,6 +5,13 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.183.1 — 2026-09-30 — secure npm publishing recovery
+
+- Patch `fast-uri` to `3.1.8` after the September 30 host-normalization advisory, keeping the production
+  dependency audit green instead of bypassing the release gate.
+- Replace the expired long-lived npm publishing secret with package-scoped GitHub OIDC Trusted Publishing,
+  so releases use short-lived workflow credentials and no npm write token is stored in GitHub.
+
 ## 0.183.0 — 2026-09-30 — Ark Coding Plan and leaner Agent turns
 
 - Add Volcengine Ark Coding Plan as a separate subscription connection with its fixed Beijing Responses
