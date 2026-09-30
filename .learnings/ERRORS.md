@@ -1,5 +1,33 @@
 # Errors
 
+## [ERR-20260930-NPM12-REMOTE-LOCK-ORIGIN] npm 12 rejected historical mirror tarball URLs in the lockfile
+
+**Logged**: 2026-09-30T16:04:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: dependencies
+
+### Summary
+
+After token-free OIDC setup, npm 12 stopped at `npm ci` with `EALLOWREMOTE` because the lockfile still resolved
+packages through `registry.npmmirror.com`. Older npm accepted those URLs, hiding the third-party origin.
+
+### Resolution
+
+Normalize every locked tarball origin to `https://registry.npmjs.org/` without changing package versions or
+integrities. A clean npm 12.1.0 install from the official registry then completed with zero vulnerabilities.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes with npm 12 and the mirror-origin lockfile
+- Related Files: `package-lock.json`
+- Tags: npm, lockfile, registry, supply-chain, release
+- Pattern-Key: dependencies.lockfile_uses_authoritative_registry_origins
+- Recurrence-Count: 1
+
+---
+
 ## [ERR-20260930-SETUP-NODE-DUMMY-TOKEN-BLOCKED-OIDC] setup-node v5 masked npm Trusted Publishing with dummy token auth
 
 **Logged**: 2026-09-30T15:55:00+08:00
