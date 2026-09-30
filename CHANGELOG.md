@@ -5,6 +5,13 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.183.2 — 2026-09-30 — reproducible token-free npm releases
+
+- Complete the npm Trusted Publishing migration with a token-free GitHub OIDC job that is exercised by the
+  canonical version-tag release path rather than relying on manual-dispatch identity matching.
+- Pin dependency tarballs in the lockfile to the official npm registry so npm 12 can perform a clean,
+  reproducible release install without accepting mutable third-party registry origins.
+
 ## 0.183.1 — 2026-09-30 — secure npm publishing recovery
 
 - Patch `fast-uri` to `3.1.8` after the September 30 host-normalization advisory, keeping the production
