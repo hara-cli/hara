@@ -46,7 +46,7 @@ jobs:
       - name: Publish to npm (idempotent)
         run: |
           set +e
-          out=$(npm publish --registry https://registry.npmjs.org/ 2>&1); code=$?
+          out=$(npm publish --loglevel verbose --registry https://registry.npmjs.org/ 2>&1); code=$?
           echo "$out"
           if [ $code -eq 0 ]; then echo "✓ published"; exit 0; fi
           if echo "$out" | grep -qiE "cannot publish over|previously published|EPUBLISHCONFLICT|409 Conflict"; then
