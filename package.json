@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.183.2",
+  "version": "0.183.3",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "runtime-bootstrap.cjs"
@@ -86,7 +86,7 @@
   },
   "overrides": {
     "@larksuiteoapi/node-sdk": {
-      "axios": "1.18.1",
+      "axios": "1.20.0",
       "protobufjs": "7.6.5"
     },
     "@hono/node-server": "2.0.11",

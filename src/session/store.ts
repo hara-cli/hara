@@ -482,6 +482,8 @@ export interface SessionRuntimeItemEvent {
   errorKind?: SessionRuntimeErrorKind;
   generation?: number;
   inputTokens?: number;
+  /** Provider-reported cache-read share of `inputTokens`; absent when the provider does not report it. */
+  cachedInputTokens?: number;
   outputTokens?: number;
 }
 
@@ -616,6 +618,7 @@ export interface SessionRuntimeItemReplay {
   errorKind?: SessionRuntimeErrorKind;
   generation?: number;
   inputTokens?: number;
+  cachedInputTokens?: number;
   outputTokens?: number;
   queuedAt?: string;
   startedAt?: string;
@@ -1929,6 +1932,7 @@ function isSessionRuntimeItemEvent(value: unknown, sessionId?: string): value is
     ].includes(event.errorKind as string))
     && (event.generation === undefined || (Number.isSafeInteger(event.generation) && Number(event.generation) >= 1))
     && (event.inputTokens === undefined || isNonNegativeSafeInteger(event.inputTokens))
+    && (event.cachedInputTokens === undefined || isNonNegativeSafeInteger(event.cachedInputTokens))
     && (event.outputTokens === undefined || isNonNegativeSafeInteger(event.outputTokens));
 }
 
@@ -2085,6 +2089,7 @@ export function replaySessionJournal(events: readonly SessionJournalEvent[]): Se
           ...(event.errorKind ? { errorKind: event.errorKind } : {}),
           ...(event.generation !== undefined ? { generation: event.generation } : {}),
           ...(event.inputTokens !== undefined ? { inputTokens: event.inputTokens } : {}),
+          ...(event.cachedInputTokens !== undefined ? { cachedInputTokens: event.cachedInputTokens } : {}),
           ...(event.outputTokens !== undefined ? { outputTokens: event.outputTokens } : {}),
           ...(event.state === "queued" ? { queuedAt: event.at } : {}),
           ...(event.state === "started" ? { startedAt: event.at } : {}),
@@ -2135,6 +2140,7 @@ export function replaySessionJournal(events: readonly SessionJournalEvent[]): Se
       if (event.state === "started") current.startedAt = event.at;
       if (event.errorKind) current.errorKind = event.errorKind;
       if (event.inputTokens !== undefined) current.inputTokens = event.inputTokens;
+      if (event.cachedInputTokens !== undefined) current.cachedInputTokens = event.cachedInputTokens;
       if (event.outputTokens !== undefined) current.outputTokens = event.outputTokens;
       if (terminal(event.state)) current.terminalAt = event.at;
     }
@@ -2581,6 +2587,7 @@ export function recordSessionRuntimeItem(input: SessionRuntimeItemInput): boolea
       ...(input.errorKind ? { errorKind: input.errorKind } : {}),
       ...(input.generation !== undefined ? { generation: input.generation } : {}),
       ...(input.inputTokens !== undefined ? { inputTokens: input.inputTokens } : {}),
+      ...(input.cachedInputTokens !== undefined ? { cachedInputTokens: input.cachedInputTokens } : {}),
       ...(input.outputTokens !== undefined ? { outputTokens: input.outputTokens } : {}),
     }));
   } catch {

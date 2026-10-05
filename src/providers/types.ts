@@ -139,6 +139,10 @@ export interface TurnArgs {
   organizationPolicyVersion?: number;
 }
 
+/** Opening bytes of the engine's per-request trailing context message (see `trailingTurnContext`). Cache-aware
+ * providers use it to keep that changing block out of a cached prefix. */
+export const TURN_CONTEXT_OPEN = "<system-reminder>\n# Engine turn context\n";
+
 export interface ProviderExecutionSnapshot {
   organizationPolicyVersion?: number;
   /** Exact in-memory policy returned by the same authenticated Control response as the version above.
@@ -149,6 +153,11 @@ export interface ProviderExecutionSnapshot {
 export interface Provider {
   id: string;
   model: string;
+  /** This route keeps a trailing engine `<system-reminder>` user message valid and benefits from a
+   * byte-stable system prompt (prefix caching). When true, the agent loop sends per-request state — clock,
+   * accepted brief, checkpoint — as the last history message instead of a changing system suffix. Missing
+   * or false keeps the single system prompt, so custom providers and test doubles see no contract change. */
+  readonly trailingTurnContext?: boolean;
   /** Redacted runtime identity and capability snapshot for this exact account/model route. The internal
    * health key is never returned by settings APIs or written to a session transcript. */
   connection?: ProviderConnectionDescriptor;

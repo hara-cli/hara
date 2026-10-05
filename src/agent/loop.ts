@@ -59,7 +59,7 @@ import { agentMaxRounds, agentRunTimeoutMs, formatAgentDuration, MAX_AGENT_MAX_R
 import { subdirHint } from "../context/subdir-hints.js";
 import { classifyError, failoverAction, errorHint, type ErrKind } from "./failover.js";
 import { currentTodos, renderTodos, type Todo } from "../tools/todo.js";
-import { drainReminders, wrapReminders, pushReminder, todoStaleReminder, TODO_STALE_ROUNDS, synthesisReminder, SYNTHESIS_MIN_AGENTS } from "./reminders.js";
+import { drainReminders, wrapReminders, wrapTurnContext, isSystemReminderContent, pushReminder, todoStaleReminder, TODO_STALE_ROUNDS, synthesisReminder, SYNTHESIS_MIN_AGENTS } from "./reminders.js";
 import { coreDeferredToolsForHistory } from "./core-capabilities.js";
 import { setTurnPhase } from "./phase.js";
 import { AssistantTextSanitizer, sanitizeAssistantText } from "./assistant-text.js";
@@ -140,6 +140,51 @@ const DURABLE_AGENT_TEAM_TOOLS = new Set([
  *  "working Ns" forever (the "pressed Enter, thought it failed" report). Generous default because
  *  hidden-reasoning models can legitimately go quiet for a while; HARA_STALL_TIMEOUT (ms) tunes it,
  *  floor 1s (tests). codex's equivalent is its 2–9s stream-idle timeout. */
+/** Engine-owned bookkeeping that may share the round which records a completion receipt. */
+const COMPLETION_ROUND_TOOLS: ReadonlySet<string> = new Set(["task_checkpoint", "todo_write"]);
+
+function carriesCompletionReceipt(toolUses: readonly { name: string; input?: unknown }[]): boolean {
+  return toolUses.some((toolUse) =>
+    toolUse.name === "task_checkpoint"
+    && (toolUse.input as { completion?: unknown } | null | undefined)?.completion !== undefined);
+}
+
+/** The user-facing reply a model placed inside its completion receipt (`completion.final_answer`). Many
+ *  models emit tool calls without accompanying text; carrying the answer in the call lets the turn end at
+ *  the receipt instead of spending one more provider round to restate the result. */
+function completionFinalAnswer(toolUses: readonly { name: string; input?: unknown }[]): string {
+  for (const toolUse of toolUses) {
+    if (toolUse.name !== "task_checkpoint") continue;
+    const completion = (toolUse.input as { completion?: { final_answer?: unknown } } | null | undefined)?.completion;
+    if (typeof completion?.final_answer === "string" && completion.final_answer.trim()) return completion.final_answer.trim();
+  }
+  return "";
+}
+
+/** A response may record engine task state — a brief, or a capability preflight — next to the work that
+ *  depends on it. The gates for that work are evaluated at plan time, so both cannot be planned as one
+ *  round. Return the state calls to run (and durably checkpoint) first and the remaining calls to replay
+ *  afterwards, or undefined when the response needs no split. A completion receipt attests to finished
+ *  work, so it always stays with the remaining calls. */
+export function splitTaskStateTransition<T extends { name: string; input?: unknown }>(
+  toolUses: readonly T[],
+): { state: T[]; rest: T[] } | undefined {
+  const input = (toolUse: T): { completion?: unknown; capabilities?: unknown } =>
+    toolUse.input && typeof toolUse.input === "object" ? toolUse.input as { completion?: unknown; capabilities?: unknown } : {};
+  const recordsState = (toolUse: T): boolean =>
+    toolUse.name === "task_intake"
+    || (toolUse.name === "task_checkpoint" && input(toolUse).completion === undefined);
+  const state = toolUses.filter(recordsState);
+  const rest = toolUses.filter((toolUse) => !recordsState(toolUse));
+  const gatesLaterWork = state.some((toolUse) => {
+    if (toolUse.name === "task_intake") return true;
+    const capabilities = input(toolUse).capabilities;
+    return Array.isArray(capabilities) && capabilities.length > 0;
+  });
+  if (!gatesLaterWork || !rest.some((toolUse) => !COMPLETION_ROUND_TOOLS.has(toolUse.name))) return undefined;
+  return { state, rest };
+}
+
 export function stallMs(): number {
   const raw = Number(process.env.HARA_STALL_TIMEOUT ?? 240_000);
   return Math.max(1_000, Number.isFinite(raw) && raw > 0 ? raw : 240_000);
@@ -503,7 +548,11 @@ export function composeSystem(
           "their observed states with `task_checkpoint` before depending on them. After each major stage, before " +
           "reporting a blocker, and before final synthesis, update the shared checkpoint. Canonical step completion " +
           "belongs in `todo_write`; facts, capability results, blockers, next step, and artifacts belong in `task_checkpoint`. " +
-          "Immediately before the final answer, persist a completion receipt: use completion.state=`verified` with " +
+          "Every model round costs the user real waiting time: never spend a response only on `todo_write` or a " +
+          "progress `task_checkpoint`; send them in the same response as your next working tool calls. " +
+          "To finish, send ONE response containing any last `todo_write` and the `task_checkpoint` completion " +
+          "receipt with your complete final reply in completion.final_answer, with no other tools. Hara shows " +
+          "that reply and ends the turn only if the receipt is accepted. Use completion.state=`verified` with " +
           "observable evidence only after every acceptance check passes. Use completion.state=`awaiting_user` only " +
           "with a typed dependency and observed evidence proving the remaining step can only be performed by the " +
           "human; an available authorized action is never such a dependency. An accepted brief without a fresh " +
@@ -518,12 +567,16 @@ export function composeSystem(
           "target, hard boundaries, and observable proof. Ask one concise question only when a missing answer would " +
           "materially change scope, safety, or the deliverable; otherwise state the conservative assumption in " +
           "constraints. BEFORE the first edit, non-read-only command, " +
-          "background-process start/stop, computer action, external agent, or MCP connection, call `task_intake` in its OWN tool round with " +
-          "the interpreted goal, intent, constraints, acceptance checks, and short steps. Use intent `answer` " +
+          "background-process start/stop, computer action, external agent, or MCP connection, call `task_intake` with " +
+          "the interpreted goal, intent, constraints, acceptance checks, and short steps. Do not spend a response " +
+          "on `task_intake` alone when you already know the first action: send `task_intake` and those first " +
+          "tool calls in the SAME response. Hara applies and saves the brief first, then runs the other calls " +
+          "against it; if the brief is rejected, none of them run. Use intent `answer` " +
           "for a direct answer, `investigate` for evidence gathering/diagnosis, and `change` when the user asked " +
           "you to modify or deliver something. Do not claim completion until the acceptance checks are verified. " +
           "Once a brief is accepted, finish with a task_checkpoint completion receipt: verified plus observable " +
-          "evidence, or awaiting_user plus a typed, evidenced human-only dependency."
+          "evidence, or awaiting_user plus a typed, evidenced human-only dependency. Put the final reply in that " +
+          "receipt's completion.final_answer so the turn ends there."
         );
   assembler
     .add("working-directory", "session", "runtime", `Working directory: ${cwd}`)
@@ -672,6 +725,8 @@ export interface RunRuntimeItemEvent {
   errorKind?: ErrKind;
   generation?: number;
   inputTokens?: number;
+  /** Cache-read share of `inputTokens`, when the provider reports it. */
+  cachedInputTokens?: number;
   outputTokens?: number;
 }
 
@@ -1150,8 +1205,9 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     ? {
         name: "task_intake",
         description:
-          "Record or revise your explicit understanding of the active task before side effects. Call this " +
-          "in its own tool round only after using the conversation and any needed read-only evidence to identify " +
+          "Record or revise your explicit understanding of the active task before side effects. Send it in the same " +
+          "response as the first actions it authorizes: Hara saves the brief first, then runs those calls against it. " +
+          "Call this only after using the conversation and any needed read-only evidence to identify " +
           "the real goal, concrete target, boundaries, and observable completion proof. Resolve deictic requests " +
           "such as 'start/continue/this' from active context instead of copying them as the goal. Required before " +
           "edits, non-read-only commands, background-process start/stop, computer actions, external agents, or MCP.",
@@ -1201,7 +1257,9 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           "Persist the active task's shared execution state. Use after a major stage, whenever a verified fact " +
           "or required capability state changes, before reporting a blocker, and before final synthesis. Keep the " +
           "canonical completed/pending step list in todo_write; this tool stores the current/blocked/next cursor, " +
-          "artifacts, verified facts, capability preflight, and the final completion receipt. Before the final answer, " +
+          "artifacts, verified facts, capability preflight, and the final completion receipt. Send progress updates " +
+          "alongside working tool calls, not in a response of their own. To finish, send the completion receipt with " +
+          "the final reply in completion.final_answer (only todo_write may accompany it): " +
           "set completion to verified with observable acceptance evidence, or awaiting_user only with a typed, evidenced " +
           "human-only dependency. Never use awaiting_user merely because giving instructions is easier than acting. " +
           "Without this fresh receipt an accepted task remains paused. A changed prior fact requires fresh evidence. " +
@@ -1251,6 +1309,10 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
               description: "Final engine-readable receipt. Use verified only after all acceptance checks pass. awaiting_user is valid only for an unavoidable typed human dependency.",
               properties: {
                 state: { type: "string", enum: ["verified", "awaiting_user"] },
+                final_answer: {
+                  type: "string",
+                  description: "Your complete final reply to the user, in the user's language: verified result, remaining blockers, next required action. Provide it here so the turn ends with this call; it is shown to the user only if this receipt is accepted. Omit only when the same response already carries the final reply as text.",
+                },
                 evidence: {
                   type: "array",
                   items: { type: "string" },
@@ -1310,7 +1372,12 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         classify: () => ({ effect: "state", concurrencySafe: false }),
         run: async (input) => {
           if (!taskStateDirty) syncIntakeTask();
-          const applied = applyTaskCheckpoint(intakeTask, input);
+          // `final_answer` is the reply to deliver, not task state: it never enters the checkpoint.
+          const completionInput = (input as { completion?: unknown } | null)?.completion;
+          const stateInput = completionInput && typeof completionInput === "object" && "final_answer" in completionInput
+            ? { ...(input as object), completion: (({ final_answer: _finalAnswer, ...rest }) => rest)(completionInput as Record<string, unknown>) }
+            : input;
+          const applied = applyTaskCheckpoint(intakeTask, stateInput);
           if (!applied.ok) return `Error: task checkpoint rejected — ${applied.reason}`;
           intakeTask = applied.task;
           taskStateDirty = true;
@@ -1514,6 +1581,9 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
   // Todo attention-refresh (à la Claude Code): tool rounds since the checklist was last touched while
   // unfinished items exist. Main loop only — quiet (sub-agent) runs share the global list and must not nag.
   let todoIdleRounds = 0;
+  // The second half of a split response (see splitTaskStateTransition): calls the model already made that
+  // wait for its own task-state round to close. They run as the next round without another provider request.
+  let carriedToolRound: Pick<Awaited<ReturnType<Provider["turn"]>>, "toolUses" | "continuation"> | undefined;
   for (;;) {
     let userIntervenedThisRound = false;
     // A cancellation that already happened is authoritative: do not start pending-input work, a provider
@@ -1585,6 +1655,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     // Type-ahead steering: fold in anything the user submitted while the previous step ran, so it
     // reaches the model on this next call (drained after the last tool round; empty on the 1st pass).
     if (opts.pendingInput && !runSignal.aborted) {
+      const historyBeforePendingInput = history.length;
       let pending: NeutralMsg[] | typeof RUN_STOPPED;
       try {
         // Defer the callback by one microtask so a synchronous throw follows the same explicit error path
@@ -1595,7 +1666,12 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         return interactionFailure("pending-input channel", error);
       }
       if (pending === RUN_STOPPED) return stoppedOutcome();
-      userIntervenedThisRound = pending.length > 0;
+      // CLI and Serve write-ahead hosts may append accepted steering to the shared history themselves
+      // and return []. Observe that materialization too; an old carried action must not outrun new input.
+      userIntervenedThisRound = pending.length > 0 || history.slice(historyBeforePendingInput).some((message) =>
+        message.role === "user" && !isSystemReminderContent(message.content));
+      // The model has not seen this input. Calls it issued earlier must not run past it unreviewed.
+      if (userIntervenedThisRound) carriedToolRound = undefined;
       for (const m of pending) history.push(m);
       // pendingInput may have durably accepted steering into the owner's immutable task snapshot. Refresh
       // before composing the system or applying a later brief so that state is never overwritten.
@@ -1640,6 +1716,10 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     const suppressUnverifiedActionProse =
       intakeTask?.brief?.intent === "change"
       && !freshTaskCompletion(intakeTask);
+    // A provider can emit text before announcing its tool calls. Owned task responses must therefore be
+    // held until the complete response identifies whether they contain a completion receipt. Ordinary
+    // chat without task intake keeps its immediate streaming path.
+    const bufferTaskProse = Boolean(opts.taskIntake);
     // Remote chat and unattended cron output cannot be retracted after delivery. Buffer their prose until
     // the full response passes the credential-solicitation guard; local interactive streaming keeps its
     // low-latency path and blocks structured credential questions at ask_user/task-checkpoint boundaries.
@@ -1659,13 +1739,35 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       },
       ctx.profileId,
     );
-    const system = assembledSystem.text;
+    // Turn-tier parts (accepted brief, checkpoint, clock) change between provider requests. Left in the
+    // system prompt they sit in FRONT of the whole conversation, so every request misses the provider's
+    // prefix cache from that point on and re-processes the full history. Send only the stable prefix as
+    // the system prompt and deliver the changing parts as an ephemeral trailing message instead.
+    // Only routes that declare the capability get the split; custom providers keep one system prompt.
+    const turnContextInSystem = activeProvider.trailingTurnContext !== true
+      || process.env.HARA_TURN_CONTEXT_PLACEMENT === "system";
+    const stableSystemParts = turnContextInSystem
+      ? assembledSystem.parts
+      : assembledSystem.parts.filter((part) => part.stability !== "turn");
+    const turnContext = turnContextInSystem
+      ? ""
+      : assembledSystem.parts
+        .filter((part) => part.stability === "turn")
+        .map((part) => part.content)
+        .join("\n\n");
+    const system = turnContext
+      ? stableSystemParts.map((part) => part.content).join("\n\n")
+      : assembledSystem.text;
     const prepared = prepareHistoryForModel(history, {
       model: activeProvider.model,
-      system,
+      // Budget against the full context: the trailing turn message costs the same tokens as before.
+      system: assembledSystem.text,
       tools: specs,
       budgetScale: contextBudgetScale,
     });
+    const modelHistory: NeutralMsg[] = [...prepared.history];
+    // Never persisted: the durable history stays free of engine context, and the next request rebuilds it.
+    if (turnContext) modelHistory.push({ role: "user", content: wrapTurnContext(turnContext) });
     if (prepared.changed && !contextGuardNotified && !opts.quiet) {
       contextGuardNotified = true;
       const note = `✻ context guard bounded this model request (${Math.round(prepared.originalChars / 1000)}k → ${Math.round(prepared.preparedChars / 1000)}k chars); durable history is unchanged`;
@@ -1682,13 +1784,15 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       model: activeProvider.model,
       ...(activeProvider.connection?.connectionId ? { name: activeProvider.connection.connectionId } : {}),
     };
+    // No provider request is made for a carried round, so it reports no provider item, tokens, or call.
+    const replayingCarriedRound = carriedToolRound !== undefined;
     const assistantMessageItem = {
       itemId: randomUUID(),
       kind: "message" as const,
-      parentItemId: providerItem.itemId,
+      ...(replayingCarriedRound ? {} : { parentItemId: providerItem.itemId }),
       role: "assistant" as const,
     };
-    emitRuntimeItem(opts, { ...providerItem, state: "started" });
+    if (!replayingCarriedRound) emitRuntimeItem(opts, { ...providerItem, state: "started" });
     emitRuntimeItem(opts, { ...assistantMessageItem, state: "started" });
     let providerItemStreaming = false;
     let assistantMessageStreaming = false;
@@ -1783,10 +1887,20 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         if (expireRunBudgetIfNeeded(life) || attempt.signal.aborted || runSignal.aborted) {
           return { text: "", toolUses: [], stop: "error" as const, errorMsg: "interrupted" };
         }
+        if (carriedToolRound) {
+          const carried = carriedToolRound;
+          carriedToolRound = undefined;
+          return {
+            text: "",
+            toolUses: carried.toolUses,
+            stop: "tool_use" as const,
+            ...(carried.continuation ? { continuation: carried.continuation } : {}),
+          };
+        }
         return activeProvider.turn({
           system,
-          systemParts: assembledSystem.parts,
-          history: prepared.history,
+          systemParts: stableSystemParts,
+          history: modelHistory,
           tools: specs,
           ...(organizationPolicyVersion !== undefined ? { organizationPolicyVersion } : {}),
       // Any stream chunk keeps the connection considered alive — even suppressed reasoning_content, so a
@@ -1815,7 +1929,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         }
         alive();
         const visible = assistantText.push(d);
-        if (suppressUnverifiedActionProse || guardAutomatedProse) deferredActionProse += visible;
+        if (bufferTaskProse || guardAutomatedProse) deferredActionProse += visible;
         else emitVisibleText(visible);
       },
       onReasoning: () => {
@@ -1850,14 +1964,8 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       removeAttemptStop();
       runSignal.removeEventListener("abort", onRunAbort);
       const finalVisible = assistantText.finish();
-      if (guardAutomatedProse) {
+      if (guardAutomatedProse || bufferTaskProse) {
         deferredActionProse += finalVisible;
-      } else if (suppressUnverifiedActionProse) {
-        deferredActionProse += finalVisible;
-        // Buffer until the provider commits to an actual tool round. This keeps a useful "I'll handle it"
-        // acknowledgement before execution while ensuring a prose-only delegation can still be discarded
-        // atomically by the ownership guard below.
-        if (r?.stop !== "error" && r?.toolUses?.length) emitVisibleText(deferredActionProse);
       } else {
         emitVisibleText(finalVisible);
       }
@@ -1884,11 +1992,12 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       : r.stop === "error"
         ? "failed"
         : "completed";
-    emitRuntimeItem(opts, {
+    if (!replayingCarriedRound) emitRuntimeItem(opts, {
       ...providerItem,
       state: providerTerminalState,
       ...(providerErrorKind ? { errorKind: providerErrorKind } : {}),
       ...(r.usage?.input !== undefined ? { inputTokens: r.usage.input } : {}),
+      ...(r.usage?.cachedInput !== undefined ? { cachedInputTokens: r.usage.cachedInput } : {}),
       ...(r.usage?.output !== undefined ? { outputTokens: r.usage.output } : {}),
     });
     emitRuntimeItem(opts, {
@@ -1900,7 +2009,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           : "completed",
       ...(providerErrorKind ? { errorKind: providerErrorKind } : {}),
     });
-    if (opts.stats) opts.stats.providerCalls = (opts.stats.providerCalls ?? 0) + 1;
+    if (opts.stats && !replayingCarriedRound) opts.stats.providerCalls = (opts.stats.providerCalls ?? 0) + 1;
     if (r.usage && opts.stats) {
       opts.stats.input += r.usage.input;
       opts.stats.output += r.usage.output;
@@ -1912,8 +2021,12 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     // A provider may ignore AbortSignal and return a perfectly valid-looking tool_use after cancellation.
     // The original run signal is authoritative: do not append/approve/execute any late response.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return stoppedOutcome();
+    const responseCarriesCompletion = carriesCompletionReceipt(r.toolUses);
+    const structuredAnswer = sanitizeAssistantText(completionFinalAnswer(r.toolUses)).trim();
     if (guardAutomatedProse) {
-      const guardedText = [r.text, deferredActionProse].filter(Boolean).join("\n");
+      // Structured closing replies use the same bounded correction as prose, before any receipt/tool
+      // is persisted or executed. Switching between the two formats cannot reset the retry allowance.
+      const guardedText = [r.text, deferredActionProse, structuredAnswer].filter(Boolean).join("\n");
       if (requestsCredentialDisclosure(guardedText)) {
         if (credentialDisclosureRetries < 1) {
           credentialDisclosureRetries += 1;
@@ -1929,10 +2042,10 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         emitVisibleText(message);
         return { status: "error", error: message };
       }
-      // A remote/cron transport cannot retract a premature "done". For an accepted change task, retain the
-      // validated prose until a fresh completion receipt exists; the next provider round can then publish
-      // the final answer. Credential-safe prose for non-change or already-verified work remains immediate.
-      if (!suppressUnverifiedActionProse) emitVisibleText(r.text || deferredActionProse);
+    }
+    if ((bufferTaskProse || guardAutomatedProse) && !responseCarriesCompletion && r.stop !== "error"
+      && (!suppressUnverifiedActionProse || r.toolUses.length > 0)) {
+      emitVisibleText(r.text || deferredActionProse);
     }
     if (ctx.spaceId && ctx.spaceId !== "personal") {
       try {
@@ -1951,12 +2064,27 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         };
       }
     }
-    history.push({
+    if (opts.taskIntake && !replayingCarriedRound && r.stop === "tool_use") {
+      const split = splitTaskStateTransition(r.toolUses);
+      if (split) {
+        carriedToolRound = {
+          toolUses: split.rest,
+          // Reasoning text may be repeated on the replayed assistant row (DeepSeek-style chat passback wants
+          // it beside every tool call). Responses reasoning items carry unique ids and stay on the first row.
+          ...(r.continuation?.type === "chat_reasoning" ? { continuation: r.continuation } : {}),
+        };
+        r = { ...r, toolUses: split.state };
+      }
+    }
+    const assistantHistoryMessage: Extract<NeutralMsg, { role: "assistant" }> = {
       role: "assistant",
-      text: r.text,
+      // Tool protocol stays complete, but unaccepted completion prose is not a user-visible message.
+      // Restore this field only after the matching closed result accepts the receipt, before saving.
+      text: responseCarriesCompletion ? "" : r.text,
       toolUses: r.toolUses,
       ...(r.continuation ? { continuation: r.continuation } : {}),
-    });
+    };
+    history.push(assistantHistoryMessage);
 
     if (r.stop === "error") {
       // Retrying the same route is still a replay. Once the provider emitted any stream activity,
@@ -1996,7 +2124,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       }
       const fallbackProvider = selectFallbackProvider(
         kind,
-        providerTurnRequirements(prepared.history, specs, activeProvider, kind),
+        providerTurnRequirements(modelHistory, specs, activeProvider, kind),
         replaySafe,
       );
       if (fallbackProvider) {
@@ -2129,7 +2257,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         actionOwnershipRetries += 1;
         const ownershipFallback = selectFallbackProvider(
           "unknown",
-          providerTurnRequirements(prepared.history, specs, activeProvider, "unknown"),
+          providerTurnRequirements(modelHistory, specs, activeProvider, "unknown"),
           true,
         );
         const switched = Boolean(ownershipFallback);
@@ -2420,7 +2548,8 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     const taskBriefTransitionInRound = r.toolUses.some((tu) => tu.name === "task_intake");
     // A completion receipt attests to the state after all work. Any later non-checkpoint tool invalidates
     // it before execution; otherwise a model could verify early, mutate afterward, and retain stale success.
-    if (opts.taskIntake && r.toolUses.some((tu) => tu.name !== "task_checkpoint")) {
+    // `todo_write` only edits the checklist, so it neither invalidates nor is blocked by a receipt.
+    if (opts.taskIntake && r.toolUses.some((tu) => !COMPLETION_ROUND_TOOLS.has(tu.name))) {
       if (!taskStateDirty) syncIntakeTask();
       if (intakeTask?.checkpoint?.completion) {
         const checkpoint = { ...intakeTask.checkpoint };
@@ -2496,12 +2625,16 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         });
         continue;
       }
-      if (tu.name === "task_checkpoint" && input.completion !== undefined && r.toolUses.length > 1) {
+      if (
+        tu.name === "task_checkpoint"
+        && input.completion !== undefined
+        && r.toolUses.some((other) => other !== tu && other.name !== "todo_write")
+      ) {
         plans.push({
           tu,
           tool,
           denied:
-            "Completion receipt boundary: task_checkpoint with completion must be the only tool in its final tool round. " +
+            "Completion receipt boundary: task_checkpoint with completion may share its final tool round only with todo_write. " +
             "Finish and observe all work first, then record the receipt in the next round.",
         });
         continue;
@@ -2562,7 +2695,8 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
             tool,
             denied:
               "Understanding gate: this action was NOT executed. First inspect/ask what is needed, then call " +
-              "task_intake in its own tool round with goal, intent, constraints, acceptance, and steps.",
+              "task_intake with goal, intent, constraints, acceptance, and steps. You may resend this action in " +
+              "the same response as task_intake.",
           });
           continue;
         }
@@ -2580,7 +2714,8 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
               denied:
                 `Capability preflight gate: this side effect was NOT executed. Check and record ${unchecked.join(", ")} ` +
                 "with task_checkpoint first. Record unavailable or blocked honestly; a known negative state still " +
-                "closes preflight and lets the task choose a safe partial path.",
+                "closes preflight and lets the task choose a safe partial path. Once checked, that task_checkpoint " +
+                "may share one response with this action.",
             });
             continue;
           }
@@ -2592,7 +2727,8 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
             denied:
               `Understanding gate: task brief intent is '${intakeTask?.brief?.intent ?? "unset"}', so this ` +
               "side effect was NOT executed. Revise task_intake to intent 'change' with the user's authorized " +
-              "goal and acceptance checks before trying again.",
+              "goal and acceptance checks before trying again; the revised task_intake and this action may " +
+              "share one response.",
           });
           continue;
         }
@@ -2607,7 +2743,8 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
             denied:
               `Understanding gate: task brief intent is '${intakeTask?.brief?.intent ?? "unset"}', so this ` +
               "diagnostic probe was NOT executed. Revise task_intake to intent 'investigate' or 'change' " +
-              "with the user's authorized goal before trying again.",
+              "with the user's authorized goal before trying again; the revised task_intake and this probe " +
+              "may share one response.",
           });
           continue;
         }
@@ -3073,9 +3210,34 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         }
       }
     }
+    if (carriedToolRound) {
+      // This round was the state half of a split response. The rest may run only on the state it asked for.
+      const rejected = results.findIndex((result, index) =>
+        plans[index]?.denied !== undefined
+        || result.isError === true
+        || looksFailed(result.content, result.name));
+      if (rejected !== -1) {
+        const dropped = carriedToolRound.toolUses.length;
+        carriedToolRound = undefined;
+        results[rejected].content +=
+          `\nThe ${dropped} other tool call(s) sent in the same response were NOT executed. ` +
+          "Fix this task-state update, then send them again.";
+      }
+    }
     const boundedContents = limitToolResultBatch(results.map((result) => result.content));
     for (let i = 0; i < results.length; i++) results[i].content = boundedContents[i];
     history.push({ role: "tool", results });
+    const acceptedCompletionReply = Boolean(
+      opts.taskIntake
+      && !repeatHalt
+      && !breakerHalt
+      && carriesCompletionReceipt(r.toolUses)
+      && r.toolUses.every((toolUse) => COMPLETION_ROUND_TOOLS.has(toolUse.name))
+      && results.every((result, index) =>
+        plans[index]?.denied === undefined && result.isError !== true && !looksFailed(result.content, result.name))
+      && freshTaskCompletion(intakeTask)
+    );
+    if (acceptedCompletionReply) assistantHistoryMessage.text = r.text;
     for (let index = 0; index < results.length; index++) {
       const plan = plans[index];
       const result = results[index];
@@ -3180,6 +3342,38 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       || progressEvent.verifiedChangeAdvanced
     )) {
       lastDurableCheckpointRound = life.rounds;
+    }
+
+    // The final answer arrived with an accepted completion receipt — as response text, or inside the
+    // receipt's `final_answer` — so the turn is done. Asking the provider again would only re-send the
+    // whole context to restate it.
+    if (
+      acceptedCompletionReply && freshTaskCompletion(intakeTask)
+    ) {
+      const deliver = (text: string): void => {
+        if (opts.quiet) return;
+        if (sink) sink.text(text);
+        else if (tty && process.env.HARA_MD !== "0") {
+          const renderer = makeRenderer(out);
+          renderer.push(text);
+          renderer.end();
+          out("\n");
+        } else out(`${text}\n`);
+      };
+      if (r.text.trim()) {
+        deliver(r.text || deferredActionProse);
+        return { status: "completed" };
+      }
+      if (structuredAnswer) {
+        // Persist it as the assistant's closing message so transcripts, resume, and request/response
+        // clients see an ordinary final reply rather than a turn that ends on a tool result.
+        history.push({ role: "assistant", text: structuredAnswer, toolUses: [] });
+        const answerItem = { itemId: randomUUID(), kind: "message" as const, role: "assistant" as const };
+        emitRuntimeItem(opts, { ...answerItem, state: "started" });
+        deliver(structuredAnswer);
+        emitRuntimeItem(opts, { ...answerItem, state: "completed" });
+        return { status: "completed" };
+      }
     }
 
     const repeatedFailure = repeatHalt as { label: string; count: number } | null;

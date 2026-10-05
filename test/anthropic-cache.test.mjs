@@ -81,3 +81,30 @@ test("no more than 4 breakpoints total (Anthropic's cap): ≤2 system sections +
   const marks = (Array.isArray(system) ? system.filter((b) => b.cache_control).length : 0) + messages.reduce((n, m) => n + (Array.isArray(m.content) ? m.content.filter((b) => b.cache_control).length : 0), 0);
   assert.ok(marks <= 4, `expected ≤4 breakpoints, got ${marks}`);
 });
+
+test("the rolling breakpoint skips the engine's trailing turn context so the written prefix stays readable", () => {
+  const turnContext = "<system-reminder>\n# Engine turn context\nCurrent date and time: 2026-10-05 18:00:00\n</system-reminder>";
+  const messages = [
+    { role: "user", content: "fix the parser" },
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "read_file", input: {} }] },
+    {
+      role: "user",
+      content: [
+        { type: "tool_result", tool_use_id: "t1", content: "file body" },
+        { type: "text", text: turnContext },
+      ],
+    },
+  ];
+  applyCacheControl("You are hara.", messages);
+  assert.deepEqual(messages[2].content[0].cache_control, CC, "the durable tool result closes the cached prefix");
+  assert.equal(messages[2].content[1].cache_control, undefined, "per-request state is never inside a cache breakpoint");
+  assert.deepEqual(lastBlock(messages[0]).cache_control, CC, "the look-back breakpoint is unchanged");
+});
+
+test("a message that is only turn context carries no breakpoint", () => {
+  const messages = [
+    { role: "user", content: "<system-reminder>\n# Engine turn context\nclock\n</system-reminder>" },
+  ];
+  applyCacheControl("You are hara.", messages);
+  assert.equal(typeof messages[0].content, "string");
+});

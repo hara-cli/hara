@@ -494,7 +494,7 @@ test("session journal deterministically replays provider, message, tool, diff, a
       { ...common, itemId: providerId, kind: "provider", state: "streaming", provider: "volcengine-agent-plan", model: "glm-5.3-flash" },
       { ...common, itemId: messageId, kind: "message", state: "streaming", parentItemId: providerId, role: "assistant" },
       { ...common, itemId: messageId, kind: "message", state: "completed", parentItemId: providerId, role: "assistant" },
-      { ...common, itemId: providerId, kind: "provider", state: "completed", provider: "volcengine-agent-plan", model: "glm-5.3-flash", inputTokens: 120, outputTokens: 30 },
+      { ...common, itemId: providerId, kind: "provider", state: "completed", provider: "volcengine-agent-plan", model: "glm-5.3-flash", inputTokens: 120, cachedInputTokens: 96, outputTokens: 30 },
       { ...common, itemId: toolId, kind: "tool", state: "queued", parentItemId: messageId, role: "tool", name: "edit_file", effect: "edit" },
       { ...common, itemId: diffId, kind: "diff", state: "queued", parentItemId: toolId, effect: "edit" },
       { ...common, itemId: toolId, kind: "tool", state: "started", parentItemId: messageId, role: "tool", name: "edit_file", effect: "edit" },
@@ -528,7 +528,10 @@ test("session journal deterministically replays provider, message, tool, diff, a
       { id: agentId, kind: "agent", state: "completed", parent: toolId },
     ]);
     const provider = replay.runtimeItems[0];
-    assert.deepEqual({ input: provider.inputTokens, output: provider.outputTokens }, { input: 120, output: 30 });
+    assert.deepEqual(
+      { input: provider.inputTokens, cached: provider.cachedInputTokens, output: provider.outputTokens },
+      { input: 120, cached: 96, output: 30 },
+    );
     assert.deepEqual(replaySessionJournal(journal.events).runtimeItems, replay.runtimeItems,
       "the same ordered journal always reduces to the same lifecycle projection");
 

@@ -95,7 +95,9 @@ test("legacy enrollment storage rejects a symlink after a successful token excha
       model: "model",
     }), { status: 200, headers: { "content-type": "application/json" } });
     try {
-      await assert.rejects(() => enrollDevice("https://gateway.invalid", "code"), /symbolic link/i);
+      // Keep the successful exchange on the mocked fetch even when this workstation
+      // has a model/system proxy; this test is about private file ownership, not routing.
+      await assert.rejects(() => enrollDevice("http://127.0.0.1:11301", "code"), /symbolic link/i);
     } finally {
       globalThis.fetch = previousFetch;
     }

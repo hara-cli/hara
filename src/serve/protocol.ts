@@ -299,7 +299,7 @@
 //   event.task_state {version,streamId,sequence,taskId,turnId,objective,state,taskStatus,phase,checkpoint,…}
 //                     authoritative execution plane; clients feature-detect it via capabilities.events.
 //   event.runtime_item {taskId,turnId,itemId,kind,state,parentItemId?,role?,name?,effect?,provider?,model?,
-//                       errorKind?,generation?,inputTokens?,outputTokens?,at}
+//                       errorKind?,generation?,inputTokens?,cachedInputTokens?,outputTokens?,at}
 //                     credential-free replay item; prompts, reasoning, arguments/results, paths and diff bodies omitted.
 // Provider reasoning content is intentionally never sent to persistent clients.
 

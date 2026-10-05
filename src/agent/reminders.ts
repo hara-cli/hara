@@ -7,6 +7,8 @@
 // Claude Code's disclaimer is preserved: the model is told the context may be irrelevant, so an
 // injected nudge never derails an unrelated task.
 
+import { TURN_CONTEXT_OPEN } from "../providers/types.js";
+
 const DEFAULT_SCOPE = "default";
 const queues = new Map<string, string[]>();
 const SYSTEM_REMINDER = /^\s*<system-reminder>[\s\S]*<\/system-reminder>\s*$/u;
@@ -52,6 +54,22 @@ export function wrapReminders(items: string[]): string {
     items.join("\n\n") +
     "\n\nThis context may or may not be relevant to your task — do not respond to it directly; ignore it unless it is relevant.\n" +
     "</system-reminder>"
+  );
+}
+
+/** Per-request engine state (clock, accepted brief, checkpoint) delivered as the request's trailing
+ *  message instead of the system prompt. Anything that changes between provider requests must sit AFTER
+ *  the durable history: a changing system suffix invalidates the provider's prefix cache for every message
+ *  behind it. Unlike `wrapReminders`, this context is authoritative, so it carries no "may be irrelevant"
+ *  disclaimer. The envelope still satisfies `isSystemReminderContent`, so routing, transcript projection,
+ *  and genuine-user-text lookups keep ignoring it. */
+export function wrapTurnContext(text: string): string {
+  return (
+    TURN_CONTEXT_OPEN +
+    "Authoritative runtime state from Hara, refreshed before every model request. It is not a user message: " +
+    "do not reply to it or mention it; apply it while continuing the conversation above.\n\n" +
+    text.trim() +
+    "\n</system-reminder>"
   );
 }
 

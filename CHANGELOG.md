@@ -5,6 +5,22 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.183.3 — 2026-10-05 — fewer model round trips and verified final replies
+
+- Keep changing task state and clock context at the request tail for compatible routes, preserving a
+  byte-stable system prefix and Anthropic cache boundaries. Custom routes retain the original layout;
+  `HARA_TURN_CONTEXT_PLACEMENT=system` restores it explicitly. Cache-read tokens are retained in runtime replay.
+- Execute a task brief or capability preflight and its dependent actions as separately persisted, closed
+  tool rounds without an extra model request. Existing intent, capability and approval gates still apply;
+  both returned and write-ahead-materialized user steering discard queued actions before execution.
+- Accept a verified completion receipt with its final reply in one round. Rejected receipt prose stays
+  out of live output, saved transcripts and resume; structured and ordinary remote/cron replies share the
+  same credential-solicitation correction and bounded stop. Ordinary non-task chat remains streaming.
+- This patch does not enable or bundle the pending Computer Use, Laya or Agent-creation work. Model latency
+  gains remain task/model-dependent; the measured small-sample benchmark is not a universal performance claim.
+- Refresh the Feishu SDK's pinned Axios transport to `1.20.0` after the new adapter, redirect, header and
+  prototype-pollution advisories; production dependency audit must pass before release.
+
 ## 0.183.2 — 2026-09-30 — reproducible token-free npm releases
 
 - Complete the npm Trusted Publishing migration with a token-free GitHub OIDC job that is exercised by the

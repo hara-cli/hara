@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import type { Provider, NeutralMsg, SystemPromptPart, TurnArgs, TurnResult } from "./types.js";
+import { TURN_CONTEXT_OPEN, type Provider, type NeutralMsg, type SystemPromptPart, type TurnArgs, type TurnResult } from "./types.js";
 import { imageToBase64 } from "../images.js";
 import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
 import { safeProviderErrorMessage } from "./errors.js";
@@ -71,12 +71,21 @@ export function applyCacheControl(
   messages: Anthropic.MessageParam[],
   systemParts?: SystemPromptPart[],
 ): { system: string | Anthropic.TextBlockParam[]; messages: Anthropic.MessageParam[] } {
+  // The engine's trailing turn context changes on every request. A breakpoint on it would write a prefix no
+  // later request can read, so the mark goes on the last durable block in front of it.
+  const isTurnContext = (text: string): boolean => text.startsWith(TURN_CONTEXT_OPEN);
   const mark = (m: Anthropic.MessageParam): void => {
     if (typeof m.content === "string") {
-      if (m.content.length) m.content = [{ type: "text", text: m.content, cache_control: CACHE }];
-    } else if (m.content.length) {
-      (m.content[m.content.length - 1] as { cache_control?: typeof CACHE }).cache_control = CACHE;
+      if (m.content.length && !isTurnContext(m.content)) m.content = [{ type: "text", text: m.content, cache_control: CACHE }];
+      return;
     }
+    let index = m.content.length - 1;
+    while (index >= 0) {
+      const block = m.content[index];
+      if (block.type !== "text" || !isTurnContext(block.text)) break;
+      index--;
+    }
+    if (index >= 0) (m.content[index] as { cache_control?: typeof CACHE }).cache_control = CACHE;
   };
   const idxs = new Set<number>();
   if (messages.length) idxs.add(messages.length - 1);
@@ -144,6 +153,7 @@ export function createAnthropicProvider(opts: { apiKey: string; model: string; b
   return {
     id: "anthropic",
     model: opts.model,
+    trailingTurnContext: true,
     async turn({ system, systemParts, history, tools, onText, onReasoning, signal }: TurnArgs): Promise<TurnResult> {
       const thinking = buildThinkingParam(opts.model, opts.reasoningEffort);
       const { system: cachedSystem, messages } = applyCacheControl(system, toAnthropic(history), systemParts);

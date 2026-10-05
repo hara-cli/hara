@@ -124,6 +124,7 @@ export function createOpenAIProvider(opts: {
   return {
     id: opts.label ?? "openai",
     model: opts.model,
+    trailingTurnContext: true,
     async turn({ system, history, tools, onText, onReasoning, onActivity, signal }: TurnArgs): Promise<TurnResult> {
       const oaiTools = tools.map((t) => ({
         type: "function" as const,

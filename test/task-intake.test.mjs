@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runAgent } from "../dist/agent/loop.js";
+import { runAgent, splitTaskStateTransition } from "../dist/agent/loop.js";
 import {
   applyTaskBrief,
   createTaskExecution,
@@ -21,15 +21,33 @@ after(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
-function provider(turns) {
+/** The engine's per-request context (brief, checkpoint, clock) rides as the trailing reminder message so
+ * the system prompt stays byte-stable for provider prefix caching. */
+function engineTurnContext(history) {
+  const tail = history.at(-1);
+  return tail?.role === "user" && tail.content.startsWith("<system-reminder>\n# Engine turn context")
+    ? tail.content
+    : "";
+}
+
+function provider(turns, options = {}) {
   let index = 0;
+  // `systems` is everything the model is instructed with on a request: stable system prompt + turn context.
   const systems = [];
+  const stableSystems = [];
+  const turnContexts = [];
   return {
     id: "intake-fixture",
     model: "intake-fixture",
+    ...(options.trailingTurnContext ? { trailingTurnContext: true } : {}),
     systems,
-    async turn({ system, onText }) {
-      systems.push(system);
+    stableSystems,
+    turnContexts,
+    async turn({ system, history, onText }) {
+      const turnContext = engineTurnContext(history);
+      stableSystems.push(system);
+      turnContexts.push(turnContext);
+      systems.push([system, turnContext].filter(Boolean).join("\n\n"));
       const result = turns[Math.min(index++, turns.length - 1)];
       if (result.text) onText?.(result.text);
       return result;
@@ -392,7 +410,7 @@ test("a successful external action gets one bounded completion round before the 
   assert.match(JSON.stringify(history), /任务收尾边界/);
 });
 
-test("task_intake and an edit in the same model response cannot bypass the round boundary", async () => {
+test("task_intake and an edit in the same response run as two closed rounds with the brief checkpointed first", async () => {
   const turn = newTurnInteraction();
   let task = createTaskExecution("change one file", turn.turnId);
   let editRuns = 0;
@@ -415,11 +433,15 @@ test("task_intake and an edit in the same model response cannot bypass the round
       ],
       stop: "tool_use",
     },
-    { text: "", toolUses: [{ id: "e1", name: edit.name, input: {} }], stop: "tool_use" },
-    { text: "done", toolUses: [], stop: "end" },
+    {
+      text: "done",
+      toolUses: [{ id: "c9", name: "task_checkpoint", input: { completion: { state: "verified", evidence: ["the edit completed"] } } }],
+      stop: "tool_use",
+    },
   ]);
   const history = [{ role: "user", content: "change one file" }];
   const checkpoints = [];
+  const stats = { input: 0, output: 0 };
   await runAgent(history, {
     provider: p,
     ctx: { cwd: process.cwd() },
@@ -427,6 +449,7 @@ test("task_intake and an edit in the same model response cannot bypass the round
     confirm: async () => true,
     quiet: true,
     extraTools: [edit],
+    stats,
     taskIntake: {
       task,
       onUpdate(next) {
@@ -434,15 +457,28 @@ test("task_intake and an edit in the same model response cannot bypass the round
       },
       onCheckpoint(next) {
         task = next;
-        checkpoints.push(history.length);
+        const tail = history.at(-1);
+        checkpoints.push({
+          editRuns,
+          closedBriefRound: tail?.role === "tool"
+            && tail.results.length === 1
+            && tail.results[0].name === "task_intake"
+            && history.at(-2).toolUses.length === 1,
+        });
       },
     },
   });
 
-  assert.equal(editRuns, 1, "same-response edit stayed blocked; the next-round edit ran");
-  assert.deepEqual(checkpoints.length, 1);
-  const firstToolRound = history.find((message) => message.role === "tool");
-  assert.ok(firstToolRound.results.find((result) => result.name === edit.name)?.isError);
+  assert.equal(editRuns, 1, "the same-response edit ran once, without being resent by the model");
+  assert.deepEqual(checkpoints[0], { editRuns: 0, closedBriefRound: true }, "the brief was durable in its own closed round before the edit started");
+  assert.equal(p.systems.length, 2, "no provider request was spent between the brief and the edit");
+  assert.equal(stats.providerCalls, 2);
+  assert.deepEqual(
+    history.filter((message) => message.role === "assistant").map((message) => message.toolUses.map((toolUse) => toolUse.id)),
+    [["b1"], ["e0"], ["c9"]],
+  );
+  const editRound = history.filter((message) => message.role === "tool")[1];
+  assert.equal(editRound.results[0].content.startsWith("edited"), true);
 });
 
 test("revising an existing change brief cannot inherit its permission for a same-round side effect", async () => {
@@ -500,8 +536,13 @@ test("revising an existing change brief cannot inherit its permission for a same
   assert.equal(editRuns, 0, "the old change brief cannot authorize an edit beside its own revision");
   assert.equal(task.brief.intent, "investigate");
   assert.equal(task.brief.goal, revisedBrief.goal);
-  const resultRound = history.find((message) => message.role === "tool");
-  assert.match(resultRound.results.find((result) => result.name === edit.name).content, /Wait for the next model round/);
+  const editRound = history.filter((message) => message.role === "tool")
+    .find((message) => message.results.some((result) => result.name === edit.name));
+  assert.match(
+    editRound.results.find((result) => result.name === edit.name).content,
+    /task brief intent is 'investigate'/,
+    "the carried edit is planned against the revised, already-checkpointed brief",
+  );
 });
 
 test("a revised brief replaces the old brief in the next model prompt instead of being duplicated", async () => {
@@ -777,7 +818,7 @@ test("a bounded diagnostic probe runs under an investigate brief without grantin
   assert.doesNotMatch(JSON.stringify(history), /intent is 'investigate'/);
 });
 
-test("task_intake and a diagnostic probe in the same response cannot bypass the round boundary", async () => {
+test("task_intake and a diagnostic probe in the same response run after the brief is checkpointed", async () => {
   const interaction = newTurnInteraction();
   let task = createTaskExecution("check one endpoint", interaction.turnId);
   let probes = 0;
@@ -808,7 +849,6 @@ test("task_intake and a diagnostic probe in the same response cannot bypass the 
       ],
       stop: "tool_use",
     },
-    { text: "", toolUses: [{ id: "p1", name: probe.name, input: {} }], stop: "tool_use" },
     { text: "diagnosed", toolUses: [], stop: "end" },
   ]);
   const history = [{ role: "user", content: "check the endpoint without changing anything" }];
@@ -830,9 +870,11 @@ test("task_intake and a diagnostic probe in the same response cannot bypass the 
     },
   });
 
-  assert.equal(probes, 1, "same-response probe stayed blocked; the next-round probe ran");
-  const firstToolRound = history.find((message) => message.role === "tool");
-  assert.match(firstToolRound.results.find((result) => result.name === probe.name).content, /Wait for the next model round/);
+  assert.equal(probes, 1, "the same-response probe ran once against the accepted investigate brief");
+  assert.equal(p.systems.length, 2);
+  const [briefRound, probeRound] = history.filter((message) => message.role === "tool");
+  assert.deepEqual(briefRound.results.map((result) => result.name), ["task_intake"]);
+  assert.equal(probeRound.results[0].content.startsWith("reachable"), true);
 });
 
 test("stopping a background job is a state change even when the job tool is classified read-only", async () => {
@@ -1181,4 +1223,454 @@ test("a later tool call invalidates an early completion receipt", async () => {
   });
   assert.equal(reads, 1);
   assert.equal(task.checkpoint.completion, undefined, "work after attestation requires a new final receipt");
+});
+
+function uiSink() {
+  const text = [];
+  return {
+    text,
+    sink: {
+      text: (delta) => text.push(delta),
+      reasoning() {},
+      tool() {},
+      diff() {},
+      notice() {},
+    },
+  };
+}
+
+function fixtureEdit(onRun = () => {}) {
+  return {
+    name: "fixture_edit",
+    description: "test-only edit",
+    input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+    kind: "edit",
+    async run() {
+      onRun();
+      return "edited";
+    },
+  };
+}
+
+test("per-request engine context trails the history so the system prompt stays byte-stable for prefix caching", async () => {
+  const turn = newTurnInteraction();
+  let task = createTaskExecution("fix the parser", turn.turnId);
+  const edit = fixtureEdit();
+  const p = provider([
+    { text: "", toolUses: [{ id: "b1", name: "task_intake", input: BRIEF }], stop: "tool_use" },
+    { text: "", toolUses: [{ id: "e1", name: edit.name, input: { path: "a.ts" } }], stop: "tool_use" },
+    {
+      text: "",
+      toolUses: [{
+        id: "c1",
+        name: "task_checkpoint",
+        input: { completion: { state: "verified", evidence: ["the edit completed"] } },
+      }],
+      stop: "tool_use",
+    },
+    { text: "done", toolUses: [], stop: "end" },
+  ], { trailingTurnContext: true });
+  const history = [{ role: "user", content: "fix the parser" }];
+  const outcome = await runAgent(history, {
+    provider: p,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+    extraTools: [edit],
+    taskIntake: { task, current: () => task, onUpdate(next) { task = next; }, onCheckpoint(next) { task = next; } },
+  });
+
+  assert.equal(outcome.status, "completed");
+  assert.equal(p.stableSystems.length, 4);
+  for (const system of p.stableSystems) {
+    assert.equal(system, p.stableSystems[0], "an accepted brief, checkpoint, or clock tick must not rewrite the system prompt");
+    assert.doesNotMatch(system, /Runtime date and time|Understanding → execution boundary/);
+  }
+  assert.match(p.turnContexts[0], /Runtime date and time/);
+  assert.match(p.turnContexts[0], /Do not jump from a raw request straight into side effects/);
+  assert.match(p.turnContexts[1], /The task brief below is the accepted interpretation/);
+  assert.match(p.turnContexts[1], new RegExp(`Goal: ${BRIEF.goal}`));
+  assert.equal(
+    history.some((message) => message.role === "user" && message.content.includes("# Engine turn context")),
+    false,
+    "turn context is rebuilt per request and never enters durable history",
+  );
+});
+
+test("providers without the trailing-context capability keep the single system prompt", async () => {
+  const p = provider([{ text: "hello", toolUses: [], stop: "end" }]);
+  await runAgent([{ role: "user", content: "hi" }], {
+    provider: p,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+  });
+  assert.match(p.stableSystems[0], /Runtime date and time/);
+  assert.equal(p.turnContexts[0], "");
+});
+
+test("HARA_TURN_CONTEXT_PLACEMENT=system restores the legacy single system prompt", async () => {
+  const previous = process.env.HARA_TURN_CONTEXT_PLACEMENT;
+  process.env.HARA_TURN_CONTEXT_PLACEMENT = "system";
+  try {
+    const p = provider([{ text: "hello", toolUses: [], stop: "end" }], { trailingTurnContext: true });
+    await runAgent([{ role: "user", content: "hi" }], {
+      provider: p,
+      ctx: { cwd: process.cwd() },
+      approval: "full-auto",
+      confirm: async () => true,
+      quiet: true,
+    });
+    assert.match(p.stableSystems[0], /Runtime date and time/);
+    assert.equal(p.turnContexts[0], "");
+  } finally {
+    if (previous === undefined) delete process.env.HARA_TURN_CONTEXT_PLACEMENT;
+    else process.env.HARA_TURN_CONTEXT_PLACEMENT = previous;
+  }
+});
+
+test("a final answer sent with an accepted completion receipt ends the turn without another provider round", async () => {
+  const turn = newTurnInteraction();
+  let task = createTaskExecution("fix the parser", turn.turnId);
+  const edit = fixtureEdit();
+  const ui = uiSink();
+  const p = provider([
+    { text: "", toolUses: [{ id: "b1", name: "task_intake", input: BRIEF }], stop: "tool_use" },
+    { text: "", toolUses: [{ id: "e1", name: edit.name, input: { path: "a.ts" } }], stop: "tool_use" },
+    {
+      text: "Parser fixed and verified.",
+      toolUses: [
+        { id: "t1", name: "todo_write", input: { todos: [{ text: "apply the edit", status: "done" }] } },
+        {
+          id: "c1",
+          name: "task_checkpoint",
+          input: { completion: { state: "verified", evidence: ["the edit completed and verification passed"] } },
+        },
+      ],
+      stop: "tool_use",
+    },
+    { text: "UNEXPECTED EXTRA ROUND", toolUses: [], stop: "end" },
+  ]);
+  const history = [{ role: "user", content: "fix the parser" }];
+  const outcome = await runAgent(history, {
+    provider: p,
+    ctx: { cwd: process.cwd(), ui: ui.sink, todoScope: `intake-finish-${turn.turnId}` },
+    approval: "full-auto",
+    confirm: async () => true,
+    extraTools: [edit],
+    taskIntake: { task, current: () => task, onUpdate(next) { task = next; }, onCheckpoint(next) { task = next; } },
+  });
+
+  assert.equal(outcome.status, "completed");
+  assert.equal(p.systems.length, 3, "the receipt round is the last provider request");
+  assert.equal(task.checkpoint.completion.state, "verified");
+  assert.equal(history.at(-1).role, "tool", "the closed receipt round ends the durable history");
+  assert.equal(history.at(-1).results.every((result) => result.isError !== true), true, "todo_write may accompany the receipt");
+  assert.equal(ui.text.join(""), "Parser fixed and verified.", "the held final answer is delivered exactly once");
+});
+
+test("a final answer riding with a rejected completion receipt is withheld and the run continues", async () => {
+  const turn = newTurnInteraction();
+  let task = createTaskExecution("fix the parser", turn.turnId);
+  const edit = fixtureEdit();
+  const ui = uiSink();
+  const p = provider([
+    { text: "", toolUses: [{ id: "b1", name: "task_intake", input: BRIEF }], stop: "tool_use" },
+    { text: "", toolUses: [{ id: "e1", name: edit.name, input: { path: "a.ts" } }], stop: "tool_use" },
+    {
+      text: "Premature claim.",
+      toolUses: [{ id: "c0", name: "task_checkpoint", input: { completion: { state: "verified", evidence: [] } } }],
+      stop: "tool_use",
+    },
+    {
+      text: "Parser fixed and verified.",
+      toolUses: [{
+        id: "c1",
+        name: "task_checkpoint",
+        input: { completion: { state: "verified", evidence: ["the edit completed and verification passed"] } },
+      }],
+      stop: "tool_use",
+    },
+    { text: "UNEXPECTED EXTRA ROUND", toolUses: [], stop: "end" },
+  ]);
+  const outcome = await runAgent([{ role: "user", content: "fix the parser" }], {
+    provider: p,
+    ctx: { cwd: process.cwd(), ui: ui.sink },
+    approval: "full-auto",
+    confirm: async () => true,
+    extraTools: [edit],
+    taskIntake: { task, current: () => task, onUpdate(next) { task = next; }, onCheckpoint(next) { task = next; } },
+  });
+
+  assert.equal(outcome.status, "completed");
+  assert.equal(p.systems.length, 4);
+  assert.equal(ui.text.join(""), "Parser fixed and verified.", "a rejected receipt never surfaces its completion claim");
+});
+
+test("a completion receipt batched with real work is still refused", async () => {
+  const turn = newTurnInteraction();
+  let task = createTaskExecution("fix the parser", turn.turnId);
+  let edits = 0;
+  const edit = fixtureEdit(() => { edits += 1; });
+  const p = provider([
+    { text: "", toolUses: [{ id: "b1", name: "task_intake", input: BRIEF }], stop: "tool_use" },
+    {
+      text: "Done.",
+      toolUses: [
+        { id: "e1", name: edit.name, input: { path: "a.ts" } },
+        { id: "c1", name: "task_checkpoint", input: { completion: { state: "verified", evidence: ["claimed"] } } },
+      ],
+      stop: "tool_use",
+    },
+    {
+      text: "Parser fixed and verified.",
+      toolUses: [{ id: "c2", name: "task_checkpoint", input: { completion: { state: "verified", evidence: ["the edit completed"] } } }],
+      stop: "tool_use",
+    },
+  ]);
+  const history = [{ role: "user", content: "fix the parser" }];
+  const outcome = await runAgent(history, {
+    provider: p,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+    extraTools: [edit],
+    taskIntake: { task, current: () => task, onUpdate(next) { task = next; }, onCheckpoint(next) { task = next; } },
+  });
+
+  assert.equal(outcome.status, "completed");
+  assert.equal(edits, 1);
+  assert.equal(p.systems.length, 3, "the mixed round cannot finish the turn");
+  const mixedRound = history.find((message) => message.role === "tool" && message.results.some((result) => result.id === "c1"));
+  assert.match(mixedRound.results.find((result) => result.id === "c1").content, /Completion receipt boundary/);
+});
+
+test("splitTaskStateTransition separates gating task state from the work that depends on it", () => {
+  const intake = { id: "b", name: "task_intake", input: BRIEF };
+  const progress = { id: "p", name: "task_checkpoint", input: { current_step: "edit" } };
+  const preflight = { id: "c", name: "task_checkpoint", input: { capabilities: [{ name: "publish", state: "available", detail: "ok" }] } };
+  const receipt = { id: "r", name: "task_checkpoint", input: { completion: { state: "verified", evidence: ["ok"] } } };
+  const todo = { id: "t", name: "todo_write", input: { todos: [] } };
+  const read = { id: "f", name: "read_file", input: { path: "a.ts" } };
+  const edit = { id: "e", name: "edit_file", input: { path: "a.ts" } };
+
+  assert.deepEqual(splitTaskStateTransition([read, intake, edit]), { state: [intake], rest: [read, edit] });
+  assert.deepEqual(splitTaskStateTransition([preflight, progress, edit]), { state: [preflight, progress], rest: [edit] });
+  assert.deepEqual(
+    splitTaskStateTransition([intake, edit, receipt]),
+    { state: [intake], rest: [edit, receipt] },
+    "a completion receipt never moves ahead of the work it attests",
+  );
+  assert.equal(splitTaskStateTransition([intake]), undefined);
+  assert.equal(splitTaskStateTransition([intake, todo, receipt]), undefined, "pure bookkeeping stays one round");
+  assert.equal(splitTaskStateTransition([progress, edit]), undefined, "a progress note gates nothing");
+  assert.equal(splitTaskStateTransition([read, edit]), undefined);
+});
+
+test("a rejected brief drops the calls sent beside it instead of running them on the old state", async () => {
+  const turn = newTurnInteraction();
+  let task = createTaskExecution("fix the parser", turn.turnId);
+  let edits = 0;
+  const edit = fixtureEdit(() => { edits += 1; });
+  const p = provider([
+    {
+      text: "",
+      toolUses: [
+        { id: "b0", name: "task_intake", input: { ...BRIEF, intent: "rewrite everything" } },
+        { id: "e0", name: edit.name, input: { path: "a.ts" } },
+      ],
+      stop: "tool_use",
+    },
+    { text: "need a real goal", toolUses: [], stop: "end" },
+  ]);
+  const history = [{ role: "user", content: "fix the parser" }];
+  await runAgent(history, {
+    provider: p,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+    extraTools: [edit],
+    taskIntake: { task, current: () => task, onUpdate(next) { task = next; }, onCheckpoint(next) { task = next; } },
+  });
+
+  assert.equal(edits, 0);
+  assert.equal(task.brief, undefined);
+  assert.equal(p.systems.length, 2);
+  const rounds = history.filter((message) => message.role === "tool");
+  assert.equal(rounds.length, 1, "the dropped call never became a tool round");
+  assert.match(rounds[0].results[0].content, /task brief rejected/);
+  assert.match(rounds[0].results[0].content, /The 1 other tool call\(s\) sent in the same response were NOT executed/);
+});
+
+test("user input that arrives between the two halves of a split response cancels the carried calls", async () => {
+  const turn = newTurnInteraction();
+  let task = createTaskExecution("fix the parser", turn.turnId);
+  let edits = 0;
+  let polls = 0;
+  const edit = fixtureEdit(() => { edits += 1; });
+  const p = provider([
+    {
+      text: "",
+      toolUses: [
+        { id: "b1", name: "task_intake", input: { ...BRIEF, intent: "investigate" } },
+        { id: "e0", name: edit.name, input: { path: "a.ts" } },
+      ],
+      stop: "tool_use",
+    },
+    { text: "stopped as asked", toolUses: [], stop: "end" },
+  ]);
+  const history = [{ role: "user", content: "fix the parser" }];
+  await runAgent(history, {
+    provider: p,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+    extraTools: [edit],
+    pendingInput: async () => (++polls === 2 ? [{ role: "user", content: "wait, do not edit anything" }] : []),
+    taskIntake: { task, current: () => task, onUpdate(next) { task = next; }, onCheckpoint(next) { task = next; } },
+  });
+
+  assert.equal(edits, 0, "the model must see the new input before any earlier-issued call runs");
+  assert.equal(p.systems.length, 2);
+  assert.equal(task.brief.goal, BRIEF.goal, "the accepted brief itself stays durable");
+});
+
+test("a capability preflight checkpoint and the action that needs it can share one response", async () => {
+  const turn = newTurnInteraction();
+  const created = createTaskExecution("publish the result", turn.turnId);
+  const briefed = applyTaskBrief(created, { ...BRIEF, required_capabilities: ["publish"] });
+  assert.equal(briefed.ok, true);
+  let task = briefed.task;
+  let edits = 0;
+  const edit = fixtureEdit(() => { edits += 1; });
+  const p = provider([
+    {
+      text: "",
+      toolUses: [
+        { id: "e0", name: edit.name, input: { path: "a.ts" } },
+        {
+          id: "c0",
+          name: "task_checkpoint",
+          input: { capabilities: [{ name: "publish", state: "available", detail: "authenticated preflight succeeded" }] },
+        },
+      ],
+      stop: "tool_use",
+    },
+    {
+      text: "done",
+      toolUses: [{ id: "c9", name: "task_checkpoint", input: { completion: { state: "verified", evidence: ["the edit completed"] } } }],
+      stop: "tool_use",
+    },
+  ]);
+  const history = [{ role: "user", content: "publish the result" }];
+  await runAgent(history, {
+    provider: p,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+    extraTools: [edit],
+    taskIntake: { task, current: () => task, onUpdate(next) { task = next; }, onCheckpoint(next) { task = next; } },
+  });
+
+  assert.equal(edits, 1, "the preflight was recorded first, so the capability gate let the same-response action run");
+  assert.equal(p.systems.length, 2);
+  assert.equal(task.checkpoint.capabilities.publish.state, "available");
+});
+
+test("completion.final_answer ends the turn as an ordinary assistant reply without another provider round", async () => {
+  const turn = newTurnInteraction();
+  let task = createTaskExecution("fix the parser", turn.turnId);
+  const edit = fixtureEdit();
+  const ui = uiSink();
+  const p = provider([
+    {
+      text: "",
+      toolUses: [
+        { id: "b1", name: "task_intake", input: BRIEF },
+        { id: "e1", name: edit.name, input: { path: "a.ts" } },
+      ],
+      stop: "tool_use",
+    },
+    {
+      text: "",
+      toolUses: [{
+        id: "c1",
+        name: "task_checkpoint",
+        input: {
+          completion: {
+            state: "verified",
+            evidence: ["the edit completed and verification passed"],
+            final_answer: "Parser fixed; the targeted check passes.",
+          },
+        },
+      }],
+      stop: "tool_use",
+    },
+    { text: "UNEXPECTED EXTRA ROUND", toolUses: [], stop: "end" },
+  ]);
+  const history = [{ role: "user", content: "fix the parser" }];
+  const outcome = await runAgent(history, {
+    provider: p,
+    ctx: { cwd: process.cwd(), ui: ui.sink },
+    approval: "full-auto",
+    confirm: async () => true,
+    extraTools: [edit],
+    taskIntake: { task, current: () => task, onUpdate(next) { task = next; }, onCheckpoint(next) { task = next; } },
+  });
+
+  assert.equal(outcome.status, "completed");
+  assert.equal(p.systems.length, 2, "brief+edit, then receipt+reply: two provider requests for the whole task");
+  assert.deepEqual(history.at(-1), { role: "assistant", text: "Parser fixed; the targeted check passes.", toolUses: [] });
+  assert.equal(ui.text.join(""), "Parser fixed; the targeted check passes.");
+  assert.equal(task.checkpoint.completion.state, "verified");
+  assert.equal(JSON.stringify(task.checkpoint).includes("Parser fixed"), false, "the reply is presentation, not task state");
+});
+
+test("completion.final_answer on a rejected receipt is not delivered", async () => {
+  const turn = newTurnInteraction();
+  let task = createTaskExecution("fix the parser", turn.turnId);
+  const edit = fixtureEdit();
+  const ui = uiSink();
+  const p = provider([
+    {
+      text: "",
+      toolUses: [
+        { id: "b1", name: "task_intake", input: BRIEF },
+        { id: "e1", name: edit.name, input: { path: "a.ts" } },
+      ],
+      stop: "tool_use",
+    },
+    {
+      text: "",
+      toolUses: [{ id: "c0", name: "task_checkpoint", input: { completion: { state: "verified", evidence: [], final_answer: "Premature claim." } } }],
+      stop: "tool_use",
+    },
+    {
+      text: "",
+      toolUses: [{
+        id: "c1",
+        name: "task_checkpoint",
+        input: { completion: { state: "verified", evidence: ["verification passed"], final_answer: "Parser fixed." } },
+      }],
+      stop: "tool_use",
+    },
+  ]);
+  const outcome = await runAgent([{ role: "user", content: "fix the parser" }], {
+    provider: p,
+    ctx: { cwd: process.cwd(), ui: ui.sink },
+    approval: "full-auto",
+    confirm: async () => true,
+    extraTools: [edit],
+    taskIntake: { task, current: () => task, onUpdate(next) { task = next; }, onCheckpoint(next) { task = next; } },
+  });
+
+  assert.equal(outcome.status, "completed");
+  assert.equal(p.systems.length, 3);
+  assert.equal(ui.text.join(""), "Parser fixed.");
 });

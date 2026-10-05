@@ -489,7 +489,9 @@ test("getEmbedder combines its hard timeout with the parent signal", async () =>
         init.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })), { once: true });
       });
     };
-    const embed = getEmbedder({ embedProvider: "openai", embedBaseURL: "https://embed.invalid/v1", embedApiKey: "test" });
+    // Loopback bypasses inherited system/model proxies, so this cancellation fixture
+    // always exercises the mocked fetch instead of opening a real proxy transport.
+    const embed = getEmbedder({ embedProvider: "openai", embedBaseURL: "http://127.0.0.1:11300/v1", embedApiKey: "test" });
     const running = embed(["hello"], controller.signal);
     await new Promise((resolve) => setTimeout(resolve, 20));
     controller.abort();
