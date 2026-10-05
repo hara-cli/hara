@@ -571,9 +571,12 @@ export function composeSystem(
           "the interpreted goal, intent, constraints, acceptance checks, and short steps. Do not spend a response " +
           "on `task_intake` alone when you already know the first action: send `task_intake` and those first " +
           "tool calls in the SAME response. Hara applies and saves the brief first, then runs the other calls " +
-          "against it; if the brief is rejected, none of them run. Use intent `answer` " +
-          "for a direct answer, `investigate` for evidence gathering/diagnosis, and `change` when the user asked " +
-          "you to modify or deliver something. Do not claim completion until the acceptance checks are verified. " +
+          "against it; if the brief is rejected, none of them run. Choose intent from the user-authorized end " +
+          "result, not your current stage or first tool. Use `change` for an authorized fix, edit, creation, " +
+          "delivery, or automation even when you start with read-only inspection. Use `answer` for explanation " +
+          "only and `investigate` for diagnosis/review without modification. Do not infer permission to change " +
+          "from a tool you want to call; keep read-only requests read-only and ask only if a material scope " +
+          "decision is missing. Do not claim completion until the acceptance checks are verified. " +
           "Once a brief is accepted, finish with a task_checkpoint completion receipt: verified plus observable " +
           "evidence, or awaiting_user plus a typed, evidenced human-only dependency. Put the final reply in that " +
           "receipt's completion.final_answer so the turn ends there."
@@ -1217,7 +1220,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
             intent: {
               type: "string",
               enum: ["answer", "investigate", "change"],
-              description: "answer = direct response, investigate = evidence/diagnosis, change = modify or deliver",
+              description: "Choose by the user-authorized outcome, not the first stage: answer = explanation only; investigate = inspect/diagnose/review without modification; change = authorized modify/create/deliver/automate, including when inspection comes first. Never infer change authority from a desired tool call.",
             },
             goal: { type: "string", description: "One concrete interpreted outcome with the actual target; never use only 'start', 'continue', 'this task', or generic 'help the user'." },
             constraints: { type: "array", items: { type: "string" }, description: "User/project boundaries and any conservative assumptions that must remain true." },

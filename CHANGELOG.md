@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.183.4 — 2026-10-05 — bounded execution regression gates and private network diagnostics
+
+- Choose task intent from the user's authorized outcome, not the first inspection stage. Read-only
+  requests stay read-only; tool selection never grants mutation authority.
+- Add eight isolated, current-engine execution checks to the default feedback gate. Count actual provider
+  calls against stats and runtime journals, verify crash-safe closed rounds, and retain the original nine
+  historical feedback receipts unchanged. These synthetic checks are not live-model speed claims.
+- Show the selected model-network route and proxy source in offline doctor diagnostics without exposing
+  endpoint/proxy addresses, credentials, or bypass rules. Retain existing proxy selection and VPN behavior.
+- Hide organization gateway addresses in expired-auth guidance, and reject forged network-error messages
+  that only imitate Hara's diagnostic prefix before forwarding SDK errors to the user.
+- Computer Use, Laya and Agent-creation work remains outside this patch. Desktop and Mobile actual
+  component checks cover final-reply display and restoration, not a complete real-device relay test.
+
 ## 0.183.3 — 2026-10-05 — fewer model round trips and verified final replies
 
 - Keep changing task state and clock context at the request tail for compatible routes, preserving a

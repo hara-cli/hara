@@ -6,6 +6,7 @@ import { connect } from "node:net";
 import {
   bypassesModelProxy,
   createModelFetch,
+  modelNetworkDiagnostic,
   parseWindowsProxyRegistry,
   safeModelNetworkFailureMessage,
   selectModelProxy,
@@ -115,6 +116,56 @@ test("model proxy selection honors explicit/env precedence, NO_PROXY, and uncond
     }),
     undefined,
   );
+});
+
+test("offline model-network diagnostics identify effective proxy sources without disclosing addresses", () => {
+  const target = "https://endpoint-user:endpoint-secret@private-model.example/private-path?token=private-query#private-fragment";
+  const configuredProxy = "http://config-user:config-secret@private-config.example:8080";
+  const windowsProxy = { enabled: true, server: "http=private-windows.example:8083" };
+  const cases = [
+    [{ configuredProxy, env: { HARA_MODEL_PROXY: "http://hara-user:hara-secret@private-hara.example:8081", HTTPS_PROXY: "http://private-env.example:8082" }, platform: "win32", windowsProxy }, /proxy via HARA_MODEL_PROXY \/ --proxy/],
+    [{ configuredProxy, env: { HTTPS_PROXY: "http://env-user:env-secret@private-env.example:8082" }, platform: "win32", windowsProxy }, /proxy via HTTP\(S\)_PROXY environment/],
+    [{ configuredProxy, env: {}, platform: "win32", windowsProxy }, /proxy via Hara user config/],
+    [{ env: {}, platform: "win32", windowsProxy }, /proxy via Windows static system proxy/],
+  ];
+  for (const [options, expected] of cases) {
+    const diagnosis = modelNetworkDiagnostic(target, options);
+    assert.match(diagnosis, expected);
+    assert.doesNotMatch(diagnosis, /private-|endpoint-user|endpoint-secret|config-user|config-secret|hara-user|hara-secret|env-user|env-secret|808[0-3]|https?:\/\//);
+    assert.match(diagnosis, /addresses hidden/);
+  }
+});
+
+test("offline model-network diagnostics distinguish NO_PROXY, loopback and Windows bypass decisions", () => {
+  const configuredProxy = "http://private-proxy.example:8080";
+  const target = "https://private-model.example:443/private-path?secret=private-query";
+  const env = { HARA_MODEL_PROXY: configuredProxy, HTTPS_PROXY: configuredProxy, NO_PROXY: ".private-model.example:443" };
+  assert.match(modelNetworkDiagnostic(target, { configuredProxy, env, platform: "linux" }), /direct — NO_PROXY matched/);
+  assert.equal(selectModelProxy(new URL(target), { configuredProxy, env, platform: "linux" }), undefined);
+  assert.match(modelNetworkDiagnostic(target, { configuredProxy, env: { ...env, no_proxy: ".other.example" }, platform: "linux" }), /proxy via HARA_MODEL_PROXY \/ --proxy · NO_PROXY not matched/);
+  assert.match(modelNetworkDiagnostic(target, { configuredProxy, env: { NO_PROXY: ".private-model.example:444" }, platform: "linux" }), /proxy via Hara user config · NO_PROXY not matched/);
+  for (const local of ["http://localhost:11434/v1", "http://127.0.0.2:11434/v1", "http://[::1]:11434/v1"]) {
+    assert.match(modelNetworkDiagnostic(local, { configuredProxy: "invalid://secret", env: {}, platform: "linux" }), /direct — loopback intentionally bypasses proxies/);
+  }
+  assert.match(modelNetworkDiagnostic(target, { env: {}, platform: "win32", windowsProxy: { enabled: true, server: configuredProxy, override: "*.private-model.example" } }), /direct — Windows proxy bypass matched/);
+  assert.match(modelNetworkDiagnostic(target, { env: {}, platform: "win32", windowsProxy: { enabled: true, server: "socks=private-socks.example:1080", autoConfigUrl: "https://private-pac.example/private.pac?secret=x" } }), /direct — no supported HTTP\(S\) proxy selected/);
+  assert.doesNotMatch(modelNetworkDiagnostic(target, { configuredProxy, env, platform: "linux" }), /private-|https?:\/\//);
+});
+
+test("offline model-network diagnostics hide malformed endpoint/proxy inputs and send no request", () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; throw new Error("unexpected network request"); };
+  try {
+    assert.match(modelNetworkDiagnostic(undefined, { env: {}, platform: "linux" }), /unknown/);
+    assert.equal(modelNetworkDiagnostic("private-endpoint-secret", { env: {}, platform: "linux" }), "invalid endpoint (address hidden)");
+    assert.equal(modelNetworkDiagnostic("file:///private-path?secret=private-query", { env: {}, platform: "linux" }), "invalid endpoint — HTTP(S) required (address hidden)");
+    assert.equal(modelNetworkDiagnostic("https://private-model.example", { configuredProxy: "http://user:password@private-proxy.example/private-path?token=private-query", env: {}, platform: "linux" }), "invalid proxy configuration — use an HTTP(S) origin (address hidden)");
+    assert.match(modelNetworkDiagnostic("https://private-model.example", { env: {}, platform: "linux" }), /direct — no supported HTTP\(S\) proxy selected/);
+    assert.equal(calls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("managed model traffic uses an authenticated CONNECT proxy without exposing the proxy credential", async () => {
@@ -227,6 +278,26 @@ test("provider SDK wrappers preserve only Hara's redacted model-network diagnosi
     undefined,
     "arbitrary SDK causes are never exposed",
   );
+});
+
+test("provider SDK wrappers reject forged model-network prefixes carrying credentials or endpoints", () => {
+  const safePrefix = "model network request failed through the configured proxy";
+  const guidance = "; check the endpoint, VPN, and proxy settings";
+  for (const forged of [
+    `${safePrefix} https://fixture-user:fixture-password@fixture-endpoint.invalid/fixture-path?token=fixture-query${guidance}`,
+    `${safePrefix} (ECONNREFUSED); fixture-password`,
+    `${safePrefix} (https://fixture-endpoint.invalid)${guidance}`,
+    `model network request failed through the Windows system proxy (ECONNREFUSED)${guidance}`,
+  ]) {
+    assert.equal(safeModelNetworkFailureMessage(new Error("Connection error.", { cause: new Error(forged) })), undefined);
+  }
+  for (const safe of [
+    `${safePrefix}${guidance}`,
+    `${safePrefix} (ECONNREFUSED)${guidance}`,
+    `model network request failed (ENETUNREACH)${guidance}`,
+  ]) {
+    assert.equal(safeModelNetworkFailureMessage(new Error("Connection error.", { cause: new Error(safe) })), safe);
+  }
 });
 
 test("closed loopback endpoints receive a local-service diagnosis instead of proxy guidance", async () => {

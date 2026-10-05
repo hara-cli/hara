@@ -181,12 +181,129 @@ test("doctor reports the active named Token Plan connection instead of stale Per
       ],
     }, null, 2)}\n`, { mode: 0o600 });
 
-    const result = await runCli(["doctor"], project, home);
+    const result = await runCli(["doctor"], project, home, {
+      HARA_MODEL_PROXY: "http://fixture-proxy.invalid:8080",
+      no_proxy: "",
+      NO_PROXY: "token-plan.cn-beijing.maas.aliyuncs.com",
+    });
     assert.equal(result.code, 0, result.stderr || result.stdout);
     assert.match(result.stdout, /provider token-plan · model qwen3\.7-plus/);
-    assert.match(result.stdout, /token-plan\.cn-beijing\.maas\.aliyuncs\.com\/compatible-mode\/v1/);
+    assert.match(result.stdout, /model-network direct — NO_PROXY matched/);
+    assert.match(result.stdout, /selection only; no request sent/);
+    assert.doesNotMatch(result.stdout, /token-plan\.cn-beijing\.maas\.aliyuncs\.com|compatible-mode\/v1|fixture-proxy/);
     assert.doesNotMatch(result.stdout, /model glm-5\.2/);
     assert.doesNotMatch(result.stdout, /fixture-token-plan-key/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("doctor reports proxy provenance offline and hides credential-bearing model/proxy URLs", { timeout: 30_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-doctor-private-network-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const haraHome = join(home, ".hara");
+  const baseURL = "https://fixture-endpoint-user:fixture-endpoint-password@fixture-model.invalid/fixture-private-path?token=fixture-query#fixture-fragment";
+  try {
+    mkdirSync(haraHome, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({
+      provider: "openai", model: "fixture-model", apiKey: "fixture-api-key", baseURL,
+      proxy: "http://fixture-config-user:fixture-config-password@fixture-config-proxy.invalid:8080",
+      guardian: "off", updateCheck: false,
+    }), { mode: 0o600 });
+    const clearEnv = {
+      HARA_PROVIDER: "", HARA_BASE_URL: "", HARA_MODEL: "", HARA_API_KEY: "",
+      HARA_MODEL_PROXY: "", http_proxy: "", HTTP_PROXY: "", https_proxy: "", HTTPS_PROXY: "",
+      no_proxy: "", NO_PROXY: "",
+    };
+    for (const [networkEnv, pattern] of [
+      [{ HARA_MODEL_PROXY: "http://fixture-hara-user:fixture-hara-password@fixture-hara-proxy.invalid:8081", HTTPS_PROXY: "http://fixture-env-proxy.invalid:8082" }, /model-network proxy via HARA_MODEL_PROXY \/ --proxy/],
+      [{ HTTPS_PROXY: "http://fixture-env-user:fixture-env-password@fixture-env-proxy.invalid:8082" }, /model-network proxy via HTTP\(S\)_PROXY environment/],
+      [{}, /model-network proxy via Hara user config/],
+      [{ HARA_MODEL_PROXY: "http://fixture-hara-proxy.invalid:8081", NO_PROXY: "fixture-model.invalid" }, /model-network direct — NO_PROXY matched/],
+      [{ HARA_MODEL_PROXY: "http://fixture-invalid-user:fixture-invalid-password@fixture-invalid-proxy.invalid/fixture-proxy-path?token=fixture-proxy-query" }, /model-network invalid proxy configuration/],
+    ]) {
+      const result = await runCli(["doctor"], project, home, { ...clearEnv, ...networkEnv });
+      assert.equal(result.code, 0, result.stderr || result.stdout);
+      assert.match(result.stdout, pattern);
+      assert.match(result.stdout, /selection only; no request sent/);
+      assert.match(result.stdout, /endpoint configured \(address hidden\)/);
+      assert.doesNotMatch(result.stdout + result.stderr, /fixture-(?:endpoint|private-path|query|fragment|api-key|config|hara|env|invalid|proxy-path|proxy-query)|fixture-model\.invalid/);
+      assert.equal(JSON.parse(readFileSync(join(haraHome, "config.json"), "utf8")).baseURL, baseURL, "doctor never rewrites the user's endpoint or proxy settings");
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("doctor uses the SDK-selected endpoint for offline proxy diagnosis without printing it", { timeout: 30_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-doctor-sdk-endpoint-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const haraHome = join(home, ".hara");
+  try {
+    mkdirSync(haraHome, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    for (const provider of ["openai", "anthropic", "qwen-oauth"]) {
+      writeFileSync(join(haraHome, "config.json"), JSON.stringify({ provider, model: "fixture-model", apiKey: "fixture-api-key", guardian: "off", updateCheck: false }), { mode: 0o600 });
+      if (provider === "qwen-oauth") {
+        writeFileSync(join(haraHome, "qwen-oauth.json"), JSON.stringify({
+          access: "fixture-access-token", refresh: "fixture-refresh-token", expires: 0,
+          resourceUrl: "http://127.0.0.1:11312/fixture-private-path?token=fixture-query",
+        }), { mode: 0o600 });
+      }
+      const result = await runCli(["doctor"], project, home, {
+        HARA_PROVIDER: "", HARA_BASE_URL: "", HARA_MODEL: "", HARA_API_KEY: "",
+        HARA_MODEL_PROXY: "http://fixture-proxy.invalid:8080", no_proxy: "", NO_PROXY: "",
+        OPENAI_BASE_URL: "http://127.0.0.1:11310/fixture-private-path?token=fixture-query",
+        ANTHROPIC_BASE_URL: "http://127.0.0.1:11311/fixture-private-path?token=fixture-query",
+      });
+      assert.equal(result.code, 0, result.stderr || result.stdout);
+      assert.match(result.stdout, /model-network direct — loopback intentionally bypasses proxies/);
+      assert.match(result.stdout, /selection only; no request sent/);
+      assert.doesNotMatch(result.stdout + result.stderr, /fixture-(?:api-key|proxy|private-path|query|access-token|refresh-token)|127\.0\.0\.1|1131[012]/);
+    }
+    writeFileSync(join(haraHome, "qwen-oauth.json"), JSON.stringify({ access: "fixture-access-token", refresh: "fixture-refresh-token", expires: 0, resourceUrl: 23 }), { mode: 0o600 });
+    const malformedOAuth = await runCli(["doctor"], project, home, { HARA_PROVIDER: "", HARA_BASE_URL: "", HARA_MODEL: "" });
+    assert.equal(malformedOAuth.code, 0, malformedOAuth.stderr || malformedOAuth.stdout);
+    assert.match(malformedOAuth.stdout, /model-network unknown — effective endpoint unavailable/);
+    assert.doesNotMatch(malformedOAuth.stdout + malformedOAuth.stderr, /fixture-(?:access-token|refresh-token)/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("doctor hides the organization endpoint in expired-access guidance", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-doctor-expired-gateway-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const haraHome = join(home, ".hara");
+  try {
+    mkdirSync(haraHome, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({ provider: "openai", model: "fixture-model", guardian: "off", updateCheck: false }), { mode: 0o600 });
+    writeFileSync(join(haraHome, "profiles.json"), JSON.stringify({
+      active: "expired-org",
+      profiles: [
+        { id: "personal", kind: "byok", label: "Personal", provider: "openai" },
+        {
+          id: "expired-org", kind: "gateway", tenantId: "fixture-tenant", deviceId: "fixture-device",
+          gatewayUrl: "https://fixture-gateway-user:fixture-gateway-password@fixture-gateway.invalid/fixture-private-path?token=fixture-query",
+          defaultModel: "fixture-org-model", tokenExpiresAt: "2000-01-01T00:00:00.000Z",
+        },
+      ],
+    }), { mode: 0o600 });
+    const result = await runCli(["doctor"], project, home, {
+      HARA_API_KEY: "", HARA_GATEWAY_TOKEN: "", HARA_MODEL_PROXY: "", http_proxy: "", HTTP_PROXY: "", https_proxy: "", HTTPS_PROXY: "", no_proxy: "", NO_PROXY: "",
+    });
+    assert.equal(result.code, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /expired organization access/);
+    assert.match(result.stdout, /--gateway <url> --code <code>/);
+    assert.doesNotMatch(result.stdout + result.stderr, /fixture-(?:gateway|private-path|query)/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

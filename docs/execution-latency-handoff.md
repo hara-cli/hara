@@ -223,3 +223,30 @@ system 的哈希、输入项哈希、首字节时间，以及流里 `response.co
 火山 coding plan 走的是 Responses 协议（`instructions` + `input`），不是 chat completions；
 环境里有代理变量时 Hara 改走 undici，不经过 `globalThis.fetch`，所以要先 unset。
 基线用 `git archive HEAD | tar -x` 到临时目录后 `tsc` 构建。
+
+## Codex 后续验收 — 2026-10-05
+
+- 新的默认 feedback gate 保留原 9 条历史回执，再运行 8 个隔离的当前引擎场景。标准任务实际
+  `provider.turn`、stats、runtime item、session journal 四份计数一致：0.183.3 为 4 个请求、5 个逻辑回合；
+  同一自适应 mock 在 0.183.2 完成同样产物需 6 个请求。错误 intent、只读、能力未知、拒绝 brief 和用户
+  插话仍阻止或丢弃相应动作。这不是在线模型速度或首次 intent 正确率的测量。
+- 方舟默认 DeepSeek 的合成代码长上下文重复测试通过：两次实际 input 都是 97,835，第二次 reported
+  cachedInput 为 97,792；均成功返回 fixture marker，零重试。首次字节约 6,504/5,580 ms，正文首字约
+  6,652/5,711 ms；每次 output 上限 1,024。这是一次 first-observed（不保证冷缓存）与相同请求重复，
+  不能当作显著提速或跨供应商性能结论。保持原 HTTP(S)_PROXY 路由，禁用脚本内重试/重定向；实际
+  SDK fetch 计数为 2，无真实历史数据、未经过上下文压缩，也没有修改用户配置。
+- 两处 intent 提示改为按用户授权的终局选类型；先检查不意味着只能 investigate，但想调用某工具也
+  不能新增 change 权限。新提示并未改变 enum、审批或 dispatch gate。
+- doctor 增加离线有效网络路由说明，隐藏 endpoint、proxy、bypass 规则和过期组织 gateway 地址。
+  网络错误恢复只接受 Engine 生成的固定语法，不能靠相同前缀伪造“安全”错误。代理选择策略不变。
+- 实际 Desktop React 组件的实时/历史/恢复/重连测试通过；官方 0.183.3 mock Serve 的九组 capture
+  又通过实际 Desktop SSR 和 Mobile SessionScreen。无 provider-parent 的 carried-round 消息不会丢失
+  终局回复。该结果不等于浏览器布局、Tauri 全壳、移动真机或公网 Relay 全链路验收。
+- 方舟 Coding Plan 上的 MiniMax-M3 限额代码测试未获得完整通过结论：初次 4 个请求已改动并验证合成
+  parser，但缺少已接受的完成回执；后续出现流式错误。没有自动重试直到成功，没有改用户网络或跨供应商
+  复用密钥。Qwen3.8-max 本机缺可用 Personal 配置，不能标为已验收。
+
+方法更正：provider started→streaming 反映任何模型活动，**不是可见正文首 token**。缓存缺失记为 unknown，
+不能当作 0；transport token 也不是订阅账单。代理流量不会经过 globalThis.fetch，验收应在 SDK 的
+实际自定义 fetch 上计时，保留用户的 effective proxy，不建议为了收集计时而直接 unset 用户网络变量。
+长上下文只发送合成代码，并以最终 provider usage 的实际 input 而非字符估算证明超过 30k。

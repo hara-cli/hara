@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import React from "react";
 import { render } from "ink-testing-library";
 import { InputBox, wrapRows, windowRows, cursorRowIndex, composerTextForDisplay, MAX_INPUT_ROWS } from "../dist/tui/InputBox.js";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -158,7 +158,11 @@ test("InputBox backspace deletes before the cursor", async () => {
 });
 
 test("InputBox shows an @path popup with file matches", async () => {
-  const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5" }));
+  // A seeded workspace makes this a completion/UI test rather than a timed scan of
+  // whichever large repository happens to be the test runner's working directory.
+  const mentionRoot = mkdtempSync(join(tmpdir(), "hara-mention-popup-"));
+  writeFileSync(join(mentionRoot, "src-demo.ts"), "export const example = 1;\n");
+  const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd: mentionRoot, model: "glm-5" }));
   try {
     stdin.write("@src");
     await waitUntil(() => {
@@ -166,10 +170,11 @@ test("InputBox shows an @path popup with file matches", async () => {
       return /src/.test(frame) && (frame.includes("insert") || frame.includes("select"));
     }, "@path popup did not settle");
     const frame = strip(lastFrame());
-    assert.ok(/src/.test(frame), "shows src path candidates");
+    assert.ok(frame.includes("src-demo.ts"), "shows the actual seeded path candidate, not only the typed query");
     assert.ok(frame.includes("insert") || frame.includes("select"), "popup hint shown");
   } finally {
     unmount();
+    rmSync(mentionRoot, { recursive: true, force: true });
   }
 });
 

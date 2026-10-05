@@ -209,6 +209,50 @@ export function selectModelProxy(
   return uri ? { uri, source: "windows-system" } : undefined;
 }
 
+const MODEL_PROXY_SOURCE_LABELS: Record<ModelProxySource, string> = {
+  "hara-env": "HARA_MODEL_PROXY / --proxy",
+  environment: "HTTP(S)_PROXY environment",
+  config: "Hara user config",
+  "windows-system": "Windows static system proxy",
+};
+
+/** Report the same request-scoped route used by model fetch without making a network request. Every
+ * returned fragment is engine-owned: endpoint/proxy addresses, credentials and bypass rules stay hidden.
+ * This describes Hara's transport selection, not VPN/TUN routing or actual provider reachability. */
+export function modelNetworkDiagnostic(
+  target: string | URL | undefined,
+  options: ModelProxyResolutionOptions = {},
+): string {
+  if (!target) return "unknown — effective endpoint unavailable (address hidden)";
+  let url: URL;
+  try {
+    url = new URL(target);
+  } catch {
+    return "invalid endpoint (address hidden)";
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return "invalid endpoint — HTTP(S) required (address hidden)";
+  }
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const noProxy = nonBlank(env.no_proxy) ?? nonBlank(env.NO_PROXY);
+  const windowsProxy = options.windowsProxy ?? (platform === "win32" ? readWindowsProxySettings() : undefined);
+  try {
+    const proxy = selectModelProxy(url, { ...options, env, platform, windowsProxy });
+    if (proxy) {
+      return `proxy via ${MODEL_PROXY_SOURCE_LABELS[proxy.source]}${noProxy ? " · NO_PROXY not matched" : ""} (addresses hidden)`;
+    }
+    if (loopbackHostname(url.hostname)) return "direct — loopback intentionally bypasses proxies (address hidden)";
+    if (bypassesModelProxy(url, noProxy)) return "direct — NO_PROXY matched (address and rule hidden)";
+    if (platform === "win32" && windowsProxy?.enabled && bypassesModelProxy(url, windowsProxy.override, true)) {
+      return "direct — Windows proxy bypass matched (address and rule hidden)";
+    }
+    return `direct — no supported HTTP(S) proxy selected${noProxy ? " · NO_PROXY not matched" : ""} (address hidden)`;
+  } catch {
+    return "invalid proxy configuration — use an HTTP(S) origin (address hidden)";
+  }
+}
+
 function isBunRuntime(): boolean {
   return typeof (globalThis as { Bun?: unknown }).Bun === "object";
 }
@@ -249,6 +293,39 @@ function networkErrorCode(error: unknown): string | undefined {
 }
 
 const SAFE_MODEL_NETWORK_ERROR_PREFIX = "model network request failed";
+const MODEL_NETWORK_FAILURE_DIAGNOSTICS = {
+  local: {
+    path: " because the selected local endpoint is unavailable",
+    guidance: "loopback endpoints intentionally bypass proxies — start the selected local model/gateway service, "
+      + "switch to a working personal direct connection, or reconnect or re-enroll the selected organization connection",
+  },
+  windowsProxy: {
+    path: " through the Windows system proxy",
+    guidance: "verify the Windows static HTTP(S) proxy listener, bypass list, and VPN",
+  },
+  configuredProxy: {
+    path: " through the configured proxy",
+    guidance: "check the endpoint, VPN, and proxy settings",
+  },
+  unsupportedWindowsProxy: {
+    path: " without a supported HTTP(S) proxy",
+    guidance: "PAC-only or SOCKS-only settings need an HTTP(S) proxy entry; run 'hara config set proxy http://127.0.0.1:<port>' or fix VPN/TUN routing",
+  },
+  direct: {
+    path: "",
+    guidance: "check the endpoint, VPN, and proxy settings",
+  },
+};
+
+function isOwnedModelNetworkFailureMessage(message: string): boolean {
+  return Object.values(MODEL_NETWORK_FAILURE_DIAGNOSTICS).some(({ path, guidance }) => {
+    const prefix = `${SAFE_MODEL_NETWORK_ERROR_PREFIX}${path}`;
+    const suffix = `; ${guidance}`;
+    if (!message.startsWith(prefix) || !message.endsWith(suffix)) return false;
+    const code = message.slice(prefix.length, -suffix.length);
+    return code === "" || /^ \([A-Z][A-Z0-9_]{1,39}\)$/u.test(code);
+  });
+}
 
 /** Recover only the bounded diagnostic Hara itself created before a provider SDK wrapped it.
  * Provider SDK connection errors commonly replace this message with a generic "Connection error".
@@ -261,7 +338,7 @@ export function safeModelNetworkFailureMessage(error: unknown): string | undefin
     if (current instanceof Error) {
       const message = current.message.trim();
       if (
-        message.startsWith(SAFE_MODEL_NETWORK_ERROR_PREFIX)
+        isOwnedModelNetworkFailureMessage(message)
         && message.length <= 1024
         && !/[\r\n\u0000-\u001f\u007f]/u.test(message)
       ) {
@@ -283,27 +360,17 @@ function safeModelNetworkError(
 ): Error {
   if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) return error;
   const code = networkErrorCode(error);
-  if (loopbackHostname(target.hostname)) {
-    return new Error(
-      `${SAFE_MODEL_NETWORK_ERROR_PREFIX} because the selected local endpoint is unavailable${code ? ` (${code})` : ""}; `
-      + "loopback endpoints intentionally bypass proxies — start the selected local model/gateway service, "
-      + "switch to a working personal direct connection, or reconnect or re-enroll the selected organization connection",
-    );
-  }
-  const networkPath = proxy
+  const diagnosis = loopbackHostname(target.hostname)
+    ? MODEL_NETWORK_FAILURE_DIAGNOSTICS.local
+    : proxy
     ? proxy.source === "windows-system"
-      ? " through the Windows system proxy"
-      : " through the configured proxy"
+      ? MODEL_NETWORK_FAILURE_DIAGNOSTICS.windowsProxy
+      : MODEL_NETWORK_FAILURE_DIAGNOSTICS.configuredProxy
     : platform === "win32"
-      ? " without a supported HTTP(S) proxy"
-      : "";
-  const guidance = proxy?.source === "windows-system"
-    ? "verify the Windows static HTTP(S) proxy listener, bypass list, and VPN"
-    : !proxy && platform === "win32"
-      ? "PAC-only or SOCKS-only settings need an HTTP(S) proxy entry; run 'hara config set proxy http://127.0.0.1:<port>' or fix VPN/TUN routing"
-      : "check the endpoint, VPN, and proxy settings";
+      ? MODEL_NETWORK_FAILURE_DIAGNOSTICS.unsupportedWindowsProxy
+      : MODEL_NETWORK_FAILURE_DIAGNOSTICS.direct;
   return new Error(
-    `${SAFE_MODEL_NETWORK_ERROR_PREFIX}${networkPath}${code ? ` (${code})` : ""}; ${guidance}`,
+    `${SAFE_MODEL_NETWORK_ERROR_PREFIX}${diagnosis.path}${code ? ` (${code})` : ""}; ${diagnosis.guidance}`,
   );
 }
 

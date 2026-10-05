@@ -232,7 +232,7 @@ import { levelsFor, normalizeEffort } from "./tui/model-picker.js";
 import { isOfficialTokenPlanOpenAIEndpoint, tokenPlanModelHint } from "./providers/alibaba.js";
 import { planNoteLines } from "./providers/plan-notes.js";
 import { listModels } from "./providers/models.js";
-import { createModelFetch } from "./network/model-fetch.js";
+import { createModelFetch, modelNetworkDiagnostic } from "./network/model-fetch.js";
 import { listJobs, tailJob, killJob } from "./exec/jobs.js";
 import { readModelContextFileSync } from "./fs-read.js";
 import { MIN_NODE_VERSION, unsupportedNodeMessage } from "./runtime.js";
@@ -277,7 +277,7 @@ function renderBgJobs(): string {
   });
   return `Background jobs — /jobs tail <id> · /jobs kill <id>:\n${rows.join("\n")}`;
 }
-import { qwenDeviceLogin, loadQwenToken } from "./providers/qwen-oauth.js";
+import { qwenDeviceLogin, loadQwenToken, normalizeBaseUrl as normalizeQwenBaseUrl } from "./providers/qwen-oauth.js";
 import { loadAgentContext, hasAgentsMd, hasProjectContent, INIT_PROMPT, findProjectRoot } from "./context/agents-md.js";
 import {
   homeWorkspaceActionError,
@@ -946,7 +946,7 @@ function authHint(cfg: HaraConfig, boundProfile?: Profile | null): string {
   const ap = boundProfile ?? profileForConfig(cfg).profile;
   if (ap.kind === "gateway") {
     if (deviceTokenExpired(ap.tokenExpiresAt)) {
-      return `Active profile '${ap.id}' has expired organization access — re-enroll with \`hara profile add ${ap.id} --gateway ${ap.gatewayUrl || "<url>"} --code <code>\`.`;
+      return `Active profile '${ap.id}' has expired organization access — re-enroll with \`hara profile add ${ap.id} --gateway <url> --code <code>\` (gateway address hidden).`;
     }
     return `Active profile '${ap.id}' is a gateway profile but is missing deviceToken — re-enroll with \`hara profile add ${ap.id} --gateway <url> --code <code>\`.`;
   }
@@ -3405,9 +3405,21 @@ function runDoctor(cfg: HaraConfig): string {
   const nodeSupported = unsupportedNodeMessage() === null;
   const envKey = providerEnvKey(live.provider);
   const hasKey = !!(live.apiKey || (envKey ? process.env[envKey] : undefined) || process.env.HARA_API_KEY);
-  const oauthOk = live.provider === "qwen-oauth" && loadQwenToken() !== null;
+  const oauthToken = live.provider === "qwen-oauth" ? loadQwenToken() : null;
+  const oauthOk = oauthToken !== null;
   const gatewayOk = profile.kind === "gateway" && !!profile.deviceToken && !deviceTokenExpired(profile.tokenExpiresAt);
   const authed = hasKey || oauthOk || gatewayOk || providerIsLocal(live.provider);
+  // Mirror the SDK's effective HTTP(S) base when Hara did not supply one; OAuth discovery is special
+  // and must not be guessed from the Personal endpoint. This remains offline and never refreshes auth.
+  const wireApi = resolvePlatform(live.provider, live.baseURL, undefined, live.model).wireApi;
+  const oauthEndpoint = oauthToken && (oauthToken.resourceUrl === undefined || typeof oauthToken.resourceUrl === "string")
+    ? normalizeQwenBaseUrl(oauthToken.resourceUrl) : undefined;
+  const networkEndpoint = live.provider === "qwen-oauth"
+    ? oauthEndpoint
+    : live.baseURL || providerDefaultBaseURL(live.provider)
+      || (wireApi === "anthropic"
+        ? process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com"
+        : process.env.OPENAI_BASE_URL || "https://api.openai.com/v1");
   const ad = assetsDir();
   const roles = loadActiveRoles(live.cwd, profile.id);
   const vcap = classifyVision(live.provider, live.model, live.modelVision);
@@ -3431,7 +3443,8 @@ function runDoctor(cfg: HaraConfig): string {
     `${ok(nodeSupported)} node ${process.versions.node} ${c.dim(`(need ≥${MIN_NODE_VERSION})`)}`,
     `${dot} install ${c.bold(installationLabel(installation))} · ${c.dim(installation.launchPath)}`,
     ...shadowInstallLines(installation),
-    `${dot} provider ${c.bold(live.provider)} · model ${c.bold(live.model)}${live.baseURL ? c.dim(" · " + live.baseURL) : ""}`,
+    `${dot} provider ${c.bold(live.provider)} · model ${c.bold(live.model)}${live.baseURL ? c.dim(" · endpoint configured (address hidden)") : ""}`,
+    `${dot} model-network ${c.dim(modelNetworkDiagnostic(networkEndpoint, { configuredProxy: live.proxy }))}${c.dim(" · selection only; no request sent")}`,
     `${ok(authed)} auth ${providerIsLocal(live.provider) ? c.dim("not required (local endpoint)") : authed ? c.dim("configured") : c.yellow("missing — " + authHint(live, profile))}`,
     `${ok(existsSync(configPath()))} config ${c.dim(configPath())}`,
     `${dot} code-assets ${existsSync(ad) ? c.dim(ad) : c.dim("none — run: hara recall --init")}`,

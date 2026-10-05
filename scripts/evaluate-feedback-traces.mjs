@@ -526,7 +526,7 @@ export function loadFeedbackTraces(directory = defaultTraceDirectory) {
   });
 }
 
-function main() {
+async function main() {
   const [, , directoryArgument, extra] = process.argv;
   if (extra) {
     console.error("usage: node scripts/evaluate-feedback-traces.mjs [trace-directory]");
@@ -546,6 +546,19 @@ function main() {
   }
   console.log(`feedback-eval: ${JSON.stringify(suite.summary)}`);
   if (!suite.passed) process.exitCode = 1;
+  // Historical receipts remain unchanged. The default CI gate also runs the current engine against
+  // synthetic bounded scenarios so fewer provider round trips cannot regress behind static JSON.
+  if (directoryArgument === undefined) {
+    const { evaluateExecutionLatencySuite, printExecutionLatencySuite } = await import("./evaluate-execution-latency.mjs");
+    const latencySuite = evaluateExecutionLatencySuite();
+    printExecutionLatencySuite(latencySuite);
+    if (!latencySuite.passed) process.exitCode = 1;
+  }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) main();
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  main().catch(() => {
+    console.error("feedback-eval could not complete; check trace input and build dist for the default synthetic engine gate");
+    process.exitCode = 1;
+  });
+}
