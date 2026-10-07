@@ -140,19 +140,26 @@ export async function walkFilesAsync(root: string, options: FileWalkOptions = {}
   let entriesVisited = 0;
   let sinceYield = 0;
   const timedOut = (): boolean => Date.now() - startedAt >= cfg.timeoutMs;
+  const finishAtTimeLimit = async (): Promise<FileWalkResult> => {
+    // setImmediate yields only to the check phase: when called from that phase, an already scheduled
+    // cancellation timer can still be pending when it resolves. Use a timer-phase turn at the terminal
+    // wall boundary, then recheck cancellation before reporting a best-effort truncated inventory.
+    // Ordinary scan yields retain setImmediate, so this adds no per-entry timer delay.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    throwIfAborted(cfg.signal);
+    return result(files, directoriesVisited, entriesVisited, "time_limit");
+  };
 
   // A contended filesystem can consume a tiny wall budget in the synchronous Home-boundary preflight.
   // Yield once before returning that entry-time timeout so already-due cancellation/deadline timers are
   // observable even though no directory descriptor was opened.
   if (timedOut()) {
-    await yieldToEventLoop();
-    throwIfAborted(cfg.signal);
-    return result(files, directoriesVisited, entriesVisited, "time_limit");
+    return finishAtTimeLimit();
   }
 
   while (stack.length) {
     throwIfAborted(cfg.signal);
-    if (timedOut()) return result(files, directoriesVisited, entriesVisited, "time_limit");
+    if (timedOut()) return await finishAtTimeLimit();
     if (directoriesVisited >= cfg.maxDirectories) {
       return result(files, directoriesVisited, entriesVisited, "directory_limit");
     }
@@ -171,10 +178,10 @@ export async function walkFilesAsync(root: string, options: FileWalkOptions = {}
     }
     try {
       throwIfAborted(cfg.signal);
-      if (timedOut()) return result(files, directoriesVisited, entriesVisited, "time_limit");
+      if (timedOut()) return await finishAtTimeLimit();
       for await (const entry of directory) {
         throwIfAborted(cfg.signal);
-        if (timedOut()) return result(files, directoriesVisited, entriesVisited, "time_limit");
+        if (timedOut()) return await finishAtTimeLimit();
         if (entriesVisited >= cfg.maxEntries) {
           return result(files, directoriesVisited, entriesVisited, "entry_limit");
         }
@@ -186,7 +193,7 @@ export async function walkFilesAsync(root: string, options: FileWalkOptions = {}
           sinceYield = 0;
           await yieldToEventLoop();
           throwIfAborted(cfg.signal);
-          if (timedOut()) return result(files, directoriesVisited, entriesVisited, "time_limit");
+          if (timedOut()) return await finishAtTimeLimit();
         }
 
         if (entry.name.startsWith(".") && entry.name !== ".env" && entry.isDirectory() && IGNORE_DIRS.has(entry.name)) {
@@ -215,6 +222,8 @@ export async function walkFilesAsync(root: string, options: FileWalkOptions = {}
       } catch {
         /* already closed */
       }
+      // Closing a descriptor is itself asynchronous; cancellation can arrive during that final await.
+      throwIfAborted(cfg.signal);
     }
 
     // Empty-directory forests do not increment the Dirent counter while they are being popped. Yield on
@@ -224,7 +233,7 @@ export async function walkFilesAsync(root: string, options: FileWalkOptions = {}
       sinceYield = 0;
       await yieldToEventLoop();
       throwIfAborted(cfg.signal);
-      if (timedOut()) return result(files, directoriesVisited, entriesVisited, "time_limit");
+      if (timedOut()) return await finishAtTimeLimit();
     }
   }
   return result(files, directoriesVisited, entriesVisited);

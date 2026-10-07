@@ -5,7 +5,7 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## 0.184.0 — 2026-10-08 — scoped approvals and native coding questions
+## 0.184.1 — 2026-10-08 — scoped approvals and native coding questions
 
 - Add human-only approval cards for one action or the current task, with a 15-minute task limit,
   explicit revocation, idempotent retry, and fail-closed disconnect/restoration. Task grants remain
@@ -19,6 +19,15 @@ All notable changes to `@nanhara/hara`.
   install its runtime, or grant permission to perform an action.
 - Upgrade the MCP SDK and its proxy-address dependency after new production security advisories.
   These changes do not alter user model credentials, network routes, or running sessions.
+- Observe pending cancellation timers at asynchronous file-walk wall-budget exits and after descriptor
+  cleanup. Harden release fixtures against slow pre-dispatch setup and concurrent runtime-state writes without skipping
+  tests or increasing production execution budgets.
+
+## 0.184.0 — 2026-10-08 — initial release candidate (unreleased)
+
+- The initial scoped-approval candidate did not pass all cross-platform release tests and was not
+  published to npm or the stable binary release. Keep its tag unchanged as failure history; 0.184.1
+  carries the corrected candidate through the same publication gates.
 
 ## 0.183.4 — 2026-10-05 — bounded execution regression gates and private network diagnostics
 

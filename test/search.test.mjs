@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { linkSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
+import fsPromises from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -87,18 +89,72 @@ test("fs-walk async: timer-driven cancellation interrupts a cached empty-directo
   }
 });
 
-test("fs-walk async: total wall budget starts at API entry", async () => {
+test("fs-walk async: total wall budget starts at API entry", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "hara-walk-time-"));
   try {
-    for (let i = 0; i < 512; i++) mkdirSync(join(dir, `empty-${String(i).padStart(4, "0")}`));
+    // Simulate a contended synchronous preflight consuming the wall budget without depending on the
+    // speed of a CI disk. The walk must not reset its clock after that preflight or open a directory.
+    let clockReads = 0;
+    t.mock.method(Date, "now", () => clockReads++ === 0 ? 0 : 10);
     let timerRan = false;
     const timer = setTimeout(() => { timerRan = true; }, 0);
     const walked = await walkFilesAsync(dir, { timeoutMs: 5, yieldEvery: 1 });
     clearTimeout(timer);
     assert.equal(walked.reason, "time_limit");
     assert.equal(timerRan, true, "the wall-budget scan yields to deadline timers");
-    assert.ok(walked.directoriesVisited < 513, "the scan stopped before consuming the forest");
+    assert.equal(walked.directoriesVisited, 0, "entry-time expiry stops before opening a directory");
   } finally {
+    t.mock.restoreAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fs-walk async: an entry-time wall limit from the check phase observes deadline cancellation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-walk-timer-phase-"));
+  const controller = new AbortController();
+  const deadline = new Error("test pending deadline timer");
+  let timer;
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    timer = setTimeout(() => controller.abort(deadline), 0);
+    await assert.rejects(
+      walkFilesAsync(dir, { timeoutMs: 0, signal: controller.signal }),
+      (error) => error === deadline,
+    );
+  } finally {
+    clearTimeout(timer);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fs-walk async: cancellation during descriptor close wins over a completed inventory", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-walk-close-abort-"));
+  const controller = new AbortController();
+  const deadline = new Error("test cancellation while closing the directory");
+  let opened = 0;
+  let closed = 0;
+  try {
+    t.mock.method(fsPromises, "opendir", async () => {
+      opened += 1;
+      return {
+        async *[Symbol.asyncIterator]() {},
+        async close() {
+          closed += 1;
+          await Promise.resolve();
+          controller.abort(deadline);
+        },
+      };
+    });
+    syncBuiltinESMExports();
+    await assert.rejects(
+      walkFilesAsync(dir, { signal: controller.signal, timeoutMs: 10_000, yieldEvery: 128 }),
+      (error) => error === deadline,
+    );
+    assert.equal(opened, 1);
+    assert.equal(closed, 1, "the descriptor is closed before cancellation propagates");
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
     rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -42,10 +42,48 @@ after(() => {
 
 const tick = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+async function withinFixtureDeadline(promise, description, timeoutMs = 3_000) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`${description} did not settle within ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function startActiveFixtureClockAtToolEntry(t) {
+  const wallNow = Date.now.bind(Date);
+  const runStartedAt = wallNow();
+  let toolStartedAt;
+  // These two tests exercise a physical tool that outlives a real deadline, not setup contention.
+  // runActiveElapsedMs/expireRunBudgetIfNeeded use Date.now; freeze only pre-dispatch accounting,
+  // then advance from actual wall time. The engine's real setTimeout/AbortSignal remain untouched.
+  t.mock.method(Date, "now", () => toolStartedAt === undefined
+    ? runStartedAt
+    : runStartedAt + wallNow() - toolStartedAt);
+  return () => {
+    assert.equal(toolStartedAt, undefined, "the late wrapper starts exactly once");
+    toolStartedAt = wallNow();
+  };
+}
+
 async function continueJustAfterAbort(signal) {
   assert.ok(signal instanceof AbortSignal, "the tool receives the run cancellation signal");
   if (!signal.aborted) {
-    await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+    let onAbort;
+    try {
+      await withinFixtureDeadline(new Promise((resolve) => {
+        onAbort = resolve;
+        signal.addEventListener("abort", onAbort, { once: true });
+      }), "the real run deadline must cancel the started wrapper");
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
   }
   // Intentionally continue after cancellation so the delegated tool must enforce its own boundary.
   await tick(20);
@@ -1207,6 +1245,7 @@ test("active deadline stops a provider that stays active forever and ignores Abo
 test("a synchronous provider cannot overrun the active budget and then start a side effect", async () => {
   let confirmations = 0;
   let toolRuns = 0;
+  let physicalToolPromises = 0;
   const provider = {
     id: "busy-provider",
     model: "busy-provider",
@@ -1226,6 +1265,7 @@ test("a synchronous provider cannot overrun the active budget and then start a s
     approval: "suggest",
     timeoutMs: 1_000,
     quiet: true,
+    onToolRun: () => { physicalToolPromises += 1; },
     confirm: async () => { confirmations += 1; return true; },
     extraTools: [{
       name: "late_effect",
@@ -1238,6 +1278,7 @@ test("a synchronous provider cannot overrun the active budget and then start a s
   assert.equal(outcome.stopReason, "deadline");
   assert.equal(confirmations, 0);
   assert.equal(toolRuns, 0);
+  assert.equal(physicalToolPromises, 0, "pre-dispatch expiry creates no physical wrapper callback to await");
 });
 
 test("the 80% time boundary reaches the model as an in-band checkpoint instruction", async () => {
@@ -1409,10 +1450,11 @@ test("active deadline closes a tool round even when the tool ignores cancellatio
   assert.match(history.at(-1).results[0].content, /active-execution deadline 1s reached/);
 });
 
-test("a late non-cooperative wrapper cannot commit through built-in write_file after the deadline", async () => {
+test("a late non-cooperative wrapper cannot commit through built-in write_file after the deadline", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "hara-late-write-"));
   const target = join(dir, "late.txt");
   let lateResult = "";
+  let lateStarted = false;
   let lateSettled;
   const lateDone = new Promise((resolve) => { lateSettled = resolve; });
   const provider = {
@@ -1423,39 +1465,49 @@ test("a late non-cooperative wrapper cannot commit through built-in write_file a
     },
   };
   try {
-    const outcome = await runAgent([{ role: "user", content: "write late" }], base(provider, {
-      ctx: { cwd: dir },
-      timeoutMs: 1_000,
-      quiet: true,
-      extraTools: [{
-        name: "late_write_wrapper",
-        description: "delays, then delegates to the built-in writer",
-        input_schema: { type: "object", properties: {} },
-        kind: "edit",
-        async run(_input, ctx) {
-          try {
-            await continueJustAfterAbort(ctx.signal);
-            lateResult = await getTool("write_file").run({ path: "late.txt", content: "must not land\n" }, ctx);
-            return lateResult;
-          } finally {
-            lateSettled();
-          }
-        },
-      }],
-    }));
+    const startActiveClock = startActiveFixtureClockAtToolEntry(t);
+    let outcome;
+    try {
+      outcome = await runAgent([{ role: "user", content: "write late" }], base(provider, {
+        ctx: { cwd: dir },
+        timeoutMs: 1_000,
+        quiet: true,
+        extraTools: [{
+          name: "late_write_wrapper",
+          description: "delays, then delegates to the built-in writer",
+          input_schema: { type: "object", properties: {} },
+          kind: "edit",
+          async run(_input, ctx) {
+            try {
+              startActiveClock();
+              lateStarted = true;
+              await continueJustAfterAbort(ctx.signal);
+              lateResult = await getTool("write_file").run({ path: "late.txt", content: "must not land\n" }, ctx);
+              return lateResult;
+            } finally {
+              lateSettled();
+            }
+          },
+        }],
+      }));
+    } finally {
+      if (lateStarted) await withinFixtureDeadline(lateDone, "the physical late write wrapper");
+    }
+    assert.equal(lateStarted, true, "this fixture must reach physical tool dispatch before testing late writes");
     assert.equal(outcome.stopReason, "deadline");
-    await lateDone;
     assert.equal(existsSync(target), false, "the physical late tool cannot cross the atomic commit gate");
     assert.match(lateResult, /cancel|No changes written/i);
   } finally {
+    t.mock.restoreAll();
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("a late non-cooperative wrapper cannot start another registered edit tool after the deadline", async () => {
+test("a late non-cooperative wrapper cannot start another registered edit tool after the deadline", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "hara-late-memory-"));
   const target = join(dir, ".hara", "memory", "MEMORY.md");
   let lateResult = "";
+  let lateStarted = false;
   let lateSettled;
   const lateDone = new Promise((resolve) => { lateSettled = resolve; });
   const provider = {
@@ -1466,31 +1518,40 @@ test("a late non-cooperative wrapper cannot start another registered edit tool a
     },
   };
   try {
-    const outcome = await runAgent([{ role: "user", content: "write memory late" }], base(provider, {
-      ctx: { cwd: dir },
-      timeoutMs: 1_000,
-      quiet: true,
-      extraTools: [{
-        name: "late_memory_wrapper",
-        description: "delays, then delegates to another registered edit tool",
-        input_schema: { type: "object", properties: {} },
-        kind: "edit",
-        async run(_input, ctx) {
-          try {
-            await continueJustAfterAbort(ctx.signal);
-            lateResult = await getTool("memory_write").run({ content: "must not land", scope: "project" }, ctx);
-            return lateResult;
-          } finally {
-            lateSettled();
-          }
-        },
-      }],
-    }));
+    const startActiveClock = startActiveFixtureClockAtToolEntry(t);
+    let outcome;
+    try {
+      outcome = await runAgent([{ role: "user", content: "write memory late" }], base(provider, {
+        ctx: { cwd: dir },
+        timeoutMs: 1_000,
+        quiet: true,
+        extraTools: [{
+          name: "late_memory_wrapper",
+          description: "delays, then delegates to another registered edit tool",
+          input_schema: { type: "object", properties: {} },
+          kind: "edit",
+          async run(_input, ctx) {
+            try {
+              startActiveClock();
+              lateStarted = true;
+              await continueJustAfterAbort(ctx.signal);
+              lateResult = await getTool("memory_write").run({ content: "must not land", scope: "project" }, ctx);
+              return lateResult;
+            } finally {
+              lateSettled();
+            }
+          },
+        }],
+      }));
+    } finally {
+      if (lateStarted) await withinFixtureDeadline(lateDone, "the physical late memory wrapper");
+    }
+    assert.equal(lateStarted, true, "this fixture must reach physical tool dispatch before testing late delegation");
     assert.equal(outcome.stopReason, "deadline");
-    await lateDone;
     assert.equal(existsSync(target), false, "the registry boundary refuses delayed cross-tool side effects");
     assert.match(lateResult, /cancelled before execution/i);
   } finally {
+    t.mock.restoreAll();
     rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
@@ -17,6 +17,88 @@ import {
   probeExternalCommand,
   resolveExternalCommand,
 } from "../dist/external-sessions/process.js";
+
+// Both the parent and its real child-process fixtures publish complete documents. Keep this function
+// self-contained so the generated Herdr fixture and the staged-write regression execute the same writer.
+function writeFixtureState(statePath, patch, beforePublish = () => {}) {
+  const previous = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : {};
+  const temporary = `${statePath}.${process.pid}.tmp`;
+  writeFileSync(temporary, JSON.stringify({ ...previous, ...patch }));
+  beforePublish();
+  renameSync(temporary, statePath);
+}
+
+async function stopFixtureProcesses(children) {
+  await Promise.all([...children].map(async (child) => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    await new Promise((resolve, reject) => {
+      const closed = () => { clearTimeout(timer); clearTimeout(deadline); resolve(); };
+      child.once("close", closed);
+      const timer = setTimeout(() => child.kill("SIGKILL"), 1_000);
+      const deadline = setTimeout(() => {
+        child.off("close", closed);
+        reject(new Error("the tracked fixture process did not stop"));
+      }, 3_000);
+      child.kill("SIGTERM");
+    });
+  }));
+}
+
+test("fixture state readers retain the previous complete JSON until an atomic child publication", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "hara-fixture-state-"));
+  const statePath = join(root, "state.json");
+  const children = new Set();
+  t.after(async () => {
+    try { await stopFixtureProcesses(children); }
+    finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  writeFixtureState(statePath, { serverPid: 123, before: true });
+  const child = spawn(process.execPath, ["--input-type=module", "-e", `
+    import { existsSync, readFileSync, readSync, renameSync, writeFileSync, writeSync } from "node:fs";
+    ${writeFixtureState.toString()}
+    writeFixtureState(${JSON.stringify(statePath)}, { after: true }, () => {
+      writeSync(1, "staged\\n");
+      const gate = Buffer.alloc(1);
+      if (readSync(0, gate, 0, 1, null) !== 1) throw new Error("publication gate was not released");
+    });
+  `], { stdio: ["pipe", "pipe", "pipe"] });
+  children.add(child);
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+  const exited = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) => code === 0 ? resolve() : reject(new Error(`fixture writer exited ${code}: ${stderr}`)));
+  });
+  // Handle an early child exit immediately while preserving the rejection for the explicit await below.
+  void exited.catch(() => {});
+  await new Promise((resolve, reject) => {
+    let output = "";
+    const finish = (error) => {
+      clearTimeout(timer);
+      child.stdout.off("data", received);
+      child.off("close", earlyClose);
+      child.off("error", failed);
+      error ? reject(error) : resolve();
+    };
+    const received = (chunk) => { output += String(chunk); if (output === "staged\n") finish(); };
+    const earlyClose = () => finish(new Error(`fixture writer closed before staging: ${stderr}`));
+    const failed = (error) => finish(error);
+    const timer = setTimeout(() => finish(new Error("fixture writer did not stage its complete document")), 3_000);
+    child.stdout.on("data", received);
+    child.once("close", earlyClose);
+    child.once("error", failed);
+  });
+  assert.deepEqual(JSON.parse(readFileSync(statePath, "utf8")), { serverPid: 123, before: true });
+  child.stdin.end("1");
+  let exitDeadline;
+  await Promise.race([
+    exited,
+    new Promise((_, reject) => {
+      exitDeadline = setTimeout(() => reject(new Error("fixture writer did not exit after publication was released")), 3_000);
+    }),
+  ]).finally(() => clearTimeout(exitDeadline));
+  assert.deepEqual(JSON.parse(readFileSync(statePath, "utf8")), { serverPid: 123, before: true, after: true });
+});
 
 test("external command discovery rejects relative PATH roots and finds a versioned NVM install", () => {
   const root = mkdtempSync(join(tmpdir(), "hara-external-command-"));
@@ -325,10 +407,16 @@ test("the Herdr terminal bridge fails closed on a missing incremental frame", {
 
 test("Hara Live starts an isolated runtime, creates a coding-agent relay, and keeps native ids behind Core", {
   skip: process.platform === "win32" ? "POSIX detached runtime fixture" : false,
-}, async () => {
+}, async (t) => {
   const root = mkdtempSync(join(tmpdir(), "hara-live-runtime-"));
   const statePath = join(root, "runtime-state.json");
-  try {
+  const children = new Set();
+  // Cleanup must not parse a shared state file or replace an earlier assertion with a JSON error.
+  t.after(async () => {
+    try { await stopFixtureProcesses(children); }
+    finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  {
     const wezterm = join(root, ".local", "bin", "wezterm");
     mkdirSync(join(root, ".local", "bin"), { recursive: true });
     writeFileSync(wezterm, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
@@ -336,10 +424,11 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
     let nativeTerminalArgs = null;
     const fixture = join(root, "fake-herdr.mjs");
     writeFileSync(fixture, `
-      import { existsSync, readFileSync, writeFileSync } from "node:fs";
+      import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
       const statePath = ${JSON.stringify(statePath)};
+      ${writeFixtureState.toString()}
       const readState = () => existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : {};
-      const writeState = (patch) => writeFileSync(statePath, JSON.stringify({ ...readState(), ...patch }));
+      const writeState = (patch) => writeFixtureState(statePath, patch);
       const raw = process.argv.slice(2);
       if (raw.includes("--version")) {
         process.stdout.write("herdr 0.8.2\\n");
@@ -472,7 +561,9 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
       runtimeRoot: join(root, "runtime"),
       spawnProcess(command, args, options) {
         if (command === realpathSync(wezterm)) nativeTerminalArgs = [...args];
-        return spawn(command, [...args], options);
+        const child = spawn(command, [...args], options);
+        children.add(child);
+        return child;
       },
     });
     const source = await adapter.inspect();
@@ -535,10 +626,10 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
     assert.equal(snapshot.sessionId, created.session.id);
     assert.match(snapshot.text, /codex ready/);
     const blockedState = JSON.parse(readFileSync(statePath, "utf8"));
-    writeFileSync(statePath, JSON.stringify({
+    writeFixtureState(statePath, {
       ...blockedState,
       agent: { ...blockedState.agent, agent_status: "blocked", revision: 2, state_change_seq: 2 },
-    }));
+    });
     const blockedRead = await adapter.read(created.session.id);
     assert.equal(blockedRead.session.state, "waiting");
     assert.match(blockedRead.messages[0]?.text ?? "", /codex ready/);
@@ -554,17 +645,24 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
 
     const streamedFrames = [];
     const streamClosed = [];
+    let resolveFirstFrame;
+    let rejectFirstFrame;
+    const firstFrame = new Promise((resolve, reject) => {
+      resolveFirstFrame = resolve;
+      rejectFirstFrame = reject;
+    });
+    void firstFrame.catch(() => {});
+    const frameDeadline = setTimeout(() => rejectFirstFrame(new Error("Herdr fixture did not deliver its initial frame within 3 seconds")), 3_000);
+    t.after(() => clearTimeout(frameDeadline));
     const stream = await adapter.openTerminalStream(created.session.id, {
       mode: "control",
       cols: 96,
       rows: 31,
     }, {
-      frame: (frame) => streamedFrames.push(frame),
-      closed: (reason) => streamClosed.push(reason),
+      frame: (frame) => { streamedFrames.push(frame); resolveFirstFrame(frame); },
+      closed: (reason) => { streamClosed.push(reason); rejectFirstFrame(new Error(`Herdr fixture closed before its initial frame: ${reason}`)); },
     });
-    for (let attempt = 0; attempt < 40 && streamedFrames.length === 0; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    await firstFrame.finally(() => clearTimeout(frameDeadline));
     assert.equal(Buffer.from(streamedFrames[0].bytes, "base64").toString(), "\u001b[2Jstream ready");
     assert.equal(streamedFrames[0].encoding, "ansi-base64");
     stream.input("\u0003中文");
@@ -629,14 +727,6 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
       "--permission-mode", "acceptEdits", "--resume", "provider-native-claude-secret",
     ]);
     await adapter.remove(recoveredClaude.session.id);
-  } finally {
-    if (existsSync(statePath)) {
-      const state = JSON.parse(readFileSync(statePath, "utf8"));
-      if (Number.isSafeInteger(state.serverPid) && state.serverPid > 1) {
-        try { process.kill(state.serverPid, "SIGTERM"); } catch {}
-      }
-    }
-    rmSync(root, { recursive: true, force: true });
   }
 });
 
