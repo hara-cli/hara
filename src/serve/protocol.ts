@@ -22,7 +22,7 @@
 //                                                   params.deliveryCursor:{streamId,sequence}. Private terminal
 //                                                   stream frames keep their stream-specific snapshot contract.
 //   events.snapshot   {sessionIds:[…]}             → {streamId,throughSequence,taskStates,workforceStates,
-//                                                    externalTurns,approvals}; a bounded authoritative recovery
+//                                                    externalTurns,externalQuestions,approvals}; a bounded authoritative recovery
 //                                                    fence. Clients apply it before buffered events newer than
 //                                                    throughSequence, so reconnect never depends on replay alone.
 //   session.list      {cwd?,cursor?,limit?,archived?} → {sessions:[{id,title,cwd,model,profileId?,updatedAt}],
@@ -44,6 +44,21 @@
 //   external.sessions.steer {sessionId,text,expectedTurnId?,commandId?}
 //                                                   → {sessionId,turnId,accepted:true}
 //   external.sessions.interrupt {sessionId,expectedTurnId?,commandId?} → {}
+//   external.question.request {questionId:UUID,sessionId,turnId,expiresAt,questions:[
+//       {id,header?,question,options?:[{label,description?}],multiSelect?,isOther?,isSecret?}]}
+//   external.question.reply {questionId,sessionId,turnId,answers:{[id]:{answers:string[]}},
+//                            cancelled?,commandId:UUID} → {}
+//   external.question.resolved {questionId,sessionId,turnId,outcome:"answered"|"cancelled"|"timed_out"|"interrupted"}
+//     Requires client-declared external.questions.v1. Questions are NOT execution approvals; no implicit
+//     first choice, secret requests, credential collection, or legacy confirm fallback. Answers remain
+//     memory-only; durable command receipts store only hashes and empty reply results. Snapshot
+//     externalQuestions repeats the full request while pending; stale session/turn/question replies deny.
+//     Last-responder disconnect retains pending questions/approvals for at most 15 seconds within the
+//     same Serve instance, never past their original expiry. Compatible reauthentication clears that
+//     grace; expiry/shutdown deny/cancel without a default. Process restart does not recreate pending input.
+//     Input feature negotiation is captured per submitted turn; a legacy turn cannot gain it later.
+//     Subsequent cards use the current authenticated compatible client, not a disconnected socket.
+//     A new question arriving with no compatible responder is cancelled immediately, never left pending.
 //                      commandId is a client UUID. A private started receipt is durable before the provider
 //                      action; matching terminal results replay across reconnect and Serve restart. A crash
 //                      window blocks mutation until read/resume observes the authoritative provider session
@@ -97,7 +112,8 @@
 //                                                     Root/user posts wake idle members once; Agent posts never do,
 //                                                     preventing autonomous reply loops.
 //   session.agent-rooms.close {sessionId,room,controlLease?} → {sessionId,room}
-//   session.resume    {sessionId,approval?}      → {sessionId,model,profileId,approval,history:[{role,text}]}
+//   session.resume    {sessionId,approval?}      → {sessionId,model,profileId,approval,history:[{role,text}],
+//                                                  pendingApprovals:[{approvalId,question,allowAlways,presentation?}]}
 //                                                    approval only migrates legacy sessions with no saved choice.
 //   session.pause     {sessionId,controlLease?}  → {sessionId,state:"paused",suspensionId,runtimeCursor}
 //                      Flushes the authoritative snapshot before cancellation, drains the root turn, tools,
@@ -151,7 +167,23 @@
 //                      Once a lease is active, session submit/send/steer/interrupt, approval replies, model or
 //                      approval changes, compaction, rewind, and deletion require the exact
 //                      controlLease:{leaseId,epoch}. With no active lease, older local clients remain compatible.
-//   approval.reply    {approvalId,allow,always?,scope?,sessionId?,commandId?,controlLease?} → {}
+//   approval.reply    {approvalId,allow,always?,forTask?,scope?,sessionId?,commandId?,controlLease?} → {} or {taskApprovalState}
+//                      `forTask:true` requires task.approvals.v1 negotiated on BOTH the originating turn
+//                      and replying socket, allow:true, scope:"session", sessionId and stable UUID commandId.
+//                      It is mutually exclusive with always:true, invokes only the private live human gate,
+//                      and does not widen independent deny/organization/Computer Use/external safety gates.
+//                      Missing/stale task callbacks conflict; ordinary allow/deny never grant a task scope.
+//                      Grants are in-memory, exact execution/Agent/project/family, bounded to 15 minutes,
+//                      revoked on execution end, cancel, policy/control change, last disconnect or shutdown.
+//                      They are never recovered across restart, resume or /continue.
+//   session.task-approval.revoke {sessionId,commandId,controlLease?} → {taskApprovalState}
+//                      Ownership-validated, idempotent revocation of all task grants for this session.
+//   event.task_approval_state {sessionId,active,toolFamilies:["bash"|"python"|"file-change"],expiresAt?,canRevoke}
+//                      Read-only safe state derived from live grant validity (not durable authority).
+//                      Negotiated foreground pending cards expose allowForTask:true, actual request
+//                      expiresAt and taskApproval:{summary,toolFamily,durationMs}; never callback/writer.
+//                      events.snapshot.taskApprovalStates is an array of {sessionId,...state};
+//                      session.resume.taskApprovalState is the same state object without sessionId.
 //                      `always` persists only when allow=true and the engine declared a project scope.
 //                      New clients send scope + sessionId + a stable UUID commandId; Hara saves a started/result
 //                      receipt before/after applying the decision so reconnect retries cannot flip or repeat it.
@@ -295,7 +327,11 @@
 //   event.text {delta} · event.tool {name,preview} · event.diff {text}
 //   event.notice {text,category?:"output"} · event.surface {kind,title,resource} · event.turn_end
 //     {reply,usage:{input,output,requests,lastInput,cachedInput?,reasoningOutput?},error?,status?,stopReason?}
-//   approval.request {approvalId,question,allowAlways}
+//   approval.request {approvalId,question,allowAlways,presentation?}
+//     presentation:{kind:"agent-create",username,name,role,description,instructions} is a foreground
+//     single-use creation review. It grants no execution authority and is restored in events.snapshot
+//     approvals, never in ambient event.task_state. Older clients can review the full question instead.
+//   event.agents_changed {sessionId} → refresh the current authorized Agent catalog after creation
 //   event.task_state {version,streamId,sequence,taskId,turnId,objective,state,taskStatus,phase,checkpoint,…}
 //                     authoritative execution plane; clients feature-detect it via capabilities.events.
 //   event.runtime_item {taskId,turnId,itemId,kind,state,parentItemId?,role?,name?,effect?,provider?,model?,

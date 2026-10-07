@@ -5,6 +5,7 @@
 // (no import cycle back into the CLI entry).
 import { WebSocketServer, type WebSocket } from "ws";
 import { randomBytes, randomUUID, timingSafeEqual, createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import {
   closeSync,
   constants as fsConstants,
@@ -24,7 +25,8 @@ import { homedir, platform } from "node:os";
 import { basename, isAbsolute, join, relative, sep } from "node:path";
 import "../tools/all.js"; // register the full built-in toolset — serve must work as a standalone entry
 import { pruneStoredToolResults } from "../tools/result-limit.js";
-import type { Tool } from "../tools/registry.js";
+import type { AgentCreationApproval, Tool } from "../tools/registry.js";
+import { createAgentCreationTool } from "./agent-creator.js";
 import { createServeRuntimeLogger, serveRuntimeFailureCategory } from "./runtime-log.js";
 import { runAgent, type RunOpts, type RunProgressEvent, type RunRuntimeItemEvent } from "../agent/loop.js";
 import {
@@ -86,6 +88,7 @@ import type {
   DecisionSettingsTestInput,
   DecisionSettingsTestResult,
 } from "../decision-settings.js";
+import type { LayaRuntimeState } from "../decision/laya.js";
 import type {
   WeChatGroupDraft,
   WeChatGroupFillResult,
@@ -99,6 +102,7 @@ import type {
   WeChatGroupSendResult,
 } from "../wechat-group-scene.js";
 import { wrapUntrusted } from "../security/external-content.js";
+import { createTaskApprovalStore, MAX_TASK_APPROVAL_TTL_MS, type TaskApprovalFamily } from "../security/task-approvals.js";
 import type { SandboxMode } from "../sandbox.js";
 import { loadAgentContext } from "../context/agents-md.js";
 import {
@@ -325,7 +329,14 @@ import {
   type ExternalSessionService,
   type ExternalSessionSourceId,
   type ExternalTerminalStream,
+  type ExternalUserQuestionAnswers,
+  type ExternalUserQuestionRequest,
 } from "../external-sessions/types.js";
+import {
+  EXTERNAL_USER_QUESTIONS_FEATURE,
+  normalizeExternalUserQuestions,
+  validateExternalUserAnswers,
+} from "../external-sessions/questions.js";
 
 export interface ServeScreenshotContext {
   cwd: string;
@@ -390,6 +401,7 @@ export interface ServeDeps {
   decisionSettings?: (cwd?: string) => DecisionSettingsState;
   saveDecisionSettings?: (input: DecisionSettingsInput, cwd?: string) => DecisionSettingsState;
   testDecisionSettings?: (input: DecisionSettingsTestInput, cwd?: string) => Promise<DecisionSettingsTestResult>;
+  prepareDecisionRuntime?: (confirmed: boolean) => LayaRuntimeState;
   /** Local-only WeChat group assistant. Assist mode keeps filling as a user click. Managed mode can send
    * only after an explicit per-attachment confirmation, a bound conversation, and the controller's local
    * trigger/rate/deduplication checks; the renderer never receives a screenshot. */
@@ -600,6 +612,10 @@ export interface ServeDeps {
   sandbox: SandboxMode;
   approval: ApprovalMode;
   store?: SessionStore; // tests inject a hermetic store
+  /** Host/test policy may shorten (never extend) the five-minute external question expiry. */
+  externalUserQuestionTimeoutMs?: number;
+  /** Host/test policy may shorten (never extend) the 15-second same-instance input reconnect grace. */
+  pendingInputReconnectGraceMs?: number;
   quietDiscovery?: boolean; // tests: skip ~/.hara/serve.json
   discoveryHome?: string; // tests: isolate the discovery file from the real home directory
   artifactHome?: string; // tests/embedders: isolate ~/.hara/artifacts from the real home directory
@@ -2142,7 +2158,107 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     scope: "session" | "external";
     sessionId: string;
     question: string;
+    presentation?: AgentCreationApproval;
+    expiresAt?: string;
+    deadlineMonotonic?: number;
+    taskApproval?: {
+      summary: string; toolFamily: TaskApprovalFamily; durationMs: number;
+      grantFromHuman: () => boolean; isActive: () => boolean; isCurrent: () => boolean;
+      agentId: string;
+      owner: WebSocket;
+    };
   }>();
+  // Authority is process-local and host-generated. No restored task, persona, tool input or transcript
+  // can populate this store, a pending grant callback, or a root/child execution identity.
+  const taskApprovalStore = createTaskApprovalStore();
+  let taskAuthorizationEpoch = 0;
+  const taskSessionEpochs = new Map<string, number>();
+  const activeTaskExecutions = new Map<string, string>();
+  const taskExecutionOwners = new Map<string, WebSocket>();
+  const activeTaskApprovalOffers = new Map<string, Array<{
+    agentId: string; toolFamily: TaskApprovalFamily; deadlineMonotonic: number; isActive: () => boolean;
+  }>>();
+  const taskApprovalTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const taskApprovalState = (sessionId: string): {
+    active: boolean; toolFamilies: TaskApprovalFamily[]; expiresAt?: string; canRevoke: boolean;
+  } => {
+    const previousOffers = activeTaskApprovalOffers.get(sessionId) ?? [];
+    let offers = previousOffers.filter((offer) => {
+      try { return offer.isActive() === true; } catch { return false; }
+    });
+    if (offers.length !== previousOffers.length) {
+      // A callback verifies the original operation's gates as well as the grant. Losing that proof must
+      // not merely hide UI state while another command in the family still sees the private store grant.
+      taskApprovalStore.revokeSession(sessionId);
+      taskSessionEpochs.set(sessionId, (taskSessionEpochs.get(sessionId) ?? 0) + 1);
+      for (const approval of pendingApprovals.values()) {
+        if (approval.scope === "session" && approval.sessionId === sessionId) delete approval.taskApproval;
+      }
+      offers = [];
+    }
+    if (offers.length) activeTaskApprovalOffers.set(sessionId, offers);
+    else activeTaskApprovalOffers.delete(sessionId);
+    return {
+      active: offers.length > 0,
+      toolFamilies: [...new Set(offers.map((offer) => offer.toolFamily))],
+      ...(offers.length ? { expiresAt: new Date(Date.now() + Math.max(0,
+        Math.min(...offers.map((offer) => offer.deadlineMonotonic)) - performance.now())).toISOString() } : {}),
+      canRevoke: offers.length > 0,
+    };
+  };
+  const publishTaskApprovalState = (sessionId: string): void => {
+    const state = taskApprovalState(sessionId);
+    // Safe status only: never commands, paths, approval answers or authority-bearing callbacks.
+    broadcast("event.task_approval_state", { sessionId, ...state });
+    const previous = taskApprovalTimers.get(sessionId);
+    if (previous) clearTimeout(previous);
+    taskApprovalTimers.delete(sessionId);
+    if (state.active && !closing) {
+      const deadline = Math.min(...(activeTaskApprovalOffers.get(sessionId) ?? []).map((offer) => offer.deadlineMonotonic));
+      const timer = setTimeout(() => publishTaskApprovalState(sessionId), Math.max(1, deadline - performance.now()));
+      timer.unref();
+      taskApprovalTimers.set(sessionId, timer);
+    }
+  };
+  const revokeTaskApprovals = (sessionId?: string): void => {
+    const affected = sessionId ? [sessionId] : [...new Set([
+      ...activeTaskApprovalOffers.keys(), ...activeTaskExecutions.keys(),
+      ...[...pendingApprovals.values()].filter((approval) => approval.taskApproval).map((approval) => approval.sessionId),
+    ])];
+    if (sessionId) {
+      taskSessionEpochs.set(sessionId, (taskSessionEpochs.get(sessionId) ?? 0) + 1);
+      taskApprovalStore.revokeSession(sessionId);
+    } else {
+      taskAuthorizationEpoch += 1;
+      taskApprovalStore.clear();
+    }
+    for (const target of affected) {
+      activeTaskApprovalOffers.delete(target);
+      for (const approval of pendingApprovals.values()) {
+        if (approval.scope === "session" && approval.sessionId === target) delete approval.taskApproval;
+      }
+      publishTaskApprovalState(target);
+    }
+  };
+  const pendingTaskApprovalForClient = (ws: WebSocket, approval: (typeof pendingApprovals extends Map<string, infer T> ? T : never)) => {
+    const offer = approval.taskApproval;
+    if (!clientFeatures.get(ws)?.has("task.approvals.v1") || !offer || !approval.expiresAt
+      || offer.owner !== ws
+      || !approval.deadlineMonotonic || approval.deadlineMonotonic <= performance.now()) return {};
+    try { if (!offer.isCurrent()) return {}; } catch { return {}; }
+    return { allowForTask: true as const, expiresAt: approval.expiresAt,
+      taskApproval: { summary: offer.summary, toolFamily: offer.toolFamily, durationMs: offer.durationMs } };
+  };
+  interface PendingExternalQuestion {
+    sessionId: string;
+    turnId: string;
+    expiresAt: string;
+    request: ExternalUserQuestionRequest;
+    finish: (answers: ExternalUserQuestionAnswers, outcome: "answered" | "cancelled" | "timed_out" | "interrupted") => void;
+  }
+  const pendingExternalQuestions = new Map<string, PendingExternalQuestion>();
+  let approvalReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let questionReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   const inFlightRequests = new Set<Promise<void>>();
   const sessionSubmissionTails = new Map<string, Promise<void>>();
   const automationRuns = new Map<AbortController, ReturnType<typeof runJobTracked>>();
@@ -2330,6 +2446,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     automationRuns.size > 0 ||
     activeOperations.size > 0 ||
     pendingApprovals.size > 0 ||
+    pendingExternalQuestions.size > 0 ||
     hub.active().some((session) =>
       session.busy ||
       session.configuring ||
@@ -2471,6 +2588,108 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   // Adapter turn identifiers never cross Serve. Keep the one active wire id per opaque session so a
   // follow-up (`steer`) is correlated with the same stream that Desktop is already rendering.
   const externalWireTurns = new Map<string, string>();
+  const externalQuestionForClient = (questionId: string, pending: PendingExternalQuestion) => ({
+    questionId,
+    sessionId: pending.sessionId,
+    turnId: pending.turnId,
+    expiresAt: pending.expiresAt,
+    questions: pending.request.questions,
+  });
+  const cancelExternalQuestions = (sessionId?: string, turnId?: string): void => {
+    for (const pending of [...pendingExternalQuestions.values()]) {
+      if ((sessionId === undefined || pending.sessionId === sessionId) && (turnId === undefined || pending.turnId === turnId)) {
+        pending.finish({}, "interrupted");
+      }
+    }
+  };
+  const clearPendingInputReconnectTimers = (): void => {
+    if (approvalReconnectTimer) clearTimeout(approvalReconnectTimer);
+    if (questionReconnectTimer) clearTimeout(questionReconnectTimer);
+    approvalReconnectTimer = null;
+    questionReconnectTimer = null;
+  };
+  const reconcilePendingInputReconnect = (): void => {
+    if (closing) return clearPendingInputReconnectTimers();
+    const graceMs = typeof deps.pendingInputReconnectGraceMs === "number" && Number.isFinite(deps.pendingInputReconnectGraceMs)
+      ? Math.max(1, Math.min(15_000, Math.trunc(deps.pendingInputReconnectGraceMs))) : 15_000;
+    // A reconnect authenticates with this Serve's token; it does not inherit a terminal/control lease.
+    // Retaining the unchanged pending request during this short grace never approves or answers it.
+    if (authed.size > 0 || pendingApprovals.size === 0) {
+      if (approvalReconnectTimer) clearTimeout(approvalReconnectTimer);
+      approvalReconnectTimer = null;
+    } else if (!approvalReconnectTimer) {
+      approvalReconnectTimer = setTimeout(() => {
+        approvalReconnectTimer = null;
+        if (authed.size === 0) {
+          for (const approval of [...pendingApprovals.values()]) approval.finish(false, "interrupted");
+        }
+      }, graceMs);
+      approvalReconnectTimer.unref();
+    }
+    const hasQuestionResponder = externalSessionSpaceId() === "personal"
+      && [...authed].some((client) => clientFeatures.get(client)?.has(EXTERNAL_USER_QUESTIONS_FEATURE));
+    if (hasQuestionResponder || pendingExternalQuestions.size === 0) {
+      if (questionReconnectTimer) clearTimeout(questionReconnectTimer);
+      questionReconnectTimer = null;
+    } else if (!questionReconnectTimer) {
+      questionReconnectTimer = setTimeout(() => {
+        questionReconnectTimer = null;
+        if (externalSessionSpaceId() !== "personal"
+          || ![...authed].some((client) => clientFeatures.get(client)?.has(EXTERNAL_USER_QUESTIONS_FEATURE))) cancelExternalQuestions();
+      }, graceMs);
+      questionReconnectTimer.unref();
+    }
+  };
+  const askExternalUser = (
+    originallyNegotiated: boolean,
+    sessionId: string,
+    turnId: string,
+    request: ExternalUserQuestionRequest,
+    signal: AbortSignal,
+  ): Promise<ExternalUserQuestionAnswers> => {
+    // Cancelling a pending form can let the provider ask its next question in the same microtask turn.
+    // Shutdown must not admit a new form before adapter.close has delivered its cancellation signal.
+    if (closing) return Promise.resolve({});
+    const normalized = normalizeExternalUserQuestions(request);
+    const hasCompatibleResponder = [...authed].some((client) => clientFeatures.get(client)?.has(EXTERNAL_USER_QUESTIONS_FEATURE));
+    if (!normalized || !originallyNegotiated || !hasCompatibleResponder
+      || signal.aborted || externalWireTurns.get(sessionId) !== turnId || externalSessionSpaceId() !== "personal") {
+      broadcast("external.event.notice", {
+        sessionId, turnId, text: "User input cannot be safely collected by this client; no answer was selected. Update Hara or use the original terminal.",
+      });
+      return Promise.resolve({});
+    }
+    return new Promise((resolve) => {
+      const questionId = randomUUID();
+      let settled = false;
+      const timeoutMs = typeof deps.externalUserQuestionTimeoutMs === "number" && Number.isFinite(deps.externalUserQuestionTimeoutMs)
+        ? Math.max(1, Math.min(APPROVAL_TIMEOUT_MS, Math.trunc(deps.externalUserQuestionTimeoutMs)))
+        : APPROVAL_TIMEOUT_MS;
+      const expiresAt = new Date(Date.now() + timeoutMs).toISOString();
+      const finish: PendingExternalQuestion["finish"] = (answers, outcome) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        pendingExternalQuestions.delete(questionId);
+        if (pendingExternalQuestions.size === 0 && questionReconnectTimer) {
+          clearTimeout(questionReconnectTimer);
+          questionReconnectTimer = null;
+        }
+        broadcast("external.question.resolved", { questionId, sessionId, turnId, outcome });
+        resolve(answers);
+      };
+      const onAbort = (): void => finish({}, "interrupted");
+      const timer = setTimeout(() => finish({}, "timed_out"), timeoutMs);
+      timer.unref();
+      const pending: PendingExternalQuestion = { sessionId, turnId, expiresAt, request: normalized, finish };
+      pendingExternalQuestions.set(questionId, pending);
+      reconcilePendingInputReconnect();
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+      else broadcast("external.question.request", externalQuestionForClient(questionId, pending));
+    });
+  };
   const confirmExternalSessionAction = (
     sessionId: string,
     question: string,
@@ -2485,6 +2704,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       settled = true;
       clearTimeout(timer);
       pendingApprovals.delete(approvalId);
+      if (pendingApprovals.size === 0 && approvalReconnectTimer) {
+        clearTimeout(approvalReconnectTimer);
+        approvalReconnectTimer = null;
+      }
       signal.removeEventListener("abort", onAbort);
       resolve(value);
     };
@@ -2492,6 +2715,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     timer = setTimeout(() => finish(false), APPROVAL_TIMEOUT_MS);
     timer.unref();
     pendingApprovals.set(approvalId, { finish, allowAlways, scope: "external", sessionId, question });
+    reconcilePendingInputReconnect();
     if (signal.aborted) finish(false);
     else {
       signal.addEventListener("abort", onAbort, { once: true });
@@ -2935,6 +3159,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       throw error;
     }
     publishSuspensionItem(session, suspension, "started");
+    revokeTaskApprovals(session.meta.id);
     for (const approval of [...pendingApprovals.values()]) {
       if (approval.scope === "session" && approval.sessionId === session.meta.id) {
         approval.finish(false, "interrupted");
@@ -3069,6 +3294,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     attachments: ValidatedSessionAttachments = { images: [], contexts: [], views: [] },
     forceNewTask = false,
     displayText = text,
+    taskApprovalsNegotiated = false,
+    taskApprovalOwner?: WebSocket,
   ): Promise<{
     reply: string;
     usage: {
@@ -3086,6 +3313,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     stopReason?: "deadline" | "task_round_budget" | "max_rounds" | "strategy_stall" | "no_progress" | "repeat_loop";
   }> => {
     const sessionId = s.meta.id;
+    // Continuing or replacing a logical task never resumes prior execution grants.
+    revokeTaskApprovals(sessionId);
+    let taskExecution: { agentId: string; isCurrent: () => boolean } | undefined;
     const runtimeStartedAt = Date.now();
     const spaceBinding = sessionSpaceBinding(s.meta);
     bindSafeLegacyPersonalSession(s, spaceBinding);
@@ -3224,12 +3454,28 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     const confirm = (
       q: string,
       signal: AbortSignal = turnAbort.signal,
-      options: { allowAlways?: boolean } = {},
+      options: { allowAlways?: boolean; presentation?: AgentCreationApproval; taskApproval?: {
+        summary: string; toolFamily: TaskApprovalFamily; durationMs: number;
+        grantFromHuman: () => boolean; isActive: () => boolean;
+      } } = {},
     ): Promise<boolean | "always"> =>
       new Promise((resolve) => {
+        if (closing || signal.aborted) { resolve(false); return; }
         const approvalId = randomUUID();
         const allowAlways = options.allowAlways === true;
+        const presentation = options.presentation;
         const taskIdentity = s.task ? { taskId: s.task.id, turnId: s.task.turnId } : undefined;
+        const execution = taskExecution;
+        const candidate = options.taskApproval;
+        const taskApproval = taskApprovalsNegotiated && execution?.isCurrent()
+          && s.approval !== "full-auto" && !presentation
+          && candidate && typeof candidate.summary === "string" && candidate.summary.length <= 1000
+          && ["bash", "python", "file-change"].includes(candidate.toolFamily)
+          && Number.isSafeInteger(candidate.durationMs) && candidate.durationMs > 0 && candidate.durationMs <= MAX_TASK_APPROVAL_TTL_MS
+          && typeof candidate.grantFromHuman === "function" && typeof candidate.isActive === "function"
+          && taskApprovalOwner ? { ...candidate, agentId: execution.agentId, owner: taskApprovalOwner, isCurrent: execution.isCurrent } : undefined;
+        const expiresAt = new Date(Date.now() + APPROVAL_TIMEOUT_MS).toISOString();
+        const deadlineMonotonic = performance.now() + APPROVAL_TIMEOUT_MS;
         let settled = false;
         let requestRegistered = false;
         let timer: ReturnType<typeof setTimeout>;
@@ -3241,6 +3487,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           settled = true;
           clearTimeout(timer);
           pendingApprovals.delete(approvalId);
+          if (pendingApprovals.size === 0 && approvalReconnectTimer) {
+            clearTimeout(approvalReconnectTimer);
+            approvalReconnectTimer = null;
+          }
           signal.removeEventListener("abort", onAbort);
           if (requestRegistered && taskIdentity) {
             hub.recordApprovalState({
@@ -3263,7 +3513,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         };
         const onAbort = (): void => finish(false, "interrupted");
         timer = setTimeout(() => finish(false, "timed_out"), APPROVAL_TIMEOUT_MS); // unanswered → deny, turn continues
-        pendingApprovals.set(approvalId, { finish, allowAlways, scope: "session", sessionId, question: q });
+        const pendingApproval = { finish, allowAlways, scope: "session" as const, sessionId, question: q, expiresAt, deadlineMonotonic,
+          ...(presentation ? { presentation } : {}), ...(taskApproval ? { taskApproval } : {}) };
+        pendingApprovals.set(approvalId, pendingApproval);
+        reconcilePendingInputReconnect();
         if (signal.aborted) finish(false);
         else {
           // `signal` composes the owning turn cancellation with runAgent's lifecycle cancellation. Listening
@@ -3282,10 +3535,19 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           emitTaskState({
             state: "waiting",
             phase: "approval",
-            detail: q,
-            approval: { id: approvalId, question: q, allowAlways },
+            detail: presentation ? `Create Agent ${presentation.name}` : q,
+            // Proposed standing instructions belong to foreground review, never ambient task telemetry.
+            approval: { id: approvalId, question: presentation ? `Create Agent ${presentation.name}` : q, allowAlways },
           });
-          broadcast("approval.request", { sessionId, approvalId, question: q, allowAlways });
+          // Legacy observers receive an ordinary card, never a task-grant affordance. The independent
+          // reply guard also requires the negotiated feature and exact live private callback.
+          const params = { sessionId, approvalId, question: q, allowAlways, ...(presentation ? { presentation } : {}) };
+          const { frame, cursor } = eventReplay.publish("approval.request", params);
+          for (const client of authed) {
+            const taskFields = pendingTaskApprovalForClient(client, pendingApproval);
+            sendBoundedSocketFrame(client, Object.keys(taskFields).length
+              ? rpcNotify("approval.request", { ...params, ...taskFields, deliveryCursor: cursor }) : frame);
+          }
         }
       });
     let stopTodoEvents = (): void => {};
@@ -3344,6 +3606,27 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         : undefined;
       sessionSpaceBinding(s.meta);
       const sessionRoleToolFilter = roleToolFilter(sessionRole);
+      const agentCreationTool = !s.meta.agentRef && s.meta.spaceId === "personal"
+        ? createAgentCreationTool({
+            assertPersonalRoot: () => {
+              if (s.meta.agentRef || sessionSpaceBinding(s.meta).spaceId !== "personal") {
+                throw new Error("Only the main Hara conversation in Personal Space can create a personal Bot.");
+              }
+            },
+            create: async (input) => {
+              const binding = sessionSpaceBinding(s.meta);
+              if (s.meta.agentRef || binding.spaceId !== "personal") throw new Error("Personal root authority is no longer available.");
+              const catalog = serveAgentCatalog(s.meta.cwd, binding.profileId, binding.spaceId);
+              const ref = `global:${input.id}`;
+              const existing = catalog.agents.find((agent) => agent.ref === ref || agent.name.toLowerCase() === input.id);
+              if (existing) return { ref: existing.ref, name: existing.identity.displayName, created: false };
+              if (catalog.dismissedAgentRefs.includes(ref)) throw new Error("This username belongs to a dismissed Agent. Restore that colleague explicitly or choose another username; its instructions and history will not be overwritten.");
+              const created = await createNativeGlobalAgent(input);
+              broadcast("event.agents_changed", { sessionId });
+              return { ref, name: created.identity.displayName, created: true };
+            },
+          })
+        : undefined;
       const agentContactTool: Tool | undefined = s.meta.agentRef ? undefined : {
         name: "agent_contact",
         description:
@@ -3592,7 +3875,33 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       });
       let outcome;
       do {
+        const agentId = randomUUID();
+        const epoch = taskAuthorizationEpoch;
+        const sessionEpoch = taskSessionEpochs.get(sessionId) ?? 0;
+        const taskId = s.task?.id;
+        const turnId = s.task?.turnId;
+        const policyFingerprint = (): string => {
+          const binding = sessionSpaceBinding(s.meta);
+          const role = roleForSession(s);
+          return JSON.stringify([binding.profileId, binding.spaceId, binding.runtime.profileKind,
+            binding.runtime.organizationProfileId, s.approval, [...s.autoApprove].sort(), s.meta.model,
+            s.effort, deps.sandbox, role?.organizationPolicyVersion, role?.readOnly]);
+        };
+        const policy = policyFingerprint();
+        const isCurrent = (): boolean => {
+          if (closing || turnAbort.signal.aborted || hub.get(sessionId) !== s || s.abort !== turnAbort
+            || activeTaskExecutions.get(sessionId) !== agentId || taskAuthorizationEpoch !== epoch
+            || (taskSessionEpochs.get(sessionId) ?? 0) !== sessionEpoch || !taskApprovalOwner || !authed.has(taskApprovalOwner)
+            || taskApprovalOwner.readyState !== taskApprovalOwner.OPEN
+            || s.task?.id !== taskId || s.task?.turnId !== turnId || s.task?.status !== "running") return false;
+          try { return policyFingerprint() === policy; } catch { return false; }
+        };
+        activeTaskExecutions.set(sessionId, agentId);
+        if (taskApprovalOwner) taskExecutionOwners.set(sessionId, taskApprovalOwner);
+        taskExecution = { agentId, isCurrent };
+        try {
         outcome = await runAgent(s.history, {
+        ...(taskApprovalsNegotiated ? { taskApprovals: { agentId, store: taskApprovalStore, isCurrent } } : {}),
         provider: s.provider,
         organizationPolicyVersion: sessionRolePolicyVersion,
         ctx: {
@@ -3634,6 +3943,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             ...(s.task?.turnId ? { parentTurnId: s.task.turnId, rootTurnId: s.task.turnId } : {}),
           }),
           ui: sink,
+          toolImageMode: (imageProvider) => {
+            sessionSpaceBinding(s.meta);
+            const runtime = runtimeInfo(s.meta.cwd, s.meta.model, s.meta.profileId, s.meta.spaceId);
+            const mode = runtime.attachmentCapabilities?.image.mode;
+            return mode === "vision-sidecar" ? "inspect"
+              : mode === "native" && imageProvider.supportsToolImages === true ? "native" : "unavailable";
+          },
           inspectImage: async (image, hint, signal) => {
             sessionSpaceBinding(s.meta);
             const runtime = runtimeInfo(s.meta.cwd, s.meta.model, s.meta.profileId, s.meta.spaceId);
@@ -3717,7 +4033,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         ...(sessionRole ? { systemOverride: sessionRole.system } : {}),
         ...(sessionRoleToolFilter ? { toolFilter: sessionRoleToolFilter } : {}),
         ...(sessionRole?.readOnly ? { hooks: false } : {}),
-        ...(agentContactTool ? { extraTools: [agentContactTool] } : {}),
+        extraTools: [agentContactTool, agentCreationTool].filter((tool): tool is Tool => Boolean(tool)),
         ...(slashSkillPolicy ? { skillPolicies: [slashSkillPolicy] } : {}),
         taskIntake: {
           task: s.task,
@@ -3787,6 +4103,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         guardian: turnGuardian,
         ...(deps.runLimits?.(s.meta.cwd) ?? {}),
         });
+        } finally {
+          taskApprovalStore.revokeTask({ sessionId, taskId: taskId ?? "", agentId });
+          if (activeTaskExecutions.get(sessionId) === agentId) activeTaskExecutions.delete(sessionId);
+          taskExecutionOwners.delete(sessionId);
+          taskExecution = undefined;
+          publishTaskApprovalState(sessionId);
+        }
         // A steer may land after the agent's final in-loop drain but before the logical turn returns. Keep
         // it in the same task/run instead of making the client retry it as an unrelated session.send.
         const trailing = materializePendingSteering(s);
@@ -3913,6 +4236,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       });
       throw error;
     } finally {
+      revokeTaskApprovals(sessionId);
+      activeTaskExecutions.delete(sessionId);
+      taskExecutionOwners.delete(sessionId);
       stopTodoEvents();
       s.abort = null;
       s.busy = s.pendingProviderTurns > 0 || s.pendingToolRuns > 0;
@@ -4292,6 +4618,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     | "external.sessions.interrupt"
     | "external.sessions.terminal.input"
     | "external.sessions.terminal.key"
+    | "external.question.reply"
     | "approval.reply";
 
   const externalCommandFromOutcome = (outcome: RemoteCommandOutcome): unknown => {
@@ -4476,6 +4803,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       expectedEffort?: string;
     },
     deferStartedResult = false,
+    taskApprovalsNegotiated = false,
+    taskApprovalOwner?: WebSocket,
   ): Promise<SubmitDecision> => {
     if (s.meta.serveSuspension) {
       return {
@@ -4583,7 +4912,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       // before mutation: start_or_steer follows the then-current state; strict steer keeps its turn guard.
       state = routingState();
       if (input.mode === "start_or_steer" && !state.occupied) {
-        const completion = runTurn(s, text);
+        const completion = runTurn(s, text, undefined, false, text, taskApprovalsNegotiated, taskApprovalOwner);
         if (deferStartedResult) return { submission: "starting", completion };
         const result = await completion;
         return { submission: "started", ...result };
@@ -4647,7 +4976,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     const effectiveText = text.trim()
       ? text
       : "Please inspect the attached context and tell me what you find.";
-    const completion = runTurn(s, effectiveText, validated, input.newTask === true, text);
+    const completion = runTurn(s, effectiveText, validated, input.newTask === true, text, taskApprovalsNegotiated, taskApprovalOwner);
     if (deferStartedResult) return { submission: "starting", completion };
     const result = await completion;
     return { submission: "started", ...result };
@@ -4821,6 +5150,23 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         const { req } = parsed;
         const id = req.id ?? null;
         const reply = (frame: string): void => {
+          // Successful host mutations invalidate live grants and pending task choices immediately.
+          // Read/test RPCs do not. Ordinary approvals remain usable; physical desktop leases are separate.
+          const policyMutations = new Set([
+            "plugins.set", "agents.update-profile", "agents.create", "agents.archive", "spaces.use",
+            "settings.computer.save", "settings.decision.save", "settings.vision.save", "settings.providers.save",
+            "settings.providers.connections.create", "settings.providers.connections.use", "settings.providers.connections.remove",
+            "settings.providers.failover.save", "settings.profiles.unpin", "settings.gateways.credentials.save",
+            "settings.gateways.credentials.remove", "settings.gateways.authorization.approve", "settings.gateways.start",
+            "settings.gateways.stop", "settings.organizations.enroll", "settings.organizations.use",
+            "settings.organizations.remove", "settings.organizations.check",
+          ]);
+          if (policyMutations.has(req.method)) {
+            try { if (Object.hasOwn(JSON.parse(frame), "result")) revokeTaskApprovals(); } catch { /* not a success */ }
+          } else if (["session.set-model", "session.set-approval", "session.delete", "session.rewind", "session.compact"].includes(req.method)
+            && typeof p.sessionId === "string") {
+            try { if (Object.hasOwn(JSON.parse(frame), "result")) revokeTaskApprovals(p.sessionId); } catch { /* not a success */ }
+          }
           if (id !== null) sendBoundedSocketFrame(ws, frame);
         };
         const p = (req.params ?? {}) as Record<string, any>;
@@ -4840,6 +5186,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               )).slice(0, 64)
             : [];
           clientFeatures.set(ws, new Set(declaredFeatures));
+          reconcilePendingInputReconnect();
           runtimeLog("client.authenticated", { method: "initialize" });
           // capability negotiation (codex app-server pattern): the server ADVERTISES its method set so
           // clients feature-detect up front instead of probing for -32601 per call. `p.capabilities`
@@ -4849,7 +5196,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "events.replay", "events.ack", "events.snapshot",
             "session.list", "session.create", "session.resume", "session.pause", "session.migration.prepare", "session.migration.resume", "session.history", "session.runtime.replay", "session.agents.list", "session.agents.spawn", "session.agents.message", "session.agents.interrupt", "session.agent-rooms.create", "session.agent-rooms.read", "session.agent-rooms.post", "session.agent-rooms.close", "session.submit", "session.send", "session.steer", "session.interrupt", "session.control.acquire", "session.control.release", "session.set-model", "session.set-approval",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
-            "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
+            "approval.reply", "session.task-approval.revoke", "external.question.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
             "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.resume", "external.sessions.fork",
             "external.sessions.submit", "external.sessions.steer", "external.sessions.interrupt", "external.sessions.remove",
             "external.sessions.terminal.snapshot", "external.sessions.terminal.input", "external.sessions.terminal.key",
@@ -4938,6 +5285,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           if (deps.decisionSettings && deps.saveDecisionSettings && deps.testDecisionSettings) {
             methods.push("settings.decision.get", "settings.decision.save", "settings.decision.test");
           }
+          if (deps.prepareDecisionRuntime) methods.push("settings.decision.laya.prepare");
           const localWechatGroup = (
             deps.wechatGroupStatus
             && deps.saveWechatGroupSettings
@@ -5006,6 +5354,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sessions.command-idempotency.serve-lifetime.v1",
             "external.sessions.command-idempotency.durable.v2",
             "approval.command-idempotency.v1",
+            "task.approvals.v1",
+            EXTERNAL_USER_QUESTIONS_FEATURE,
             "external.sessions.terminal-mirror.v1",
             "external.sessions.terminal-stream.v2",
             "external.sessions.terminal-input-sequence.v1",
@@ -5016,6 +5366,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           if (deps.spaces && deps.useSpace) features.push("spaces.tenant-boundary.v1");
           if (deps.computerSettings && deps.saveComputerSettings) features.push("computer-use.core.v1");
           if (deps.decisionSettings && deps.saveDecisionSettings) features.push("action-guard.settings.v1");
+          if (deps.prepareDecisionRuntime) features.push("action-guard.laya-mlx.v1");
           if (localWechatGroup) features.push("wechat-group.local-agent.v1");
           if (managedWechatGroup) features.push("wechat-group.managed-send.v1");
           if (deps.installCoreBrowser) features.push("browser.structured-core.v1");
@@ -5053,10 +5404,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             capabilities: {
               methods,
               events: [
-                "event.task_state", "event.runtime_item", "event.workforce_state", "event.agent_state", "event.surface", "event.session_changed",
-                "event.control_state", "event.control_revoked",
+                "event.task_state", "event.runtime_item", "event.workforce_state", "event.agent_state", "event.agents_changed", "event.surface", "event.session_changed",
+                "event.control_state", "event.control_revoked", "event.task_approval_state",
                 "external.event.turn_start", "external.event.text", "external.event.tool",
                 "external.event.notice", "external.event.turn_end", "external.approval.request",
+                "external.question.request", "external.question.resolved",
                 "external.event.command_committed", "external.event.command_failed",
                 "external.event.terminal.frame", "external.event.terminal.closed",
                 "external.event.terminal.handoff_requested", "external.event.terminal.handoff_cancelled",
@@ -5189,7 +5541,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                     phase: "approval",
                     approval: {
                       id: pending[0],
-                      question: pending[1].question,
+                      question: pending[1].presentation ? `Create Agent ${pending[1].presentation.name}` : pending[1].question,
                       allowAlways: pending[1].allowAlways,
                     },
                   }
@@ -5206,9 +5558,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               streamId: eventReplay.streamId,
               throughSequence: eventReplay.currentSequence,
               taskStates,
+              ...(clientFeatures.get(ws)?.has("task.approvals.v1") ? {
+                taskApprovalStates: [...requested].map((sessionId) => ({ sessionId, ...taskApprovalState(sessionId) })),
+              } : {}),
               workforceStates: workforceLedger.readAll().filter((state) => requested.has(state.sessionId)),
               externalTurns: externalSessionSpaceId() === "personal"
                 ? [...externalWireTurns].map(([sessionId, turnId]) => ({ sessionId, turnId }))
+                : [],
+              externalQuestions: externalSessionSpaceId() === "personal" && clientFeatures.get(ws)?.has(EXTERNAL_USER_QUESTIONS_FEATURE)
+                ? [...pendingExternalQuestions].map(([questionId, pending]) => externalQuestionForClient(questionId, pending))
                 : [],
               approvals: [...pendingApprovals]
                 .filter(([, approval]) => approval.scope === "session"
@@ -5220,6 +5578,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                   scope: approval.scope,
                   question: approval.question,
                   allowAlways: approval.allowAlways,
+                  ...pendingTaskApprovalForClient(ws, approval),
+                  ...(approval.presentation ? { presentation: approval.presentation } : {}),
                 })),
             }));
           }
@@ -5361,6 +5721,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               });
             }
             if (acquisition.acquired) {
+              revokeTaskApprovals(p.sessionId);
               publishSessionControlState(
                 p.sessionId,
                 "controlled",
@@ -5392,6 +5753,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               throw leaseFailure(error);
             }
             if (released.released) {
+              revokeTaskApprovals(p.sessionId);
               publishSessionControlState(p.sessionId, "released", released.epoch, "released");
             }
             return reply(rpcResult(id!, { sessionId: p.sessionId, ...released }));
@@ -5748,6 +6110,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.PARAMS, "sessionId + text required"));
             }
             const externalSessionId = p.sessionId;
+            // Bind feature consent to the submitting turn, not to a socket that may be replaced by a
+            // compatible authenticated reconnect. A legacy turn never gains input UI retroactively.
+            const userQuestionsNegotiated = clientFeatures.get(ws)?.has(EXTERNAL_USER_QUESTIONS_FEATURE) === true;
             const wireResult = await runIdempotentExternalCommand(
               "external.sessions.submit",
               p,
@@ -5775,6 +6140,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                       signal,
                       request.allowAlways === true,
                     ),
+                    askUser: (request, signal) => askExternalUser(userQuestionsNegotiated, externalSessionId, externalTurnId, request, signal),
                   });
                   const resultForWire = { ...result, turnId: externalTurnId };
                   broadcast("external.event.turn_end", {
@@ -5802,6 +6168,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                   });
                   throw error;
                 } finally {
+                  cancelExternalQuestions(externalSessionId, externalTurnId);
                   if (externalWireTurns.get(externalSessionId) === externalTurnId) {
                     externalWireTurns.delete(externalSessionId);
                   }
@@ -5863,6 +6230,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 ) {
                   throw new SessionCommandRpcError(ERR.CONFLICT, "expectedTurnId does not own the active external turn");
                 }
+                cancelExternalQuestions(p.sessionId);
                 await externalSessions.interrupt(p.sessionId);
                 return {};
               },
@@ -6695,6 +7063,26 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.PARAMS, "approval must be suggest, auto-edit, or full-auto"));
             }
             const live = hub.get(p.sessionId);
+            if (live?.busy && !live.configuring && p.approval === undefined) {
+              // Foreground reconnect recovery is a read of the SAME live execution, not a provider
+              // refresh, resume action, command reconciliation, control takeover or authority import.
+              sessionSpaceBinding(live.meta);
+              return reply(rpcResult(id!, {
+                sessionId: live.meta.id, model: live.meta.model, profileId: live.meta.profileId,
+                spaceId: live.meta.spaceId, approval: live.approval, agentRef: live.meta.agentRef,
+                history: historyForClient(live.history),
+                pendingApprovals: [...pendingApprovals].flatMap(([approvalId, approval]) => (
+                  approval.scope === "session" && approval.sessionId === live.meta.id
+                    ? [{ approvalId, question: approval.question, allowAlways: approval.allowAlways,
+                        ...pendingTaskApprovalForClient(ws, approval),
+                        ...(approval.presentation ? { presentation: approval.presentation } : {}) }]
+                    : []
+                )),
+                ...(clientFeatures.get(ws)?.has("task.approvals.v1") ? { taskApprovalState: taskApprovalState(live.meta.id) } : {}),
+                task: live.task ? { id: live.task.id, objective: live.task.objective, status: live.task.status,
+                  turnId: live.task.turnId, updatedAt: live.task.updatedAt } : undefined,
+              }));
+            }
             if (live?.busy || live?.configuring) return reply(rpcError(id, ERR.BUSY, "session is running or changing configuration — retry resume shortly"));
             const priorMeta = hub.peekMeta(p.sessionId);
             const priorSuspension = live?.meta.serveSuspension ?? priorMeta?.serveSuspension;
@@ -6815,7 +7203,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                   phase: "approval",
                   approval: {
                     id: pendingApproval[0],
-                    question: pendingApproval[1].question,
+                    question: pendingApproval[1].presentation ? `Create Agent ${pendingApproval[1].presentation.name}` : pendingApproval[1].question,
                     allowAlways: pendingApproval[1].allowAlways,
                   },
                 }
@@ -6828,6 +7216,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               approval: r.session.approval,
               agentRef: r.session.meta.agentRef,
               history: historyForClient(r.session.history),
+              ...(clientFeatures.get(ws)?.has("task.approvals.v1") ? { taskApprovalState: taskApprovalState(r.session.meta.id) } : {}),
+              pendingApprovals: [...pendingApprovals].flatMap(([approvalId, approval]) => (
+                approval.scope === "session" && approval.sessionId === r.session.meta.id
+                  ? [{ approvalId, question: approval.question, allowAlways: approval.allowAlways,
+                      ...pendingTaskApprovalForClient(ws, approval),
+                      ...(approval.presentation ? { presentation: approval.presentation } : {}) }]
+                  : []
+              )),
               task: r.session.task ? {
                 id: r.session.task.id,
                 objective: r.session.task.objective,
@@ -7023,6 +7419,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (p.expectedEffort !== undefined && p.expectedModel === undefined) {
               return reply(rpcError(id, ERR.PARAMS, "expectedModel required with expectedEffort"));
             }
+            const taskApprovalsNegotiated = clientFeatures.get(ws)?.has("task.approvals.v1") === true;
             const result = await runIdempotentSessionCommand("session.submit", p, s, async () => {
               authorizeSessionMutation(ws, p.sessionId, p);
               try {
@@ -7035,7 +7432,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                     expectedTurnId: p.expectedTurnId,
                     expectedModel: p.expectedModel,
                     expectedEffort: p.expectedEffort,
-                  }, true));
+                  }, true, taskApprovalsNegotiated, ws));
                 return decision.submission === "starting"
                   ? { submission: "started" as const, ...await decision.completion }
                   : decision;
@@ -7060,6 +7457,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (p.attachments !== undefined && !Array.isArray(p.attachments)) {
               return reply(rpcError(id, ERR.PARAMS, "attachments must be an array"));
             }
+            const taskApprovalsNegotiated = clientFeatures.get(ws)?.has("task.approvals.v1") === true;
             const legacy = await runIdempotentSessionCommand("session.send", p, s, async () => {
               authorizeSessionMutation(ws, p.sessionId, p);
               try {
@@ -7069,7 +7467,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                     attachments: p.attachments,
                     newTask: p.newTask === true,
                     mode: "start_if_idle",
-                  }, true));
+                  }, true, taskApprovalsNegotiated, ws));
                 const result = decision.submission === "starting"
                   ? { submission: "started" as const, ...await decision.completion }
                   : decision;
@@ -7127,6 +7525,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 broadcastTaskState(s, { state: "running", phase: "stopping", detail: "Stopping at a safe boundary" });
               }
               if (s.abort) {
+                revokeTaskApprovals(s.meta.id);
                 runtimeLog("turn.interrupted", { sessionId: s.meta.id, category: "cancelled" });
                 s.abort.abort();
               }
@@ -7134,18 +7533,53 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             });
             return reply(rpcResult(id!, interrupted));
           }
+          case "external.question.reply": {
+            if (externalSessionSpaceId() !== "personal" || !clientFeatures.get(ws)?.has(EXTERNAL_USER_QUESTIONS_FEATURE)) {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "external user questions require a compatible Personal Space client"));
+            }
+            if (!validSessionCommandId(p.questionId) || !validSessionCommandId(p.commandId)
+              || typeof p.sessionId !== "string" || !/^ext_(?:codex|claude|opencode|runtime)_[a-f0-9]{24}$/u.test(p.sessionId)
+              || typeof p.turnId !== "string" || !validSessionCommandId(p.turnId.replace(/^extturn_/u, ""))
+              || (p.cancelled !== undefined && typeof p.cancelled !== "boolean")
+              || !p.answers || typeof p.answers !== "object" || Array.isArray(p.answers)) {
+              return reply(rpcError(id, ERR.PARAMS, "questionId + opaque sessionId + active turnId + answers + commandId required"));
+            }
+            const result = await runIdempotentExternalCommand("external.question.reply", p, p.sessionId, async () => {
+              const pending = pendingExternalQuestions.get(p.questionId);
+              if (!pending || pending.sessionId !== p.sessionId || pending.turnId !== p.turnId
+                || externalWireTurns.get(p.sessionId) !== p.turnId || Date.parse(pending.expiresAt) <= Date.now()) {
+                throw new SessionCommandRpcError(ERR.CONFLICT, "question no longer belongs to this active external turn");
+              }
+              const answers = validateExternalUserAnswers(pending.request, p.answers);
+              if (answers === undefined || (p.cancelled === true && Object.keys(answers).length !== 0)) {
+                throw new SessionCommandRpcError(ERR.PARAMS, "answers must match the question options or permitted custom input");
+              }
+              pending.finish(p.cancelled === true ? {} : answers, p.cancelled === true ? "cancelled" : "answered");
+              return {};
+            });
+            return reply(rpcResult(id!, result));
+          }
           case "approval.reply": {
             if (
               typeof p.approvalId !== "string"
               || typeof p.allow !== "boolean"
               || (p.always !== undefined && typeof p.always !== "boolean")
+              || (p.forTask !== undefined && typeof p.forTask !== "boolean")
             ) {
               return reply(rpcError(id, ERR.PARAMS, "approvalId + boolean allow required"));
             }
-            const finishApproval = (expected?: { scope: "session" | "external"; sessionId: string }): {} => {
+            if (p.forTask === true && (p.allow !== true || p.always === true || p.scope !== "session"
+              || typeof p.sessionId !== "string" || !validSessionCommandId(p.commandId)
+              || !clientFeatures.get(ws)?.has("task.approvals.v1"))) {
+              return reply(rpcError(id, ERR.PARAMS, "task choice requires negotiated task approvals, allow=true, session scope and a UUID commandId; always is mutually exclusive"));
+            }
+            const finishApproval = (expected?: { scope: "session" | "external"; sessionId: string }): Record<string, unknown> => {
               if (expected?.scope === "session") authorizeSessionMutation(ws, expected.sessionId, p);
               const approval = pendingApprovals.get(p.approvalId);
-              if (!approval) return {};
+              if (!approval) {
+                if (p.forTask === true) throw new SessionCommandRpcError(ERR.CONFLICT, "task approval is no longer pending; retry the original commandId or revoke session grants");
+                return {};
+              }
               if (
                 expected
                 && (approval.scope !== expected.scope || approval.sessionId !== expected.sessionId)
@@ -7153,7 +7587,35 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 throw new SessionCommandRpcError(ERR.CONFLICT, "approval no longer belongs to the requested session");
               }
               if (!expected && approval.scope === "session") authorizeSessionMutation(ws, approval.sessionId, p);
+              if (p.forTask === true) {
+                const offer = approval.taskApproval;
+                if (offer && offer.owner !== ws) {
+                  throw new SessionCommandRpcError(ERR.UNAUTHORIZED, "only the originating task controller can grant this execution scope");
+                }
+                let granted = false;
+                try {
+                  granted = approval.scope === "session" && Boolean(offer) && Boolean(approval.expiresAt)
+                    && (approval.deadlineMonotonic ?? 0) > performance.now() && offer!.isCurrent()
+                    && offer!.grantFromHuman() === true && offer!.isActive() === true;
+                } catch { /* an unavailable/stale private gate never resolves allow */ }
+                if (!granted || !offer) {
+                  revokeTaskApprovals(approval.sessionId);
+                  delete approval.taskApproval;
+                  throw new SessionCommandRpcError(ERR.CONFLICT, "task approval expired or its execution/policy changed; an ordinary approval or a new task is required");
+                }
+                const offers = activeTaskApprovalOffers.get(approval.sessionId) ?? [];
+                if (!offers.some((existing) => existing.agentId === offer.agentId && existing.toolFamily === offer.toolFamily)) {
+                  offers.push({ agentId: offer.agentId, toolFamily: offer.toolFamily,
+                    deadlineMonotonic: performance.now() + offer.durationMs, isActive: offer.isActive });
+                  activeTaskApprovalOffers.set(approval.sessionId, offers);
+                }
+                const state = taskApprovalState(approval.sessionId);
+                publishTaskApprovalState(approval.sessionId);
+                approval.finish(true, "allowed");
+                return { taskApprovalState: state };
+              }
               const allowed = p.allow === true;
+              if (!allowed && approval.scope === "session") revokeTaskApprovals(approval.sessionId);
               const value = allowed && p.always === true && approval.allowAlways ? "always" : allowed;
               approval.finish(value, value === "always" ? "allowed_always" : value ? "allowed" : "denied");
               return {};
@@ -7180,13 +7642,17 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (expected.scope === "session") {
               const session = hub.get(expected.sessionId);
               if (!session) return reply(rpcError(id, ERR.NO_SESSION, "no such live session"));
+              // Ownership is checked even for a matching cached receipt, not only the first mutation.
+              authorizeSessionMutation(ws, expected.sessionId, p);
+              sessionSpaceBinding(session.meta);
               const result = await runIdempotentSessionCommand(
                 "approval.reply",
                 p,
                 session,
                 async () => finishApproval(expected),
               );
-              return reply(rpcResult(id!, result));
+              return reply(rpcResult(id!, p.forTask === true
+                ? { ...result, taskApprovalState: taskApprovalState(expected.sessionId) } : result));
             }
             if (externalSessionSpaceId() !== "personal") {
               return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
@@ -7198,6 +7664,24 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               async () => finishApproval(expected),
             );
             return reply(rpcResult(id!, result));
+          }
+          case "session.task-approval.revoke": {
+            if (!clientFeatures.get(ws)?.has("task.approvals.v1") || typeof p.sessionId !== "string"
+              || !p.sessionId || !validSessionCommandId(p.commandId)) {
+              return reply(rpcError(id, ERR.PARAMS, "negotiated task approvals, sessionId and a UUID commandId are required"));
+            }
+            const session = hub.get(p.sessionId);
+            if (!session) return reply(rpcError(id, ERR.NO_SESSION, "no such live session"));
+            authorizeSessionMutation(ws, p.sessionId, p);
+            sessionSpaceBinding(session.meta);
+            const result = await runIdempotentSessionCommand("session.task-approval.revoke", p, session, async () => {
+              authorizeSessionMutation(ws, p.sessionId, p);
+              revokeTaskApprovals(p.sessionId);
+              return { taskApprovalState: taskApprovalState(p.sessionId) };
+            });
+            // A matching old UUID remains a no-op, but its historical inactive receipt cannot hide a
+            // later explicit grant. Only project the current safe status; never repeat the revocation.
+            return reply(rpcResult(id!, { ...result, taskApprovalState: taskApprovalState(p.sessionId) }));
           }
           case "plugins.list": {
             const on = new Set(enabledPlugins().map((pl) => pl.name));
@@ -7263,19 +7747,26 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           case "settings.decision.test": {
             if (!deps.testDecisionSettings) return reply(rpcError(id, ERR.METHOD, "Action Guard testing is not supported by this server"));
             if (
-              (p.model !== undefined && typeof p.model !== "string")
+              (p.engine !== undefined && typeof p.engine !== "string")
+              || (p.model !== undefined && typeof p.model !== "string")
               || (p.baseURL !== undefined && typeof p.baseURL !== "string")
               || (p.apiKey !== undefined && typeof p.apiKey !== "string")
               || (p.clearApiKey !== undefined && typeof p.clearApiKey !== "boolean")
             ) return reply(rpcError(id, ERR.PARAMS, "model, baseURL, apiKey and clearApiKey must use valid types"));
             const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             const result = await deps.testDecisionSettings({
+              ...(typeof p.engine === "string" ? { engine: p.engine as DecisionSettingsTestInput["engine"] } : {}),
               ...(typeof p.model === "string" ? { model: p.model } : {}),
               ...(typeof p.baseURL === "string" ? { baseURL: p.baseURL } : {}),
               ...(typeof p.apiKey === "string" ? { apiKey: p.apiKey } : {}),
               ...(typeof p.clearApiKey === "boolean" ? { clearApiKey: p.clearApiKey } : {}),
             }, targetCwd);
             return reply(rpcResult(id!, redactSensitiveValue(result).value));
+          }
+          case "settings.decision.laya.prepare": {
+            if (!deps.prepareDecisionRuntime) return reply(rpcError(id, ERR.METHOD, "Local Laya preparation is not supported by this server"));
+            if (p.confirmDownload !== true) return reply(rpcError(id, ERR.PARAMS, "confirmDownload=true required; preparation downloads the local runtime and model"));
+            return reply(rpcResult(id!, deps.prepareDecisionRuntime(true)));
           }
           case "settings.wechat-group.get": {
             if (!deps.wechatGroupStatus) return reply(rpcError(id, ERR.METHOD, "the local WeChat group scene is not supported by this server"));
@@ -9260,8 +9751,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       authed.delete(ws);
       clientFeatures.delete(ws);
       eventAcks.delete(ws);
+      for (const [sessionId, owner] of taskExecutionOwners) {
+        if (owner === ws) revokeTaskApprovals(sessionId);
+      }
+      if (authed.size === 0) revokeTaskApprovals();
       for (const released of controlLeases.releaseOwner(ws)) {
         if (!released.resourceId.startsWith("session:")) continue;
+        revokeTaskApprovals(released.resourceId.slice("session:".length));
         publishSessionControlState(
           released.resourceId.slice("session:".length),
           "released",
@@ -9270,17 +9766,17 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         );
       }
       void releaseExternalTerminalsForSocket(ws);
-      if (authed.size === 0) {
-        // nobody left to answer — deny pending approvals now instead of stalling turns for the timeout
-        for (const approval of pendingApprovals.values()) approval.finish(false, "interrupted");
-        pendingApprovals.clear();
-      }
+      reconcilePendingInputReconnect();
     });
   });
 
   const close = (): Promise<void> => {
     if (closePromise) return closePromise;
     closing = true; // message handlers check this before parsing, so no new work enters the hub
+    revokeTaskApprovals();
+    for (const timer of taskApprovalTimers.values()) clearTimeout(timer);
+    taskApprovalTimers.clear();
+    clearPendingInputReconnectTimers();
     runtimeLog("serve.stopping");
     if (sessionIndexRefreshTimer) clearInterval(sessionIndexRefreshTimer);
     if (wechatManagedTimer) clearInterval(wechatManagedTimer);
@@ -9295,6 +9791,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
 
       for (const approval of pendingApprovals.values()) approval.finish(false, "interrupted");
       pendingApprovals.clear();
+      cancelExternalQuestions();
       await Promise.all([...externalTerminalStreams.keys()].map((client) => releaseExternalTerminalsForSocket(client)));
       const ownedAutomationRuns = [...automationRuns.entries()];
       for (const [controller] of ownedAutomationRuns) {

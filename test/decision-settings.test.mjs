@@ -42,7 +42,10 @@ test("Action Guard settings persist a write-only TypeSafe credential", () => {
     baseURL: "https://api.typesafe.ai/",
     apiKey: "typesafe-fixture-key",
   }, home);
-  assert.deepEqual(saved, {
+  const { laya, ...cloud } = saved;
+  assert.equal(laya.contextTokens, 1024);
+  assert.equal(laya.experimental, true);
+  assert.deepEqual(cloud, {
     engine: "typesafe",
     mode: "advisory",
     model: "jev-latest",
@@ -67,6 +70,23 @@ test("Action Guard settings persist a write-only TypeSafe credential", () => {
   }, home);
   assert.equal(cleared.credential, "missing");
   assert.equal("decisionApiKey" in JSON.parse(readFileSync(join(home, ".hara", "config.json"), "utf8")), false);
+});
+
+test("local engine selection preserves Jev settings and is shadow-only", () => {
+  const previous = Object.fromEntries(names.slice(2).map((name) => [name, process.env[name]]));
+  try {
+    for (const name of names.slice(2)) delete process.env[name];
+    saveDecisionSettings({ engine: "typesafe", mode: "shadow", model: "jev-pinned", baseURL: "https://api.typesafe.ai", apiKey: "preserved-cloud-key" }, home);
+    const saved = saveDecisionSettings({ engine: "laya-mlx", mode: "shadow", model: "jev-pinned", baseURL: "https://api.typesafe.ai" }, home);
+    assert.equal(saved.engine, "laya-mlx");
+    const raw = JSON.parse(readFileSync(join(home, ".hara", "config.json"), "utf8"));
+    assert.equal(raw.decisionApiKey, "preserved-cloud-key");
+    assert.equal(raw.decisionModel, "jev-pinned");
+    assert.throws(() => saveDecisionSettings({ engine: "laya-mlx", mode: "enforce", model: saved.model, baseURL: saved.baseURL }, home), /shadow mode only/);
+    assert.equal(JSON.stringify(saved).includes("preserved-cloud-key"), false);
+  } finally {
+    for (const [name, value] of Object.entries(previous)) value === undefined ? delete process.env[name] : process.env[name] = value;
+  }
 });
 
 test("Action Guard settings reject insecure endpoints and respect environment ownership", () => {

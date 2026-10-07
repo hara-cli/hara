@@ -710,6 +710,7 @@ test("an investigate brief may render a web page while computer approval remains
     provider: p,
     ctx: { cwd: process.cwd() },
     approval: "full-auto",
+    approvalChannel: true,
     confirm: async () => {
       confirmations += 1;
       return true;

@@ -268,7 +268,9 @@ export class ProviderConnectionCircuitRegistry {
 export const providerConnectionCircuits = new ProviderConnectionCircuitRegistry();
 
 function hasImages(history: readonly NeutralMsg[]): boolean {
-  return history.some((message) => message.role === "user" && Boolean(message.images?.length));
+  return history.some((message) => message.role === "user"
+    ? Boolean(message.images?.length)
+    : message.role === "tool" && message.results.some((result) => Boolean(result.images?.length)));
 }
 
 export interface ProviderTurnRequirements {

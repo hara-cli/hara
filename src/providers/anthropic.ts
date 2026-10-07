@@ -1,12 +1,13 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { TURN_CONTEXT_OPEN, type Provider, type NeutralMsg, type SystemPromptPart, type TurnArgs, type TurnResult } from "./types.js";
 import { imageToBase64 } from "../images.js";
+import { readToolImageToBase64, TOOL_IMAGE_UNAVAILABLE_NOTE, TOOL_IMAGE_UNSUPPORTED_NOTE } from "../tools/tool-images.js";
 import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
 import { safeProviderErrorMessage } from "./errors.js";
 import { providerErrorMetadata } from "./retry.js";
 import type { Effort } from "./reasoning.js";
 
-export function toAnthropic(history: NeutralMsg[]): Anthropic.MessageParam[] {
+export function toAnthropic(history: NeutralMsg[], supportsToolImages = true): Anthropic.MessageParam[] {
   const msgs: Anthropic.MessageParam[] = [];
   // Append a user message, merging into the previous one if it's also `user` — Anthropic requires
   // alternating roles, and tool-results map to a user message, so a mid-turn-injected user message
@@ -41,12 +42,21 @@ export function toAnthropic(history: NeutralMsg[]): Anthropic.MessageParam[] {
       msgs.push({ role: "assistant", content: content.length ? content : [{ type: "text", text: "(no output)" }] });
     } else {
       pushUser(
-        m.results.map((r) => ({
-          type: "tool_result" as const,
-          tool_use_id: r.id,
-          content: r.content,
-          is_error: r.isError,
-        })),
+        m.results.map((r) => {
+          if (!r.images?.length) {
+            return { type: "tool_result" as const, tool_use_id: r.id, content: r.content, is_error: r.isError };
+          }
+          const content: Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> = [];
+          if (r.content) content.push({ type: "text", text: r.content });
+          for (const image of r.images) {
+            const data = supportsToolImages ? readToolImageToBase64(image) : null;
+            if (data) content.push({
+              type: "image", source: { type: "base64", media_type: image.mediaType as Anthropic.Base64ImageSource["media_type"], data },
+            });
+            else content.push({ type: "text", text: supportsToolImages ? TOOL_IMAGE_UNAVAILABLE_NOTE : TOOL_IMAGE_UNSUPPORTED_NOTE });
+          }
+          return { type: "tool_result" as const, tool_use_id: r.id, content, is_error: r.isError };
+        }),
       );
     }
   }
@@ -143,7 +153,7 @@ export function buildThinkingParam(model: string, effort?: Effort):
   return { type: "enabled", budget_tokens: 24000 };
 }
 
-export function createAnthropicProvider(opts: { apiKey: string; model: string; baseURL?: string; reasoningEffort?: Effort; fetch?: typeof fetch }): Provider {
+export function createAnthropicProvider(opts: { apiKey: string; model: string; baseURL?: string; reasoningEffort?: Effort; fetch?: typeof fetch; supportsImages?: boolean }): Provider {
   const client = new Anthropic({
     apiKey: opts.apiKey,
     maxRetries: 0,
@@ -153,10 +163,11 @@ export function createAnthropicProvider(opts: { apiKey: string; model: string; b
   return {
     id: "anthropic",
     model: opts.model,
+    supportsToolImages: opts.supportsImages !== false,
     trailingTurnContext: true,
     async turn({ system, systemParts, history, tools, onText, onReasoning, signal }: TurnArgs): Promise<TurnResult> {
       const thinking = buildThinkingParam(opts.model, opts.reasoningEffort);
-      const { system: cachedSystem, messages } = applyCacheControl(system, toAnthropic(history), systemParts);
+      const { system: cachedSystem, messages } = applyCacheControl(system, toAnthropic(history, opts.supportsImages !== false), systemParts);
       const stream = client.messages.stream(
         {
           model: opts.model,

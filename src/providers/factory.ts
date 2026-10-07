@@ -6,7 +6,7 @@ import { getValidQwenAuth } from "./qwen-oauth.js";
 import { createAnthropicProvider } from "./anthropic.js";
 import { createOpenAIProvider } from "./openai.js";
 import { createResponsesProvider } from "./responses.js";
-import { deepSeekResponsesSupportsImages } from "./deepseek.js";
+import { classifyVision } from "../vision.js";
 import { isOfficialTokenPlanOpenAIEndpoint } from "./alibaba.js";
 import { resolvePlatform } from "./registry.js";
 import {
@@ -75,7 +75,7 @@ export async function createProviderForTarget(
   /** True when the engine picked `reasoningEffort` itself rather than a user or rule choosing it. Such a
    * value is advisory: an endpoint that rejects the field may be retried without it instead of failing the
    * whole call. An explicit selection is a latency/cost contract and always fails visibly. */
-  options: { reasoningAdvisory?: boolean } = {},
+  options: { reasoningAdvisory?: boolean; supportsImages?: boolean } = {},
 ): Promise<Provider | null> {
   const { provider, apiKey, model, baseURL, proxy } = target;
   const fetch = proxy === undefined ? userModelFetch : createModelFetch(proxy);
@@ -88,6 +88,7 @@ export async function createProviderForTarget(
       model,
       label: provider,
       reasoningEffort,
+      supportsImages: options.supportsImages ?? classifyVision(provider, model) === "vision",
       fetch,
     }));
   }
@@ -100,7 +101,10 @@ export async function createProviderForTarget(
   const caps = resolvePlatform(provider, baseURL, undefined, model);
   const wire = caps.wireApi;
   if (wire === "anthropic") {
-    return withProviderRetry(createAnthropicProvider({ apiKey: transportKey, model, baseURL, reasoningEffort, fetch }));
+    return withProviderRetry(createAnthropicProvider({
+      apiKey: transportKey, model, baseURL, reasoningEffort, fetch,
+      supportsImages: options.supportsImages ?? classifyVision(provider, model) === "vision",
+    }));
   }
   if (wire === "responses") {
     const alibabaTokenPlan = isOfficialTokenPlanOpenAIEndpoint(baseURL);
@@ -113,7 +117,7 @@ export async function createProviderForTarget(
       label: provider,
       reasoningEffort,
       reasoningStyle: caps.reasoning,
-      supportsImages: !/^deepseek-/i.test(model) || deepSeekResponsesSupportsImages(model),
+      supportsImages: options.supportsImages ?? classifyVision(provider, model) === "vision",
       ...(options.reasoningAdvisory ? { reasoningAdvisory: true } : {}),
       ...(alibabaTokenPlan ? { store: false, dashscopeSessionCache: true } : {}),
       ...(volcengineAgentPlan || volcengineCodingPlan ? { store: false } : {}),
@@ -137,6 +141,7 @@ export async function createProviderForTarget(
     label: provider,
     ...(options.reasoningAdvisory ? { reasoningAdvisory: true } : {}),
     reasoningEffort,
+    supportsImages: options.supportsImages ?? classifyVision(provider, model) === "vision",
     omitAuthorization: providerIsLocal(provider),
     fetch,
   }));

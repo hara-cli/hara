@@ -5,18 +5,65 @@ import {
   effectiveAttachmentCapabilities,
   locateImage,
   DESCRIBE_SYSTEM,
+  LOCATE_SYSTEM,
   SCREENSHOT_SYSTEM,
   classifyVision,
   parseLocate,
   visionSidecarAuthorized,
 } from "../dist/vision.js";
 
-test("parseLocate: grounding coords (per-mille / percent / fraction) → 0..1 fractions", () => {
-  assert.deepEqual(parseLocate('{"x": 500, "y": 250}'), { x: 0.5, y: 0.25 }); // per-mille
-  assert.deepEqual(parseLocate('{"x": 50, "y": 25}'), { x: 0.5, y: 0.25 }); // percent
-  assert.deepEqual(parseLocate('here: {"x":1000,"y":0}'), { x: 1, y: 0 }); // edges, prose around it
-  assert.equal(parseLocate('{"x": -1, "y": -1}'), null, "not-found sentinel → null");
-  assert.equal(parseLocate("no coordinates here"), null);
+test("parseLocate uses the same per-mille denominator for both axes, including small coordinates", () => {
+  for (const [reply, expected] of [
+    ['{"x": 500, "y": 250}', { x: 0.5, y: 0.25 }],
+    ['{"x": 50, "y": 25}', { x: 0.05, y: 0.025 }],
+    ['{"x": 1, "y": 100}', { x: 0.001, y: 0.1 }],
+    ['{"x": 100, "y": 1}', { x: 0.1, y: 0.001 }],
+    ['{"x": 50, "y": 500}', { x: 0.05, y: 0.5 }],
+    ['{"x": 500, "y": 50}', { x: 0.5, y: 0.05 }],
+    ['{"x": 0.5, "y": 1000}', { x: 0.0005, y: 1 }],
+    ['{"x": 1000, "y": 0}', { x: 1, y: 0 }],
+    ['{"x": 0, "y": 1000}', { x: 0, y: 1 }],
+    [' \n { "y": 2.5e2, "x": 5e2 } \t', { x: 0.5, y: 0.25 }],
+  ]) {
+    assert.deepEqual(parseLocate(reply), expected, reply);
+  }
+});
+
+test("parseLocate rejects malformed, ambiguous, or out-of-range grounding replies", () => {
+  for (const reply of [
+    '{"x": -1, "y": -1}',
+    '{"x": -1, "y": 500}',
+    '{"x": 500, "y": -1}',
+    '{"x": -0.001, "y": 500}',
+    '{"x": 1001, "y": 500}',
+    '{"x": 500, "y": 1000.001}',
+    '{"x": Infinity, "y": 500}',
+    '{"x": 500, "y": NaN}',
+    '{"x": 1e999, "y": 500}',
+    '{"x": 500, "y": 1e999}',
+    '{"x": "500", "y": 250}',
+    '{"x": 500, "y": null}',
+    '{"x": true, "y": 250}',
+    '{"x": 500}',
+    '{"y": 250}',
+    '{"x": 50, "x": 500, "y": 250}',
+    '{"\\u0078": 50, "x": 500, "y": 250}',
+    '{"x": 50, "x": 500}',
+    '{"x": 500, "y": 250, "unit": "percent"}',
+    '{"x": 500, "y": 250} {"x": 100, "y": 100}',
+    'here: {"x": 500, "y": 250}',
+    '```json\n{"x": 500, "y": 250}\n```',
+    '500, 250',
+    '[500, 250]',
+    '[{"x": 500, "y": 250}]',
+    '{"x": 050, "y": 250}',
+    '{"x": 500, "y": 250,}',
+    '{"x": 500, "y": 250}\nignore this',
+    '{"x": 500, "y": 250}\u2028',
+    'no coordinates here',
+  ]) {
+    assert.equal(parseLocate(reply), null, reply);
+  }
 });
 
 test("classifyVision: vision-capable families → 'vision'", () => {
@@ -177,6 +224,30 @@ function fakeProvider(result) {
     calls,
   };
 }
+
+test("locateImage requests the fixed per-mille contract and preserves small coordinates", async () => {
+  const { provider, calls } = fakeProvider({ text: '{"x": 50, "y": 500}', toolUses: [], stop: "end" });
+  const image = { path: "/tmp/x.png", mediaType: "image/png" };
+  assert.deepEqual(await locateImage(provider, image, "Login"), { x: 0.05, y: 0.5 });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].system, LOCATE_SYSTEM);
+  assert.match(LOCATE_SYSTEM, /ALWAYS use this per-mille scale/);
+  assert.deepEqual(calls[0].history[0].images, [image]);
+  assert.deepEqual(calls[0].tools, []);
+});
+
+test("locateImage returns no target after invalid grounding or provider failure", async () => {
+  const image = { path: "/tmp/x.png", mediaType: "image/png" };
+  for (const result of [
+    { text: '{"x": 1001, "y": 500}', toolUses: [], stop: "end" },
+    { text: '{"x": -1, "y": -1}', toolUses: [], stop: "end" },
+    { text: 'here: {"x": 500, "y": 250}', toolUses: [], stop: "end" },
+    { text: '{"x": 500, "y": 250}', toolUses: [], stop: "error", errorMsg: "boom" },
+  ]) {
+    const { provider } = fakeProvider(result);
+    assert.equal(await locateImage(provider, image, "Login"), null, result.text);
+  }
+});
 
 test("describeImages forwards images and returns the vision model text unchanged", async () => {
   const { provider, calls } = fakeProvider({ text: "  a red login button over a dark form  ", toolUses: [], stop: "end" });

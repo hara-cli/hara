@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.183.4",
+  "version": "0.184.0",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "runtime-bootstrap.cjs"
@@ -61,7 +61,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.2",
     "@larksuiteoapi/node-sdk": "^1.68.0",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "1.31.0",
     "@nanhara/hara-presentation": "0.1.0-alpha.8",
     "commander": "^15.0.0",
     "cross-spawn": "^7.0.6",
@@ -93,6 +93,7 @@
     "hono": "4.13.7",
     "fast-uri": "3.1.8",
     "ip-address": "10.7.2",
-    "qs": "6.16.0"
+    "qs": "6.16.0",
+    "proxy-addr": "2.0.8"
   }
 }

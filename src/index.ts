@@ -416,7 +416,9 @@ import {
   decisionSettingsSnapshot,
   saveDecisionSettings,
   testDecisionSettings,
+  prepareDecisionRuntime,
 } from "./decision-settings.js";
+import { layaRuntime } from "./decision/laya.js";
 import "./tools/open-directory.js"; // register safe Finder/File Explorer directory opening
 import "./tools/open-browser.js"; // register safe real-browser navigation for website/UI testing
 import { HARA_RUNTIME_VERSION } from "./version.js";
@@ -526,7 +528,9 @@ async function buildProvider(
       : reasoningEffortOverride
         ?? (runtimeProfileBindings.get(cfg) === ap.id ? cfg.reasoningEffort : undefined)
         ?? gatewayDefaultReasoningEffort(ap, model);
-    const rawProvider = await createProviderForTarget(target, reasoningEffort);
+    const rawProvider = await createProviderForTarget(target, reasoningEffort, {
+      supportsImages: classifyVision(target.provider, target.model, cfg.modelVision) === "vision",
+    });
     const policyBound = rawProvider
       ? bindOrganizationProvider(rawProvider, { ...ap }, () => profileByIdForConfig(cfg, ap.id))
       : null;
@@ -552,7 +556,9 @@ async function buildProvider(
   const reasoningEffort = reasoningEffortOverride === null
     ? undefined
     : reasoningEffortOverride ?? connectionReasoningEffort;
-  const rawProvider = await createProviderForTarget(target, reasoningEffort);
+  const rawProvider = await createProviderForTarget(target, reasoningEffort, {
+    supportsImages: classifyVision(target.provider, target.model, cfg.modelVision) === "vision",
+  });
   let policyBound = rawProvider;
   if (rawProvider && expectedSpaceId !== PERSONAL_ID) {
     const enrollment = organizationEnrollmentForSpace(cfg, expectedSpaceId);
@@ -821,7 +827,9 @@ async function buildGuardian(
           proxy: cfg.proxy,
         },
       }
-    : undefined;
+    : cfg.decisionEngine === "laya-mlx"
+      ? { engine: "laya-mlx", config: { mode: "shadow" } }
+      : undefined;
   return { provider: gp, enabled: true, ...(decision ? { decision } : {}) };
 }
 
@@ -3454,7 +3462,7 @@ function runDoctor(cfg: HaraConfig): string {
     `${dot} search ${c.dim("lexical (always on)")}${live.embedProvider === "off" ? c.dim(" · semantic off (hara config set embedProvider ollama|qwen)") : c.dim(" · semantic ") + c.bold(live.embedProvider) + (() => { const idx = ["repo", "assets", "memory"].filter((n) => indexExists(n, live.cwd)); return c.dim(" · indexed: ") + (idx.length ? c.green(idx.join(", ")) : c.yellow("none — run: hara index --all")); })()}`,
     `${dot} images ${imageStatus}`,
     `${dot} screen ${live.computerUse === "off" ? c.dim("off (hara config set computerUse read|click|full)") : c.bold(live.computerUse) + c.dim(` · ${computerBackends()}${live.computerApps.length ? " · apps: " + live.computerApps.join(", ") : " · no app allowlist"}`)}`,
-    `${dot} action-guard ${live.decisionEngine === "off" ? c.dim("built-in · Jev off (hara config set decisionEngine typesafe)") : c.bold(`TypeSafe ${live.decisionMode}`) + c.dim(` · ${live.decisionModel} · ${live.decisionApiKey ? "credential configured" : "credential missing"}`)}`,
+    `${dot} action-guard ${live.decisionEngine === "off" ? c.dim("built-in · optional engines: typesafe | laya-mlx") : live.decisionEngine === "laya-mlx" ? c.bold("Laya local · shadow only") + c.dim(` · ${layaRuntime().snapshot().status} · no API key`) : c.bold(`TypeSafe ${live.decisionMode}`) + c.dim(` · ${live.decisionModel} · ${live.decisionApiKey ? "credential configured" : "credential missing"}`)}`,
     `${dot} plugins ${(() => { const inst = listInstalled(); const on = enabledPlugins().length; return inst.length ? c.dim(`${on}/${inst.length} enabled: ${inst.map((p) => p.name).slice(0, 6).join(", ")}`) : c.dim("none — hara plugin add <source>"); })()}`,
     `${dot} mcp ${c.dim(`client: ${Object.keys({ ...pluginMcpServers(), ...live.mcpServers }).length} server(s) · serve: ${mcpServeToolNames().length} read tools via \`hara mcp\``)}`,
     `${dot} hooks ${(() => { const ph = pluginHooks(); const pre = (live.hooks.PreToolUse ?? []).length + (ph.PreToolUse ?? []).length; const post = (live.hooks.PostToolUse ?? []).length + (ph.PostToolUse ?? []).length; return pre + post ? c.dim(`${pre} pre · ${post} post`) : c.dim("none — config.json \"hooks\""); })()}`,
@@ -4906,6 +4914,7 @@ program
         decisionSettings: (targetCwd) => decisionSettingsSnapshot(targetCwd ?? cwd),
         saveDecisionSettings: (input, targetCwd) => saveDecisionSettings(input, targetCwd ?? cwd),
         testDecisionSettings: (input, targetCwd) => testDecisionSettings(input, targetCwd ?? cwd),
+        prepareDecisionRuntime: (confirmed) => prepareDecisionRuntime(confirmed),
         wechatGroupStatus: () => wechatGroupScene.status(),
         saveWechatGroupSettings: (input) => wechatGroupScene.save(input),
         prepareWechatGroupRuntime: () => wechatGroupScene.prepare(),
@@ -6384,6 +6393,28 @@ login
     }
   });
 
+const decisionCommands = program.command("decision").description("manage optional global action-decision engines");
+decisionCommands.command("status").description("show redacted global policy and local Laya readiness").action(() => {
+  out(JSON.stringify(decisionSettingsSnapshot(process.cwd()), null, 2) + "\n");
+});
+decisionCommands.command("prepare").description("prepare the optional local Laya-MLX runtime and pinned multilingual model")
+  .option("--confirm-download", "explicitly consent to downloading Python/runtime dependencies and approximately 620 MiB of model weights")
+  .action(async (options) => {
+    try {
+      if (options.confirmDownload !== true) throw new Error("Use --confirm-download to consent to local runtime/model downloads. This does not enable the engine.");
+      layaRuntime().prepare(true);
+      const result = await layaRuntime().waitForPreparation();
+      out(JSON.stringify(result, null, 2) + "\n");
+      if (result.status !== "ready") process.exitCode = 1;
+    } catch (error) { out(c.red((error instanceof Error ? error.message : String(error)) + "\n")); process.exitCode = 1; }
+  });
+decisionCommands.command("test [engine]").description("test an unsaved engine with fixed synthetic data; never click or send")
+  .action(async (engine) => {
+    const result = await testDecisionSettings({ ...(engine ? { engine } : {}) }, process.cwd());
+    out(JSON.stringify(result, null, 2) + "\n");
+    if (!result.ok) process.exitCode = 1;
+  });
+
 const config = program.command("config").description("manage ~/.hara/config.json");
 config
   .command("set <key> <value>")
@@ -7343,6 +7374,9 @@ program.action(async (opts) => {
           meta?.spaceId ?? headlessLaunchSpaceId,
         ),
         describeImage,
+        toolImageMode: (imageProvider: Provider): "native" | "inspect" | "unavailable" =>
+          visionRouteForProfile(cfg, __activeP).model ? "inspect"
+            : imageProvider.supportsToolImages === true ? "native" : "unavailable",
         inspectImage: (image: ImageAttachment, hint?: string, signal?: AbortSignal) =>
           inspectImageWithCurrentRoute(headlessProvider, __activeP, image, hint, signal, meta?.spaceId ?? headlessLaunchSpaceId),
       },
@@ -8012,9 +8046,13 @@ program.action(async (opts) => {
     interactiveAgentTaskIds.set(task.turnId, task.id);
     return interactiveAgentTeam.controller("/root", { rootTurnId: task.turnId });
   };
-  const interactiveAgentContextForRun = (): { agentTeam?: AgentTeamController } => {
+  const interactiveAgentContextForRun = (): Pick<ToolContext, "agentTeam" | "toolImageMode"> => {
     const controller = interactiveAgentControllerForRun();
-    return controller ? { agentTeam: controller } : {};
+    return {
+      ...(controller ? { agentTeam: controller } : {}),
+      toolImageMode: (imageProvider) => visionRouteForProfile(cfg, __activeP).model ? "inspect"
+        : imageProvider.supportsToolImages === true ? "native" : "unavailable",
+    };
   };
   let interactiveAgentShutdown: Promise<boolean> | undefined;
   const shutdownInteractiveAgentTeam = (): Promise<boolean> => {

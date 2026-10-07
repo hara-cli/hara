@@ -42,3 +42,18 @@ vendored into the source tree or returned to Desktop:
 
 Their upstream distributions include the authoritative license and notice files for the exact versions
 resolved at installation time.
+
+## On-demand Laya-MLX decision runtime
+
+The optional local Action Guard backend installs the following runtime after explicit download consent.
+Neither its Python package nor model weights are vendored into Hara's source or npm package. Hara owns
+the embedded stdio bridge; it does not execute a separately checked-out Laya repository.
+
+- `laya-mlx` 0.2.0 — Apache-2.0, with upstream `LICENSE` and `NOTICE` in its distribution.
+- MLX — MIT; Transformers / Hugging Face Hub — Apache-2.0; NumPy — BSD-3-Clause.
+- Checkpoint: `aac6fef/laya-multilingual-mlx`, revision
+  `ba40c87fcb357f1643d04d71323af9cdc3b9e591`, derived from the multilingual Laya model.
+  Model license/notice files are included in the explicit checkpoint download when supplied upstream.
+
+Use the license and notice files accompanying the resolved package/model distributions for full terms
+and attribution. The Laya backend is independent of Jev/TypeSafe and does not imply their endorsement.

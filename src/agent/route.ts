@@ -49,6 +49,7 @@ export function routingProvider(primary: Provider, alt: Provider): Provider {
     ...primary,
     id: primary.id,
     model: primary.model, // reported model = primary; routing is transparent
+    supportsToolImages: primary.supportsToolImages === true && alt.supportsToolImages === true,
     trailingTurnContext: primary.trailingTurnContext === true && alt.trailingTurnContext === true,
     async prepareTurn(history: NeutralMsg[], signal?: AbortSignal) {
       return selected(history).prepareTurn?.(history, signal);

@@ -82,6 +82,7 @@ test("a website UI test can open the real browser without an understanding brief
     },
     ctx: { cwd: process.cwd() },
     approval: "suggest",
+    approvalChannel: true,
     confirm: async () => { confirmations++; return true; },
     quiet: true,
     extraTools: [tool],

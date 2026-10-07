@@ -36,6 +36,32 @@ privileged native handle.
 6. Collaboration can request an action but cannot expand the local user's authority.
 7. Hara CLI continues to work when Desktop, Collab, and every optional connector are absent.
 
+## Creating a personal Bot through chat
+
+In a Personal Space conversation backed by `hara serve`, the main Hara Agent can offer
+`agent_create`. A request such as “Create a research colleague named Ada” follows this flow:
+
+1. Check existing contacts with `agent_contact(action: list)` and agree on the job and boundaries.
+2. Present a single-use creation card with the nickname, stable username, role, description, and
+   complete standing instructions. Desktop renders the same review in English or Chinese.
+3. Save only after a live human confirmation. Full-auto and headless auto-yes do not waive that decision.
+4. Persist the private native role and refresh the contact list. The receipt distinguishes a new save
+   (`created: true`) from an existing colleague (`created: false`); existing instructions are not overwritten.
+
+Pending proposals survive a UI disconnect through the authenticated foreground `events.snapshot`
+approvals. They do not survive a server shutdown as an already-authorized creation. Ambient task telemetry
+contains only the pending action summary, not the proposed standing instructions. Duplicate approval replies
+cannot create another Bot. A dismissed username must be explicitly restored or a different username chosen.
+
+Creation accepts no credentials, model/endpoint overrides, or execution grants. The new colleague follows
+the Space model and ordinary tool permissions; it does not receive the main Agent's hiring authority.
+Organization-managed Agent enrollment remains a separate, policy-governed workflow.
+
+A permanent contact is not a temporary coding worker. Hara understands, dispatches, and reviews the task;
+eligible coding engines execute it behind their existing permission checks. Codex and Claude Code's durable
+workers retain their native-session continuation links. OpenCode's existing headless execution adapter is
+not equivalent to a durable, resumable worker, and this creation feature does not claim to add that capability.
+
 ## Capability contract
 
 Desktop and CLI should negotiate capabilities instead of assuming platform parity:
@@ -144,6 +170,53 @@ the choice materially changes the result.
 
 ## Computer use
 
+### Native fallback hardening (unreleased source, CLI 0.183.2)
+
+The LCU comparison informed lifecycle/approval patterns, not a bundled LCU/OpenAI runtime. Hara
+keeps its configured model/provider and existing OS permission boundary. This implementation adds:
+
+- Fixed per-mille grounding: one complete numeric `x/y` JSON object, both divided by 1000.
+  Missing, ambiguous, non-finite, duplicate-key, or out-of-range coordinates are rejected.
+- A live human channel for every computer action, including screenshots. `full-auto` and a headless
+  `confirm => true` callback are not a substitute. No setting is silently enabled by an upgrade.
+- An ephemeral, host-owned run scope. `activate` binds an exact app/PID/native window/frame;
+  coordinate and keyboard input require the latest opaque `observationId`, valid for 30 seconds.
+  The host rechecks screen bytes, window identity/geometry and current permissions immediately
+  before dispatch. Changed state requires a fresh observation rather than an automatic retry.
+- A private cross-process desktop lease at `~/.hara/computer-control/desktop.json`. It contains
+  opaque run/session identity and worker lifecycle facts, not screen/message content. A live
+  owner/worker is never displaced by a timeout. A crash with an unresolved spawn reservation
+  deliberately blocks recovery until it is diagnosed; never delete a live lease to bypass control.
+- Private temporary screenshots with normal/error/cancel cleanup. Up to four validated tool
+  images (3.6 MB each) reach only the next model request, through native input or the authorized
+  vision-first route. Pixels, base64 and ephemeral file paths do not enter durable tool history.
+  Unknown/text-only routes explicitly report unread images. MCP `isError` remains an error.
+  Media echoed in errors or successful text is scrubbed before local history, result continuation
+  files, or UI output. This local cleanup does not change a provider's own retention/cache policies.
+- `Dispatched` and `Observed` receipts, not a success checkmark based on subprocess exit code.
+  Business completion needs separate evidence. A failed/uncertain paste has no automatic alternate
+  input path; an uncertain post-action observation stops this run rather than resending.
+  A failed/cancelled macOS paste attempts only a fixed `Cmd` key-up while still owning the lease;
+  that cleanup is not another paste or evidence that the input succeeded.
+
+The pixel fallback is still not an atomic semantic action. A person or non-Hara application can
+change focus between the last host check and native input. Windows additionally checks HWND/PID/frame
+inside its worker; X11 keyboard input names the bound window, which some applications may ignore.
+macOS AX/CGWindow matching, Windows DPI behavior and real application effects require explicit
+device acceptance. Synthetic tests do not establish that a real send/click succeeded.
+
+Only the primary display is supported on macOS/Windows; macOS capture uses `screencapture -m`
+and logical primary-screen coordinates. Linux target binding supports X11, not Wayland control.
+Moving a window, switching screens, animated UI/caret changes, or a large capture can refuse
+input under the conservative exact-snapshot rule. Semantic AX/UIA inspection/invoke, isolated browser
+APIs, general MCP elicitation/turn-ended integration, a crash-recovery UI and real-device testing
+remain follow-up work. This source change is not a release or an unattended-send authorization.
+
+Validation on 2026-10-05: `npm test` (Node 22.23.1, isolated test homes) passed all 1,912 tests,
+with no failures or skips. Native transactions use executable fixtures instead of OS GUI programs;
+provider/media tests use synthetic images and in-memory transports. This is source regression evidence,
+not macOS/Windows application acceptance. No release, real desktop action or WeChat send was performed.
+
 The current `computer` tool supplies a useful last-resort screenshot/coordinate path. Its next
 backend should be semantic:
 
@@ -243,4 +316,3 @@ Build them only after internal task assignment and the safe local Agent executio
 - Apple: EventKit event-store access, AXUIElement, and ScreenCaptureKit documentation.
 - Microsoft: Graph Calendar/delta query, Microsoft UI Automation, and
   Windows.Graphics.Capture documentation.
-

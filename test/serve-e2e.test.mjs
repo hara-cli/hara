@@ -710,6 +710,56 @@ test("serve e2e: Desktop manages Jev policy and sends only a fixed WeChat connec
   }
 });
 
+test("serve e2e: Laya setup requires explicit local consent and advertises a separate capability", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-laya-"));
+  const runtime = { supported: true, status: "missing", model: "local-fixture", revision: "pinned-fixture", contextTokens: 1024, experimental: true };
+  const calls = [];
+  const server = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, {
+    ...baseDeps(textProvider, memStore()),
+    decisionSettings: () => ({ engine: "off", mode: "shadow", laya: runtime }),
+    saveDecisionSettings: (input) => input,
+    testDecisionSettings: async (input) => { calls.push(["test", input]); return { ok: true, experimental: true, decision: "review" }; },
+    prepareDecisionRuntime: (confirmed) => { calls.push(["prepare", confirmed]); return { ...runtime, status: "preparing" }; },
+  });
+  const client = await connect(server.port);
+  try {
+    assert.equal((await client.call("settings.decision.laya.prepare", { confirmDownload: true })).error.code, -32001,
+      "consent cannot replace authenticated local access");
+    const initialized = await client.call("initialize", { token: "tok" });
+    assert.ok(initialized.result.capabilities.methods.includes("settings.decision.laya.prepare"));
+    assert.ok(initialized.result.capabilities.features.includes("action-guard.laya-mlx.v1"));
+    for (const params of [{}, { confirmDownload: false }, { confirmDownload: "true" }]) {
+      assert.equal((await client.call("settings.decision.laya.prepare", params)).error.code, -32602);
+    }
+    assert.deepEqual(calls, [], "merely opening settings never prepares or downloads");
+    assert.equal((await client.call("settings.decision.get", {})).result.laya.status, "missing");
+    assert.equal((await client.call("settings.decision.laya.prepare", { confirmDownload: true })).result.status, "preparing");
+    assert.equal((await client.call("settings.decision.test", { engine: "laya-mlx" })).result.experimental, true);
+    assert.equal((await client.call("settings.decision.test", { engine: 123 })).error.code, -32602);
+    assert.deepEqual(calls, [["prepare", true], ["test", { engine: "laya-mlx" }]]);
+  } finally {
+    client.close();
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: old Engines do not advertise or execute Laya preparation", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-no-laya-"));
+  const server = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(textProvider, memStore()));
+  const client = await connect(server.port);
+  try {
+    const initialized = await client.call("initialize", { token: "tok" });
+    assert.equal(initialized.result.capabilities.methods.includes("settings.decision.laya.prepare"), false);
+    assert.equal(initialized.result.capabilities.features.includes("action-guard.laya-mlx.v1"), false);
+    assert.equal((await client.call("settings.decision.laya.prepare", { confirmDownload: true })).error.code, -32601);
+  } finally {
+    client.close();
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: local WeChat group scene is explicit, bounded, and separately controlled", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-wechat-group-"));
   const status = {
@@ -1938,6 +1988,9 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.ok(init.result.capabilities.events.includes("event.runtime_item"), "replayable runtime item lifecycle advertised");
     assert.ok(init.result.capabilities.events.includes("event.workforce_state"), "typed workforce snapshot event advertised");
     assert.ok(init.result.capabilities.events.includes("event.surface"), "typed visual surface event advertised");
+    assert.ok(init.result.capabilities.methods.includes("external.question.reply"), "external structured question reply advertised");
+    assert.ok(init.result.capabilities.events.includes("external.question.request"), "external structured question request advertised");
+    assert.ok(init.result.capabilities.events.includes("external.question.resolved"), "external structured question resolution advertised");
     assert.deepEqual(
       init.result.capabilities.features,
       [
@@ -1971,6 +2024,8 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "external.sessions.command-idempotency.serve-lifetime.v1",
         "external.sessions.command-idempotency.durable.v2",
         "approval.command-idempotency.v1",
+        "task.approvals.v1",
+        "external.questions.v1",
         "external.sessions.terminal-mirror.v1",
         "external.sessions.terminal-stream.v2",
         "external.sessions.terminal-input-sequence.v1",
@@ -4108,16 +4163,18 @@ test("serve e2e: an unconfigured engine still initializes so Desktop can open Sy
   }
 });
 
-test("serve e2e: live metadata and resume are serialized with an active turn", { timeout: 20000 }, async () => {
+test("serve e2e: live metadata changes are serialized while resume without approval is read-only", { timeout: 20000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-busy-"));
   const store = memStore();
   let markStarted;
   let finishTurn;
+  let turnCount = 0;
   const started = new Promise((resolve) => { markStarted = resolve; });
   const provider = {
     id: "fake",
     model: "fake-1",
     async turn() {
+      turnCount += 1;
       markStarted();
       return new Promise((resolve) => {
         finishTurn = () => resolve({ text: "finished", toolUses: [], stop: "end", usage: { input: 1, output: 1 } });
@@ -4133,8 +4190,17 @@ test("serve e2e: live metadata and resume are serialized with an active turn", {
     sending = c.call("session.send", { sessionId: result.sessionId, text: "hold this turn" });
     await started;
 
+    const persistedBeforeResume = structuredClone(store.saved.get(result.sessionId));
+    const resumed = await c.call("session.resume", { sessionId: result.sessionId });
+    assert.equal(resumed.error, undefined, "foreground recovery may read the running session");
+    assert.equal(resumed.result.sessionId, result.sessionId);
+    assert.equal(resumed.result.task.status, "running");
+    assert.deepEqual(resumed.result.pendingApprovals, []);
+    assert.equal(turnCount, 1, "read-only resume did not restart the provider turn");
+    assert.deepEqual(store.saved.get(result.sessionId), persistedBeforeResume, "read-only resume did not persist mutations");
+
     for (const [method, params] of [
-      ["session.resume", { sessionId: result.sessionId }],
+      ["session.resume", { sessionId: result.sessionId, approval: "full-auto" }],
       ["session.rename", { sessionId: result.sessionId, title: "racy title" }],
       ["session.archive", { sessionId: result.sessionId, archived: true }],
     ]) {

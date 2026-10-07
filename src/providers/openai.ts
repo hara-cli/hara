@@ -1,6 +1,8 @@
 import OpenAI from "openai";
 import type { Provider, NeutralMsg, ToolUse, TurnArgs, TurnResult } from "./types.js";
 import { imageToBase64 } from "../images.js";
+import { readToolImageToBase64, TOOL_IMAGE_UNAVAILABLE_NOTE, TOOL_IMAGE_UNSUPPORTED_NOTE } from "../tools/tool-images.js";
+import { classifyVision } from "../vision.js";
 import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
 import { safeProviderErrorMessage } from "./errors.js";
 import { providerErrorMetadata } from "./retry.js";
@@ -44,7 +46,7 @@ export function assembleToolCalls(
 export { isReasoningModel } from "./reasoning.js";
 
 /** Build OpenAI chat-completions messages from neutral history. */
-export function toOpenAI(system: string, history: NeutralMsg[], reasoningStyle: ReasoningStyle = "none"): any[] {
+export function toOpenAI(system: string, history: NeutralMsg[], reasoningStyle: ReasoningStyle = "none", supportsToolImages = true): any[] {
   const msgs: any[] = [{ role: "system", content: system }];
   for (const m of history) {
     if (m.role === "user") {
@@ -82,13 +84,27 @@ export function toOpenAI(system: string, history: NeutralMsg[], reasoningStyle: 
         ...(tool_calls.length ? { tool_calls } : {}),
       });
     } else {
+      const imageParts: any[] = [];
       for (const r of m.results) {
+        let content = r.isError ? `ERROR: ${r.content}` : r.content;
+        for (const image of r.images ?? []) {
+          const data = supportsToolImages ? readToolImageToBase64(image) : null;
+          if (data) {
+            imageParts.push(
+              { type: "text", text: `Image observation from tool ${r.name} (call ${r.id}):` },
+              { type: "image_url", image_url: { url: `data:${image.mediaType};base64,${data}` } },
+            );
+          } else content += `\n${supportsToolImages ? TOOL_IMAGE_UNAVAILABLE_NOTE : TOOL_IMAGE_UNSUPPORTED_NOTE}`;
+        }
         msgs.push({
           role: "tool",
           tool_call_id: r.id,
-          content: r.isError ? `ERROR: ${r.content}` : r.content,
+          content,
         });
       }
+      // Chat Completions tool messages accept text only. Complete the whole tool-result batch before
+      // adding native pixels as a user observation, preserving every tool_call_id relationship.
+      if (imageParts.length) msgs.push({ role: "user", content: imageParts });
     }
   }
   return msgs;
@@ -111,6 +127,9 @@ export function createOpenAIProvider(opts: {
    * constructor value, so explicitly remove its generated Authorization header at the final header layer. */
   omitAuthorization?: boolean;
   fetch?: typeof fetch;
+  /** Explicit session capability decision. Applies to ephemeral tool media; user attachments retain
+   * the existing upstream vision-first handling. Unknown native capabilities fail closed by default. */
+  supportsImages?: boolean;
 }): Provider {
   const client = new OpenAI({
     apiKey: opts.apiKey,
@@ -121,9 +140,11 @@ export function createOpenAIProvider(opts: {
     ...(opts.omitAuthorization ? { defaultHeaders: { Authorization: null } } : {}),
     ...(opts.fetch ? { fetch: opts.fetch } : {}),
   });
+  const supportsToolImages = opts.supportsImages ?? classifyVision(opts.label ?? "openai", opts.model) === "vision";
   return {
     id: opts.label ?? "openai",
     model: opts.model,
+    supportsToolImages,
     trailingTurnContext: true,
     async turn({ system, history, tools, onText, onReasoning, onActivity, signal }: TurnArgs): Promise<TurnResult> {
       const oaiTools = tools.map((t) => ({
@@ -134,7 +155,7 @@ export function createOpenAIProvider(opts: {
       const style = opts.reasoningStyle ?? caps.reasoning;
       const params: any = {
         model: opts.model,
-        messages: toOpenAI(system, history, style),
+        messages: toOpenAI(system, history, style, supportsToolImages),
         max_tokens: 32000, // was 8192 — too small: a big write_file's args got truncated → unparseable → loop
         stream: true,
         stream_options: { include_usage: true },

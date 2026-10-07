@@ -171,20 +171,27 @@ export const LOCATE_SYSTEM = [
   "You are given a screenshot. The user names ONE UI element (button, field, icon, menu item, link).",
   "Return ONLY its CENTER as JSON: {\"x\": <0-1000>, \"y\": <0-1000>}, where x is the position as per-mille of",
   "the image WIDTH (0=left, 1000=right) and y as per-mille of the HEIGHT (0=top, 1000=bottom).",
+  "Both coordinates ALWAYS use this per-mille scale, including values below 100. Do not use percentages,",
+  "0-1 fractions, or pixels. Return exactly the two numeric fields x and y; no extra fields or formatting.",
   "If the element is not visible, return {\"x\": -1, \"y\": -1}. Output ONLY the JSON, nothing else.",
 ].join("\n");
 
-/** Parse a grounding reply → {x,y} as 0..1 fractions (accepts per-mille / percent / fraction), or null. */
+// Match the complete, narrow JSON contract so duplicate keys and extra candidate locations cannot be
+// silently discarded. Use JSON's whitespace and number grammar, not permissive numeric extraction.
+const LOCATE_NUMBER = "-?(?:0|[1-9]\\d*)(?:\\.\\d+)?(?:[eE][+-]?\\d+)?";
+const LOCATE_SPACE = "[ \\t\\r\\n]*";
+const LOCATE_REPLY = new RegExp(
+  `^${LOCATE_SPACE}\\{${LOCATE_SPACE}"(x|y)"${LOCATE_SPACE}:${LOCATE_SPACE}(${LOCATE_NUMBER})${LOCATE_SPACE},${LOCATE_SPACE}"(x|y)"${LOCATE_SPACE}:${LOCATE_SPACE}(${LOCATE_NUMBER})${LOCATE_SPACE}\\}${LOCATE_SPACE}$`,
+);
+
+/** Parse exactly one {x,y} JSON reply in 0..1000 per-mille → 0..1 fractions, or null. */
 export function parseLocate(text: string): { x: number; y: number } | null {
-  const m = text.match(/"x"\s*:\s*(-?\d+(?:\.\d+)?)[\s,}]+.*?"y"\s*:\s*(-?\d+(?:\.\d+)?)/s) || text.match(/(-?\d+(?:\.\d+)?)\s*[,\s]\s*(-?\d+(?:\.\d+)?)/);
-  if (!m) return null;
-  let x = Number(m[1]);
-  let y = Number(m[2]);
-  if (x < 0 || y < 0 || Number.isNaN(x) || Number.isNaN(y)) return null; // not found / unparseable
-  const norm = (v: number): number => (v > 100 ? v / 1000 : v > 1.5 ? v / 100 : v); // per-mille | percent | fraction → 0..1
-  x = Math.min(1, Math.max(0, norm(x)));
-  y = Math.min(1, Math.max(0, norm(y)));
-  return { x, y };
+  const match = LOCATE_REPLY.exec(text);
+  if (!match || match[0] !== text || match[1] === match[3]) return null;
+  const x = Number(match[1] === "x" ? match[2] : match[4]);
+  const y = Number(match[1] === "y" ? match[2] : match[4]);
+  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x > 1000 || y > 1000) return null;
+  return { x: x / 1000, y: y / 1000 };
 }
 
 /** Send a screenshot to a (grounding-capable) vision model and get the target's center as 0..1 fractions. */

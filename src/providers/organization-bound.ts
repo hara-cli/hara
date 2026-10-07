@@ -79,6 +79,7 @@ export function bindOrganizationProvider(
   return {
     id: provider.id,
     model: provider.model,
+    supportsToolImages: provider.supportsToolImages,
     trailingTurnContext: provider.trailingTurnContext,
     async prepareTurn(_history, signal) {
       const policy = await prepare(signal);

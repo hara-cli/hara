@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { getTool } from "../dist/tools/registry.js";
-import { actionAllowed, keyIsBlocked, windowsClipboardInvocation } from "../dist/tools/computer.js";
+import { actionAllowed, keyIsBlocked, windowsClipboardInvocation, windowsActivateInvocation, windowsScreenshotInvocation } from "../dist/tools/computer.js";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,6 +25,20 @@ test("Windows clipboard invocation preserves CJK and emoji without putting user 
   assert.equal(Buffer.from(invocation.input, "base64").toString("utf8"), text);
   assert.equal(invocation.args.join(" ").includes(text), false);
   assert.match(invocation.args.at(-1), /FromBase64String/);
+});
+
+test("Windows activation and capture send application/path strings as data, never PowerShell source", () => {
+  const hostile = '$([Console]::WriteLine("injected")) 中文';
+  for (const build of [windowsActivateInvocation, windowsScreenshotInvocation]) {
+    const invocation = build(hostile);
+    assert.equal(Buffer.from(invocation.input, "base64").toString("utf8"), hostile);
+    assert.equal(invocation.args.join(" ").includes(hostile), false);
+    assert.match(invocation.args.at(-1), /FromBase64String/);
+    assert.ok(invocation.args.includes("-STA"));
+  }
+  assert.match(windowsActivateInvocation("app").args.at(-1), /if\(-not.*AppActivate\(\$value\)/);
+  assert.match(windowsScreenshotInvocation("capture.png").args.at(-1), /SetProcessDPIAware[\s\S]*PrimaryScreen/);
+  assert.match(windowsScreenshotInvocation("capture.png").args.at(-1), /finally.*Dispose/);
 });
 
 test("keyIsBlocked: dangerous combos refused, safe ones allowed", () => {
@@ -76,7 +90,7 @@ test("computer child is cancelled promptly and does not survive the parent deadl
     process.env.HARA_COMPUTER_APPS = "Fixture App";
     const controller = new AbortController();
     let earlySettlement;
-    const running = getTool("computer").run({ action: "activate", app: "Fixture App" }, { cwd: dir, signal: controller.signal });
+    const running = getTool("computer").run({ action: "activate", app: "Fixture App" }, { cwd: dir, stateHome: dir, signal: controller.signal });
     void running.then(
       (value) => { earlySettlement = `resolved early: ${value}`; },
       (error) => { earlySettlement = `rejected early: ${error instanceof Error ? error.message : String(error)}`; },

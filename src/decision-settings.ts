@@ -13,6 +13,7 @@ import {
   TYPESAFE_DEFAULT_MODEL,
 } from "./decision/typesafe.js";
 import { redactSensitiveText } from "./security/secrets.js";
+import { layaRuntime, type LayaRuntimeState } from "./decision/laya.js";
 
 export interface DecisionSettingsState {
   engine: DecisionEngineId;
@@ -25,6 +26,7 @@ export interface DecisionSettingsState {
   modelEditable: boolean;
   baseURLEditable: boolean;
   credentialEditable: boolean;
+  laya?: LayaRuntimeState;
 }
 
 export interface DecisionSettingsInput {
@@ -37,6 +39,7 @@ export interface DecisionSettingsInput {
 }
 
 export interface DecisionSettingsTestInput {
+  engine?: DecisionEngineId;
   model?: string;
   baseURL?: string;
   apiKey?: string;
@@ -50,6 +53,7 @@ export interface DecisionSettingsTestResult {
   model?: string;
   elapsedMs?: number;
   error?: string;
+  experimental?: boolean;
 }
 
 function envValue(name: string): string | undefined {
@@ -92,6 +96,7 @@ export function decisionSettingsSnapshot(targetCwd: string): DecisionSettingsSta
     modelEditable: process.env.HARA_DECISION_MODEL === undefined,
     baseURLEditable: process.env.HARA_DECISION_BASE_URL === undefined,
     credentialEditable: !environmentKey,
+    laya: layaRuntime().snapshot(),
   };
 }
 
@@ -102,6 +107,9 @@ export function saveDecisionSettings(input: DecisionSettingsInput, targetCwd: st
   }
   if (!DECISION_MODES.includes(input.mode)) {
     throw new Error(`decision mode must be one of: ${DECISION_MODES.join(", ")}`);
+  }
+  if (input.engine === "laya-mlx" && input.mode !== "shadow") {
+    throw new Error("Experimental Laya-MLX supports shadow mode only; it cannot make authorization decisions");
   }
   const model = cleanModel(input.model);
   const baseURL = normalizeTypeSafeBaseURL(input.baseURL || TYPESAFE_DEFAULT_BASE_URL);
@@ -144,6 +152,20 @@ export async function testDecisionSettings(
   targetCwd: string,
 ): Promise<DecisionSettingsTestResult> {
   const current = loadConfig({ cwd: targetCwd });
+  const engine = input.engine ?? current.decisionEngine;
+  if (!DECISION_ENGINES.includes(engine)) return { ok: false, error: "Unknown decision engine" };
+  if (engine === "laya-mlx") {
+    try {
+      // No credentials, proxy or TypeSafe endpoint reaches the local backend, including on failure.
+      const result = await layaRuntime().judge({
+        task: "Verify a local read-only action with synthetic data.", tool: "computer", category: "read",
+        classifierReason: "connection test", detail: "Read a local screenshot without clicking or sending.",
+      }, { timeoutMs: 30_000 });
+      return { ok: true, decision: result.choice, confidence: result.confidence, model: result.model, elapsedMs: result.elapsedMs, experimental: true };
+    } catch (error) {
+      return { ok: false, error: redactSensitiveText(error instanceof Error ? error.message : String(error)).text.slice(0, 300), experimental: true };
+    }
+  }
   const apiKey = input.clearApiKey === true
     ? undefined
     : cleanApiKey(input.apiKey) ?? current.decisionApiKey;
@@ -174,4 +196,9 @@ export async function testDecisionSettings(
       error: redactSensitiveText(error instanceof Error ? error.message : String(error)).text.slice(0, 300),
     };
   }
+}
+
+/** Downloads are explicitly confirmed in the local settings UI, never by an Agent/tool. */
+export function prepareDecisionRuntime(confirmed: boolean): LayaRuntimeState {
+  return layaRuntime().prepare(confirmed);
 }

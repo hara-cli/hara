@@ -203,6 +203,29 @@ test("loadConfig: TypeSafe decision engine is explicit and supports ephemeral en
   }
 });
 
+test("loadConfig: local Laya stays opt-in and cannot be promoted by environment or repository config", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-config-laya-"));
+  const home = join(root, "home"); const project = join(root, "project");
+  mkdirSync(join(home, ".hara"), { recursive: true }); mkdirSync(join(project, ".hara"), { recursive: true });
+  const keys = ["HOME", "USERPROFILE", "HARA_DECISION_ENGINE", "HARA_DECISION_MODE"];
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    process.env.HOME = home; process.env.USERPROFILE = home;
+    delete process.env.HARA_DECISION_ENGINE; delete process.env.HARA_DECISION_MODE;
+    writeFileSync(join(project, ".hara", "config.json"), JSON.stringify({ decisionEngine: "laya-mlx", decisionMode: "enforce" }));
+    assert.equal(loadConfig({ cwd: project }).decisionEngine, "off", "a repository cannot turn on local or cloud judges");
+    writeFileSync(join(home, ".hara", "config.json"), JSON.stringify({ decisionEngine: "laya-mlx", decisionMode: "enforce" }));
+    assert.equal(loadConfig({ cwd: project }).decisionMode, "shadow");
+    process.env.HARA_DECISION_MODE = "enforce";
+    assert.equal(loadConfig({ cwd: project }).decisionMode, "shadow");
+    process.env.HARA_DECISION_ENGINE = "typesafe";
+    assert.equal(loadConfig({ cwd: project }).decisionMode, "enforce", "the existing Jev policy is unchanged");
+  } finally {
+    for (const [key, value] of Object.entries(previous)) value === undefined ? delete process.env[key] : process.env[key] = value;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("loadConfig: autoContinue defaults on and an explicit environment value overrides global config", () => {
   const root = mkdtempSync(join(tmpdir(), "hara-config-auto-continue-"));
   const home = join(root, "home");

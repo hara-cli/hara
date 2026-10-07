@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { resolve, isAbsolute } from "node:path";
 import { stdout as procOut } from "node:process";
-import { registerTool, reportVerifiedFileChange } from "./registry.js";
+import { getTool, registerTool, reportVerifiedFileChange } from "./registry.js";
 import { reportChangedDeclaredOutputs, snapshotDeclaredOutputs } from "./declared-outputs.js";
 import { runShell } from "../sandbox.js";
 import { nearestPathsAsync } from "../fs-walk.js";
@@ -614,3 +614,8 @@ registerTool({
     return `Error: unknown action '${action}'.`;
   },
 });
+
+// Capture the real registered implementations while this module owns registration. A later plugin
+// registration using the same name must not inherit temporary task approval authority.
+export const ORIGINAL_TASK_BASH_TOOL = Object.freeze(getTool("bash")!);
+export const ORIGINAL_TASK_WRITE_FILE_TOOL = Object.freeze(getTool("write_file")!);

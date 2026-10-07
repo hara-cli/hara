@@ -6,6 +6,8 @@ import type { McpServerConfig } from "../config.js";
 import { redactSensitiveValue } from "../security/secrets.js";
 import { redactToolSubprocessOutput, toolSubprocessEnv } from "../security/subprocess-env.js";
 import { sensitiveStructuredInputReason } from "../security/sensitive-files.js";
+import type { ToolContext } from "../tools/registry.js";
+import { MAX_TOOL_IMAGES, validateToolImage } from "../tools/tool-images.js";
 
 const clients = new Map<string, Client>();
 const DEFAULT_STARTUP_TIMEOUT_MS = 10_000;
@@ -14,6 +16,61 @@ const MAX_STARTUP_TIMEOUT_MS = 60_000;
 const safeDiagnosticName = (name: string): string => name.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 128) || "server";
 const NPM_UNKNOWN_USER_CONFIG_NOISE =
   /^npm\s+warn\s+Unknown user config "(?:always-auth|home)"(?:\s|\(|\.|$)/i;
+
+/** Text stays bounded and media stays out of transcripts/continuation storage. Never stringify unknown
+ * blocks: an image, audio, or embedded resource can contain huge base64 data or an untrusted file URI. */
+export function collectMcpToolResult(result: unknown, ctx: ToolContext): string {
+  const record = result && typeof result === "object" ? result as Record<string, unknown> : {};
+  if (record.isError === true) ctx.markToolError?.();
+  const blocks = Array.isArray(record.content) ? record.content : [];
+  const output: string[] = [];
+  const textLimit = 128_000;
+  let textChars = 0;
+  let imageCount = 0;
+  for (const raw of blocks.slice(0, 128)) {
+    const block = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+    if (block.type === "text" && typeof block.text === "string") {
+      const remaining = Math.max(0, textLimit - textChars);
+      const text = block.text.slice(0, remaining);
+      if (text) output.push(text);
+      textChars += text.length;
+      if (text.length < block.text.length) output.push("[MCP text content truncated at the safe limit.]");
+    } else if (block.type === "image") {
+      if (++imageCount > MAX_TOOL_IMAGES) {
+        output.push("[MCP image omitted: tool image count limit exceeded.]");
+        ctx.markToolError?.();
+        continue;
+      }
+      try {
+        // MCP accepts only canonical inline base64, never local paths or resource URLs. Validation
+        // also runs for embedders that do not offer a native media route.
+        if (typeof block.data !== "string" || typeof block.mimeType !== "string") {
+          throw new Error("image block requires inline base64 and MIME type");
+        }
+        const image = { data: block.data, mediaType: block.mimeType };
+        validateToolImage(image);
+        if (!ctx.attachToolImage) {
+          output.push("[MCP image omitted: this run has no authorized tool image route; its pixels were not inspected.]");
+        } else {
+          ctx.attachToolImage(image);
+          output.push(`[MCP image attached: ${image.mediaType}.]`);
+        }
+      } catch {
+        // Do not repeat remote data, MIME strings, filesystem paths, or callback exception details.
+        output.push("[MCP image rejected: invalid, oversized, or unavailable inline image.]");
+        ctx.markToolError?.();
+      }
+    } else {
+      output.push("[MCP non-text content omitted: only text and validated inline images are supported.]");
+    }
+  }
+  if (blocks.length > 128) {
+    output.push("[MCP content omitted: block count limit exceeded.]");
+    ctx.markToolError?.();
+  }
+  const text = output.join("\n") || "(no output)";
+  return record.isError === true ? `Error: MCP tool reported a failure.\n${text}` : text;
+}
 
 export interface McpConnectOptions {
   /** The caller obtained an explicit startup grant from the interactive user. Launch-time
@@ -205,9 +262,7 @@ export async function connectMcpServers(
               undefined,
               { signal: ctx.signal },
             );
-            const blocks: any[] = Array.isArray(res?.content) ? res.content : [];
-            const text = blocks.map((b) => (b?.type === "text" ? b.text : JSON.stringify(b))).join("\n");
-            return redactToolSubprocessOutput(text || "(no output)", process.env, cfg.env ?? {});
+            return redactToolSubprocessOutput(collectMcpToolResult(res, ctx), process.env, cfg.env ?? {});
           },
         });
         count++;

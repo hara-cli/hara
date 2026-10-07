@@ -1,4 +1,5 @@
 import { redactKnownSecrets } from "../security/secrets.js";
+import { redactOwnedToolImageText } from "../security/tool-media-redaction.js";
 
 const MAX_PROVIDER_ERROR_LENGTH = 2_000;
 
@@ -29,7 +30,7 @@ export function safeProviderErrorMessage(
     raw = String(error);
   }
 
-  const safe = redactKnownSecrets(raw, knownSecrets).text
+  const safe = redactKnownSecrets(redactOwnedToolImageText(raw), knownSecrets).text
     // Keep diagnostics on one readable line while preventing terminal/control-sequence injection.
     .replace(/[\t\r\n]+/g, " ")
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")

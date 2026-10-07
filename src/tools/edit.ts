@@ -1,5 +1,5 @@
 import { isAbsolute, resolve } from "node:path";
-import { registerTool, reportVerifiedFileChange } from "./registry.js";
+import { getTool, registerTool, reportVerifiedFileChange } from "./registry.js";
 import { nearestPathsAsync } from "../fs-walk.js";
 import { emitDiff } from "../diff.js";
 import { applyEdits, type OneEdit } from "./apply-core.js";
@@ -88,3 +88,5 @@ registerTool({
       (committed.warnings?.length ? ` Warning: ${committed.warnings.join("; ")}` : "");
   },
 });
+
+export const ORIGINAL_TASK_EDIT_FILE_TOOL = Object.freeze(getTool("edit_file")!);

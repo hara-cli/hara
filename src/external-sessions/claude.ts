@@ -8,6 +8,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import { redactSensitiveText } from "../security/secrets.js";
 import { opaqueProviderSessionId, type ExternalSessionOwnershipStore } from "./identity.js";
+import { normalizeExternalUserQuestions, validateExternalUserAnswers } from "./questions.js";
 import {
   probeExternalCommand,
   resolveExternalCommandRuntime,
@@ -358,6 +359,38 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
 
   private permissionHandler(sink: ExternalTurnSink): CanUseTool {
     return async (toolName, input, prompt) => {
+      if (toolName === "AskUserQuestion") {
+        const raw = Array.isArray(input.questions) ? input.questions : [];
+        const request = normalizeExternalUserQuestions({ questions: raw.map((question, index) => (
+          question && typeof question === "object" && !Array.isArray(question)
+            ? { ...question, id: String(index), isOther: true }
+            : question
+        )) });
+        if (!request || !sink.askUser || prompt.signal.aborted
+          || new Set(request.questions.map((question) => question.question)).size !== request.questions.length
+          || request.questions.some((question) => ["__proto__", "constructor", "prototype"].includes(question.question))) {
+          return { behavior: "deny", message: "User input is unavailable; no answer was selected." };
+        }
+        try {
+          const response = await sink.askUser(request, prompt.signal);
+          const answers = prompt.signal.aborted ? undefined : validateExternalUserAnswers(request, response);
+          const updatedAnswers: Record<string, string> = {};
+          for (const question of request.questions) {
+            // Official SDK sdk-tools.d.ts defines answer keys as question text, not the UI header.
+            // Partial/cancelled forms must not be
+            // treated as an approval of AskUserQuestion, which could otherwise invent a default.
+            const answer = answers?.[question.id]?.answers;
+            if (!answer?.length || Object.hasOwn(updatedAnswers, question.question)
+              || ["__proto__", "constructor", "prototype"].includes(question.question)) {
+              return { behavior: "deny", message: "The question was cancelled or incomplete; no answer was selected." };
+            }
+            updatedAnswers[question.question] = answer.join(", ");
+          }
+          return { behavior: "allow", updatedInput: { ...input, answers: updatedAnswers } };
+        } catch {
+          return { behavior: "deny", message: "User input was cancelled; no answer was selected." };
+        }
+      }
       const previewSource = prompt.title || prompt.description || prompt.displayName || `Claude wants to use ${toolName}`;
       const detail = typeof input.command === "string" ? `\n${input.command.slice(0, 800)}` : "";
       const question = safeText(`${previewSource}${detail}`, 1_200) || `Claude wants to use ${toolName}`;

@@ -50,7 +50,7 @@ export type ProviderId =
   | "hara-gateway";
 export type ApprovalMode = "suggest" | "auto-edit" | "full-auto";
 export type VisionModelSource = "current" | "custom";
-export type DecisionEngineId = "off" | "typesafe";
+export type DecisionEngineId = "off" | "typesafe" | "laya-mlx";
 export type DecisionMode = "shadow" | "advisory" | "enforce";
 
 export interface McpServerConfig {
@@ -337,7 +337,7 @@ export const REASONING_EFFORTS: NonNullable<HaraConfig["reasoningEffort"]>[] = [
 export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-auto"];
 export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
 export const COMPUTER_USE_MODES: HaraConfig["computerUse"][] = ["off", "read", "click", "full"];
-export const DECISION_ENGINES: DecisionEngineId[] = ["off", "typesafe"];
+export const DECISION_ENGINES: DecisionEngineId[] = ["off", "typesafe", "laya-mlx"];
 export const DECISION_MODES: DecisionMode[] = ["shadow", "advisory", "enforce"];
 const PROJECT_ROOT_MARKERS = [".git", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", ".hg"];
 const MAX_PROJECT_CONFIG_BYTES = 256 * 1024;
@@ -895,7 +895,9 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
     ? requestedDecisionEngine as DecisionEngineId
     : "off";
   const requestedDecisionMode = nonBlankEnv(process.env.HARA_DECISION_MODE) ?? merged.decisionMode ?? "shadow";
-  const decisionMode: DecisionMode = DECISION_MODES.includes(requestedDecisionMode as DecisionMode)
+  // Local model quality is not yet calibrated against Hara's authorization cases. Even an ambient
+  // environment or `config set` cannot promote this experimental backend out of observation-only mode.
+  const decisionMode: DecisionMode = decisionEngine === "laya-mlx" ? "shadow" : DECISION_MODES.includes(requestedDecisionMode as DecisionMode)
     ? requestedDecisionMode as DecisionMode
     : "shadow";
   const decisionModel = nonBlankEnv(process.env.HARA_DECISION_MODEL)

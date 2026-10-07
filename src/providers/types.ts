@@ -6,7 +6,14 @@ import type {
 } from "./connection-health.js";
 
 export type ToolUse = { id: string; name: string; input: any };
-export type ToolResult = { id: string; name: string; content: string; isError?: boolean };
+export type ToolResult = {
+  id: string;
+  name: string;
+  content: string;
+  isError?: boolean;
+  /** Ephemeral, engine-owned snapshots for this model request only. Never persist in a transcript. */
+  images?: ImageAttachment[];
+};
 export interface ResponsesReasoningItem {
   type: "reasoning";
   id: string;
@@ -28,6 +35,8 @@ export type AssistantContinuation =
 /** An image the user attached to a turn. Only the path rides in history (sessions stay small); the
  *  bytes are read + base64-encoded by each provider at request time. */
 export type ImageAttachment = { path: string; mediaType: string };
+/** Inline bytes cross the tool boundary, never a model/server-controlled local path or resource URI. */
+export type ToolImageInput = { data: string | Uint8Array; mediaType: string };
 /** Safe, display-only attachment metadata. Absolute local paths never cross back to a renderer. */
 export type UserAttachmentView = {
   kind: "image" | "file" | "directory";
@@ -153,6 +162,9 @@ export interface ProviderExecutionSnapshot {
 export interface Provider {
   id: string;
   model: string;
+  /** Explicit native tool-media capability of this exact route. Missing/unknown never authorizes
+   * media forwarding; the session may independently select its configured vision-first route. */
+  readonly supportsToolImages?: boolean;
   /** This route keeps a trailing engine `<system-reminder>` user message valid and benefits from a
    * byte-stable system prompt (prefix caching). When true, the agent loop sends per-request state — clock,
    * accepted brief, checkpoint — as the last history message instead of a changing system suffix. Missing

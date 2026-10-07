@@ -102,7 +102,8 @@ export type SessionCommandMethod =
   | "session.send"
   | "session.steer"
   | "session.interrupt"
-  | "approval.reply";
+  | "approval.reply"
+  | "session.task-approval.revoke";
 
 export type SessionCommandOutcome =
   | { kind: "result"; json: string }
@@ -2853,6 +2854,7 @@ function isSessionCommandReceipt(value: unknown): value is SessionCommandReceipt
       && receipt.method !== "session.steer"
       && receipt.method !== "session.interrupt"
       && receipt.method !== "approval.reply"
+      && receipt.method !== "session.task-approval.revoke"
     )
     || typeof receipt.requestHash !== "string"
     || !/^[0-9a-f]{64}$/u.test(receipt.requestHash)

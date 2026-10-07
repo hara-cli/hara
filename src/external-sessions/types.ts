@@ -145,11 +145,28 @@ export interface ExternalApprovalRequest {
   allowAlways?: boolean;
 }
 
+/** Questions are input, never permission to execute a tool or disclose credentials. */
+export interface ExternalUserQuestionRequest {
+  questions: Array<{
+    id: string;
+    header?: string;
+    question: string;
+    options?: Array<{ label: string; description?: string }>;
+    multiSelect?: boolean;
+    isOther?: boolean;
+    isSecret?: boolean;
+  }>;
+}
+
+export type ExternalUserQuestionAnswers = Record<string, { answers: string[] }>;
+
 export interface ExternalTurnSink {
   text(delta: string): void;
   tool(name: string, preview: string): void;
   notice(text: string): void;
   confirm(request: ExternalApprovalRequest, signal: AbortSignal): Promise<boolean | "always">;
+  /** Absent/aborted/incompatible clients must return no answers, never permission or the first option. */
+  askUser?(request: ExternalUserQuestionRequest, signal: AbortSignal): Promise<ExternalUserQuestionAnswers>;
 }
 
 export interface ExternalSessionListInput {

@@ -2,6 +2,7 @@ import { createHmac, randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import { redactSensitiveText } from "../security/secrets.js";
 import { opaqueProviderSessionId, type ExternalSessionOwnershipStore } from "./identity.js";
+import { normalizeExternalUserQuestions, validateExternalUserAnswers } from "./questions.js";
 import {
   ExternalJsonlRpcRequestError,
   JsonlRpcClient,
@@ -592,18 +593,6 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
       const reason = typeof params.reason === "string" ? ` ${params.reason}` : "";
       return { question: safeText(`Codex wants to change project files.${reason}`, 1_200), allowAlways: true };
     }
-    if (request.method === "item/tool/requestUserInput") {
-      const questions = Array.isArray(params.questions) ? params.questions : [];
-      const text = questions.flatMap((question) => {
-        if (!question || typeof question !== "object" || Array.isArray(question)) return [];
-        const value = (question as Record<string, unknown>).question;
-        return typeof value === "string" ? [value] : [];
-      }).join("\n");
-      return {
-        question: safeText(`Codex needs a choice. Allow Hara to use the first suggested option?\n${text}`, 1_200),
-        allowAlways: false,
-      };
-    }
     return { question: "Codex requests additional permissions for this turn.", allowAlways: false };
   }
 
@@ -611,6 +600,7 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
     request: JsonlRpcRequest,
     sink: ExternalTurnSink,
     signal: AbortSignal,
+    binding?: { threadId: string; nativeTurnReady: Promise<string> },
   ): Promise<unknown> {
     if (request.method === "item/commandExecution/requestApproval") {
       const prompt = this.approvalQuestion(request);
@@ -622,22 +612,28 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
       const verdict = await sink.confirm(prompt, signal);
       return { decision: verdict === false ? "decline" : verdict === "always" ? "acceptForSession" : "accept" };
     }
-    if (request.method === "item/tool/requestUserInput") {
-      const prompt = this.approvalQuestion(request);
-      const verdict = await sink.confirm(prompt, signal);
-      const answers: Record<string, { answers: string[] }> = {};
-      const questions = Array.isArray(request.params?.questions) ? request.params.questions : [];
-      for (const question of questions) {
-        if (!question || typeof question !== "object" || Array.isArray(question)) continue;
-        const record = question as Record<string, unknown>;
-        if (typeof record.id !== "string") continue;
-        const options = Array.isArray(record.options) ? record.options : [];
-        const first = options[0] && typeof options[0] === "object" && !Array.isArray(options[0])
-          ? (options[0] as Record<string, unknown>).label
-          : undefined;
-        answers[record.id] = { answers: verdict !== false && typeof first === "string" ? [first] : [] };
+    if (request.method === "item/tool/requestUserInput" || request.method === "tool/requestUserInput") {
+      const questions = normalizeExternalUserQuestions(request.params);
+      if (!questions || !sink.askUser || signal.aborted) {
+        sink.notice("Codex needs user input that cannot be safely collected here; no answer was selected.");
+        return { answers: {} };
       }
-      return { answers };
+      if (binding) {
+        const turnId = await binding.nativeTurnReady;
+        if (!turnId || signal.aborted || request.params?.threadId !== binding.threadId || request.params?.turnId !== turnId) {
+          sink.notice("The user-input request does not belong to this active Codex turn; no answer was selected.");
+          return { answers: {} };
+        }
+      }
+      try {
+        const response = await sink.askUser(questions, signal);
+        const answers = signal.aborted ? {} : validateExternalUserAnswers(questions, response);
+        if (answers === undefined) sink.notice("The user input was invalid; no answer was selected.");
+        return { answers: answers ?? {} };
+      } catch {
+        sink.notice("The user input was cancelled or unavailable; no answer was selected.");
+        return { answers: {} };
+      }
     }
     if (request.method === "item/permissions/requestApproval") {
       sink.notice("Codex requested a granular permission profile that Hara cannot safely project; no additional permissions were granted.");
@@ -749,10 +745,12 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
       onServerRequest: (request, respond, reject) => {
         runtime.state = "waiting";
         this.setState(ref, "waiting");
-        void this.answerServerRequest(request, sink, abort.signal)
+        void this.answerServerRequest(request, sink, abort.signal, { threadId: ref.nativeId, nativeTurnReady: runtime.nativeTurnReady })
           .then((result) => {
-            runtime.state = "working";
-            this.setState(ref, "working");
+            if (this.running.get(sessionId) === runtime && !abort.signal.aborted) {
+              runtime.state = "working";
+              this.setState(ref, "working");
+            }
             respond(result);
           })
           .catch(() => reject(-32601, "request is not supported by Hara"));
@@ -811,13 +809,18 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
           input: [{ type: "text", text, text_elements: [] }],
           approvalsReviewer: "user",
         });
-        if (started.turn && typeof started.turn === "object" && !Array.isArray(started.turn)) {
-          const nativeTurnId = (started.turn as Record<string, unknown>).id;
-          if (typeof nativeTurnId === "string") {
-            runtime.nativeTurnId = nativeTurnId;
-            runtime.resolveNativeTurn(nativeTurnId);
-          }
+        const startedTurn = started?.turn && typeof started.turn === "object" && !Array.isArray(started.turn)
+          ? started.turn as Record<string, unknown> : {};
+        const nativeTurnId = startedTurn.id;
+        if (typeof nativeTurnId !== "string" || nativeTurnId.trim().length === 0) {
+          // A provider can emit a question in the same chunk as turn/start. Never leave that question
+          // waiting for a native binding that a malformed start response can no longer provide.
+          runtime.resolveNativeTurn("");
+          this.setState(ref, "error");
+          throw new Error("Codex did not expose a valid started turn; refresh the session before retrying");
         }
+        runtime.nativeTurnId = nativeTurnId;
+        runtime.resolveNativeTurn(nativeTurnId);
       }
       return await terminal;
     } catch (error) {

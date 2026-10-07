@@ -1,4 +1,4 @@
-import type { ImageAttachment, ToolSpec } from "../providers/types.js";
+import type { ImageAttachment, Provider, ToolImageInput, ToolSpec } from "../providers/types.js";
 import type { SandboxMode } from "../sandbox.js";
 import { prepareToolResult } from "./result-limit.js";
 import { homeWorkspaceActionError, isUnsafeProjectWorkspace } from "../context/workspace-scope.js";
@@ -6,6 +6,8 @@ import type { SkillToolPolicyActivation } from "../skills/tool-policy.js";
 import type { AgentTeamController } from "../subagent/team.js";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
+import { redactOwnedToolImageText } from "../security/tool-media-redaction.js";
+import type { ComputerRunScope } from "./computer-run.js";
 
 /** Where agent-side output goes. In the TUI it drives ink state; in plain mode it's absent and
  *  the loop/tools fall back to writing the terminal directly. */
@@ -47,6 +49,8 @@ export interface ToolContext {
   /** Current durable conversation, when this run has one. Transcript recall uses it to exclude the active
    * session and enforce interactive/gateway/cron audience boundaries. */
   sessionId?: string;
+  /** Host-owned, one-turn desktop target/observation. Never reconstructed from tool input or history. */
+  computerScope?: ComputerRunScope;
   /** Engine-owned execution identity for evidence deduplication. Tools may use it for opaque provenance;
    * models never provide or override it. */
   taskId?: string;
@@ -94,6 +98,14 @@ export interface ToolContext {
     hint?: string,
     signal?: AbortSignal,
   ) => Promise<{ text: string; model: string }>;
+  /** Attach validated inline media to this concrete tool call's next model request. The engine owns
+   * private snapshots, route selection, retention, and cleanup; paths/base64 never enter tool text. */
+  attachToolImage?: (image: ToolImageInput) => void;
+  /** Preserve structured failures from external tools even when their text does not start with Error. */
+  markToolError?: () => void;
+  /** Host-selected route for the current session, including explicit vision-first preferences.
+   * This is internal policy; tool/model input cannot provide or override it. */
+  toolImageMode?: (provider: Provider) => "native" | "inspect" | "unavailable";
   /** locate a UI element in a screenshot via a grounding vision model → center as 0..1 fractions (for RPA clicks) */
   locate?: (path: string, target: string, signal?: AbortSignal) => Promise<{ x: number; y: number } | null>;
 }
@@ -109,6 +121,16 @@ export function reportVerifiedFileChange(ctx: ToolContext, path: string, after: 
 
 export type ToolEffect = "read" | "state" | "probe" | "edit" | "exec" | "computer" | "interactive";
 
+/** Foreground human review of a proposed colleague, not public identity/telemetry. */
+export interface AgentCreationApproval {
+  kind: "agent-create";
+  username: string;
+  name: string;
+  role: string;
+  description: string;
+  instructions: string;
+}
+
 export interface ToolOperationTraits {
   /** Concrete effect for this input. Multi-action tools must not share one static permission label. */
   effect: ToolEffect;
@@ -120,6 +142,7 @@ export interface ToolOperationTraits {
   /** Require a fresh human decision even when the session is full-auto. Use for explicit ownership
    * transfers such as accepting a child Agent Diff; this grant is intentionally never remembered. */
   requiresExplicitApproval?: boolean;
+  approvalPresentation?: AgentCreationApproval;
   /** Metadata for future audit/permission UIs; never weakens the ordinary approval/guardian boundary. */
   destructive?: boolean;
 }
@@ -189,7 +212,10 @@ export function registerTool(t: Tool): void {
       // Verified read_file content already passed the protected-file policy. Preserve its historical
       // explicit opt-in semantics and harmless template placeholders in the immediate preview; oversized
       // continuation storage is still independently redacted by storeToolResult().
-      return prepareToolResult(await run(input, ctx), undefined, { redactPreview: t.name !== "read_file" });
+      // Continuation storage happens here, before runAgent can scrub its visible result. Apply the media
+      // boundary first so a large external-tool echo cannot persist pixels in a saved tool-result page.
+      const result = redactOwnedToolImageText(await run(input, ctx));
+      return prepareToolResult(result, undefined, { redactPreview: t.name !== "read_file" });
     },
   });
   specsCache = null;
@@ -233,6 +259,8 @@ export function toolOperationTraits(tool: Tool, input: unknown, ctx: ToolContext
         ? { approvalKind: classified.approvalKind }
         : {}),
       ...(classified.requiresExplicitApproval === true ? { requiresExplicitApproval: true } : {}),
+      ...(classified.requiresExplicitApproval === true && classified.approvalPresentation
+        ? { approvalPresentation: classified.approvalPresentation } : {}),
       ...(classified.destructive === true ? { destructive: true } : {}),
     };
   } catch {

@@ -71,7 +71,11 @@ never imports back into the CLI entry. Non-CLI entry points (`serve`, `gateway`,
 
 - `prompt.ts` — `PromptAssembler` builds the system prompt as ordered parts (`static` → `session` →
   `turn`). Ordering is enforced at assembly time; placing stable material after a dynamic suffix throws,
-  because it would destroy provider prefix-cache locality.
+  because it would destroy provider prefix-cache locality. For providers that declare
+  `trailingTurnContext` (all built-ins), `runAgent` sends only the `static`/`session` parts as the system
+  prompt; `turn` parts (brief, checkpoint, clock) ride as an ephemeral trailing `<system-reminder>` message
+  that never enters durable history (`HARA_TURN_CONTEXT_PLACEMENT=system` restores the single-prompt
+  layout). See `docs/execution-latency-handoff.md`.
 - `context-budget.ts` / `compact.ts` — history trimming, auto-compaction, working-set restore.
 - `failover.ts` — classifies a *finished* provider error (the SDK already retried transient ones) and
   decides on one fallback-model retry. `auth` and `interrupted` never auto-recover.
@@ -175,3 +179,6 @@ change nothing until explicitly approved and can never widen permissions).
   when you learn something durable — it is how Codex and Claude sessions hand off here.
 - Because Codex works in this repo too, check `git status` / `git diff` before starting: the change you
   were asked for may already be in flight in the working tree.
+- Messages between Codex and Claude sessions live in `../inbox/` (workspace-level `hara/inbox/`, format in
+  its `README.md`). Read open messages addressed to `claude` or `all` before non-trivial work, and leave
+  handoffs for Codex there rather than only in chat.

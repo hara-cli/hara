@@ -1,5 +1,7 @@
 import OpenAI from "openai";
 import { imageToBase64 } from "../images.js";
+import { readToolImageToBase64, TOOL_IMAGE_UNAVAILABLE_NOTE, TOOL_IMAGE_UNSUPPORTED_NOTE } from "../tools/tool-images.js";
+import { classifyVision } from "../vision.js";
 import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
 import { safeProviderErrorMessage } from "./errors.js";
 import { providerErrorMetadata } from "./retry.js";
@@ -84,13 +86,27 @@ export function toResponsesInput(
       continue;
     }
 
+    const imageParts: any[] = [];
     for (const result of message.results) {
+      let output = result.isError ? `ERROR: ${result.content}` : result.content;
+      for (const image of result.images ?? []) {
+        const data = supportsImages ? readToolImageToBase64(image) : null;
+        if (data) {
+          imageParts.push(
+            { type: "input_text", text: `Image observation from tool ${result.name} (call ${result.id}):` },
+            { type: "input_image", image_url: `data:${image.mediaType};base64,${data}`, detail: "auto" },
+          );
+        } else output += `\n${supportsImages ? TOOL_IMAGE_UNAVAILABLE_NOTE : TOOL_IMAGE_UNSUPPORTED_NOTE}`;
+      }
       input.push({
         type: "function_call_output",
         call_id: result.id,
-        output: result.isError ? `ERROR: ${result.content}` : result.content,
+        output,
       });
     }
+    // A separate user observation also works on compatible Responses services that only allow
+    // string function_call_output. The call id label keeps media provenance explicit.
+    if (imageParts.length) input.push({ role: "user", content: imageParts });
   }
   return input;
 }
@@ -189,10 +205,12 @@ export function createResponsesProvider(opts: {
     ...(Object.keys(defaultHeaders).length ? { defaultHeaders } : {}),
     ...(opts.fetch ? { fetch: opts.fetch } : {}),
   });
+  const supportsImages = opts.supportsImages ?? classifyVision(opts.label ?? "openai", opts.model) === "vision";
 
   return {
     id: opts.label ?? "openai",
     model: opts.model,
+    supportsToolImages: supportsImages,
     trailingTurnContext: true,
     async turn({ system, history, tools, onText, onReasoning, onActivity, signal }: TurnArgs): Promise<TurnResult> {
       const responseTools = tools.map((tool) => ({
@@ -204,7 +222,7 @@ export function createResponsesProvider(opts: {
       const params: any = {
         model: opts.model,
         instructions: system,
-        input: toResponsesInput(history, opts.supportsImages !== false),
+        input: toResponsesInput(history, supportsImages),
         max_output_tokens: 32000,
         stream: true,
       };

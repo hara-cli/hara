@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -116,6 +116,282 @@ const deps = (spaceId, externalSessions) => ({
     spaceId,
   }),
   externalSessions,
+});
+
+const userQuestionFixture = async ({ compatible = true, request, timeoutMs, reconnectGraceMs, inputMode = "question",
+  questionCount = 1, beforeQuestion } = {}) => {
+  const root = mkdtempSync(join(tmpdir(), "hara-serve-user-question-"));
+  const sessionId = "ext_codex_0123456789abcdef01234567";
+  const controller = new AbortController();
+  const received = [];
+  let resolveAnswered;
+  const answered = new Promise((resolve) => { resolveAnswered = resolve; });
+  const questions = request ?? { questions: [
+    { id: "runtime", header: "Runtime", question: "Which runtime?", options: [{ label: "A" }, { label: "B" }] },
+    { id: "title", question: "Pick a title", options: [{ label: "Default" }], isOther: true },
+    { id: "checks", question: "Which checks?", options: [{ label: "Build" }, { label: "Test" }], multiSelect: true },
+  ] };
+  const externalSessions = {
+    async submit(_sessionId, _text, sink) {
+      let answer;
+      for (let index = 0; index < questionCount; index++) {
+        await beforeQuestion?.(index);
+        answer = inputMode === "approval"
+          ? await sink.confirm({ question: "Allow this isolated fixture action?", allowAlways: false }, controller.signal)
+          : await sink.askUser(questions, controller.signal);
+        received.push(answer);
+      }
+      resolveAnswered(answer);
+      return { sessionId, turnId: "provider-private-turn", status: "completed", reply: "handled without answer echo" };
+    },
+    async interrupt() { controller.abort(); },
+    async close() { controller.abort(); },
+  };
+  const server = await startServe({ host: "127.0.0.1", port: 0, token: "personal-token", cwd: root }, {
+    ...deps("personal", externalSessions),
+    remoteCommandLedger: new RemoteCommandLedger({ home: root }),
+    ...(timeoutMs ? { externalUserQuestionTimeoutMs: timeoutMs } : {}),
+    ...(reconnectGraceMs ? { pendingInputReconnectGraceMs: reconnectGraceMs } : {}),
+  });
+  const client = await connect(server.port);
+  const initialized = await client.call("initialize", { token: "personal-token",
+    ...(compatible ? { capabilities: { features: ["external.questions.v1"] } } : {}) });
+  return { root, server, client, initialized, sessionId, controller, received, questions, answered,
+    async close() { client.ws.close(); await server.close(); rmSync(root, { recursive: true, force: true }); } };
+};
+
+test("external structured questions recover, validate exact answers and dedupe without saving answer text", async () => {
+  const fixture = await userQuestionFixture();
+  const { root, server, client, initialized, sessionId, received, questions } = fixture;
+  let observer;
+  try {
+    assert.ok(initialized.result.capabilities.features.includes("external.questions.v1"));
+    assert.ok(initialized.result.capabilities.methods.includes("external.question.reply"));
+    assert.ok(initialized.result.capabilities.events.includes("external.question.request"));
+    assert.ok(initialized.result.capabilities.events.includes("external.question.resolved"));
+    const submitting = client.call("external.sessions.submit", { sessionId, text: "ask with choices", commandId: randomUUID() });
+    const { params: pending } = await client.waitFor("external.question.request");
+    assert.deepEqual(pending.questions, questions.questions);
+    assert.ok(Date.parse(pending.expiresAt) > Date.now());
+    assert.match(pending.questionId, /^[a-f0-9-]{36}$/);
+    observer = await connect(server.port);
+    await observer.call("initialize", { token: "personal-token", capabilities: { features: ["external.questions.v1"] } });
+    const snapshot = (await observer.call("events.snapshot", { sessionIds: [] })).result;
+    assert.equal(snapshot.externalQuestions.length, 1);
+    assert.deepEqual(snapshot.externalQuestions[0], {
+      questionId: pending.questionId, sessionId, turnId: pending.turnId, expiresAt: pending.expiresAt, questions: pending.questions,
+    });
+    // Permission approval does not answer a question, even when its request UUID is known.
+    await client.call("approval.reply", { approvalId: pending.questionId, allow: true });
+    assert.equal(received.length, 0);
+    const base = { questionId: pending.questionId, sessionId, turnId: pending.turnId };
+    const wrongSession = await client.call("external.question.reply", { ...base,
+      sessionId: "ext_codex_89abcdef0123456789abcdef", answers: {}, commandId: randomUUID() });
+    assert.equal(wrongSession.error.code, -32005);
+    const stale = await client.call("external.question.reply", { ...base,
+      turnId: `extturn_${randomUUID()}`, answers: {}, commandId: randomUUID() });
+    assert.equal(stale.error.code, -32005);
+    const invalid = await client.call("external.question.reply", { ...base,
+      answers: { runtime: { answers: ["Not an option"] } }, commandId: randomUUID() });
+    assert.equal(invalid.error.code, -32602);
+    assert.equal((await client.call("events.snapshot", { sessionIds: [] })).result.externalQuestions.length, 1,
+      "invalid input never consumes the pending question");
+    const marker = "PRIVATE_CUSTOM_ANSWER_NOT_FOR_JOURNAL_2049";
+    const answers = { runtime: { answers: ["B"] }, title: { answers: [marker] }, checks: { answers: ["Build", "Test"] } };
+    const replyParams = { ...base, answers, commandId: randomUUID() };
+    assert.deepEqual((await observer.call("external.question.reply", replyParams)).result, {});
+    assert.deepEqual((await submitting).result.reply, "handled without answer echo");
+    assert.deepEqual(received, [answers]);
+    assert.equal((await client.waitFor("external.question.resolved")).params.outcome, "answered");
+    assert.deepEqual((await observer.call("external.question.reply", replyParams)).result, {}, "an exact retry never submits twice");
+    const conflict = await observer.call("external.question.reply", { ...replyParams, answers: {} });
+    assert.equal(conflict.error.code, -32005);
+    assert.deepEqual((await client.call("events.snapshot", { sessionIds: [] })).result.externalQuestions, []);
+    assert.doesNotMatch(readFileSync(join(root, ".hara", "serve", "remote-command-receipts.json"), "utf8"), new RegExp(marker));
+    assert.equal(JSON.stringify(client.events).includes(marker), false, "answer body is absent from streamed/replayed lifecycle data");
+    const late = await client.call("external.question.reply", { ...replyParams, commandId: randomUUID() });
+    assert.equal(late.error.code, -32005, "a new reply cannot reach a finished turn");
+    assert.equal(received.length, 1);
+  } finally { observer?.ws.close(); await fixture.close(); }
+});
+
+test("a sole Desktop can reconnect and recover a question or approval without extending expiry or auto-allowing", async () => {
+  for (const inputMode of ["question", "approval"]) {
+    const fixture = await userQuestionFixture({ reconnectGraceMs: 400, inputMode });
+    let reconnected;
+    try {
+      const { client, server, sessionId, received } = fixture;
+      void client.call("external.sessions.submit", { sessionId, text: "ask once" });
+      const { params: pending } = await client.waitFor(inputMode === "question" ? "external.question.request" : "external.approval.request");
+      const disconnected = new Promise((resolve) => client.ws.once("close", resolve));
+      client.ws.close();
+      await disconnected;
+      assert.equal(received.length, 0, "disconnect itself does not choose an answer or allow an action");
+      reconnected = await connect(server.port);
+      assert.equal((await reconnected.call("initialize", { token: "wrong-token" })).error.code, -32001);
+      await reconnected.call("initialize", { token: "personal-token", capabilities: { features: ["external.questions.v1"] } });
+      // Outlive the disconnect grace: the compatible authenticated reconnect must have cleared it.
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      const snapshot = (await reconnected.call("events.snapshot", { sessionIds: [] })).result;
+      assert.equal(received.length, 0);
+      if (inputMode === "question") {
+        const { deliveryCursor: _transportCursor, ...requestProjection } = pending;
+        assert.deepEqual(snapshot.externalQuestions, [requestProjection]);
+        assert.equal(snapshot.externalQuestions[0].expiresAt, pending.expiresAt);
+        assert.deepEqual((await reconnected.call("external.question.reply", { questionId: pending.questionId,
+          sessionId, turnId: pending.turnId, answers: { runtime: { answers: ["B"] } }, commandId: randomUUID() })).result, {});
+        assert.deepEqual(await fixture.answered, { runtime: { answers: ["B"] } });
+      } else {
+        assert.equal(snapshot.approvals.length, 1);
+        assert.equal(snapshot.approvals[0].approvalId, pending.approvalId);
+        assert.equal(snapshot.approvals[0].question, pending.question);
+        assert.deepEqual((await reconnected.call("approval.reply", { approvalId: pending.approvalId, allow: false,
+          scope: "external", sessionId, commandId: randomUUID() })).result, {});
+        assert.equal(await fixture.answered, false);
+      }
+    } finally { reconnected?.ws.close(); await fixture.close(); }
+  }
+});
+
+test("reconnect grace expires fail closed, respects the original question timeout, and shutdown cancels immediately", async () => {
+  for (const scenario of ["grace", "expiry", "shutdown", "approval-grace"]) {
+    const fixture = await userQuestionFixture({ reconnectGraceMs: scenario === "expiry" ? 1_000 : 40,
+      ...(scenario === "expiry" ? { timeoutMs: 60 } : {}),
+      ...(scenario === "approval-grace" ? { inputMode: "approval" } : {}) });
+    let incompatible;
+    try {
+      const { client, server, sessionId } = fixture;
+      void client.call("external.sessions.submit", { sessionId, text: "ask once" });
+      await client.waitFor(scenario === "approval-grace" ? "external.approval.request" : "external.question.request");
+      const disconnected = new Promise((resolve) => client.ws.once("close", resolve));
+      client.ws.close();
+      await disconnected;
+      if (scenario === "grace") {
+        incompatible = await connect(server.port);
+        await incompatible.call("initialize", { token: "personal-token" });
+        assert.deepEqual((await incompatible.call("events.snapshot", { sessionIds: [] })).result.externalQuestions, []);
+      }
+      if (scenario === "shutdown") await server.close();
+      assert.deepEqual(await fixture.answered, scenario === "approval-grace" ? false : {});
+      if (incompatible) {
+        await incompatible.call("initialize", { token: "personal-token", capabilities: { features: ["external.questions.v1"] } });
+        assert.deepEqual((await incompatible.call("events.snapshot", { sessionIds: [] })).result.externalQuestions, [],
+          "an expired form cannot be resurrected by later feature negotiation");
+      }
+    } finally { incompatible?.ws.close(); await fixture.close(); }
+  }
+});
+
+test("a negotiated turn can ask its second question after socket replacement, but old turns never gain input UI", async () => {
+  const fixture = await userQuestionFixture({ reconnectGraceMs: 400, questionCount: 2 });
+  let reconnected;
+  try {
+    const { client, server, sessionId } = fixture;
+    void client.call("external.sessions.submit", { sessionId, text: "two cards" });
+    const { params: first } = await client.waitFor("external.question.request");
+    const disconnected = new Promise((resolve) => client.ws.once("close", resolve));
+    client.ws.close();
+    await disconnected;
+    reconnected = await connect(server.port);
+    await reconnected.call("initialize", { token: "personal-token", capabilities: { features: ["external.questions.v1"] } });
+    const firstAnswers = { runtime: { answers: ["B"] } };
+    assert.deepEqual((await reconnected.call("external.question.reply", { questionId: first.questionId, sessionId,
+      turnId: first.turnId, answers: firstAnswers, commandId: randomUUID() })).result, {});
+    const { params: second } = await reconnected.waitFor("external.question.request");
+    assert.notEqual(second.questionId, first.questionId);
+    assert.equal(second.turnId, first.turnId);
+    const secondAnswers = { title: { answers: ["Second card"] } };
+    assert.deepEqual((await reconnected.call("external.question.reply", { questionId: second.questionId, sessionId,
+      turnId: second.turnId, answers: secondAnswers, commandId: randomUUID() })).result, {});
+    assert.deepEqual(await fixture.answered, secondAnswers);
+    assert.deepEqual(fixture.received, [firstAnswers, secondAnswers]);
+  } finally { reconnected?.ws.close(); await fixture.close(); }
+
+  for (const scenario of ["legacy", "disconnected-before-new-question"]) {
+    let release;
+    let reached;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const ready = new Promise((resolve) => { reached = resolve; });
+    const old = await userQuestionFixture({ compatible: scenario !== "legacy", reconnectGraceMs: 40,
+      beforeQuestion: async () => { reached(); await gate; } });
+    let compatibleClient;
+    try {
+      const submitting = old.client.call("external.sessions.submit", { sessionId: old.sessionId, text: "hold before question" });
+      await ready;
+      if (scenario === "legacy") {
+        compatibleClient = await connect(old.server.port);
+        await compatibleClient.call("initialize", { token: "personal-token", capabilities: { features: ["external.questions.v1"] } });
+      } else {
+        const closed = new Promise((resolve) => old.client.ws.once("close", resolve));
+        old.client.ws.close();
+        await closed;
+      }
+      release();
+      assert.deepEqual(await old.answered, {}, "an unsupported/disconnected new request closes without a choice or unbounded wait");
+      assert.deepEqual(old.received, [{}]);
+      if (scenario === "legacy") {
+        await submitting;
+        assert.equal(compatibleClient.events.some((event) => event.method === "external.question.request"), false);
+      }
+    } finally { release(); compatibleClient?.ws.close(); await old.close(); }
+  }
+});
+
+test("shutdown does not admit a second question when cancellation releases the first form", async () => {
+  const fixture = await userQuestionFixture({ questionCount: 2 });
+  try {
+    const { client, server, sessionId } = fixture;
+    void client.call("external.sessions.submit", { sessionId, text: "two cards during shutdown" });
+    await client.waitFor("external.question.request");
+    // Leave the compatible socket open: this exercises the shutdown microtask window, not disconnect.
+    await server.close();
+    assert.deepEqual(await fixture.answered, {});
+    assert.deepEqual(fixture.received, [{}, {}]);
+    assert.equal(client.events.filter((event) => event.method === "external.question.request").length, 1,
+      "stopping releases the original question but never broadcasts the provider's follow-up form");
+  } finally { await fixture.close(); }
+});
+
+test("external question cancellation, timeout and interruption return no default answers", async () => {
+  for (const reason of ["cancelled", "timed_out", "interrupted"]) {
+    const fixture = await userQuestionFixture({ ...(reason === "timed_out" ? { timeoutMs: 30 } : {}) });
+    const { client, sessionId, received } = fixture;
+    try {
+      const submitting = client.call("external.sessions.submit", { sessionId, text: "ask once" });
+      const { params: pending } = await client.waitFor("external.question.request");
+      if (reason === "cancelled") {
+        assert.deepEqual((await client.call("external.question.reply", { questionId: pending.questionId, sessionId,
+          turnId: pending.turnId, answers: {}, cancelled: true, commandId: randomUUID() })).result, {});
+      } else if (reason === "interrupted") {
+        await client.call("external.sessions.interrupt", { sessionId, expectedTurnId: pending.turnId, commandId: randomUUID() });
+      }
+      const resolved = await client.waitFor("external.question.resolved");
+      assert.equal(resolved.params.outcome, reason);
+      await submitting;
+      assert.deepEqual(received, [{}]);
+      assert.deepEqual((await client.call("events.snapshot", { sessionIds: [] })).result.externalQuestions, []);
+      assert.equal((await client.call("external.question.reply", { questionId: pending.questionId, sessionId,
+        turnId: pending.turnId, answers: { runtime: { answers: ["A"] } }, commandId: randomUUID() })).error.code, -32005);
+    } finally { await fixture.close(); }
+  }
+});
+
+test("old clients and secret questions fail closed without a request or confirmation fallback", async () => {
+  for (const scenario of ["old", "secret", "credential"]) {
+    const fixture = await userQuestionFixture({ compatible: scenario !== "old",
+      ...(scenario === "secret" ? { request: { questions: [{ id: "secret", question: "Required value", isSecret: true }] } } : {}),
+      ...(scenario === "credential" ? { request: { questions: [{ id: "key", question: "Paste your API key here" }] } } : {}),
+    });
+    try {
+      const { client, sessionId, received } = fixture;
+      const result = await client.call("external.sessions.submit", { sessionId, text: "ask once" });
+      assert.equal(result.result.status, "completed");
+      assert.deepEqual(received, [{}]);
+      assert.equal(client.events.some((event) => event.method === "external.question.request" || event.method === "external.approval.request"), false);
+      assert.deepEqual((await client.call("events.snapshot", { sessionIds: [] })).result.externalQuestions, []);
+      assert.doesNotMatch(JSON.stringify(client.events), /Paste your API key/);
+    } finally { await fixture.close(); }
+  }
 });
 
 test("an external retry cannot report provider success after its durable receipt failed", async () => {

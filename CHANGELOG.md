@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.184.0 — 2026-10-08 — scoped approvals and native coding questions
+
+- Add human-only approval cards for one action or the current task, with a 15-minute task limit,
+  explicit revocation, idempotent retry, and fail-closed disconnect/restoration. Task grants remain
+  memory-only, never pass to child Agents, and do not override stricter policy or Computer Use consent.
+- Relay native Codex and Claude Code choice questions with their real option identifiers, including
+  multiple selections and custom answers, instead of silently accepting a default. Restore Agent
+  creation cards without duplicating the created Agent or granting tools from chat content.
+- Add observed-step Computer Use transactions and screenshot-aware model input, with explicit action
+  approval, bounded leases, private transient media, and redaction of model media echoes before logging.
+- Offer opt-in local Laya assessment in experimental shadow mode; it does not silently replace Jev,
+  install its runtime, or grant permission to perform an action.
+- Upgrade the MCP SDK and its proxy-address dependency after new production security advisories.
+  These changes do not alter user model credentials, network routes, or running sessions.
+
 ## 0.183.4 — 2026-10-05 — bounded execution regression gates and private network diagnostics
 
 - Choose task intent from the user's authorized outcome, not the first inspection stage. Read-only

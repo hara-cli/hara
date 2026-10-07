@@ -28,6 +28,7 @@ import {
   type FetchLike,
   type TypeSafeDecisionConfig,
 } from "../decision/typesafe.js";
+import { layaRuntime } from "../decision/laya.js";
 
 export type RiskLevel = "low" | "high";
 export type GuardianDecision = "allow" | "block";
@@ -40,6 +41,7 @@ export interface ActionGuardVerdict {
   decision: ActionDecision;
   reason: string;
   source: "guardian" | "typesafe" | "combined";
+  engine?: "typesafe" | "laya-mlx";
   mode?: DecisionMode;
   observedDecision?: ActionDecision;
   confidence?: number;
@@ -51,12 +53,16 @@ export interface ActionGuardVerdict {
     outputTokens?: number;
   };
   unavailable?: boolean;
+  unavailableReason?: string;
 }
 
-export interface ActionGuardDecisionEngine {
+export type ActionGuardDecisionEngine = {
   engine: "typesafe";
   config: TypeSafeDecisionConfig;
-}
+} | {
+  engine: "laya-mlx";
+  config: { mode: DecisionMode };
+};
 
 // ── Deterministic risk classifier ────────────────────────────────────────────────────────────────────
 // The classifier is intentionally NARROW: false positives here cost latency + an LLM call + potential
@@ -390,6 +396,7 @@ export async function evaluateActionGuard(
     signal?: AbortSignal;
     onProviderTurn?: (turn: Promise<unknown>) => void;
     decisionFetch?: FetchLike;
+    localJudge?: typeof import("../decision/laya.js").LayaRuntime.prototype.judge;
   } = {},
 ): Promise<ActionGuardVerdict> {
   if (!decisionEngine) {
@@ -397,7 +404,7 @@ export async function evaluateActionGuard(
     return { ...legacy, source: "guardian" };
   }
 
-  const mode = decisionEngine.config.mode;
+  const mode = decisionEngine.engine === "laya-mlx" ? "shadow" : decisionEngine.config.mode;
   // Shadow intentionally pays for both calls so it can compare Jev with today's behavior. Once promoted to
   // advisory/enforce, Jev replaces the free-form semantic call; this is the latency/token saving. Advisory
   // falls back to the prior Guardian only when Jev itself is unavailable.
@@ -406,19 +413,24 @@ export async function evaluateActionGuard(
     : undefined;
   const task = taskSummary(history);
   let observed: Awaited<ReturnType<typeof judgeActionWithTypeSafe>> | undefined;
+  let unavailableReason: string | undefined;
   try {
-    observed = await judgeActionWithTypeSafe(
+    const input = {
+      task,
+      tool: action.tool,
+      category: action.category,
+      classifierReason: action.classifierReason,
+      detail: action.detail,
+    };
+    observed = decisionEngine.engine === "laya-mlx"
+      ? await (opts.localJudge ?? ((value, options) => layaRuntime().judge(value, options)))(input, { timeoutMs: opts.timeoutMs, signal: opts.signal })
+      : await judgeActionWithTypeSafe(
       decisionEngine.config,
-      {
-        task,
-        tool: action.tool,
-        category: action.category,
-        classifierReason: action.classifierReason,
-        detail: action.detail,
-      },
+      input,
       { timeoutMs: opts.timeoutMs, signal: opts.signal, fetch: opts.decisionFetch },
     );
-  } catch {
+  } catch (error) {
+    if (decisionEngine.engine === "laya-mlx") unavailableReason = redactSensitiveText(error instanceof Error ? error.message : String(error)).text.slice(0, 240);
     // The mode-specific fallback below owns availability semantics.
   }
 
@@ -428,6 +440,7 @@ export async function evaluateActionGuard(
     return {
       ...legacy,
       source: observed ? "combined" : "guardian",
+      engine: decisionEngine.engine,
       mode,
       ...(observed
         ? {
@@ -438,7 +451,7 @@ export async function evaluateActionGuard(
             elapsedMs: observed.elapsedMs,
             usage: observed.usage,
           }
-        : { unavailable: true }),
+        : { unavailable: true, ...(unavailableReason ? { unavailableReason } : {}) }),
     };
   }
 
