@@ -332,8 +332,8 @@ OpenBot `aff4981e0734f15ff2fc68c86a32f765e0cae2b2` 与 Codex
   抑制重复，不向普通聊天追加原始错误，也不伪造未确认用户消息的 accepted 状态或自动重发。
 - 内部 reminder 的 returned/write-ahead 两种入口均不会丢弃已接受的 intake 后续动作，
   合成回归确认只执行一次、无额外模型请求；真实用户插话仍丢弃原排队动作。
-- 最终 CLI 0.185.0 私有候选完整 `npm test`：2,462 通过、0 失败/取消、1 个 Windows 专项
-  条件跳过（共 2,463 项，约 179 秒）。Desktop 457/457、production build 与本机 locked
+- Windows 修订后 CLI 0.185.0 私有候选完整 `npm test`：2,483 通过、0 失败/取消、1 个 Windows 专项
+  条件跳过（共 2,484 项，约 191 秒）。Desktop 457/457、production build 与本机 locked
   cargo check 通过；这是源码/宿主检查，不是完整 App 或移动公网验收。
 - 真实 npm 包的 283 个公开文件、隔离安装、CLI/Pi API 与 OpenCode 原生执行通过；保留同一
   tarball 和 SHA-512 receipt，上传前复核且不重新打包。compiled Pi 的认证 Serve、读工具、
@@ -342,3 +342,6 @@ OpenBot `aff4981e0734f15ff2fc68c86a32f765e0cae2b2` 与 Codex
   Mac ARM 的本机结果不能冒充 Windows、Linux、musl、Intel、Developer ID 公证或稳定 CDN 验证。
   当前尚未发布/替换装机，也没有关闭原上传工单；必须先发布并验证新 CLI，再将 Desktop
   stamp 锁到新版本的精确提交，单独走其保护环境、签名和稳定更新链。
+- 首轮远端 main CI 的 Windows npm 安装超时和 Pi failed 阻止了创建 tag。已补 Windows
+  工作树路径身份回归与有界 npm 安装诊断，新提交必须重新经过同样跨平台门禁；详情见
+  [coding-executors-acceptance.md](coding-executors-acceptance.md#windows-远端门禁阻止发布及修订)。

@@ -89,6 +89,33 @@ function outputText(result: GitResult): string {
   return result.stdout.toString("utf8").trim();
 }
 
+/** Git's NUL-delimited porcelain paths are unquoted and may use non-native separators. Compare
+ * filesystem identity, not Git's display spelling, without weakening the target's no-link checks. */
+export function agentWorktreeRegistrationMatches(
+  output: string,
+  target: string,
+  options: Readonly<{
+    canonicalize?: (value: string) => string;
+    isAbsolutePath?: (value: string) => boolean;
+  }> = {},
+): boolean {
+  if (!output.endsWith("\0")) return false;
+  const canonicalize = options.canonicalize ?? ((value: string) => realpathSync.native(resolve(value)));
+  const isAbsolutePath = options.isAbsolutePath ?? isAbsolute;
+  for (const field of output.split("\0")) {
+    if (!field.startsWith("worktree ")) continue;
+    const path = field.slice("worktree ".length);
+    if (!isAbsolutePath(path)) continue;
+    try {
+      if (canonicalize(path) === target) return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+    }
+  }
+  return false;
+}
+
 function pathWithin(root: string, candidate: string): boolean {
   const rel = relative(root, candidate);
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
@@ -282,8 +309,8 @@ export class AgentWorktreeManager {
     if (!COMMIT.test(baseCommit) || (expectedBaseCommit && baseCommit !== expectedBaseCommit)) {
       throw new Error("managed Agent worktree base commit changed");
     }
-    const listed = outputText(git(this.repositoryRoot, ["worktree", "list", "--porcelain"]));
-    if (!listed.split(/\r?\n/u).includes(`worktree ${target}`)) {
+    const listed = git(this.repositoryRoot, ["worktree", "list", "--porcelain", "-z"]).stdout.toString("utf8");
+    if (!agentWorktreeRegistrationMatches(listed, target)) {
       throw new Error("managed Agent directory is not registered to the source repository");
     }
     const cwd = resolve(target, this.sourceRelativeCwd);

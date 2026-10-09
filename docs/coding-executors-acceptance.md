@@ -53,8 +53,8 @@
 
 ## 0.185.0 发布前产物门禁（2026-10-09，未发布）
 
-- 最终隔离候选完整 `npm test`：2,463 项，2,462 通过、0 失败/取消、1 个 Windows 专项条件跳过，
-  约 179 秒。明确 Node 22.23.1/Bun PATH；此前因旧断言和 IPv6 夹具失败的全量结果仍保留，
+- Windows 修订后隔离候选完整 `npm test`：2,484 项，2,483 通过、0 失败/取消、1 个 Windows 专项条件跳过，
+  约 191 秒。明确 Node 22.23.1/Bun PATH；此前因旧断言和 IPv6 夹具失败的全量结果仍保留，
   不以定向复跑替代本次最终全量。
 - 最终候选在私有安装目录完成真实 npm pack/install 验收：283 个公开文件、CLI version/help/licenses、
   Pi SDK 版本与 API、独立安装路径归属，以及 OpenCode Darwin ARM64 1.18.32 原生执行均通过。
@@ -64,10 +64,27 @@
 - 新编译 CLI 0.185.0 的 Darwin ARM64 产物按既有 entitlements 做 ad-hoc 外层签名，签名校验后再次
   通过 boundary、Serve、内嵌 OpenCode 和 compiled Pi 四项实际 smoke。Pi 使用认证 Serve 与本机
   合成 Provider，真实读工具、同会话第二代继续和 3 请求/21 输入/9 输出计量一致，无付费请求。
-  该临时产物 SHA-256 为 `bc78f0c65e144d79fc6b0a9638c201b480ca52c2fbc40ef51268cdcb90557703`。
+  Windows 路径修订后重新编译并通过同样四项 smoke 的临时产物 SHA-256 为
+  `9c046d153dbfdbe44be47ef7a538ff3dc82e775ca1c5cfc139e52da22114547c`。
 - npm 发布依赖完整 reusable CI；Linux ARM64 在原生 runner 执行后才进入 release assembly。
   npm 安装门禁已进入 Node、Windows 及四平台 native lane，compiled Pi smoke 进入 native 和公开
   Darwin 产物门禁。这些是已接入的要求，不表示这些远端 runner 已经为本候选通过。
 - Desktop 当前源码候选 457/457 回归、production build 与锁定 Rust 的本机 cargo check 通过。
   这不是完整 packaged-app initialize、Developer ID 公证、真实手机/公网 Relay 或稳定更新渠道验证。
   Desktop 仍锁旧 CLI；必须在 CLI 的新提交/tag 与公共产物验证后更新锁并单独发布。
+
+### Windows 远端门禁阻止发布及修订
+
+- 首次 main CI `37945998646`（`cd1ee086`）的八个非 Windows job 通过。Windows 的编译、
+  boundary、Serve 与内嵌 OpenCode 均通过，但 npm 私有安装触发 180 秒 deadline，Pi worker
+  返回 failed 而非 completed。因此没有创建发布 tag，也没有发布 npm 或 Desktop。
+- npm 安装仍固定使用官方 registry、禁用生命周期脚本、隔离配置且失败即停止；Windows 的
+  有界安装预算改为 360 秒，其他平台保持 180 秒。新增固定阶段/耗时/预算诊断，不回显子进程
+  原始内容；现有日志不足以把具体原因归到网络或磁盘。
+- 另发现工作树登记直接比较 Git slash 路径与 native Windows 路径的缺陷。改用 `--porcelain -z`
+  原始字段和原生规范身份，保留目录 no-link、源仓登记、HEAD 与 cwd 检查。新增 Windows drive/UNC、
+  NUL/Unicode、真实 prepare/capture、链接与外仓拒绝回归，并进入 Windows 专项 CI。
+- Pi 失败诊断只依赖 Node builtins，输出固定阶段、轮次、状态与工作树错误码，不打印任意错误
+  正文、路径、模型输入或 token；公开原生产物检查无需源码 dist/node_modules。
+- 修改后本机完整回归和真实 npm 包检查通过，新 Mac ARM 原生产物四项 smoke 通过。
+  仍须新提交的 Windows CI 验证；不能凭源码缺陷推定首次 Pi 失败的全部原因已证实。

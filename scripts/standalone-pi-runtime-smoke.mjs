@@ -8,6 +8,7 @@ import { createServer } from "node:http";
 import { createServer as createPortReservation } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { readStandalonePiSmokeWorkerFailure, standalonePiSmokeDiagnostic } from "./standalone-pi-runtime-diagnostics.mjs";
 
 const [binaryArg, expectedVersion] = process.argv.slice(2);
 if (!binaryArg || !expectedVersion) {
@@ -32,6 +33,7 @@ const env = {
 let child, ws, failedRequest;
 let childOutput = "";
 let rootRounds = 0, workerRounds = 0, requests = 0;
+let stage = "fixture_git", diagnosticWorker, diagnosticSessionId;
 const pending = new Map();
 const server = createServer(async (req, res) => {
   try {
@@ -126,15 +128,18 @@ try {
     const result = spawnSync("git", ["-c", "core.hooksPath=/dev/null", ...args], { cwd, env, encoding: "utf8", timeout: 10_000 });
     assert.equal(result.status, 0, "isolated fixture Git setup failed");
   }
+  stage = "fixture_provider";
   await new Promise((done, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", done); });
   env.HARA_BASE_URL = `http://127.0.0.1:${server.address().port}/v1`;
   // Serve pins a persisted route per session; ambient model variables alone do not create that route.
+  stage = "profile";
   for (const args of [["profile", "add", "native-smoke", "--byok", "--provider", "openai-compatible",
     "--no-key-prompt", "--key", env.HARA_API_KEY, "--base-url", env.HARA_BASE_URL, "--model", env.HARA_MODEL],
     ["profile", "use", "native-smoke"]]) {
     const configured = spawnSync(binary, args, { cwd: root, env, encoding: "utf8", timeout: 15_000, windowsHide: true });
     assert.equal(configured.status, 0, "isolated synthetic provider profile setup failed");
   }
+  stage = "serve_start";
   const port = await new Promise((done, reject) => {
     const reservation = createPortReservation(); reservation.once("error", reject);
     reservation.listen(0, "127.0.0.1", () => {
@@ -147,6 +152,7 @@ try {
   child.stderr.on("data", chunk => { childOutput = (childOutput + String(chunk)).slice(-4_000); });
   child.on("error", error => { notificationFailure = error; });
   const discovery = join(home, ".hara", "serve.json");
+  stage = "discovery";
   const record = await waitFor(() => {
     if (notificationFailure) throw notificationFailure;
     if (!existsSync(discovery)) return null;
@@ -173,18 +179,25 @@ try {
     ws.addEventListener("open", () => { clearTimeout(timer); done(); }, { once: true });
     ws.addEventListener("error", () => { clearTimeout(timer); reject(new Error("native WebSocket failed")); }, { once: true });
   });
+  stage = "initialize";
   const initialized = await rpc("initialize", { token: record.token,
     capabilities: { features: ["coding.settings.v1", "external.delegated-interaction.v1", "external.questions.v1"] } });
   assert.equal(initialized.error, undefined); assert.equal(initialized.result.version, expectedVersion);
+  stage = "settings";
   const settings = await rpc("settings.coding.get");
   assert.equal(settings.error, undefined); assert.equal(settings.result.effectiveExecutor, "pi");
+  stage = "session_create";
   const created = await rpc("session.create"); assert.equal(created.error, undefined);
   const sessionId = created.result.sessionId;
+  diagnosticSessionId = sessionId;
+  stage = "session_send";
   const sent = await rpc("session.send", { sessionId, text: "Run the synthetic Pi read and same-session recall fixture. No external services, sends, writes or shell commands." });
   if (failedRequest) throw failedRequest;
   if (notificationFailure) throw notificationFailure;
   assert.equal(sent.error, undefined, "native Pi task did not complete");
+  stage = "worker_assertions";
   const listed = await rpc("session.agents.list", { sessionId }); assert.equal(listed.error, undefined);
+  diagnosticWorker = listed.result?.agents?.[0];
   assert.equal(listed.result.agents.length, 1);
   const worker = listed.result.agents[0];
   assert.equal(worker.runtime, "pi"); assert.equal(worker.status, "completed"); assert.equal(worker.generation, 2);
@@ -193,6 +206,7 @@ try {
   assert.equal(listed.result.budget.providerRounds, 3); assert.equal(listed.result.budget.toolCalls, 1);
   assert.equal(listed.result.budget.inputTokens, 21); assert.equal(listed.result.budget.outputTokens, 9);
   assert.equal(readFileSync(join(cwd, "source.txt"), "utf8"), "synthetic-pi-memory-314\n");
+  stage = "shutdown";
   const shutdown = await rpc("server.shutdown"); assert.equal(shutdown.error, undefined);
   await new Promise((done, reject) => {
     if (child.exitCode !== null) { assert.equal(child.exitCode, 0); done(); return; }
@@ -202,7 +216,11 @@ try {
   assert.equal(existsSync(discovery), false);
   console.log("✓ compiled Pi SDK: authenticated Serve, real read tool, same-session resume and exact usage; loopback synthetic only");
 } catch (error) {
-  console.error(`standalone Pi runtime smoke: ${error instanceof Error ? error.message : "fixture failed"}`);
+  console.error("standalone Pi runtime smoke failed");
+  const workerFailure = readStandalonePiSmokeWorkerFailure(home, diagnosticSessionId, diagnosticWorker?.id);
+  console.error(`standalone Pi runtime diagnostic: ${JSON.stringify(standalonePiSmokeDiagnostic({
+    stage, rootRounds, workerRounds, requests, worker: diagnosticWorker, workerFailure, error,
+  }))}`);
   process.exitCode = 1;
 } finally {
   for (const item of pending.values()) { clearTimeout(item.timer); item.reject(new Error("fixture stopped")); }

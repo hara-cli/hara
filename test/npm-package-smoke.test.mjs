@@ -14,6 +14,8 @@ import {
   verifyRetainedPackage,
   packageSmokeEnv,
   npmInstallArgs,
+  npmInstallTimeout,
+  packageSmokeCommandFailure,
   matchingNpmCliCandidates,
   writeInstalledModuleProbe,
 } from "../scripts/npm-package-smoke.mjs";
@@ -437,6 +439,32 @@ test("offline and cache-preferred install modes are explicit and mutually exclus
   assert.ok(!offline.includes("--prefer-offline"));
   assert.ok(preferred.includes("--prefer-offline"));
   assert.ok(!preferred.includes("--offline"));
+});
+
+test("fresh Windows npm installs have a bounded longer budget without changing other platforms", () => {
+  assert.equal(npmInstallTimeout("win32"), 360_000);
+  for (const platform of ["darwin", "linux", "freebsd"]) assert.equal(npmInstallTimeout(platform), 180_000);
+  assert.equal(npmInstallTimeout(), npmInstallTimeout(process.platform));
+});
+
+test("package command timeout diagnostics identify the stage and budget without exposing child data", () => {
+  const privateText = "PRIVATE_TOKEN=fixture-secret https://private.invalid/signed?token=fixture";
+  const failure = packageSmokeCommandFailure({
+    error: { code: "ETIMEDOUT", message: privateText }, stderr: privateText, stdout: privateText,
+  }, "isolated npm install", 360_000, 360_045.4);
+  assert.match(failure, /^isolated npm install failed \(ETIMEDOUT\)/u);
+  assert.match(failure, /elapsed 360045ms, timeout 360000ms/u);
+  assert.doesNotMatch(failure, /PRIVATE_TOKEN|fixture-secret|private\.invalid/u);
+});
+
+test("package command diagnostics preserve exit/signal failures and suppress arbitrary error reasons", () => {
+  assert.match(packageSmokeCommandFailure({ status: 1 }, "npm pack", 60_000, 100), /failed \(1\)/u);
+  assert.match(packageSmokeCommandFailure({ signal: "SIGTERM" }, "npm pack", 60_000, 100), /failed \(SIGTERM\)/u);
+  const failure = packageSmokeCommandFailure({ error: { code: "secret=untrusted-data" } },
+    "isolated npm install", 180_000, 100, true);
+  assert.match(failure, /failed \(spawn error\)/u);
+  assert.match(failure, /offline mode requires a prefilled npm metadata\/tarball cache/u);
+  assert.doesNotMatch(failure, /untrusted-data/u);
 });
 
 test("npm CLI lookup is bound to the active Node installation, not npm shims or environment overrides", () => {

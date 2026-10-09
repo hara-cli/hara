@@ -22,6 +22,8 @@ All notable changes to `@nanhara/hara`.
 - Ship offline engine license notices and gate release artifacts with isolated npm installation,
   native OpenCode checks and compiled Pi same-session smoke. npm publishes the exact tested archive;
   native Linux ARM64 is executed on its own runner before release assembly.
+- Match Git's NUL-delimited worktree paths by native filesystem identity, including Windows path
+  separators, while retaining repository, no-link, base-commit and workspace ownership checks.
 
 ## 0.184.1 — 2026-10-08 — scoped approvals and native coding questions
 

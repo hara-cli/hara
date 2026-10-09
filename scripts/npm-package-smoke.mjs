@@ -147,6 +147,20 @@ export function npmInstallArgs(tarball, prefix, { offline = false, cache } = {})
   ];
 }
 
+/** Fresh tarball installs resolve ranges without the checkout lockfile; Windows gets a longer bounded budget. */
+export function npmInstallTimeout(platform = process.platform) {
+  return platform === "win32" ? 360_000 : 180_000;
+}
+
+/** Only fixed stage names, OS failure codes and timings are reportable; never echo child output. */
+export function packageSmokeCommandFailure(result, label, timeout, elapsedMs, offline = false) {
+  const value = result.error?.code ?? result.signal ?? result.status;
+  const reason = typeof value === "string" && /^[A-Z][A-Z0-9_]{0,63}$/u.test(value) ? value
+    : Number.isSafeInteger(value) ? value : "spawn error";
+  return `${label} failed (${reason}); elapsed ${Math.max(0, Math.round(elapsedMs))}ms, timeout ${timeout}ms`
+    + (offline ? "; offline mode requires a prefilled npm metadata/tarball cache" : "");
+}
+
 // Run in a separate Node process so even SDK module initialization gets only the private environment.
 const INSTALLED_MODULE_PROBE = String.raw`
 import assert from "node:assert/strict";
@@ -223,10 +237,14 @@ export function runNpmPackageSmoke({ packageRoot = resolve(dirname(fileURLToPath
     const selectedCache = cache ? resolve(cache) : join(scratch, "npm-cache");
     const env = packageSmokeEnv(home, selectedCache, process.env);
     const run = (command, args, label, timeout = 60_000) => {
+      console.error(`npm package smoke: ${label} started (timeout ${timeout}ms)`);
+      const started = performance.now();
       const result = spawnSync(command, args, { cwd: scratch, env, encoding: "utf8", timeout, maxBuffer: 8 * 1024 * 1024 });
+      const elapsedMs = performance.now() - started;
       if (result.error || result.status !== 0) {
-        throw new Error(`${label} failed (${result.error?.code ?? result.signal ?? result.status ?? "spawn error"})${offline ? "; offline mode requires a prefilled npm metadata/tarball cache" : ""}`);
+        throw new Error(packageSmokeCommandFailure(result, label, timeout, elapsedMs, offline));
       }
+      console.error(`npm package smoke: ${label} passed (${Math.round(elapsedMs)}ms)`);
       return result.stdout;
     };
     const manifest = parseJson(run(process.execPath, [npmCli, "pack", root, "--ignore-scripts", "--json", "--pack-destination", packedDir], "npm pack"), "npm pack manifest");
@@ -234,7 +252,7 @@ export function runNpmPackageSmoke({ packageRoot = resolve(dirname(fileURLToPath
     const packed = manifest[0], inspected = inspectPackageFiles(packed, pkg);
     const tarball = join(packedDir, packed.filename);
     if (tarballIntegrity(tarball) !== packed.integrity) throw new Error("npm tarball integrity mismatch");
-    run(process.execPath, [npmCli, ...npmInstallArgs(tarball, prefix, { offline, cache: selectedCache })], "isolated npm install", 180_000);
+    run(process.execPath, [npmCli, ...npmInstallArgs(tarball, prefix, { offline, cache: selectedCache })], "isolated npm install", npmInstallTimeout());
     const installed = realpathSync(join(prefix, "node_modules", "@nanhara", "hara"));
     const installedRelative = relative(prefix, installed);
     if (installedRelative === ".." || installedRelative.startsWith(`..${sep}`) || isAbsolute(installedRelative)) {
