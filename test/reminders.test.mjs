@@ -1,11 +1,12 @@
-// system-reminder injection layer (à la Claude Code's Ie1/WD5) + todo attention-refresh.
+// Internal reminder injection + the unified progress watchdog's todo attention-refresh.
 // Pins: (a) the queue/wrap contract incl. the ignore-if-irrelevant disclaimer, (b) the loop injecting
 // queued reminders as ONE user message before the next model call, (c) staleness firing after
-// TODO_STALE_ROUNDS untouched rounds and resetting on todo_write, (d) quiet (sub-agent) runs neither
+// five stale rounds and resetting on durable progress, (d) quiet (sub-agent) runs neither
 // draining nor nagging, and (e) the bounded checkpoint compaction contract.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { pushReminder, drainReminders, isSystemReminderContent, wrapReminders, todoStaleReminder, TODO_STALE_ROUNDS, disposeReminderScope } from "../dist/agent/reminders.js";
+import { pushReminder, drainReminders, isSystemReminderContent, wrapReminders, disposeReminderScope } from "../dist/agent/reminders.js";
+import { UNATTENDED_PROGRESS_NUDGE_ROUNDS as TODO_STALE_ROUNDS } from "../dist/agent/progress-watchdog.js";
 import { COMPACT_SYSTEM } from "../dist/agent/compact.js";
 import { runAgent } from "../dist/agent/loop.js";
 import { getTool } from "../dist/tools/registry.js";
@@ -97,17 +98,18 @@ test("loop: queued reminder lands as ONE <system-reminder> user message before t
   assert.ok(injected[0].content.includes("config file changed"), "carries the queued event");
 });
 
-test("loop: todo staleness fires after TODO_STALE_ROUNDS untouched rounds (unfinished items)", async () => {
+test("loop: pending todos use the unified progress warning after five stale rounds", async () => {
   drainReminders();
   clearTodos();
   await getTool("todo_write").run({ todos: [{ text: "big task", status: "in_progress" }] }, { cwd: process.cwd() });
-  // TODO_STALE_ROUNDS rounds of non-todo tools → nag queued on the Nth, injected on the NEXT call.
+  // Five rounds of non-todo tools → one warning, not an independent queued todo reminder.
   const provider = mkProvider(Array.from({ length: TODO_STALE_ROUNDS + 1 }, () => ["noop"]));
   const history = [{ role: "user", content: "work" }];
   await runAgent(history, base(history, provider));
-  const nag = history.find((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("todo list has not been updated"));
-  assert.ok(nag, "staleness reminder injected");
-  assert.ok(nag.content.includes("big task"), "re-shows the authoritative list");
+  const nags = history.filter((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("No-progress checkpoint"));
+  assert.equal(nags.length, 1, "one engine-owned staleness reminder");
+  assert.match(nags[0].content, /todo 0\/1/);
+  assert.equal(history.some(m => m.content?.includes("todo list has not been updated")), false);
   clearTodos();
 });
 
@@ -131,8 +133,8 @@ test("loop: completing a todo resets the staleness clock (no nag)", async () => 
   const history = [{ role: "user", content: "work" }];
   await runAgent(history, base(history, provider));
   assert.ok(
-    !history.some((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("todo list has not been updated")),
-    "no staleness nag when the checklist keeps being touched",
+    !history.some((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("No-progress checkpoint")),
+    "no staleness nag when a todo is genuinely completed",
   );
   clearTodos();
 });
@@ -151,7 +153,7 @@ test("loop: rewriting the same unfinished todo cannot reset the staleness clock"
   const history = [{ role: "user", content: "work" }];
   await runAgent(history, base(history, provider));
   assert.ok(
-    history.some((message) => typeof message.content === "string" && message.content.includes("todo list has not been updated")),
+    history.some((message) => typeof message.content === "string" && message.content.includes("No-progress checkpoint")),
     "an unchanged todo rewrite does not manufacture progress",
   );
   clearTodos();

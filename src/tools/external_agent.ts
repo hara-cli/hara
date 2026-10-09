@@ -13,7 +13,7 @@ import { registerTool, type ToolContext } from "./registry.js";
 import { capHeadTail } from "./builtin.js";
 import { loadConfig } from "../config.js";
 import type { SandboxMode } from "../sandbox.js";
-import { haraCodeRuntimeCommand } from "../opencode-runtime.js";
+import { HARA_CODE_RUNTIME_UNAVAILABLE_MESSAGE, resolveHaraCodeRuntime } from "../opencode-runtime.js";
 import {
   createBoundedToolNoticeEmitter,
   createToolOutputLineRedactor,
@@ -76,9 +76,11 @@ export function buildExternalArgv(backend: string, task: string, o: ExternalArgv
     return { cmd: "codex", args: ["exec", task, "--cd", o.cwd, ...(o.model ? ["-m", o.model] : []), "--sandbox", sb] };
   }
   if (backend === "opencode") {
+    const runtime = resolveHaraCodeRuntime();
+    if (!runtime.available) return null;
     const agent = o.trust === "full" || o.sandbox === "workspace-write" ? "build" : "plan";
     return {
-      cmd: haraCodeRuntimeCommand(),
+      cmd: runtime.command,
       args: [
         "--pure",
         "run",
@@ -216,8 +218,10 @@ registerTool({
     // An explicit choice must not wait for an unrelated CLI's slow or broken `--version` command.
     // Discovery still probes all built-ins concurrently only when the caller asks Hara to choose.
     const candidates = requestedBackend ? [requestedBackend] : BUILTIN_BACKENDS;
-    const commands = candidates.map((candidate) => candidate === "opencode" ? haraCodeRuntimeCommand() : candidate);
-    const availability = await Promise.all(commands.map((command) => available(command, ctx.signal)));
+    const runtime = candidates.includes("opencode") ? resolveHaraCodeRuntime() : undefined;
+    const commands = candidates.map((candidate) => candidate === "opencode"
+      ? runtime?.available ? runtime.command : undefined : candidate);
+    const availability = await Promise.all(commands.map((command) => command ? available(command, ctx.signal) : false));
     if (ctx.signal?.aborted) return "[external agent] interrupted before start by agent run deadline or cancellation";
     const installed = candidates.filter((_candidate, index) => availability[index]);
     const backend = requestedBackend || installed[0] || "";
@@ -227,14 +231,14 @@ registerTool({
     if (!availability[candidates.indexOf(backend)]) {
       return requestedBackend
         ? backend === "opencode"
-          ? "Hara's built-in code runtime is unavailable. Reinstall the official Hara Desktop package or configure OpenCode for standalone Hara CLI."
+          ? HARA_CODE_RUNTIME_UNAVAILABLE_MESSAGE
           : `'${backend}' CLI not found on PATH. Other external-agent CLIs were not probed because you explicitly selected ${backend}.`
         : `'${backend}' coding runtime is unavailable. Available runtimes: ${installed.join(", ") || "none"}.`;
     }
     if (ctx.signal?.aborted) return "[external agent] interrupted before start by agent run deadline or cancellation";
 
     const built = buildExternalArgv(backend, task, { cwd: ctx.cwd, model: input.model ? String(input.model) : undefined, sandbox: ctx.sandbox ?? "off", trust });
-    if (!built) return `Unknown backend '${backend}'.`;
+    if (!built) return backend === "opencode" ? HARA_CODE_RUNTIME_UNAVAILABLE_MESSAGE : `Unknown backend '${backend}'.`;
     const timeout = Math.min(Math.max(30_000, Number(input.timeout_ms) || 600_000), 1_800_000);
 
     return await new Promise<string>((resolve) => {

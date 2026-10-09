@@ -439,7 +439,7 @@ test("Serve exposes user-driven Agent members, direct messages, and bounded grou
     assert.deepEqual(listed.result.agents.find((agent) => agent.id === alpha.result.agent.id).runtimeGrants, ["codex"]);
     assert.deepEqual(
       listed.result.agents.find((agent) => agent.id === beta.result.agent.id).runtimeGrants,
-      ["codex", "claude"],
+      ["codex", "claude", "opencode", "pi"],
       "a Personal-space Hara Agent inherits eligible coding executors without a separate setup step",
     );
 
@@ -495,7 +495,7 @@ test("Serve exposes user-driven Agent members, direct messages, and bounded grou
   }
 });
 
-test("Serve routes approved Codex Agents through one isolated Hara Live continuation", { timeout: 20_000 }, async () => {
+test("Serve routes approved Codex Agents through one isolated structured provider continuation", { timeout: 20_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-serve-external-agent-team-"));
   const home = join(root, "home");
   const repo = join(root, "repo");
@@ -511,24 +511,24 @@ test("Serve routes approved Codex Agents through one isolated Hara Live continua
   writeFileSync(join(repo, "owned.txt"), "source\n");
   runGit("add", "owned.txt");
   runGit("commit", "-qm", "base");
-  const runtimeId = `ext_runtime_${"c".repeat(24)}`;
+  const providerSessionId = `ext_codex_${"c".repeat(24)}`;
   const calls = [];
   let runtimeCwd = "";
   const externalSessions = {
-    async createSession(input) {
+    async createCodingSession(input) {
       calls.push(["create", input]);
       runtimeCwd = input.cwd;
-      return { session: { id: runtimeId }, messages: [], readOnly: false, controlMode: "live" };
+      return { session: { id: providerSessionId, sourceId: "codex" }, messages: [], readOnly: false, controlMode: "managed" };
     },
-    async readSession(id) {
-      calls.push(["read", id]);
-      return { session: { id }, messages: [], readOnly: false, controlMode: "live" };
+    async resumeCodingSession(input) {
+      calls.push(["resume", input.providerSessionId]);
+      return { session: { id: input.providerSessionId, sourceId: "codex" }, messages: [], readOnly: false, controlMode: "managed" };
     },
     async submit(id, text) {
       calls.push(["submit", id, text]);
       return { sessionId: id, turnId: `turn-${calls.length}`, status: "completed", reply: "reviewed" };
     },
-    async terminalInput(id, text) { calls.push(["terminal-input", id, text]); },
+    async steer(id, text) { calls.push(["steer", id, text]); },
     async interrupt(id) { calls.push(["interrupt", id]); },
     async close() { calls.push(["close"]); },
   };
@@ -560,8 +560,9 @@ test("Serve routes approved Codex Agents through one isolated Hara Live continua
     assert.deepEqual(listed.result.rooms, []);
     assert.notEqual(runtimeCwd, repo);
     assert.equal(calls.filter((entry) => entry[0] === "create").length, 1);
-    assert.equal(calls.filter((entry) => entry[0] === "read").length, 1);
+    assert.equal(calls.filter((entry) => entry[0] === "resume").length, 1);
     assert.equal(calls.filter((entry) => entry[0] === "submit").length, 2);
+    assert.ok(calls.filter((entry) => entry[0] === "submit").every((entry) => entry[1] === providerSessionId));
     assert.equal(readFileSync(join(repo, "owned.txt"), "utf8"), "source\n");
   } finally {
     client?.ws.close();

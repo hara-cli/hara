@@ -148,6 +148,10 @@ test("interactive CLI hosts and cold-restores the durable Agent tree", { timeout
       const body = JSON.parse(raw);
       requests.push(body);
       const transcript = JSON.stringify(body.messages ?? []);
+      if (transcript.includes("Name this coding session as a SHORT slug")) {
+        respondText(response, "durable-agent-inspection");
+        return;
+      }
       if (transcript.includes("Initial assignment:\\nInspect the fixture and return a concise conclusion.")) {
         respondText(response, "child conclusion");
         return;
@@ -182,6 +186,7 @@ test("interactive CLI hosts and cold-restores the durable Agent tree", { timeout
           completion: {
             state: "verified",
             evidence: ["wait_agent returned the child conclusion"],
+            final_answer: "INITIAL_AGENT_TREE_COMPLETE",
           },
         });
       } else {
@@ -216,6 +221,7 @@ test("interactive CLI hosts and cold-restores the durable Agent tree", { timeout
     await first.waitFor(/Type a task\./u);
     first.write("Delegate one inspection through a durable Agent");
     await first.waitFor(/INITIAL_AGENT_TREE_COMPLETE[\s\S]*mock-model[\s\S]*›/u);
+    assert.equal(initialRound, 4, "the accepted receipt ends the root turn without a prose-only model request");
     first.write("/exit");
     assert.equal(await first.close(), 0, first.output());
 

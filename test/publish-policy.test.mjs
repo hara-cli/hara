@@ -1,0 +1,40 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+const ci = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+const publishing = readFileSync(new URL("../.github/workflows/publish-npm.yml", import.meta.url), "utf8");
+
+function workflowJob(workflow, name) {
+  const lines = workflow.split("\n");
+  const start = lines.indexOf(`  ${name}:`);
+  assert.ok(start >= 0, `workflow must define ${name}`);
+  const next = lines.findIndex((line, index) => index > start && /^  [A-Za-z0-9_-]+:\s*$/.test(line));
+  return lines.slice(start + 1, next < 0 ? undefined : next).join("\n");
+}
+
+test("npm publication waits for the same complete reusable CI on tags and manual dispatch", () => {
+  assert.match(ci, /^on:\n  workflow_call:/m);
+  assert.match(publishing, /^  workflow_dispatch:/m);
+  const verify = workflowJob(publishing, "verify");
+  assert.match(verify, /^    uses: \.\/\.github\/workflows\/ci\.yml$/m);
+  assert.doesNotMatch(verify, /^    if:|continue-on-error:\s*true/m, "verification cannot be optional");
+  const publish = workflowJob(publishing, "publish");
+  assert.match(publish, /^    needs: verify$/m, "npm upload must depend on successful reusable CI");
+  assert.doesNotMatch(publish, /^    if:/m, "no job status override may bypass a failed dependency");
+  for (const job of ["build-test", "legacy-runtime-message", "windows-runtime", "docker-runtime", "standalone-runtime"]) {
+    assert.doesNotMatch(workflowJob(ci, job), /^    if:|continue-on-error:\s*true/m, `${job} must remain a required check`);
+  }
+});
+
+test("Trusted Publishing stays in publish-npm while reusable verification gets no OIDC permission", () => {
+  assert.match(publishing, /^permissions:\n  contents: read\n  id-token: write$/m);
+  const verify = workflowJob(publishing, "verify");
+  assert.match(verify, /^    permissions:\n      contents: read$/m);
+  assert.doesNotMatch(verify, /id-token: write|secrets:\s*inherit/);
+  const publish = workflowJob(publishing, "publish");
+  assert.match(publish, /ACTIONS_ID_TOKEN_REQUEST_URL/);
+  assert.match(publish, /refusing token auth in the Trusted Publishing job/);
+  assert.match(publish, /npm publish "\$verified_tarball" --ignore-scripts --registry https:\/\/registry\.npmjs\.org\//);
+  assert.doesNotMatch(ci, /npm publish|id-token:\s*write/);
+});

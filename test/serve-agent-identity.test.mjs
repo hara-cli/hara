@@ -166,6 +166,7 @@ test("serve persists the simplified Agent directory and runs the selected person
                   completion: {
                     state: "verified",
                     evidence: ["the internal Agent execution returned a completed receipt"],
+                    final_answer: "internal delivery complete",
                   },
                 },
               }],

@@ -3,6 +3,7 @@
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import {
+  createRunRepeatGuard,
   failureIdentities,
   failureIdentity,
   keyOf,
@@ -241,4 +242,114 @@ test("keyOf: space-separated identity + survives unserializable args", () => {
   const cyc = {};
   cyc.self = cyc;
   assert.equal(keyOf("bash", cyc), "bash <unserializable>");
+});
+
+test("a run guard returns the warning and exact-call stop from the same completed calls", () => {
+  const guard = createRunRepeatGuard("typed:exact");
+  const input = { command: "npm test" };
+  assert.deepEqual(guard.recordCall("bash", input, "Command failed: build"), { failed: true, note: "" });
+  const second = guard.recordCall("bash", input, "Command failed: build");
+  assert.match(second.note, /FAILED 2×/);
+  assert.equal(second.stopped, undefined, "the warning still leaves one recovery attempt");
+  const third = guard.recordCall("bash", input, "Command failed: build");
+  assert.match(third.note, /FAILED 3×/);
+  assert.deepEqual(third.stopped, { identity: failureIdentity("bash", input, "Command failed: build"), count: 3 });
+});
+
+test("a fresh run preserves scoped warning history without inheriting its hard-stop count", () => {
+  const input = { command: "npm test" };
+  const firstRun = createRunRepeatGuard("typed:resume");
+  firstRun.recordCall("bash", input, "Command failed: build");
+  firstRun.recordCall("bash", input, "Command failed: build");
+  const resumedRun = createRunRepeatGuard("typed:resume");
+  const firstResumedCall = resumedRun.recordCall("bash", input, "Command failed: build");
+  assert.match(firstResumedCall.note, /FAILED 3×/, "the session warning count remains unchanged");
+  assert.equal(firstResumedCall.stopped, undefined, "resuming gets a fresh run audit");
+  assert.equal(resumedRun.recordCall("bash", input, "Command failed: build").stopped, undefined);
+  assert.equal(resumedRun.recordCall("bash", input, "Command failed: build").stopped?.count, 3);
+});
+
+test("a successful repair resets interleaved ordinary failures in both warning and stop histories", () => {
+  const guard = createRunRepeatGuard("typed:repair");
+  const input = { path: "missing.txt" };
+  guard.recordCall("read_file", input, "Error: missing");
+  guard.recordCall("bash", { command: "npm test" }, "Command failed: build");
+  assert.match(guard.recordCall("read_file", input, "Error: missing").note, /FAILED 2×/);
+  assert.deepEqual(guard.recordCall("write_file", input, "written"), { failed: false, note: "" });
+  assert.deepEqual(guard.recordCall("read_file", input, "Error: missing"), { failed: true, note: "" });
+});
+
+test("a run guard preserves access boundaries across reads and task-intake repairs", () => {
+  const guard = createRunRepeatGuard("typed:access");
+  const failure = "Command failed: HTTP 401 Unauthorized";
+  const attempt = (number) => ({ command: `curl https://api.example/private?attempt=${number}` });
+  const first = guard.recordCall("bash", attempt(1), failure);
+  assert.match(first.note, /one registered sign-in\/capability path/);
+  assert.equal(first.stopped, undefined);
+  guard.recordCall("read_file", { path: "README.md" }, "documentation");
+  guard.recordCall("task_intake", { intent: "change" }, "task brief accepted");
+  const second = guard.recordCall("bash", attempt(2), failure);
+  assert.equal(second.stopped?.identity.kind, "access_boundary");
+  assert.equal(second.stopped?.count, 2);
+  assert.match(second.note, /persisted across 2 attempts/);
+});
+
+test("a run guard clears policy failures only after successful task intake", () => {
+  const guard = createRunRepeatGuard("typed:policy");
+  const failure = "Understanding gate: task brief intent is 'investigate', so this side effect was NOT executed.";
+  guard.recordCall("bash", { command: "write_a" }, failure, true);
+  guard.recordCall("read_file", { path: "README.md" }, "documentation");
+  const second = guard.recordCall("python", { code: "write_b()" }, failure, true);
+  assert.match(second.note, /blocked 2 attempted actions/);
+  assert.equal(second.stopped, undefined);
+  guard.recordCall("task_intake", { intent: "change" }, "Error: task brief rejected", true);
+  const third = guard.recordCall("bash", { command: "write_c" }, failure, true);
+  assert.equal(third.stopped?.identity.kind, "policy_boundary");
+  assert.equal(third.stopped?.count, 3, "a rejected intake cannot repair policy state");
+  guard.recordCall("task_intake", { intent: "change" }, "task brief accepted");
+  const restarted = guard.recordCall("bash", { command: "write_d" }, failure, true);
+  assert.match(restarted.note, /blocked 1 attempted action/);
+  assert.equal(restarted.stopped, undefined);
+});
+
+test("a run guard retains semantic strategy thresholds and exact-call stop precedence", () => {
+  const guard = createRunRepeatGuard("typed:strategy");
+  const input = { command: "curl https://api.example/upload" };
+  const failure = 'Command failed: {"code":1061002,"msg":"params error"}';
+  guard.recordCall("bash", input, failure);
+  const second = guard.recordCall("bash", input, failure);
+  assert.match(second.note, /2 variants of the same/);
+  assert.equal(second.stopped, undefined);
+  const third = guard.recordCall("bash", input, failure);
+  assert.equal(third.stopped?.identity.kind, "exact", "the loop historically selects the first threshold identity");
+  assert.equal(third.stopped?.count, 3);
+  assert.match(third.note, /FAILED 3×/);
+
+  const browserGuard = createRunRepeatGuard("typed:browser");
+  const spaFailure = "Error: web_fetch received only a JavaScript SPA shell. Use open_browser.";
+  browserGuard.recordCall("web_fetch", { url: "https://example.com/app" }, spaFailure);
+  const stopped = browserGuard.recordCall("web_fetch", { url: "https://example.com/app", render: true }, spaFailure);
+  assert.equal(stopped.stopped?.identity.kind, "strategy");
+  assert.equal(stopped.stopped?.count, 2);
+});
+
+test("a run guard identifies recall exhaustion separately from ordinary run halts", () => {
+  const guard = createRunRepeatGuard("typed:recall");
+  guard.recordCall("memory_search", { query: "first" }, "(no memory matches)");
+  guard.recordCall("session_search", { query: "second" }, "(no session matches)");
+  const exhausted = guard.recordCall("memory_search", { query: "third" }, "(no memory matches)");
+  assert.equal(exhausted.stopped?.identity.kind, "empty_recall");
+  assert.equal(exhausted.stopped?.count, 3);
+  assert.match(exhausted.note, /Recall tools are disabled/);
+});
+
+test("run warning and stop histories share bounded least-recently-observed eviction", () => {
+  const guard = createRunRepeatGuard("typed:bounded");
+  for (let index = 0; index < 64; index++) guard.recordCall("bounded_tool", { index }, "Error: missing");
+  assert.match(guard.recordCall("bounded_tool", { index: 0 }, "Error: missing").note, /FAILED 2×/);
+  guard.recordCall("bounded_tool", { index: 64 }, "Error: missing");
+  const retained = guard.recordCall("bounded_tool", { index: 0 }, "Error: missing");
+  assert.equal(retained.stopped?.count, 3, "refreshing an identity keeps it within the fixed-size ledger");
+  const evicted = guard.recordCall("bounded_tool", { index: 1 }, "Error: missing");
+  assert.deepEqual(evicted, { failed: true, note: "" }, "the oldest unrefreshed identity starts a new audit");
 });

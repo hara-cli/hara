@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
+import { createCodingUsageAccumulator } from "./coding/accounting.js";
+import { thirdPartyNotices } from "./third-party-notices.js";
 import { createInterface } from "node:readline/promises";
 import { emitKeypressEvents } from "node:readline";
 import { runTui, askConfirm } from "./tui/run.js";
@@ -208,8 +210,14 @@ import {
 } from "./subagent/team.js";
 import { AgentWorktreeManager } from "./subagent/worktree.js";
 import { executeExternalCodingAgent } from "./subagent/external.js";
+import { createCodingHostBridge, type CodingHostBridge } from "./coding/host.js";
+import { createCodingToolset } from "./coding/tools.js";
+import { createCodingContinuationStore } from "./coding/continuations.js";
+import { codingSettingsSnapshot, saveCodingSettings } from "./coding-settings.js";
 import { createExternalSessionRegistry } from "./external-sessions/registry.js";
 import type { ExternalSessionService } from "./external-sessions/types.js";
+import type { ExternalUserQuestionAnswers } from "./external-sessions/types.js";
+import { validateExternalUserAnswers } from "./external-sessions/questions.js";
 import {
   overrideProviderTarget,
   profileByIdForConfig,
@@ -3523,6 +3531,9 @@ program
   .option("--resume <id>", "resume a specific session by id")
   .option("--sandbox <mode>", "sandbox the shell: off | workspace-write | read-only");
 
+program.command("licenses").description("show bundled third-party license notices (also available offline)")
+  .action(() => { stdout.write(thirdPartyNotices()); });
+
 // Wire the global `--profile <id>` flag into the resolution chain BEFORE any subcommand
 // action runs. resolveActive() consults setFlagOverride() at the top of the priority chain,
 // so this single hook covers `hara whoami`, `hara profile list`, `hara model …`, and the
@@ -4906,6 +4917,8 @@ program
         },
         providerSettings: (targetCwd) => providerSettingsSnapshot(targetCwd ?? cwd),
         computerSettings: (targetCwd) => computerSettingsFor(targetCwd ?? cwd),
+        codingSettings: codingSettingsSnapshot,
+        saveCodingSettings,
         saveComputerSettings: (input, targetCwd) => {
           const settingsCwd = targetCwd ?? cwd;
           saveComputerSettingsPolicy(input, settingsCwd);
@@ -6895,7 +6908,7 @@ program.action(async (opts) => {
     if (machineOutput) process.stderr.write(message);
     else out(c.yellow(message));
   }
-  const stats = { input: 0, output: 0, lastInput: 0 };
+  const stats = { input: 0, output: 0, lastInput: 0, providerCalls: 0 };
 
   // Advertise configured MCP capabilities without starting any subprocess or blocking startup for permission.
   // The model can call `mcp_connect` when a task first needs ONE server; that external-boundary tool goes
@@ -7821,6 +7834,11 @@ program.action(async (opts) => {
   const interactiveAgentTaskIds = new Map<string, string>();
   if (task) interactiveAgentTaskIds.set(task.turnId, task.id);
   const interactiveWorkspaceStates = new Map<string, RunRuntimeItemEvent["state"]>();
+  let codingInput: {
+    signal?: AbortSignal;
+    confirm: (question: string, signal?: AbortSignal, options?: { allowAlways?: boolean }) => Promise<boolean | "always">;
+    ask: (question: string, options?: string[], signal?: AbortSignal) => Promise<string>;
+  } | undefined = useTui ? undefined : { confirm, ask: askUser };
   let interactiveExternalSessions: ExternalSessionService | undefined;
   const externalSessionsForAgents = (): ExternalSessionService => {
     interactiveExternalSessions ??= createExternalSessionRegistry({ haraVersion: HARA_RUNTIME_VERSION });
@@ -7882,7 +7900,8 @@ program.action(async (opts) => {
     sessionId: meta.id,
     store: new AgentTeamStore(homedir()),
     currentRootTurnId: () => task?.turnId,
-    codingRuntimes: () => meta.spaceId === "personal" ? ["codex", "claude"] : [],
+    codingRuntimes: () => meta.spaceId === "personal" ? ["codex", "claude", "opencode", "pi"] : [],
+    preferredCodingRuntime: () => codingSettingsSnapshot().effectiveExecutor,
     limits: () => {
       const perAgentRounds = Math.max(1, Math.min(24, cfg.maxAgentRounds));
       const modelWindow = provider.connection?.capabilities.contextWindowTokens
@@ -7927,11 +7946,13 @@ program.action(async (opts) => {
           return {
             status: "error" as const,
             text: "",
-            error: "Local Codex and Claude coding runtimes are available only in Personal Space.",
+            error: "Local coding runtimes are available only in Personal Space.",
           };
         }
         const now = new Date().toISOString();
-        const providerId = `hara-live-${request.runtime}`;
+        const providerId = `hara-coding-${request.runtime}`;
+        let codingHost: CodingHostBridge | undefined;
+        const accountCodingUsage = createCodingUsageAccumulator(stats);
         recordLifecycle({
           id: request.id,
           providerId,
@@ -7941,7 +7962,75 @@ program.action(async (opts) => {
           startedAt: now,
         });
         try {
-          const result = await executeExternalCodingAgent(request, externalSessionsForAgents());
+          const input = codingInput;
+          const codingProvider = provider;
+          let codingSessionId = request.providerSessionId;
+          const parentSignal = input?.signal ?? currentTurn?.signal;
+          const signal = parentSignal ? AbortSignal.any([request.signal, parentSignal]) : request.signal;
+          const assertCurrent = (): void => {
+            assertInteractiveAudience();
+            const worker = interactiveAgentTeam.list().find((entry) => entry.id === request.id);
+            if (signal.aborted || provider !== codingProvider || task?.turnId !== rootTurnId
+              || !worker || worker.generation !== request.generation || worker.status !== "working") {
+              throw new Error("the parent coding execution is no longer current");
+            }
+          };
+          const observer: import("./coding/pi.js").PiCodingAgentObserver
+            & Pick<import("./subagent/external.js").ExternalCodingAgentObserver, "onSession"> = {
+            onSession: (session) => { codingSessionId = session.id; },
+            onPiSession: (id) => { codingSessionId = id; },
+            confirm: async (action, actionSignal) => {
+              const combined = AbortSignal.any([signal, actionSignal]);
+              assertCurrent();
+              if (!input || combined.aborted) return false;
+              const allowed = await input.confirm(action.question, combined, { allowAlways: false });
+              assertCurrent();
+              return !combined.aborted && allowed === true;
+            },
+            askUser: async (questions, actionSignal) => {
+              const combined = AbortSignal.any([signal, actionSignal]);
+              assertCurrent();
+              if (!input || combined.aborted) return {};
+              const answers: ExternalUserQuestionAnswers = {};
+              for (const question of questions.questions) {
+                const answer = await input.ask(question.question, question.options?.map((option) => option.label), combined);
+                assertCurrent();
+                if (combined.aborted) return {};
+                answers[question.id] = { answers: [answer] };
+              }
+              return validateExternalUserAnswers(questions, answers) ?? {};
+            },
+          };
+          const prepareHost = async (hostSignal: AbortSignal) => {
+            assertCurrent();
+            if (!codingSessionId || !request.workspace || request.workspace.mode !== "isolated-write") throw new Error("coding requires an owned isolated worktree and bound session");
+            const combined = AbortSignal.any([signal, hostSignal]);
+            const toolset = createCodingToolset({ cwd: request.workspace.cwd, signal: combined, assertCurrent,
+              confirm: observer.confirm, askUser: observer.askUser });
+            codingHost = await createCodingHostBridge({ provider: codingProvider, ...toolset, signal: combined, assertCurrent,
+              budget: request.budget,
+              continuationStore: createCodingContinuationStore(homedir(), { workerId: request.id, providerSessionId: codingSessionId,
+                cwd: request.workspace.cwd, providerId: codingProvider.id, model: codingProvider.model, profileId: authoritativeProfileId,
+                connectionRuntimeKey: codingProvider.connection?.runtimeKey }),
+              system: "You are a Hara-owned coding worker. Use only the supplied tools in the isolated worktree. Ask through ask_user for choices. Never bypass approvals or claim unverified execution.",
+              onUsage: accountCodingUsage,
+              onProgress: (metrics) => request.reportProgress(metrics),
+            });
+            return codingHost;
+          };
+          const codingRequest = { ...request, signal };
+          const result = request.runtime === "pi"
+            ? await (await import("./coding/pi.js")).executePiCodingAgent(codingRequest, prepareHost, observer)
+            : await executeExternalCodingAgent(codingRequest, externalSessionsForAgents(), { ...observer,
+              ...(request.runtime === "opencode" ? { executionMetrics: () => {
+                if (!codingHost) throw new Error("the coding host did not start");
+                return codingHost.metrics;
+              } } : {}),
+              prepareCodingHost: async (hostSignal) => {
+                const host = await prepareHost(hostSignal);
+                return { ...host, get metrics() { return host.metrics; }, progress: () => true };
+              },
+            });
           recordLifecycle({
             id: request.id,
             providerId,
@@ -7966,6 +8055,8 @@ program.action(async (opts) => {
             endedAt: new Date().toISOString(),
           });
           throw error;
+        } finally {
+          if (codingHost) accountCodingUsage(codingHost.metrics);
         }
       }
       const result = await runSubagentResult(
@@ -8815,6 +8906,7 @@ program.action(async (opts) => {
       onClipboardImage: readClipboardImage,
       vim: cfg.vimMode,
       onSubmit: async (line, h, images, interaction) => {
+        codingInput = h;
         try {
           assertInteractiveAudience();
         } catch (error) {

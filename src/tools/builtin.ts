@@ -619,3 +619,4 @@ registerTool({
 // registration using the same name must not inherit temporary task approval authority.
 export const ORIGINAL_TASK_BASH_TOOL = Object.freeze(getTool("bash")!);
 export const ORIGINAL_TASK_WRITE_FILE_TOOL = Object.freeze(getTool("write_file")!);
+export const ORIGINAL_CODING_READ_FILE_TOOL = Object.freeze(getTool("read_file")!);

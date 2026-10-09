@@ -17,7 +17,15 @@ permissions:
   id-token: write
 
 jobs:
+  # Reuse the same native/Windows/Docker checks that protect main. Keep OIDC publication in this
+  # workflow's publish job so the npm Trusted Publishing identity does not move to the reusable CI.
+  verify:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
   publish:
+    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -43,10 +51,14 @@ jobs:
       - name: Audit production dependencies
         run: bash .github/scripts/audit-production.sh
       - run: npm test
+      - name: Smoke the packed npm package before upload
+        shell: bash
+        run: node scripts/npm-package-smoke.mjs --cache "$(npm config get cache)" --pack-destination "$RUNNER_TEMP/hara-verified-package"
       - name: Publish to npm (idempotent)
         run: |
+          verified_tarball="$(node scripts/npm-package-smoke.mjs --verify-retained "$RUNNER_TEMP/hara-verified-package")"
           set +e
-          out=$(npm publish --registry https://registry.npmjs.org/ 2>&1); code=$?
+          out=$(npm publish "$verified_tarball" --ignore-scripts --registry https://registry.npmjs.org/ 2>&1); code=$?
           echo "$out"
           if [ $code -eq 0 ]; then echo "✓ published"; exit 0; fi
           if echo "$out" | grep -qiE "cannot publish over|previously published|EPUBLISHCONFLICT|409 Conflict"; then

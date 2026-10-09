@@ -359,7 +359,10 @@ export class AgentProgressWatchdog {
     const warn = Boolean(trigger)
       || highestRepeatedCount >= 2
       || this.similarEvidenceRounds >= 2
-      || (this.unattended
+      // Pending todos retain their attention refresh on attached runs, but use the same durable-progress
+      // ledger and warning episode as unattended stalls. A changing file/checkpoint is not a stale task
+      // just because todo_write has not run; a live user steer starts a fresh warning window.
+      || ((this.unattended || total > done)
         && this.unattendedRounds >= UNATTENDED_PROGRESS_NUDGE_ROUNDS
         && this.checkpointStaleRounds >= UNATTENDED_PROGRESS_NUDGE_ROUNDS)
       || (totalTokens >= Math.floor(UNATTENDED_NO_PROGRESS_TOKEN_LIMIT * 0.8)

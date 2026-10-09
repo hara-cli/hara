@@ -21,7 +21,9 @@ registerTool({
   name: "spawn_agent",
   description:
     "Start a durable child Agent in the background and return its stable id/path immediately. runtime defaults to hara. "
-    + "Choose runtime codex or claude only when the assignment needs a specialist coding executor. Those runtime-backed "
+    + "Use runtime 'coding' for bounded coding work: the trusted host resolves the user's current executor preference. "
+    + "Explicit opencode, pi, codex, or claude may be used when that exact executor was requested. There is no auto runtime "
+    + "or silent fallback. OpenCode/Pi use Personal model connections; Codex/Claude use their existing separate sign-ins. Those runtime-backed "
     + "records are Code tasks, not conversational members; the shared team journal is a compatibility transport. Hara "
     + "discovers and routes that capability from the conversation, so never ask the user to configure a runtime on the "
     + "Agent first. Every coding launch requires fresh just-in-time approval and runs inside a private Git worktree. "
@@ -42,8 +44,8 @@ registerTool({
       role: { type: "string", description: "optional Hara specialist role id" },
       runtime: {
         type: "string",
-        enum: ["hara", "codex", "claude"],
-        description: "execution runtime; codex/claude automatically require isolated-write",
+        enum: ["hara", "coding", "codex", "claude", "opencode", "pi"],
+        description: "coding resolves the trusted host preference; exact coding executors require isolated-write and fresh approval",
       },
       workspace: {
         type: "string",
@@ -56,7 +58,7 @@ registerTool({
   kind: "read",
   concurrencySafe: false,
   classify: (input, ctx) => (
-    (input?.runtime === "codex" || input?.runtime === "claude")
+    (input?.runtime === "coding" || input?.runtime === "codex" || input?.runtime === "claude" || input?.runtime === "opencode" || input?.runtime === "pi")
     && ctx.spaceId === "personal"
   )
     ? {
@@ -72,17 +74,19 @@ registerTool({
     if (typeof input.task_name !== "string" || typeof input.message !== "string") {
       return "Error: spawn_agent needs task_name and message.";
     }
-    const runtime = typeof input.runtime === "string" ? input.runtime : "hara";
-    if (runtime !== "hara" && runtime !== "codex" && runtime !== "claude") {
-      return "Error: runtime must be hara, codex, or claude.";
+    const requested = typeof input.runtime === "string" ? input.runtime : "hara";
+    if (requested !== "hara" && requested !== "coding" && requested !== "codex" && requested !== "claude" && requested !== "opencode" && requested !== "pi") {
+      return "Error: runtime must be hara, coding, codex, claude, opencode, or pi.";
     }
-    if (runtime !== "hara" && ctx.spaceId !== "personal") {
-      return "Error: local Codex and Claude coding runtimes are available only in Personal Space.";
-    }
-    if (runtime !== "hara" && !team.runtimeGrants.includes(runtime)) {
-      return `Error: the ${runtime} coding runtime is unavailable in this space.`;
+    if (requested !== "hara" && ctx.spaceId !== "personal") {
+      return "Error: local coding runtimes are available only in Personal Space.";
     }
     try {
+      const runtime = requested === "coding" ? team.preferredCodingRuntime : requested;
+      if (runtime === undefined) return "Error: the preferred coding executor is unavailable; review the Coding executor setting.";
+      if (runtime !== "hara" && !team.runtimeGrants.includes(runtime)) {
+        return `Error: the ${runtime} coding runtime is unavailable in this space.`;
+      }
       return json(await team.spawn({
         taskName: input.task_name,
         message: input.message,

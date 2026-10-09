@@ -1144,6 +1144,20 @@ export function freshTaskCompletion(task: TaskExecution | undefined): TaskComple
   return completion;
 }
 
+/** One lifecycle classification shared by persistence, closeout copy and Serve transport. A safety
+ * pause is recoverable; provider/empty/other safety failures must remain blocked errors. */
+export function isRecoverableRunPause(outcome: RunOutcome | undefined): boolean {
+  return outcome?.status === "halted" && (
+    outcome.stopReason === "deadline"
+    || outcome.stopReason === "task_round_budget"
+    || outcome.stopReason === "max_rounds"
+    || outcome.stopReason === "strategy_stall"
+    || outcome.stopReason === "no_progress"
+    || outcome.stopReason === "repeat_loop"
+    || outcome.stopReason === "completion_verification"
+  );
+}
+
 export function finishTaskExecution(
   task: TaskExecution | undefined,
   outcome: RunOutcome | undefined,
@@ -1164,15 +1178,7 @@ export function finishTaskExecution(
     ? "paused"
     : outcome?.status === "completed"
       ? (awaitingUser || incomplete || !acceptedBriefVerified ? "paused" : "completed")
-      : outcome?.status === "halted" && (
-          outcome.stopReason === "deadline"
-          || outcome.stopReason === "task_round_budget"
-          || outcome.stopReason === "max_rounds"
-          || outcome.stopReason === "strategy_stall"
-          || outcome.stopReason === "no_progress"
-          || outcome.stopReason === "repeat_loop"
-          || outcome.stopReason === "completion_verification"
-        )
+      : isRecoverableRunPause(outcome)
         ? "paused"
       : outcome?.status === "error" || outcome?.status === "empty" || outcome?.status === "halted"
         ? "blocked"

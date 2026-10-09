@@ -19,6 +19,50 @@ function round(overrides = {}) {
   };
 }
 
+test("attached pending todos share one durable progress decision, not a second todo clock", () => {
+  const todos = [{ text: "deliver the report", status: "in_progress" }];
+  const watchdog = new AgentProgressWatchdog({ unattended: false, todos });
+  for (let currentRound = 1; currentRound <= 11; currentRound += 1) {
+    const decision = watchdog.recordRound(round({
+      todos,
+      observations: [{ name: "read_file", input: { file: currentRound }, content: `row-${currentRound}` }],
+    }));
+    assert.equal(decision.warn, currentRound >= 5);
+    assert.equal(decision.stop, false, "attached todo warning does not add an unattended hard stop");
+  }
+});
+
+test("healthy file changes suppress todo staleness even when the list is not rewritten", () => {
+  const todos = [{ text: "deliver the report", status: "in_progress" }];
+  const watchdog = new AgentProgressWatchdog({ unattended: true, todos });
+  for (let currentRound = 1; currentRound <= 12; currentRound += 1) {
+    const decision = watchdog.recordRound(round({
+      todos,
+      verifiedChanges: [currentRound.toString(16).padStart(64, "0")],
+      observations: [{ name: "write_file", input: { file: "report.md" }, content: "report saved" }],
+    }));
+    assert.equal(decision.warn, false);
+    assert.equal(decision.stop, false);
+    assert.equal(decision.state.checkpointStaleRounds, 0);
+  }
+});
+
+test("user steering refreshes pending-todo warnings without erasing token usage or stale evidence", () => {
+  const todos = [{ text: "deliver the report", status: "in_progress" }];
+  const watchdog = new AgentProgressWatchdog({ unattended: false, todos });
+  for (let currentRound = 1; currentRound <= 11; currentRound += 1) {
+    const decision = watchdog.recordRound(round({
+      todos,
+      userIntervened: currentRound === 6,
+      usage: { input: currentRound * 100, output: currentRound },
+      observations: [{ name: "read_file", input: { file: currentRound }, content: `row-${currentRound}` }],
+    }));
+    assert.equal(decision.warn, currentRound === 5 || currentRound === 11);
+    assert.equal(decision.state.tokens.total, currentRound * 101);
+    assert.equal(decision.state.checkpointStaleRounds, currentRound);
+  }
+});
+
 test("progress similarity ignores only volatile transport values", () => {
   const left = "upload attempt 41 completed at 2026-09-08T10:00:01Z request_id=6ba7b810-9dad-11d1-80b4-00c04fd430c8; artifact is still pending";
   const right = "upload attempt 42 completed at 2026-09-08T10:00:09Z request_id=123e4567-e89b-12d3-a456-426614174000; artifact is still pending";

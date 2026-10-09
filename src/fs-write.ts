@@ -413,6 +413,10 @@ export async function atomicWriteText(path: string, content: string, options: At
     try {
       const opened = await handle.stat();
       writtenIdentity = { dev: opened.dev, ino: opened.ino, mode: opened.mode & 0o777, nlink: opened.nlink };
+      // open/stat are asynchronous: a parent may have been exchanged while the descriptor was being
+      // acquired. Refuse BEFORE sending content to that fd, not only at the later namespace commit.
+      throwIfCancelled();
+      verifyCommitParent();
       await handle.writeFile(content, "utf8");
       // open(2) applies the process umask even when replacing an existing file. Restore that existing (or
       // explicit rollback) mode on the staged fd; brand-new ordinary files still honor the user's umask.

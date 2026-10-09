@@ -5,6 +5,24 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.185.0 — 2026-10-09 — owned coding engines and reliable task closeout
+
+- Bundle the pinned OpenCode runtime and Pi SDK behind Hara's personal-space `runtime: "coding"` delegation. The
+  default selects OpenCode; Pi is an experimental setting. Existing workers keep their original
+  engine and session. No separate engine installation or silent fallback is required.
+- Keep the real provider credential in Hara. Both engines use Hara-owned read/write/edit/list/ask
+  tools, parent-chat permission and question cards, bounded execution, cancellation accounting,
+  private continuations and isolated worktrees with human diff merging. Arbitrary worker shell and
+  build/test tools are not enabled; the main Agent must verify through separately authorized tools.
+- Produce a durable final reply from accepted task evidence without an extra model request or
+  repeating a completed upload/send. Waiting, unfinished steps, cancellation and provider errors
+  keep their distinct states and safe recovery guidance.
+- Consolidate repeated-failure and no-progress controls; internal reminders do not masquerade as
+  user steering or discard accepted queued actions. Existing authority and execution limits remain.
+- Ship offline engine license notices and gate release artifacts with isolated npm installation,
+  native OpenCode checks and compiled Pi same-session smoke. npm publishes the exact tested archive;
+  native Linux ARM64 is executed on its own runner before release assembly.
+
 ## 0.184.1 — 2026-10-08 — scoped approvals and native coding questions
 
 - Add human-only approval cards for one action or the current task, with a 15-minute task limit,

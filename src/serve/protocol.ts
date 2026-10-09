@@ -59,6 +59,19 @@
 //     Input feature negotiation is captured per submitted turn; a legacy turn cannot gain it later.
 //     Subsequent cards use the current authenticated compatible client, not a disconnected socket.
 //     A new question arriving with no compatible responder is cancelled immediately, never left pending.
+//     external.delegated-interaction.v1 additionally routes Agent-owned Codex/Claude input to its parent
+//     chat. Requests and snapshots carry parentSessionId + agentPath as display metadata only; authority
+//     remains the host-bound child session/turn and originating logical parent execution. No client or
+//     provider tool argument can choose the parent, grant permissions, or convert a question to approval.
+//   external.approval.request {approvalId,sessionId,turnId,expiresAt,question,allowAlways:false,
+//                              parentSessionId,agentPath}
+//   external.approval.reply {approvalId,sessionId,turnId,allow:boolean,commandId:UUID} → {}
+//   external.approval.resolved {approvalId,sessionId,turnId,outcome:"answered"|"cancelled"|"timed_out"|"interrupted"}
+//     Delegated approvals are single-use only; legacy approval.reply cannot answer them. Missing feature
+//     consent/responder, changed parent/profile/Space, cancelled worker, stale turn or expiry fail closed.
+//     Reconnect restores pending cards only for requested parent chats within the unchanged deadline.
+//     These structured worker APIs do not expose session creation authority through Serve; old live PTYs
+//     must be explicitly released before resuming their exact provider identity with structured input.
 //                      commandId is a client UUID. A private started receipt is durable before the provider
 //                      action; matching terminal results replay across reconnect and Serve restart. A crash
 //                      window blocks mutation until read/resume observes the authoritative provider session

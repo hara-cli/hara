@@ -43,7 +43,8 @@ Every main task preserves two different records:
 
 Before a brief exists, Hara permits conversation, file reads, search, questions, and todo planning. The runtime
 blocks edits, unsafe or unknown shell commands, computer actions, external agents, and MCP connections. The
-agent must first call the engine-owned `task_intake` tool in a separate round:
+agent must first call the engine-owned `task_intake` tool. This is a separate persisted protocol round,
+not necessarily a separate model request:
 
 ```text
 raw request
@@ -62,10 +63,12 @@ authorized execution
 verification against acceptance checks
 ```
 
-Separating the checkpoint from the first mutation is deliberate. A model cannot place `task_intake` and an
-edit in one response to bypass the boundary—even when an older `change` brief already existed. The checkpoint
-is published and persisted only after its tool-use/result pair is protocol-complete, so resume never starts
-from a half-written state.
+Separating the checkpoint from the first mutation is deliberate. If a model places `task_intake` and an edit
+in one response, Hara splits the response, closes and persists the checkpoint's tool-use/result pair, then
+revalidates the carried edit against the accepted state and permission gates. That edit does not require an
+extra model request, but cannot bypass the boundary—even when an older `change` brief already existed. New
+user steering discards carried actions so the model must reconsider them. Resume never starts from a
+half-written state.
 
 An `answer` or `investigate` brief does not authorize mutation. A mutating operation requires `intent: change`;
 opaque external tools retain their own per-action confirmation in addition to the understanding gate. The
@@ -85,9 +88,11 @@ TaskExecution
   checkpoint: todos/outcome used for resume
 ```
 
-On every model round, the runtime reconstructs the system context from the current execution object. The
+On every model round, the runtime reconstructs the authoritative context from the current execution object. The
 stable task identity snapshot deliberately does not embed a frozen brief; exactly one current brief is added
-dynamically, so a revision cannot leave the model seeing both the old and new goals. Steering
+dynamically, so a revision cannot leave the model seeing both the old and new goals. Providers that support
+trailing turn context receive changing clock/brief/checkpoint data after durable history, preserving the
+stable system prefix rather than invalidating its cache. Steering
 that arrives while the model is running updates the authoritative owner first; a later brief checkpoint
 refreshes from that owner before writing, preventing a stale snapshot from deleting the new steering.
 
@@ -126,9 +131,17 @@ tool round
 
 The fourth substantially unchanged repeat of the same successful call pauses the run. Six consecutive rounds
 of more than 80% similar successful evidence also pause it. For Serve/Desktop/Mobile, headless print, gateway,
-cron, and native subagent work, five rounds without a genuinely new checkpoint or completed todo raise one
-warning; eight pause the run. If the same unattended window consumes 200,000 input/output tokens without durable
-progress, it pauses after at least four stale rounds. A live user steer resets the unattended window.
+cron, and native subagent work, five rounds without a genuinely new checkpoint, completed todo or verified
+file change raise one warning; eight pause the run. Attached runs with unfinished todos use the same warning
+decision, but do not acquire that unattended eight-round stop. The 200,000 input/output token boundary applies
+to all runs and uses cumulative usage since run start (minus its initial stats baseline), with at least two
+consecutive stale rounds. It is not a sliding “tokens since last progress” counter. A live user steer refreshes
+the unattended/warning window, not consumed tokens or the evidence ledger.
+
+One continuous warning episode produces one reminder and one notice. Real durable progress can re-arm it.
+There is no second todo timer and no Gateway heuristic that treats five uses of the same tool as a stall.
+The specific Gateway missing-native-image-input correction remains separate, internally wrapped and issued
+once; quiet children never inject or consume the main conversation's reminder stream.
 
 Only new observed evidence counts: a new fact value/evidence receipt, artifact, capability state, completion
 receipt, or newly completed todo. Rewriting `current_step`, resaving an identical fact, or changing command
@@ -145,3 +158,24 @@ that boundary; a second access-boundary attempt pauses the task with the reason 
 round, tool-call, token, todo, similarity, and checkpoint-age counters through `event.task_state.progress`.
 Desktop and Mobile should render this typed object and the persisted blocker/next step; they must not infer
 progress by parsing terminal prose.
+
+Failure warning and hard-stop counting share one module's identity, reset and eviction rules. Their lifetimes
+remain intentionally distinct: warnings retain their existing session scope, while each run starts a fresh
+hard-stop ledger. Successful unrelated reads cannot erase access or policy boundaries.
+
+## 6. Human closeout and errors
+
+An accepted fresh completion receipt closes the model turn without another model request just to produce
+prose. Missing prose receives a bounded, redacted ordinary assistant reply from durable state. Awaiting-user
+dependencies and unfinished todos override contradictory success claims. Copy-only manual instructions,
+verification commands and resume phrases remain available to plain-text clients; they are never executed
+by rendering the reply. Long or multiline commands are not presented as executable truncated prefixes.
+
+The shared `isRecoverableRunPause` classification drives persisted status, closeout wording and Serve's pause
+response. Provider/empty/unclassified safety failures stay blocked errors, not a generic `/continue` pause.
+Their terminal event retains this turn's already streamed/persisted handoff, while the RPC still reports an
+error. Explicit cancellation and task/turn ownership fences remain authoritative.
+
+Neither a normal model turn nor a model-authored receipt independently proves every external business
+effect. Uploads, publications and other consequential operations still need their own authoritative evidence;
+an unknown result must not be blindly replayed.

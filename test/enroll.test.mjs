@@ -39,6 +39,47 @@ import { orgRolesDir, loadRoles, parseOrganizationRoleBundleEnvelope } from "../
 import { addProfile, getProfile, listProfiles, loadActiveProfile, spaceIdForProfile, upsertProfile } from "../dist/profile/profile.js";
 import { resetPrivateHaraStateForTests } from "../dist/security/private-state.js";
 
+async function listenEnrollmentFixture(server) {
+  await new Promise((resolve, reject) => {
+    const failed = (error) => reject(error);
+    server.once("error", failed);
+    // On macOS a wildcard IPv6 listener can share its port with another test's IPv4 listener.
+    // Bind the same address used by every fixture request instead of relying on dual-stack routing.
+    server.listen(0, "127.0.0.1", () => {
+      server.removeListener("error", failed);
+      resolve();
+    });
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  assert.equal(address.address, "127.0.0.1", "enrollment fixtures own their exact IPv4 request address");
+  return address.port;
+}
+
+test("enrollment HTTP fixtures bind the exact IPv4 loopback request address", { timeout: 5_000 }, async (t) => {
+  let requests = 0;
+  const server = createServer((req, res) => {
+    requests += 1;
+    req.resume();
+    res.writeHead(req.method === "POST" && req.url === "/v1/enroll" ? 200 : 404);
+    res.end("enrollment-fixture");
+  });
+  t.after(async () => {
+    if (!server.listening) return;
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const port = await listenEnrollmentFixture(server);
+  const response = await fetch(`http://127.0.0.1:${port}/v1/enroll`, {
+    method: "POST",
+    body: "{}",
+    signal: AbortSignal.timeout(2_000),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), "enrollment-fixture");
+  assert.equal(requests, 1, "the request reaches this fixture's listener");
+});
+
 test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry, requires a token", () => {
   const e = parseEnrollResponse(
     "https://gw/",
@@ -288,7 +329,7 @@ test("enroll → store (0600) → heartbeat → clear, against a stub control pl
       }
     });
   });
-  await new Promise((r) => server.listen(0, r));
+  await listenEnrollmentFixture(server);
   const url = `http://127.0.0.1:${server.address().port}`;
   try {
     const e = await enrollDevice(url, "CODE123");
@@ -397,7 +438,7 @@ test("profile-native enrollment stores only the scoped token in private profiles
       res.end();
     }
   });
-  await new Promise((resolve) => server.listen(0, resolve));
+  await listenEnrollmentFixture(server);
   const url = `http://127.0.0.1:${server.address().port}`;
   try {
     const result = await enrollGatewayProfile({
@@ -591,7 +632,7 @@ test("syncOrgRoles: pulls /v1/roles → ~/.hara/org-roles/*.md, maps snake→cam
       }
     });
   });
-  await new Promise((r) => server.listen(0, r));
+  await listenEnrollmentFixture(server);
   const url = `http://127.0.0.1:${server.address().port}`;
   try {
     assert.equal(await syncOrgRoles(), 0, "not enrolled → 0, never throws");
@@ -656,7 +697,7 @@ test("syncOrgRoles rejects an entire malformed bundle without writing any role",
       res.end();
     }
   });
-  await new Promise((resolve) => server.listen(0, resolve));
+  await listenEnrollmentFixture(server);
   const url = `http://127.0.0.1:${server.address().port}`;
   try {
     await enrollDevice(url, "CODE");
@@ -1069,7 +1110,7 @@ test("enrollDevice: a non-2xx (bad code) throws with a clear message", async () 
     res.writeHead(403);
     res.end(`invalid code ${reflectedSecret}`);
   });
-  await new Promise((r) => server.listen(0, r));
+  await listenEnrollmentFixture(server);
   const url = `http://127.0.0.1:${server.address().port}`;
   try {
     await assert.rejects(

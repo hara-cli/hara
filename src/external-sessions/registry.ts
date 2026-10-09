@@ -1,15 +1,20 @@
 import { randomBytes } from "node:crypto";
+import { realpathSync, statSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { CodexAppServerAdapter } from "./codex.js";
 import { ClaudeAgentSdkAdapter } from "./claude.js";
 import { HaraRuntimeAdapter } from "./runtime.js";
 import { OpenCodeRuntimeAdapter } from "./opencode.js";
-import { haraCodeRuntimeCommand } from "../opencode-runtime.js";
+import { OpenCodeCodingWorkerAdapter } from "./opencode-worker.js";
+import { HARA_CODE_RUNTIME_UNAVAILABLE_MESSAGE, resolveHaraCodeRuntime } from "../opencode-runtime.js";
 import { ExternalSessionOwnershipStore, externalSessionIdentityKey } from "./identity.js";
 import type { ExternalCommandOptions } from "./process.js";
 import {
   ExternalSessionInputError,
   type ExternalSessionAdapter,
   type ExternalSessionCreateInput,
+  type ExternalCodingSessionInput,
+  type ExternalCodingSessionResumeInput,
   type ExternalSessionForkResult,
   type ExternalSessionListInput,
   type ExternalSessionListResult,
@@ -54,14 +59,37 @@ export interface ExternalSessionRegistryOptions {
   runtime?: Partial<ExternalCommandOptions> & { sessionName?: string; runtimeRoot?: string };
 }
 
+/** Missing optional native packages are a capability state, never an ambient PATH fallback. */
+export class UnavailableOpenCodeAdapter implements ExternalSessionAdapter {
+  readonly id = "opencode" as const;
+
+  async inspect(): Promise<ExternalSessionSourceInfo & { installed: false; available: false; remediation: string }> {
+    return { id: this.id, label: "OpenCode", state: "not_installed", reason: "command_not_found",
+      installed: false, available: false, remediation: HARA_CODE_RUNTIME_UNAVAILABLE_MESSAGE,
+      capabilities: { listMetadata: false, read: false, create: false, fork: false, resume: false,
+        observeLive: false, submit: false, steer: false, interrupt: false } };
+  }
+
+  async list(): Promise<{ sessions: [] }> { return { sessions: [] }; }
+  async createCodingSession(): Promise<ExternalSessionReadResult> { throw new ExternalSessionInputError(HARA_CODE_RUNTIME_UNAVAILABLE_MESSAGE); }
+  async resumeCodingSession(): Promise<ExternalSessionReadResult> { throw new ExternalSessionInputError(HARA_CODE_RUNTIME_UNAVAILABLE_MESSAGE); }
+  async read(): Promise<ExternalSessionReadResult> { throw new ExternalSessionInputError(HARA_CODE_RUNTIME_UNAVAILABLE_MESSAGE); }
+  async resume(): Promise<ExternalSessionReadResult> { throw new ExternalSessionInputError(HARA_CODE_RUNTIME_UNAVAILABLE_MESSAGE); }
+  async submit(): Promise<ExternalTurnResult> { throw new ExternalSessionInputError(HARA_CODE_RUNTIME_UNAVAILABLE_MESSAGE); }
+}
+
 export class ExternalSessionRegistry implements ExternalSessionService {
   private readonly adapters: Map<ExternalSessionSourceId, ExternalSessionAdapter>;
   private readonly cursors = new Map<string, CursorRecord>();
+  private readonly writers = new Set<string>();
 
   constructor(options: ExternalSessionRegistryOptions) {
     const adapters = options.adapters ?? (() => {
       const identityKey = options.identityKey ?? externalSessionIdentityKey(options.identityHome);
       const ownership = new ExternalSessionOwnershipStore(options.identityHome);
+      const opencodeRuntime = options.opencode?.command !== undefined
+        ? { available: true as const, command: options.opencode.command }
+        : resolveHaraCodeRuntime(options.opencode?.env ?? process.env);
       return [
         new HaraRuntimeAdapter({
           command: options.runtime?.command ?? process.env.HARA_HERDR_PATH ?? "herdr",
@@ -94,15 +122,32 @@ export class ExternalSessionRegistry implements ExternalSessionService {
           identityKey,
           ownership,
         }),
-        new OpenCodeRuntimeAdapter({
-          command: options.opencode?.command ?? haraCodeRuntimeCommand(),
+        opencodeRuntime.available ? new OpenCodeCodingWorkerAdapter({
+          command: opencodeRuntime.command,
           argsPrefix: options.opencode?.argsPrefix,
           spawnProcess: options.opencode?.spawnProcess,
           timeoutMs: options.opencode?.timeoutMs,
           env: options.opencode?.env,
           identityKey,
+          identityHome: options.identityHome,
           ownership,
-        }),
+          history: new OpenCodeRuntimeAdapter({
+            command: opencodeRuntime.command,
+            argsPrefix: options.opencode?.argsPrefix,
+            spawnProcess: options.opencode?.spawnProcess,
+            timeoutMs: options.opencode?.timeoutMs,
+            env: options.opencode?.env,
+            identityKey,
+            ownership,
+          }),
+          prepareTurn: async (_input, sink) => {
+            if (!sink.prepareCodingHost || !sink.signal || sink.signal.aborted) {
+              throw new ExternalSessionInputError("the guarded Hara coding host is unavailable");
+            }
+            // OpenCode supplies its own combined cancellation signal after reserving the writer.
+            return await sink.prepareCodingHost(sink.signal);
+          },
+        }) : new UnavailableOpenCodeAdapter(),
       ];
     })();
     this.adapters = new Map(adapters.map((adapter) => [adapter.id, adapter]));
@@ -257,6 +302,49 @@ export class ExternalSessionRegistry implements ExternalSessionService {
     });
   }
 
+  private codingInput(input: ExternalCodingSessionInput): ExternalCodingSessionInput {
+    if (!input || (input.agentKind !== "codex" && input.agentKind !== "claude" && input.agentKind !== "opencode")
+      || typeof input.cwd !== "string" || !isAbsolute(input.cwd)) {
+      throw new ExternalSessionInputError("a coding worker requires a provider and an absolute worktree directory");
+    }
+    let cwd: string;
+    try {
+      cwd = realpathSync(input.cwd);
+      if (!statSync(cwd).isDirectory()) throw new Error("not a directory");
+    } catch {
+      throw new ExternalSessionInputError("the coding worker worktree is no longer available");
+    }
+    return { agentKind: input.agentKind, cwd, ...(input.title !== undefined ? { title: input.title } : {}) };
+  }
+
+  async createCodingSession(input: ExternalCodingSessionInput): Promise<ExternalSessionReadResult> {
+    const bounded = this.codingInput(input);
+    const adapter = this.adapters.get(bounded.agentKind);
+    if (!adapter?.createCodingSession) throw new ExternalSessionInputError("this provider cannot create a structured coding worker");
+    return await adapter.createCodingSession(bounded);
+  }
+
+  async resumeCodingSession(input: ExternalCodingSessionResumeInput): Promise<ExternalSessionReadResult> {
+    const bounded = this.codingInput(input);
+    const adapter = this.adapterForSession(input.providerSessionId);
+    if (adapter.id !== bounded.agentKind || !adapter.resumeCodingSession) {
+      throw new ExternalSessionInputError("the saved coding session does not match its worker provider");
+    }
+    return await this.withWriter(input.providerSessionId, async () => {
+      // Index only locates a native id. The adapter must separately require existing Hara ownership
+      // and the exact canonical worktree before it resumes anything.
+      await this.indexProviderSession(input.providerSessionId, adapter);
+      return await adapter.resumeCodingSession!({ ...bounded, providerSessionId: input.providerSessionId });
+    });
+  }
+
+  private async withWriter<T>(sessionId: string, action: () => Promise<T>): Promise<T> {
+    if (this.writers.has(sessionId)) throw new ExternalSessionInputError("this external session already has a Hara-controlled writer");
+    this.writers.add(sessionId);
+    try { return await action(); }
+    finally { this.writers.delete(sessionId); }
+  }
+
   private adapterForSession(sessionId: string): ExternalSessionAdapter {
     if (typeof sessionId !== "string" || !/^ext_(?:codex|claude|opencode|runtime)_[a-f0-9]{24}$/.test(sessionId)) {
       throw new ExternalSessionInputError("external session id is invalid");
@@ -296,7 +384,7 @@ export class ExternalSessionRegistry implements ExternalSessionService {
     if (Buffer.byteLength(text, "utf8") > 256 * 1024) {
       throw new ExternalSessionInputError("external session input exceeds 256 KiB");
     }
-    return await adapter.submit(sessionId, text, sink);
+    return await this.withWriter(sessionId, () => adapter.submit!(sessionId, text, sink));
   }
 
   async steer(sessionId: string, text: string): Promise<ExternalSteerResult> {
@@ -407,8 +495,10 @@ export class ExternalSessionRegistry implements ExternalSessionService {
     if (!adapter.resumeInTerminal) {
       throw new ExternalSessionInputError("this provider does not support terminal recovery");
     }
-    await this.indexProviderSession(targetId, adapter);
-    return await adapter.resumeInTerminal(targetId);
+    return await this.withWriter(targetId, async () => {
+      await this.indexProviderSession(targetId, adapter);
+      return await adapter.resumeInTerminal!(targetId);
+    });
   }
 
   async close(): Promise<void> {

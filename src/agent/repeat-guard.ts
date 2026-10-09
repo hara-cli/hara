@@ -10,7 +10,8 @@
 // sessions in one process, so streaks are keyed by the same run scope as todo/reminder state.
 const DEFAULT_SCOPE = "default";
 const MAX_FAILURE_IDENTITIES_PER_SCOPE = 64;
-const seenByScope = new Map<string, Map<string, { fails: number; kind: FailureIdentity["kind"] }>>();
+type FailureLedger = Map<string, { fails: number; kind: FailureIdentity["kind"] }>;
+const seenByScope = new Map<string, FailureLedger>();
 const HOME_WORKSPACE_BOUNDARY_KEY = "root-cause:home-workspace-boundary";
 const EMPTY_RECALL_KEY = "root-cause:empty-memory-or-session-recall";
 
@@ -159,9 +160,9 @@ function commandStrategyAnchor(input: unknown): string | undefined {
   return parts.length ? [...new Set(parts)].join("+") : undefined;
 }
 
-function scopedSeen(scope?: string): Map<string, { fails: number; kind: FailureIdentity["kind"] }> {
+function scopedSeen(scope?: string): FailureLedger {
   const key = scope?.trim() || DEFAULT_SCOPE;
-  const seen = seenByScope.get(key) ?? new Map<string, { fails: number; kind: FailureIdentity["kind"] }>();
+  const seen: FailureLedger = seenByScope.get(key) ?? new Map();
   seenByScope.set(key, seen);
   return seen;
 }
@@ -332,12 +333,14 @@ export function failureIdentity(
   return failureIdentities(name, input, content, isError)[0];
 }
 
-/** Record a completed call; returns a warning to APPEND to the tool result when the same call has now
- * failed >=2x without intervening success (empty string otherwise). Pure aside from the scoped map. */
-export function recordCall(name: string, input: unknown, content: string, isError = false, scope?: string): string {
-  const failed = isError || looksFailed(content, name);
-  const identities = failureIdentities(name, input, content, isError);
-  const seen = scopedSeen(scope);
+interface RecordedFailure {
+  identity: FailureIdentity;
+  streak: { fails: number; kind: FailureIdentity["kind"] };
+}
+
+/** Shared counting rules for the scoped warning history and a single run's stop history. Their
+ * lifetimes differ, but neither caller may independently change increment, reset, or eviction policy. */
+function recordFailures(seen: FailureLedger, name: string, failed: boolean, identities: readonly FailureIdentity[]): RecordedFailure[] {
   if (!failed) {
     // A successful unrelated read cannot grant credentials, authority, or repair task classification.
     // A successful task_intake is the one explicit state transition that may clear an understanding gate.
@@ -346,7 +349,7 @@ export function recordCall(name: string, input: unknown, content: string, isErro
         || (streak.kind === "policy_boundary" && name !== "task_intake");
       if (!keep) seen.delete(key);
     }
-    return "";
+    return [];
   }
   const next = identities.map((identity) => {
     const streak = { fails: (seen.get(identity.key)?.fails ?? 0) + 1, kind: identity.kind };
@@ -360,6 +363,11 @@ export function recordCall(name: string, input: unknown, content: string, isErro
     if (oldest === undefined) break;
     seen.delete(oldest);
   }
+  return next;
+}
+
+function failureWarning(name: string, next: readonly RecordedFailure[]): string {
+  if (!next.length) return "";
   const exact = next.find(({ identity }) => identity.kind === "exact");
   const semantic = next.find(({ identity }) => identity.kind !== "exact");
   const selected = semantic?.identity.kind === "home_boundary"
@@ -446,6 +454,46 @@ export function recordCall(name: string, input: unknown, content: string, isErro
     `repeating it unchanged will fail again. Read the error above, change something (arguments / approach / tool), ` +
     `or step back and re-plan; if you're out of ideas, ask the user and say what you tried.`
   );
+}
+
+export interface RepeatGuardDecision {
+  failed: boolean;
+  note: string;
+  /** First identity at its existing threshold; empty_recall exhausts recall rather than halting. */
+  stopped?: { identity: FailureIdentity; count: number };
+}
+
+export interface RunRepeatGuard {
+  /** Record only settled calls; interrupted or unexecuted cancellation results stay with the caller. */
+  recordCall(name: string, input: unknown, content: string, isError?: boolean): RepeatGuardDecision;
+}
+
+/** A new run starts a fresh hard-stop audit. Warning history retains its existing session scope until
+ * resetRepeatGuard, so resuming after a pause cannot inherit a previous run's hard-stop count. */
+export function createRunRepeatGuard(scope?: string): RunRepeatGuard {
+  const runSeen: FailureLedger = new Map();
+  return {
+    recordCall(name, input, content, isError = false) {
+      const failed = isError || looksFailed(content, name);
+      const identities = failureIdentities(name, input, content, isError);
+      const warningCounts = recordFailures(scopedSeen(scope), name, failed, identities);
+      const runCounts = recordFailures(runSeen, name, failed, identities);
+      const stopped = runCounts.find(({ identity, streak }) => streak.fails >= identity.hardStopAfter);
+      return {
+        failed,
+        note: failureWarning(name, warningCounts),
+        ...(stopped ? { stopped: { identity: stopped.identity, count: stopped.streak.fails } } : {}),
+      };
+    },
+  };
+}
+
+/** Compatibility warning-only entry point. Main runs use createRunRepeatGuard for one typed warning
+ * and stop decision, while older callers retain the same scoped warning prose. */
+export function recordCall(name: string, input: unknown, content: string, isError = false, scope?: string): string {
+  const failed = isError || looksFailed(content, name);
+  const identities = failureIdentities(name, input, content, isError);
+  return failureWarning(name, recordFailures(scopedSeen(scope), name, failed, identities));
 }
 
 /** Clear the streaks — /reset (fresh start) and tests. */

@@ -4,6 +4,7 @@
 // bridging. Provider building / subagent spawn / guardian stay in index.ts and are injected as ServeDeps
 // (no import cycle back into the CLI entry).
 import { WebSocketServer, type WebSocket } from "ws";
+import { createCodingUsageAccumulator } from "../coding/accounting.js";
 import { randomBytes, randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import {
@@ -307,6 +308,7 @@ import {
   createTaskExecution,
   continueTaskExecution,
   finishTaskExecution,
+  isRecoverableRunPause,
   newSteerInteraction,
   newTurnInteraction,
   recordAwaitingTaskDecision,
@@ -323,6 +325,10 @@ import {
 } from "./attachments.js";
 import { createExternalSessionRegistry } from "../external-sessions/registry.js";
 import { executeExternalCodingAgent } from "../subagent/external.js";
+import { createCodingHostBridge, type CodingHostBridge } from "../coding/host.js";
+import { createCodingToolset } from "../coding/tools.js";
+import { createCodingContinuationStore } from "../coding/continuations.js";
+import type { CodingSettingsInput, CodingSettingsState } from "../coding-settings.js";
 import {
   ExternalSessionInputError,
   type ExternalRuntimeLaunchOptions,
@@ -398,6 +404,8 @@ export interface ServeDeps {
    * the engine so Desktop cannot bypass environment ownership or Hara's global config lock. */
   computerSettings?: (cwd?: string) => ComputerSettingsState;
   saveComputerSettings?: (input: ComputerSettingsInput, cwd?: string) => ComputerSettingsState;
+  codingSettings?: (cwd?: string) => CodingSettingsState;
+  saveCodingSettings?: (input: CodingSettingsInput, cwd?: string) => CodingSettingsState;
   decisionSettings?: (cwd?: string) => DecisionSettingsState;
   saveDecisionSettings?: (input: DecisionSettingsInput, cwd?: string) => DecisionSettingsState;
   testDecisionSettings?: (input: DecisionSettingsTestInput, cwd?: string) => Promise<DecisionSettingsTestResult>;
@@ -1421,6 +1429,7 @@ export function sessionCommandRequestHash(
 export const MAX_SERVE_SOCKET_BUFFERED_BYTES = 4 * 1024 * 1024;
 export const MAX_SESSION_RUNTIME_REPLAY_PAGE = 256;
 const EXTERNAL_TERMINAL_HANDOFF_FEATURE = "external.sessions.terminal-handoff.v1";
+const EXTERNAL_DELEGATED_INTERACTION_FEATURE = "external.delegated-interaction.v1";
 const EXTERNAL_TERMINAL_HANDOFF_TIMEOUT_MS = 3_000;
 
 interface BoundedSocketWriter {
@@ -2152,6 +2161,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     timer: ReturnType<typeof setTimeout> | null;
   }
   const pendingExternalTerminalHandoffs = new Map<string, PendingExternalTerminalHandoff>();
+  interface ExternalDelegationContext {
+    parentSessionId: string;
+    agentPath: string;
+    turnId: string;
+    originallyNegotiated: boolean;
+    isCurrent: () => boolean;
+  }
+  // Feature consent belongs to a human-started logical parent turn, not an Agent's tool arguments.
+  const delegatedInputTurns = new Map<string, { turnId: string; negotiated: boolean }>();
   const pendingApprovals = new Map<string, {
     finish: (v: boolean | "always", outcome?: SessionApprovalOutcome) => void;
     allowAlways: boolean;
@@ -2161,6 +2179,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     presentation?: AgentCreationApproval;
     expiresAt?: string;
     deadlineMonotonic?: number;
+    delegation?: ExternalDelegationContext;
     taskApproval?: {
       summary: string; toolFamily: TaskApprovalFamily; durationMs: number;
       grantFromHuman: () => boolean; isActive: () => boolean; isCurrent: () => boolean;
@@ -2254,6 +2273,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     turnId: string;
     expiresAt: string;
     request: ExternalUserQuestionRequest;
+    delegation?: ExternalDelegationContext;
     finish: (answers: ExternalUserQuestionAnswers, outcome: "answered" | "cancelled" | "timed_out" | "interrupted") => void;
   }
   const pendingExternalQuestions = new Map<string, PendingExternalQuestion>();
@@ -2455,9 +2475,16 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       session.pendingToolRuns > 0
     );
 
+  const canReceiveEvent = (ws: WebSocket, method: string, params: Record<string, unknown>): boolean => (
+    !(method.startsWith("external.") && typeof params.parentSessionId === "string")
+    || (externalSessionSpaceId() === "personal"
+      && clientFeatures.get(ws)?.has(EXTERNAL_DELEGATED_INTERACTION_FEATURE) === true)
+  );
   const broadcast = (method: string, params: Record<string, unknown>): void => {
     const { frame } = eventReplay.publish(method, params);
-    for (const ws of authed) sendBoundedSocketFrame(ws, frame);
+    for (const ws of authed) {
+      if (canReceiveEvent(ws, method, params)) sendBoundedSocketFrame(ws, frame);
+    }
   };
   const notifySocket = (ws: WebSocket, method: string, params: Record<string, unknown>): boolean => {
     return sendBoundedSocketFrame(ws, rpcNotify(method, params));
@@ -2588,18 +2615,40 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   // Adapter turn identifiers never cross Serve. Keep the one active wire id per opaque session so a
   // follow-up (`steer`) is correlated with the same stream that Desktop is already rendering.
   const externalWireTurns = new Map<string, string>();
+  const delegationIsCurrent = (context: ExternalDelegationContext): boolean => {
+    try { return context.isCurrent(); } catch { return false; }
+  };
+  const delegatedPresentation = (context?: ExternalDelegationContext) => context ? {
+    parentSessionId: context.parentSessionId, agentPath: context.agentPath,
+  } : {};
+  const hasExternalInputResponder = (delegation?: ExternalDelegationContext, question = false): boolean => (
+    externalSessionSpaceId() === "personal"
+    && [...authed].some((client) => (!question || clientFeatures.get(client)?.has(EXTERNAL_USER_QUESTIONS_FEATURE))
+      && (!delegation || clientFeatures.get(client)?.has(EXTERNAL_DELEGATED_INTERACTION_FEATURE)))
+  );
   const externalQuestionForClient = (questionId: string, pending: PendingExternalQuestion) => ({
     questionId,
     sessionId: pending.sessionId,
     turnId: pending.turnId,
     expiresAt: pending.expiresAt,
     questions: pending.request.questions,
+    ...delegatedPresentation(pending.delegation),
   });
   const cancelExternalQuestions = (sessionId?: string, turnId?: string): void => {
     for (const pending of [...pendingExternalQuestions.values()]) {
       if ((sessionId === undefined || pending.sessionId === sessionId) && (turnId === undefined || pending.turnId === turnId)) {
         pending.finish({}, "interrupted");
       }
+    }
+  };
+  const cancelDelegatedInput = (parentSessionId?: string): void => {
+    for (const pending of [...pendingExternalQuestions.values()]) {
+      if (pending.delegation && (!parentSessionId || pending.delegation.parentSessionId === parentSessionId)
+        && !delegationIsCurrent(pending.delegation)) pending.finish({}, "interrupted");
+    }
+    for (const pending of [...pendingApprovals.values()]) {
+      if (pending.delegation && (!parentSessionId || pending.delegation.parentSessionId === parentSessionId)
+        && !delegationIsCurrent(pending.delegation)) pending.finish(false, "interrupted");
     }
   };
   const clearPendingInputReconnectTimers = (): void => {
@@ -2614,28 +2663,29 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       ? Math.max(1, Math.min(15_000, Math.trunc(deps.pendingInputReconnectGraceMs))) : 15_000;
     // A reconnect authenticates with this Serve's token; it does not inherit a terminal/control lease.
     // Retaining the unchanged pending request during this short grace never approves or answers it.
-    if (authed.size > 0 || pendingApprovals.size === 0) {
+    const approvalsWithoutResponder = () => [...pendingApprovals.values()].filter((approval) => (
+      approval.delegation ? !hasExternalInputResponder(approval.delegation) : authed.size === 0
+    ));
+    if (approvalsWithoutResponder().length === 0) {
       if (approvalReconnectTimer) clearTimeout(approvalReconnectTimer);
       approvalReconnectTimer = null;
     } else if (!approvalReconnectTimer) {
       approvalReconnectTimer = setTimeout(() => {
         approvalReconnectTimer = null;
-        if (authed.size === 0) {
-          for (const approval of [...pendingApprovals.values()]) approval.finish(false, "interrupted");
-        }
+        for (const approval of approvalsWithoutResponder()) approval.finish(false, "interrupted");
       }, graceMs);
       approvalReconnectTimer.unref();
     }
-    const hasQuestionResponder = externalSessionSpaceId() === "personal"
-      && [...authed].some((client) => clientFeatures.get(client)?.has(EXTERNAL_USER_QUESTIONS_FEATURE));
-    if (hasQuestionResponder || pendingExternalQuestions.size === 0) {
+    const questionsWithoutResponder = () => [...pendingExternalQuestions.values()].filter((pending) => (
+      !hasExternalInputResponder(pending.delegation, true)
+    ));
+    if (questionsWithoutResponder().length === 0) {
       if (questionReconnectTimer) clearTimeout(questionReconnectTimer);
       questionReconnectTimer = null;
     } else if (!questionReconnectTimer) {
       questionReconnectTimer = setTimeout(() => {
         questionReconnectTimer = null;
-        if (externalSessionSpaceId() !== "personal"
-          || ![...authed].some((client) => clientFeatures.get(client)?.has(EXTERNAL_USER_QUESTIONS_FEATURE))) cancelExternalQuestions();
+        for (const pending of questionsWithoutResponder()) pending.finish({}, "interrupted");
       }, graceMs);
       questionReconnectTimer.unref();
     }
@@ -2646,13 +2696,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     turnId: string,
     request: ExternalUserQuestionRequest,
     signal: AbortSignal,
+    delegation?: ExternalDelegationContext,
   ): Promise<ExternalUserQuestionAnswers> => {
     // Cancelling a pending form can let the provider ask its next question in the same microtask turn.
     // Shutdown must not admit a new form before adapter.close has delivered its cancellation signal.
     if (closing) return Promise.resolve({});
     const normalized = normalizeExternalUserQuestions(request);
-    const hasCompatibleResponder = [...authed].some((client) => clientFeatures.get(client)?.has(EXTERNAL_USER_QUESTIONS_FEATURE));
+    const hasCompatibleResponder = hasExternalInputResponder(delegation, true);
     if (!normalized || !originallyNegotiated || !hasCompatibleResponder
+      || (delegation && (!delegation.originallyNegotiated || !delegationIsCurrent(delegation)))
       || signal.aborted || externalWireTurns.get(sessionId) !== turnId || externalSessionSpaceId() !== "personal") {
       broadcast("external.event.notice", {
         sessionId, turnId, text: "User input cannot be safely collected by this client; no answer was selected. Update Hara or use the original terminal.",
@@ -2676,13 +2728,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           clearTimeout(questionReconnectTimer);
           questionReconnectTimer = null;
         }
-        broadcast("external.question.resolved", { questionId, sessionId, turnId, outcome });
+        broadcast("external.question.resolved", { questionId, sessionId, turnId, outcome, ...delegatedPresentation(delegation) });
         resolve(answers);
       };
       const onAbort = (): void => finish({}, "interrupted");
       const timer = setTimeout(() => finish({}, "timed_out"), timeoutMs);
       timer.unref();
-      const pending: PendingExternalQuestion = { sessionId, turnId, expiresAt, request: normalized, finish };
+      const pending: PendingExternalQuestion = { sessionId, turnId, expiresAt, request: normalized, finish,
+        ...(delegation ? { delegation } : {}) };
       pendingExternalQuestions.set(questionId, pending);
       reconcilePendingInputReconnect();
       signal.addEventListener("abort", onAbort, { once: true });
@@ -2722,6 +2775,45 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       broadcast("external.approval.request", { sessionId, approvalId, question, allowAlways });
     }
   });
+  const confirmDelegatedAction = (
+    sessionId: string, question: string, signal: AbortSignal, delegation: ExternalDelegationContext,
+  ): Promise<boolean> => {
+    if (closing || signal.aborted || !delegation.originallyNegotiated
+      || !delegationIsCurrent(delegation) || !hasExternalInputResponder(delegation)
+      || externalWireTurns.get(sessionId) !== delegation.turnId) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const approvalId = randomUUID();
+      const turnId = delegation.turnId;
+      const timeoutMs = typeof deps.externalUserQuestionTimeoutMs === "number" && Number.isFinite(deps.externalUserQuestionTimeoutMs)
+        ? Math.max(1, Math.min(APPROVAL_TIMEOUT_MS, Math.trunc(deps.externalUserQuestionTimeoutMs))) : APPROVAL_TIMEOUT_MS;
+      const expiresAt = new Date(Date.now() + timeoutMs).toISOString();
+      const deadlineMonotonic = performance.now() + timeoutMs;
+      let settled = false;
+      const finish = (value: boolean | "always", outcome?: SessionApprovalOutcome): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        pendingApprovals.delete(approvalId);
+        broadcast("external.approval.resolved", { approvalId, sessionId, turnId,
+          ...delegatedPresentation(delegation),
+          outcome: outcome === "timed_out" ? "timed_out" : outcome === "interrupted" ? "interrupted"
+            : value === true ? "answered" : "cancelled" });
+        resolve(value === true);
+        reconcilePendingInputReconnect();
+      };
+      const onAbort = (): void => finish(false, "interrupted");
+      const timer = setTimeout(() => finish(false, "timed_out"), timeoutMs);
+      timer.unref();
+      pendingApprovals.set(approvalId, { finish, scope: "external", sessionId, question, allowAlways: false,
+        delegation, expiresAt, deadlineMonotonic });
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+      else broadcast("external.approval.request", { approvalId, sessionId, turnId, question, allowAlways: false,
+        expiresAt, ...delegatedPresentation(delegation) });
+      reconcilePendingInputReconnect();
+    });
+  };
   const nextTaskEventCursor = (): TaskLifecycleCursor => {
     const sequence = taskEventSequence + 1;
     if (!Number.isSafeInteger(sequence)) {
@@ -2866,8 +2958,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       store: agentTeamStore,
       currentRootTurnId: () => session.task?.turnId,
       codingRuntimes: () => sessionSpaceBinding(session.meta).spaceId === "personal"
-        ? ["codex", "claude"]
+        ? ["codex", "claude", "opencode", "pi"]
         : [],
+      preferredCodingRuntime: () => deps.codingSettings?.(session.meta.cwd).effectiveExecutor ?? "opencode",
       limits: () => {
         const perRun = deps.runLimits?.(session.meta.cwd) ?? { timeoutMs: 8 * 60_000, maxRounds: 24 };
         const modelWindow = session.provider.connection?.capabilities.contextWindowTokens
@@ -2915,11 +3008,22 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             return {
               status: "error",
               text: "",
-              error: "Local Codex and Claude coding runtimes are available only in Personal Space.",
+              error: "Local coding runtimes are available only in Personal Space.",
             };
           }
           const now = new Date().toISOString();
-          const providerId = `hara-live-${request.runtime}`;
+          // Durable children have independent controllers. While dispatched by a foreground parent,
+          // cancelling that parent must also stop its native turn and resolve every pending input.
+          const parentSignal = session.abort?.signal;
+          const codingSignal = parentSignal ? AbortSignal.any([request.signal, parentSignal]) : request.signal;
+          let codingSessionId: string | undefined;
+          let codingTurnId: string | undefined;
+          let codingStatus = "failed";
+          let delegation: ExternalDelegationContext | undefined;
+          const providerId = `hara-coding-${request.runtime}`;
+          const codingProvider = session.provider;
+          let codingHost: CodingHostBridge | undefined;
+          const accountCodingUsage = createCodingUsageAccumulator(session.stats);
           recordLifecycle({
             id: request.id,
             providerId,
@@ -2929,8 +3033,89 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             startedAt: now,
           });
           try {
-            const result = await executeExternalCodingAgent(request, externalSessions);
+            const onBound = (opaqueId: string): void => {
+                if (codingSignal.aborted || externalWireTurns.has(opaqueId)) {
+                  throw new Error("the coding session is cancelled or already has an active controller");
+                }
+                codingSessionId = opaqueId;
+                codingTurnId = `extturn_${randomUUID()}`;
+                const consent = delegatedInputTurns.get(session.meta.id);
+                delegation = {
+                  parentSessionId: session.meta.id, agentPath: request.path, turnId: codingTurnId,
+                  originallyNegotiated: Boolean(consent && consent.turnId === turnId && consent.negotiated),
+                  isCurrent: () => {
+                    const current = sessionSpaceBinding(session.meta);
+                    const currentConsent = delegatedInputTurns.get(session.meta.id);
+                    return !closing && !codingSignal.aborted && hub.get(session.meta.id) === session
+                      && Boolean(taskId && turnId) && session.task?.id === taskId && session.task?.turnId === turnId
+                      && Boolean(currentConsent && currentConsent.turnId === turnId && currentConsent.negotiated)
+                      && current.spaceId === "personal" && current.profileId === binding.profileId
+                      && externalWireTurns.get(opaqueId) === codingTurnId;
+                  },
+                };
+                externalWireTurns.set(opaqueId, codingTurnId);
+                broadcast("external.event.turn_start", { sessionId: opaqueId, turnId: codingTurnId,
+                  ...delegatedPresentation(delegation) });
+            };
+            const assertCodingCurrent = (): void => {
+              const current = sessionSpaceBinding(session.meta);
+              const worker = team.list().find((agent) => agent.id === request.id);
+              if (closing || codingSignal.aborted || hub.get(session.meta.id) !== session
+                || !taskId || !turnId || session.task?.id !== taskId || session.task?.turnId !== turnId
+                || session.provider !== codingProvider || current.spaceId !== "personal"
+                || current.profileId !== binding.profileId || !codingSessionId || !codingTurnId
+                || externalWireTurns.get(codingSessionId) !== codingTurnId
+                || !worker || worker.status !== "working" || worker.generation !== request.generation
+                || worker.rootTurnId !== turnId || worker.providerSessionId !== codingSessionId) {
+                throw new Error("the parent coding execution is no longer current");
+              }
+            };
+            const observer = {
+              onSession: (codingSession: { id: string }) => onBound(codingSession.id),
+              onPiSession: onBound,
+              confirm: (action, signal) => codingSessionId && delegation
+                ? confirmDelegatedAction(codingSessionId, action.question, signal, delegation) : Promise.resolve(false),
+              askUser: (questions, signal) => codingSessionId && codingTurnId && delegation
+                ? askExternalUser(delegation.originallyNegotiated, codingSessionId, codingTurnId, questions, signal, delegation)
+                : Promise.resolve({}),
+            } satisfies import("../coding/pi.js").PiCodingAgentObserver
+              & Pick<import("../subagent/external.js").ExternalCodingAgentObserver, "onSession">;
+            const prepareHost = async (signal: AbortSignal) => {
+              assertCodingCurrent();
+              if (!request.workspace || request.workspace.mode !== "isolated-write") {
+                throw new Error("coding requires an owned isolated worktree");
+              }
+              const combined = AbortSignal.any([codingSignal, signal]);
+              const toolset = createCodingToolset({ cwd: request.workspace.cwd, signal: combined,
+                assertCurrent: assertCodingCurrent, confirm: observer.confirm, askUser: observer.askUser });
+              codingHost = await createCodingHostBridge({ provider: codingProvider, ...toolset, signal: combined,
+                assertCurrent: assertCodingCurrent, budget: request.budget,
+                continuationStore: createCodingContinuationStore(deps.agentTeamHome ?? deps.discoveryHome ?? homedir(), {
+                  workerId: request.id, providerSessionId: codingSessionId!, cwd: request.workspace.cwd,
+                  providerId: codingProvider.id, model: codingProvider.model, profileId: binding.profileId,
+                  connectionRuntimeKey: codingProvider.connection?.runtimeKey,
+                }),
+                system: "You are a Hara-owned coding worker. Use only the supplied tools within the isolated worktree. Ask the user through ask_user when a choice is required. Never bypass approvals. Report the actual edits and verification; do not claim tests ran unless a tool verified them.",
+                onUsage: accountCodingUsage,
+                onProgress: (metrics) => request.reportProgress(metrics),
+              });
+              return codingHost;
+            };
+            const codingRequest = { ...request, signal: codingSignal };
+            const result = request.runtime === "pi"
+              ? await (await import("../coding/pi.js")).executePiCodingAgent(codingRequest, prepareHost, observer, deps.agentTeamHome ?? deps.discoveryHome ?? homedir())
+              : await executeExternalCodingAgent(codingRequest, externalSessions, { ...observer,
+                ...(request.runtime === "opencode" ? { executionMetrics: () => {
+                  if (!codingHost) throw new Error("the coding host did not start");
+                  return codingHost.metrics;
+                } } : {}),
+                prepareCodingHost: async (signal) => {
+                  const host = await prepareHost(signal);
+                  return { ...host, get metrics() { return host.metrics; }, progress: () => true };
+                },
+              });
             const endedAt = new Date().toISOString();
+            codingStatus = result.status === "completed" ? "completed" : result.status === "cancelled" ? "cancelled" : "failed";
             recordLifecycle({
               id: request.id,
               providerId,
@@ -2949,12 +3134,28 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               id: request.id,
               providerId,
               ...(request.role ? { role: request.role } : {}),
-              state: request.signal.aborted ? "cancelled" : "failed",
+              state: codingSignal.aborted ? "cancelled" : "failed",
               queuedAt: now,
               startedAt: now,
               endedAt: new Date().toISOString(),
             });
             throw error;
+          } finally {
+            // Cancellation may account dispatched input after the last progress callback. This is
+            // bookkeeping only: it must not re-enable tools, approvals, or a revoked provider route.
+            if (codingHost) accountCodingUsage(codingHost.metrics);
+            if (codingSessionId && codingTurnId) {
+              cancelExternalQuestions(codingSessionId, codingTurnId);
+              for (const approval of [...pendingApprovals.values()]) {
+                if (approval.sessionId === codingSessionId && approval.delegation?.turnId === codingTurnId) {
+                  approval.finish(false, "interrupted");
+                }
+              }
+              if (externalWireTurns.get(codingSessionId) === codingTurnId) externalWireTurns.delete(codingSessionId);
+              broadcast("external.event.turn_end", { sessionId: codingSessionId, turnId: codingTurnId,
+                requestedSessionId: codingSessionId,
+                ...delegatedPresentation(delegation), reply: "", status: codingSignal.aborted ? "cancelled" : codingStatus });
+            }
           }
         }
         if (deps.spawnSubagentResult) {
@@ -3310,7 +3511,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     taskId: string;
     turnId: string;
     status?: "paused";
-    stopReason?: "deadline" | "task_round_budget" | "max_rounds" | "strategy_stall" | "no_progress" | "repeat_loop";
+    stopReason?: "deadline" | "task_round_budget" | "max_rounds" | "strategy_stall" | "no_progress" | "repeat_loop" | "completion_verification";
   }> => {
     const sessionId = s.meta.id;
     // Continuing or replacing a logical task never resumes prior execution grants.
@@ -3352,6 +3553,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         s.meta.todos = [];
       }
       executionContext = taskExecutionContext(s.task, interaction, s.meta.todos ?? []);
+      const previousConsent = delegatedInputTurns.get(sessionId);
+      const inputNegotiated = Boolean(taskApprovalOwner
+        && clientFeatures.get(taskApprovalOwner)?.has(EXTERNAL_DELEGATED_INTERACTION_FEATURE)
+        && clientFeatures.get(taskApprovalOwner)?.has(EXTERNAL_USER_QUESTIONS_FEATURE));
+      delegatedInputTurns.set(sessionId, { turnId: interaction.turnId,
+        negotiated: previousConsent?.turnId === interaction.turnId
+          ? previousConsent.negotiated && inputNegotiated : inputNegotiated });
+      cancelDelegatedInput(sessionId);
       hub.save(s); // crash-safe running identity before provider/tool side effects
       const userMessageItemId = `message:user:${interaction.turnId}`;
       publishRuntimeItem(s, {
@@ -4132,14 +4341,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           : outcome.status === "halted"
             ? "agent turn halted by a safety control"
             : "agent turn failed");
-        if (outcome.status === "halted" && (
-          outcome.stopReason === "deadline"
-          || outcome.stopReason === "task_round_budget"
-          || outcome.stopReason === "max_rounds"
-          || outcome.stopReason === "strategy_stall"
-          || outcome.stopReason === "no_progress"
-          || outcome.stopReason === "repeat_loop"
-        )) {
+        if (isRecoverableRunPause(outcome)) {
           // A bounded lifecycle pause is a successful, recoverable checkpoint transition. The typed
           // task event already says `paused`; returning a normal RPC result keeps Desktop and other Serve
           // clients from rendering the same state as `error:` while still exposing the focused /continue
@@ -4148,7 +4350,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             sessionId,
             taskId: s.task!.id,
             turnId: s.task!.turnId,
-            reply: "",
+            reply: lastAssistantText(s.history.slice(historyStart)),
             status: "paused",
             stopReason: outcome.stopReason,
             usage,
@@ -4160,7 +4362,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             durationMs: Date.now() - runtimeStartedAt,
           });
           return {
-            reply: failure,
+            reply: lastAssistantText(s.history.slice(historyStart)) || failure,
             usage,
             ctx,
             taskId: s.task!.id,
@@ -4169,12 +4371,23 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             stopReason: outcome.stopReason,
           };
         }
-        broadcast("event.turn_end", { sessionId, taskId: s.task!.id, turnId: s.task!.turnId, reply: "", error: failure, status: outcome.status, usage, ctx });
+        // Keep the error outcome/RPC contract, but do not erase the bounded handoff already streamed
+        // and persisted for this turn. Request-only clients still receive an explicit RPC error.
+        broadcast("event.turn_end", { sessionId, taskId: s.task!.id, turnId: s.task!.turnId, reply: lastAssistantText(s.history.slice(historyStart)), error: failure, status: outcome.status, usage, ctx });
         throw new Error(failure);
       }
       // A persistent session may already contain many assistant messages. Only messages appended by THIS
       // request are eligible for its reply; a failed/empty turn must never replay a previous success.
       const reply = lastAssistantText(s.history.slice(historyStart));
+      if (s.task?.status === "paused") {
+        // `completed` is the logical model turn, not proof that the user's business task succeeded.
+        // Waiting for a real dependency or unfinished todos must remain visibly paused on every client.
+        const usage = turnUsage();
+        const ctx = ctxOf(s);
+        broadcast("event.turn_end", { sessionId, taskId: s.task.id, turnId: s.task.turnId, reply, status: "paused", usage, ctx });
+        runtimeLog("turn.paused", { sessionId, category: "conflict", durationMs: Date.now() - runtimeStartedAt });
+        return { reply, usage, ctx, taskId: s.task.id, turnId: s.task.turnId, status: "paused" };
+      }
       // CLI turns already auto-compact after a successful response. Serve used to expose only the manual
       // RPC, so Desktop conversations kept resending a large transcript until a person noticed the meter.
       // Capture the reply first, then compact under the same session lease. Failure is best-effort and never
@@ -4619,6 +4832,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     | "external.sessions.terminal.input"
     | "external.sessions.terminal.key"
     | "external.question.reply"
+    | "external.approval.reply"
     | "approval.reply";
 
   const externalCommandFromOutcome = (outcome: RemoteCommandOutcome): unknown => {
@@ -5154,7 +5368,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           // Read/test RPCs do not. Ordinary approvals remain usable; physical desktop leases are separate.
           const policyMutations = new Set([
             "plugins.set", "agents.update-profile", "agents.create", "agents.archive", "spaces.use",
-            "settings.computer.save", "settings.decision.save", "settings.vision.save", "settings.providers.save",
+            "settings.computer.save", "settings.coding.update", "settings.decision.save", "settings.vision.save", "settings.providers.save",
             "settings.providers.connections.create", "settings.providers.connections.use", "settings.providers.connections.remove",
             "settings.providers.failover.save", "settings.profiles.unpin", "settings.gateways.credentials.save",
             "settings.gateways.credentials.remove", "settings.gateways.authorization.approve", "settings.gateways.start",
@@ -5196,7 +5410,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "events.replay", "events.ack", "events.snapshot",
             "session.list", "session.create", "session.resume", "session.pause", "session.migration.prepare", "session.migration.resume", "session.history", "session.runtime.replay", "session.agents.list", "session.agents.spawn", "session.agents.message", "session.agents.interrupt", "session.agent-rooms.create", "session.agent-rooms.read", "session.agent-rooms.post", "session.agent-rooms.close", "session.submit", "session.send", "session.steer", "session.interrupt", "session.control.acquire", "session.control.release", "session.set-model", "session.set-approval",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
-            "approval.reply", "session.task-approval.revoke", "external.question.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
+            "approval.reply", "session.task-approval.revoke", "external.question.reply", "external.approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
             "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.resume", "external.sessions.fork",
             "external.sessions.submit", "external.sessions.steer", "external.sessions.interrupt", "external.sessions.remove",
             "external.sessions.terminal.snapshot", "external.sessions.terminal.input", "external.sessions.terminal.key",
@@ -5282,6 +5496,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           if (deps.computerSettings && deps.saveComputerSettings) {
             methods.push("settings.computer.get", "settings.computer.save");
           }
+          if (deps.codingSettings && deps.saveCodingSettings && externalSessionSpaceId() === "personal") {
+            methods.push("settings.coding.get", "settings.coding.update");
+          }
           if (deps.decisionSettings && deps.saveDecisionSettings && deps.testDecisionSettings) {
             methods.push("settings.decision.get", "settings.decision.save", "settings.decision.test");
           }
@@ -5361,10 +5578,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sessions.terminal-input-sequence.v1",
             "external.sessions.terminal-command-idempotency.v1",
             EXTERNAL_TERMINAL_HANDOFF_FEATURE,
+            EXTERNAL_DELEGATED_INTERACTION_FEATURE,
             "external.sessions.runtime-remove.v1",
           ];
           if (deps.spaces && deps.useSpace) features.push("spaces.tenant-boundary.v1");
           if (deps.computerSettings && deps.saveComputerSettings) features.push("computer-use.core.v1");
+          if (deps.codingSettings && deps.saveCodingSettings && externalSessionSpaceId() === "personal") features.push("coding.settings.v1");
           if (deps.decisionSettings && deps.saveDecisionSettings) features.push("action-guard.settings.v1");
           if (deps.prepareDecisionRuntime) features.push("action-guard.laya-mlx.v1");
           if (localWechatGroup) features.push("wechat-group.local-agent.v1");
@@ -5408,7 +5627,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 "event.control_state", "event.control_revoked", "event.task_approval_state",
                 "external.event.turn_start", "external.event.text", "external.event.tool",
                 "external.event.notice", "external.event.turn_end", "external.approval.request",
-                "external.question.request", "external.question.resolved",
+                "external.question.request", "external.question.resolved", "external.approval.resolved",
                 "external.event.command_committed", "external.event.command_failed",
                 "external.event.terminal.frame", "external.event.terminal.closed",
                 "external.event.terminal.handoff_requested", "external.event.terminal.handoff_cancelled",
@@ -5566,18 +5785,25 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 ? [...externalWireTurns].map(([sessionId, turnId]) => ({ sessionId, turnId }))
                 : [],
               externalQuestions: externalSessionSpaceId() === "personal" && clientFeatures.get(ws)?.has(EXTERNAL_USER_QUESTIONS_FEATURE)
-                ? [...pendingExternalQuestions].map(([questionId, pending]) => externalQuestionForClient(questionId, pending))
+                ? [...pendingExternalQuestions].filter(([, pending]) => !pending.delegation
+                  || (clientFeatures.get(ws)?.has(EXTERNAL_DELEGATED_INTERACTION_FEATURE)
+                    && requested.has(pending.delegation.parentSessionId) && delegationIsCurrent(pending.delegation)))
+                  .map(([questionId, pending]) => externalQuestionForClient(questionId, pending))
                 : [],
               approvals: [...pendingApprovals]
                 .filter(([, approval]) => approval.scope === "session"
                   ? requested.has(approval.sessionId)
-                  : externalSessionSpaceId() === "personal")
+                  : externalSessionSpaceId() === "personal" && (!approval.delegation
+                    || (clientFeatures.get(ws)?.has(EXTERNAL_DELEGATED_INTERACTION_FEATURE)
+                      && requested.has(approval.delegation.parentSessionId) && delegationIsCurrent(approval.delegation))))
                 .map(([approvalId, approval]) => ({
                   approvalId,
                   sessionId: approval.sessionId,
                   scope: approval.scope,
                   question: approval.question,
                   allowAlways: approval.allowAlways,
+                  ...(approval.delegation ? { ...delegatedPresentation(approval.delegation),
+                    turnId: approval.delegation.turnId, expiresAt: approval.expiresAt } : {}),
                   ...pendingTaskApprovalForClient(ws, approval),
                   ...(approval.presentation ? { presentation: approval.presentation } : {}),
                 })),
@@ -5605,6 +5831,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             // The handler performs no await between taking the replay page and writing it, so live events
             // cannot interleave inside this exact prefix. The original frames retain their original cursor.
             for (const frame of replay.frames) {
+              const event = JSON.parse(frame) as { method: string; params?: Record<string, unknown> };
+              if (!canReceiveEvent(ws, event.method, event.params ?? {})) continue;
               if (!sendBoundedSocketFrame(ws, frame)) return;
             }
             return reply(rpcResult(id!, {
@@ -7538,7 +7766,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.UNAUTHORIZED, "external user questions require a compatible Personal Space client"));
             }
             if (!validSessionCommandId(p.questionId) || !validSessionCommandId(p.commandId)
-              || typeof p.sessionId !== "string" || !/^ext_(?:codex|claude|opencode|runtime)_[a-f0-9]{24}$/u.test(p.sessionId)
+              || typeof p.sessionId !== "string" || !/^ext_(?:codex|claude|opencode|pi|runtime)_[a-f0-9]{24}$/u.test(p.sessionId)
               || typeof p.turnId !== "string" || !validSessionCommandId(p.turnId.replace(/^extturn_/u, ""))
               || (p.cancelled !== undefined && typeof p.cancelled !== "boolean")
               || !p.answers || typeof p.answers !== "object" || Array.isArray(p.answers)) {
@@ -7550,11 +7778,43 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 || externalWireTurns.get(p.sessionId) !== p.turnId || Date.parse(pending.expiresAt) <= Date.now()) {
                 throw new SessionCommandRpcError(ERR.CONFLICT, "question no longer belongs to this active external turn");
               }
+              if (pending.delegation) {
+                if (!clientFeatures.get(ws)?.has(EXTERNAL_DELEGATED_INTERACTION_FEATURE)) {
+                  throw new SessionCommandRpcError(ERR.UNAUTHORIZED, "delegated input requires a compatible chat client");
+                }
+                if (!delegationIsCurrent(pending.delegation)) {
+                  pending.finish({}, "interrupted");
+                  throw new SessionCommandRpcError(ERR.CONFLICT, "the parent Agent execution changed");
+                }
+              }
               const answers = validateExternalUserAnswers(pending.request, p.answers);
               if (answers === undefined || (p.cancelled === true && Object.keys(answers).length !== 0)) {
                 throw new SessionCommandRpcError(ERR.PARAMS, "answers must match the question options or permitted custom input");
               }
               pending.finish(p.cancelled === true ? {} : answers, p.cancelled === true ? "cancelled" : "answered");
+              return {};
+            });
+            return reply(rpcResult(id!, result));
+          }
+          case "external.approval.reply": {
+            if (externalSessionSpaceId() !== "personal" || !clientFeatures.get(ws)?.has(EXTERNAL_DELEGATED_INTERACTION_FEATURE)) {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "delegated approvals require a compatible Personal Space client"));
+            }
+            if (!validSessionCommandId(p.approvalId) || !validSessionCommandId(p.commandId)
+              || typeof p.sessionId !== "string" || !/^ext_(?:codex|claude|opencode|pi)_[a-f0-9]{24}$/u.test(p.sessionId)
+              || typeof p.turnId !== "string" || !validSessionCommandId(p.turnId.replace(/^extturn_/u, ""))
+              || typeof p.allow !== "boolean" || p.always !== undefined || p.forTask !== undefined) {
+              return reply(rpcError(id, ERR.PARAMS, "approvalId + opaque sessionId + active turnId + boolean allow + commandId required; single use only"));
+            }
+            const result = await runIdempotentExternalCommand("external.approval.reply", p, p.sessionId, async () => {
+              const pending = pendingApprovals.get(p.approvalId);
+              if (!pending?.delegation || pending.scope !== "external" || pending.sessionId !== p.sessionId
+                || pending.delegation.turnId !== p.turnId || externalWireTurns.get(p.sessionId) !== p.turnId
+                || (pending.deadlineMonotonic ?? 0) <= performance.now() || !delegationIsCurrent(pending.delegation)) {
+                if (pending?.delegation && !delegationIsCurrent(pending.delegation)) pending.finish(false, "interrupted");
+                throw new SessionCommandRpcError(ERR.CONFLICT, "approval no longer belongs to this parent and external turn");
+              }
+              pending.finish(p.allow, p.allow ? "allowed" : "denied");
               return {};
             });
             return reply(rpcResult(id!, result));
@@ -7579,6 +7839,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               if (!approval) {
                 if (p.forTask === true) throw new SessionCommandRpcError(ERR.CONFLICT, "task approval is no longer pending; retry the original commandId or revoke session grants");
                 return {};
+              }
+              if (approval.delegation) {
+                throw new SessionCommandRpcError(ERR.CONFLICT, "delegated approvals require their original external session and turn via external.approval.reply");
               }
               if (
                 expected
@@ -7692,6 +7955,29 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (!listInstalled().some((pl) => pl.name === p.name)) return reply(rpcError(id, ERR.PARAMS, `no installed plugin "${p.name}"`));
             setPluginEnabled(p.name, p.enabled);
             return reply(rpcResult(id!, { name: p.name, enabled: p.enabled })); // takes effect on the next session/turn (loaders re-read)
+          }
+          case "settings.coding.get": {
+            if (externalSessionSpaceId() !== "personal") return reply(rpcError(id, ERR.UNAUTHORIZED, "coding settings require Personal Space"));
+            if (!deps.codingSettings || !deps.saveCodingSettings) return reply(rpcError(id, ERR.METHOD, "coding settings are not supported by this server"));
+            if (Object.keys(p).some((key) => key !== "cwd") || (p.cwd !== undefined && typeof p.cwd !== "string")) {
+              return reply(rpcError(id, ERR.PARAMS, "only an optional cwd is supported"));
+            }
+            return reply(rpcResult(id!, deps.codingSettings(opts.cwd)));
+          }
+          case "settings.coding.update": {
+            if (externalSessionSpaceId() !== "personal") return reply(rpcError(id, ERR.UNAUTHORIZED, "coding settings require Personal Space"));
+            if (!deps.codingSettings || !deps.saveCodingSettings) return reply(rpcError(id, ERR.METHOD, "coding settings are not supported by this server"));
+            if (Object.keys(p).some((key) => !["cwd", "executor", "expectedRevision"].includes(key))
+              || !["auto", "opencode", "pi", "codex", "claude"].includes(p.executor)
+              || !Number.isSafeInteger(p.expectedRevision) || p.expectedRevision < 0
+              || (p.cwd !== undefined && typeof p.cwd !== "string")) {
+              return reply(rpcError(id, ERR.PARAMS, "executor + non-negative expectedRevision required"));
+            }
+            try {
+              return reply(rpcResult(id!, deps.saveCodingSettings({ executor: p.executor, expectedRevision: p.expectedRevision }, opts.cwd)));
+            } catch {
+              return reply(rpcError(id, ERR.CONFLICT, "coding settings were not saved; refresh Settings before retrying"));
+            }
           }
           case "settings.computer.get": {
             if (!deps.computerSettings) return reply(rpcError(id, ERR.METHOD, "Computer Use settings are not supported by this server"));

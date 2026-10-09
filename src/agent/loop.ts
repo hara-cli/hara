@@ -58,11 +58,10 @@ import {
   type BreakerState,
 } from "../security/guardian.js";
 import {
-  failureIdentities,
+  createRunRepeatGuard,
   looksFailed,
   pythonSyntaxDiagnostic,
   pythonSyntaxRecoveryNote,
-  recordCall,
 } from "./repeat-guard.js";
 import {
   AgentProgressWatchdog,
@@ -74,11 +73,12 @@ import {
 import { agentMaxRounds, agentRunTimeoutMs, formatAgentDuration, MAX_AGENT_MAX_ROUNDS } from "./limits.js";
 import { subdirHint } from "../context/subdir-hints.js";
 import { classifyError, failoverAction, errorHint, type ErrKind } from "./failover.js";
-import { currentTodos, renderTodos, type Todo } from "../tools/todo.js";
-import { drainReminders, wrapReminders, wrapTurnContext, isSystemReminderContent, pushReminder, todoStaleReminder, TODO_STALE_ROUNDS, synthesisReminder, SYNTHESIS_MIN_AGENTS } from "./reminders.js";
+import { currentTodos, type Todo } from "../tools/todo.js";
+import { drainReminders, wrapReminders, wrapTurnContext, isSystemReminderContent, pushReminder, synthesisReminder, SYNTHESIS_MIN_AGENTS } from "./reminders.js";
 import { coreDeferredToolsForHistory } from "./core-capabilities.js";
 import { setTurnPhase } from "./phase.js";
 import { AssistantTextSanitizer, sanitizeAssistantText } from "./assistant-text.js";
+import { completionCloseoutText, pausedCloseoutText } from "./task-closeout.js";
 import { recordTouch } from "./touched.js";
 import { resolve as resolvePath } from "node:path";
 import { redactSensitiveText, requestsCredentialDisclosure } from "../security/secrets.js";
@@ -390,6 +390,11 @@ human action. Execute any action Hara can safely own, route credentials only thr
 settings/login capability, and dry-run or probe the end-to-end path when the accepted outcome requires it. If a
 real human-only dependency remains, record awaiting_user; never call the task verified and then append setup work
 for the user in prose.
+Track delivery and notification as separate accepted steps: an upload receipt does not prove a message was
+sent, and a failed notification does not undo a verified upload. Retain each successful receipt before the next
+stage and retry only the unfinished stage when authorized. Do not keep asking the user to say “continue” during
+normal authorized execution. The final reply must say what was delivered and where, what is still unverified,
+and whether anything actually needs the user; do not repeat successful uploads merely to produce that reply.
 When an observed missing-secret or missing-authority blocker is an expired login, present it to the user as
 "Sign in again" / "需要重新登录", not as a failed business operation. Say that the task is safely paused and
 its completed checkpoint is retained. Keep JWT, refresh-token, raw error-code, and tool-chain wording out of
@@ -831,8 +836,6 @@ interface RunLifecycle {
   checkpointInjected: boolean;
   limitAnnounced: boolean;
   disposed: boolean;
-  failedCalls: Map<string, number>;
-  failedCallKinds: Map<string, ReturnType<typeof failureIdentities>[number]["kind"]>;
   pythonSyntaxRecovery?: {
     file: string;
     label: string;
@@ -1062,8 +1065,6 @@ function createRunLifecycle(opts: RunOpts, language: RuntimeCopyLanguage): RunLi
     checkpointInjected: false,
     limitAnnounced: false,
     disposed: false,
-    failedCalls: new Map<string, number>(),
-    failedCallKinds: new Map(),
     taskRoundsUsed: taskBudget?.used ?? 0,
     taskRoundsCommitted: 0,
     ...(taskBudget ? {
@@ -1163,15 +1164,32 @@ function hardStop(
 /** Provider-agnostic agentic loop. Mutates `history` in place. */
 export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<RunOutcome> {
   const life = createRunLifecycle(opts, runtimeCopyLanguage(history));
+  const runTaskBinding = opts.taskIntake
+    ? { id: opts.taskIntake.task.id, turnId: opts.taskIntake.task.turnId }
+    : undefined;
   const taskAuthority = captureRunTaskAuthority(opts);
   const computerScope = createComputerRunScope();
   const media = new Map<string, { images: ImageAttachment[]; store: ReturnType<typeof createToolImageStore> }>();
   try {
     const outcome = await runAgentInner(history, { ...opts, ctx: { ...opts.ctx, computerScope } }, life, media, taskAuthority);
+    const task = opts.taskIntake?.current ? opts.taskIntake.current() : opts.taskIntake?.task;
+    const sameTaskTurn = task && task.id === runTaskBinding?.id && task.turnId === runTaskBinding?.turnId;
+    if (sameTaskTurn && task.brief?.intent === "change" && outcome.status !== "completed" && !opts.signal?.aborted) {
+      // Notices carry diagnostics; an ordinary persisted assistant reply carries the human handoff.
+      // Do not ask the provider to summarize a stopped run, or re-run its external side effects.
+      const text = pausedCloseoutText(task, currentTodos(opts.ctx.todoScope), life.language, outcome);
+      history.push({ role: "assistant", text, toolUses: [] });
+      const item = { itemId: randomUUID(), kind: "message" as const, role: "assistant" as const };
+      emitRuntimeItem(opts, { ...item, state: "started" });
+      if (!opts.quiet) {
+        if (opts.ctx.ui) opts.ctx.ui.text(text);
+        else out(`${text}\n`);
+      }
+      emitRuntimeItem(opts, { ...item, state: "completed" });
+    }
     const uncommittedRounds = life.rounds - life.taskRoundsCommitted;
-    if (uncommittedRounds > 0 && opts.taskIntake?.onRoundUsage) {
-      const current = opts.taskIntake.current?.() ?? opts.taskIntake.task;
-      opts.taskIntake.onRoundUsage(recordTaskRoundUsage(current, uncommittedRounds));
+    if (uncommittedRounds > 0 && sameTaskTurn && opts.taskIntake?.onRoundUsage) {
+      opts.taskIntake.onRoundUsage(recordTaskRoundUsage(task, uncommittedRounds));
     }
     return outcome;
   } finally {
@@ -1650,14 +1668,13 @@ async function runAgentInner(
     else if (stdout.isTTY) out(c.yellow(note + "\n"));
   }
 
-  // Stuck/loop guard — only in headless chat (`hara gateway`), where a wrong approach can grind forever with
-  // nobody to hit Esc (e.g. screenshots it can't read). Once per run, when the agent keeps repeating one
-  // non-read tool or acting blind, we inject a reflection nudge so it steps back instead of spinning.
+  // Missing native image input is a specific capability failure, not a tool-count heuristic. General
+  // stalls (including unchanged todos) belong to the progress watchdog below, on every surface.
   const guard = !!process.env.HARA_GATEWAY;
   const unattendedRun = opts.unattended === true || guard || process.env.HARA_CRON === "1";
-  const toolCounts = new Map<string, number>();
   let blindShots = 0;
-  let nudged = false;
+  let blindNudged = false;
+  const repeatGuard = createRunRepeatGuard(ctx.todoScope);
   // The engine owns this ledger rather than trusting reminder prose. It retains only digests/shingles and
   // credential-free counters, while treating same-evidence checkpoints/todo rewrites as no progress.
   const progressWatchdog = new AgentProgressWatchdog({
@@ -1721,9 +1738,6 @@ async function runAgentInner(
   const breaker: BreakerState = newBreaker();
   let breakerHalt = false; // set when a tripped breaker aborts this run
 
-  // Todo attention-refresh (à la Claude Code): tool rounds since the checklist was last touched while
-  // unfinished items exist. Main loop only — quiet (sub-agent) runs share the global list and must not nag.
-  let todoIdleRounds = 0;
   // The second half of a split response (see splitTaskStateTransition): calls the model already made that
   // wait for its own task-state round to close. They run as the next round without another provider request.
   let carriedToolRound: Pick<Awaited<ReturnType<Provider["turn"]>>, "toolUses" | "continuation"> | undefined;
@@ -1811,7 +1825,7 @@ async function runAgentInner(
       if (pending === RUN_STOPPED) return stoppedOutcome();
       // CLI and Serve write-ahead hosts may append accepted steering to the shared history themselves
       // and return []. Observe that materialization too; an old carried action must not outrun new input.
-      userIntervenedThisRound = pending.length > 0 || history.slice(historyBeforePendingInput).some((message) =>
+      userIntervenedThisRound = [...pending, ...history.slice(historyBeforePendingInput)].some((message) =>
         message.role === "user" && !isSystemReminderContent(message.content));
       // The model has not seen this input. Calls it issued earlier must not run past it unreviewed.
       if (userIntervenedThisRound) carriedToolRound = undefined;
@@ -1820,7 +1834,7 @@ async function runAgentInner(
       // before composing the system or applying a later brief so that state is never overwritten.
       syncIntakeTask();
     }
-    // system-reminder injection: event-driven context queued since the last call (todo staleness today)
+    // system-reminder injection: event-driven context queued since the last call
     // lands as ONE wrapped user message the UI never renders. Quiet runs don't drain — a parallel
     // sub-agent must not steal the main conversation's reminders.
     if (!opts.quiet) {
@@ -1854,6 +1868,11 @@ async function runAgentInner(
       ? [...baseSpecs, ...visibleExtraTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.input_schema }))]
       : baseSpecs;
     if (recallExhausted) specs = specs.filter((tool) => !RECALL_TOOLS.has(tool.name));
+    // The no-progress grace is for closing already-observed work, not another execution attempt.
+    // Ordinary tools can otherwise consume the closing round with a redundant read or repeat a delivery.
+    if (noProgressFinalizationRetries > 0) {
+      specs = specs.filter((tool) => COMPLETION_ROUND_TOOLS.has(tool.name));
+    }
     const sink = ctx.ui; // TUI mode: route output to ink instead of stdout
     syncIntakeTask();
     const suppressUnverifiedActionProse =
@@ -2698,9 +2717,9 @@ async function runAgentInner(
     let unansweredUserQuestion = false;
     let credentialQuestionBlocked = false;
     const noteCall = (name: string, input: unknown, content: string, isError = false): string => {
-      let note = recordCall(name, input, content, isError, ctx.todoScope);
-      const identities = failureIdentities(name, input, content, isError);
-      if (isError || looksFailed(content, name)) {
+      const decision = repeatGuard.recordCall(name, input, content, isError);
+      let note = decision.note;
+      if (decision.failed) {
         const syntax = pythonSyntaxDiagnostic(content);
         if (syntax?.file) {
           life.pythonSyntaxRecovery = {
@@ -2711,24 +2730,7 @@ async function runAgentInner(
           };
         }
         note += pythonSyntaxRecoveryNote(content);
-        const counts = identities.map((identity) => ({
-          identity,
-          count: (life.failedCalls.get(identity.key) ?? 0) + 1,
-        }));
-        // Retain a bounded run-local no-progress ledger. Alternating read_file → python → read_file is
-        // still the same unchanged read failure, not evidence that the underlying cause improved.
-        for (const { identity, count } of counts) {
-          life.failedCalls.delete(identity.key);
-          life.failedCalls.set(identity.key, count);
-          life.failedCallKinds.set(identity.key, identity.kind);
-        }
-        while (life.failedCalls.size > 64) {
-          const oldest = life.failedCalls.keys().next().value as string | undefined;
-          if (oldest === undefined) break;
-          life.failedCalls.delete(oldest);
-          life.failedCallKinds.delete(oldest);
-        }
-        const stopped = counts.find(({ identity, count }) => count >= identity.hardStopAfter);
+        const stopped = decision.stopped;
         if (stopped && !repeatHalt) {
           const { identity, count } = stopped;
           if (identity.kind === "empty_recall") {
@@ -2750,14 +2752,6 @@ async function runAgentInner(
             `${recovery.line ? ` around line ${recovery.line}` : ""} has now been read. ` +
             "Repair using this exact text with materially different edit arguments, then validate syntax before execution."
           );
-        }
-        // Preserve authorization/authentication and internal policy boundaries across unrelated successful
-        // reads. Only task_intake can repair an understanding gate; harmless probes cannot grant authority.
-        for (const key of life.failedCalls.keys()) {
-          const kind = life.failedCallKinds.get(key);
-          if (kind === "access_boundary" || (kind === "policy_boundary" && name !== "task_intake")) continue;
-          life.failedCalls.delete(key);
-          life.failedCallKinds.delete(key);
         }
       }
       return note;
@@ -2840,6 +2834,16 @@ async function runAgentInner(
         // Circuit-breaker halted the run: refuse every remaining call in this round with a clear message
         // (no hang, no further tools) so the model + user get a definitive stop.
         plans.push({ tu, tool: resolveTool(tu.name), denied: "Guardian circuit-breaker halted this run (too many high-risk actions blocked). Ask the user to review and re-run." });
+        continue;
+      }
+      if (noProgressFinalizationRetries > 0 && !COMPLETION_ROUND_TOOLS.has(tu.name)) {
+        plans.push({
+          tu,
+          tool: resolveTool(tu.name),
+          denied:
+            "No-progress finalization boundary: this call was NOT executed. Only task_checkpoint and " +
+            "todo_write may close this run using existing receipts; do not repeat completed work.",
+        });
         continue;
       }
       if (skillPolicyTransitionInRound && tu.name !== "skill") {
@@ -3611,7 +3615,13 @@ async function runAgentInner(
         plans[index]?.denied === undefined && result.isError !== true && !looksFailed(result.content, result.name))
       && freshTaskCompletion(intakeTask)
     );
-    if (acceptedCompletionReply) assistantHistoryMessage.text = r.text;
+    if (acceptedCompletionReply) {
+      // Checkpoint callbacks (and runtime observers) may persist immediately. Do not let a crash
+      // restore contradictory success prose before the safe terminal summary replaces it below.
+      const needsStateSummary = freshTaskCompletion(intakeTask)?.state === "awaiting_user"
+        || currentTodos(ctx.todoScope).some((todo) => todo.status !== "done");
+      assistantHistoryMessage.text = needsStateSummary ? "" : r.text;
+    }
     for (let index = 0; index < results.length; index++) {
       const plan = plans[index];
       const result = results[index];
@@ -3724,6 +3734,9 @@ async function runAgentInner(
     if (
       acceptedCompletionReply && freshTaskCompletion(intakeTask)
     ) {
+      const remainingTodos = currentTodos(ctx.todoScope);
+      const incompleteChecklist = remainingTodos.some((todo) => todo.status !== "done");
+      const useTaskStateSummary = incompleteChecklist || freshTaskCompletion(intakeTask)?.state === "awaiting_user";
       const deliver = (text: string): void => {
         if (opts.quiet) return;
         if (sink) sink.text(text);
@@ -3734,17 +3747,20 @@ async function runAgentInner(
           out("\n");
         } else out(`${text}\n`);
       };
-      if (r.text.trim()) {
+      if (r.text.trim() && !useTaskStateSummary) {
         deliver(r.text || deferredActionProse);
         return { status: "completed" };
       }
-      if (structuredAnswer) {
+      const closingAnswer = (!useTaskStateSummary ? structuredAnswer : "")
+        || completionCloseoutText(intakeTask, remainingTodos, life.language);
+      if (closingAnswer) {
+        if (useTaskStateSummary) assistantHistoryMessage.text = "";
         // Persist it as the assistant's closing message so transcripts, resume, and request/response
         // clients see an ordinary final reply rather than a turn that ends on a tool result.
-        history.push({ role: "assistant", text: structuredAnswer, toolUses: [] });
+        history.push({ role: "assistant", text: closingAnswer, toolUses: [] });
         const answerItem = { itemId: randomUUID(), kind: "message" as const, role: "assistant" as const };
         emitRuntimeItem(opts, { ...answerItem, state: "started" });
-        deliver(structuredAnswer);
+        deliver(closingAnswer);
         emitRuntimeItem(opts, { ...answerItem, state: "completed" });
         return { status: "completed" };
       }
@@ -3762,8 +3778,8 @@ async function runAgentInner(
       history.push({
         role: "user",
         content: wrapReminders([life.language === "zh-Hans"
-          ? "任务收尾边界：Hara 已观察到本任务至少有一次成功的修改或外部操作，但在 Agent 记录完成证据前触发了无进展止损。不要重复上传、发送、发布或执行其他外部操作。根据已有工具回执核对原验收条件：如果已经全部满足，下一轮只调用 task_checkpoint，记录 completion.state=verified 和简短可观察证据；如果尚未满足，记录当前事实、剩余步骤或真实的人类依赖，然后安全停止。"
-          : "Task finalization boundary: Hara observed at least one successful change or external action, but the no-progress limit was reached before the Agent recorded completion evidence. Do not repeat uploads, messages, releases, or other external side effects. Check the accepted criteria against the existing tool receipts. If every check already passes, use only task_checkpoint in the next round with completion.state=verified and concise observable evidence. Otherwise checkpoint the current facts, remaining step, or real human dependency, then stop safely."]),
+          ? "任务收尾边界：Hara 已观察到本任务至少有一次成功的修改或外部操作，但在 Agent 记录完成证据前触发了无进展止损。不要重复上传、发送、发布或执行其他外部操作。下一轮只开放 task_checkpoint 和必要的 todo_write。根据已有工具回执核对原验收条件：如果已经全部满足，用 task_checkpoint 一次记录 completion.state=verified、简短可观察 evidence 和给用户的 final_answer；如果尚未满足，记录当前事实、剩余步骤或真实的人类依赖，然后安全停止。"
+          : "Task finalization boundary: Hara observed at least one successful change or external action, but the no-progress limit was reached before the Agent recorded completion evidence. Do not repeat uploads, messages, releases, or other external side effects. Only task_checkpoint and necessary todo_write are available for the next round. Check the accepted criteria against the existing tool receipts. If every check already passes, record completion.state=verified, concise observable evidence, and the user's final_answer together in task_checkpoint. Otherwise checkpoint the current facts, remaining step, or real human dependency, then stop safely."]),
       });
       showRunNotice(
         opts,
@@ -3838,21 +3854,6 @@ async function runAgentInner(
       if (fanout >= SYNTHESIS_MIN_AGENTS) pushReminder(synthesisReminder(fanout), ctx.todoScope);
     }
 
-    // Todo attention-refresh: only completing a previously unfinished item resets the clock. Rewriting
-    // the same list is not progress; otherwise a looping model could suppress both the reminder and the
-    // unattended watchdog with cosmetic todo_write calls. At most one reminder is queued per N stale rounds.
-    if (!opts.quiet) {
-      if (progressEvent.todo.advanced) {
-        todoIdleRounds = 0;
-      } else if (currentTodos(ctx.todoScope).some((t) => t.status !== "done")) {
-        todoIdleRounds++;
-        if (todoIdleRounds >= TODO_STALE_ROUNDS) {
-          pushReminder(todoStaleReminder(renderTodos(currentTodos(ctx.todoScope))), ctx.todoScope);
-          todoIdleRounds = 0;
-        }
-      }
-    }
-
     if (breakerHalt) {
       // A tripped-and-declined circuit-breaker is a hard stop: end the run cleanly (the denial messages are
       // already in `results` so the model/user see why). Never spin further.
@@ -3864,28 +3865,21 @@ async function runAgentInner(
       return { status: "halted" };
     }
 
-    if (guard && !nudged) {
-      for (const p of plans) {
-        if (p.tool && p.operation && p.operation.effect !== "read" && p.operation.effect !== "state" && p.operation.effect !== "interactive") {
-          toolCounts.set(p.tu.name, (toolCounts.get(p.tu.name) ?? 0) + 1);
-        }
-      }
+    if (guard && !opts.quiet && !blindNudged) {
       for (const res of results) {
         if (typeof res.content === "string" && /switch to (?:a model with native image input|an image-capable model)/i.test(res.content)) {
           blindShots++;
         }
       }
-      const maxRepeat = Math.max(0, ...toolCounts.values());
-      const blind = blindShots >= 2;
-      if (blind || maxRepeat >= 5) {
-        nudged = true;
+      if (blindShots >= 2) {
+        blindNudged = true;
         history.push({
           role: "user",
-          content: blind
-            ? "⚠ Self-check: the selected model has no native image input, so you are acting blind. Stop using the computer tool. Switch models or reach the user through a non-visual path (CLI, API, or send_file). State the new plan in one line, then do it."
-            : "⚠ Self-check: you've repeated the same action several times without resolving the task. Stop and reconsider — is there a more direct tool or channel (e.g. send_file to deliver a file)? Don't keep retrying the same thing. State your revised plan in one line, then act.",
+          content: wrapReminders([
+            "⚠ Self-check: the selected model has no native image input, so you are acting blind. Stop using the computer tool. Switch models or reach the user through a non-visual path (CLI, API, or send_file). State the new plan in one line, then do it.",
+          ]),
         });
-        if (!opts.quiet && !ctx.ui) out(c.dim("  ⟲ stuck-guard: nudging a rethink\n"));
+        if (!ctx.ui) out(c.dim("  ⟲ image-capability guard: requesting a non-visual path\n"));
       }
     }
   }

@@ -1,3 +1,5 @@
+import type { OpenCodeWorkerTurnBridge } from "./opencode-worker.js";
+
 /**
  * Provider-neutral metadata for coding-agent sessions discovered on this device.
  *
@@ -8,6 +10,9 @@
 export type ExternalSessionSourceId = "codex" | "claude" | "opencode" | "runtime";
 
 export type ExternalRuntimeAgentKind = "codex" | "claude";
+
+/** Structured Core workers are distinct from the PTY launch/recovery allowlist. */
+export type ExternalCodingAgentKind = ExternalRuntimeAgentKind | "opencode";
 
 export type ExternalRuntimeEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -124,6 +129,14 @@ export interface ExternalSessionForkResult extends ExternalSessionReadResult {
 
 export type ExternalTurnStatus = "completed" | "interrupted" | "failed";
 
+/** Absolute counters for one guarded provider turn, not increments to a legacy estimate. */
+export interface ExternalTurnMetrics {
+  providerRounds: number;
+  toolCalls: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
 export interface ExternalTurnResult {
   sessionId: string;
   /** Hara-owned turn id. */
@@ -131,6 +144,7 @@ export interface ExternalTurnResult {
   status: ExternalTurnStatus;
   reply: string;
   error?: string;
+  metrics?: ExternalTurnMetrics;
 }
 
 export interface ExternalSteerResult {
@@ -161,6 +175,10 @@ export interface ExternalUserQuestionRequest {
 export type ExternalUserQuestionAnswers = Record<string, { answers: string[] }>;
 
 export interface ExternalTurnSink {
+  /** Core host cancellation, including admission/setup before a native turn becomes active. */
+  signal?: AbortSignal;
+  /** Core-only scoped factory. The worker passes its combined lifecycle signal, never model input. */
+  prepareCodingHost?(signal: AbortSignal): Promise<OpenCodeWorkerTurnBridge>;
   text(delta: string): void;
   tool(name: string, preview: string): void;
   notice(text: string): void;
@@ -182,6 +200,17 @@ export interface ExternalSessionCreateInput {
   agentKind: ExternalRuntimeAgentKind;
   title?: string;
   launch?: ExternalRuntimeLaunchOptions;
+}
+
+/** Core-only worker admission. No native ids, arbitrary permission modes, or Serve creation right. */
+export interface ExternalCodingSessionInput {
+  agentKind: ExternalCodingAgentKind;
+  cwd: string;
+  title?: string;
+}
+
+export interface ExternalCodingSessionResumeInput extends ExternalCodingSessionInput {
+  providerSessionId: string;
 }
 
 /** Core-only request to rebuild a lost Hara Live terminal around the same provider conversation. */
@@ -297,6 +326,8 @@ export interface ExternalSessionAdapter {
   inspect(): Promise<ExternalSessionSourceInfo>;
   list(input: { cursor?: string; limit: number; search?: string }): Promise<ExternalSessionAdapterPage>;
   create?(input: ExternalSessionAdapterCreateInput): Promise<ExternalSessionReadResult>;
+  createCodingSession?(input: ExternalCodingSessionInput): Promise<ExternalSessionReadResult>;
+  resumeCodingSession?(input: ExternalCodingSessionResumeInput): Promise<ExternalSessionReadResult>;
   prepareRuntimeSession?(input: Omit<ExternalSessionCreateInput, "sourceId">): Promise<ExternalRuntimePreparedSession>;
   prepareRuntimeContinuation?(
     sessionId: string,
@@ -326,6 +357,8 @@ export interface ExternalSessionService {
   listSources(): Promise<{ sources: ExternalSessionSourceInfo[] }>;
   listSessions(input?: ExternalSessionListInput): Promise<ExternalSessionListResult>;
   createSession(input: ExternalSessionCreateInput): Promise<ExternalSessionReadResult>;
+  createCodingSession(input: ExternalCodingSessionInput): Promise<ExternalSessionReadResult>;
+  resumeCodingSession(input: ExternalCodingSessionResumeInput): Promise<ExternalSessionReadResult>;
   recoverRuntimeSession(input: ExternalRuntimeRecoverInput): Promise<ExternalSessionReadResult>;
   readSession(sessionId: string): Promise<ExternalSessionReadResult>;
   resumeSession(sessionId: string): Promise<ExternalSessionReadResult>;

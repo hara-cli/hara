@@ -194,7 +194,7 @@ test("server.shutdown leaves a pending approval intact, then succeeds after it r
           toolUses: [{
             id: "verify",
             name: "task_checkpoint",
-            input: { completion: { state: "verified", evidence: ["write_file applied approved.txt with safe content"] } },
+            input: { completion: { state: "verified", evidence: ["write_file applied approved.txt with safe content"], final_answer: "done" } },
           }],
           stop: "tool_use",
           usage: { input: 1, output: 1 },

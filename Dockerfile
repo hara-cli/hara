@@ -39,7 +39,7 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY runtime-bootstrap.cjs ./
-COPY package.json README.md ./
+COPY package.json README.md THIRD_PARTY_NOTICES.md ./
 # Operate on the user's mounted repo, not /app.
 WORKDIR /workspace
 ENTRYPOINT ["node", "/app/runtime-bootstrap.cjs"]

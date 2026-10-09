@@ -1,6 +1,6 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -154,9 +154,16 @@ test("buildExternalArgv: codex --sandbox maps from sandbox/trust, --cd = cwd", (
   assert.equal(danger.args.at(-1), "danger-full-access"); // only at trust=full
 });
 
-test("buildExternalArgv: opencode stays pure and receives a fail-closed permission overlay", () => {
+test("buildExternalArgv: opencode stays pure and receives a fail-closed permission overlay", (t) => {
   const previousRuntime = process.env.HARA_CODE_RUNTIME_PATH;
-  process.env.HARA_CODE_RUNTIME_PATH = "/opt/hara/hara-code-runtime";
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "hara-external-agent-native-")));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const native = Buffer.alloc(256); const arm = process.arch === "arm64";
+  if (process.platform === "darwin") { native.writeUInt32BE(0xcffaedfe); native.writeUInt32LE(arm ? 0x0100000c : 0x01000007, 4); }
+  else if (process.platform === "linux") { native.set([0x7f, 0x45, 0x4c, 0x46, 2, 1]); native.writeUInt16LE(arm ? 183 : 62, 18); }
+  else { native.set([0x4d, 0x5a]); native.writeUInt32LE(128, 60); native.writeUInt32LE(0x4550, 128); native.writeUInt16LE(arm ? 0xaa64 : 0x8664, 132); }
+  const runtime = join(root, "hara-code-runtime"); writeFileSync(runtime, native, { mode: 0o755 });
+  process.env.HARA_CODE_RUNTIME_PATH = runtime;
   try {
   const ro = buildExternalArgv("opencode", "inspect this repo", {
     cwd: "/proj",
@@ -164,7 +171,7 @@ test("buildExternalArgv: opencode stays pure and receives a fail-closed permissi
     trust: "gated",
     model: "openai/gpt-5.4",
   });
-  assert.equal(ro.cmd, "/opt/hara/hara-code-runtime");
+  assert.equal(ro.cmd, runtime);
   assert.deepEqual(ro.args, [
     "--pure",
     "run",
@@ -210,6 +217,29 @@ test("buildExternalArgv: opencode stays pure and receives a fail-closed permissi
 
 test("buildExternalArgv: unknown backend → null", () => {
   assert.equal(buildExternalArgv("gemini", "x", { cwd: "/w", sandbox: "off", trust: "gated" }), null);
+});
+
+test("external_agent rejects an unavailable bundled OpenCode without probing a PATH impostor", async (t) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "hara-external-agent-unavailable-")));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const marker = join(root, "path-command-ran");
+  writeCommand(root, "opencode", `printf 'x' > ${JSON.stringify(marker)}\nexit 0`,
+    `> ${cmdPath(marker)} <nul set /p "=x"\nexit /b 0`);
+  const previous = { PATH: process.env.PATH, HARA_CODE_RUNTIME_PATH: process.env.HARA_CODE_RUNTIME_PATH,
+    HARA_EXTERNAL_AGENT_TRUST: process.env.HARA_EXTERNAL_AGENT_TRUST };
+  process.env.PATH = root; process.env.HARA_CODE_RUNTIME_PATH = join(root, "absent-sidecar");
+  process.env.HARA_EXTERNAL_AGENT_TRUST = "full";
+  try {
+    assert.equal(buildExternalArgv("opencode", "task", { cwd: root, sandbox: "read-only", trust: "gated" }), null);
+    const result = await getTool("external_agent").run({ task: "task", backend: "opencode" },
+      { cwd: root, sandbox: "read-only", ask: async () => true });
+    assert.match(result, /bundled coding runtime is unavailable/u);
+    assert.match(result, /optional dependencies enabled/u); assert.equal(existsSync(marker), false);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
 });
 
 test("external-agent capture preserves head/tail while remaining strictly bounded", () => {

@@ -1114,7 +1114,7 @@ test("Codex official runtime resumes the selected original session without a dup
             reply(request.id, { turn: { id: "native-turn" } });
             process.stdout.write(JSON.stringify({
               id: "approval-native", method: "item/commandExecution/requestApproval",
-              params: { command: "npm test" }
+              params: { command: "npm test", threadId: "native-source", turnId: "native-turn" }
             }) + "\\n");
           }
           if (request.id === "approval-native" && request.result?.decision === "accept") {

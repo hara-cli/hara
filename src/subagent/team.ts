@@ -38,11 +38,11 @@ const COMMIT = /^[0-9a-f]{40,64}$/u;
 const WORKSPACE_ID = /^aw_[a-f0-9]{40}$/u;
 const PATCH_HASH = /^[a-f0-9]{64}$/u;
 const RUNTIME_SESSION_ID = /^ext_runtime_[a-f0-9]{24}$/u;
-const PROVIDER_SESSION_ID = /^ext_(codex|claude)_[a-f0-9]{24}$/u;
+const PROVIDER_SESSION_ID = /^ext_(codex|claude|opencode|pi)_[a-f0-9]{24}$/u;
 const MAX_DIFF_PATHS = 256;
 
 export type AgentWorkspaceMode = "read-only" | "isolated-write";
-export type AgentRuntime = "hara" | "codex" | "claude";
+export type AgentRuntime = "hara" | "codex" | "claude" | "opencode" | "pi";
 export type AgentCodingRuntime = Exclude<AgentRuntime, "hara">;
 export type AgentWorkspaceState = "pending" | "ready" | "changes" | "applying" | "applied" | "rejected" | "error";
 
@@ -332,9 +332,16 @@ export interface AgentTeamExecutionRequest {
   runtimeSessionId?: string;
   providerSessionId?: string;
   task: string;
+  /** Immutable launch-snapshot mail already included in task; not admission-time arrivals. */
+  initialInputIds: readonly string[];
   signal: AbortSignal;
   controller: AgentTeamController;
   pendingInput: () => Promise<AgentMailboxDelivery[]>;
+  /** Persist the exact Hara-owned provider identity before dispatch or any observer projection. */
+  bindProviderSession: (id: string) => void;
+  /** Read without acknowledging. Coding executors ACK only confirmed input, never a failed steer. */
+  reserveInput: () => Promise<AgentMailboxDelivery[]>;
+  acknowledgeInput: (id: string) => Promise<void>;
   budget: Pick<AgentTeamExecutionBudget, "maxProviderRounds" | "maxToolCalls" | "maxTokens" | "timeoutMs">;
   /** Absolute generation counters. False means the shared tree ceiling was reached; no new work may start. */
   reportProgress: (metrics: AgentTeamExecutionMetrics) => boolean;
@@ -349,6 +356,8 @@ export interface AgentTeamExecutionRequest {
 export interface AgentTeamController {
   readonly path: string;
   readonly runtimeGrants: readonly AgentCodingRuntime[];
+  /** Host-only routing preference; this does not grant availability or execution permission. */
+  readonly preferredCodingRuntime: AgentCodingRuntime | undefined;
   spawn(input: {
     taskName: string;
     message: string;
@@ -387,6 +396,8 @@ export interface DurableAgentTeamOptions {
   /** Coding executors the current host/space may offer through a just-in-time approval. Hara Agents inherit
    * this availability automatically; it is not a per-Agent preference the user must configure. */
   codingRuntimes?: readonly AgentCodingRuntime[] | (() => readonly AgentCodingRuntime[]);
+  /** Resolve at a new coding spawn only. Persisted workers retain their exact original runtime. */
+  preferredCodingRuntime?: () => AgentCodingRuntime;
   /** Lazily constructed because ordinary/read-only sessions need not be Git repositories. */
   worktreeManager?: AgentWorktreeManager | (() => AgentWorktreeManager);
 }
@@ -468,11 +479,11 @@ function safeRole(value: unknown): string | undefined {
 
 function normalizeRuntimeGrants(value: unknown): AgentCodingRuntime[] {
   if (value === undefined) return [];
-  if (!Array.isArray(value) || value.length > 2) throw new Error("Agent coding runtime grants are invalid");
+  if (!Array.isArray(value) || value.length > 4) throw new Error("Agent coding runtime grants are invalid");
   const grants: AgentCodingRuntime[] = [];
   for (const runtime of value) {
-    if (runtime !== "codex" && runtime !== "claude") {
-      throw new Error("Agent coding runtime grants may contain only codex or claude");
+    if (runtime !== "codex" && runtime !== "claude" && runtime !== "opencode" && runtime !== "pi") {
+      throw new Error("Agent coding runtime grants may contain only codex, claude, opencode, or pi");
     }
     if (!grants.includes(runtime)) grants.push(runtime);
   }
@@ -814,7 +825,7 @@ function parseRecord(value: unknown): AgentTeamRecord {
     throw new Error("agent team role is invalid");
   }
   const runtime = value.runtime === undefined ? "hara" : String(value.runtime);
-  if (runtime !== "hara" && runtime !== "codex" && runtime !== "claude") {
+  if (runtime !== "hara" && runtime !== "codex" && runtime !== "claude" && runtime !== "opencode" && runtime !== "pi") {
     throw new Error("agent runtime is invalid");
   }
   if (value.runtimeSessionId !== undefined && !RUNTIME_SESSION_ID.test(String(value.runtimeSessionId))) {
@@ -1168,6 +1179,26 @@ export class DurableAgentTeam {
     return normalizeRuntimeGrants(configured === undefined ? ["codex", "claude"] : [...configured]);
   }
 
+  private assertCodingRuntimeAllowed(record: AgentTeamRecord, snapshot: AgentTeamSnapshot): void {
+    if (record.runtime === "hara") return;
+    if (!this.codingRuntimes().includes(record.runtime)) throw new Error("Agent coding runtime is no longer available in this space");
+    if (record.parentPath !== "/root") {
+      const parent = snapshot.agents.find((candidate) => candidate.path === record.parentPath);
+      if (!parent || !parent.runtimeGrants.includes(record.runtime)) throw new Error("Parent Agent coding runtime grant was withdrawn");
+    }
+  }
+
+  private assertExecutionFence(record: AgentTeamRecord, generation: number, controller: AbortController, rootTurnId?: string, snapshot = this.snapshot!): void {
+    const owner = this.active.get(record.id);
+    if (this.closed || this.draining || controller.signal.aborted || owner?.controller !== controller
+      || owner.generation !== generation || record.generation !== generation || record.status !== "working"
+      || record.rootTurnId !== rootTurnId
+      || (this.options.currentRootTurnId && this.options.currentRootTurnId() !== rootTurnId)) {
+      throw new Error("Agent execution generation or parent turn is no longer current");
+    }
+    this.assertCodingRuntimeAllowed(record, snapshot);
+  }
+
   private newBudget(rootTurnId?: string): AgentTeamBudget {
     const limits = this.configuredLimits();
     const started = Date.now();
@@ -1458,9 +1489,15 @@ export class DurableAgentTeam {
     const runtimeGrants: readonly AgentCodingRuntime[] = path === "/root"
       ? this.codingRuntimes()
       : [...this.resolve(path).runtimeGrants];
+    const preferredCodingRuntime = () => {
+      this.assertControllerFence(path, provenance);
+      const configured = this.options.preferredCodingRuntime?.();
+      return configured === undefined ? undefined : normalizeRuntimeGrants([configured])[0];
+    };
     return {
       path,
       runtimeGrants,
+      get preferredCodingRuntime() { return preferredCodingRuntime(); },
       spawn: (input, commandId) => {
         this.assertControllerFence(path, provenance);
         return this.spawn(path, input, provenance, commandId);
@@ -1807,15 +1844,19 @@ export class DurableAgentTeam {
     const message = safeText(input.message, MAX_ASSIGNMENT_CHARS, "message");
     const role = safeRole(input.role);
     const runtime = input.runtime ?? "hara";
-    if (runtime !== "hara" && runtime !== "codex" && runtime !== "claude") {
-      throw new Error("Agent runtime must be 'hara', 'codex', or 'claude'");
+    if (runtime !== "hara" && runtime !== "codex" && runtime !== "claude" && runtime !== "opencode" && runtime !== "pi") {
+      throw new Error("Agent runtime must be 'hara', 'codex', 'claude', 'opencode', or 'pi'");
     }
     const workspace = input.workspace ?? (runtime === "hara" ? "read-only" : "isolated-write");
     if (workspace !== "read-only" && workspace !== "isolated-write") {
       throw new Error("Agent workspace must be 'read-only' or 'isolated-write'");
     }
     if (runtime !== "hara" && workspace !== "isolated-write") {
-      throw new Error("Codex and Claude Agents must use an isolated-write workspace");
+      throw new Error("Coding Agents must use an isolated-write workspace");
+    }
+    const availableRuntimes = this.codingRuntimes();
+    if (runtime !== "hara" && !availableRuntimes.includes(runtime)) {
+      throw new Error("Agent coding runtime is unavailable in this space");
     }
     if (parentPath !== "/root" && runtime !== "hara") {
       const parent = this.resolve(parentPath);
@@ -1829,10 +1870,13 @@ export class DurableAgentTeam {
           : [...this.resolve(parentPath).runtimeGrants])
       : normalizeRuntimeGrants(input.runtimeGrants);
     if (runtime !== "hara" && runtimeGrants.length > 0) {
-      throw new Error("Codex and Claude Agents cannot re-delegate coding runtimes");
+      throw new Error("External coding Agents cannot re-delegate coding runtimes");
     }
     if (parentPath !== "/root" && input.runtimeGrants !== undefined && runtimeGrants.length > 0) {
       throw new Error("Only /root may grant coding runtimes to a Hara Agent");
+    }
+    if (runtimeGrants.some((grant) => !availableRuntimes.includes(grant))) {
+      throw new Error("Agent coding runtime grant is unavailable in this space");
     }
     const stableCommandId = commandId?.trim() || randomUUID();
     if (!validProvenanceId(stableCommandId)) throw new Error("Agent spawn command id is invalid");
@@ -1944,6 +1988,7 @@ export class DurableAgentTeam {
       // record, not the earlier cache snapshot, or a follow-up arriving on that boundary can remain queued
       // forever after the generation's final pending-mailbox check has already run.
       startAfterCommit = kind === "followup" && terminal(record.status);
+      if (kind === "followup") this.assertCodingRuntimeAllowed(record, draft);
       if (
         startAfterCommit
         && record.workspace
@@ -1984,6 +2029,7 @@ export class DurableAgentTeam {
   private startNextGeneration(id: string): AgentTeamRecord {
     const queued = this.change(id, (record, draft) => {
       if (!terminal(record.status)) throw new Error("Agent '" + record.path + "' is already " + record.status);
+      this.assertCodingRuntimeAllowed(record, draft);
       record.generation += 1;
       record.status = "queued";
       record.queuedAt = iso();
@@ -2008,13 +2054,16 @@ export class DurableAgentTeam {
 
   private launch(id: string, consumePendingAtStart: boolean): void {
     if (this.closed || this.draining || this.active.has(id)) return;
-    const before = this.current(id);
+    const before = structuredClone(this.current(id));
     const generation = before.generation;
     const task = executionPrompt(before);
+    const initialInputIds = Object.freeze(before.mailbox
+      .filter(message => message.state === "pending" && before.instructions.slice(1).includes(message.content))
+      .map(message => message.id));
     const controller = new AbortController();
     const active: ActiveAgentRun = { generation, controller, promise: Promise.resolve() };
     this.active.set(id, active);
-    const run = this.executeGeneration(id, generation, task, controller, consumePendingAtStart)
+    const run = this.executeGeneration(id, generation, task, initialInputIds, controller, consumePendingAtStart)
       .finally(() => {
         const owned = this.active.get(id);
         if (owned?.generation === generation) this.active.delete(id);
@@ -2039,13 +2088,25 @@ export class DurableAgentTeam {
     id: string,
     generation: number,
     task: string,
+    initialInputIds: readonly string[],
     controller: AbortController,
     consumePendingAtStart: boolean,
   ): Promise<void> {
     const deliveredAtStart: string[] = [];
-    const working = this.change(id, (record) => {
+    const working = this.change(id, (record, draft) => {
       if (record.generation !== generation || record.status !== "queued") {
         throw new Error("Agent '" + record.path + "' generation changed before launch");
+      }
+      try {
+        if (controller.signal.aborted || (this.options.currentRootTurnId && this.options.currentRootTurnId() !== record.rootTurnId)) {
+          throw new Error("Agent parent turn is no longer current");
+        }
+        this.assertCodingRuntimeAllowed(record, draft);
+      } catch {
+        record.status = "failed";
+        record.endedAt = iso();
+        record.error = "Agent coding admission or parent turn was withdrawn before execution.";
+        return;
       }
       record.status = "working";
       record.startedAt = iso();
@@ -2054,7 +2115,7 @@ export class DurableAgentTeam {
       delete record.error;
       delete record.model;
       delete record.usage;
-      if (consumePendingAtStart) {
+      if (consumePendingAtStart && record.runtime === "hara") {
         for (const message of record.mailbox) {
           if (message.state !== "pending") continue;
           message.state = "delivered";
@@ -2063,6 +2124,7 @@ export class DurableAgentTeam {
         }
       }
     });
+    if (working.status !== "working") return;
     for (const messageId of deliveredAtStart) {
       const message = working.mailbox.find((entry) => entry.id === messageId);
       if (!message) continue;
@@ -2099,6 +2161,10 @@ export class DurableAgentTeam {
       }
     }
     if (!result) try {
+      this.snapshot = this.options.store.load(this.options.sessionId);
+      this.assertExecutionFence(this.current(id), generation, controller, working.rootTurnId);
+      const reservedInput = new Set<string>();
+      const reserveInput = () => this.reserveMailbox(id, generation, controller, working.rootTurnId, reservedInput);
       const observed = Promise.resolve(this.options.executor({
         id,
         path: working.path,
@@ -2109,12 +2175,28 @@ export class DurableAgentTeam {
         ...(working.runtimeSessionId ? { runtimeSessionId: working.runtimeSessionId } : {}),
         ...(working.providerSessionId ? { providerSessionId: working.providerSessionId } : {}),
         task,
+        initialInputIds,
         signal: controller.signal,
         controller: this.controller(working.path, {
           parentTurnId: working.id + ":" + String(generation),
           ...(working.rootTurnId ? { rootTurnId: working.rootTurnId } : {}),
         }),
-        pendingInput: () => this.drainMailbox(id, generation),
+        pendingInput: working.runtime === "hara" ? () => this.drainMailbox(id, generation) : reserveInput,
+        bindProviderSession: (providerId) => {
+          if (typeof providerId !== "string" || !PROVIDER_SESSION_ID.test(providerId)
+            || !providerId.startsWith(`ext_${working.runtime}_`) || working.runtime === "hara") {
+            throw new Error("Agent provider session binding is invalid");
+          }
+          this.change(id, (record, draft) => {
+            this.assertExecutionFence(record, generation, controller, working.rootTurnId, draft);
+            if (record.providerSessionId !== undefined && record.providerSessionId !== providerId) {
+              throw new Error("Agent provider session identity cannot be replaced");
+            }
+            record.providerSessionId = providerId;
+          });
+        },
+        reserveInput,
+        acknowledgeInput: (messageId) => this.acknowledgeMailbox(id, generation, controller, working.rootTurnId, reservedInput, messageId),
         budget: {
           maxProviderRounds: executionBudget.maxProviderRounds,
           maxToolCalls: executionBudget.maxToolCalls,
@@ -2217,8 +2299,12 @@ export class DurableAgentTeam {
           record.runtime === "hara"
           || !PROVIDER_SESSION_ID.test(result.providerSessionId)
           || !result.providerSessionId.startsWith(`ext_${record.runtime}_`)
+          || (record.providerSessionId !== undefined && record.providerSessionId !== result.providerSessionId)
         ) {
-          throw new Error("Agent executor returned an invalid provider session");
+          record.status = "failed";
+          record.error = "Agent executor returned an invalid or replaced provider session.";
+          delete record.result;
+          return;
         }
         record.providerSessionId = result.providerSessionId;
       }
@@ -2262,6 +2348,41 @@ export class DurableAgentTeam {
       this.publishMailbox(updated, message, "completed");
     }
     return deliveries;
+  }
+
+  private async reserveMailbox(id: string, generation: number, controller: AbortController, rootTurnId: string | undefined, reserved: Set<string>): Promise<AgentMailboxDelivery[]> {
+    this.snapshot = this.options.store.load(this.options.sessionId);
+    const record = this.current(id);
+    this.assertExecutionFence(record, generation, controller, rootTurnId);
+    return record.mailbox.filter((message) => message.state === "pending" && message.rootTurnId === rootTurnId
+      && message.acceptedGeneration <= generation).map((message) => {
+      reserved.add(message.id);
+      return { id: message.id, sourcePath: message.sourcePath, content: message.content, kind: message.kind };
+    });
+  }
+
+  private async acknowledgeMailbox(id: string, generation: number, controller: AbortController, rootTurnId: string | undefined, reserved: Set<string>, messageId: string): Promise<void> {
+    if (typeof messageId !== "string" || !UUID.test(messageId) || !reserved.has(messageId)) {
+      throw new Error("Agent mailbox acknowledgement was not reserved by this generation");
+    }
+    let acknowledged = false;
+    const updated = this.change(id, (record, draft) => {
+      this.assertExecutionFence(record, generation, controller, rootTurnId, draft);
+      const message = record.mailbox.find((entry) => entry.id === messageId);
+      if (!message || message.rootTurnId !== rootTurnId || message.acceptedGeneration > generation
+        || (message.state === "delivered" && message.deliveredGeneration !== generation)) {
+        throw new Error("Agent mailbox acknowledgement does not belong to this generation");
+      }
+      if (message.state === "delivered") return;
+      message.state = "delivered";
+      message.deliveredGeneration = generation;
+      acknowledged = true;
+    });
+    if (acknowledged) {
+      const message = updated.mailbox.find((entry) => entry.id === messageId)!;
+      this.publishMailbox(updated, message, "started");
+      this.publishMailbox(updated, message, "completed");
+    }
   }
 
   /** Preserve every settled participant contribution in its open room transcript. Delivery to peers is
@@ -2485,6 +2606,9 @@ export class DurableAgentTeam {
       return;
     }
     if (!terminal(record.status)) return;
+    // A failed/unsupported external steer leaves durable pending input for an explicit next action.
+    // Retrying it here would resubmit an unacknowledged coding task without fresh user admission.
+    if (record.runtime !== "hara") return;
     if (!record.mailbox.some((message) => message.state === "pending" && message.kind === "followup")) return;
     this.startNextGeneration(id);
   }

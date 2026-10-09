@@ -19,6 +19,8 @@ import {
 import type {
   ExternalSessionAdapter,
   ExternalSessionAdapterCreateInput,
+  ExternalCodingSessionInput,
+  ExternalCodingSessionResumeInput,
   ExternalSessionAdapterPage,
   ExternalSessionForkResult,
   ExternalSessionInfo,
@@ -51,6 +53,8 @@ interface ClaudeNativeRef {
   cwd?: string;
   owned: boolean;
   info: ExternalSessionInfo;
+  codingWorkspace?: string;
+  fresh?: boolean;
 }
 
 const digest = (kind: string, value: string, identityKey: Buffer): string => createHmac("sha256", identityKey)
@@ -135,7 +139,12 @@ export interface ClaudeAgentSdkAdapterOptions extends ExternalCommandOptions {
 export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
   readonly id = "claude" as const;
   private readonly refs = new Map<string, ClaudeNativeRef>();
-  private readonly running = new Map<string, { close(): void }>();
+  private readonly running = new Map<string, {
+    handle: ReturnType<ClaudeAgentSdkFacade["query"]>;
+    turnId: string;
+    nativeId: string;
+    interrupted: boolean;
+  }>();
   private authenticationCache?: { value: "authenticated" | "missing" | "unknown"; expiresAt: number };
 
   constructor(private readonly options: ClaudeAgentSdkAdapterOptions) {}
@@ -217,13 +226,50 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
   private remember(session: SDKSessionInfo, owned: boolean): ExternalSessionInfo | null {
     const info = mapSession(session, this.options.identityKey);
     if (!info) return null;
+    const prior = this.refs.get(info.id);
     this.refs.set(info.id, {
       nativeId: session.sessionId,
       ...(typeof session.cwd === "string" && session.cwd ? { cwd: session.cwd } : {}),
       owned: owned || this.options.ownership?.has(info.id) === true,
       info,
+      ...(prior?.codingWorkspace && prior.codingWorkspace === session.cwd ? { codingWorkspace: prior.codingWorkspace } : {}),
     });
     return info;
+  }
+
+  async createCodingSession(input: ExternalCodingSessionInput): Promise<ExternalSessionReadResult> {
+    if (input.agentKind !== "claude") throw new Error("the coding worker provider does not match Claude Code");
+    await this.requireAuthentication();
+    const nativeId = randomUUID();
+    const now = Date.now();
+    const info = this.remember({ sessionId: nativeId, cwd: input.cwd, lastModified: now, createdAt: now,
+      summary: "", customTitle: input.title ?? "Hara coding task" }, true);
+    if (!info) throw new Error("Claude Code could not reserve the coding session");
+    const ref = this.ref(info.id);
+    ref.codingWorkspace = input.cwd;
+    ref.fresh = true;
+    this.options.ownership?.add("claude", info.id);
+    // This reserves the exact UUID, not a claim that a model turn/history already exists. If the
+    // first turn never starts, recovery fails closed instead of silently creating another session.
+    return { session: info, messages: [], readOnly: false, controlMode: "managed" };
+  }
+
+  async resumeCodingSession(input: ExternalCodingSessionResumeInput): Promise<ExternalSessionReadResult> {
+    const ref = this.ref(input.providerSessionId);
+    if (input.agentKind !== "claude" || !ref.owned || ref.cwd !== input.cwd) {
+      throw new Error("the saved Claude coding session is not owned by Hara in this worktree");
+    }
+    if (this.running.has(input.providerSessionId)) throw new Error("the saved Claude coding session already has a Hara-controlled turn");
+    await this.requireAuthentication();
+    const sdk = this.options.sdk ?? await loadOfficialSdk();
+    const metadata = await sdk.getSessionInfo(ref.nativeId, { dir: input.cwd });
+    if (!metadata || metadata.sessionId !== ref.nativeId || metadata.cwd !== input.cwd) {
+      throw new Error("Claude Code did not find the original coding session in its owned worktree");
+    }
+    const info = this.remember(metadata, true);
+    if (!info || info.id !== input.providerSessionId) throw new Error("Claude Code returned a different coding session");
+    this.ref(info.id).codingWorkspace = input.cwd;
+    return { session: info, messages: [], readOnly: false, controlMode: "managed" };
   }
 
   private ref(sessionId: string): ClaudeNativeRef {
@@ -404,6 +450,7 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
   }
 
   async submit(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult> {
+    if (sink.signal?.aborted) throw new Error("the coding turn was cancelled before dispatch");
     const ref = this.ref(sessionId);
     if (this.running.has(sessionId)) throw new Error("this external Claude session already has a Hara-controlled turn");
     if (!ref.owned) {
@@ -413,11 +460,16 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
     const launch = resolveExternalCommandRuntime(this.options.command, this.options.env ?? process.env);
     if (!launch) throw new Error("Claude Code is no longer installed at its verified location");
     const sdk = this.options.sdk ?? await loadOfficialSdk();
+    if (sink.signal?.aborted) throw new Error("the coding turn was cancelled before dispatch");
     const turnId = `extturn_${randomUUID()}`;
+    const fresh = ref.fresh === true;
+    // Consume the new-session mode before starting. A failed/retried turn may only resume this id,
+    // never silently start a replacement conversation.
+    ref.fresh = false;
     const handle = sdk.query({
       prompt: text,
       options: {
-        resume: ref.nativeId,
+        ...(fresh ? { sessionId: ref.nativeId } : { resume: ref.nativeId }),
         ...(ref.cwd ? { cwd: ref.cwd } : {}),
         pathToClaudeCodeExecutable: launch.command,
         env: { ...launch.env, CLAUDE_AGENT_SDK_CLIENT_APP: "hara/external-session" },
@@ -425,13 +477,20 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
         canUseTool: this.permissionHandler(sink),
       },
     });
-    this.running.set(sessionId, handle);
+    const runtime = { handle, turnId, nativeId: ref.nativeId, interrupted: false };
+    this.running.set(sessionId, runtime);
+    const cancel = (): void => { runtime.interrupted = true; handle.close(); };
+    sink.signal?.addEventListener("abort", cancel, { once: true });
+    if (sink.signal?.aborted) cancel();
     let reply = "";
     let failure = "";
     let interrupted = false;
     try {
       for await (const message of handle) {
         const frame = message as SDKMessage;
+        if (ref.codingWorkspace && (!("session_id" in frame) || frame.session_id !== ref.nativeId)) {
+          throw new Error("Claude Code returned output for a different coding session");
+        }
         if (frame.type === "assistant" && frame.parent_tool_use_id === null) {
           const chunk = extractMessageText(frame.message);
           if (chunk) {
@@ -457,24 +516,32 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
       if (/abort|closed|interrupt/iu.test(message)) interrupted = true;
       else failure = safeText(message, 2_000) || "Claude Code turn failed";
     } finally {
+      sink.signal?.removeEventListener("abort", cancel);
       this.running.delete(sessionId);
       handle.close();
     }
     return {
       sessionId,
       turnId,
-      status: interrupted ? "interrupted" : failure ? "failed" : "completed",
+      status: interrupted || runtime.interrupted ? "interrupted" : failure ? "failed" : "completed",
       reply,
       ...(failure ? { error: failure } : {}),
     };
   }
 
   async interrupt(sessionId: string): Promise<void> {
-    this.running.get(sessionId)?.close();
+    const runtime = this.running.get(sessionId);
+    if (runtime) {
+      runtime.interrupted = true;
+      runtime.handle.close();
+    }
   }
 
   async close(): Promise<void> {
-    for (const handle of this.running.values()) handle.close();
+    for (const runtime of this.running.values()) {
+      runtime.interrupted = true;
+      runtime.handle.close();
+    }
     this.running.clear();
   }
 }

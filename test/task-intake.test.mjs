@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runAgent, splitTaskStateTransition } from "../dist/agent/loop.js";
+import { wrapReminders } from "../dist/agent/reminders.js";
 import {
   applyTaskBrief,
   createTaskExecution,
@@ -199,7 +200,8 @@ test("an accepted change task cannot end as advice when an authorized tool can a
   assert.equal(task.checkpoint.completion.state, "verified");
   assert.doesNotMatch(visible.join(""), /run the edit yourself/);
   assert.match(visible.join(""), /I'll handle the edit/, "a tool-backed acknowledgement remains visible before execution");
-  assert.match(visible.join(""), /requested change is verified/);
+  assert.match(visible.join(""), /fixture edit returned edited and verified/);
+  assert.equal(p.systems.length, 4, "accepted evidence closes directly without a fifth model request for prose");
   assert.match(notices.join("\n"), /action ownership guard/);
   assert.doesNotMatch(JSON.stringify(history), /run the edit yourself/);
   assert.match(JSON.stringify(history), /Execution ownership correction/);
@@ -1176,7 +1178,7 @@ test("declared non-core capabilities must have one fixed preflight state before 
   assert.match(denied.results.find((result) => result.id === "e0").content, /Capability preflight gate/);
 });
 
-test("a later tool call invalidates an early completion receipt", async () => {
+test("an accepted completion receipt closes before a later speculative tool call", async () => {
   const interaction = newTurnInteraction();
   let task = createTaskExecution("inspect then finish", interaction.turnId);
   let reads = 0;
@@ -1222,8 +1224,9 @@ test("a later tool call invalidates an early completion receipt", async () => {
       },
     },
   });
-  assert.equal(reads, 1);
-  assert.equal(task.checkpoint.completion, undefined, "work after attestation requires a new final receipt");
+  assert.equal(reads, 0, "the accepted final receipt ends this turn rather than asking for more work");
+  assert.equal(p.systems.length, 2);
+  assert.equal(task.checkpoint.completion.state, "verified");
 });
 
 function uiSink() {
@@ -1283,7 +1286,7 @@ test("per-request engine context trails the history so the system prompt stays b
   });
 
   assert.equal(outcome.status, "completed");
-  assert.equal(p.stableSystems.length, 4);
+  assert.equal(p.stableSystems.length, 3, "the accepted receipt needs no additional synthesis request");
   for (const system of p.stableSystems) {
     assert.equal(system, p.stableSystems[0], "an accepted brief, checkpoint, or clock tick must not rewrite the system prompt");
     assert.doesNotMatch(system, /Runtime date and time|Understanding → execution boundary/);
@@ -1540,6 +1543,43 @@ test("user input that arrives between the two halves of a split response cancels
   assert.equal(p.systems.length, 2);
   assert.equal(task.brief.goal, BRIEF.goal, "the accepted brief itself stays durable");
 });
+
+for (const delivery of ["returned", "write-ahead"]) {
+  test(`an internal ${delivery} reminder between split rounds preserves the checkpointed carried action`, async () => {
+    const turn = newTurnInteraction();
+    let task = createTaskExecution("fix the parser", turn.turnId);
+    let edits = 0, polls = 0;
+    const edit = fixtureEdit(() => { edits += 1; });
+    const p = provider([
+      { text: "", toolUses: [
+        { id: "b1", name: "task_intake", input: BRIEF },
+        { id: "e0", name: edit.name, input: { path: "a.ts" } },
+      ], stop: "tool_use" },
+      { text: "done", toolUses: [{ id: "c1", name: "task_checkpoint", input: {
+        completion: { state: "verified", evidence: ["the carried fixture edit completed"] },
+      } }], stop: "tool_use" },
+    ]);
+    const history = [{ role: "user", content: "fix the parser" }];
+    const reminder = { role: "user", content: wrapReminders(["Synthetic internal status, not new user authority."]) };
+    await runAgent(history, {
+      provider: p, ctx: { cwd: process.cwd() }, approval: "full-auto", confirm: async () => true,
+      quiet: true, extraTools: [edit],
+      pendingInput: async () => {
+        if (++polls !== 2) return [];
+        if (delivery === "returned") return [reminder];
+        history.push(reminder);
+        return [];
+      },
+      taskIntake: { task, current: () => task, onUpdate(next) { task = next; }, onCheckpoint(next) { task = next; } },
+    });
+    assert.equal(edits, 1, "an internal reminder must not revoke the already-checkpointed carried edit");
+    assert.equal(p.systems.length, 2, "a carried action does not add a model request");
+    assert.equal(task.brief.goal, BRIEF.goal);
+    assert.equal(history.filter(message => message.role === "user" && message.content === reminder.content).length, 1);
+    const rounds = history.filter(message => message.role === "tool");
+    assert.deepEqual(rounds.slice(0, 2).map(message => message.results.map(result => result.name)), [["task_intake"], [edit.name]]);
+  });
+}
 
 test("a capability preflight checkpoint and the action that needs it can share one response", async () => {
   const turn = newTurnInteraction();

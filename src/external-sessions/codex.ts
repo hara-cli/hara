@@ -20,6 +20,8 @@ import type {
   ExternalSessionInfo,
   ExternalSessionMessage,
   ExternalSessionAdapterCreateInput,
+  ExternalCodingSessionInput,
+  ExternalCodingSessionResumeInput,
   ExternalProviderTerminalResult,
   ExternalSessionReadResult,
   ExternalRuntimePreparedSession,
@@ -69,6 +71,8 @@ interface CodexNativeRef {
   owned: boolean;
   /** True only when the thread is loaded in the official daemon Hara is connected to. */
   live: boolean;
+  /** Only Core worker admission can select the bounded, human-reviewed coding profile. */
+  codingWorkspace?: string;
   info: ExternalSessionInfo;
 }
 
@@ -309,6 +313,7 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
       if (!mapped) return [];
       const prior = this.refs.get(mapped.info.id);
       if (prior?.owned || this.options.ownership?.has(mapped.info.id)) mapped.owned = true;
+      if (prior?.codingWorkspace === mapped.cwd) mapped.codingWorkspace = prior.codingWorkspace;
       mapped.live = daemon && ["idle", "working", "waiting"].includes(mapped.info.state);
       const runtime = this.running.get(mapped.info.id);
       if (runtime) {
@@ -335,6 +340,13 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
   async prepareRuntimeSession(
     input: Omit<ExternalSessionAdapterCreateInput, "prepare">,
   ): Promise<ExternalRuntimePreparedSession> {
+    return await this.prepareSession(input, "never");
+  }
+
+  private async prepareSession(
+    input: Omit<ExternalSessionAdapterCreateInput, "prepare">,
+    approvalPolicy: "never" | "on-request",
+  ): Promise<ExternalRuntimePreparedSession> {
     const launch = input.launch ?? {};
     const result = await runJsonlRpcSequence<CodexThreadResponse>({
       ...this.options,
@@ -345,7 +357,7 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
         method: "thread/start",
         params: {
           cwd: input.cwd,
-          approvalPolicy: "never",
+          approvalPolicy,
           approvalsReviewer: "user",
           sandbox: launch.sandboxMode ?? "workspace-write",
           ephemeral: false,
@@ -391,6 +403,32 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
         }).then(() => undefined, () => undefined);
       },
     };
+  }
+
+  async createCodingSession(input: ExternalCodingSessionInput): Promise<ExternalSessionReadResult> {
+    if (input.agentKind !== "codex") throw new Error("the coding worker provider does not match Codex");
+    const prepared = await this.prepareSession({ ...input, agentKind: "codex", launch: { sandboxMode: "workspace-write" } }, "on-request");
+    try {
+      prepared.commit();
+      const ref = this.ref(prepared.providerSessionId);
+      ref.codingWorkspace = input.cwd;
+      return { session: ref.info, messages: [], readOnly: false, controlMode: "managed" };
+    } catch (error) {
+      await prepared.rollback();
+      throw error;
+    }
+  }
+
+  async resumeCodingSession(input: ExternalCodingSessionResumeInput): Promise<ExternalSessionReadResult> {
+    const ref = this.ref(input.providerSessionId);
+    if (input.agentKind !== "codex" || !ref.owned || ref.cwd !== input.cwd) {
+      throw new Error("the saved Codex coding session is not owned by Hara in this worktree");
+    }
+    if (this.running.has(input.providerSessionId) || ref.info.state === "working" || ref.info.state === "waiting") {
+      throw new Error("the saved Codex coding session is already active; release its current controller first");
+    }
+    ref.codingWorkspace = input.cwd;
+    return { session: ref.info, messages: [], readOnly: false, controlMode: "managed" };
   }
 
   async prepareRuntimeContinuation(
@@ -602,6 +640,14 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
     signal: AbortSignal,
     binding?: { threadId: string; nativeTurnReady: Promise<string> },
   ): Promise<unknown> {
+    if (binding && (request.method === "item/commandExecution/requestApproval"
+      || request.method === "item/fileChange/requestApproval")) {
+      const turnId = await binding.nativeTurnReady;
+      if (!turnId || signal.aborted || request.params?.threadId !== binding.threadId || request.params?.turnId !== turnId) {
+        sink.notice("The permission request does not belong to this active Codex turn; no action was approved.");
+        return { decision: "decline" };
+      }
+    }
     if (request.method === "item/commandExecution/requestApproval") {
       const prompt = this.approvalQuestion(request);
       const verdict = await sink.confirm(prompt, signal);
@@ -675,6 +721,7 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
   }
 
   async submit(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult> {
+    if (sink.signal?.aborted) throw new Error("the coding turn was cancelled before dispatch");
     const ref = this.ref(sessionId);
     if (this.running.has(sessionId)) throw new Error("this external Codex session already has a Hara-controlled turn");
     if (!ref.owned && !ref.live) {
@@ -682,6 +729,7 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
     }
     const priorState = ref.info.state;
     const appServerArgs = await this.appServerArgs();
+    if (sink.signal?.aborted) throw new Error("the coding turn was cancelled before dispatch");
     const haraTurnId = `extturn_${randomUUID()}`;
     const abort = new AbortController();
     let complete: ((result: ExternalTurnResult) => void) | undefined;
@@ -711,29 +759,42 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
       appServerArgs,
       maxOutputBytes: 64 * 1024 * 1024,
       onNotification: (method, params) => {
-        if (method === "item/agentMessage/delta" && typeof params.delta === "string") {
-          const delta = safeDelta(params.delta);
-          if (delta) {
-            replyText += delta;
-            sink.text(delta);
+        const project = (): void => {
+          if (terminalSettled || abort.signal.aborted) return;
+          if (method === "item/agentMessage/delta" && typeof params.delta === "string") {
+            const delta = safeDelta(params.delta);
+            if (delta) {
+              replyText += delta;
+              sink.text(delta);
+            }
+          } else if (method === "item/completed") {
+            this.toolEvent(params, sink);
+          } else if (method === "turn/completed") {
+            const turn = params.turn && typeof params.turn === "object" && !Array.isArray(params.turn)
+              ? params.turn as Record<string, unknown>
+              : {};
+            const providerStatus = turn.status;
+            const status = providerStatus === "interrupted" ? "interrupted" : providerStatus === "failed" ? "failed" : "completed";
+            this.setState(ref, status === "failed" ? "error" : "idle");
+            finish({
+              sessionId,
+              turnId: haraTurnId,
+              status,
+              reply: replyText,
+              ...(status === "failed" ? { error: "Codex turn failed" } : {}),
+            });
           }
-        } else if (method === "item/completed") {
-          this.toolEvent(params, sink);
-        } else if (method === "turn/completed") {
-          const turn = params.turn && typeof params.turn === "object" && !Array.isArray(params.turn)
-            ? params.turn as Record<string, unknown>
-            : {};
-          const providerStatus = turn.status;
-          const status = providerStatus === "interrupted" ? "interrupted" : providerStatus === "failed" ? "failed" : "completed";
-          this.setState(ref, status === "failed" ? "error" : "idle");
-          finish({
-            sessionId,
-            turnId: haraTurnId,
-            status,
-            reply: replyText,
-            ...(status === "failed" ? { error: "Codex turn failed" } : {}),
-          });
-        }
+        };
+        if (!ref.codingWorkspace) return project();
+        // The app server may report several threads. A worker must not project another thread's
+        // output or finish on its completion; same-chunk notifications await the turn/start binding.
+        if (params.threadId !== ref.nativeId) return;
+        const turn = params.turn && typeof params.turn === "object" && !Array.isArray(params.turn)
+          ? params.turn as Record<string, unknown> : {};
+        const notificationTurnId = method === "turn/completed" ? turn.id : params.turnId;
+        void nativeTurnReady.then((expected) => {
+          if (expected && notificationTurnId === expected && this.running.get(sessionId) === runtime) project();
+        });
       },
       onClose: (error) => finish({
         sessionId,
@@ -767,6 +828,9 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
       resolveNativeTurn: settleNativeTurn,
     };
     this.running.set(sessionId, runtime);
+    const cancel = (): void => { void this.interrupt(sessionId); };
+    sink.signal?.addEventListener("abort", cancel, { once: true });
+    if (sink.signal?.aborted) cancel();
     this.setState(ref, "working");
     try {
       await client.call("initialize", {
@@ -782,11 +846,18 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
         threadId: ref.nativeId,
         approvalsReviewer: "user",
         excludeTurns: true,
+        ...(ref.codingWorkspace ? { cwd: ref.codingWorkspace, approvalPolicy: "on-request", sandbox: "workspace-write" } : {}),
       });
       const resumedThread = resumed.thread && typeof resumed.thread === "object" && !Array.isArray(resumed.thread)
         ? resumed.thread as Record<string, unknown>
         : {};
       const resumedState = stateFromStatus(resumedThread.status);
+      if (ref.codingWorkspace && (resumedThread.id !== ref.nativeId || resumedThread.cwd !== ref.codingWorkspace)) {
+        throw new Error("Codex did not resume the original coding session in its owned worktree");
+      }
+      if (ref.codingWorkspace && (resumedState === "working" || resumedState === "waiting")) {
+        throw new Error("the saved Codex coding session has an active native turn; no second writer was started");
+      }
       const active = ref.live && (
         resumedState === "working"
         || resumedState === "waiting"
@@ -808,6 +879,7 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
           threadId: ref.nativeId,
           input: [{ type: "text", text, text_elements: [] }],
           approvalsReviewer: "user",
+          ...(ref.codingWorkspace ? { cwd: ref.codingWorkspace, approvalPolicy: "on-request" } : {}),
         });
         const startedTurn = started?.turn && typeof started.turn === "object" && !Array.isArray(started.turn)
           ? started.turn as Record<string, unknown> : {};
@@ -826,6 +898,7 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
     } catch (error) {
       throw error;
     } finally {
+      sink.signal?.removeEventListener("abort", cancel);
       settleNativeTurn("");
       this.running.delete(sessionId);
       abort.abort();

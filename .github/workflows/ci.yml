@@ -1,6 +1,7 @@
 name: ci
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
@@ -21,6 +22,9 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      - name: Smoke the packed npm package in a private installation
+        shell: bash
+        run: node scripts/npm-package-smoke.mjs --cache "$(npm config get cache)"
 
   legacy-runtime-message:
     runs-on: ubuntu-latest
@@ -48,7 +52,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.3.9"
-          # Use the old-CPU-compatible runtime itself; an explicit same-target compile would download it again.
+          # Use the old-CPU-compatible compiler itself as well as the standalone baseline target.
           bun-download-url: "https://github.com/oven-sh/bun/releases/download/bun-v1.3.9/bun-windows-x64-baseline.zip"
       - run: npm ci
       - name: Build TypeScript
@@ -75,6 +79,9 @@ jobs:
             Write-Output "::error file=.github/workflows/ci.yml,title=Windows contract test output::$tail"
             exit $code
           }
+      - name: Smoke the packed npm package on Windows
+        shell: bash
+        run: node scripts/npm-package-smoke.mjs --cache "$(npm config get cache)"
       - name: Compile and execute-smoke the native baseline standalone
         if: ${{ !cancelled() && steps.windows-build.outcome == 'success' }}
         shell: bash
@@ -96,6 +103,8 @@ jobs:
             exit "$code"
           fi
           node scripts/standalone-serve-smoke.mjs dist/bin/hara.exe "$expected"
+          node scripts/standalone-coding-runtime-smoke.mjs dist/bin/hara.exe "$expected"
+          node scripts/standalone-pi-runtime-smoke.mjs dist/bin/hara.exe "$expected"
 
   docker-runtime:
     runs-on: ubuntu-latest
@@ -158,3 +167,8 @@ jobs:
           ./dist/bin/hara --help >/dev/null
           node scripts/standalone-boundary-smoke.mjs ./dist/bin/hara "$expected"
           node scripts/standalone-serve-smoke.mjs ./dist/bin/hara "$expected"
+          node scripts/standalone-coding-runtime-smoke.mjs ./dist/bin/hara "$expected"
+          node scripts/standalone-pi-runtime-smoke.mjs ./dist/bin/hara "$expected"
+      - name: Smoke the packed npm package on the native platform
+        shell: bash
+        run: node scripts/npm-package-smoke.mjs --cache "$(npm config get cache)"

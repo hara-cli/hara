@@ -1,6 +1,8 @@
 import {
   ExternalRuntimeSessionGoneError,
+  type ExternalSessionInfo,
   type ExternalSessionService,
+  type ExternalTurnMetrics,
   type ExternalTurnSink,
 } from "../external-sessions/types.js";
 import { redactSensitiveText } from "../security/secrets.js";
@@ -27,15 +29,42 @@ function pollDelay(signal: AbortSignal): Promise<void> {
 }
 
 export interface ExternalCodingAgentObserver {
+  /** Synchronous host binding, before any provider turn or interaction is allowed. */
+  onSession?(session: ExternalSessionInfo): void;
   text?(delta: string): void;
   tool?(name: string, preview: string): void;
   notice?(text: string): void;
+  confirm?: ExternalTurnSink["confirm"];
+  askUser?: ExternalTurnSink["askUser"];
+  prepareCodingHost?: ExternalTurnSink["prepareCodingHost"];
+  /** Host-authoritative absolute counters. When present, adapter event usage is diagnostic only. */
+  executionMetrics?(): ExternalTurnMetrics;
+}
+
+async function humanReply<T>(
+  signal: AbortSignal,
+  fallback: T,
+  callback: () => Promise<T>,
+): Promise<T> {
+  if (signal.aborted) return fallback;
+  let cancelled: () => void = () => {};
+  const abort = new Promise<T>((resolve) => { cancelled = () => resolve(fallback); });
+  signal.addEventListener("abort", cancelled, { once: true });
+  if (signal.aborted) cancelled();
+  try {
+    return await Promise.race([Promise.resolve().then(callback).catch(() => fallback), abort]);
+  } finally {
+    signal.removeEventListener("abort", cancelled);
+  }
 }
 
 /**
- * Execute one durable Agent generation through Hara Live's official Codex/Claude adapters.
- * The caller must supply the Agent-owned isolated worktree as cwd. The returned opaque runtime id is
- * persisted by DurableAgentTeam so follow-up generations continue the same provider conversation.
+ * Execute a durable generation through the structured Codex/Claude/OpenCode adapters. The provider
+ * opaque id is persisted by DurableAgentTeam. Old live PTYs must be explicitly released, never killed
+ * or silently joined by a second writer; an authoritatively gone PTY can recover its original provider.
+ * Native interaction cards are independent of in-flight input: Claude's string-prompt SDK turn does
+ * not expose a safe persistent input queue here. Unsupported mailbox delivery interrupts explicitly;
+ * it never restarts the task or reports an unconfirmed message as delivered.
  */
 export async function executeExternalCodingAgent(
   request: AgentTeamExecutionRequest,
@@ -45,107 +74,148 @@ export async function executeExternalCodingAgent(
   if (request.runtime === "hara") {
     return { status: "error", text: "", error: "native Hara Agents do not use the external coding runtime" };
   }
+  if (request.runtime !== "codex" && request.runtime !== "claude" && request.runtime !== "opencode") {
+    return { status: "error", text: "", error: "this executor is not an external structured coding provider" };
+  }
   if (!request.workspace || request.workspace.mode !== "isolated-write") {
     return {
       status: "error",
       text: "",
-      error: "Codex and Claude Agents require an Agent-owned isolated Git worktree",
+      error: "External coding Agents require an Agent-owned isolated Git worktree",
     };
   }
   if (request.signal.aborted) return { status: "cancelled", text: "" };
 
-  let runtimeSessionId = request.runtimeSessionId;
+  const runtimeSessionId = request.runtimeSessionId;
   let providerSessionId = request.providerSessionId;
-  if (!runtimeSessionId) {
-    const created = await service.createSession({
-      sourceId: "runtime",
-      cwd: request.workspace.cwd,
-      agentKind: request.runtime,
-      title: `${request.runtime === "codex" ? "Codex" : "Claude"} · ${request.path}`,
-      launch: request.runtime === "codex"
-        ? { sandboxMode: "workspace-write" }
-        : { permissionMode: "acceptEdits" },
-    });
-    runtimeSessionId = created.session.id;
-    providerSessionId = created.session.providerSessionId;
-  } else {
-    // Rehydrate the runtime adapter after a Hara restart before attempting continuation.
+  const ids = () => ({ ...(runtimeSessionId ? { runtimeSessionId } : {}),
+    ...(providerSessionId ? { providerSessionId } : {}) });
+  if (runtimeSessionId) {
     try {
       const live = await service.readSession(runtimeSessionId);
+      if (providerSessionId && live.session.providerSessionId && providerSessionId !== live.session.providerSessionId) {
+        return { status: "error", text: "", error: "the legacy terminal and saved provider conversation do not match", ...ids() };
+      }
       providerSessionId ??= live.session.providerSessionId;
+      return { status: "error", text: "", ...ids(), error:
+        "This coding Agent still owns a legacy Hara Live terminal. Release that terminal explicitly before continuing with structured approval and question cards; Hara did not start a second writer." };
     } catch (error) {
-      // Rebuild only after an authoritative missing-terminal result. Transport/read failures remain
-      // failures so a transient outage can never create two controllers for one provider session.
-      if (!(error instanceof ExternalRuntimeSessionGoneError) || !providerSessionId) throw error;
-      const recovered = await service.recoverRuntimeSession({
-        sourceId: "runtime",
-        cwd: request.workspace.cwd,
-        agentKind: request.runtime,
-        providerSessionId,
-        title: `${request.runtime === "codex" ? "Codex" : "Claude"} · ${request.path}`,
-        launch: request.runtime === "codex"
-          ? { sandboxMode: "workspace-write" }
-          : { permissionMode: "acceptEdits" },
-      });
-      runtimeSessionId = recovered.session.id;
-      providerSessionId = recovered.session.providerSessionId ?? providerSessionId;
-      observer.notice?.(
-        `Hara restored the same ${request.runtime === "codex" ? "Codex" : "Claude Code"} conversation in a new local terminal.`,
-      );
+      if (!(error instanceof ExternalRuntimeSessionGoneError) || !providerSessionId) {
+        return { status: request.signal.aborted ? "cancelled" : "error", text: "", ...ids(),
+          error: safeError(error, "Hara could not safely inspect the legacy coding terminal") };
+      }
     }
   }
+  if (request.signal.aborted) return { status: "cancelled", text: "", ...ids() };
+  let session: ExternalSessionInfo;
+  try {
+    const input = { agentKind: request.runtime, cwd: request.workspace.cwd,
+      title: `${request.runtime === "codex" ? "Codex" : request.runtime === "claude" ? "Claude" : "OpenCode"} · ${request.path}` };
+    const admitted = providerSessionId
+      ? await service.resumeCodingSession({ ...input, providerSessionId })
+      : await service.createCodingSession(input);
+    if (admitted.session.sourceId !== request.runtime
+      || !new RegExp(`^ext_${request.runtime}_[a-f0-9]{24}$`, "u").test(admitted.session.id)
+      || (providerSessionId && admitted.session.id !== providerSessionId)
+      || admitted.readOnly || admitted.controlMode !== "managed") {
+      throw new Error("the coding adapter did not admit the original owned provider session");
+    }
+    session = admitted.session;
+    providerSessionId = session.id;
+    // Persist the opaque native-conversation binding before any UI observer or model dispatch.
+    // Optional invocation keeps old mock executors compatible; DurableAgentTeam always supplies it.
+    request.bindProviderSession?.(providerSessionId);
+  } catch (error) {
+    return { status: request.signal.aborted ? "cancelled" : "error", text: "", ...ids(),
+      error: safeError(error, "the structured coding session could not be admitted") };
+  }
   if (request.signal.aborted) {
-    await service.interrupt(runtimeSessionId).catch(() => undefined);
-    return {
-      status: "cancelled",
-      text: "",
-      runtimeSessionId,
-      ...(providerSessionId ? { providerSessionId } : {}),
-    };
+    return { status: "cancelled", text: "", ...ids() };
+  }
+  const initialIds = new Set<string>();
+  try {
+    const reserved = await request.reserveInput?.() ?? [];
+    // The generation captures these ids with its prompt. An admission-time message must instead
+    // remain in the pump, even if it is already visible in this first reservation.
+    const captured = new Set(request.initialInputIds ?? reserved.map((delivery) => delivery.id));
+    for (const delivery of reserved) if (captured.has(delivery.id)) initialIds.add(delivery.id);
+  } catch (error) {
+    return { status: request.signal.aborted ? "cancelled" : "error", text: "", ...ids(),
+      error: safeError(error, "Hara could not reserve the generation's initial Agent input") };
+  }
+  if (request.signal.aborted) return { status: "cancelled", text: "", ...ids() };
+  try { observer.onSession?.(session); }
+  catch (error) {
+    return { status: "error", text: "", ...ids(), error: safeError(error, "the parent conversation could not bind this coding session") };
   }
 
-  const metrics = { providerRounds: 1, toolCalls: 0, inputTokens: 0, outputTokens: 0 };
+  // OpenCode's host reports actual absolute rounds; do not pre-charge a fictitious round.
+  // Legacy adapters still lack detailed usage and retain their existing one-round estimate.
+  const metrics: ExternalTurnMetrics = { providerRounds: request.runtime === "opencode" ? 0 : 1,
+    toolCalls: 0, inputTokens: 0, outputTokens: 0 };
   if (!request.reportProgress(metrics)) {
     return {
       status: "halted",
       text: "",
       error: "Agent tree execution budget reached before the external coding turn",
       metrics,
-      runtimeSessionId,
-      ...(providerSessionId ? { providerSessionId } : {}),
+      ...ids(),
     };
   }
+  const finalMetrics = (adapter?: ExternalTurnMetrics): "valid" | "invalid" | "exhausted" => {
+    let actual: ExternalTurnMetrics | undefined;
+    try {
+      actual = observer.executionMetrics ? observer.executionMetrics() : adapter;
+      if (actual === undefined && !observer.executionMetrics) return "valid";
+      if (actual !== undefined || observer.executionMetrics) {
+        if (!actual || typeof actual !== "object" || Array.isArray(actual)) return "invalid";
+        const snapshot = { providerRounds: actual.providerRounds, toolCalls: actual.toolCalls,
+          inputTokens: actual.inputTokens, outputTokens: actual.outputTokens };
+        if (Object.values(snapshot).some((value) => !Number.isSafeInteger(value) || value < 0)) return "invalid";
+        Object.assign(metrics, snapshot);
+      }
+    } catch { return "invalid"; }
+    return request.reportProgress(metrics) ? "valid" : "exhausted";
+  };
 
   const mailboxPumpController = new AbortController();
   const abort = (): void => {
     mailboxPumpController.abort();
-    void service.interrupt(runtimeSessionId!).catch(() => undefined);
+    void service.interrupt(providerSessionId!).catch(() => undefined);
   };
   request.signal.addEventListener("abort", abort, { once: true });
   let pumping = true;
   let mailboxError = "";
+  const seenInput = new Set(initialIds);
   const mailboxPump = (async () => {
     while (pumping && !request.signal.aborted) {
       await pollDelay(mailboxPumpController.signal);
       if (!pumping || request.signal.aborted) break;
       let deliveries;
       try {
-        deliveries = await request.pendingInput();
+        deliveries = await (request.reserveInput?.() ?? request.pendingInput());
       } catch (error) {
         mailboxError = safeError(error, "Hara could not read in-flight Agent messages");
-        await service.interrupt(runtimeSessionId!).catch(() => undefined);
+        await service.interrupt(providerSessionId!).catch(() => undefined);
         return;
       }
       for (const delivery of deliveries) {
+        if (!pumping || request.signal.aborted) return;
+        if (seenInput.has(delivery.id)) continue;
         try {
-          await service.terminalInput(
-            runtimeSessionId!,
+          const accepted = await service.steer(
+            providerSessionId!,
             `[Hara Agent message from ${delivery.sourcePath}]\n${delivery.content}`,
           );
+          if (accepted?.accepted !== true || accepted.sessionId !== providerSessionId) {
+            throw new Error("the coding provider did not confirm this in-flight Agent message");
+          }
+          await request.acknowledgeInput?.(delivery.id);
+          seenInput.add(delivery.id);
           observer.notice?.(`Hara relayed a message from ${delivery.sourcePath} to the active ${request.runtime} Agent.`);
         } catch (error) {
           mailboxError = safeError(error, "Hara could not relay an in-flight Agent message");
-          await service.interrupt(runtimeSessionId!).catch(() => undefined);
+          await service.interrupt(providerSessionId!).catch(() => undefined);
           return;
         }
       }
@@ -158,27 +228,59 @@ export async function executeExternalCodingAgent(
   };
   try {
     const sink: ExternalTurnSink = {
+      signal: request.signal,
+      ...(observer.prepareCodingHost ? {
+        prepareCodingHost: async (signal: AbortSignal) => {
+          const combined = AbortSignal.any([signal, request.signal]);
+          if (combined.aborted) throw new Error("the coding host was cancelled before setup");
+          return await observer.prepareCodingHost!(combined);
+        },
+      } : {}),
       text: (delta) => observer.text?.(delta),
       tool: (name, preview) => observer.tool?.(name, preview),
       notice: (text) => observer.notice?.(text),
-      // Hara Live launches Codex/Claude with a bounded worktree permission profile. It does not ask
-      // arbitrary provider questions during relay; fail closed if a future adapter unexpectedly does.
-      confirm: async () => false,
+      confirm: async (approval, signal) => {
+        const combined = AbortSignal.any([signal, request.signal]);
+        if (!observer.confirm || combined.aborted) return false;
+        const verdict = await humanReply(combined, false as boolean | "always",
+          () => observer.confirm!({ ...approval, allowAlways: false }, combined));
+        // A worker may obtain a fresh single-action approval, never a provider-session grant.
+        return !combined.aborted && (verdict === true || verdict === "always");
+      },
+      askUser: async (questions, signal) => {
+        const combined = AbortSignal.any([signal, request.signal]);
+        if (!observer.askUser || combined.aborted) return {};
+        const answers = await humanReply(combined, {}, () => observer.askUser!(questions, combined));
+        return combined.aborted ? {} : answers;
+      },
     };
     let turn;
     try {
-      turn = await service.submit(runtimeSessionId, request.task, sink);
+      if (request.signal.aborted) return { status: "cancelled", text: "", metrics, ...ids() };
+      turn = await service.submit(providerSessionId!, request.task, sink);
     } catch (error) {
+      const accounting = finalMetrics();
+      if (accounting === "invalid") return { status: "error", text: "", ...ids(), error: "the coding host returned invalid execution counters" };
       return {
-        status: request.signal.aborted ? "cancelled" : "error",
+        status: accounting === "exhausted" ? "halted" : request.signal.aborted ? "cancelled" : "error",
         text: "",
         error: safeError(error, "external coding Agent failed before completion"),
         metrics,
-        runtimeSessionId,
-        ...(providerSessionId ? { providerSessionId } : {}),
+        ...ids(),
       };
     }
     await stopMailboxPump();
+    if (turn.sessionId !== providerSessionId) {
+      if (observer.executionMetrics) {
+        const accounting = finalMetrics();
+        if (accounting === "invalid") return { status: "error", text: "", ...ids(), error: "the coding host returned invalid execution counters" };
+      }
+      return { status: "error", text: "", error: "the coding provider returned a different conversation", metrics, ...ids() };
+    }
+    const accounting = finalMetrics(turn.metrics);
+    if (accounting === "invalid") return { status: "error", text: "", ...ids(), error: "the coding provider or host returned invalid execution counters" };
+    if (accounting === "exhausted") return { status: "halted", text: redactSensitiveText(turn.reply).text,
+      error: "Agent tree execution budget reached during the external coding turn", metrics, ...ids() };
     if (mailboxError) {
       return {
         status: "error",
@@ -186,9 +288,16 @@ export async function executeExternalCodingAgent(
         error: mailboxError,
         model: `${request.runtime} coding runtime`,
         metrics,
-        runtimeSessionId,
-        ...(providerSessionId ? { providerSessionId } : {}),
+        ...ids(),
       };
+    }
+    if (turn.status === "completed" && !request.signal.aborted) {
+      try {
+        for (const id of initialIds) await request.acknowledgeInput?.(id);
+      } catch (error) {
+        return { status: request.signal.aborted ? "cancelled" : "error", text: redactSensitiveText(turn.reply).text,
+          error: safeError(error, "Hara could not acknowledge completed Agent input"), metrics, ...ids() };
+      }
     }
     return {
       status: request.signal.aborted
@@ -200,8 +309,7 @@ export async function executeExternalCodingAgent(
       model: `${request.runtime} coding runtime`,
       ...(turn.error ? { error: safeError(turn.error, "external coding Agent turn failed") } : {}),
       metrics,
-      runtimeSessionId,
-      ...(providerSessionId ? { providerSessionId } : {}),
+      ...ids(),
     };
   } finally {
     request.signal.removeEventListener("abort", abort);

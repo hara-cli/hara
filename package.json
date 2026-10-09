@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.184.1",
+  "version": "0.185.0",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "runtime-bootstrap.cjs"
@@ -15,6 +15,8 @@
     "docs/volcengine-coding-plan.md",
     "docs/jev-action-guard-experience.md",
     "docs/wechat-agent-scenes.md",
+    "docs/coding-executors.md",
+    "docs/coding-executors-benchmark.md",
     "scripts/jev-wechat-bridge.py",
     "CHANGELOG.md",
     "THIRD_PARTY_NOTICES.md",
@@ -60,6 +62,13 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.2",
+    "@earendil-works/chord": "1.1.0",
+    "@earendil-works/pi-agent-core": "1.1.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-codemode": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-mcp": "1.1.0",
+    "@earendil-works/pi-tui": "1.1.0",
     "@larksuiteoapi/node-sdk": "^1.68.0",
     "@modelcontextprotocol/sdk": "1.31.0",
     "@nanhara/hara-presentation": "0.1.0-alpha.8",
@@ -82,6 +91,14 @@
   "optionalDependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.250",
     "@zvec/zvec": "^0.5.0",
+    "opencode-darwin-arm64": "1.18.32",
+    "opencode-darwin-x64-baseline": "1.18.32",
+    "opencode-linux-arm64": "1.18.32",
+    "opencode-linux-arm64-musl": "1.18.32",
+    "opencode-linux-x64-baseline": "1.18.32",
+    "opencode-linux-x64-baseline-musl": "1.18.32",
+    "opencode-windows-arm64": "1.18.32",
+    "opencode-windows-x64-baseline": "1.18.32",
     "qrcode-terminal": "^0.12.0"
   },
   "overrides": {

@@ -273,7 +273,7 @@ const toolProvider = () => {
   return {
     id: "fake",
     model: "fake-1",
-    async turn({ onText }) {
+    async turn({ onText, history }) {
       if (n++ === 0) {
         return {
           text: "",
@@ -296,6 +296,8 @@ const toolProvider = () => {
         return { text: "", toolUses: [{ id: "t1", name: "write_file", input: { path: "approved.txt", content: "hi" } }], stop: "tool_use", usage: { input: 1, output: 1 } };
       }
       if (n === 3) {
+        const denied = history.flatMap((message) => message.role === "tool" ? message.results : [])
+          .some((result) => result.name === "write_file" && /denied|declined|not approved/iu.test(result.content));
         return {
           text: "",
           toolUses: [{
@@ -306,9 +308,20 @@ const toolProvider = () => {
               blocked_step: "",
               block_reason: "",
               next_step: "",
-              completion: {
+              ...(denied ? { capabilities: [{ name: "workspace_write", state: "blocked", detail: "the user denied the write_file approval" }] } : {}),
+              completion: denied ? {
+                state: "awaiting_user",
+                evidence: ["the user denied the write_file approval"],
+                dependency: {
+                  kind: "missing_authority",
+                  capability: "workspace_write",
+                  detail: "The write was denied; it will not be retried without fresh user authorization.",
+                  evidence: ["approval.reply returned allow=false"],
+                },
+              } : {
                 state: "verified",
                 evidence: ["approved.txt was written and read back with the exact content hi"],
+                final_answer: "done",
               },
             },
           }],
@@ -2031,6 +2044,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "external.sessions.terminal-input-sequence.v1",
         "external.sessions.terminal-command-idempotency.v1",
         "external.sessions.terminal-handoff.v1",
+        "external.delegated-interaction.v1",
         "external.sessions.runtime-remove.v1",
         "spaces.tenant-boundary.v1",
       ],
@@ -6160,7 +6174,9 @@ test("serve e2e: a mid-turn conversation can fork from its last protocol-complet
 
     await c.call("approval.reply", { approvalId: approval.params.approvalId, allow: false });
     const original = await sending;
-    assert.equal(original.result.reply, "done", "copying does not interrupt or mutate the source turn");
+    assert.equal(original.error, undefined);
+    assert.equal(original.result.status, "paused", "the original turn respects its own denied approval after copying");
+    assert.match(original.result.reply, /denied|authorization/iu);
   } finally {
     if (sending) await sending.catch(() => {});
     c.close();
@@ -6231,7 +6247,10 @@ test("serve e2e: denied approval blocks the tool", { timeout: 20000 }, async () 
     const denier = c.waitEvent("approval.request").then((ev) => c.call("approval.reply", { approvalId: ev.params.approvalId, allow: false }));
     const sent = await c.call("session.send", { sessionId: result.sessionId, text: "write it" });
     await denier;
-    assert.equal(sent.result.reply, "done", "turn still completes (model told of the denial)");
+    assert.equal(sent.error, undefined);
+    assert.equal(sent.result.status, "paused", "a denied business action is not a completed task");
+    assert.match(sent.result.reply, /denied|authorization/iu);
+    assert.doesNotMatch(sent.result.reply, /The task is complete\./u);
     assert.equal(existsSync(join(dir, "approved.txt")), false, "denied tool did NOT run");
   } finally {
     c.close();

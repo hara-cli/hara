@@ -656,7 +656,7 @@ test("changing command fragments without durable state pause within eight unatte
     }],
   }));
   assert.ok(turns >= 5 && turns <= 8, `expected a bounded 5–8 round pause, received ${turns}`);
-  assert.equal(tools, turns);
+  assert.equal(tools, turns - 1, "the final receipt-only round cannot continue editing unchanged fragments");
   assert.equal(outcome.status, "halted");
   assert.equal(outcome.stopReason, "no_progress");
   assert.equal(task.checkpoint.completion, undefined);

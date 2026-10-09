@@ -41,3 +41,14 @@ Use the Feishu group `hara 反馈群` (`oc_17590648f393135cde6a6b9cd6f1c710`) as
 ## Agent Inbox
 
 Codex, Claude Code, and other sessions working under `hara/` leave each other messages in `../inbox/` (the workspace-level `hara/inbox/`, outside this repository). Before non-trivial work, list that directory and read every message addressed to you or to `all` whose status is not `done`. Reply by appending to the same file and updating its status; `../inbox/README.md` defines the format. Keep durable knowledge in `.learnings/` and long documents in `docs/`, and never put secrets in a message.
+
+## Reference Source Freshness & Feedback Noise
+
+Before studying a reference checkout (including OpenBot and Codex), inspect its local changes and fetch its
+configured upstream. Fast-forward a clean checkout only; never reset or overwrite local work. Record the
+inspected commit and update time, and state when network access prevents a freshness check. Updating a
+reference is not permission to run its scripts or change Hara's pinned runtime dependencies.
+
+Acknowledge new actionable human Feishu feedback once, then close the original thread after verified work.
+Do not reply to every Nanhara bot notification, our own progress replies, or duplicate/settled tickets.
+Trusted automated crash reports may enter intake silently; they do not each need a public acknowledgment.
