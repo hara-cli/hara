@@ -5,7 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.185.1 — 2026-10-10 — npm 12 publication compatibility
+
+- Accept npm 12's exact package-name-keyed pack manifest as well as the legacy singleton array,
+  retaining all package identity, public-file and tested-tarball integrity checks.
+- Exercise the pinned publication Node/npm toolchain in ordinary CI before creating release tags.
+- Isolate the human-approval timing fixture from pre-confirmation setup contention while retaining
+  real wait, cancellation and deadline assertions. Production execution budgets are unchanged.
+
 ## 0.185.0 — 2026-10-09 — owned coding engines and reliable task closeout
+
+> Native binaries were published; npm publication stopped before upload because the pack-manifest
+> checker did not accept npm 12's new JSON format. Version 0.185.1 carries the correction.
 
 - Bundle the pinned OpenCode runtime and Pi SDK behind Hara's personal-space `runtime: "coding"` delegation. The
   default selects OpenCode; Pi is an experimental setting. Existing workers keep their original

@@ -45,6 +45,18 @@ function tarballIntegrity(path) {
   return `sha512-${createHash("sha512").update(readFileSync(path)).digest("base64")}`;
 }
 
+/** npm 12 keys pack JSON by package name; older npm emits an array. Accept exactly one expected entry. */
+export function normalizePackManifest(manifest, pkg) {
+  let packed;
+  if (Array.isArray(manifest) && manifest.length === 1) packed = manifest[0];
+  else if (manifest && typeof manifest === "object" && pkg?.name === "@nanhara/hara"
+    && Object.keys(manifest).length === 1 && Object.hasOwn(manifest, pkg.name)) packed = manifest[pkg.name];
+  if (!packed || typeof packed !== "object" || Array.isArray(packed)) {
+    throw new Error("npm pack returned an invalid manifest");
+  }
+  return packed;
+}
+
 /** Pure fail-closed inspection of npm pack's actual file manifest. Generated state is never publishable. */
 export function inspectPackageFiles(packed, pkg) {
   if (pkg?.name !== "@nanhara/hara" || packed?.name !== pkg.name || packed.version !== pkg.version
@@ -248,8 +260,7 @@ export function runNpmPackageSmoke({ packageRoot = resolve(dirname(fileURLToPath
       return result.stdout;
     };
     const manifest = parseJson(run(process.execPath, [npmCli, "pack", root, "--ignore-scripts", "--json", "--pack-destination", packedDir], "npm pack"), "npm pack manifest");
-    if (!Array.isArray(manifest) || manifest.length !== 1) throw new Error("npm pack returned an invalid manifest");
-    const packed = manifest[0], inspected = inspectPackageFiles(packed, pkg);
+    const packed = normalizePackManifest(manifest, pkg), inspected = inspectPackageFiles(packed, pkg);
     const tarball = join(packedDir, packed.filename);
     if (tarballIntegrity(tarball) !== packed.integrity) throw new Error("npm tarball integrity mismatch");
     run(process.execPath, [npmCli, ...npmInstallArgs(tarball, prefix, { offline, cache: selectedCache })], "isolated npm install", npmInstallTimeout());

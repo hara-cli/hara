@@ -56,18 +56,18 @@ async function withinFixtureDeadline(promise, description, timeoutMs = 3_000) {
   }
 }
 
-function startActiveFixtureClockAtToolEntry(t) {
+function startActiveFixtureClockAtBoundary(t, description = "the late wrapper") {
   const wallNow = Date.now.bind(Date);
   const runStartedAt = wallNow();
   let toolStartedAt;
-  // These two tests exercise a physical tool that outlives a real deadline, not setup contention.
+  // These tests exercise a dispatched tool or human wait, not pre-dispatch setup contention.
   // runActiveElapsedMs/expireRunBudgetIfNeeded use Date.now; freeze only pre-dispatch accounting,
   // then advance from actual wall time. The engine's real setTimeout/AbortSignal remain untouched.
   t.mock.method(Date, "now", () => toolStartedAt === undefined
     ? runStartedAt
     : runStartedAt + wallNow() - toolStartedAt);
   return () => {
-    assert.equal(toolStartedAt, undefined, "the late wrapper starts exactly once");
+    assert.equal(toolStartedAt, undefined, `${description} starts exactly once`);
     toolStartedAt = wallNow();
   };
 }
@@ -1465,7 +1465,7 @@ test("a late non-cooperative wrapper cannot commit through built-in write_file a
     },
   };
   try {
-    const startActiveClock = startActiveFixtureClockAtToolEntry(t);
+    const startActiveClock = startActiveFixtureClockAtBoundary(t);
     let outcome;
     try {
       outcome = await runAgent([{ role: "user", content: "write late" }], base(provider, {
@@ -1518,7 +1518,7 @@ test("a late non-cooperative wrapper cannot start another registered edit tool a
     },
   };
   try {
-    const startActiveClock = startActiveFixtureClockAtToolEntry(t);
+    const startActiveClock = startActiveFixtureClockAtBoundary(t);
     let outcome;
     try {
       outcome = await runAgent([{ role: "user", content: "write memory late" }], base(provider, {
@@ -1556,7 +1556,7 @@ test("a late non-cooperative wrapper cannot start another registered edit tool a
   }
 });
 
-test("human approval wait does not consume active execution budget", async () => {
+test("human approval wait does not consume active execution budget", async (t) => {
   let round = 0;
   const provider = {
     id: "approval-wait",
@@ -1570,32 +1570,42 @@ test("human approval wait does not consume active execution budget", async () =>
   };
   const notices = [];
   let toolRuns = 0;
-  const started = Date.now();
-  const outcome = await runAgent([{ role: "user", content: "ask before running" }], base(provider, {
-    approval: "suggest",
-    timeoutMs: 1_000,
-    maxRounds: 10,
-    ctx: { cwd: process.cwd(), ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice: (message) => notices.push(message) } },
-    confirm: async () => {
-      await tick(1_150);
-      return true;
-    },
-    extraTools: [{
-      name: "gated_effect",
-      description: "runs after the user answers",
-      input_schema: { type: "object", properties: {} },
-      kind: "edit",
-      async run() { toolRuns += 1; return "ran"; },
-    }],
-  }));
-  assert.equal(outcome.status, "completed");
-  assert.equal(toolRuns, 1);
-  assert.ok(Date.now() - started > 1_050, "wall time may exceed the active execution budget while waiting");
-  assert.equal(
-    notices.some((message) => /still actively working|80% used|agent run paused/.test(message)),
-    false,
-    "active-run warnings stay silent while the user prompt owns the wall time",
-  );
+  let confirmations = 0;
+  const wallNow = Date.now.bind(Date);
+  const started = wallNow();
+  const startActiveClock = startActiveFixtureClockAtBoundary(t, "the human confirmation");
+  try {
+    const outcome = await runAgent([{ role: "user", content: "ask before running" }], base(provider, {
+      approval: "suggest",
+      timeoutMs: 1_000,
+      maxRounds: 10,
+      ctx: { cwd: process.cwd(), ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice: (message) => notices.push(message) } },
+      confirm: async () => {
+        confirmations += 1;
+        startActiveClock();
+        await tick(1_150);
+        return true;
+      },
+      extraTools: [{
+        name: "gated_effect",
+        description: "runs after the user answers",
+        input_schema: { type: "object", properties: {} },
+        kind: "edit",
+        async run() { toolRuns += 1; return "ran"; },
+      }],
+    }));
+    assert.equal(confirmations, 1, "the fixture must reach the human wait before testing its budget exclusion");
+    assert.equal(outcome.status, "completed");
+    assert.equal(toolRuns, 1);
+    assert.ok(wallNow() - started > 1_050, "real wall time may exceed the active execution budget while waiting");
+    assert.equal(
+      notices.some((message) => /still actively working|80% used|agent run paused/.test(message)),
+      false,
+      "active-run warnings stay silent while the user prompt owns the wall time",
+    );
+  } finally {
+    t.mock.restoreAll();
+  }
 });
 
 test("external cancellation still aborts and cleans a paused approval", async () => {

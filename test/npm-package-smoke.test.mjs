@@ -9,6 +9,7 @@ import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import {
   REQUIRED_PACKAGE_FILES,
+  normalizePackManifest,
   inspectPackageFiles,
   inspectPackageReceipt,
   verifyRetainedPackage,
@@ -33,6 +34,38 @@ function packed(extraPaths = []) {
     files: [...REQUIRED_PACKAGE_FILES, ...extraPaths].map((path) => ({ path, size: 1, mode: 0o644 })),
   };
 }
+
+test("pack JSON accepts the legacy singleton array and npm 12's exact package-name-keyed object", () => {
+  const info = packed();
+  for (const manifest of [[info], { [pkg.name]: info }]) {
+    assert.equal(normalizePackManifest(manifest, pkg), info, "normalization must preserve the original manifest");
+    assert.deepEqual(inspectPackageFiles(normalizePackManifest(manifest, pkg), pkg), { fileCount: info.files.length });
+  }
+});
+
+test("pack JSON rejects ambiguous envelopes, arbitrary objects and unexpected package keys", () => {
+  const info = packed();
+  for (const manifest of [
+    undefined, null, true, 1, "manifest", [], [info, info], [[info]], [null], ["manifest"],
+    {}, info, { "0": info }, { "@other/hara": info },
+    { [pkg.name]: info, "@other/hara": info }, { [pkg.name]: info, error: "unexpected" },
+    { [pkg.name]: null }, { [pkg.name]: [info] }, { [pkg.name]: "manifest" },
+    Object.create({ [pkg.name]: info }),
+  ]) assert.throws(() => normalizePackManifest(manifest, pkg), /npm pack returned an invalid manifest/u);
+});
+
+test("both supported pack envelopes retain all package identity and public-file checks", () => {
+  for (const info of [
+    { ...packed(), name: "@other/hara" }, { ...packed(), version: "0.184.2" },
+    { ...packed(), filename: "../nanhara-hara-0.184.1.tgz" },
+    { ...packed(), files: [] }, packed([".env"]), packed(["dist/auth.json"]),
+    packed(["dist/cli.js"]), packed(["dist/bin/hara"]),
+  ]) {
+    for (const manifest of [[info], { [pkg.name]: info }]) {
+      assert.throws(() => inspectPackageFiles(normalizePackManifest(manifest, pkg), pkg));
+    }
+  }
+});
 
 function below(base, path) {
   assert.equal(typeof path, "string");
