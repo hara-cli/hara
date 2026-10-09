@@ -194,6 +194,31 @@ test("rejected empty-evidence receipt never becomes a success claim or repeats u
   assert.match(result.text, pausedCopy);
 });
 
+test("source-linked receipt uses the actual upload result and closes without an additional model round", async () => {
+  const result = await runCloseout({ completion: { state: "verified", evidence: [RECEIPT], checks: [
+    { acceptance_index: 0, evidence: RECEIPT, tool_call_ids: ["upload"] },
+  ] } });
+  assert.equal(result.requests, 3);
+  assert.equal(result.uploads, 1);
+  assert.equal(result.task.status, "completed");
+  assert.match(result.task.checkpoint.completion.evidence[0], /engine-observed sources: sha256:[a-f0-9]{64}/u);
+  assertOrdinaryReply(result);
+});
+
+for (const reference of ["NONEXISTENT_RECEIPT", "brief", "completion"]) {
+  test(`unobserved or bookkeeping reference ${reference} cannot turn a model assertion into verified completion`, async () => {
+    const result = await runCloseout({ completion: { state: "verified", evidence: [RECEIPT], final_answer: FALSE_CLAIM, checks: [
+      { acceptance_index: 0, evidence: "all acceptance checks passed", tool_call_ids: [reference] },
+    ] }, invalid: true });
+    assert.equal(result.uploads, 1, "citation repair must not replay a successful upload");
+    assert.notEqual(result.task.status, "completed");
+    assert.equal(result.task.checkpoint.completion, undefined);
+    assert.doesNotMatch(result.text, new RegExp(FALSE_CLAIM));
+    assertOrdinaryReply(result);
+    assert.match(result.text, pausedCopy);
+  });
+}
+
 test("provider failure after one upload closes honestly without implying all acceptance checks passed", async () => {
   const result = await runCloseout({ error: true });
   assert.equal(result.requests, 3);

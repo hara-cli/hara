@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.185.2 — 2026-10-10 — source-linked task acceptance
+
+- Optionally link every accepted task criterion to successful working-tool results observed by the
+  current engine run. Reject missing, failed, bookkeeping, ambiguous and stale references, including
+  task, turn, brief and user-steering changes. Routine checkpoint updates preserve valid references.
+- Retain only bounded source hashes, not raw tool output or credentials, in acceptance records.
+  Legacy receipts remain compatible and do not acquire stronger verification retroactively. A source
+  link verifies provenance, not the model's interpretation or external business success.
+- Close an accepted receipt without an extra model request; citation failures do not automatically
+  replay an upload, message or paid operation. Cover these boundaries with deterministic, offline
+  engine regressions rather than claiming live-model performance improvements.
+
 ## 0.185.1 — 2026-10-10 — npm 12 publication compatibility
 
 - Accept npm 12's exact package-name-keyed pack manifest as well as the legacy singleton array,

@@ -79,6 +79,7 @@ import { coreDeferredToolsForHistory } from "./core-capabilities.js";
 import { setTurnPhase } from "./phase.js";
 import { AssistantTextSanitizer, sanitizeAssistantText } from "./assistant-text.js";
 import { completionCloseoutText, pausedCloseoutText } from "./task-closeout.js";
+import { CompletionEvidenceLedger, completionEvidenceScope } from "./completion-evidence.js";
 import { recordTouch } from "./touched.js";
 import { resolve as resolvePath } from "node:path";
 import { redactSensitiveText, requestsCredentialDisclosure } from "../security/secrets.js";
@@ -1320,6 +1321,7 @@ async function runAgentInner(
     restrictToolsForSkill,
   };
   let intakeTask = opts.taskIntake?.task;
+  const completionEvidence = new CompletionEvidenceLedger();
   let taskStateDirty = false;
   const syncIntakeTask = (): void => {
     const current = opts.taskIntake?.current?.();
@@ -1479,6 +1481,20 @@ async function runAgentInner(
                   items: { type: "string" },
                   description: "Observable checks/results. At least one is required for verified.",
                 },
+                checks: {
+                  type: "array",
+                  description: "Optional source-linked verified receipt: cover every current brief acceptance criterion once using its zero-based acceptance_index and 1-4 successful working tool_call_ids from this run. Evidence is your short interpretation, not independent proof of business success. Never repeat a side effect to repair a citation.",
+                  maxItems: 12,
+                  items: {
+                    type: "object",
+                    properties: {
+                      acceptance_index: { type: "integer", minimum: 0, maximum: 11 },
+                      evidence: { type: "string", maxLength: 400 },
+                      tool_call_ids: { type: "array", minItems: 1, maxItems: 4, items: { type: "string" } },
+                    },
+                    required: ["acceptance_index", "evidence", "tool_call_ids"],
+                  },
+                },
                 waiting_for: {
                   type: "string",
                   description: "Deprecated compatibility mirror of dependency.detail; omit in new calls.",
@@ -1533,6 +1549,9 @@ async function runAgentInner(
         classify: () => ({ effect: "state", concurrencySafe: false }),
         run: async (input) => {
           if (!taskStateDirty) syncIntakeTask();
+          const boundEvidence = completionEvidence.bind(intakeTask, input);
+          if (!boundEvidence.ok) return `Error: task checkpoint rejected — ${boundEvidence.reason}`;
+          input = boundEvidence.input;
           // `final_answer` is the reply to deliver, not task state: it never enters the checkpoint.
           const completionInput = (input as { completion?: unknown } | null)?.completion;
           const stateInput = completionInput && typeof completionInput === "object" && "final_answer" in completionInput
@@ -3295,6 +3314,8 @@ async function runAgentInner(
     const verifiedRoundChanges: string[] = [];
     const runOne = async (idx: number, p: Plan): Promise<void> => {
       if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return;
+      if (!taskStateDirty) syncIntakeTask();
+      const evidenceObservation = completionEvidence.begin(completionEvidenceScope(intakeTask), p.tu.id, p.tu.name, p.operation?.effect);
       if (unansweredUserQuestion || credentialQuestionBlocked) {
         results[idx] = {
           id: p.tu.id,
@@ -3500,6 +3521,7 @@ async function runAgentInner(
           return;
         }
         const resultLooksFailed = structuredToolError || looksFailed(res, p.tu.name);
+        completionEvidence.finish(evidenceObservation, res, resultLooksFailed);
         if (
           !resultLooksFailed
           && intakeTask?.brief?.intent === "change"
