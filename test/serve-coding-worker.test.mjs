@@ -12,6 +12,7 @@ import { startServe } from "../dist/serve/server.js";
 import { RemoteCommandLedger } from "../dist/serve/remote-command-ledger.js";
 
 const features=["external.delegated-interaction.v1","external.questions.v1","coding.settings.v1"];
+const TURN_FIXTURE_TIMEOUT_MS=30_000;
 const done=text=>({text,toolUses:[],stop:"end",usage:{input:3,output:2}});
 function memoryStore(){const records=new Map();return {
   load:id=>records.get(id)??null,save:(meta,history,task)=>records.set(meta.id,{meta:{...meta},history:structuredClone(history),task:task&&structuredClone(task)}),
@@ -29,8 +30,8 @@ async function connect(port){
     }
   });ws.on("close",failAll);
   await new Promise((resolve,reject)=>{ws.once("open",resolve);ws.once("error",reject);});
-  return {ws,events,call(method,params={}){return new Promise((resolve,reject)=>{
-    const id=nextId++,timer=setTimeout(()=>{pending.delete(id);reject(new Error(`fixture RPC timeout: ${method}`));},12_000);
+  return {ws,events,call(method,params={},{timeoutMs=12_000}={}){return new Promise((resolve,reject)=>{
+    const id=nextId++,timer=setTimeout(()=>{pending.delete(id);reject(new Error(`fixture RPC timeout: ${method}`));},timeoutMs);
     pending.set(id,{resolve,reject,timer});ws.send(JSON.stringify({jsonrpc:"2.0",id,method,params}));
   });},wait(method,predicate=()=>true){const prior=events.find(item=>item.method===method&&predicate(item.params));if(prior)return Promise.resolve(prior.params);
     return new Promise((resolve,reject)=>{const item={method,predicate,resolve,reject,timer:undefined};item.timer=setTimeout(()=>{
@@ -120,14 +121,16 @@ async function fixture(t,{executor="pi",personal=true,expiry,blockWorker=false}=
   });client=await connect(server.port);const initialized=await client.call("initialize",{token:"fixture-token",capabilities:{features}});
   assert.equal(initialized.error,undefined);const created=await client.call("session.create");assert.equal(created.error,undefined,JSON.stringify(created));const parent=created.result.sessionId;
   return {root,home,repo,state,server,client,parent,initialized,async launch(){
-    const sending=client.call("session.send",{sessionId:parent,text:"Implement this bounded coding fixture."});
+    // Legacy session.send resolves after the complete interactive turn, including human input.
+    // Match the outer turn-test bound; individual control RPCs and event waits keep their shorter deadlines.
+    const sending=client.call("session.send",{sessionId:parent,text:"Implement this bounded coding fixture."},{timeoutMs:TURN_FIXTURE_TIMEOUT_MS});
     void sending.catch(()=>{});const approval=await client.wait("approval.request");
     assert.equal((await client.call("approval.reply",{approvalId:approval.approvalId,allow:true})).error,undefined);return {sending};
   },async agents(){const result=await client.call("session.agents.list",{sessionId:parent});assert.equal(result.error,undefined);return result.result;}};
 }
 
 for(const executor of ["pi","opencode"]){
-  test(`Serve ${executor} uses the same Hara provider and parent-chat fresh tool/question cards`,{timeout:30_000},async t=>{
+  test(`Serve ${executor} uses the same Hara provider and parent-chat fresh tool/question cards`,{timeout:TURN_FIXTURE_TIMEOUT_MS},async t=>{
     const f=await fixture(t,{executor});assert.ok(f.initialized.result.capabilities.features.includes("coding.settings.v1"));
     assert.equal((await f.client.call("settings.coding.get")).result.effectiveExecutor,executor);const {sending}=await f.launch();
     const approval=await f.client.wait("external.approval.request");assert.equal(approval.parentSessionId,f.parent);assert.equal(approval.agentPath,"/root/coder");
@@ -155,7 +158,7 @@ for(const executor of ["pi","opencode"]){
   });
 }
 
-test("parent cancellation denies the outstanding Pi tool permission and rejects its late answer",{timeout:30_000},async t=>{
+test("parent cancellation denies the outstanding Pi tool permission and rejects its late answer",{timeout:TURN_FIXTURE_TIMEOUT_MS},async t=>{
   const f=await fixture(t);const {sending}=await f.launch();const approval=await f.client.wait("external.approval.request");
   assert.equal((await f.client.call("session.interrupt",{sessionId:f.parent})).error,undefined);await sending;
   const resolved=await f.client.wait("external.approval.resolved",value=>value.approvalId===approval.approvalId);assert.equal(resolved.outcome,"interrupted");
@@ -164,7 +167,7 @@ test("parent cancellation denies the outstanding Pi tool permission and rejects 
   assert.equal(readFileSync(join(f.repo,"source.txt"),"utf8"),"original checkout\n");assert.equal(f.client.events.some(event=>event.method==="external.question.request"),false);
 });
 
-test("parent cancellation of an in-flight Pi model charges final conservative host input exactly once",{timeout:30_000},async t=>{
+test("parent cancellation of an in-flight Pi model charges final conservative host input exactly once",{timeout:TURN_FIXTURE_TIMEOUT_MS},async t=>{
   const f=await fixture(t,{blockWorker:true});const {sending}=await f.launch();
   let timer;try{await Promise.race([f.state.workerStarted.promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error("fixture worker did not enter provider")),8_000);})]);}
   finally{clearTimeout(timer);}
@@ -182,7 +185,7 @@ test("parent cancellation of an in-flight Pi model charges final conservative ho
   assert.equal(f.client.events.some(event=>event.method==="external.approval.request"||event.method==="external.question.request"),false);
 });
 
-test("expired Pi write permission never defaults to allow or revives on a late reply",{timeout:30_000},async t=>{
+test("expired Pi write permission never defaults to allow or revives on a late reply",{timeout:TURN_FIXTURE_TIMEOUT_MS},async t=>{
   const f=await fixture(t,{expiry:30});const {sending}=await f.launch();const approval=await f.client.wait("external.approval.request");
   const resolved=await f.client.wait("external.approval.resolved",value=>value.approvalId===approval.approvalId);assert.equal(resolved.outcome,"timed_out");
   assert.ok((await f.client.call("external.approval.reply",{approvalId:approval.approvalId,sessionId:approval.sessionId,turnId:approval.turnId,allow:true,commandId:randomUUID()})).error);

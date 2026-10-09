@@ -12,6 +12,8 @@ All notable changes to `@nanhara/hara`.
 - Exercise the pinned publication Node/npm toolchain in ordinary CI before creating release tags.
 - Isolate the human-approval timing fixture from pre-confirmation setup contention while retaining
   real wait, cancellation and deadline assertions. Production execution budgets are unchanged.
+- Give the legacy coding-worker completion request the existing whole-test deadline: it spans human
+  choices and final results, unlike short control RPCs. Keep control/event deadlines and result checks.
 
 ## 0.185.0 — 2026-10-09 — owned coding engines and reliable task closeout
 
