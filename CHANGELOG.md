@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.185.3 — 2026-10-10 — closeout recovery maintenance release
+
+- Add six real WebSocket and production disk-store regression cases for closeout recovery after the
+  fixture client loses terminal delivery. Cover completed, waiting, unfinished and failed task states.
+- Verify that repeated command UUIDs restore the saved outcome without another model request or tool
+  execution. If terminal receipt storage fails, retain readable closing history while refusing uncertain
+  re-execution. These are deterministic Serve-instance replacement checks, not OS-crash or real-upload acceptance.
+- No production execution logic, provider routing, permissions or automatic retries change in this
+  maintenance release. Existing source-linked acceptance and bounded closeout behavior remain unchanged.
+
 ## 0.185.2 — 2026-10-10 — source-linked task acceptance
 
 - Optionally link every accepted task criterion to successful working-tool results observed by the
