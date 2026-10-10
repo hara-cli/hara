@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import WebSocket from "ws";
@@ -11,29 +12,40 @@ import WebSocket from "ws";
 const buildRoot = process.env.HARA_SERVE_TASK_CLOSEOUT_TEST_BUILD_ROOT ?? process.env.HARA_TASK_CLOSEOUT_TEST_BUILD_ROOT;
 const { startServe, lastAssistantText, historyForClient } = await import(buildRoot
   ? pathToFileURL(join(resolve(buildRoot), "serve/server.js")).href : new URL("../dist/serve/server.js", import.meta.url).href);
+const { realStore } = await import(buildRoot
+  ? pathToFileURL(join(resolve(buildRoot), "serve/sessions.js")).href : new URL("../dist/serve/sessions.js", import.meta.url).href);
 const RECEIPT = "synthetic upload receipt REMOTE-482 saved in the private fixture";
 const FALSE_CLAIM = "UNACCEPTED_ALL_UPLOAD_CHECKS_COMPLETE";
 
-function connect(port) {
+function connect(port, { discardTerminal = false } = {}) {
   return new Promise((connected, reject) => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}`);
     const events = [];
+    const discarded = [];
     const pending = new Map();
     let sequence = 0;
     ws.once("error", reject);
     ws.on("message", raw => {
       const message = JSON.parse(String(raw));
+      if (discardTerminal && (message.method === "event.text" || message.method === "event.turn_end")) {
+        discarded.push(message);
+        return;
+      }
       const finish = pending.get(message.id);
       if (finish) { pending.delete(message.id); finish(message); }
       else if (message.method) events.push(message);
     });
-    ws.once("open", () => connected({ ws, events,
-      call(method, params = {}) {
+    ws.once("open", () => connected({ ws, events, discarded,
+      call(method, params = {}, { discardReply = false } = {}) {
         return new Promise((finish, fail) => {
           const id = ++sequence;
           const timer = setTimeout(() => { pending.delete(id); fail(new Error(`RPC timed out: ${method}`)); }, 5_000);
           timer.unref();
-          pending.set(id, message => { clearTimeout(timer); finish(message); });
+          pending.set(id, message => {
+            clearTimeout(timer);
+            if (discardReply) { discarded.push(message); finish(undefined); }
+            else finish(message);
+          });
           ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
         });
       },
@@ -51,7 +63,11 @@ function memoryStore() {
   };
 }
 
-async function fixture(t, mode) {
+async function fixture(t, mode, { durable = false, failTerminalReceipt = false } = {}) {
+  if (durable) {
+    assert.ok(basename(homedir()).startsWith("hara-test-home-") && process.env.USERPROFILE === homedir(),
+      "real persistence tests require --import ./test/setup-isolated-home.mjs; never use the developer's HOME");
+  }
   const root = realpathSync.native(mkdtempSync(join(tmpdir(), "hara-serve-task-closeout-")));
   let server, client, calls = 0;
   t.after(async () => { client?.ws.terminate(); await server?.close(); rmSync(root, { recursive: true, force: true }); });
@@ -86,22 +102,41 @@ async function fixture(t, mode) {
     }
     return { text: "EXTRA_PROVIDER_ROUND_IS_A_CLOSEOUT_BUG", stop: "end", toolUses: [], usage: { input: 3, output: 1 } };
   } };
-  const store = memoryStore();
-  server = await startServe({ host: "127.0.0.1", port: 0, token: "synthetic-closeout-token", cwd: root }, {
+  const commandId = randomUUID();
+  const store = durable ? { ...realStore, save(meta, history, task) {
+    if (failTerminalReceipt && meta.commandReceipts?.some(receipt => receipt.commandId === commandId && receipt.outcome)) {
+      throw new Error("synthetic terminal receipt storage failure");
+    }
+    realStore.save(meta, history, task);
+  } } : memoryStore();
+  const options = { host: "127.0.0.1", port: 0, token: "synthetic-closeout-token", cwd: root };
+  const deps = {
     version: "0.0.0-test", providerId: provider.id, model: provider.model, buildSessionProvider: async () => provider,
     spawnSubagent: async () => "no child authority", sandbox: "off", approval: "full-auto", guardian: { enabled: false },
     store, quietDiscovery: true, discoveryHome: root, agentTeamHome: root, artifactHome: root,
     runLimits: () => ({ timeoutMs: 10_000, maxRounds: 6 }), autoCompact: () => ({ enabled: false }),
     computerSettings: () => ({ mode: "off", apps: [] }), saveComputerSettings: input => input,
     runtimeInfo: () => ({ providerId: provider.id, model: provider.model, profileId: "personal", spaceId: "personal" }),
-  });
-  client = await connect(server.port);
+  };
+  server = await startServe(options, deps);
+  client = await connect(server.port, { discardTerminal: durable });
   assert.ok((await client.call("initialize", { token: "synthetic-closeout-token" })).result);
   const created = await client.call("session.create", { cwd: root });
   assert.ok(created.result, JSON.stringify(created));
   const sessionId = created.result.sessionId;
-  const sent = await client.call("session.send", { sessionId, text: "Write the synthetic upload receipt exactly once and verify its accepted checks." });
-  return { root, client, store, sessionId, sent, calls: () => calls };
+  const request = { sessionId, text: "Write the synthetic upload receipt exactly once and verify its accepted checks.", ...(durable ? { commandId } : {}) };
+  const sent = await client.call(durable ? "session.submit" : "session.send", request, { discardReply: durable });
+  return { root, client, store, sessionId, sent, request, calls: () => calls,
+    async restart() {
+      client.ws.terminate();
+      await server.close();
+      // A new hub reads the production store from disk, not the original hub or the observing wrapper.
+      server = await startServe(options, { ...deps, store: realStore });
+      client = await connect(server.port);
+      assert.ok((await client.call("initialize", { token: "synthetic-closeout-token" })).result);
+      return client;
+    },
+  };
 }
 
 for (const [mode, expectedState] of [["awaiting", "paused"], ["manual", "paused"], ["pending", "paused"], ["verified", "completed"]]) {
@@ -168,5 +203,72 @@ test("Serve provider failure preserves the stopped handoff in events and history
   assert.equal(historyForClient(saved.history).filter(row => row.role === "assistant").at(-1)?.text, reply);
   assert.equal(events.filter(event => event.method === "event.task_state").at(-1).params.taskStatus, "blocked");
   assert.equal(events.filter(event => event.method === "event.tool" && event.params.name === "write_file").length, 1);
+  assert.equal(readFileSync(join(f.root, "upload-receipt.txt"), "utf8"), `${RECEIPT}\n`);
+});
+
+for (const [mode, expectedState] of [["verified", "completed"], ["awaiting", "paused"], ["manual", "paused"], ["pending", "paused"], ["provider_error", "blocked"]]) {
+  test(`Serve restart restores ${mode} closeout from the real disk store after the fixture client discards terminal delivery`, { timeout: 20_000 }, async t => {
+    const f = await fixture(t, mode, { durable: true });
+    assert.equal(f.sent, undefined, "the fixture application receives neither the RPC outcome nor closing text");
+    assert.equal(f.client.events.some(event => event.method === "event.text" || event.method === "event.turn_end"), false);
+    assert.equal(f.client.discarded.filter(event => event.method === "event.turn_end").length, 1);
+    const saved = f.store.load(f.sessionId);
+    assert.equal(saved.task.status, expectedState);
+    const reply = lastAssistantText(saved.history);
+    assert.ok(reply.trim());
+    const receipt = saved.meta.commandReceipts.find(item => item.commandId === f.request.commandId);
+    assert.equal(receipt.outcome.kind, mode === "provider_error" ? "error" : "result");
+    const expectedOutcome = receipt.outcome.kind === "error"
+      ? { error: { code: receipt.outcome.code, message: receipt.outcome.message } }
+      : { result: JSON.parse(receipt.outcome.json) };
+
+    const reconnected = await f.restart();
+    const history = await reconnected.call("session.history", { sessionId: f.sessionId });
+    assert.equal(history.error, undefined, JSON.stringify(history));
+    assert.equal(history.result.readOnly, true);
+    assert.deepEqual(history.result.history, historyForClient(saved.history));
+    assert.equal(history.result.history.filter(row => row.role === "assistant" && row.text === reply).length, 1);
+    assert.equal(f.calls(), 3, "reading the saved closeout is provider-independent");
+    const resumed = await reconnected.call("session.resume", { sessionId: f.sessionId });
+    assert.equal(resumed.error, undefined, JSON.stringify(resumed));
+    assert.equal(resumed.result.task.status, expectedState);
+    assert.equal(resumed.result.task.id, saved.task.id);
+    assert.equal(resumed.result.task.turnId, saved.task.turnId);
+    assert.deepEqual(resumed.result.history, history.result.history);
+    for (let retry = 0; retry < 3; retry += 1) {
+      const replayed = await reconnected.call("session.submit", f.request);
+      assert.deepEqual(expectedOutcome.error ? replayed.error : replayed.result,
+        expectedOutcome.error ?? expectedOutcome.result, "the same UUID returns its original terminal outcome");
+      assert.equal(f.calls(), 3, "restoring and retrying never starts another provider round");
+    }
+    const conflict = await reconnected.call("session.submit", { ...f.request, text: "a different request must not reuse the UUID" });
+    assert.equal(conflict.error.code, -32005);
+    assert.equal(f.calls(), 3);
+    assert.equal(reconnected.events.some(event => ["event.text", "event.turn_end", "event.tool"].includes(event.method)), false,
+      "deduplicated RPC replay does not emit another turn or execute tools");
+    assert.deepEqual(realStore.load(f.sessionId).history, saved.history);
+    assert.equal(readFileSync(join(f.root, "upload-receipt.txt"), "utf8"), `${RECEIPT}\n`);
+  });
+}
+
+test("Serve restart preserves a saved closeout when the terminal command receipt failed, but refuses uncertain re-execution", { timeout: 20_000 }, async t => {
+  const f = await fixture(t, "verified", { durable: true, failTerminalReceipt: true });
+  const saved = f.store.load(f.sessionId);
+  assert.equal(saved.task.status, "completed");
+  const reply = lastAssistantText(saved.history);
+  assert.ok(reply.includes(RECEIPT));
+  assert.equal(saved.meta.commandReceipts.find(item => item.commandId === f.request.commandId).outcome, undefined);
+  assert.match(f.client.discarded.find(frame => frame.error)?.error.message, /receipt could not be saved/iu);
+  const reconnected = await f.restart();
+  const resumed = await reconnected.call("session.resume", { sessionId: f.sessionId });
+  assert.equal(resumed.error, undefined, JSON.stringify(resumed));
+  assert.equal(resumed.result.task.status, "completed");
+  assert.equal(resumed.result.history.filter(row => row.role === "assistant").at(-1).text, reply);
+  const replayed = await reconnected.call("session.submit", f.request);
+  assert.equal(replayed.error.code, -32005);
+  assert.match(replayed.error.message, /deduplicated.*unavailable/iu);
+  assert.equal(realStore.load(f.sessionId).meta.commandReceipts.find(item => item.commandId === f.request.commandId).outcome.kind, "result_omitted");
+  assert.equal(f.calls(), 3, "an uncertain command receipt is never a license to repeat a delivery");
+  assert.equal(reconnected.events.some(event => ["event.text", "event.turn_end", "event.tool"].includes(event.method)), false);
   assert.equal(readFileSync(join(f.root, "upload-receipt.txt"), "utf8"), `${RECEIPT}\n`);
 });
