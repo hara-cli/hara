@@ -190,7 +190,7 @@ export class AgentFollowupStore {
         || (r.threadId && g.origin.threadId && r.threadId !== g.origin.threadId)) return "ambiguous";
       if (g.status !== "active" || g.expiresAt <= now || m.createdAtMs! < g.createdAt || g.accepted >= g.maxMessages
         || now - g.lastAcceptedAt < 30_000 || !m.text.trim() || m.text.length > 8000 || s.events.length >= 512
-        || m.images?.length || m.files?.length || ["[图片]", "[附件]"].includes(m.text.trim())
+        || m.images?.length || m.transientFiles?.length || ["[图片]", "[附件]"].includes(m.text.trim())
         || s.events.some((e) => e.grantId === g.id && ["running", "unknown"].includes(e.status))) return "blocked";
       s.events.push({ id: randomUUID(), grantId: g.id, scope, messageId: m.messageId!, text: m.text,
         createdAt: now, status: "pending" });

@@ -64,7 +64,7 @@ test("contradictory ancestry is ambiguous, never routed by a name or the most ac
 
 test("thread follow-ups cannot silently ingest attachments instead of visible text", (t) => {
   const f = fixture(t); f.grant();
-  for (const override of [{ images: [{}] }, { files: [{}] }, { text: "[图片]" }, { text: "[附件]" }]) {
+  for (const override of [{ images: ["fixture.png"] }, { transientFiles: ["fixture.txt"] }, { text: "[图片]" }, { text: "[附件]" }]) {
     assert.equal(f.store.admit(scope, reply(f.now + 1, override), true, f.now + 1), "blocked");
   }
   assert.equal(f.store.admit(scope, reply(f.now + 1), true, f.now + 1), "queued");
