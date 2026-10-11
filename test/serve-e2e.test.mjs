@@ -2045,6 +2045,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "external.sessions.terminal-command-idempotency.v1",
         "external.sessions.terminal-handoff.v1",
         "external.delegated-interaction.v1",
+        "agent.delegated-interaction.v1",
         "external.sessions.runtime-remove.v1",
         "spaces.tenant-boundary.v1",
       ],
