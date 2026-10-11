@@ -19,6 +19,7 @@ import {
 } from "../security/private-state.js";
 import type { ChatAdapter } from "./telegram.js";
 import { liveGatewayRuntimeScopes } from "./runtime-state.js";
+import { AgentFollowupStore, processAgentFollowupDelivery } from "./agent-followup.js";
 
 const NAME = /^(?:request|result)-([a-f0-9]{64})\.json$/u;
 const SCOPE = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
@@ -59,6 +60,8 @@ export interface GatewayOutboundBrokerOptions {
   now?: () => number;
   waitMs?: number;
   pollMs?: number;
+  /** Reuse this gateway's current human allowlist; raw sender ids stay in the credential process. */
+  followupSenderAllowed?: (senderId: string) => boolean;
 }
 
 function checkedScope(value: string): string {
@@ -371,10 +374,13 @@ export async function serveGatewayOutboundRequests(
   options: GatewayOutboundBrokerOptions = {},
 ): Promise<void> {
   const pollMs = Math.max(25, Math.min(2_000, options.pollMs ?? DEFAULT_POLL_MS));
+  const followups = adapter.name === "feishu" ? new AgentFollowupStore(options.home ?? homedir()) : undefined;
   while (!signal.aborted) {
     try {
       const processed = await processGatewayOutboundOnce(adapter, runtimeScope, signal, options);
-      if (!processed) await wait(pollMs, signal);
+      if (followups && options.followupSenderAllowed) followups.revalidate(runtimeScope, options.followupSenderAllowed);
+      const followed = followups ? await processAgentFollowupDelivery(adapter, runtimeScope, signal, followups) : false;
+      if (!processed && !followed) await wait(pollMs, signal);
     } catch {
       console.error(`hara gateway: ${adapter.name} outbound broker encountered private-state trouble; retrying`);
       await wait(Math.max(500, pollMs), signal);

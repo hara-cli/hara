@@ -102,6 +102,14 @@ export class ControlLeaseRegistry<Owner extends object> {
   }
 
   /** Authorize a mutation. No active lease preserves backward compatibility for older Desktop clients. */
+  captureOwned(resourceId: string, owner: Owner): ControlLeaseToken | undefined {
+    const active = this.#resources.get(resourceId)?.active;
+    if (!active) return undefined;
+    if (active.owner !== owner) throw new ControlLeaseError("held", "another device currently controls input for this session");
+    return { leaseId: active.leaseId, epoch: active.epoch };
+  }
+
+  /** Authorize a mutation. No active lease preserves backward compatibility for older Desktop clients. */
   authorize(resourceId: string, owner: Owner, lease?: ControlLeaseToken): "legacy" | "leased" {
     const state = this.#resources.get(resourceId);
     if (!state?.active) {

@@ -3248,10 +3248,11 @@ async function runAgentInner(
         try {
           const scopeHint = approvalScope ? `\n${approvalScope.summary}` : "";
           const guardHint = actionGuardReviewReason ? `\nAction Guard: ${actionGuardReviewReason}` : "";
+          const targetHint = operation.approvalTarget ? `\nTarget: ${redactSensitiveText(operation.approvalTarget).text}` : "";
           const presentation = operation.approvalPresentation;
           const question = presentation
             ? `Create Agent ${presentation.name} (${presentation.username})?\nRole: ${presentation.role}\n${presentation.description}\n\nStanding instructions:\n${presentation.instructions}\n\nThis does not grant tools, computer access or coding permissions.${guardHint}`
-            : `${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?${guardHint}${scopeHint}`;
+            : `${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?${targetHint}${guardHint}${scopeHint}`;
           replyResult = await bounded(waitForHuman(opts, life, () => Promise.resolve().then(() => opts.confirm(
             question,
             runSignal,

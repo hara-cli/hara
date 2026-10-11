@@ -22,7 +22,7 @@
 //                                                   params.deliveryCursor:{streamId,sequence}. Private terminal
 //                                                   stream frames keep their stream-specific snapshot contract.
 //   events.snapshot   {sessionIds:[…]}             → {streamId,throughSequence,taskStates,workforceStates,
-//                                                    externalTurns,externalQuestions,approvals}; a bounded authoritative recovery
+//                                                    externalTurns,externalQuestions,approvals,agentQuestions?,agentApprovals?}; a bounded authoritative recovery
 //                                                    fence. Clients apply it before buffered events newer than
 //                                                    throughSequence, so reconnect never depends on replay alone.
 //   session.list      {cwd?,cursor?,limit?,archived?} → {sessions:[{id,title,cwd,model,profileId?,updatedAt}],
@@ -37,6 +37,10 @@
 //   external.sessions.create {sourceId:"runtime",cwd,agentKind:"codex"|"claude",title?}
 //                                                   → {session,messages,readOnly:false,controlMode:"live"}
 //   external.sessions.read {sessionId}              → {session,messages:[{id,role,text}],readOnly:boolean}
+//   session.coding-link.get {sessionId}              → {link:null|{sessionId,sourceId,workspaceId,title,revision,linkedAt},target?,available?}
+//   session.coding-link.set {sessionId,targetSessionId:null|string,expectedRevision:null|string} → same
+//     A user-selected per-conversation address, never an execution grant. No resume/fork/launch occurs.
+//     connected_coding_session sends only to that address after a fresh one-action approval.
 //   external.sessions.resume {sessionId}            → {session,messages,readOnly:false,controlMode:"managed"|"live"}
 //   external.sessions.fork {sessionId}              → {sourceSessionId,session,messages,readOnly:false}
 //   external.sessions.submit {sessionId,text,commandId?}
@@ -72,6 +76,26 @@
 //     Reconnect restores pending cards only for requested parent chats within the unchanged deadline.
 //     These structured worker APIs do not expose session creation authority through Serve; old live PTYs
 //     must be explicitly released before resuming their exact provider identity with structured input.
+//   agent.question.request / agent.question.reply / agent.question.resolved
+//   agent.approval.request / agent.approval.reply / agent.approval.resolved
+//     Persistent colleagues use the same bounded question and single-action approval shapes above, but
+//     sessionId + turnId are the exact internal child UUIDs, never invented external provider IDs. Requires
+//     agent.delegated-interaction.v1 + external.questions.v1 captured on the human-started root turn.
+//     Requests carry interactionKind:"agent", root parentSessionId, host-bound agentPath, executorAgentRef
+//     and executorDisplayName. All are presentation metadata, not caller-selected routing/authority.
+//     Replies accept only the original child identity and decision (plus commandId and, when held, the
+//     initiating conversation's controlLease); always/forTask are forbidden for these approvals. The host
+//     revalidates the complete live parent chain, role/Space/provider policy and current root input lease.
+//     Pending colleague requests recover only under agentQuestions/agentApprovals for explicitly requested
+//     root chats, not legacy externalQuestions/approvals or child snapshots. Native coding workers under a
+//     colleague retain the external.* methods and true external identity, add the actual colleague's
+//     executor metadata, and require BOTH delegated-interaction features plus the root input lease.
+//     A later compatible observer cannot upgrade a legacy root turn's consent. Cancel/expiry/shutdown or
+//     successful host policy mutation denies/cancels old input without choosing a model-supplied default.
+//     agent_followup is a supervised chat tool, not a new renderer RPC or a group/full-auto bridge.
+//     A fresh single-action card activates one exact same-sender Feishu reply thread on this host.
+//     Durable ownership/receipts do not restore execution consent after Serve/client replacement;
+//     disconnect, takeover, policy/suspension changes and explicit stop pause/revoke its live closure.
 //                      commandId is a client UUID. A private started receipt is durable before the provider
 //                      action; matching terminal results replay across reconnect and Serve restart. A crash
 //                      window blocks mutation until read/resume observes the authoritative provider session

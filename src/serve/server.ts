@@ -26,6 +26,7 @@ import { homedir, platform } from "node:os";
 import { basename, isAbsolute, join, relative, sep } from "node:path";
 import "../tools/all.js"; // register the full built-in toolset — serve must work as a standalone entry
 import { pruneStoredToolResults } from "../tools/result-limit.js";
+import { NO_INTERACTIVE_USER } from "../tools/ask_user.js";
 import type { AgentCreationApproval, Tool } from "../tools/registry.js";
 import { createAgentCreationTool } from "./agent-creator.js";
 import { createServeRuntimeLogger, serveRuntimeFailureCategory } from "./runtime-log.js";
@@ -328,9 +329,14 @@ import { executeExternalCodingAgent } from "../subagent/external.js";
 import { createCodingHostBridge, type CodingHostBridge } from "../coding/host.js";
 import { createCodingToolset } from "../coding/tools.js";
 import { createCodingContinuationStore } from "../coding/continuations.js";
+import { beginAgentDispatch, claimAgentDispatch, type AgentDispatchContext } from "./agent-dispatch.js";
+import { AgentFollowupStore, type AgentFollowupGrant } from "../gateway/agent-followup.js";
+import { createAgentFollowupTool } from "./agent-followup.js";
+import { codingLinkTargetAvailable, createConnectedCodingSessionTool, isConversationCodingLink, type ConversationCodingLinkView } from "./coding-link.js";
 import type { CodingSettingsInput, CodingSettingsState } from "../coding-settings.js";
 import {
   ExternalSessionInputError,
+  ExternalSessionDeliveryUnknownError,
   type ExternalRuntimeLaunchOptions,
   type ExternalSessionService,
   type ExternalSessionSourceId,
@@ -1430,6 +1436,7 @@ export const MAX_SERVE_SOCKET_BUFFERED_BYTES = 4 * 1024 * 1024;
 export const MAX_SESSION_RUNTIME_REPLAY_PAGE = 256;
 const EXTERNAL_TERMINAL_HANDOFF_FEATURE = "external.sessions.terminal-handoff.v1";
 const EXTERNAL_DELEGATED_INTERACTION_FEATURE = "external.delegated-interaction.v1";
+const AGENT_DELEGATED_INTERACTION_FEATURE = "agent.delegated-interaction.v1";
 const EXTERNAL_TERMINAL_HANDOFF_TIMEOUT_MS = 3_000;
 
 interface BoundedSocketWriter {
@@ -2167,9 +2174,18 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     turnId: string;
     originallyNegotiated: boolean;
     isCurrent: () => boolean;
+    /** Agent input has its own RPC contract; never masquerade as a provider-native session. */
+    interactionKind?: "agent";
+    executorAgentRef?: string;
+    executorDisplayName?: string;
+    nativeInputNegotiated?: boolean;
   }
+  const colleagueInputTurns = new Map<string, ExternalDelegationContext>();
+  // Configuration revocation is not a socket disconnect. Pending single-use input may survive a
+  // compatible reconnect, but never a host policy/provider mutation that happened during its task.
+  let delegationPolicyEpoch = 0;
   // Feature consent belongs to a human-started logical parent turn, not an Agent's tool arguments.
-  const delegatedInputTurns = new Map<string, { turnId: string; negotiated: boolean }>();
+  const delegatedInputTurns = new Map<string, { turnId: string; negotiated: boolean; agentNegotiated: boolean }>();
   const pendingApprovals = new Map<string, {
     finish: (v: boolean | "always", outcome?: SessionApprovalOutcome) => void;
     allowAlways: boolean;
@@ -2290,6 +2306,28 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const controlLeases = new ControlLeaseRegistry<WebSocket>();
   let closing = false;
   let closePromise: Promise<void> | null = null;
+  const agentFollowups = new AgentFollowupStore(deps.agentTeamHome ?? deps.discoveryHome ?? homedir());
+  // A durable record is not a restored execution grant. Only a live human-approved closure can populate
+  // this map. Disconnect, takeover, shutdown or policy change invalidates it; reboot never reruns work.
+  const followupActivations = new Map<string, {
+    grant: AgentFollowupGrant; target: ServeSession; owner: WebSocket; controller: AbortController;
+    dispatch: AgentDispatchContext; isCurrent: () => boolean; running: boolean;
+  }>();
+  let followupTimer: ReturnType<typeof setInterval> | undefined;
+  const stopFollowup = (id: string, parentSessionId: string, status: "paused" | "revoked" = "revoked"): void => {
+    agentFollowups.stop(id, parentSessionId, status);
+    const activation = followupActivations.get(id);
+    activation?.controller.abort(new Error("Agent follow-up stopped"));
+    followupActivations.delete(id);
+  };
+  const pauseFollowups = (parentSessionId?: string, owner?: WebSocket): void => {
+    for (const [id, activation] of followupActivations) {
+      if (parentSessionId && activation.grant.parentSessionId !== parentSessionId && activation.grant.sessionId !== parentSessionId) continue;
+      if (owner && activation.owner !== owner) continue;
+      try { stopFollowup(id, activation.grant.parentSessionId, "paused"); }
+      catch { activation.controller.abort(); followupActivations.delete(id); }
+    }
+  };
 
   const trackActiveOperation = <T>(operation: Promise<T>): Promise<T> => {
     activeOperations.add(operation);
@@ -2476,9 +2514,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     );
 
   const canReceiveEvent = (ws: WebSocket, method: string, params: Record<string, unknown>): boolean => (
-    !(method.startsWith("external.") && typeof params.parentSessionId === "string")
+    method.startsWith("agent.") && typeof params.parentSessionId === "string"
+      ? externalSessionSpaceId() === "personal" && clientFeatures.get(ws)?.has(AGENT_DELEGATED_INTERACTION_FEATURE) === true
+        && clientFeatures.get(ws)?.has(EXTERNAL_USER_QUESTIONS_FEATURE) === true
+      : !(method.startsWith("external.") && typeof params.parentSessionId === "string")
     || (externalSessionSpaceId() === "personal"
-      && clientFeatures.get(ws)?.has(EXTERNAL_DELEGATED_INTERACTION_FEATURE) === true)
+      && clientFeatures.get(ws)?.has(EXTERNAL_DELEGATED_INTERACTION_FEATURE) === true
+      && (params.executorAgentRef === undefined || clientFeatures.get(ws)?.has(AGENT_DELEGATED_INTERACTION_FEATURE) === true))
   );
   const broadcast = (method: string, params: Record<string, unknown>): void => {
     const { frame } = eventReplay.publish(method, params);
@@ -2615,16 +2657,31 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   // Adapter turn identifiers never cross Serve. Keep the one active wire id per opaque session so a
   // follow-up (`steer`) is correlated with the same stream that Desktop is already rendering.
   const externalWireTurns = new Map<string, string>();
+  const connectedCodingControllers = new Map<string, AbortController>();
   const delegationIsCurrent = (context: ExternalDelegationContext): boolean => {
     try { return context.isCurrent(); } catch { return false; }
   };
   const delegatedPresentation = (context?: ExternalDelegationContext) => context ? {
     parentSessionId: context.parentSessionId, agentPath: context.agentPath,
+    ...(context.interactionKind ? { interactionKind: context.interactionKind } : {}),
+    ...(context.executorAgentRef ? { executorAgentRef: context.executorAgentRef,
+      executorDisplayName: context.executorDisplayName } : {}),
   } : {};
+  const inputMethod = (context: ExternalDelegationContext | undefined, suffix: string): string =>
+    `${context?.interactionKind === "agent" ? "agent" : "external"}.${suffix}`;
+  const inputTurnIsCurrent = (sessionId: string, turnId: string, context?: ExternalDelegationContext): boolean =>
+    context?.interactionKind === "agent"
+      ? colleagueInputTurns.get(sessionId) === context && context.turnId === turnId && delegationIsCurrent(context)
+      : externalWireTurns.get(sessionId) === turnId;
+  const clientSupportsInput = (client: WebSocket, delegation?: ExternalDelegationContext): boolean =>
+    !delegation || (clientFeatures.get(client)?.has(delegation.interactionKind === "agent"
+      ? AGENT_DELEGATED_INTERACTION_FEATURE : EXTERNAL_DELEGATED_INTERACTION_FEATURE) === true
+      && (!delegation.executorAgentRef || clientFeatures.get(client)?.has(AGENT_DELEGATED_INTERACTION_FEATURE) === true));
   const hasExternalInputResponder = (delegation?: ExternalDelegationContext, question = false): boolean => (
     externalSessionSpaceId() === "personal"
     && [...authed].some((client) => (!question || clientFeatures.get(client)?.has(EXTERNAL_USER_QUESTIONS_FEATURE))
-      && (!delegation || clientFeatures.get(client)?.has(EXTERNAL_DELEGATED_INTERACTION_FEATURE)))
+      && clientSupportsInput(client, delegation)
+      && (delegation?.interactionKind !== "agent" || clientFeatures.get(client)?.has(EXTERNAL_USER_QUESTIONS_FEATURE)))
   );
   const externalQuestionForClient = (questionId: string, pending: PendingExternalQuestion) => ({
     questionId,
@@ -2705,9 +2762,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     const hasCompatibleResponder = hasExternalInputResponder(delegation, true);
     if (!normalized || !originallyNegotiated || !hasCompatibleResponder
       || (delegation && (!delegation.originallyNegotiated || !delegationIsCurrent(delegation)))
-      || signal.aborted || externalWireTurns.get(sessionId) !== turnId || externalSessionSpaceId() !== "personal") {
-      broadcast("external.event.notice", {
-        sessionId, turnId, text: "User input cannot be safely collected by this client; no answer was selected. Update Hara or use the original terminal.",
+      || signal.aborted || !inputTurnIsCurrent(sessionId, turnId, delegation) || externalSessionSpaceId() !== "personal") {
+      broadcast(delegation?.interactionKind === "agent" ? "event.notice" : "external.event.notice", {
+        sessionId, turnId, text: delegation?.interactionKind === "agent"
+          ? "User input cannot be safely collected by this client; no answer was selected. Use an updated Hara client to continue in the initiating conversation."
+          : "User input cannot be safely collected by this client; no answer was selected. Update Hara or use the original terminal.",
       });
       return Promise.resolve({});
     }
@@ -2728,7 +2787,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           clearTimeout(questionReconnectTimer);
           questionReconnectTimer = null;
         }
-        broadcast("external.question.resolved", { questionId, sessionId, turnId, outcome, ...delegatedPresentation(delegation) });
+        broadcast(inputMethod(delegation, "question.resolved"), { questionId, sessionId, turnId, outcome, ...delegatedPresentation(delegation) });
         resolve(answers);
       };
       const onAbort = (): void => finish({}, "interrupted");
@@ -2740,7 +2799,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       reconcilePendingInputReconnect();
       signal.addEventListener("abort", onAbort, { once: true });
       if (signal.aborted) onAbort();
-      else broadcast("external.question.request", externalQuestionForClient(questionId, pending));
+      else broadcast(inputMethod(delegation, "question.request"), externalQuestionForClient(questionId, pending));
     });
   };
   const confirmExternalSessionAction = (
@@ -2780,7 +2839,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   ): Promise<boolean> => {
     if (closing || signal.aborted || !delegation.originallyNegotiated
       || !delegationIsCurrent(delegation) || !hasExternalInputResponder(delegation)
-      || externalWireTurns.get(sessionId) !== delegation.turnId) return Promise.resolve(false);
+      || !inputTurnIsCurrent(sessionId, delegation.turnId, delegation)) return Promise.resolve(false);
     return new Promise((resolve) => {
       const approvalId = randomUUID();
       const turnId = delegation.turnId;
@@ -2788,6 +2847,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         ? Math.max(1, Math.min(APPROVAL_TIMEOUT_MS, Math.trunc(deps.externalUserQuestionTimeoutMs))) : APPROVAL_TIMEOUT_MS;
       const expiresAt = new Date(Date.now() + timeoutMs).toISOString();
       const deadlineMonotonic = performance.now() + timeoutMs;
+      const agentTask = delegation.interactionKind === "agent" ? hub.get(sessionId)?.task : undefined;
+      const taskIdentity = agentTask ? { taskId: agentTask.id, turnId: agentTask.turnId } : undefined;
       let settled = false;
       const finish = (value: boolean | "always", outcome?: SessionApprovalOutcome): void => {
         if (settled) return;
@@ -2795,7 +2856,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         clearTimeout(timer);
         signal.removeEventListener("abort", onAbort);
         pendingApprovals.delete(approvalId);
-        broadcast("external.approval.resolved", { approvalId, sessionId, turnId,
+        if (taskIdentity) hub.recordApprovalState({ sessionId, approvalId, ...taskIdentity, allowAlways: false,
+          state: "resolved", outcome: outcome ?? (value === true ? "allowed" : "denied") });
+        broadcast(inputMethod(delegation, "approval.resolved"), { approvalId, sessionId, turnId,
           ...delegatedPresentation(delegation),
           outcome: outcome === "timed_out" ? "timed_out" : outcome === "interrupted" ? "interrupted"
             : value === true ? "answered" : "cancelled" });
@@ -2805,12 +2868,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       const onAbort = (): void => finish(false, "interrupted");
       const timer = setTimeout(() => finish(false, "timed_out"), timeoutMs);
       timer.unref();
-      pendingApprovals.set(approvalId, { finish, scope: "external", sessionId, question, allowAlways: false,
+      pendingApprovals.set(approvalId, { finish, scope: taskIdentity ? "session" : "external", sessionId, question, allowAlways: false,
         delegation, expiresAt, deadlineMonotonic });
       signal.addEventListener("abort", onAbort, { once: true });
       if (signal.aborted) onAbort();
-      else broadcast("external.approval.request", { approvalId, sessionId, turnId, question, allowAlways: false,
-        expiresAt, ...delegatedPresentation(delegation) });
+      else {
+        if (taskIdentity) hub.recordApprovalState({ sessionId, approvalId, ...taskIdentity, allowAlways: false, state: "requested" });
+        broadcast(inputMethod(delegation, "approval.request"), { approvalId, sessionId, turnId, question, allowAlways: false,
+          expiresAt, ...delegatedPresentation(delegation) });
+      }
       reconcilePendingInputReconnect();
     });
   };
@@ -3040,13 +3106,20 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 codingSessionId = opaqueId;
                 codingTurnId = `extturn_${randomUUID()}`;
                 const consent = delegatedInputTurns.get(session.meta.id);
+                const colleague = colleagueInputTurns.get(session.meta.id);
                 delegation = {
-                  parentSessionId: session.meta.id, agentPath: request.path, turnId: codingTurnId,
-                  originallyNegotiated: Boolean(consent && consent.turnId === turnId && consent.negotiated),
+                  parentSessionId: colleague?.parentSessionId ?? session.meta.id,
+                  agentPath: colleague ? `${colleague.agentPath}${request.path.replace(/^\/root/u, "")}` : request.path,
+                  turnId: codingTurnId,
+                  ...(colleague ? { executorAgentRef: colleague.executorAgentRef,
+                    executorDisplayName: colleague.executorDisplayName } : {}),
+                  originallyNegotiated: Boolean(consent && consent.turnId === turnId && consent.negotiated
+                    && (!colleague || colleague.nativeInputNegotiated)),
                   isCurrent: () => {
                     const current = sessionSpaceBinding(session.meta);
                     const currentConsent = delegatedInputTurns.get(session.meta.id);
                     return !closing && !codingSignal.aborted && hub.get(session.meta.id) === session
+                      && (!colleague || delegationIsCurrent(colleague))
                       && Boolean(taskId && turnId) && session.task?.id === taskId && session.task?.turnId === turnId
                       && Boolean(currentConsent && currentConsent.turnId === turnId && currentConsent.negotiated)
                       && current.spaceId === "personal" && current.profileId === binding.profileId
@@ -3497,6 +3570,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     displayText = text,
     taskApprovalsNegotiated = false,
     taskApprovalOwner?: WebSocket,
+    contactDispatch?: AgentDispatchContext,
   ): Promise<{
     reply: string;
     usage: {
@@ -3514,6 +3588,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     stopReason?: "deadline" | "task_round_budget" | "max_rounds" | "strategy_stall" | "no_progress" | "repeat_loop" | "completion_verification";
   }> => {
     const sessionId = s.meta.id;
+    const turnDelegationEpoch = delegationPolicyEpoch;
+    if (contactDispatch && (contactDispatch.signal.aborted || !contactDispatch.isCurrent())) {
+      throw new Error("agent_dispatch_parent_inactive");
+    }
     // Continuing or replacing a logical task never resumes prior execution grants.
     revokeTaskApprovals(sessionId);
     let taskExecution: { agentId: string; isCurrent: () => boolean } | undefined;
@@ -3527,6 +3605,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     s.projectContext = loadAgentContext(s.meta.cwd) || undefined;
     s.busy = true;
     const turnAbort = new AbortController();
+    const abortFromContact = (): void => { turnAbort.abort(contactDispatch?.signal.reason); };
+    contactDispatch?.signal.addEventListener("abort", abortFromContact, { once: true });
     s.abort = turnAbort;
     let interaction: TaskInteraction;
     let executionContext: string;
@@ -3557,9 +3637,35 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       const inputNegotiated = Boolean(taskApprovalOwner
         && clientFeatures.get(taskApprovalOwner)?.has(EXTERNAL_DELEGATED_INTERACTION_FEATURE)
         && clientFeatures.get(taskApprovalOwner)?.has(EXTERNAL_USER_QUESTIONS_FEATURE));
+      const agentInputNegotiated = Boolean(taskApprovalOwner
+        && clientFeatures.get(taskApprovalOwner)?.has(AGENT_DELEGATED_INTERACTION_FEATURE)
+        && clientFeatures.get(taskApprovalOwner)?.has(EXTERNAL_USER_QUESTIONS_FEATURE));
       delegatedInputTurns.set(sessionId, { turnId: interaction.turnId,
         negotiated: previousConsent?.turnId === interaction.turnId
-          ? previousConsent.negotiated && inputNegotiated : inputNegotiated });
+          ? previousConsent.negotiated && inputNegotiated : inputNegotiated,
+        agentNegotiated: previousConsent?.turnId === interaction.turnId
+          ? previousConsent.agentNegotiated && agentInputNegotiated : agentInputNegotiated });
+      if (contactDispatch) {
+        const identity = serveAgentCatalog(s.meta.cwd, spaceBinding.runtime.organizationProfileId ?? spaceBinding.profileId,
+          spaceBinding.spaceId).agents.find((agent) => agent.ref === s.meta.agentRef);
+        const rolePolicy = JSON.stringify(roleForSession(s));
+        colleagueInputTurns.set(sessionId, {
+          parentSessionId: contactDispatch.rootSessionId,
+          agentPath: `/root/${contactDispatch.chain.slice(1).join("/")}`,
+          turnId: interaction.turnId, interactionKind: "agent",
+          executorAgentRef: s.meta.agentRef,
+          executorDisplayName: redactSensitiveText(identity?.identity.displayName ?? s.meta.agentRef ?? "Agent").text.slice(0, 160),
+          originallyNegotiated: contactDispatch.interactionNegotiated,
+          nativeInputNegotiated: contactDispatch.interactionNegotiated && contactDispatch.nativeInputNegotiated,
+          isCurrent: () => {
+            const current = sessionSpaceBinding(s.meta);
+            return !closing && !turnAbort.signal.aborted && delegationPolicyEpoch === turnDelegationEpoch && contactDispatch.isCurrent()
+              && hub.get(sessionId) === s && s.abort === turnAbort && s.busy && s.task?.turnId === interaction.turnId
+              && current.profileId === spaceBinding.profileId && current.spaceId === spaceBinding.spaceId
+              && JSON.stringify(roleForSession(s)) === rolePolicy;
+          },
+        });
+      }
       cancelDelegatedInput(sessionId);
       hub.save(s); // crash-safe running identity before provider/tool side effects
       const userMessageItemId = `message:user:${interaction.turnId}`;
@@ -3580,6 +3686,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       // transient snapshot/config error cannot wedge it in a permanently busy, non-interruptible state.
       s.abort = null;
       s.busy = false;
+      colleagueInputTurns.delete(sessionId);
+      contactDispatch?.signal.removeEventListener("abort", abortFromContact);
       throw error;
     }
     let lastTaskStateSignature = "";
@@ -3667,8 +3775,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         summary: string; toolFamily: TaskApprovalFamily; durationMs: number;
         grantFromHuman: () => boolean; isActive: () => boolean;
       } } = {},
-    ): Promise<boolean | "always"> =>
-      new Promise((resolve) => {
+    ): Promise<boolean | "always"> => {
+      const colleague = colleagueInputTurns.get(sessionId);
+      if (colleague) return confirmDelegatedAction(sessionId, q, signal, colleague);
+      return new Promise((resolve) => {
         if (closing || signal.aborted) { resolve(false); return; }
         const approvalId = randomUUID();
         const allowAlways = options.allowAlways === true;
@@ -3759,6 +3869,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           }
         }
       });
+    };
     let stopTodoEvents = (): void => {};
     try {
       if (!(await refreshSessionProvider(s))) {
@@ -3815,6 +3926,70 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         : undefined;
       sessionSpaceBinding(s.meta);
       const sessionRoleToolFilter = roleToolFilter(sessionRole);
+      const linkedTarget = s.meta.codingSessionLink;
+      const linkedTurnId = s.task!.turnId;
+      const linkedController = new AbortController();
+      const assertLinkedCurrent = (): void => {
+        const binding = sessionSpaceBinding(s.meta);
+        if (closing || turnAbort.signal.aborted || linkedController.signal.aborted || hub.get(sessionId) !== s
+          || binding.spaceId !== "personal" || binding.profileId !== spaceBinding.profileId
+          || externalSessionSpaceId() !== "personal" || s.task?.turnId !== linkedTurnId
+          || !linkedTarget || s.meta.codingSessionLink?.revision !== linkedTarget.revision) {
+          throw new Error("coding_link_no_longer_current");
+        }
+      };
+      const connectedCodingTool = isConversationCodingLink(linkedTarget) && s.meta.spaceId === "personal"
+        && !sessionRole?.readOnly && sessionRoleToolFilter?.("connected_coding_session") !== false
+        ? createConnectedCodingSessionTool({
+          link: linkedTarget, parentSessionId: sessionId, turnId: linkedTurnId,
+          targetLabel: linkedTarget.title,
+          assertCurrent: assertLinkedCurrent,
+          read: () => externalSessions.readSession(linkedTarget.sessionId),
+          send: (message, commandId, signal) => runIdempotentExternalCommand("external.sessions.submit", {
+            sessionId: linkedTarget.sessionId, text: message, commandId,
+            parentSessionId: sessionId, parentTurnId: linkedTurnId, linkRevision: linkedTarget.revision,
+          }, linkedTarget.sessionId, async () => {
+            assertLinkedCurrent();
+            if (externalWireTurns.has(linkedTarget.sessionId)) throw new Error("coding_link_target_busy");
+            const codingTurnId = `extturn_${randomUUID()}`;
+            const combined = AbortSignal.any([turnAbort.signal, linkedController.signal, ...(signal ? [signal] : [])]);
+            const consent = delegatedInputTurns.get(sessionId);
+            const delegation: ExternalDelegationContext = {
+              parentSessionId: sessionId, agentPath: "/root/connected-session", turnId: codingTurnId,
+              originallyNegotiated: Boolean(consent?.turnId === linkedTurnId && consent.negotiated),
+              isCurrent: () => {
+                assertLinkedCurrent();
+                return !combined.aborted && externalWireTurns.get(linkedTarget.sessionId) === codingTurnId;
+              },
+            };
+            if (!delegation.originallyNegotiated) throw new Error("coding_link_compatible_client_required");
+            externalWireTurns.set(linkedTarget.sessionId, codingTurnId);
+            connectedCodingControllers.set(sessionId, linkedController);
+            try {
+              assertLinkedCurrent();
+              const result = await externalSessions.submit(linkedTarget.sessionId, message, {
+                signal: combined,
+                existingSessionMessage: true,
+                // The parent tool invocation and its receipt describe this delivery. Publishing a
+                // native turn start/end would impersonate the original controller, repaint another
+                // session's UI and trigger an automatic read that could clear an uncertainty barrier.
+                text: () => {}, tool: () => {}, notice: () => {},
+                confirm: (request, nativeSignal) => confirmDelegatedAction(linkedTarget.sessionId, request.question, nativeSignal, delegation),
+                askUser: (request, nativeSignal) => askExternalUser(delegation.originallyNegotiated, linkedTarget.sessionId, codingTurnId, request, nativeSignal, delegation),
+              });
+              return { sessionId: linkedTarget.sessionId, turnId: codingTurnId, commandId,
+                status: result.delivery === "accepted" ? "accepted" : result.status,
+                reply: redactSensitiveText(result.reply).text.slice(0, 8_000) };
+            } finally {
+              cancelExternalQuestions(linkedTarget.sessionId, codingTurnId);
+              for (const pending of [...pendingApprovals.values()]) {
+                if (pending.delegation === delegation) pending.finish(false, "interrupted");
+              }
+              if (externalWireTurns.get(linkedTarget.sessionId) === codingTurnId) externalWireTurns.delete(linkedTarget.sessionId);
+              if (connectedCodingControllers.get(sessionId) === linkedController) connectedCodingControllers.delete(sessionId);
+            }
+          }),
+        }) : undefined;
       const agentCreationTool = !s.meta.agentRef && s.meta.spaceId === "personal"
         ? createAgentCreationTool({
             assertPersonalRoot: () => {
@@ -3836,12 +4011,30 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             },
           })
         : undefined;
-      const agentContactTool: Tool | undefined = s.meta.agentRef ? undefined : {
+      const dispatchTurnId = s.task!.turnId;
+      const dispatchPolicy = JSON.stringify([spaceBinding.profileId, spaceBinding.spaceId, s.approval, roleForSession(s)]);
+      const dispatchCurrent = (): boolean => {
+        const current = sessionSpaceBinding(s.meta);
+        return !closing && hub.get(sessionId) === s && s.task?.turnId === dispatchTurnId
+          && s.busy && !turnAbort.signal.aborted && delegationPolicyEpoch === turnDelegationEpoch
+          && JSON.stringify([current.profileId, current.spaceId, s.approval, roleForSession(s)]) === dispatchPolicy;
+      };
+      const dispatch = contactDispatch ? { ...contactDispatch,
+        isCurrent: () => contactDispatch.isCurrent() && dispatchCurrent() } : beginAgentDispatch({
+        sessionId, turnId: dispatchTurnId, agentRef: s.meta.agentRef ?? "main", signal: turnAbort.signal,
+        isCurrent: dispatchCurrent,
+        interactionNegotiated: delegatedInputTurns.get(sessionId)?.agentNegotiated === true,
+        nativeInputNegotiated: delegatedInputTurns.get(sessionId)?.negotiated === true,
+      });
+      const agentContactTool: Tool | undefined = sessionRole?.readOnly
+        || sessionRoleToolFilter?.("agent_contact") === false ? undefined : {
         name: "agent_contact",
         description:
           "List or message persistent Hara Agent contacts in the current Space. "
           + "When the user names an internal Agent, use this before channel_message; channel_message is only for external Feishu/WeChat recipients. "
-          + "Each message starts an auditable execution segment in that Agent's authorized workspace while the UI keeps one stable Agent contact.",
+          + "Any authorized persistent colleague may delegate; the main Hara Agent is a fallback, not a mandatory hop. "
+          + "Respect the user's named owner. Each message starts an auditable execution segment in the recipient's authorized workspace; "
+          + "it never transfers credentials, external-session bindings or approvals. Delegation is bounded to 3 hops and 8 dispatches per root turn; never bounce tasks back to an ancestor.",
         input_schema: {
           type: "object",
           properties: {
@@ -3913,8 +4106,26 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           if (toolContext.signal?.aborted) return "Error: Agent message cancelled before delivery.";
           const contact = matches[0]!;
           let target: ServeSession | undefined;
+          let claim: ReturnType<typeof claimAgentDispatch>;
+          try {
+            claim = claimAgentDispatch(dispatch, contact.ref);
+          } catch (error) {
+            return JSON.stringify({ status: "not_delivered", recipient: { ref: contact.ref },
+              reasonCode: error instanceof Error ? error.message : "agent_dispatch_refused",
+              instruction: "Do not retry or reroute around this bound. Report the handoff limit to the user." });
+          }
           try {
             target = await createAgentContactSession(s, contact.ref);
+            if (toolContext.signal?.aborted || dispatch.signal.aborted || !dispatch.isCurrent()) {
+              hub.detach(target.meta.id);
+              return JSON.stringify({ status: "cancelled", reasonCode: "agent_dispatch_parent_inactive" });
+            }
+            target.meta.agentDelegation = {
+              rootSessionId: dispatch.rootSessionId, rootTurnId: dispatch.rootTurnId,
+              parentSessionId: sessionId, parentTurnId: dispatchTurnId,
+              fromAgentRef: s.meta.agentRef ?? "main", toAgentRef: contact.ref,
+              depth: claim.context.chain.length - 1,
+            };
             broadcast("event.session_changed", {
               sessionId: target.meta.id,
               change: "created",
@@ -3926,7 +4137,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             };
             toolContext.signal?.addEventListener("abort", cancelTarget, { once: true });
             try {
-              const result = await runTurn(target, message, undefined, true, message);
+              const result = await runTurn(target, message, undefined, true, message,
+                false, taskApprovalOwner, claim.context);
               broadcast("event.session_changed", {
                 sessionId: target.meta.id,
                 change: "agent_contact_completed",
@@ -3934,9 +4146,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 agentRef: contact.ref,
               });
               return JSON.stringify({
-                status: "completed",
+                status: result.status === "paused" ? "paused" : "completed",
                 recipient: { ref: contact.ref, displayName: contact.identity.displayName },
                 sessionId: target.meta.id,
+                taskId: result.taskId,
+                turnId: result.turnId,
+                ownerAgentRef: contact.ref,
+                rootSessionId: dispatch.rootSessionId,
                 reply: redactSensitiveText(result.reply).text.slice(0, 8_000),
               });
             } finally {
@@ -3973,9 +4189,65 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                   ? "Open the Agent conversation and explicitly authorize an available workspace in the current Space."
                   : "Open the Agent conversation to review its task state and retry.",
             });
+          } finally {
+            claim.release();
           }
         },
       };
+      const followupParentId = contactDispatch?.rootSessionId ?? sessionId;
+      const followupTool = spaceBinding.spaceId === "personal" && !sessionRole?.readOnly
+        && sessionRoleToolFilter?.("agent_followup") !== false && !contactDispatch?.followup
+        ? createAgentFollowupTool({
+          store: agentFollowups, parentSessionId: followupParentId, agentRef: s.meta.agentRef ?? "main",
+          isActive: (id) => followupActivations.get(id)?.isCurrent() === true,
+          assertCurrent: () => {
+            if (!dispatchCurrent() || (contactDispatch && !contactDispatch.isCurrent())) throw new Error("follow-up request is no longer current");
+          },
+          stop: (id) => stopFollowup(id, followupParentId),
+          grant: (candidateId, minutes, maxMessages) => {
+            if (!dispatchCurrent() || (contactDispatch && !contactDispatch.isCurrent())) throw new Error("follow-up request cancelled");
+            const parent = hub.get(followupParentId);
+            const owner = taskApprovalOwner;
+            if (!parent || !owner || !authed.has(owner) || owner.readyState !== owner.OPEN
+              || !clientFeatures.get(owner)?.has(AGENT_DELEGATED_INTERACTION_FEATURE)
+              || !clientFeatures.get(owner)?.has(EXTERNAL_USER_QUESTIONS_FEATURE)
+              || !delegatedInputTurns.get(sessionId)?.agentNegotiated
+              || (contactDispatch && !contactDispatch.interactionNegotiated)) throw new Error("a compatible live human controller is required");
+            // Never create a lease unknown to the renderer or silently take over another controller.
+            // A later first acquisition also invalidates a legacy no-lease activation.
+            const lease = controlLeases.captureOwned(sessionControlResource(followupParentId), owner);
+            const policy = JSON.stringify([roleForSession(s), roleForSession(parent), s.meta.model, s.effort, s.approval, s.meta.codingSessionLink]);
+            const epoch = delegationPolicyEpoch;
+            const controller = new AbortController();
+            let grant: AgentFollowupGrant | undefined;
+            const isCurrent = (): boolean => {
+              if (!grant || closing || controller.signal.aborted || !authed.has(owner) || owner.readyState !== owner.OPEN
+                || !clientFeatures.get(owner)?.has(AGENT_DELEGATED_INTERACTION_FEATURE)
+                || !clientFeatures.get(owner)?.has(EXTERNAL_USER_QUESTIONS_FEATURE)
+                || hub.get(followupParentId) !== parent || hub.get(sessionId) !== s || delegationPolicyEpoch !== epoch
+                || externalSessionSpaceId() !== "personal") return false;
+              try {
+                controlLeases.authorize(sessionControlResource(followupParentId), owner, lease);
+                const binding = sessionSpaceBinding(s.meta), rootBinding = sessionSpaceBinding(parent.meta);
+                const current = agentFollowups.get(grant.id);
+                return binding.spaceId === "personal" && rootBinding.spaceId === "personal"
+                  && binding.profileId === spaceBinding.profileId && rootBinding.profileId === spaceBinding.profileId
+                  && current?.status === "active" && current.expiresAt > Date.now()
+                  && JSON.stringify([roleForSession(s), roleForSession(parent), s.meta.model, s.effort, s.approval, s.meta.codingSessionLink]) === policy;
+              } catch { return false; }
+            };
+            grant = agentFollowups.grant(candidateId, { sessionId, parentSessionId: followupParentId,
+              agentRef: s.meta.agentRef ?? "main", profileId: spaceBinding.profileId, spaceId: "personal", cwd: s.meta.cwd }, minutes, maxMessages);
+            const liveDispatch = beginAgentDispatch({ sessionId: followupParentId, turnId: contactDispatch?.rootTurnId ?? dispatchTurnId,
+              agentRef: parent.meta.agentRef ?? "main", signal: controller.signal, isCurrent,
+              interactionNegotiated: true, nativeInputNegotiated: contactDispatch?.nativeInputNegotiated
+                ?? delegatedInputTurns.get(sessionId)?.negotiated === true });
+            followupActivations.set(grant.id, { grant, target: s, owner, controller,
+              dispatch: { ...liveDispatch, followup: true, chain: contactDispatch?.chain ?? [s.meta.agentRef ?? "main"] },
+              isCurrent, running: false });
+            return grant;
+          },
+        }) : undefined;
       const turnGuardian = deps.buildGuardian
         ? await deps.buildGuardian(s.meta.cwd, s.meta.profileId, s.meta.spaceId)
         : deps.guardian;
@@ -4152,6 +4424,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             ...(s.task?.turnId ? { parentTurnId: s.task.turnId, rootTurnId: s.task.turnId } : {}),
           }),
           ui: sink,
+          ...(contactDispatch ? { ask: async (question: string, options?: string[], signal?: AbortSignal): Promise<string> => {
+            const colleague = colleagueInputTurns.get(sessionId);
+            if (!colleague || !delegationIsCurrent(colleague)) return NO_INTERACTIVE_USER;
+            const answers = await askExternalUser(colleague.originallyNegotiated, sessionId, interaction.turnId,
+              { questions: [{ id: "decision", question, ...(options ? { options: options.map((label) => ({ label })) } : {}), isOther: true }] },
+              signal ?? turnAbort.signal, colleague);
+            return answers.decision?.answers[0] ?? NO_INTERACTIVE_USER;
+          } } : {}),
           toolImageMode: (imageProvider) => {
             sessionSpaceBinding(s.meta);
             const runtime = runtimeInfo(s.meta.cwd, s.meta.model, s.meta.profileId, s.meta.spaceId);
@@ -4230,19 +4510,23 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             },
           } : {}),
         },
-        approval: s.approval,
+        approval: contactDispatch?.followup ? "suggest" : s.approval,
         approvalChannel: true,
         confirm,
-        autoApprove: s.autoApprove,
-        projectApprovals: projectApprovalPolicy(s.meta.cwd),
+        autoApprove: contactDispatch?.followup ? new Set<string>() : s.autoApprove,
+        projectApprovals: contactDispatch?.followup ? undefined : projectApprovalPolicy(s.meta.cwd),
         projectContext: s.projectContext,
         memory: memoryDigest(s.meta.cwd, s.meta.spaceId),
         continuationSession: s.continuationSession,
         executionContext,
         ...(sessionRole ? { systemOverride: sessionRole.system } : {}),
-        ...(sessionRoleToolFilter ? { toolFilter: sessionRoleToolFilter } : {}),
-        ...(sessionRole?.readOnly ? { hooks: false } : {}),
-        extraTools: [agentContactTool, agentCreationTool].filter((tool): tool is Tool => Boolean(tool)),
+        ...(contactDispatch?.followup ? { toolFilter: (name: string) =>
+          ["read_file", "list_files", "search_files", "grep", "write_file", "edit_file", "bash", "python", "ask_user", "task_intake", "task_checkpoint", "todo_write", "connected_coding_session", "agent_contact"].includes(name)
+          && sessionRoleToolFilter?.(name) !== false,
+          hooks: false,
+        } : { ...(sessionRoleToolFilter ? { toolFilter: sessionRoleToolFilter } : {}),
+          ...(sessionRole?.readOnly ? { hooks: false } : {}) }),
+        extraTools: [agentContactTool, agentCreationTool, connectedCodingTool, followupTool].filter((tool): tool is Tool => Boolean(tool)),
         ...(slashSkillPolicy ? { skillPolicies: [slashSkillPolicy] } : {}),
         taskIntake: {
           task: s.task,
@@ -4449,6 +4733,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       });
       throw error;
     } finally {
+      colleagueInputTurns.delete(sessionId);
+      cancelDelegatedInput();
+      contactDispatch?.signal.removeEventListener("abort", abortFromContact);
       revokeTaskApprovals(sessionId);
       activeTaskExecutions.delete(sessionId);
       taskExecutionOwners.delete(sessionId);
@@ -4833,6 +5120,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     | "external.sessions.terminal.key"
     | "external.question.reply"
     | "external.approval.reply"
+    | "agent.question.reply"
+    | "agent.approval.reply"
     | "approval.reply";
 
   const externalCommandFromOutcome = (outcome: RemoteCommandOutcome): unknown => {
@@ -4939,6 +5228,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       try {
         result = await operation();
       } catch (error) {
+        if (error instanceof ExternalSessionDeliveryUnknownError) {
+          remoteCommandLedger.markOutcomeUnknown(commandId);
+          throw new SessionCommandRpcError(ERR.CONFLICT, "coding_link_delivery_unconfirmed");
+        }
         const failure = commandFailure(error);
         try {
           remoteCommandLedger.complete(commandId, {
@@ -5348,6 +5641,45 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     }
   };
 
+  const pollAgentFollowups = (): void => {
+    if (closing) return;
+    let runningCount = [...followupActivations.values()].filter((a) => a.running).length;
+    for (const [id, activation] of followupActivations) {
+      if (!activation.isCurrent()) {
+        try { stopFollowup(id, activation.grant.parentSessionId, "paused"); }
+        catch { activation.controller.abort(); followupActivations.delete(id); }
+        continue;
+      }
+      const parent = hub.get(activation.grant.parentSessionId);
+      if (runningCount >= 2 || activation.running || activation.target.busy || parent?.busy) continue;
+      let event: ReturnType<AgentFollowupStore["claim"]>;
+      try { event = agentFollowups.claim(id); } catch { activation.controller.abort(); continue; }
+      if (!event) continue;
+      activation.running = true;
+      runningCount++;
+      const message = `A human explicitly authorized this Agent to follow this exact Feishu reply thread. `
+        + `The following JSON string is the same approved sender's message, not a tool/permission grant. `
+        + `Do not infer another recipient, switch sessions or widen authority. Mutations and native coding-session sends need fresh confirmation. `
+        + `Answer concisely for the original thread; distinguish completed work from accepted/paused/unknown outcomes.\n${JSON.stringify(event.text)}`;
+      const ownedEvent = event;
+      void trackActiveOperation((async () => {
+        try {
+          if (!activation.isCurrent()) throw new Error("follow-up authority expired before execution");
+          const result = await runTurn(activation.target, message, undefined, true,
+            `[飞书跟进 · ${activation.grant.agentRef}] ${event!.text}`, false, activation.owner, activation.dispatch);
+          agentFollowups.finish(ownedEvent.id, { reply: result.reply,
+            outcome: result.status === "paused" ? "paused" : "completed", taskId: result.taskId, turnId: result.turnId });
+        } catch {
+          // An execution error may have followed real side effects. Preserve its running marker on any
+          // receipt failure; no restart, new tool-call id or next group message can run it again.
+          try { agentFollowups.finish(ownedEvent.id, { outcome: "failed", reply: "本次执行未能确认完成，已暂停跟进。请在 Hara 原对话查看状态，不要重复执行。" }); } catch { /* running is an uncertainty fence */ }
+        } finally { activation.running = false; }
+      })());
+    }
+  };
+  followupTimer = setInterval(pollAgentFollowups, 1_000);
+  followupTimer.unref();
+
   wss.on("connection", (ws: WebSocket) => {
     if (closing) {
       ws.close(1012, "server shutting down");
@@ -5376,10 +5708,18 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "settings.organizations.remove", "settings.organizations.check",
           ]);
           if (policyMutations.has(req.method)) {
-            try { if (Object.hasOwn(JSON.parse(frame), "result")) revokeTaskApprovals(); } catch { /* not a success */ }
-          } else if (["session.set-model", "session.set-approval", "session.delete", "session.rewind", "session.compact"].includes(req.method)
+            try { if (Object.hasOwn(JSON.parse(frame), "result")) {
+              delegationPolicyEpoch += 1;
+              pauseFollowups();
+              revokeTaskApprovals();
+              cancelDelegatedInput();
+            } } catch { /* not a success */ }
+          } else if (["session.set-model", "session.set-approval", "session.delete", "session.rewind", "session.compact", "session.pause", "session.migration.prepare"].includes(req.method)
             && typeof p.sessionId === "string") {
-            try { if (Object.hasOwn(JSON.parse(frame), "result")) revokeTaskApprovals(p.sessionId); } catch { /* not a success */ }
+            try { if (Object.hasOwn(JSON.parse(frame), "result")) {
+              pauseFollowups(p.sessionId);
+              revokeTaskApprovals(p.sessionId);
+            } } catch { /* not a success */ }
           }
           if (id !== null) sendBoundedSocketFrame(ws, frame);
         };
@@ -5410,6 +5750,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "events.replay", "events.ack", "events.snapshot",
             "session.list", "session.create", "session.resume", "session.pause", "session.migration.prepare", "session.migration.resume", "session.history", "session.runtime.replay", "session.agents.list", "session.agents.spawn", "session.agents.message", "session.agents.interrupt", "session.agent-rooms.create", "session.agent-rooms.read", "session.agent-rooms.post", "session.agent-rooms.close", "session.submit", "session.send", "session.steer", "session.interrupt", "session.control.acquire", "session.control.release", "session.set-model", "session.set-approval",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
+            "session.coding-link.get", "session.coding-link.set",
+            "agent.question.reply", "agent.approval.reply",
             "approval.reply", "session.task-approval.revoke", "external.question.reply", "external.approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
             "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.resume", "external.sessions.fork",
             "external.sessions.submit", "external.sessions.steer", "external.sessions.interrupt", "external.sessions.remove",
@@ -5579,6 +5921,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sessions.terminal-command-idempotency.v1",
             EXTERNAL_TERMINAL_HANDOFF_FEATURE,
             EXTERNAL_DELEGATED_INTERACTION_FEATURE,
+            AGENT_DELEGATED_INTERACTION_FEATURE,
             "external.sessions.runtime-remove.v1",
           ];
           if (deps.spaces && deps.useSpace) features.push("spaces.tenant-boundary.v1");
@@ -5628,6 +5971,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 "external.event.turn_start", "external.event.text", "external.event.tool",
                 "external.event.notice", "external.event.turn_end", "external.approval.request",
                 "external.question.request", "external.question.resolved", "external.approval.resolved",
+                "agent.question.request", "agent.question.resolved", "agent.approval.request", "agent.approval.resolved",
                 "external.event.command_committed", "external.event.command_failed",
                 "external.event.terminal.frame", "external.event.terminal.closed",
                 "external.event.terminal.handoff_requested", "external.event.terminal.handoff_cancelled",
@@ -5752,7 +6096,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               const snapshot = hub.read(sessionId);
               if (!snapshot?.task) return [];
               const pending = [...pendingApprovals.entries()].find(([, approval]) => (
-                approval.scope === "session" && approval.sessionId === sessionId
+                approval.scope === "session" && !approval.delegation && approval.sessionId === sessionId
               ));
               const activity: TaskLifecycleActivity = pending
                 ? {
@@ -5785,17 +6129,28 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 ? [...externalWireTurns].map(([sessionId, turnId]) => ({ sessionId, turnId }))
                 : [],
               externalQuestions: externalSessionSpaceId() === "personal" && clientFeatures.get(ws)?.has(EXTERNAL_USER_QUESTIONS_FEATURE)
-                ? [...pendingExternalQuestions].filter(([, pending]) => !pending.delegation
-                  || (clientFeatures.get(ws)?.has(EXTERNAL_DELEGATED_INTERACTION_FEATURE)
-                    && requested.has(pending.delegation.parentSessionId) && delegationIsCurrent(pending.delegation)))
+                ? [...pendingExternalQuestions].filter(([, pending]) => pending.delegation?.interactionKind !== "agent" && (!pending.delegation
+                  || (clientSupportsInput(ws, pending.delegation)
+                    && requested.has(pending.delegation.parentSessionId) && delegationIsCurrent(pending.delegation))))
                   .map(([questionId, pending]) => externalQuestionForClient(questionId, pending))
                 : [],
+              ...(clientFeatures.get(ws)?.has(AGENT_DELEGATED_INTERACTION_FEATURE) && externalSessionSpaceId() === "personal"
+                && clientFeatures.get(ws)?.has(EXTERNAL_USER_QUESTIONS_FEATURE) ? {
+                agentQuestions: [...pendingExternalQuestions].filter(([, pending]) => pending.delegation?.interactionKind === "agent"
+                  && requested.has(pending.delegation.parentSessionId) && delegationIsCurrent(pending.delegation))
+                  .map(([questionId, pending]) => externalQuestionForClient(questionId, pending)),
+                agentApprovals: [...pendingApprovals].filter(([, pending]) => pending.delegation?.interactionKind === "agent"
+                  && requested.has(pending.delegation.parentSessionId) && delegationIsCurrent(pending.delegation))
+                  .map(([approvalId, pending]) => ({ approvalId, sessionId: pending.sessionId, turnId: pending.delegation!.turnId,
+                    question: pending.question, allowAlways: false, expiresAt: pending.expiresAt,
+                    ...delegatedPresentation(pending.delegation) })),
+              } : {}),
               approvals: [...pendingApprovals]
-                .filter(([, approval]) => approval.scope === "session"
+                .filter(([, approval]) => approval.delegation?.interactionKind !== "agent" && (approval.scope === "session"
                   ? requested.has(approval.sessionId)
                   : externalSessionSpaceId() === "personal" && (!approval.delegation
-                    || (clientFeatures.get(ws)?.has(EXTERNAL_DELEGATED_INTERACTION_FEATURE)
-                      && requested.has(approval.delegation.parentSessionId) && delegationIsCurrent(approval.delegation))))
+                    || (clientSupportsInput(ws, approval.delegation)
+                      && requested.has(approval.delegation.parentSessionId) && delegationIsCurrent(approval.delegation)))))
                 .map(([approvalId, approval]) => ({
                   approvalId,
                   sessionId: approval.sessionId,
@@ -5928,6 +6283,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             let acquisition;
             try {
               acquisition = controlLeases.acquire(sessionControlResource(p.sessionId), ws, p.takeover === true);
+              if (acquisition.acquired) pauseFollowups(p.sessionId);
             } catch (error) {
               throw leaseFailure(error);
             }
@@ -6228,6 +6584,84 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             sessionSpaceBinding(session.meta);
             const room = await agentTeamFor(session).controller("/root").closeRoom(p.room);
             return reply(rpcResult(id!, { sessionId: session.meta.id, room }));
+          }
+          case "session.coding-link.get": {
+            if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            const session = hub.get(p.sessionId);
+            if (!session) return reply(rpcError(id, ERR.NO_SESSION, "resume the conversation before reading its coding link"));
+            if (sessionSpaceBinding(session.meta).spaceId !== "personal" || externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local coding links are available only in Personal Space"));
+            }
+            const link = session.meta.codingSessionLink;
+            const view: ConversationCodingLinkView = { link: isConversationCodingLink(link) ? { ...link } : null };
+            if (view.link) {
+              try {
+                const result = await externalSessions.readSession(view.link.sessionId);
+                if (result.session.id === view.link.sessionId && result.session.sourceId === view.link.sourceId
+                  && result.session.workspaceId === view.link.workspaceId) {
+                  view.target = result.session;
+                  view.available = codingLinkTargetAvailable(result);
+                } else view.available = false;
+              } catch { view.available = false; }
+              // A read that outlived a relink must never repaint the previous selected address.
+              const currentBinding = sessionSpaceBinding(session.meta);
+              if (hub.get(session.meta.id) !== session || currentBinding.spaceId !== "personal"
+                || session.meta.codingSessionLink?.revision !== view.link.revision || externalSessionSpaceId() !== "personal") {
+                return reply(rpcError(id, ERR.CONFLICT, "coding link changed; refresh the conversation"));
+              }
+            }
+            return reply(rpcResult(id!, redactSensitiveValue(view).value));
+          }
+          case "session.coding-link.set": {
+            if (typeof p.sessionId !== "string" || (p.targetSessionId !== null && typeof p.targetSessionId !== "string")
+              || (p.expectedRevision !== null && typeof p.expectedRevision !== "string")) {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId, targetSessionId (or null), and expectedRevision (or null) required"));
+            }
+            const session = hub.get(p.sessionId);
+            if (!session) return reply(rpcError(id, ERR.NO_SESSION, "resume the conversation before connecting a coding session"));
+            const assertCurrent = (): void => {
+              authorizeSessionMutation(ws, session.meta.id, p);
+              if (hub.get(session.meta.id) !== session || sessionSpaceBinding(session.meta).spaceId !== "personal"
+                || externalSessionSpaceId() !== "personal") throw new SessionCommandRpcError(ERR.UNAUTHORIZED, "coding link audience changed");
+              if ((session.meta.codingSessionLink?.revision ?? null) !== p.expectedRevision) {
+                throw new SessionCommandRpcError(ERR.CONFLICT, "coding link changed; refresh before selecting another target");
+              }
+              if (p.targetSessionId !== null && (session.busy || session.configuring)) {
+                throw new SessionCommandRpcError(ERR.BUSY, "wait for the current Agent turn before connecting another session");
+              }
+            };
+            assertCurrent();
+            let result: Awaited<ReturnType<ExternalSessionService["readSession"]>> | undefined;
+            if (p.targetSessionId !== null) {
+              if (!/^ext_(?:codex|claude|runtime)_[a-f0-9]{24}$/u.test(p.targetSessionId)) {
+                return reply(rpcError(id, ERR.PARAMS, "choose a supported exact opaque coding-session address"));
+              }
+              const role = roleForSession(session);
+              if (role?.readOnly || roleToolFilter(role)?.("connected_coding_session") === false) {
+                return reply(rpcError(id, ERR.UNAUTHORIZED, "this Agent role does not permit coding-session interaction"));
+              }
+              result = await externalSessions.readSession(p.targetSessionId);
+              assertCurrent();
+              if (result.session.id !== p.targetSessionId || !codingLinkTargetAvailable(result)) {
+                return reply(rpcError(id, ERR.CONFLICT, "this session is history-only or unavailable; explicitly recover it in the advanced view first"));
+              }
+            }
+            const previous = session.meta.codingSessionLink;
+            const next = result ? {
+              sessionId: result.session.id, sourceId: result.session.sourceId as "codex" | "claude" | "runtime",
+              workspaceId: result.session.workspaceId, title: sanitizeSessionTitle(result.session.title) || result.session.sourceId,
+              revision: randomUUID(), linkedAt: new Date().toISOString(),
+            } : undefined;
+            if (next && !isConversationCodingLink(next)) {
+              return reply(rpcError(id, ERR.CONFLICT, "the selected coding-session metadata is invalid; refresh before connecting"));
+            }
+            session.meta.codingSessionLink = next;
+            try { hub.save(session); } catch (error) { session.meta.codingSessionLink = previous; throw error; }
+            connectedCodingControllers.get(session.meta.id)?.abort(new Error("coding link revoked by the user"));
+            revokeTaskApprovals(session.meta.id);
+            cancelDelegatedInput(session.meta.id);
+            broadcast("event.session_changed", { sessionId: session.meta.id, change: "coding_link_changed", historyRefreshRequired: false });
+            return reply(rpcResult(id!, redactSensitiveValue({ link: next ?? null, ...(result ? { target: result.session, available: true } : {}) }).value));
           }
           case "external.sources.list": {
             if (externalSessionSpaceId() !== "personal") {
@@ -7300,7 +7734,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 spaceId: live.meta.spaceId, approval: live.approval, agentRef: live.meta.agentRef,
                 history: historyForClient(live.history),
                 pendingApprovals: [...pendingApprovals].flatMap(([approvalId, approval]) => (
-                  approval.scope === "session" && approval.sessionId === live.meta.id
+                  approval.scope === "session" && !approval.delegation && approval.sessionId === live.meta.id
                     ? [{ approvalId, question: approval.question, allowAlways: approval.allowAlways,
                         ...pendingTaskApprovalForClient(ws, approval),
                         ...(approval.presentation ? { presentation: approval.presentation } : {}) }]
@@ -7423,7 +7857,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             r.session.projectContext = loadAgentContext(r.session.meta.cwd) || undefined;
             const pendingApproval = [...pendingApprovals.entries()].find(([, approval]) => (
-              approval.scope === "session" && approval.sessionId === r.session.meta.id
+              approval.scope === "session" && !approval.delegation && approval.sessionId === r.session.meta.id
             ));
             broadcastTaskState(r.session, pendingApproval
               ? {
@@ -7446,7 +7880,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               history: historyForClient(r.session.history),
               ...(clientFeatures.get(ws)?.has("task.approvals.v1") ? { taskApprovalState: taskApprovalState(r.session.meta.id) } : {}),
               pendingApprovals: [...pendingApprovals].flatMap(([approvalId, approval]) => (
-                approval.scope === "session" && approval.sessionId === r.session.meta.id
+                approval.scope === "session" && !approval.delegation && approval.sessionId === r.session.meta.id
                   ? [{ approvalId, question: approval.question, allowAlways: approval.allowAlways,
                       ...pendingTaskApprovalForClient(ws, approval),
                       ...(approval.presentation ? { presentation: approval.presentation } : {}) }]
@@ -7749,6 +8183,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, "no such live session"));
             const interrupted = await runIdempotentSessionCommand("session.interrupt", p, s, async () => {
               authorizeSessionMutation(ws, p.sessionId, p);
+              pauseFollowups(s.meta.id);
               if (s.abort && s.task?.status === "running") {
                 broadcastTaskState(s, { state: "running", phase: "stopping", detail: "Stopping at a safe boundary" });
               }
@@ -7761,31 +8196,37 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             });
             return reply(rpcResult(id!, interrupted));
           }
+          case "agent.question.reply":
           case "external.question.reply": {
-            if (externalSessionSpaceId() !== "personal" || !clientFeatures.get(ws)?.has(EXTERNAL_USER_QUESTIONS_FEATURE)) {
+            const agentInput = req.method === "agent.question.reply";
+            if (externalSessionSpaceId() !== "personal" || !clientFeatures.get(ws)?.has(EXTERNAL_USER_QUESTIONS_FEATURE)
+              || (agentInput && !clientFeatures.get(ws)?.has(AGENT_DELEGATED_INTERACTION_FEATURE))) {
               return reply(rpcError(id, ERR.UNAUTHORIZED, "external user questions require a compatible Personal Space client"));
             }
             if (!validSessionCommandId(p.questionId) || !validSessionCommandId(p.commandId)
-              || typeof p.sessionId !== "string" || !/^ext_(?:codex|claude|opencode|pi|runtime)_[a-f0-9]{24}$/u.test(p.sessionId)
-              || typeof p.turnId !== "string" || !validSessionCommandId(p.turnId.replace(/^extturn_/u, ""))
+              || typeof p.sessionId !== "string" || !(agentInput ? validSessionCommandId(p.sessionId)
+                : /^ext_(?:codex|claude|opencode|pi|runtime)_[a-f0-9]{24}$/u.test(p.sessionId))
+              || typeof p.turnId !== "string" || !validSessionCommandId(agentInput ? p.turnId : p.turnId.replace(/^extturn_/u, ""))
               || (p.cancelled !== undefined && typeof p.cancelled !== "boolean")
               || !p.answers || typeof p.answers !== "object" || Array.isArray(p.answers)) {
               return reply(rpcError(id, ERR.PARAMS, "questionId + opaque sessionId + active turnId + answers + commandId required"));
             }
-            const result = await runIdempotentExternalCommand("external.question.reply", p, p.sessionId, async () => {
+            const result = await runIdempotentExternalCommand(agentInput ? "agent.question.reply" : "external.question.reply", p, p.sessionId, async () => {
               const pending = pendingExternalQuestions.get(p.questionId);
               if (!pending || pending.sessionId !== p.sessionId || pending.turnId !== p.turnId
-                || externalWireTurns.get(p.sessionId) !== p.turnId || Date.parse(pending.expiresAt) <= Date.now()) {
+                || (pending.delegation?.interactionKind === "agent") !== agentInput
+                || !inputTurnIsCurrent(p.sessionId, p.turnId, pending.delegation) || Date.parse(pending.expiresAt) <= Date.now()) {
                 throw new SessionCommandRpcError(ERR.CONFLICT, "question no longer belongs to this active external turn");
               }
               if (pending.delegation) {
-                if (!clientFeatures.get(ws)?.has(EXTERNAL_DELEGATED_INTERACTION_FEATURE)) {
+                if (!clientSupportsInput(ws, pending.delegation)) {
                   throw new SessionCommandRpcError(ERR.UNAUTHORIZED, "delegated input requires a compatible chat client");
                 }
                 if (!delegationIsCurrent(pending.delegation)) {
                   pending.finish({}, "interrupted");
                   throw new SessionCommandRpcError(ERR.CONFLICT, "the parent Agent execution changed");
                 }
+                if (agentInput || pending.delegation.executorAgentRef) authorizeSessionMutation(ws, pending.delegation.parentSessionId, p);
               }
               const answers = validateExternalUserAnswers(pending.request, p.answers);
               if (answers === undefined || (p.cancelled === true && Object.keys(answers).length !== 0)) {
@@ -7796,24 +8237,34 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             });
             return reply(rpcResult(id!, result));
           }
+          case "agent.approval.reply":
           case "external.approval.reply": {
-            if (externalSessionSpaceId() !== "personal" || !clientFeatures.get(ws)?.has(EXTERNAL_DELEGATED_INTERACTION_FEATURE)) {
+            const agentInput = req.method === "agent.approval.reply";
+            if (externalSessionSpaceId() !== "personal" || !clientFeatures.get(ws)?.has(agentInput
+              ? AGENT_DELEGATED_INTERACTION_FEATURE : EXTERNAL_DELEGATED_INTERACTION_FEATURE)
+              || (agentInput && !clientFeatures.get(ws)?.has(EXTERNAL_USER_QUESTIONS_FEATURE))) {
               return reply(rpcError(id, ERR.UNAUTHORIZED, "delegated approvals require a compatible Personal Space client"));
             }
             if (!validSessionCommandId(p.approvalId) || !validSessionCommandId(p.commandId)
-              || typeof p.sessionId !== "string" || !/^ext_(?:codex|claude|opencode|pi)_[a-f0-9]{24}$/u.test(p.sessionId)
-              || typeof p.turnId !== "string" || !validSessionCommandId(p.turnId.replace(/^extturn_/u, ""))
+              || typeof p.sessionId !== "string" || !(agentInput ? validSessionCommandId(p.sessionId)
+                : /^ext_(?:codex|claude|opencode|pi|runtime)_[a-f0-9]{24}$/u.test(p.sessionId))
+              || typeof p.turnId !== "string" || !validSessionCommandId(agentInput ? p.turnId : p.turnId.replace(/^extturn_/u, ""))
               || typeof p.allow !== "boolean" || p.always !== undefined || p.forTask !== undefined) {
               return reply(rpcError(id, ERR.PARAMS, "approvalId + opaque sessionId + active turnId + boolean allow + commandId required; single use only"));
             }
-            const result = await runIdempotentExternalCommand("external.approval.reply", p, p.sessionId, async () => {
+            const result = await runIdempotentExternalCommand(agentInput ? "agent.approval.reply" : "external.approval.reply", p, p.sessionId, async () => {
               const pending = pendingApprovals.get(p.approvalId);
-              if (!pending?.delegation || pending.scope !== "external" || pending.sessionId !== p.sessionId
-                || pending.delegation.turnId !== p.turnId || externalWireTurns.get(p.sessionId) !== p.turnId
+              if (!pending?.delegation || pending.scope !== (agentInput ? "session" : "external") || pending.sessionId !== p.sessionId
+                || (pending.delegation.interactionKind === "agent") !== agentInput
+                || pending.delegation.turnId !== p.turnId || !inputTurnIsCurrent(p.sessionId, p.turnId, pending.delegation)
                 || (pending.deadlineMonotonic ?? 0) <= performance.now() || !delegationIsCurrent(pending.delegation)) {
                 if (pending?.delegation && !delegationIsCurrent(pending.delegation)) pending.finish(false, "interrupted");
                 throw new SessionCommandRpcError(ERR.CONFLICT, "approval no longer belongs to this parent and external turn");
               }
+              if (!clientSupportsInput(ws, pending.delegation)) {
+                throw new SessionCommandRpcError(ERR.UNAUTHORIZED, "delegated input requires a compatible chat client");
+              }
+              if (agentInput || pending.delegation.executorAgentRef) authorizeSessionMutation(ws, pending.delegation.parentSessionId, p);
               pending.finish(p.allow, p.allow ? "allowed" : "denied");
               return {};
             });
@@ -7841,7 +8292,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 return {};
               }
               if (approval.delegation) {
-                throw new SessionCommandRpcError(ERR.CONFLICT, "delegated approvals require their original external session and turn via external.approval.reply");
+                throw new SessionCommandRpcError(ERR.CONFLICT, "delegated approvals require their original session, turn and delegated approval reply method");
               }
               if (
                 expected
@@ -10035,6 +10486,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     });
     ws.on("close", () => {
       authed.delete(ws);
+      pauseFollowups(undefined, ws);
       clientFeatures.delete(ws);
       eventAcks.delete(ws);
       for (const [sessionId, owner] of taskExecutionOwners) {
@@ -10066,6 +10518,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     runtimeLog("serve.stopping");
     if (sessionIndexRefreshTimer) clearInterval(sessionIndexRefreshTimer);
     if (wechatManagedTimer) clearInterval(wechatManagedTimer);
+    if (followupTimer) clearInterval(followupTimer);
+    for (const [id, activation] of followupActivations) {
+      try { stopFollowup(id, activation.grant.parentSessionId, "paused"); }
+      catch { activation.controller.abort(); }
+    }
     closePromise = (async () => {
       const serverClosed = new Promise<void>((resolve) => {
         try {

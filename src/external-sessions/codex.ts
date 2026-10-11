@@ -3,6 +3,7 @@ import { basename } from "node:path";
 import { redactSensitiveText } from "../security/secrets.js";
 import { opaqueProviderSessionId, type ExternalSessionOwnershipStore } from "./identity.js";
 import { normalizeExternalUserQuestions, validateExternalUserAnswers } from "./questions.js";
+import { ExternalSessionDeliveryUnknownError } from "./types.js";
 import {
   ExternalJsonlRpcRequestError,
   JsonlRpcClient,
@@ -551,6 +552,7 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
       messages: await this.recentMessages(ref),
       readOnly: !ref.owned && !ref.live,
       controlMode: ref.owned ? "managed" : ref.live ? "live" : "history",
+      conversationLinkAvailable: !ref.codingWorkspace,
     };
   }
 
@@ -720,12 +722,56 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
     return typeof turnId === "string" ? turnId : "";
   }
 
+  /** A chat follow-up to an independently running terminal is delivery, not control ownership.
+   * Reading does not subscribe/resume the thread. Closing this proxy must not interrupt its turn.
+   * https://learn.chatgpt.com/docs/app-server#steer-an-active-turn
+   */
+  private async messageLoadedTurn(ref: CodexNativeRef, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult> {
+    const appServerArgs = await this.appServerArgs();
+    if (sink.signal?.aborted) throw new Error("coding_link_cancelled");
+    const client = JsonlRpcClient.start({ ...this.options, appServerArgs });
+    const cancel = (): void => client.close();
+    sink.signal?.addEventListener("abort", cancel, { once: true });
+    try {
+      if (sink.signal?.aborted) throw new Error("coding_link_cancelled");
+      await client.call("initialize", {
+        clientInfo: { name: "hara", title: "Hara", version: this.options.haraVersion },
+        capabilities: { experimentalApi: true, requestAttestation: false },
+      });
+      client.notify("initialized");
+      const current = await client.call<CodexThreadResponse>("thread/read", { threadId: ref.nativeId, includeTurns: false });
+      const currentThread = current.thread && typeof current.thread === "object" && !Array.isArray(current.thread)
+        ? current.thread as Record<string, unknown> : {};
+      if (currentThread.id !== ref.nativeId || !["working", "waiting"].includes(stateFromStatus(currentThread.status))) {
+        throw new Error("coding_link_native_turn_not_active");
+      }
+      const nativeTurnId = await this.activeTurnId(client, ref.nativeId);
+      if (!nativeTurnId) throw new Error("coding_link_native_turn_not_active");
+      if (sink.signal?.aborted) throw new Error("coding_link_cancelled");
+      let accepted: { turnId?: string };
+      try {
+        accepted = await client.call<{ turnId?: string }>("turn/steer", {
+          threadId: ref.nativeId, input: [{ type: "text", text, text_elements: [] }], expectedTurnId: nativeTurnId,
+        });
+      } catch { throw new ExternalSessionDeliveryUnknownError(); }
+      if (accepted.turnId !== nativeTurnId) throw new ExternalSessionDeliveryUnknownError();
+      return { sessionId: ref.info.id, turnId: `extturn_${randomUUID()}`, status: "completed", delivery: "accepted",
+        reply: "The follow-up was accepted by the original active Codex turn. Its execution and approvals remain in the original session; completion has not been verified." };
+    } finally {
+      sink.signal?.removeEventListener("abort", cancel);
+      client.close();
+    }
+  }
+
   async submit(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult> {
     if (sink.signal?.aborted) throw new Error("the coding turn was cancelled before dispatch");
     const ref = this.ref(sessionId);
     if (this.running.has(sessionId)) throw new Error("this external Codex session already has a Hara-controlled turn");
     if (!ref.owned && !ref.live) {
       throw new Error("resume the original Codex session explicitly before sending a message");
+    }
+    if (sink.existingSessionMessage && ref.live && !ref.codingWorkspace) {
+      return await this.messageLoadedTurn(ref, text, sink);
     }
     const priorState = ref.info.state;
     const appServerArgs = await this.appServerArgs();
@@ -785,7 +831,7 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
             });
           }
         };
-        if (!ref.codingWorkspace) return project();
+        if (!ref.codingWorkspace && !sink.existingSessionMessage) return project();
         // The app server may report several threads. A worker must not project another thread's
         // output or finish on its completion; same-chunk notifications await the turn/start binding.
         if (params.threadId !== ref.nativeId) return;

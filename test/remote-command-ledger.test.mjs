@@ -89,6 +89,25 @@ test("remote command ledger never evicts an unresolved side effect", () => {
   );
 });
 
+test("an explicitly unconfirmed native delivery blocks fresh command ids and survives restart", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-unconfirmed-delivery-"));
+  const first = command("99999999-9999-4999-8999-999999999999");
+  const next = command("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", hash("e"));
+  try {
+    const ledger = new RemoteCommandLedger({ home });
+    assert.equal(ledger.claim(first).kind, "new"); ledger.markOutcomeUnknown(first.commandId);
+    assert.equal(ledger.snapshot()[0].outcome, undefined);
+    assert.equal(ledger.claim(first).kind, "uncertain");
+    assert.equal(ledger.claim(next).kind, "uncertain");
+    const restarted = new RemoteCommandLedger({ home });
+    assert.equal(restarted.claim(next).kind, "uncertain");
+    assert.equal(restarted.reconcileResource(hash("a"), "working"), 0);
+    assert.equal(restarted.reconcileResource(hash("a"), "idle"), 1);
+    assert.equal(restarted.claim(first).outcome.kind, "result_omitted");
+    assert.equal(restarted.claim(next).kind, "new");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
 test("a failed terminal receipt blocks the resource until its durable snapshot is recovered", () => {
   const home = mkdtempSync(join(tmpdir(), "hara-remote-command-ledger-write-failure-"));
   const ledgerPath = join(home, ".hara", "serve", "remote-command-receipts.json");

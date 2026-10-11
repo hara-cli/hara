@@ -195,7 +195,7 @@ function sanitizeOutcome(outcome: RemoteCommandOutcome): RemoteCommandOutcome {
  */
 export class RemoteCommandLedger {
   private readonly receipts = new Map<string, RemoteCommandReceipt>();
-  /** Only receipts loaded without an outcome represent a crash window. Current-process work is live. */
+  /** Restored started receipts and explicitly unconfirmed native deliveries. Ordinary in-flight work is live. */
   private readonly restoredUncertain = new Set<string>();
   /** Terminal provider work whose result is known in memory but has not crossed the durable boundary. */
   private readonly durabilityUncertain = new Set<string>();
@@ -292,6 +292,14 @@ export class RemoteCommandLedger {
       throw error;
     }
     return { kind: "new" };
+  }
+
+  markOutcomeUnknown(commandId: string): void {
+    const receipt = this.receipts.get(commandId);
+    if (!receipt || receipt.outcome) throw new Error("only an unresolved started command can have an unknown outcome");
+    // claim() already fsync'd this started receipt. Leaving it without a terminal outcome preserves
+    // the same resource barrier after restart, without pretending an ambiguous write was rejected.
+    this.restoredUncertain.add(commandId);
   }
 
   complete(commandId: string, outcome: RemoteCommandOutcome): void {

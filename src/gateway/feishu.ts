@@ -130,9 +130,29 @@ type FeishuResourceDownloader = (
   options: { maxBytes: number; signal: AbortSignal },
 ) => Promise<string | null>;
 
+/** Keep exact platform ancestry through durable spool replay. Malformed metadata is explicitly marked
+ * unusable rather than silently turning a reply into a fresh task or selecting a nearby session. */
+export function feishuReplyContext(message: unknown): InboundMsg["replyContext"] {
+  if (!message || typeof message !== "object") return undefined;
+  const raw = message as Record<string, unknown>;
+  const fields = { parent_id: "parentMessageId", root_id: "rootMessageId", thread_id: "threadId" } as const;
+  let result: NonNullable<InboundMsg["replyContext"]> | undefined;
+  for (const [native, field] of Object.entries(fields)) {
+    const value = raw[native];
+    if (value === undefined || value === null || value === "") continue;
+    result ??= { valid: true };
+    if (typeof value !== "string" || !/^[A-Za-z0-9_.:-]{1,256}$/u.test(value)) {
+      result.valid = false;
+    } else {
+      result[field as typeof fields[keyof typeof fields]] = value;
+    }
+  }
+  return result;
+}
+
 /** Build an InboundMsg from a Feishu im.message.receive_v1 event (downloads media). Handles BOTH p2p (DM) and
  *  group messages — group @-mentions are surfaced (with `isSelf`) so gateway flows can target them. null = skip. */
-async function toInbound(
+export async function feishuEventToInbound(
   downloadResource: FeishuResourceDownloader,
   data: any,
   botOpenId: string | undefined,
@@ -165,12 +185,15 @@ async function toInbound(
   const transientFiles: string[] = [];
   const mediaMarker = parsed.imageKey ? "[图片]" : parsed.fileKey ? "[附件]" : "";
   const createdAtMs = feishuTimestampMs(msg.create_time);
+  const replyContext = feishuReplyContext(msg);
   const base: InboundMsg = {
     chatId: String(msg.chat_id),
     userId,
     userName: userId,
     text: text || mediaMarker,
     ...(typeof msg.message_id === "string" && msg.message_id ? { messageId: msg.message_id } : {}),
+    ...(replyContext ? { replyContext } : {}),
+    senderType: data?.sender?.sender_type === "user" ? "user" : data?.sender?.sender_type === "app" ? "app" : "unknown",
     ...(createdAtMs === undefined ? {} : { createdAtMs }),
     durablyQueued: true,
     chatType,
@@ -430,6 +453,18 @@ export function feishuAdapter(
   };
   return {
     name: "feishu",
+    async reply(chatId, messageId, text, signal, idempotencyKey) {
+      if (!/^[A-Za-z0-9_.:-]{1,256}$/u.test(messageId) || text.length > 4000) throw new Error("invalid Feishu thread reply");
+      await withOutboundDeadline("Feishu reply", signal, outboundTransferTimeoutMs("text"), (transferSignal) =>
+        outbound.run(chatId, async () => {
+          if (transferSignal.aborted) throw new Error("Feishu reply cancelled");
+          await outboundRequest(`/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/reply`, {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ msg_type: "text", content: JSON.stringify({ text }), reply_in_thread: true,
+              ...(idempotencyKey ? { uuid: createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 32) } : {}) }),
+          }, transferSignal);
+        }));
+    },
     async send(chatId, text, signal, idempotencyKey) {
       await withOutboundDeadline("Feishu send", signal, outboundTransferTimeoutMs("text"), async (transferSignal) => {
         return outbound.run(chatId, async () => {
@@ -534,7 +569,7 @@ export function feishuAdapter(
           }
           try {
             if (!locallyCompleted.has(item.id)) {
-              const m = await toInbound(downloadResource, item.payload, await ensureBotOpenId(runSignal), runSignal, shouldDownload);
+              const m = await feishuEventToInbound(downloadResource, item.payload, await ensureBotOpenId(runSignal), runSignal, shouldDownload);
               if (runSignal.aborted) {
                 await spool.release(item.id);
                 return;

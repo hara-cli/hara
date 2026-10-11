@@ -15,6 +15,11 @@ export interface InboundMsg {
   text: string;
   /** Stable platform delivery id, when available. Used only for bounded cross-restart deduplication. */
   messageId?: string;
+  /** Transport-supplied reply ancestry, never inferred from text or the currently active window.
+   * Invalid/partial ancestry must never be used to guess another task or execution target. */
+  replyContext?: { parentMessageId?: string; rootMessageId?: string; threadId?: string; valid: boolean };
+  /** A bot/app event is not a human instruction and cannot acquire follow-up execution authority. */
+  senderType?: "user" | "app" | "unknown";
   /** Platform create time in milliseconds. Old replayed events are ignored on a fresh gateway start. */
   createdAtMs?: number;
   /** Adapter proved this event is in a private durable local queue; startup age filtering must not discard it. */
@@ -46,6 +51,8 @@ export interface ChatAdapter {
   /** `idempotencyKey` is an opaque stable effect id. Adapters whose platform supports idempotent create
    * requests may use it; adapters without that capability retain at-least-once behavior. */
   send(chatId: number | string, text: string, signal?: AbortSignal, idempotencyKey?: string): Promise<void>;
+  /** Exact original-thread reply for host-owned follow-ups; never substitute a new group-level send. */
+  reply?(chatId: number | string, messageId: string, text: string, signal?: AbortSignal, idempotencyKey?: string): Promise<void>;
   /** Optional: upload already-verified bytes. `snapshotPath` is cleanup-only and must never be reopened here. */
   sendFile?(chatId: number | string, file: OutboundFilePayload, signal?: AbortSignal, idempotencyKey?: string): Promise<void>;
   /** Optional: send a message and return its platform message id — so transient UX messages ("⟳ working…")

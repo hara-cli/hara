@@ -32,7 +32,7 @@ import type {
   ExternalTurnResult,
   ExternalTurnSink,
 } from "./types.js";
-import { ExternalSessionInputError } from "./types.js";
+import { ExternalSessionInputError, ExternalSessionDeliveryUnknownError } from "./types.js";
 
 const MAX_TEXT_BYTES = 128 * 1024;
 const MAX_MESSAGES = 1_000;
@@ -368,6 +368,7 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
       }),
       readOnly: !writable,
       controlMode: writable ? "managed" : "history",
+      conversationLinkAvailable: !ref.codingWorkspace,
       ...(authenticationRequired ? { continuationUnavailableReason: "authentication_required" as const } : {}),
     };
   }
@@ -485,10 +486,11 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
     let reply = "";
     let failure = "";
     let interrupted = false;
+    let nativeResultObserved = false;
     try {
       for await (const message of handle) {
         const frame = message as SDKMessage;
-        if (ref.codingWorkspace && (!("session_id" in frame) || frame.session_id !== ref.nativeId)) {
+        if ((ref.codingWorkspace || sink.existingSessionMessage) && (!("session_id" in frame) || frame.session_id !== ref.nativeId)) {
           throw new Error("Claude Code returned output for a different coding session");
         }
         if (frame.type === "assistant" && frame.parent_tool_use_id === null) {
@@ -501,6 +503,7 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
           const summary = safeText(frame.summary, 600);
           if (summary) sink.tool("Claude Code", summary);
         } else if (frame.type === "result") {
+          nativeResultObserved = true;
           if (frame.subtype === "success") {
             if (!reply && frame.result) {
               reply = safeText(frame.result);
@@ -519,6 +522,9 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
       sink.signal?.removeEventListener("abort", cancel);
       this.running.delete(sessionId);
       handle.close();
+    }
+    if (sink.existingSessionMessage && (!nativeResultObserved || interrupted || runtime.interrupted)) {
+      throw new ExternalSessionDeliveryUnknownError();
     }
     return {
       sessionId,

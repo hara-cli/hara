@@ -123,7 +123,9 @@ started by another process remains visible, but Desktop will neither adopt nor s
 
 The full coding agent is a **direct-message driver only** and each authorized DM run uses
 `--approval full-auto`, so set `--cwd` deliberately. Group/room traffic never falls through to that driver; it is ignored
-unless an explicit flow rule or channel bridge matches it. Unknown chat shapes fail closed as group traffic.
+unless an explicit flow rule, channel bridge or separately human-confirmed bounded Agent follow-up matches it.
+The follow-up path is supervised by its original Hara conversation; it does not enter the full-auto DM
+driver. Unknown chat shapes fail closed as group traffic.
 
 ## Feishu ↔ WeChat channel bridge
 
@@ -356,12 +358,36 @@ environment. Use the service manager's protected secret facility; never put the 
 command, a project file, or an inline shell command.
 
 Direct messages drive the full coding session. Group events and @mentions are surfaced only to matching flow
-rules and explicitly enabled `/bridge` subscriptions; they never fall through to the full coding agent. The long-connection callback first writes each event
+rules, explicitly enabled `/bridge` subscriptions and the separately approved thread follow-ups below;
+they never fall through to the full-auto coding agent. The long-connection callback first writes each event
 to a private bounded durable spool and returns within Feishu's three-second ACK window; four workers process it
 afterward. The spool survives restart, holds at most 128 events/2 MiB (128 KiB each), retries with exponential
 backoff at most five times, and emits one terminal alert when attempts are exhausted. A completed item is
 removed before its execution marker is cleaned up, preventing a crash between agent completion and ACK from
 causing a second full-auto run.
+
+### Named Agent thread follow-ups (0.186.0)
+
+With the existing connector online, an authorized human's fresh group @mention becomes a metadata-only
+candidate. In the personal-space Hara conversation, ask the intended persistent Agent (or ask main Hara
+to delegate to that colleague) to follow that exact thread. `agent_followup` lists bounded candidates and
+always presents a fresh human confirmation for the source message, root thread, named Agent, duration
+and count. No listener is started by this tool, and no candidate is preselected by recency or message text.
+
+The grant admits only new replies from that same authorized sender, account, group and platform-provided
+reply ancestry: at most 24 hours / 8 messages, with a 30-second admission interval. Conflicting, duplicate,
+bot, historical, expired or revoked requests cannot become DM execution or be retried through another
+Agent. The approving compatible client must stay connected; choices and individual file/command/native-send
+approvals return to its original chat even under a full-auto parent.
+
+Results use the original message's Feishu thread-reply API, never a group broadcast fallback. Private
+ownership and execution/delivery receipts live in `~/.hara/gateway/agent-followups.json`; bodies are cleared
+after processing and excluded from status output. An uncertain execution/send is fenced rather than
+blindly retried. Disconnect, takeover, pause/migration, changed policy, sender removal and expiry pause
+work; a restart restores records, not execution authority. Use the original chat's `agent_followup status`
+or `stop`, then explicitly confirm a fresh source if restarting. This is not an unattended all-group
+listener, arbitrary-terminal injection, or a real-public-network acceptance claim. See
+[coding-executors.md](coding-executors.md) for the exact limits and remaining validation boundaries.
 
 ## Slack
 

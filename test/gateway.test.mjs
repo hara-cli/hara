@@ -352,6 +352,26 @@ test("Feishu message create hashes a stable flow effect key into a repeatable id
   }
 });
 
+test("Feishu follow-up replies use the exact original message, thread flag and stable UUID without a new-chat fallback", async () => {
+  const savedFetch = globalThis.fetch, requests = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      if (String(url).includes("tenant_access_token")) return new Response(JSON.stringify({ code: 0, tenant_access_token: "fixture", expire: 3600 }));
+      requests.push({ url: String(url), body: JSON.parse(String(init.body)) });
+      return new Response(JSON.stringify({ code: 0, data: { message_id: "om_fixture_reply" } }));
+    };
+    const adapter = feishuAdapter("fixture-reply", "fixture-secret");
+    await adapter.reply("oc_fixture", "om_original", "Done", undefined, "same-event");
+    await adapter.reply("oc_fixture", "om_original", "Done", undefined, "same-event");
+    assert.ok(requests.every((r) => r.url.endsWith("/im/v1/messages/om_original/reply")));
+    assert.equal(requests[0].body.reply_in_thread, true); assert.deepEqual(JSON.parse(requests[0].body.content), { text: "Done" });
+    assert.match(requests[0].body.uuid, /^[a-f0-9]{32}$/u); assert.equal(requests[0].body.uuid, requests[1].body.uuid);
+    await assert.rejects(adapter.reply("oc_fixture", "../../forged", "bad"), /invalid/);
+    await assert.rejects(adapter.reply("oc_fixture", "om_original", "bad", AbortSignal.abort()), /cancelled/);
+    assert.equal(requests.length, 2);
+  } finally { globalThis.fetch = savedFetch; }
+});
+
 test("telegramAdapter retries a failed update before advancing its polling offset", async () => {
   const savedFetch = globalThis.fetch;
   const savedSetTimeout = globalThis.setTimeout;

@@ -118,6 +118,8 @@ export interface ExternalSessionReadResult {
    * Hara-created continuation, and `history` is protected provider history awaiting user consent.
    */
   controlMode: "history" | "managed" | "live";
+  /** Host-owned opt-in. Private worktree workers cannot be repurposed as another Agent's chat target. */
+  conversationLinkAvailable?: boolean;
   /** A bounded reason why provider history cannot currently become writable. No credential detail crosses Serve. */
   continuationUnavailableReason?: "authentication_required";
 }
@@ -145,6 +147,8 @@ export interface ExternalTurnResult {
   reply: string;
   error?: string;
   metrics?: ExternalTurnMetrics;
+  /** A non-owning follow-up was accepted; the original native task is NOT known to be complete. */
+  delivery?: "accepted";
 }
 
 export interface ExternalSteerResult {
@@ -177,6 +181,8 @@ export type ExternalUserQuestionAnswers = Record<string, { answers: string[] }>;
 export interface ExternalTurnSink {
   /** Core host cancellation, including admission/setup before a native turn becomes active. */
   signal?: AbortSignal;
+  /** Core-only connected-chat send. A loaded independent Codex turn must never be taken over. */
+  existingSessionMessage?: true;
   /** Core-only scoped factory. The worker passes its combined lifecycle signal, never model input. */
   prepareCodingHost?(signal: AbortSignal): Promise<OpenCodeWorkerTurnBridge>;
   text(delta: string): void;
@@ -185,6 +191,15 @@ export interface ExternalTurnSink {
   confirm(request: ExternalApprovalRequest, signal: AbortSignal): Promise<boolean | "always">;
   /** Absent/aborted/incompatible clients must return no answers, never permission or the first option. */
   askUser?(request: ExternalUserQuestionRequest, signal: AbortSignal): Promise<ExternalUserQuestionAnswers>;
+}
+
+/** A native write may have succeeded, but its delivery/completion could not be confirmed.
+ * Keep the already-durable started receipt unresolved; a fresh model call is not a retry grant. */
+export class ExternalSessionDeliveryUnknownError extends Error {
+  constructor() {
+    super("coding_link_delivery_unconfirmed");
+    this.name = "ExternalSessionDeliveryUnknownError";
+  }
 }
 
 export interface ExternalSessionListInput {

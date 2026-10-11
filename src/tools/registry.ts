@@ -142,6 +142,8 @@ export interface ToolOperationTraits {
   /** Require a fresh human decision even when the session is full-auto. Use for explicit ownership
    * transfers such as accepting a child Agent Diff; this grant is intentionally never remembered. */
   requiresExplicitApproval?: boolean;
+  /** Host-supplied immutable target label for a fresh approval. Not inferred from the model's prompt. */
+  approvalTarget?: string;
   approvalPresentation?: AgentCreationApproval;
   /** Metadata for future audit/permission UIs; never weakens the ordinary approval/guardian boundary. */
   destructive?: boolean;
@@ -259,6 +261,8 @@ export function toolOperationTraits(tool: Tool, input: unknown, ctx: ToolContext
         ? { approvalKind: classified.approvalKind }
         : {}),
       ...(classified.requiresExplicitApproval === true ? { requiresExplicitApproval: true } : {}),
+      ...(classified.requiresExplicitApproval === true && typeof classified.approvalTarget === "string"
+        ? { approvalTarget: classified.approvalTarget.slice(0, 1024) } : {}),
       ...(classified.requiresExplicitApproval === true && classified.approvalPresentation
         ? { approvalPresentation: classified.approvalPresentation } : {}),
       ...(classified.destructive === true ? { destructive: true } : {}),

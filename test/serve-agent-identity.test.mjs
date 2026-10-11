@@ -49,6 +49,49 @@ function memoryStore() {
   };
 }
 
+test("a user-selected persistent Agent delegates directly and nested colleagues cannot route back to an ancestor", { timeout: 15000 }, async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "hara-colleague-dispatch-")); const home = join(root, "home"), workspace = join(root, "repo");
+  const previousHome = process.env.HOME; process.env.HOME = home;
+  const roles = join(home, ".hara", "roles"); mkdirSync(roles, { recursive: true }); mkdirSync(workspace);
+  for (const name of ["architect", "coder"]) writeFileSync(join(roles, `${name}.md`), ["---", `name: ${name}`, `model: fake-${name}`,
+    `description: ${name} fixture`, "---", `YOU ARE THE ${name.toUpperCase()} FIXTURE`, ""].join("\n"));
+  const store = memoryStore(); const receipts = []; let handle, client;
+  const provider = () => ({ id: "fake", model: "fixture", async turn({ system, history, tools }) {
+    const results = history.filter((message) => message.role === "tool").flatMap((message) => message.results);
+    const coder = system.includes("YOU ARE THE CODER FIXTURE"); let tool;
+    if (!results.some((result) => result.name === "task_intake")) tool = { name: "task_intake", input: {
+      intent: "change", goal: "One bounded colleague handoff", constraints: ["no external channels"], acceptance: ["exact colleague receipt"], steps: ["handoff", "verify"] } };
+    else if (!results.some((result) => result.name === "agent_contact")) {
+      assert.ok(tools.some((tool) => tool.name === "agent_contact"), "ordinary persistent colleagues have the contact tool");
+      tool = { name: "agent_contact", input: { action: "message", recipient: coder ? "global:architect" : "global:coder", message: "Bounded implementation handoff" } };
+    } else if (!results.some((result) => result.name === "task_checkpoint")) {
+      const receipt = JSON.parse(results.find((result) => result.name === "agent_contact").content); receipts.push({ coder, receipt });
+      tool = { name: "task_checkpoint", input: { completion: { state: "verified", evidence: [coder ? "ancestor cycle was refused" : "colleague receipt returned"] } } };
+    }
+    return { text: tool ? "" : coder ? "Ancestor loop refused; implementation handoff checked." : "Colleague handled the bounded task.",
+      toolUses: tool ? [{ id: `${coder ? "coder" : "architect"}-${tool.name}`, ...tool }] : [], stop: tool ? "tool_use" : "end", usage: {input:1,output:1} };
+  } });
+  t.after(async () => { client?.close(); await handle?.close(); process.env.HOME = previousHome; rmSync(root, {recursive:true,force:true}); });
+  handle = await startServe({ host:"127.0.0.1",port:0,token:"fixture-token",cwd:workspace }, {
+    version:"test",providerId:"fake",model:"fixture",buildSessionProvider:async()=>provider(),buildProviderFor:async()=>provider(),
+    spawnSubagent:async()=>"unused",sandbox:"off",approval:"full-auto",store,quietDiscovery:true,agentTeamHome:home,
+    runtimeInfo:()=>({providerId:"fake",model:"fixture",profileId:"personal",spaceId:"personal"}),
+  });
+  client = await connect(handle.port); await client.call("initialize",{token:"fixture-token"});
+  const created = await client.call("session.create",{cwd:workspace,agentRef:"global:architect"}); assert.ok(created.result,JSON.stringify(created));
+  const parent = created.result.sessionId; const sent = await client.call("session.send",{sessionId:parent,text:"Delegate this bounded task directly to Coder."});
+  assert.equal(sent.error,undefined);
+  const nested = receipts.find((entry)=>entry.coder)?.receipt;
+  assert.equal(nested.status,"not_delivered"); assert.equal(nested.reasonCode,"agent_dispatch_cycle");
+  const outer = receipts.find((entry)=>!entry.coder)?.receipt;
+  assert.equal(outer.status,"completed"); assert.equal(outer.ownerAgentRef,"global:coder"); assert.equal(outer.rootSessionId,parent);
+  const child = store.saved.get(outer.sessionId); assert.ok(child);
+  assert.equal(child.meta.agentDelegation.rootSessionId,parent); assert.equal(child.meta.agentDelegation.parentSessionId,parent);
+  assert.equal(child.meta.agentDelegation.fromAgentRef,"global:architect"); assert.equal(child.meta.agentDelegation.toAgentRef,"global:coder");
+  assert.equal(child.meta.agentDelegation.depth,1); assert.equal(child.meta.codingSessionLink,undefined);
+  assert.equal([...store.saved.values()].filter((entry)=>entry.meta.agentDelegation).length,1,"cycle creates no extra execution segment");
+});
+
 test("serve persists the simplified Agent directory and runs the selected persona", async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-serve-agent-"));
   const home = join(root, "home");

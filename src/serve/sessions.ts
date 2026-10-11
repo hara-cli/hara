@@ -420,7 +420,7 @@ export class SessionHub {
       if (first && "content" in first && typeof first.content === "string") s.meta.title = deriveTitle(first.content);
     }
     this.stampVersion(s.meta);
-    if (s.durable === false && s.history.length === 0 && !s.task && !s.meta.serveSuspension) return;
+    if (s.durable === false && s.history.length === 0 && !s.task && !s.meta.serveSuspension && !s.meta.codingSessionLink) return;
     this.store.save(s.meta, s.history, s.task);
     s.durable = true;
   }
@@ -433,7 +433,7 @@ export class SessionHub {
       if (first && "content" in first && typeof first.content === "string") s.meta.title = deriveTitle(first.content);
     }
     this.stampVersion(s.meta);
-    if (s.durable === false && history.length === 0 && !task && !s.meta.serveSuspension) return;
+    if (s.durable === false && history.length === 0 && !task && !s.meta.serveSuspension && !s.meta.codingSessionLink) return;
     this.store.save(s.meta, history, task);
     s.durable = true;
   }
@@ -549,6 +549,7 @@ export class SessionHub {
       && !task
       && !(candidateMeta.commandReceipts?.length)
       && !candidateMeta.serveSuspension
+      && !candidateMeta.codingSessionLink
     );
     if (shouldPersist) {
       this.store.save(candidateMeta, history, task);

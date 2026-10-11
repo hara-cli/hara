@@ -55,6 +55,7 @@ import {
   type GatewayRunOutcomeState,
 } from "./runtime-state.js";
 import { serveGatewayOutboundRequests } from "./outbound-broker.js";
+import { AgentFollowupStore } from "./agent-followup.js";
 import {
   channelBridgeNameForSource,
   channelBridgeWeixinTargets,
@@ -1175,6 +1176,7 @@ export async function runGateway(opts: RunGatewayOptions): Promise<void> {
   // Adapter names are the source of truth (e.g. requested `lark` builds the `feishu` adapter). Keep the
   // requested spelling only for startup/config hints; all persisted/routable identities are canonical.
   const platform = adapter.name || canonicalGatewayPlatform(requestedPlatform);
+  const agentFollowups = platform === "feishu" ? new AgentFollowupStore() : undefined;
   // Lazy adapters: constructing this registry does not start Herdr, Codex, or Claude. `/coding` is the only
   // gateway route that touches it, and Hara Live starts only when the owner explicitly creates a session.
   const externalSessions = createExternalSessionRegistry({ haraVersion: HARA_RUNTIME_VERSION });
@@ -1270,7 +1272,9 @@ export async function runGateway(opts: RunGatewayOptions): Promise<void> {
   if (opts.signal?.aborted) stopFromOwner();
   else opts.signal?.addEventListener("abort", stopFromOwner, { once: true });
   ac.signal.addEventListener("abort", closeQueue, { once: true });
-  const outboundWorker = serveGatewayOutboundRequests(adapter, runtimeScope, ac.signal).catch((error) => {
+  const outboundWorker = serveGatewayOutboundRequests(adapter, runtimeScope, ac.signal, {
+    followupSenderAllowed: (senderId) => currentAllowlist().has(senderId),
+  }).catch((error) => {
     if (!ac.signal.aborted) {
       console.error(`hara gateway: connected-channel delivery worker stopped — ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1354,6 +1358,14 @@ export async function runGateway(opts: RunGatewayOptions): Promise<void> {
     await (async () => {
     if (outcomeLoadError) throw outcomeLoadError;
     const earlyCommand = existingRunOutcome ? null : parseCommand(m.text);
+    // An owner-confirmed thread has one named Agent. Consume its reply lane before flows, but never expose
+    // group traffic to the full-auto DM driver. App/unknown senders cannot create candidates or queue work.
+    if (!existingRunOutcome && agentFollowups && m.chatType === "group") {
+      const allowed = allowlist.has(String(m.userId));
+      const routed = agentFollowups.admit(runtimeScope, m, allowed);
+      if (routed !== "none") return;
+      agentFollowups.observe(runtimeScope, m, allowed);
+    }
     // Group bridge administration must run before ordinary flow matching because groups intentionally do not
     // receive the full coding agent. It is idempotent and owner-gated; safe list output exposes no chat/peer ids.
     if (earlyCommand?.cmd === "bridge" && platform === "feishu" && m.chatType === "group") {

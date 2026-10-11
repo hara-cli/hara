@@ -16,6 +16,7 @@ import { ExternalRuntimeLinkStore } from "./identity.js";
 import {
   ExternalSessionInputError,
   ExternalRuntimeSessionGoneError,
+  ExternalSessionDeliveryUnknownError,
   type ExternalRuntimeAgentKind,
   type ExternalRuntimeLaunchOptions,
   type ExternalRuntimePreparedSession,
@@ -385,13 +386,13 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
     return await this.currentAgent(discovered);
   }
 
-  private async terminalText(ref: RuntimeRef): Promise<string> {
+  private async terminalText(ref: RuntimeRef, signal?: AbortSignal): Promise<string> {
     const history = await runExternalCommandCapture(this.command, [
       "agent", "read", ref.target,
       "--source", "recent-unwrapped",
       "--lines", "240",
       "--format", "text",
-    ], { timeoutMs: 8_000, maxOutputBytes: 2 * 1024 * 1024 });
+    ], { timeoutMs: 8_000, maxOutputBytes: 2 * 1024 * 1024, signal });
     if (history.ok) return safeTerminalText(history.stdout);
     // Herdr cannot scroll alternate-screen history while a provider is blocked on an interactive
     // question. The visible terminal is still safe and readable, so keep the session usable instead
@@ -403,15 +404,15 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
       "agent", "read", ref.target,
       "--source", "visible",
       "--format", "text",
-    ], { timeoutMs: 8_000, maxOutputBytes: 2 * 1024 * 1024 });
+    ], { timeoutMs: 8_000, maxOutputBytes: 2 * 1024 * 1024, signal });
     if (!visible.ok) throw new Error("Hara Live could not read this session");
     return safeTerminalText(visible.stdout);
   }
 
-  private async currentAgent(ref: RuntimeRef): Promise<RuntimeRef> {
+  private async currentAgent(ref: RuntimeRef, signal?: AbortSignal): Promise<RuntimeRef> {
     const response = parseJsonResponse(await runExternalCommandCapture(this.command, [
       "agent", "get", ref.target,
-    ], { timeoutMs: 8_000, maxOutputBytes: 512 * 1024 }));
+    ], { timeoutMs: 8_000, maxOutputBytes: 512 * 1024, signal }));
     const agent = response?.result?.agent;
     if (!agent || typeof agent !== "object" || Array.isArray(agent)) {
       throw new Error("Hara Live could not inspect this session");
@@ -427,12 +428,13 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
     ref: RuntimeRef,
     statuses: readonly ("idle" | "working" | "blocked" | "done")[],
     timeoutMs: number,
+    signal?: AbortSignal,
   ): Promise<RuntimeRef | null> {
     const result = await runExternalCommandCapture(this.command, [
       "agent", "wait", ref.target,
       ...statuses.flatMap((status) => ["--until", status]),
       "--timeout", String(Math.max(250, timeoutMs)),
-    ], { timeoutMs: Math.max(1_000, timeoutMs + 2_000), maxOutputBytes: 512 * 1024 });
+    ], { timeoutMs: Math.max(1_000, timeoutMs + 2_000), maxOutputBytes: 512 * 1024, signal });
     const agent = parseJsonResponse(result)?.result?.agent;
     if (!result.ok || !agent || typeof agent !== "object" || Array.isArray(agent)) return null;
     const current = this.remember(agent as HerdrAgent);
@@ -451,6 +453,7 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
     baselineStateChangeSeq: number | null,
     runtime: RunningTurn,
     deadline: number,
+    signal?: AbortSignal,
   ): Promise<boolean> {
     const progressed = (candidate: RuntimeRef): boolean => (
       baselineStateChangeSeq !== null
@@ -460,27 +463,28 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
     const settled = (candidate: RuntimeRef): boolean => (
       candidate.info.state === "idle" || candidate.info.state === "waiting"
     );
-    let current = await this.currentAgent(ref);
+    let current = await this.currentAgent(ref, signal);
     if (progressed(current) && settled(current)) return true;
 
-    while (!runtime.interrupted && current.info.state !== "working" && Date.now() < deadline) {
+    while (!runtime.interrupted && !signal?.aborted && current.info.state !== "working" && Date.now() < deadline) {
       const remaining = deadline - Date.now();
-      const active = await this.waitForAgent(ref, ["working"], Math.min(30_000, remaining));
+      const active = await this.waitForAgent(ref, ["working"], Math.min(30_000, remaining), signal);
       if (active) {
         current = active;
         break;
       }
-      current = await this.currentAgent(ref);
+      current = await this.currentAgent(ref, signal);
       if (progressed(current) && settled(current)) return true;
     }
     if (runtime.interrupted) return true;
+    if (signal?.aborted) return false;
     if (current.info.state !== "working") return false;
 
     const remaining = deadline - Date.now();
     if (remaining <= 0) return false;
-    const finished = await this.waitForAgent(ref, ["idle", "done", "blocked"], remaining);
+    const finished = await this.waitForAgent(ref, ["idle", "done", "blocked"], remaining, signal);
     if (finished && settled(finished)) return true;
-    current = await this.currentAgent(ref);
+    current = await this.currentAgent(ref, signal);
     return progressed(current) && settled(current);
   }
 
@@ -492,7 +496,7 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
       role: "assistant",
       text,
     }] : [];
-    return { session: ref.info, messages, readOnly: false, controlMode: "live" };
+    return { session: ref.info, messages, readOnly: false, controlMode: "live", conversationLinkAvailable: true };
   }
 
   private async ensureServer(): Promise<boolean> {
@@ -602,15 +606,36 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
   }
 
   async submit(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult> {
+    // Connected-chat cancellation revokes only this short-lived relay command. It must never send
+    // Ctrl+C, close the workspace, or stop the provider's original terminal process.
+    const deliverySignal = sink.existingSessionMessage ? sink.signal : undefined;
+    let deliveryAttempted = false;
+    const assertDeliveryCurrent = (): void => {
+      if (deliverySignal?.aborted) {
+        if (deliveryAttempted) throw new ExternalSessionDeliveryUnknownError();
+        throw new Error("coding_link_cancelled");
+      }
+    };
+    assertDeliveryCurrent();
     const ref = await this.ref(sessionId);
+    assertDeliveryCurrent();
     if (this.running.has(sessionId)) throw new ExternalSessionInputError("this Hara Live session is already working");
     const runtime: RunningTurn = { turnId: `extturn_${randomUUID()}`, interrupted: false };
     this.running.set(sessionId, runtime);
     try {
       const deadline = Date.now() + TURN_TIMEOUT_MS;
-      const baseline = await this.currentAgent(ref);
-      const before = await this.terminalText(ref);
+      const baseline = await this.currentAgent(ref, deliverySignal);
+      assertDeliveryCurrent();
+      const before = await this.terminalText(ref, deliverySignal);
+      assertDeliveryCurrent();
+      if (sink.existingSessionMessage) {
+        const current = await this.currentAgent(ref, deliverySignal);
+        assertDeliveryCurrent();
+        if (current.info.workspaceId !== baseline.info.workspaceId) throw new Error("coding_link_target_changed");
+      }
       sink.notice("Message relayed to the original terminal session through Hara Live.");
+      assertDeliveryCurrent();
+      deliveryAttempted = true;
       const prompted = await runExternalCommandCapture(this.command, [
         "agent", "prompt", ref.target, text,
         "--wait",
@@ -618,19 +643,24 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
         "--until", "done",
         "--until", "blocked",
         "--timeout", String(TURN_TIMEOUT_MS - 5_000),
-      ], { timeoutMs: TURN_TIMEOUT_MS, maxOutputBytes: 512 * 1024 });
+      ], { timeoutMs: TURN_TIMEOUT_MS, maxOutputBytes: 512 * 1024, signal: deliverySignal });
+      assertDeliveryCurrent();
       const response = parseJsonResponse(prompted);
       let finalRef = response?.result?.agent && typeof response.result.agent === "object" && !Array.isArray(response.result.agent)
         ? this.remember(response.result.agent as HerdrAgent)
         : null;
       const settled = prompted.ok || (
         prompted.errorCode === "agent_prompt_stalled"
-        && await this.recoverAcceptedStalledPrompt(ref, baseline.stateChangeSeq, runtime, deadline)
+        && await this.recoverAcceptedStalledPrompt(ref, baseline.stateChangeSeq, runtime, deadline, deliverySignal)
       );
-      if (settled) finalRef = await this.currentAgent(ref).catch(() => finalRef);
+      assertDeliveryCurrent();
+      if (settled) finalRef = await this.currentAgent(ref, deliverySignal).catch(() => finalRef);
+      assertDeliveryCurrent();
       const waitingForInput = finalRef?.info.state === "waiting";
       const completed = settled && !waitingForInput;
-      const after = await this.terminalText(ref);
+      if (sink.existingSessionMessage && !settled && !waitingForInput) throw new ExternalSessionDeliveryUnknownError();
+      const after = await this.terminalText(ref, deliverySignal);
+      assertDeliveryCurrent();
       const captured = terminalDelta(before, after);
       const reply = captured || (runtime.interrupted
         ? "The terminal session was interrupted."
@@ -651,6 +681,10 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
               : "runtime turn failed",
         } : {}),
       };
+    } catch (error) {
+      assertDeliveryCurrent();
+      if (sink.existingSessionMessage && deliveryAttempted) throw new ExternalSessionDeliveryUnknownError();
+      throw error;
     } finally {
       this.running.delete(sessionId);
     }

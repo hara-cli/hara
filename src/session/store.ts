@@ -38,6 +38,7 @@ import { sleepSync } from "../sync-sleep.js";
 import { isTaskExecution, type TaskExecution } from "./task.js";
 import type { ApprovalMode } from "../config.js";
 import { isValidHaraVersion } from "../version.js";
+import { isConversationCodingLink } from "../serve/coding-link.js";
 
 /** Durable transcripts are local input on resume. Bound both allocation and post-parse traversal so a
  * corrupt/hostile session cannot turn startup or `hara sessions` into an unbounded resource operation. */
@@ -205,6 +206,18 @@ export interface SessionMeta {
    * one transcript to one explicit project/global role so clients never silently reuse history as another
    * persona. */
   agentRef?: string;
+  /** Audit provenance only. It never grants execution or revives a parent turn on resume. */
+  agentDelegation?: {
+    rootSessionId: string;
+    rootTurnId: string;
+    parentSessionId: string;
+    parentTurnId: string;
+    fromAgentRef: string;
+    toAgentRef: string;
+    depth: number;
+  };
+  /** Explicit per-conversation native-session address. Not a remembered execution approval. */
+  codingSessionLink?: import("../serve/coding-link.js").ConversationCodingLink;
   /** Last atomically installed context window. The transcript remains authoritative; this identity lets
    * reconnecting clients and future event replay distinguish a real replacement from a repeated notice. */
   compaction?: SessionCompactionWindow;
@@ -1631,6 +1644,11 @@ function redactedSessionCopy(data: SessionData): SessionData {
   if (data.meta.archived !== undefined) safe.meta.archived = data.meta.archived;
   if (data.meta.gatewayOwner !== undefined) safe.meta.gatewayOwner = data.meta.gatewayOwner;
   if (data.meta.agentRef !== undefined) safe.meta.agentRef = data.meta.agentRef;
+  if (data.meta.agentDelegation !== undefined) safe.meta.agentDelegation = { ...data.meta.agentDelegation };
+  if (data.meta.codingSessionLink !== undefined) {
+    safe.meta.codingSessionLink = { ...data.meta.codingSessionLink,
+      title: sanitizeSessionTitle(safe.meta.codingSessionLink?.title ?? data.meta.codingSessionLink.title) };
+  }
   if (data.meta.compaction !== undefined) safe.meta.compaction = { ...data.meta.compaction };
   if (data.meta.serveSuspension !== undefined) {
     safe.meta.serveSuspension = { ...data.meta.serveSuspension };
@@ -2985,6 +3003,17 @@ function isNeutralMessage(value: unknown): value is NeutralMsg {
   return false;
 }
 
+function isAgentDelegation(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  const ref = (value: unknown): boolean => typeof value === "string" && value.length <= 160
+    && (value === "main" || /^(?:global|[a-z0-9][a-z0-9._-]*):[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value));
+  return validSessionId(v.rootSessionId) && validSessionId(v.parentSessionId)
+    && validSessionId(v.rootTurnId) && validSessionId(v.parentTurnId)
+    && ref(v.fromAgentRef) && ref(v.toAgentRef)
+    && Number.isInteger(v.depth) && Number(v.depth) >= 1 && Number(v.depth) <= 3;
+}
+
 function isSessionMeta(value: unknown): value is SessionMeta {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const meta = value as Partial<Record<keyof SessionMeta, unknown>>;
@@ -3013,6 +3042,8 @@ function isSessionMeta(value: unknown): value is SessionMeta {
       || meta.approval === "full-auto") &&
     (meta.archived === undefined || typeof meta.archived === "boolean") &&
     (meta.gatewayOwner === undefined || typeof meta.gatewayOwner === "string") &&
+    (meta.agentDelegation === undefined || isAgentDelegation(meta.agentDelegation)) &&
+    (meta.codingSessionLink === undefined || isConversationCodingLink(meta.codingSessionLink)) &&
     (meta.compaction === undefined || isSessionCompactionWindow(meta.compaction)) &&
     (meta.serveSuspension === undefined || isSessionServeSuspension(meta.serveSuspension)) &&
     (meta.commandReceipts === undefined || (

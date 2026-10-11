@@ -5,6 +5,26 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.186.0 — 2026-10-11 — named Agent delegation and exact session follow-ups
+
+- Let persistent colleagues delegate bounded work directly while retaining root/parent/actual-executor
+  provenance, shared attempt/depth limits, cancellation and cycle fences. Return colleague questions
+  and one-action approvals to the original conversation; reconnect cannot revive expired permissions.
+- Persist an explicit per-conversation connection to an existing coding session without launching,
+  resuming or copying it. Each message requires fresh approval and an exact target check. Independent
+  loaded Codex turns receive non-owning steering and an accepted receipt, not a false completion;
+  arbitrary Claude CLI/tmux live injection is not advertised.
+- Fence outcome-unknown native sends across new call IDs, relinking and restart. Cancellation closes
+  the relay wait rather than interrupting the user's original terminal.
+- Add opt-in named-Agent follow-ups for an authorized person's exact Feishu reply thread, with fresh
+  source-labelled consent, duration/count/rate/concurrency limits, private durable ownership and receipts,
+  original-chat decisions and original-message closure. Group traffic never enters the full-auto DM
+  driver; no broad listener is enabled. Disconnect, takeover, policy changes, revocation and restart
+  stop authority rather than automatically replaying work. Uncertain delivery is not blindly retried.
+- Cover these contracts with isolated adapter, private-store and real WebSocket fixtures. These tests
+  do not establish real Feishu public-network delivery, arbitrary-terminal compatibility or business
+  completion; provider sign-ins, organization policies and worker merge boundaries remain separate.
+
 ## 0.185.3 — 2026-10-10 — closeout recovery maintenance release
 
 - Add six real WebSocket and production disk-store regression cases for closeout recovery after the
