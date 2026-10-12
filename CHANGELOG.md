@@ -11,6 +11,8 @@ All notable changes to `@nanhara/hara`.
   cancellation. Idle gateways no longer retain one expired wait on their shared AbortSignal per poll.
 - Cover idle polling, receipt timeouts and cancellation with isolated regressions, including preservation of
   unrelated cancellation handlers and exactly-once queued delivery. Existing queue and retry semantics remain.
+- Make coding-host cancellation tests advance their existing deadline after confirmed provider entry, and
+  separately verify expiry before dispatch. This removes a runner-speed race without changing runtime deadlines.
 
 ## 0.186.0 — 2026-10-11 — named Agent delegation and exact session follow-ups
 

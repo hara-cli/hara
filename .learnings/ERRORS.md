@@ -1,5 +1,37 @@
 # Errors
 
+## [ERR-20261012-CODING-HOST-FIXTURE-DEADLINE] Cancellation fixture expired before provider entry
+
+**Logged**: 2026-10-12T13:00:00+08:00
+**Priority**: medium
+**Status**: pending
+**Area**: release-verification
+
+### Summary
+
+The Intel candidate CI's second attempt cancelled the tail-accounting test and four later tests because
+the fixture awaited provider entry after its 60 ms whole-bridge deadline had already refused dispatch.
+A synthetic request delayed by 100 ms reproduced the same event-loop cancellation with zero provider calls.
+This is distinct from an active operation losing its referenced deadline; the host had correctly closed.
+
+### Resolution in progress
+
+Use Node's test clock to advance the unchanged host deadline only after confirmed provider entry. Separately
+verify expiry before dispatch rejects the request with zero provider calls and zero usage. Do not manually
+close the bridge before that assertion, loosen production deadlines, skip tests, or repeatedly rerun CI.
+All 19 coding-host cases pass; complete suite and native CI still need verification for the final source.
+
+### Metadata
+
+- Source: CI failure and isolated reproduction
+- Reproducible: yes with delayed fixture entry
+- Related Files: `test/coding-host.test.mjs`, `src/coding/host.ts`
+- Tags: tests, timeout, fake-clock, macos-intel, cancellation, accounting
+- Pattern-Key: tests.advance_deadline_after_confirmed_phase_entry
+- Recurrence-Count: 1
+
+---
+
 ## [ERR-20260930-NPM12-REMOTE-LOCK-ORIGIN] npm 12 rejected historical mirror tarball URLs in the lockfile
 
 **Logged**: 2026-09-30T16:04:00+08:00

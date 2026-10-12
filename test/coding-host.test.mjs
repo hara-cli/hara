@@ -291,12 +291,15 @@ test("round/tool/token budgets are checked before dispatch and after provider us
 });
 
 test("identity revocation, external cancellation, timeout and close abort in-flight providers", async t => {
+  // Advance the host deadline only after dispatch. A 60 ms wall-clock deadline can close the host
+  // before an overloaded runner even reaches the provider, leaving the fixture's entry unresolved.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   for (const kind of ["identity", "external", "timeout", "close"]) {
     const entered = deferred(); const released = deferred();
     const signal = new AbortController();
     let providerSignal; let revoked = false;
     const bridge = await create(t, {
-      signal: signal.signal, budget: { ...BUDGET, timeoutMs: kind === "timeout" ? 60 : 10_000 },
+      signal: signal.signal, budget: BUDGET,
       assertCurrent() { if (revoked) throw new Error("synthetic-private-binding-detail"); },
       provider: { id: "fixture", model: "fixture", async turn(args) {
         providerSignal = args.signal; entered.resolve();
@@ -308,6 +311,7 @@ test("identity revocation, external cancellation, timeout and close abort in-fli
     const operation = post(bridge, "/v1/chat/completions", PROMPT).catch(() => null);
     await entered.promise;
     if (kind === "external") signal.abort();
+    if (kind === "timeout") t.mock.timers.tick(BUDGET.timeoutMs);
     if (kind === "close") await bridge.close();
     const response = await operation;
     assert.ok(response === null || response.status !== 200, kind);
@@ -317,6 +321,20 @@ test("identity revocation, external cancellation, timeout and close abort in-fli
     await bridge.close();
     await assert.rejects(post(bridge, "/v1/chat/completions", PROMPT));
   }
+});
+
+test("a host deadline before dispatch never invokes the provider or accounts unused input", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let calls = 0;
+  const bridge = await create(t, { provider: { id: "fixture", model: "fixture", async turn() {
+    calls += 1; return { text: "must not run", toolUses: [], stop: "end" };
+  } } });
+  t.mock.timers.tick(BUDGET.timeoutMs);
+  // Let the deadline's own queued close run; a manual close here would hide a broken deadline.
+  await new Promise(resolve => setImmediate(resolve));
+  await assert.rejects(post(bridge, "/v1/chat/completions", PROMPT));
+  assert.equal(calls, 0);
+  assert.deepEqual(bridge.metrics, { providerRounds: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 });
 });
 
 test("provider errors are redacted and host progress can revoke a turn before dispatch", async t => {
@@ -336,13 +354,14 @@ test("provider errors are redacted and host progress can revoke a turn before di
 });
 
 test("cancelled provider tail accounting is synchronous and never re-enters the progress authorization gate", { timeout: 5000 }, async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   for (const kind of ["external", "timeout", "close"]) {
     const entered = deferred(); const accounted = deferred();
     const controller = new AbortController();
     const usage = []; const progress = [];
     let providerSignal;
     const bridge = await create(t, {
-      signal: controller.signal, budget: { ...BUDGET, timeoutMs: kind === "timeout" ? 60 : 10_000 },
+      signal: controller.signal, budget: BUDGET,
       onUsage(metrics) {
         usage.push({ ...metrics });
         if (metrics.inputTokens > 0) accounted.resolve();
@@ -360,6 +379,7 @@ test("cancelled provider tail accounting is synchronous and never re-enters the 
     await entered.promise;
     const authorizationCalls = progress.length;
     if (kind === "external") controller.abort();
+    if (kind === "timeout") t.mock.timers.tick(BUDGET.timeoutMs);
     if (kind === "close") await bridge.close();
     await accounted.promise;
     // This observation does not depend on a worker's later finally or a completed HTTP reply.
