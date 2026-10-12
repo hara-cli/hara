@@ -21,11 +21,16 @@ verify expiry before dispatch rejects the request with zero provider calls and z
 close the bridge before that assertion, loosen production deadlines, skip tests, or repeatedly rerun CI.
 All 19 coding-host cases pass; complete suite and native CI still need verification for the final source.
 
+The local four-file-concurrency suite then passed 2,581 cases but one unrelated input-lease case crossed
+its fixture's 5 s question deadline during three real WebSocket decisions. The case took 15.68 s, below
+its 20 s test limit. Give non-expiry colleague fixtures the longest enclosing test's 40 s window; retain the explicit
+120 ms expiry case and all late-answer/lease assertions. Production question deadlines are unchanged.
+
 ### Metadata
 
 - Source: CI failure and isolated reproduction
 - Reproducible: yes with delayed fixture entry
-- Related Files: `test/coding-host.test.mjs`, `src/coding/host.ts`
+- Related Files: `test/coding-host.test.mjs`, `test/fixtures/colleague-host.mjs`, `src/coding/host.ts`
 - Tags: tests, timeout, fake-clock, macos-intel, cancellation, accounting
 - Pattern-Key: tests.advance_deadline_after_confirmed_phase_entry
 - Recurrence-Count: 1

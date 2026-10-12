@@ -13,6 +13,8 @@ All notable changes to `@nanhara/hara`.
   unrelated cancellation handlers and exactly-once queued delivery. Existing queue and retry semantics remain.
 - Make coding-host cancellation tests advance their existing deadline after confirmed provider entry, and
   separately verify expiry before dispatch. This removes a runner-speed race without changing runtime deadlines.
+- Keep non-expiry colleague test inputs valid for their enclosing test; dedicated expiry and late-answer
+  cases retain their explicit short deadlines and authorization assertions. Production input lifetimes are unchanged.
 
 ## 0.186.0 — 2026-10-11 — named Agent delegation and exact session follow-ups
 

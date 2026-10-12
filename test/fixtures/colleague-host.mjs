@@ -49,7 +49,9 @@ function connect(port) {
   });
 }
 
-export async function fixture(t, { mode = "choice", clientFeatures = features, timeout = 5_000, holdCoder = false, approvalMode = "suggest" } = {}) {
+// Non-expiry cases have up to a 40 s test deadline and make multiple real WebSocket decisions. Keep their
+// question alive for that whole test; explicit expiry cases still supply their own short deadline.
+export async function fixture(t, { mode = "choice", clientFeatures = features, timeout = 40_000, holdCoder = false, approvalMode = "suggest" } = {}) {
   const root = mkdtempSync(join(tmpdir(), "hara-colleague-input-")), home = join(root, "home"), repo = join(root, "repo");
   const previousHome = process.env.HOME; process.env.HOME = home;
   mkdirSync(join(home, ".hara", "roles"), { recursive: true }); mkdirSync(repo);
