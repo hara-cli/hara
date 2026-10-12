@@ -5,7 +5,7 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## Unreleased — gateway polling cleanup
+## 0.186.1 — 2026-10-12 — gateway polling cleanup
 
 - Remove the cancellation listener when an outbound broker polling delay finishes normally, as well as on
   cancellation. Idle gateways no longer retain one expired wait on their shared AbortSignal per poll.
