@@ -67,6 +67,17 @@ test("both supported pack envelopes retain all package identity and public-file 
   }
 });
 
+test("every explicitly published guide is reviewed by the npm artifact allowlist", () => {
+  const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  for (const path of manifest.files.filter(path => path.startsWith("docs/"))) {
+    const info = packed(REQUIRED_PACKAGE_FILES.includes(path) ? [] : [path]);
+    assert.deepEqual(inspectPackageFiles(info, pkg), { fileCount: info.files.length }, path);
+  }
+  for (const path of ["docs/private-mailbox.json", "docs/customer-report.md", "docs/credentials.json"]) {
+    assert.throws(() => inspectPackageFiles(packed([path]), pkg), /outside the public file allowlist/);
+  }
+});
+
 function below(base, path) {
   assert.equal(typeof path, "string");
   assert.ok(isAbsolute(path), "isolated environment paths must be absolute");

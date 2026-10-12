@@ -42,6 +42,16 @@ Bun's locked OpenCode download needed network approval. npm pack's EPERM on the 
 cache did not prove root ownership despite npm's generic advice; use a task-local private cache,
 not recursive chown. Check the original exit before parsing JSON, which may be an error object.
 
+Main CI `38253121065` rejected the actual npm artifact because the newly published
+`docs/mail-taskbus.md` was absent from the exact public-file allowlist. A dry-run pack alone did
+not exercise that gate. Add only that reviewed guide to required files, keep arbitrary/private
+docs rejected, and test every explicitly published guide against the allowlist. The new test
+failed before the fix; all package-contract tests and an actual isolated pack/install/CLI/Pi/native
+OpenCode smoke passed afterward. Future local release gates must include the real artifact smoke,
+not substitute the dry-run manifest or loosen the allowlist to a documentation glob.
+The final complete CLI suite after this regression passed 2,617 tests with one platform skip
+and zero failures/cancellations; the original test process exited successfully.
+
 ### Metadata
 - Reproducible: yes, synthetic tests
 - Related Files: src/mail.ts, src/mail-runtime.ts, test/mail.test.mjs, test/mail-runtime.test.mjs

@@ -18,7 +18,7 @@ export const REQUIRED_PACKAGE_FILES = Object.freeze([
   "dist/coding/accounting.js", "dist/coding/bundled-opencode.js", "dist/opencode-runtime.js",
   "dist/external-sessions/opencode-worker.js", "dist/third-party-notices.js",
   "README.md", "THIRD_PARTY_NOTICES.md", "LICENSE",
-  "docs/coding-executors.md", "docs/coding-executors-benchmark.md",
+  "docs/coding-executors.md", "docs/coding-executors-benchmark.md", "docs/mail-taskbus.md",
   ...PUBLIC_PLUGIN_MANIFESTS,
 ]);
 const PUBLIC_FILES = new Set([
