@@ -17,6 +17,8 @@ All notable changes to `@nanhara/hara`.
   cases retain their explicit short deadlines and authorization assertions. Production input lifetimes are unchanged.
 - Wait for explicit fixture-child readiness in native relay cancellation tests instead of polling its log for
   three seconds. Cover delayed readiness without retrying delivery or interrupting the original terminal.
+- Await colleague fixture cards directly from WebSocket events under each test's existing hard deadline;
+  remove internal 10-second polling and verify abort, disconnect, filtering and listener cleanup.
 
 ## 0.186.0 — 2026-10-11 — named Agent delegation and exact session follow-ups
 

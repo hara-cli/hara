@@ -31,6 +31,12 @@ deadline. Await an IPC readiness event emitted after the actual fixture prompt e
 early submit failures, and retain the original 10 s overall test limit. A separate 3.5 s delayed-entry
 regression retains a bounded 20 s overall limit and the exactly-one-prompt/no-interrupt assertions.
 
+The next full run exposed three colleague-card waits crossing their internal 10 s polling window,
+with empty event queues, while adjacent two-hop/native workflows took 14.5/20.7 s. Await actual socket
+events under the existing enclosing test AbortSignal instead; reject disconnects and remove listeners
+on match/abort. Keep all overall test limits, explicit expiry, authority and no-write assertions unchanged.
+Add controlled-clock coverage for an event after the old window, wrong-colleague filtering and cleanup.
+
 ### Metadata
 
 - Source: CI failure and isolated reproduction

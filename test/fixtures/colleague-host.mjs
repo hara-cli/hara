@@ -7,6 +7,7 @@ import WebSocket from "ws";
 import { startServe } from "../../dist/serve/server.js";
 import { RemoteCommandLedger } from "../../dist/serve/remote-command-ledger.js";
 import { AgentFollowupStore } from "../../dist/gateway/agent-followup.js";
+import { colleagueEvents } from "./colleague-events.mjs";
 
 export const features = ["agent.delegated-interaction.v1", "external.delegated-interaction.v1", "external.questions.v1", "task.approvals.v1"];
 export const nativeId = `ext_codex_${"c".repeat(24)}`;
@@ -14,17 +15,18 @@ const question = { questions: [{ id: "scope", question: "Which fixture implement
 export const cardEvents = ["agent.approval.request", "agent.approval.resolved", "agent.question.request", "agent.question.resolved"];
 export const projection = ({ deliveryCursor: _cursor, ...value }) => value;
 
-function connect(port) {
+function connect(port, signal) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}`), events = [], requests = new Map(); let next = 0;
+    const ws = new WebSocket(`ws://127.0.0.1:${port}`), inbox = colleagueEvents(signal), events = inbox.events, requests = new Map(); let next = 0;
     ws.on("message", (raw) => {
       const value = JSON.parse(String(raw)), request = requests.get(value.id);
       if (request) { requests.delete(value.id); clearTimeout(request.timer); request.resolve(value); }
-      else if (value.method) events.push(value);
+      else if (value.method) inbox.push(value);
     });
     ws.on("close", () => {
       for (const request of requests.values()) { clearTimeout(request.timer); request.resolve({ error: { code: -1, message: "fixture disconnected" } }); }
       requests.clear();
+      inbox.close();
     });
     ws.once("error", reject);
     ws.once("open", () => resolve({ ws, events,
@@ -36,15 +38,7 @@ function connect(port) {
           requests.set(id, { resolve: done, timer }); ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
         });
       },
-      async event(method, predicate = () => true) {
-        const deadline = Date.now() + 10_000;
-        while (Date.now() < deadline) {
-          const event = events.find((event) => event.method === method && predicate(event.params));
-          if (event) return event.params;
-          await new Promise((done) => setTimeout(done, 5));
-        }
-        throw Error(`fixture event timeout: ${method}; recent events: ${JSON.stringify(events.slice(-5)).slice(0, 2_000)}`);
-      },
+      event: inbox.wait,
     }));
   });
 }
@@ -118,7 +112,7 @@ export async function fixture(t, { mode = "choice", clientFeatures = features, t
     runtimeInfo: () => ({ providerId: "fake", model: "fixture", profileId: "personal", spaceId: "personal" }),
   });
   const attach = async (declared = clientFeatures) => {
-    const client = await connect(server.port); clients.push(client);
+    const client = await connect(server.port, t.signal); clients.push(client);
     await client.call("initialize", { token: "fixture-token", capabilities: { features: declared } }); return client;
   };
   const client = await attach(), created = await client.call("session.create", { cwd: repo, agentRef: "global:architect" });
