@@ -1051,6 +1051,26 @@ export async function deskCall(
   return redactSensitiveValue(result, [opts.token]).value;
 }
 
+/** Versioned, profile-pinned taskbus transport. Runtime work never inherits the owner's credential. */
+export async function taskbusCall(
+  identity: DeskOrganizationIdentity,
+  method: "GET" | "POST",
+  path: string,
+  body?: unknown,
+  runtime = false,
+): Promise<unknown> {
+  if (!/^\/(?:capabilities|identity|directory|members(?:\/[A-Za-z0-9_-]+)?|projects|mail-bindings(?:\/[A-Za-z0-9._:@-]+\/(?:lease|status))?|mail-outbox(?:\/bm_[a-f0-9]{32}\/(?:confirm|cancel|claim|receipt|resolve))?|intake|tasks(?:\/t_[a-f0-9]+(?:\/(?:claim|renew|result|accept|reject|cancel|release|close))?)?|deliveries(?:\/ack)?|audit)(?:\?[A-Za-z0-9%_.=&:@-]*)?$/.test(path)) {
+    throw new DeskClientError("INVALID_CONFIGURATION", "unsupported taskbus route");
+  }
+  const normalized = normalizedIdentity(identity), creds = requireProfileCreds(normalized);
+  const capabilities = await deskCall(creds.url, "GET", "/taskbus/capabilities", { token: creds.token }) as { version?: number };
+  if (capabilities.version !== 1) throw new DeskClientError("PROTOCOL", "Desk taskbus.v1 is required");
+  const token = runtime ? (await ensureWorkbenchSession(normalized)).token : creds.token;
+  const result = await deskCall(creds.url, method, `/taskbus${path}`, { token, ...(body === undefined ? {} : { body }) });
+  assertProfileCredsUnchanged(normalized, creds);
+  return result;
+}
+
 function arrayField(value: unknown, field: string): unknown[] {
   if (!isObject(value) || !Array.isArray(value[field])) {
     throw new DeskClientError("PROTOCOL", `Desk response is missing ${field}`);

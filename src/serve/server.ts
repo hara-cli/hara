@@ -523,6 +523,8 @@ export interface ServeDeps {
    * bounded remote reads. Every remote call carries a captured profileId so an in-flight request cannot
    * cross organizations if the global default changes. Desk bearer credentials never enter these DTOs. */
   deskConnections?: () => DeskConnectionsSnapshot;
+  mailRequest?: (profileId: string, spaceId: string, operation: string, input?: Record<string, unknown>) => Promise<unknown>;
+  taskbusRequest?: (profileId: string, spaceId: string, operation: string, input?: Record<string, unknown>) => Promise<unknown>;
   deskSnapshot?: (profileId: string, state?: DeskTaskState) => Promise<DeskSnapshot>;
   deskTask?: (profileId: string, taskId: string) => Promise<DeskTaskDetails>;
   deskTaskCreate?: (profileId: string, input: DeskCreateTaskInput) => Promise<DeskTaskMutationResult>;
@@ -5707,7 +5709,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "settings.gateways.stop", "settings.organizations.enroll", "settings.organizations.use",
             "settings.organizations.remove", "settings.organizations.check",
           ]);
-          if (policyMutations.has(req.method)) {
+          const mailPolicyMutation = req.method === "mail.command" && ["bind", "start", "pause", "remove", "auth.start", "auth.cancel"].includes(String(req.params?.operation || ""));
+          const busPolicyMutation = req.method === "desk.taskbus.request" && ["projects.save", "members.save", "bindings.save"].includes(String(req.params?.operation || ""));
+          if (policyMutations.has(req.method) || mailPolicyMutation || busPolicyMutation) {
             try { if (Object.hasOwn(JSON.parse(frame), "result")) {
               delegationPolicyEpoch += 1;
               pauseFollowups();
@@ -5782,6 +5786,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           if (collaborationRemote) {
             methods.push("desk.connections.list", "desk.snapshot", "desk.task.get");
           }
+          if (deps.mailRequest) methods.push("mail.connections.list", "mail.auth.status", "mail.command");
+          if (deps.taskbusRequest) methods.push("desk.taskbus.request");
           const collaborationRemoteManage =
             !!deps.deskTaskCreate
             && !!deps.deskTaskClaim
@@ -9206,6 +9212,25 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             if (!deps.checkOrganizationConnection) return reply(rpcError(id, ERR.METHOD, "organization connection check not supported by this server"));
             return reply(rpcResult(id!, redactSensitiveValue(await deps.checkOrganizationConnection(p.id, targetCwd)).value));
+          }
+          case "mail.connections.list":
+          case "mail.auth.status":
+          case "mail.command":
+          case "desk.taskbus.request": {
+            if (typeof p.profileId !== "string" || !SERVE_PROFILE_ID_PATTERN.test(p.profileId)
+              || typeof p.spaceId !== "string" || !p.spaceId || p.spaceId.length > 200
+              || (p.input !== undefined && (!p.input || typeof p.input !== "object" || Array.isArray(p.input) || JSON.stringify(p.input).length > 64_000))) {
+              return reply(rpcError(id, ERR.PARAMS, "valid profileId, spaceId and bounded object input required"));
+            }
+            const operation = req.method === "mail.connections.list" ? "list" : req.method === "mail.auth.status" ? "auth.status" : p.operation;
+            if (typeof operation !== "string" || operation.length > 64) return reply(rpcError(id, ERR.PARAMS, "operation required"));
+            const callback = req.method === "desk.taskbus.request" ? deps.taskbusRequest : deps.mailRequest;
+            if (!callback) return reply(rpcError(id, ERR.METHOD, "mail/taskbus requires an updated Engine"));
+            if (req.method === "mail.command" && !["auth.start", "auth.cancel", "bind", "start", "pause", "remove", "sync"].includes(operation)) {
+              return reply(rpcError(id, ERR.PARAMS, "unsupported mailbox command"));
+            }
+            try { return reply(rpcResult(id!, redactSensitiveValue(await callback(p.profileId, p.spaceId, operation, p.input)).value)); }
+            catch (error) { return reply(deskRpcError(id, error)); }
           }
           case "desk.connections.list": {
             if (!deps.deskConnections) return reply(rpcError(id, ERR.METHOD, "organization Desk is not supported by this server"));

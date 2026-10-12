@@ -29,7 +29,10 @@ import { readFileSync, existsSync, realpathSync, statSync, writeFileSync, rmSync
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { delimiter, dirname, join, relative, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { MailEngine, type MailScope } from "./mail.js";
+import { taskbusRoute } from "./taskbus.js";
+import { cachedTaskbusRead } from "./taskbus-cache.js";
 import {
   loadConfig,
   configPath,
@@ -260,6 +263,7 @@ import {
   createDeskTask,
   DeskClientError,
   deskOrganizationIdentityMatches,
+  taskbusCall,
   deskConnectionsSnapshot as localDeskConnectionsSnapshot,
   fetchDeskSnapshot,
   fetchDeskTask,
@@ -1819,6 +1823,32 @@ function assertDeskOrganizationProfile(value: string): DeskOrganizationIdentity 
     throw new DeskClientError("NOT_CONFIGURED", `organization connection '${id}' was not found`);
   }
   return deskOrganizationIdentity(profile);
+}
+
+function mailScope(profileId: string, spaceId: string): MailScope {
+  const identity = assertDeskOrganizationProfile(profileId);
+  const profile = getProfile(profileId)!;
+  if (spaceIdForProfile(profile) !== spaceId) throw new Error("mailbox/taskbus profile does not belong to this Space");
+  return { profileId, spaceId, identityKey: createHash("sha256").update(JSON.stringify({ ...identity, spaceId })).digest("hex") };
+}
+
+function createMailEngine(): MailEngine {
+  return new MailEngine(async (scope, method, path, body, runtime) => {
+    const expected = mailScope(scope.profileId, scope.spaceId);
+    if (expected.identityKey !== scope.identityKey) throw new Error("mailbox organization identity changed");
+    const fetch = () => taskbusCall(assertDeskOrganizationProfile(scope.profileId), method, path, body, runtime);
+    const result = method === "GET" && !runtime ? await cachedTaskbusRead(scope, path, {}, fetch) : await fetch();
+    if (mailScope(scope.profileId, scope.spaceId).identityKey !== expected.identityKey) throw new Error("mailbox organization identity changed during request");
+    return result;
+  }, mailScope);
+}
+
+async function callTaskbusForSpace(profileId: string, spaceId: string, operation: string, input: Record<string, unknown> = {}) {
+  const before = mailScope(profileId, spaceId), route = taskbusRoute(operation, input);
+  const fetch = () => taskbusCall(assertDeskOrganizationProfile(profileId), route.method, route.path, route.body, route.runtime);
+  const result = route.method === "GET" ? await cachedTaskbusRead(before, operation, input, fetch) : await fetch();
+  if (mailScope(profileId, spaceId).identityKey !== before.identityKey) throw new Error("taskbus organization identity changed during request");
+  return result;
 }
 
 async function fetchDeskSnapshotForProfile(
@@ -4662,6 +4692,7 @@ program
       setMobileSessionPublication,
     } = await import("./mobile/state.js");
     const gatewayLogins = new GatewayLoginManager();
+    const mailEngine = createMailEngine();
     const gatewaySupervisor = new GatewaySupervisor({
       log: (message) => process.stderr.write(`${message}\n`),
     });
@@ -4980,6 +5011,7 @@ program
           return weixin.testWeixinOwnerConnection();
         },
         closeGateways: async () => {
+          mailEngine.close();
           wechatGroupScene.stop();
           await gatewaySupervisor.close();
         },
@@ -5108,6 +5140,8 @@ program
             .filter((profile) => profile.kind === "gateway")
             .map(deskOrganizationIdentity),
         ),
+        mailRequest: (profileId, spaceId, operation, input) => mailEngine.request(mailScope(profileId, spaceId), operation, input),
+        taskbusRequest: callTaskbusForSpace,
         deskSnapshot: fetchDeskSnapshotForProfile,
         deskTask: fetchDeskTaskForProfile,
         deskTaskCreate: createDeskTaskForProfile,
@@ -5339,6 +5373,7 @@ program
       },
     );
     void gatewaySupervisor.resume();
+    mailEngine.start();
     mobileRelay.start();
     const setupStatus = provider0 ? `${cfg.provider}:${cfg.model}` : `setup required · ${cfg.provider}:${cfg.model}`;
     out(c.bold("hara serve") + c.dim(`  ·  ws://${o.host}:${handle.port}  ·  ${setupStatus}  ·  approval ${approval}  ·  token → ~/.hara/serve.json\n`));
@@ -6066,6 +6101,52 @@ program
 // `hara desk` — connect to a hara-desk coordination server (identity registry + task board).
 // The desk is the closed-source enterprise piece; this is the open-source client side.
 const deskCmd = program.command("desk").description("coordinate with a hara-desk server (organization Agents · tasks · replay)");
+
+function taskbusCliContext(requested?: string): { profileId: string; spaceId: string } {
+  const profileId = requested?.trim() || resolveActive(process.cwd()).id;
+  assertDeskOrganizationProfile(profileId);
+  return { profileId, spaceId: spaceIdForProfile(getProfile(profileId)!) };
+}
+function taskbusCliInput(file?: string): Record<string, unknown> {
+  if (!file) return {};
+  if (statSync(file).size > 64_000) throw new Error("input file exceeds 64 KB");
+  const contents = readFileSync(file, "utf8");
+  if (contents.length > 64_000) throw new Error("input file exceeds 64 KB");
+  const value = JSON.parse(contents);
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("input file must contain one JSON object");
+  return value;
+}
+deskCmd.command("bus <operation>")
+  .description("project-scoped taskbus: projects.list/save, tasks.list/get/create/claim/renew/result/accept/reject/cancel/release/close, deliveries.list/ack, audit.list")
+  .option("--profile <id>", "organization connection")
+  .option("--input-file <path>", "bounded JSON object; mutations require a stable requestKey")
+  .action(async (operation: string, o: { profile?: string; inputFile?: string }) => {
+    try {
+      const context = taskbusCliContext(o.profile);
+      console.log(JSON.stringify(await callTaskbusForSpace(context.profileId, context.spaceId, operation, taskbusCliInput(o.inputFile)), null, 2));
+    } catch (error) { console.error(redactSensitiveText(error instanceof Error ? error.message : String(error)).text); process.exitCode = 1; }
+  });
+
+program.command("mail <operation>")
+  .description("mailbox connections: list, bind, start, pause, remove, sync, auth.start/status/cancel, watch (Engine-owned, no LLM)")
+  .option("--profile <id>", "organization connection")
+  .option("--input-file <path>", "bounded JSON object; bind/start/pause/remove should include a stable requestKey")
+  .action(async (operation: string, o: { profile?: string; inputFile?: string }) => {
+    const engine = createMailEngine();
+    try {
+      const context = taskbusCliContext(o.profile), scope = mailScope(context.profileId, context.spaceId);
+      if (operation === "watch") {
+        engine.start(true, scope);
+        console.log("Mailbox receiver active for enabled connections in this Space; Ctrl-C stops this process. It does not execute mail instructions.");
+        await new Promise<void>(resolveStop => { process.once("SIGINT", resolveStop); process.once("SIGTERM", resolveStop); });
+      } else if (operation.startsWith("auth.")) {
+        throw new Error("complete authorization in Hara Desktop; the Engine keeps the provider process alive until you approve or cancel");
+      } else {
+        console.log(JSON.stringify(await engine.request(scope, operation, taskbusCliInput(o.inputFile)), null, 2));
+      }
+    } catch (error) { console.error(redactSensitiveText(error instanceof Error ? error.message : String(error)).text); process.exitCode = 1; }
+    finally { engine.close(); }
+  });
 
 const resolveDeskProfile = (requested?: string): {
   profileId: string;
