@@ -117,6 +117,24 @@ test("splitCompound: splits top-level operators; fails closed on substitution / 
   assert.equal(splitCompound(`echo "unbalanced`), null); // unbalanced quote
 });
 
+test("literal diagnostic compounds are read-only without blessing shell expansion or tmux mutations", () => {
+  const reported = "cd /Users/fixture/work/nanhara && wc -l AGENTS.md CLAUDE.md && echo '=== 章节 ===' && grep -n '^#\\{2,3\\} ' AGENTS.md";
+  const rules = { allow: [], deny: [], readonlyAutorun: true };
+  assert.equal(decideCommand(reported, rules), "allow");
+  for (const command of ["cd './project folder'", "cd -- ./repo", "echo '=== 章节 ==='", "tmux ls", "tmux list-sessions", "pgrep -x codex", "pgrep -l codex"]) {
+    assert.equal(isReadOnlyCommand(command), true, command);
+  }
+  for (const command of ["cd", "cd -", "cd ~/repo", "cd $HOME", "cd */repo", "echo $1", "echo ${TOKEN}", "echo -e '\\033[2J'", "tmux send-keys pwd Enter", "tmux new-session", "tmux -S /tmp/untrusted ls", "pgrep -fl codex"]) {
+    assert.equal(isReadOnlyCommand(command), false, command);
+  }
+  for (const command of ['echo "$(touch marker)"', 'ls "`touch marker`"', "cat <(touch marker)", "ls &", "ls \\; touch marker", 'echo "a\\"; touch marker"', "CDPATH=/tmp cd repo", "LD_PRELOAD=./hook.so ls"]) {
+    assert.equal(splitCompound(command), null, command);
+    assert.equal(decideCommand(command, rules), "ask", command);
+  }
+  assert.equal(decideCommand("cd ./repo && echo 'ready' && touch marker", rules), "ask");
+  assert.equal(decideCommand("cd ./repo && wc -l AGENTS.md", { ...rules, deny: ["wc"] }), "deny");
+});
+
 test("matchesPattern: exact, prefix, glob", () => {
   assert.equal(matchesPattern("npm test", "npm test"), true);
   assert.equal(matchesPattern("npm test -- --watch", "npm test"), true); // prefix match

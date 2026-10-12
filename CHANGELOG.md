@@ -5,6 +5,31 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.187.0 — 2026-10-12 — verified diagnostics and mailbox task intake
+
+- Recognize narrowly bounded literal read-only shell compounds during investigate tasks, including
+  literal directory changes, text separators, tmux session names and PID/name-only process lookup.
+  Unknown shell syntax, background execution, substitutions, redirects, sensitive files and explicit
+  deny rules retain their approval/refusal boundaries; diagnostics no longer need a change brief.
+- Restore trusted macOS Homebrew tool directories in child PATH without sourcing shell profiles or
+  weakening the sandbox. This does not resolve every inherited macOS process-query restriction.
+- Let the main Personal conversation discover minimal archived colleague metadata and propose an
+  exact-ref restore through a single-use human confirmation. Recheck source revision, dismissal and
+  authority; preserve instructions/history and grant no tools or credentials. Contact lists now
+  identify their source scope. New colleague creation still defaults to personal global scope.
+- Explain consumption-guard pauses with the real round, cumulative model I/O and stale-progress
+  counters, separate from missing user authority. Keep bounded continuation and consumption guards;
+  model I/O is not a provider's bill or subscription deduction.
+- Add engine-owned mailbox intake and a scoped Desk taskbus.v1 client: durable receiving leases,
+  deduplication, offline read-only snapshots, directed tasks, immutable results and separate review.
+  Email is untrusted feedback, not authority to execute, and does not wake closed coding terminals.
+- Bind saved mailbox credentials to the unchanged identity, enrollment and verified endpoints;
+  recheck pause/rebind immediately before SMTP and do not retry outcome-unknown sends. Sending
+  remains an exact-message, separately confirmed operation; initial empty-inbox body status is honest.
+- Advertise a cached help-only prerequisite check. Mail receiving requires Python 3 and the user's
+  canonical shared feishu-communicate capability; they are not installed or logged in automatically.
+  Real mailbox authorization, server receiver deployment and external business acceptance are separate.
+
 ## 0.186.1 — 2026-10-12 — gateway polling cleanup
 
 - Remove the cancellation listener when an outbound broker polling delay finishes normally, as well as on

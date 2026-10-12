@@ -7,6 +7,7 @@ import {
   dismissAgentRef,
   dismissAgentRefs,
   dismissedAgentRefs,
+  dismissedAgentRecords,
   isAgentRefDismissed,
   restoreAgentRef,
 } from "../dist/org/agent-roster.js";
@@ -55,6 +56,19 @@ test("personal Agent roster fails closed without overwriting malformed state", (
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("restoration compares the exact dismissal under the private roster lock", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-roster-restore-fence-"));
+  try {
+    dismissAgentRef("nanhara:pm", home);
+    const before = dismissedAgentRecords(home);
+    assert.deepEqual(Object.keys(before[0]).sort(), ["dismissedAt", "ref"]);
+    assert.throws(() => restoreAgentRef("nanhara:pm", home, "2000-01-01T00:00:00.000Z"), /dismissal changed/);
+    assert.deepEqual(dismissedAgentRecords(home), before);
+    assert.equal(restoreAgentRef("nanhara:pm", home, before[0].dismissedAt), true);
+    assert.throws(() => restoreAgentRef("nanhara:pm", home, before[0].dismissedAt), /dismissal changed/);
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
 test("active role loading excludes dismissed merged identities from explicit and automatic routing", () => {

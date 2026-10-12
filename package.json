@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.186.1",
+  "version": "0.187.0",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "runtime-bootstrap.cjs"
@@ -17,6 +17,7 @@
     "docs/wechat-agent-scenes.md",
     "docs/coding-executors.md",
     "docs/coding-executors-benchmark.md",
+    "docs/mail-taskbus.md",
     "scripts/jev-wechat-bridge.py",
     "CHANGELOG.md",
     "THIRD_PARTY_NOTICES.md",

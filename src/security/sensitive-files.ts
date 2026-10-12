@@ -12,6 +12,7 @@ import {
 import type { Dir, Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { literalCdTarget, literalShellWords, splitLiteralShellCommands } from "./shell-literals.js";
 import {
   basename,
   dirname,
@@ -596,20 +597,34 @@ export function sensitiveShellCommandReason(command: string, cwd: string, env: N
   const dump = environmentDumpReason(command);
   if (dump) return dump;
 
+  // Literal cd is a read-only shell builtin, but later relative reads must retain their real protected
+  // identity. Keep all possible directories (&& / || / pipelines can branch) rather than guessing which
+  // branch ran. Preserve raw quoted whitespace here; permission canonicalization is intentionally lossy.
+  const directories = new Set([resolve(cwd)]);
+  for (const segment of splitLiteralShellCommands(command) ?? []) {
+    let words = literalShellWords(segment);
+    if (!words) continue;
+    while (words[0] === "command" || words[0] === "builtin") words = words.slice(1);
+    const target = literalCdTarget(words);
+    if (target === null) continue;
+    for (const current of [...directories]) directories.add(resolve(current, target));
+    if (directories.size > 64) return "too many possible shell working directories for protected-path inspection";
+  }
+
   // Tokenize only literal path-like chunks; command substitution/variable tricks are separately forbidden
   // by the system contract and the macOS OS-level read mask. Ordinary code searches for `\.env` retain the
   // backslash and do not match this literal-file check.
   const chunks = command.match(/[^\s'"`=<>|;&(),]+/g) ?? [];
-  for (const raw of chunks) {
+  for (const current of directories) for (const raw of chunks) {
     if (raw.startsWith("-") || raw.includes("\\.env")) continue;
-    const candidate = expandShellCandidate(raw, cwd);
+    const candidate = expandShellCandidate(raw, current);
     const reason = sensitiveFileReason(candidate);
     if (reason) return `${reason}: ${raw}`;
     // Git revision pathspecs (`HEAD:.env`) do not look like filesystem paths until git resolves them.
     const colon = raw.lastIndexOf(":");
     if (colon > 0 && !/^\w+:\/\//.test(raw)) {
       const revisionPath = raw.slice(colon + 1);
-      const revisionReason = sensitiveFileReason(resolve(cwd, revisionPath));
+      const revisionReason = sensitiveFileReason(resolve(current, revisionPath));
       if (revisionReason) return `${revisionReason} in revision path: ${raw}`;
     }
   }

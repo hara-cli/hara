@@ -9,6 +9,7 @@ import { existsSync, realpathSync, readdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { bindPrivateHaraStateFile, readPrivateStateFileSnapshotSync, removePrivateStateFile, withPrivateStateLockSync, writePrivateStateFileSync } from "./security/private-state.js";
 import { redactSensitiveText } from "./security/secrets.js";
+import { mailRuntimeStatus } from "./mail-runtime.js";
 
 export interface MailScope { spaceId: string; profileId: string; identityKey: string; }
 export interface MailConnection extends MailScope {
@@ -156,6 +157,7 @@ export class MailEngine {
   }
   async request(scope: MailScope, operation: string, input: Data = {}): Promise<Data> {
     this.assertScope(scope);
+    if (operation === "runtime.status") return mailRuntimeStatus();
     if (operation === "list") {
       const remote = await this.bus(scope, "GET", "/mail-bindings"); this.assertScope(scope);
       return { connections: (remote.bindings || []).filter((r: Data) => !r.removed).map((r: Data) => {
@@ -200,7 +202,19 @@ export class MailEngine {
       let staged: ReturnType<typeof privateFile> | undefined;
       try {
       if (transport === "imap-smtp") {
-        const password = input.password || read(["accounts"], hash(mailbox) + ".json")?.password;
+        const suppliedPassword = input.password !== undefined && input.password !== "";
+        let password = input.password;
+        if (!suppliedPassword) {
+          const account = read(["accounts"], hash(mailbox) + ".json");
+          const prior = this.connections().find(c => c.mailbox === mailbox && c.profileId === scope.profileId
+            && c.spaceId === scope.spaceId && c.identityKey === scope.identityKey && c.transport === transport);
+          const serverKeys = ["imapHost", "imapPort", "imapSecurity", "smtpHost", "smtpPort", "smtpSecurity"];
+          if (!prior || account?.mailbox !== mailbox || serverKeys.some(k => (prior.servers as Data | undefined)?.[k] !== (servers as unknown as Data)[k]
+            || account?.[k] !== (servers as unknown as Data)[k])) {
+            throw new Error("enter an explicit client password again after changing servers or enrollment");
+          }
+          password = account.password;
+        }
         if (typeof password !== "string" || !password || password.length > 4096 || /[\r\n\x00]/.test(password)) throw new Error("dedicated mail client password required");
         const leaf = "bind-" + randomUUID() + ".json";
         save(["accounts"], leaf, { mailbox, password, ...servers });
@@ -338,6 +352,9 @@ export class MailEngine {
           save([c.id, "inbox"], leaf, message);
         }
         c = this.connection(c, c.id);
+        if (c.checks?.body === "empty-inbox" && read([c.id, "inbox"], leaf)?.id === messageId) {
+          c.checks = { ...c.checks, body: "verified" }; this.update(c, c.revision);
+        }
         if (!c.pending.includes(leaf) && read([c.id, "inbox"], leaf)?.state === "pending") {
           if (c.pending.length >= 1000) throw new Error("mail inbox backlog limit reached");
           c.pending.push(leaf); this.update(c, c.revision);
@@ -374,6 +391,7 @@ export class MailEngine {
           receiverFence: lease().receiverFence, outcome: "unknown", evidence: "sending attempt started; no provider receipt was persisted" };
         save(parts, leaf, journal); // A crash after this write never causes another SMTP attempt.
         if (!claim.replayed) {
+          await ensureLease(); // Pause/rebind during the claim must stop before a new provider side effect.
           try {
             const result = await this.run(c.provider, [...this.imapArgs("mail-smtp-send", c.mailbox), "--message-file", privateFile(parts, leaf).path, "--confirm-hash", journal.contentHash]);
             if (result.ok !== true || result.outcome !== "sent" || result.source_mailbox !== c.mailbox) throw new Error("provider receipt missing");

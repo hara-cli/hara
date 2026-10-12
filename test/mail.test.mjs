@@ -213,3 +213,91 @@ test("fixed taskbus operation mapping rejects path injection and requires stable
   assert.throws(() => taskbusRoute("https://other.example"), /unsupported/);
   assert.throws(() => taskbusRoute("tasks.create", { requestKey: "x", body: "x".repeat(65000) }), /64 KB/);
 });
+
+test("saved mailbox passwords are reused only for the same enrolled host and verified servers", async () => {
+  let current = { profileId: "reuse-test", spaceId: "org-reuse", identityKey: "reuse-original" };
+  const email = "reuse@example.test";
+  const servers = { imapHost: "imap.example.test", imapPort: 993, imapSecurity: "tls", smtpHost: "smtp.example.test", smtpPort: 465, smtpSecurity: "tls" };
+  let binding, providerCalls = 0;
+  const engine = new MailEngine(async (_scope, method, _path, body) => {
+    if (method === "GET") return { bindings: binding ? [binding] : [] };
+    return { binding: binding = { ...body, revision: (binding?.revision || 0) + 1 } };
+  }, () => current, async (_provider, args) => {
+    providerCalls++;
+    if (args[0] === "mail-imap-doctor") return { ok: true, source_mailbox: email };
+    return { messages: [] };
+  });
+  try {
+    const input = { mailbox: email, servers, projectId: "p", mainBotId: "bot", password: "reuse-private-fixture" };
+    await engine.request(current, "bind", input);
+    const verifiedCalls = providerCalls;
+    await assert.rejects(engine.request(current, "bind", { ...input, password: "", servers: { ...servers, smtpHost: "changed.example.test" }, expectedRevision: 1 }), /explicit.*password|password.*again/i);
+    assert.equal(providerCalls, verifiedCalls, "no saved password reaches changed endpoints");
+    assert.equal(binding.revision, 1);
+    await engine.request(current, "bind", { ...input, password: "", expectedRevision: 1 });
+    assert.equal(binding.revision, 2, "unchanged verified account remains convenient to reuse");
+    current = { ...current, identityKey: "reuse-new-enrollment" };
+    const beforeIdentityChange = providerCalls;
+    await assert.rejects(engine.request(current, "bind", { ...input, password: "", expectedRevision: 2 }), /explicit.*password|password.*again/i);
+    assert.equal(providerCalls, beforeIdentityChange);
+  } finally { engine.close(); }
+});
+
+test("an empty-inbox body check becomes verified only after a matching body is received", async () => {
+  const s = { profileId: "first-body", spaceId: "org-first-body", identityKey: "first-body" };
+  const email = "first-body@example.test";
+  let binding, available = false;
+  const engine = new MailEngine(async (_scope, method, path, body) => {
+    if (path === "/mail-bindings" && method === "GET") return { bindings: binding ? [binding] : [] };
+    if (path === "/mail-bindings") return { binding: binding = { ...body, revision: (binding?.revision || 0) + 1 } };
+    if (path.endsWith("/lease")) return { receiverFence: 1, expiresAt: Date.now() + 90000 };
+    if (path.endsWith("/status")) return { reported: true };
+    if (path === "/intake") return { task: { id: "t_" + "f".repeat(32) } };
+    throw new Error("unexpected first-body route");
+  }, () => s, async (_provider, args) => {
+    if (args[0] === "mail-doctor") return { ok: true, source_mailbox: email };
+    if (args[0] === "mail-messages") return { messages: available ? [{ message_id: "first-body-message", received_at: new Date().toISOString() }] : [], has_more: false };
+    if (args[0] === "mail-get-message") return { message: { message_id: "first-body-message", body: "A real body fixture" } };
+    throw new Error("unexpected first-body provider call");
+  });
+  try {
+    const c = (await engine.request(s, "bind", { provider: "feishu", mailbox: email, projectId: "p", mainBotId: "bot" })).connection;
+    assert.equal(c.checks.body, "empty-inbox");
+    available = true;
+    await engine.request(s, "start", { id: c.id, expectedRevision: 1 });
+    const state = await waitFor(() => engine.request(s, "list"), x => x.connections[0].phase === "connected");
+    assert.equal(state.connections[0].checks.body, "verified");
+  } finally { engine.close(); }
+});
+
+test("pausing while an outgoing claim is in flight prevents a new SMTP attempt", async () => {
+  const s = { profileId: "pause-send", spaceId: "org-pause-send", identityKey: "pause-send" };
+  const email = "pause-send@example.test";
+  let binding, sends = 0, engine;
+  const outgoing = { id: "bm_" + "9".repeat(32), state: "queued", revision: 1, contentHash: "8".repeat(64), body: { from: email, to: ["recipient@example.test"], subject: "Fixture", body: "Do not send after pause" } };
+  engine = new MailEngine(async (_scope, method, path, body) => {
+    if (path === "/mail-bindings" && method === "GET") return { bindings: binding ? [binding] : [] };
+    if (path === "/mail-bindings") return { binding: binding = { ...body, revision: (binding?.revision || 0) + 1 } };
+    if (path.endsWith("/lease")) return { receiverFence: 1, expiresAt: Date.now() + 90000 };
+    if (path.endsWith("/status")) return { reported: true };
+    if (path.startsWith("/mail-outbox?")) return { messages: [outgoing] };
+    if (path.endsWith("/claim")) {
+      await engine.request(s, "pause", { id: binding.id, expectedRevision: binding.revision });
+      outgoing.state = "sending"; outgoing.revision++;
+      return { message: outgoing };
+    }
+    if (path.endsWith("/receipt")) return { message: outgoing };
+    throw new Error("unexpected paused-send route");
+  }, () => s, async (_provider, args) => {
+    if (args[0] === "mail-imap-doctor") return { ok: true, source_mailbox: email };
+    if (args[0] === "mail-imap-messages") return { messages: [], has_more: false };
+    if (args[0] === "mail-smtp-send") { sends++; return { ok: true, source_mailbox: email, outcome: "sent" }; }
+    throw new Error("unexpected paused-send provider call");
+  });
+  try {
+    const c = (await engine.request(s, "bind", { provider: "feishu", transport: "imap-smtp", mailbox: email, password: "paused-send-private", projectId: "p", mainBotId: "bot", allowReplies: true })).connection;
+    await engine.request(s, "start", { id: c.id, expectedRevision: 1 });
+    await waitFor(() => engine.request(s, "list"), x => x.connections[0].paused && ["connected", "error"].includes(x.connections[0].phase));
+    assert.equal(sends, 0);
+  } finally { engine.close(); }
+});

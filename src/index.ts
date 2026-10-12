@@ -6128,7 +6128,7 @@ deskCmd.command("bus <operation>")
   });
 
 program.command("mail <operation>")
-  .description("mailbox connections: list, bind, start, pause, remove, sync, auth.start/status/cancel, watch (Engine-owned, no LLM)")
+  .description("mailbox connections: runtime.status, list, bind, start, pause, remove, sync, auth.start/status/cancel, watch (Engine-owned, no LLM)")
   .option("--profile <id>", "organization connection")
   .option("--input-file <path>", "bounded JSON object; bind/start/pause/remove should include a stable requestKey")
   .action(async (operation: string, o: { profile?: string; inputFile?: string }) => {

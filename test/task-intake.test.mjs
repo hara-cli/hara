@@ -649,6 +649,7 @@ test("an investigate brief may inspect with a read-only command but cannot mutat
       text: "",
       toolUses: [
         { id: "read1", name: shell.name, input: { command: "git status --short" } },
+        { id: "read2", name: shell.name, input: { command: "cd ./repo && wc -l AGENTS.md && echo '=== 章节 ===' && grep -n '^## ' AGENTS.md" } },
         { id: "write1", name: shell.name, input: { command: "git commit --allow-empty -m test" } },
         { id: "bg1", name: shell.name, input: { command: "git status --short", background: true } },
         { id: "bg2", name: shell.name, input: { command: "git status --short", background: "true" } },
@@ -668,7 +669,7 @@ test("an investigate brief may inspect with a read-only command but cannot mutat
     taskIntake: { task: accepted.task },
   });
 
-  assert.deepEqual(commands, ["git status --short"], "only the semantically read-only command ran");
+  assert.deepEqual(commands, ["git status --short", "cd ./repo && wc -l AGENTS.md && echo '=== 章节 ===' && grep -n '^## ' AGENTS.md"], "only the semantically read-only commands ran");
   const resultRound = history.find((message) => message.role === "tool");
   assert.match(resultRound.results.find((result) => result.id === "write1").content, /intent is 'investigate'/);
   assert.match(resultRound.results.find((result) => result.id === "bg1").content, /intent is 'investigate'/);

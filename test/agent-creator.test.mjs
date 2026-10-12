@@ -244,9 +244,59 @@ test("Serve creation survives reconnect, preserves the full card, and joins the 
     await client.call("session.send", { sessionId: colleagueSession.result.sessionId, text: "Hello Ada" });
     assert.ok(!offeredTools.get("Hello Ada").includes("agent_create"),
       "creating a Bot does not grant it the main orchestrator's hiring authority");
+    assert.ok(!offeredTools.get("Hello Ada").includes("agent_restore"));
   } finally {
     client?.close();
     submittingClient?.close();
     await handle.close();
   }
+});
+
+test("Serve lists minimal archived identities and restores the exact ref only after its original-chat card", async () => {
+  const { createNativeGlobalAgent } = await import("../dist/org/roles.js");
+  const { dismissAgentRef, isAgentRefDismissed } = await import("../dist/org/agent-roster.js");
+  const workspace = join(root, "restore-workspace"); mkdirSync(workspace, { recursive: true });
+  await createNativeGlobalAgent({ id: "restore-fixture", description: proposal.description, instructions: proposal.instructions, profile: { displayName: "Archived Ada", title: proposal.role } });
+  const file = join(process.env.HOME, ".hara", "roles", "restore-fixture.md");
+  const before = readFileSync(file, "utf8");
+  dismissAgentRef("global:restore-fixture");
+  let round = 0;
+  const fake = { id: "fake", model: "fake", async turn({ history }) {
+    round++;
+    if (round === 1) return { text: "", stop: "tool_use", toolUses: [{ id: "brief", name: "task_intake", input: { intent: "change", goal: "Restore the original archived colleague", constraints: ["preserve instructions and history"], acceptance: ["the exact original ref is visible after human confirmation"], steps: ["inspect archived metadata", "confirm restoration"] } }] };
+    if (round === 2) return { text: "", stop: "tool_use", toolUses: [{ id: "list", name: "agent_contact", input: { action: "list", includeDismissed: true } }] };
+    if (round === 3) {
+      const result = history.filter(m => m.role === "tool").flatMap(m => m.results).find(r => r.id === "list");
+      const archived = JSON.parse(result.content).dismissedContacts.find(a => a.ref === "global:restore-fixture");
+      assert.ok(archived); assert.deepEqual(Object.keys(archived).sort(), ["dismissedAt", "name", "ref", "revision"]);
+      assert.equal(result.content.includes(proposal.instructions), false);
+      return { text: "", stop: "tool_use", toolUses: [{ id: "restore", name: "agent_restore", input: { ref: archived.ref, expectedRevision: archived.revision, dismissedAt: archived.dismissedAt } }] };
+    }
+    if (round === 4) {
+      const result = history.filter(m => m.role === "tool").flatMap(m => m.results).find(r => r.id === "restore");
+      assert.equal(JSON.parse(result.content).restored, true);
+    }
+    return { text: "The original colleague is restored.", stop: "end", toolUses: [] };
+  } };
+  const handle = await startServe({ host: "127.0.0.1", port: 0, token: "restore-test-token", cwd: workspace }, {
+    version: "test", providerId: "fake", model: "fake", buildSessionProvider: async () => fake, buildProviderFor: async () => fake,
+    runtimeInfo: () => ({ providerId: "fake", model: "fake", profileId: "personal", spaceId: "personal", effortLevels: [] }),
+    spawnSubagent: async () => "disabled", sandbox: "off", approval: "full-auto", quietDiscovery: true,
+  });
+  let client;
+  try {
+    client = await connect(handle.port); await client.call("initialize", { token: "restore-test-token" });
+    const session = await client.call("session.create", { cwd: workspace });
+    const submitting = client.call("session.submit", { sessionId: session.result.sessionId, text: "Restore Archived Ada", mode: "start_if_idle" }); submitting.catch(() => {});
+    const card = await client.wait("approval.request");
+    assert.equal(card.allowAlways, false); assert.equal(card.sessionId, session.result.sessionId);
+    assert.equal(isAgentRefDismissed("global:restore-fixture"), true);
+    assert.equal(readFileSync(file, "utf8"), before);
+    await client.call("approval.reply", { approvalId: card.approvalId, allow: true, always: true });
+    assert.equal((await submitting).error, undefined);
+    const catalog = await client.call("agents.list", { sessionId: session.result.sessionId });
+    assert.ok(catalog.result.agents.some(a => a.ref === "global:restore-fixture"));
+    assert.equal(readFileSync(file, "utf8"), before);
+    assert.equal(isAgentRefDismissed("global:restore-fixture"), false);
+  } finally { client?.close(); await handle.close(); }
 });

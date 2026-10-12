@@ -30,6 +30,7 @@ import { projectRepositoryTrustedAtStartup } from "./project-trust.js";
 import { readVerifiedRegularFileSnapshotSync } from "../fs-read.js";
 import { homeWorkspaceActionError, isHomeWorkspace, isUnsafeProjectWorkspace } from "../context/workspace-scope.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
+import { literalCdTarget, literalShellWords, splitLiteralShellCommands } from "./shell-literals.js";
 
 export type Decision = "allow" | "ask" | "deny";
 export interface PermissionRules {
@@ -106,12 +107,24 @@ export function canonicalize(command: string): string {
 /** True if the (already-canonical, simple) command is read-only and safe to autorun. */
 export function isReadOnlyCommand(canonical: string): boolean {
   if (!canonical) return false;
-  if (/[>]/.test(canonical)) return false; // any output redirection → not read-only
+  if (splitLiteralShellCommands(canonical)?.length !== 1) return false;
+  if (/[<>]/.test(canonical)) return false; // redirections are not read-only autorun
   if (/\$(?:\{)?[A-Za-z_][A-Za-z0-9_]*/.test(canonical)) return false; // variable expansion may print a credential
   if (/^jq\b[\s\S]*(?:\benv\b|\$ENV\b)/.test(canonical)) return false;
   if (DANGER_FLAG.test(canonical)) return false;
   const parts = canonical.split(" ");
   const prog = parts[0];
+  if (["cd", "echo", "tmux", "pgrep"].includes(prog)) {
+    const words = literalShellWords(canonical);
+    if (!words) return false;
+    if (prog === "cd") return literalCdTarget(words) !== null;
+    if (prog === "echo") return !words.slice(1).some((word) => /[\\\u0000-\u001f\u007f]/u.test(word)) && !words[1]?.startsWith("-");
+    if (prog === "tmux") return words.length === 2 && ["ls", "list-sessions"].includes(words[1]);
+    // Names/PIDs only: full-argv variants may disclose credentials from other processes.
+    const args = words.slice(1);
+    while (args.length && /^-[xl]+$/u.test(args[0])) args.shift();
+    return args.length === 1 && !!args[0] && !args[0].startsWith("-");
+  }
   // `ps` is normally read-only, but BSD/GNU environment display modifiers turn it into a credential
   // disclosure command. It must never inherit readonly auto-approval (the shell boundary also hard-denies it).
   if (prog === "ps" && psArgumentsExposeEnvironment(parts.slice(1))) return false;
@@ -152,39 +165,7 @@ export function isReadOnlyCommand(canonical: string): boolean {
  *  command uses constructs we don't safely model (command substitution / backticks / unbalanced quotes) —
  *  the caller then fails closed. */
 export function splitCompound(command: string): string[] | null {
-  const parts: string[] = [];
-  let buf = "";
-  let sq = false, dq = false;
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i];
-    const next = command[i + 1];
-    if (sq) { if (ch === "'") sq = false; buf += ch; continue; }
-    if (dq) { if (ch === '"') dq = false; buf += ch; continue; }
-    if (ch === "'") { sq = true; buf += ch; continue; }
-    if (ch === '"') { dq = true; buf += ch; continue; }
-    if (ch === "`") return null; // backtick command substitution → can't model, fail closed
-    if (ch === "$" && next === "(") return null; // $(…) substitution → fail closed
-    // File-descriptor duplication is a redirection, not a background separator. Keep `2>&1`,
-    // `1>&2`, `0<&3`, and the bash `&>` shorthand inside the current simple command so a
-    // bounded diagnostic such as `nc ... 2>&1 | head` remains parseable. The downstream
-    // command classifier still treats ordinary output redirections conservatively.
-    if (
-      ch === "&"
-      && (
-        ((command[i - 1] === ">" || command[i - 1] === "<") && /[0-9-]/u.test(next ?? ""))
-        || next === ">"
-      )
-    ) {
-      buf += ch;
-      continue;
-    }
-    if ((ch === "&" && next === "&") || (ch === "|" && next === "|")) { parts.push(buf); buf = ""; i++; continue; }
-    if (ch === ";" || ch === "|" || ch === "\n" || ch === "&") { parts.push(buf); buf = ""; continue; }
-    buf += ch;
-  }
-  if (sq || dq) return null; // unbalanced quotes → fail closed
-  parts.push(buf);
-  return parts.map((p) => canonicalize(p)).filter(Boolean);
+  return splitLiteralShellCommands(command)?.map(canonicalize) ?? null;
 }
 
 /** Match a canonical command against a single rule pattern: exact, prefix (pattern + space), or glob (*). */

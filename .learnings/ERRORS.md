@@ -1,5 +1,54 @@
 # Errors
 
+## [ERR-20261012-MAIL-RELEASE-BOUNDARIES] Mail integration needs endpoint-bound credentials and a final pause check
+
+**Logged**: 2026-10-12
+**Priority**: high
+**Status**: in_progress
+**Area**: backend
+
+### Evidence
+Pre-release source `a98f49c` was integrated on verified CLI `28e7c6c`. Three hermetic regressions
+failed before the fix: blank-password rebinding accepted changed SMTP endpoints, pausing during
+an outgoing claim still made one simulated SMTP attempt, and the first matched body left the
+empty-inbox check unchanged. No real mailbox, provider authentication or SMTP send was used.
+
+### Remediation and verification boundary
+Bind saved-password reuse to the same local enrollment and all six verified server fields;
+recheck the receiver lease/configuration after claim and before SMTP; promote body verification
+only after a matching body is durably received. Expose a cached, help-only local prerequisite
+probe so Desktop does not advertise missing Python/shared capability as ready. Full gates and
+public release acceptance remain pending until recorded separately.
+
+The first full suite inside Codex's parent sandbox failed loopback and sandbox-exec boundaries.
+Preserve that failure as environment evidence; a separately authorized isolated-Home host run passed
+2,615 tests with one platform skip. Do not report a `tail` command's exit status as the test result:
+capture the original process exit code and consume its final session result.
+The new archived-Agent restore also needs a classified exact proposal: an initial read-only refusal
+must not acquire write authority merely because the archive appears before run(). Test this race.
+Final 0.187.0 local gates: 2,616 pass / one platform skip / zero fail or cancellation, official
+production audit zero vulnerabilities, dry-run pack 295 files, native standalone and temporary
+Serve capability smoke passed. Public release and real mailbox acceptance are still separate.
+
+### Workflow corrections
+Mixed CLI/Desktop relative paths caused failed read-only searches. Use absolute owning-repository
+paths for cross-repository diagnostics. A patch with an out-of-order documentation context was
+rejected atomically; readback confirmed no partial application before retrying a corrected patch.
+Bound source/feedback reads to small chunks; truncated output is not a complete review.
+Native Chrome QA verified the Chinese missing-prerequisite warning and disabled binding UI, then
+the UI surface returned cgWindowNotFound. Stop retrying unrelated windows; stop the owned preview
+server and do not claim additional English/narrow/native visual acceptance from that partial pass.
+Bun's locked OpenCode download needed network approval. npm pack's EPERM on the restricted global
+cache did not prove root ownership despite npm's generic advice; use a task-local private cache,
+not recursive chown. Check the original exit before parsing JSON, which may be an error object.
+
+### Metadata
+- Reproducible: yes, synthetic tests
+- Related Files: src/mail.ts, src/mail-runtime.ts, test/mail.test.mjs, test/mail-runtime.test.mjs
+- Feedback: om_x100b63ff9de0dca0b15bbee1ec7cac9
+
+---
+
 ## [ERR-20261012-CODING-HOST-FIXTURE-DEADLINE] Cancellation fixture expired before provider entry
 
 **Logged**: 2026-10-12T13:00:00+08:00

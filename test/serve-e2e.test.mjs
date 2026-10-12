@@ -1967,15 +1967,17 @@ test("mail/taskbus RPC requires initialization, bounded input and explicit compa
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-mail-")), calls = [];
   const srv = await startServe({ host: "127.0.0.1", port: 0, token: "mail-rpc-test", cwd: dir }, {
     ...baseDeps(textProvider, memStore()),
-    mailRequest: async (profileId, spaceId, operation, input) => { calls.push({ profileId, spaceId, operation, input }); return { connections: [], password: "never-expose-this-secret" }; },
+    mailRequest: async (profileId, spaceId, operation, input) => { calls.push({ profileId, spaceId, operation, input }); return operation === "runtime.status" ? { ready: false, reason: "helper-missing" } : { connections: [], password: "never-expose-this-secret" }; },
     taskbusRequest: async (profileId, spaceId, operation, input) => { calls.push({ profileId, spaceId, operation, input }); if (spaceId !== "org-a") throw new Error("scope mismatch"); return { tasks: [] }; },
   });
   const c = await connect(srv.port);
   try {
     assert.ok((await c.call("mail.connections.list", { profileId: "org-a", spaceId: "org-a" })).error);
+    assert.ok((await c.call("mail.runtime.status", { profileId: "org-a", spaceId: "org-a" })).error);
     assert.equal(calls.length, 0);
     const init = await c.call("initialize", { token: "mail-rpc-test" });
     assert.ok(init.result.capabilities.methods.includes("mail.command")); assert.ok(init.result.capabilities.methods.includes("desk.taskbus.request"));
+    assert.ok(init.result.capabilities.methods.includes("mail.runtime.status"));
     const read = await c.call("mail.connections.list", { profileId: "org-a", spaceId: "org-a" });
     assert.equal(calls[0].operation, "list"); assert.ok(!JSON.stringify(read).includes("never-expose-this-secret"));
     assert.ok((await c.call("mail.command", { profileId: "org-a", spaceId: "org-a", operation: "send-arbitrary-shell" })).error);
@@ -1983,6 +1985,8 @@ test("mail/taskbus RPC requires initialization, bounded input and explicit compa
     assert.ok((await c.call("desk.taskbus.request", { profileId: "org-a", operation: "tasks.list" })).error);
     assert.ok((await c.call("desk.taskbus.request", { profileId: "org-a", spaceId: "org-a", operation: "tasks.create", input: { body: "x".repeat(64001) } })).error);
     assert.equal(calls.length, 1, "invalid envelopes never reach a provider callback");
+    assert.deepEqual((await c.call("mail.runtime.status", { profileId: "org-a", spaceId: "org-a" })).result, { ready: false, reason: "helper-missing" });
+    assert.equal(calls.at(-1).operation, "runtime.status");
     assert.deepEqual((await c.call("desk.taskbus.request", { profileId: "org-a", spaceId: "org-a", operation: "tasks.list", input: { projectId: "p" } })).result.tasks, []);
     assert.ok((await c.call("desk.taskbus.request", { profileId: "org-a", spaceId: "different-company", operation: "tasks.list" })).error);
   } finally { c.close(); await srv.close(); rmSync(dir, { recursive: true, force: true }); }

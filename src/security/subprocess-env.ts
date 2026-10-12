@@ -3,9 +3,9 @@
 // A user can explicitly pass selected names with HARA_SUBPROCESS_ENV_ALLOW=NAME,OTHER before launching Hara.
 import { redactSensitiveText } from "./secrets.js";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import { platform } from "node:os";
-import { delimiter, join, win32 as winPath } from "node:path";
+import { delimiter, dirname, join, win32 as winPath } from "node:path";
 import { normalizePortableWindowsHome } from "../runtime.js";
 
 const SECRET_NAME = /(?:^|_)(?:API_?KEY|KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIALS?|COOKIE|JWT|AUTH)(?:_|$)/i;
@@ -16,7 +16,7 @@ const SECRET_EXACT = new Set([
   "MONGO_URL",
   "PGPASSWORD",
 ]);
-const INJECTION_NAME = /^(?:BASH_ENV|ENV|NODE_OPTIONS|NODE_PATH|PYTHONPATH|PYTHONHOME|PYTHONSTARTUP|RUBYOPT|RUBYLIB|PERL5OPT|PERL5LIB|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_.*|GIT_ASKPASS|SSH_ASKPASS|SUDO_ASKPASS|GIT_SSH_COMMAND|GIT_CONFIG(?:_.*)?|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_EDITOR|GIT_SEQUENCE_EDITOR|GIT_PAGER|PAGER|MANPAGER|EDITOR|VISUAL|LESSOPEN|LESSCLOSE|NPM_CONFIG_SCRIPT_SHELL|NPM_CONFIG_NODE_GYP|NPM_CONFIG_USERCONFIG|PIP_CONFIG_FILE|AWS_SHARED_CREDENTIALS_FILE|AWS_CONFIG_FILE|DOCKER_CONFIG|KUBECONFIG|NETRC|AZURE_CONFIG_DIR)$/;
+const INJECTION_NAME = /^(?:BASH_ENV|ENV|CDPATH|NODE_OPTIONS|NODE_PATH|PYTHONPATH|PYTHONHOME|PYTHONSTARTUP|RUBYOPT|RUBYLIB|PERL5OPT|PERL5LIB|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_.*|GIT_ASKPASS|SSH_ASKPASS|SUDO_ASKPASS|GIT_SSH_COMMAND|GIT_CONFIG(?:_.*)?|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_EDITOR|GIT_SEQUENCE_EDITOR|GIT_PAGER|PAGER|MANPAGER|EDITOR|VISUAL|LESSOPEN|LESSCLOSE|NPM_CONFIG_SCRIPT_SHELL|NPM_CONFIG_NODE_GYP|NPM_CONFIG_USERCONFIG|PIP_CONFIG_FILE|AWS_SHARED_CREDENTIALS_FILE|AWS_CONFIG_FILE|DOCKER_CONFIG|KUBECONFIG|NETRC|AZURE_CONFIG_DIR)$/;
 const SAFE_EXCEPTIONS = new Set(["SSH_AUTH_SOCK"]); // socket path, not the credential itself
 
 export function isSecretEnvironmentName(name: string): boolean {
@@ -89,6 +89,34 @@ export function restoreWindowsSystemPath(
   if (!environmentValue(env, "COMSPEC")) env.ComSpec = windowsSystemExecutable("cmd.exe", env);
 }
 
+function trustedInstalledToolDirectory(directory: string): boolean {
+  const uid = process.getuid?.();
+  const groups = new Set(process.getgroups?.() ?? []);
+  for (let current = directory; ; current = dirname(current)) {
+    try {
+      const info = lstatSync(current);
+      if (!info.isDirectory() || info.isSymbolicLink() || (info.uid !== 0 && info.uid !== uid)
+        || (info.mode & 0o002) !== 0 || ((info.mode & 0o020) !== 0 && !groups.has(info.gid))) return false;
+    } catch { return false; }
+    if (dirname(current) === current) return true;
+  }
+}
+
+/** GUI launchers omit Homebrew from PATH. Append fixed, existing owner-checked directories in the child
+ * only; never source login profiles, mutate process.env, or let added tools shadow inherited commands. */
+export function restoreMacToolPath(
+  env: NodeJS.ProcessEnv,
+  runtimePlatform: NodeJS.Platform | string = platform(),
+  trusted: (directory: string) => boolean = trustedInstalledToolDirectory,
+): void {
+  if (runtimePlatform !== "darwin") return;
+  const entries = String(env.PATH ?? "").split(":").filter(Boolean);
+  for (const directory of ["/opt/homebrew/bin", "/usr/local/bin"]) {
+    if (!entries.includes(directory) && trusted(directory)) entries.push(directory);
+  }
+  if (entries.length) env.PATH = entries.join(":");
+}
+
 /** Installed plugin commands are user-approved Hara extensions. Make them reachable by model-controlled
  * subprocesses without allowing them to shadow an existing system/project command: ~/.hara/bin is appended,
  * never prepended. The interactive shell still owns its own PATH configuration. */
@@ -130,6 +158,7 @@ export function toolSubprocessEnv(
     else out[name] = value;
   }
   restoreWindowsSystemPath(out);
+  restoreMacToolPath(out);
   appendHaraPluginBin(out);
   return out;
 }

@@ -38,6 +38,7 @@ import {
   isSecretEnvironmentName,
   redactToolSubprocessOutput,
   restoreWindowsSystemPath,
+  restoreMacToolPath,
   toolSubprocessEnv,
   windowsSystemExecutable,
 } from "../dist/security/subprocess-env.js";
@@ -58,6 +59,26 @@ import "../dist/tools/edit.js";
 import "../dist/tools/patch.js";
 
 const SECRET = "opaque-boundary-value-729184";
+
+test("macOS child PATH appends only trusted installed tool directories without shadowing existing tools", () => {
+  const env = { PATH: "/usr/bin:/bin:/usr/local/bin" };
+  const checked = [];
+  const trusted = (directory) => { checked.push(directory); return directory === "/opt/homebrew/bin"; };
+  restoreMacToolPath(env, "darwin", trusted);
+  assert.equal(env.PATH, "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin");
+  assert.deepEqual(checked, ["/opt/homebrew/bin"]);
+  restoreMacToolPath(env, "darwin", trusted);
+  assert.equal(env.PATH, "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin");
+  const rejected = { PATH: "/usr/bin:/bin" };
+  restoreMacToolPath(rejected, "darwin", () => false);
+  assert.equal(rejected.PATH, "/usr/bin:/bin");
+  for (const platform of ["linux", "win32"]) {
+    const other = { PATH: "/usr/bin:/bin" };
+    restoreMacToolPath(other, platform, () => { throw new Error("must not inspect another platform"); });
+    assert.deepEqual(other, { PATH: "/usr/bin:/bin" });
+  }
+  assert.equal(toolSubprocessEnv({ PATH: "/usr/bin:/bin", CDPATH: "/tmp/untrusted" }).CDPATH, undefined);
+});
 
 test("Windows child environment restores trusted inbox tools ahead of a truncated PATH", () => {
   const env = {
@@ -126,8 +147,12 @@ test("tool subprocesses can reach installed Hara plugin commands without letting
     };
 
     const first = toolSubprocessEnv(source);
-    assert.equal(first.PATH, `${source.PATH}${process.platform === "win32" ? ";" : ":"}${pluginBin}`);
-    assert.equal(first.PATH.split(process.platform === "win32" ? ";" : ":")[0], source.PATH);
+    const systemPath = { PATH: source.PATH };
+    restoreWindowsSystemPath(systemPath);
+    restoreMacToolPath(systemPath);
+    const separator = process.platform === "win32" ? ";" : ":";
+    assert.equal(first.PATH, `${systemPath.PATH}${separator}${pluginBin}`);
+    assert.ok(first.PATH.split(separator).indexOf(source.PATH) < first.PATH.split(separator).indexOf(pluginBin));
 
     const second = toolSubprocessEnv(first);
     assert.equal(second.PATH, first.PATH, "the Hara plugin bin is appended only once");
@@ -657,6 +682,28 @@ test("shell boundary blocks secret paths/environment dumps and scrubs inherited 
     else process.env.HARA_SUBPROCESS_ENV_ALLOW = oldAllow;
     if (oldSensitiveAllow === undefined) delete process.env.HARA_ALLOW_SENSITIVE_FILES;
     else process.env.HARA_ALLOW_SENSITIVE_FILES = oldSensitiveAllow;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("literal cd compounds retain protected-file identity in every possible working directory", async () => {
+  const dir = fixture();
+  const privateDir = join(dir, "private folder", ".hara");
+  mkdirSync(privateDir, { recursive: true });
+  writeFileSync(join(privateDir, "config.json"), JSON.stringify({ apiKey: SECRET }));
+  try {
+    for (const command of [
+      "cd 'private folder/.hara' && cat config.json",
+      "cd 'private folder' && cd .hara && head config.json",
+      "cd 'private folder/.hara' || cat config.json",
+    ]) {
+      assert.match(sensitiveShellCommandReason(command, dir), /private Hara state/, command);
+      const result = await getTool("bash").run({ command }, { cwd: dir, sandbox: "off" });
+      assert.match(result, /Blocked:/);
+      assert.equal(result.includes(SECRET), false);
+    }
+    assert.equal(sensitiveShellCommandReason("cd nested && wc -l ../normal.txt && echo 'ready'", dir), null);
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

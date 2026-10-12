@@ -29,6 +29,7 @@ import { pruneStoredToolResults } from "../tools/result-limit.js";
 import { NO_INTERACTIVE_USER } from "../tools/ask_user.js";
 import type { AgentCreationApproval, Tool } from "../tools/registry.js";
 import { createAgentCreationTool } from "./agent-creator.js";
+import { createAgentRestorationTool, type AgentRestorationTarget } from "./agent-restorer.js";
 import { createServeRuntimeLogger, serveRuntimeFailureCategory } from "./runtime-log.js";
 import { runAgent, type RunOpts, type RunProgressEvent, type RunRuntimeItemEvent } from "../agent/loop.js";
 import {
@@ -261,6 +262,7 @@ import { agentIdentityFromMetadata, type AgentPublicIdentity } from "../org/agen
 import {
   dismissAgentRef,
   dismissedAgentRefs,
+  dismissedAgentRecords,
   isAgentRefDismissed,
   restoreAgentRef,
 } from "../org/agent-roster.js";
@@ -4006,7 +4008,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               const ref = `global:${input.id}`;
               const existing = catalog.agents.find((agent) => agent.ref === ref || agent.name.toLowerCase() === input.id);
               if (existing) return { ref: existing.ref, name: existing.identity.displayName, created: false };
-              if (catalog.dismissedAgentRefs.includes(ref)) throw new Error("This username belongs to a dismissed Agent. Restore that colleague explicitly or choose another username; its instructions and history will not be overwritten.");
+              if (catalog.dismissedAgentRefs.includes(ref)) throw new Error("This username belongs to a dismissed Agent. Use agent_contact(action=list, includeDismissed=true), then propose agent_restore with its exact ref, revision and dismissal time for human confirmation; its instructions and history will not be overwritten.");
               const created = await createNativeGlobalAgent(input);
               broadcast("event.agents_changed", { sessionId });
               return { ref, name: created.identity.displayName, created: true };
@@ -4021,6 +4023,35 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           && s.busy && !turnAbort.signal.aborted && delegationPolicyEpoch === turnDelegationEpoch
           && JSON.stringify([current.profileId, current.spaceId, s.approval, roleForSession(s)]) === dispatchPolicy;
       };
+      const assertPersonalRestoration = (): void => {
+        if (s.meta.agentRef || sessionSpaceBinding(s.meta).spaceId !== "personal" || !dispatchCurrent()) {
+          throw new Error("Only the current main Hara conversation in Personal Space can restore a personal colleague.");
+        }
+      };
+      const inspectArchivedAgent = (ref: string): AgentRestorationTarget | undefined => {
+        assertPersonalRestoration();
+        const record = dismissedAgentRecords().find((entry) => entry.ref === ref);
+        if (!record) return undefined;
+        const binding = sessionSpaceBinding(s.meta);
+        const resolved = resolveServeAgent(ref, s.meta.cwd, binding.profileId, { includeDismissed: true });
+        if (!resolved || "ambiguous" in resolved || resolved.ref !== ref) return undefined;
+        return { ref, name: safeAgentDescription(resolved.role.identity?.displayName ?? resolved.entry.name),
+          revision: agentRoleRevision(resolved.role), dismissedAt: record.dismissedAt };
+      };
+      const agentRestorationTool = !s.meta.agentRef && s.meta.spaceId === "personal" ? createAgentRestorationTool({
+        assertPersonalRoot: assertPersonalRestoration,
+        inspect: inspectArchivedAgent,
+        restore: (target) => {
+          const current = inspectArchivedAgent(target.ref);
+          if (!current || current.revision !== target.revision || current.dismissedAt !== target.dismissedAt) {
+            throw new Error("Archived Agent changed; refresh and confirm again.");
+          }
+          if (hub.hasActiveWorkForAgent(target.ref)) throw new Error("Finish or stop this Agent's active work before restoring it.");
+          const restored = restoreAgentRef(target.ref, homedir(), target.dismissedAt);
+          broadcast("event.agents_changed", { sessionId });
+          return { ref: target.ref, restored };
+        },
+      }) : undefined;
       const dispatch = contactDispatch ? { ...contactDispatch,
         isCurrent: () => contactDispatch.isCurrent() && dispatchCurrent() } : beginAgentDispatch({
         sessionId, turnId: dispatchTurnId, agentRef: s.meta.agentRef ?? "main", signal: turnAbort.signal,
@@ -4032,7 +4063,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         || sessionRoleToolFilter?.("agent_contact") === false ? undefined : {
         name: "agent_contact",
         description:
-          "List or message persistent Hara Agent contacts in the current Space. "
+          "List or message persistent Hara Agent contacts in the current Space. The main Personal conversation may include archived contacts for explicit agent_restore confirmation. "
           + "When the user names an internal Agent, use this before channel_message; channel_message is only for external Feishu/WeChat recipients. "
           + "Any authorized persistent colleague may delegate; the main Hara Agent is a fallback, not a mandatory hop. "
           + "Respect the user's named owner. Each message starts an auditable execution segment in the recipient's authorized workspace; "
@@ -4045,6 +4076,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               enum: ["list", "message"],
               description: "List available internal Agents or send one a message.",
             },
+            includeDismissed: { type: "boolean", description: "For list only, include minimal archived identity/revision metadata. Main Personal conversation only; no source instructions or history are returned." },
             recipient: {
               type: "string",
               description: "Exact Agent ref, internal name, or display name. Required for message.",
@@ -4064,6 +4096,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           const contacts = serveAgentCatalog(s.meta.cwd, identityProfileId, binding.spaceId).agents
             .filter((agent) => agent.ref !== "main" && agent.allowedActions.includes("chat"));
           if (input?.action === "list") {
+            if (input.includeDismissed !== undefined && typeof input.includeDismissed !== "boolean") return "Error: includeDismissed must be a boolean.";
+            const archived = input.includeDismissed === true
+              ? (() => { assertPersonalRestoration(); return dismissedAgentRecords().slice(0, SERVE_AGENT_LIMIT)
+                .map((entry) => inspectArchivedAgent(entry.ref)).filter((entry): entry is AgentRestorationTarget => !!entry); })()
+              : undefined;
             return JSON.stringify({
               contacts: contacts.map((agent) => ({
                 ref: agent.ref,
@@ -4071,7 +4108,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 displayName: agent.identity.displayName,
                 title: agent.identity.title,
                 workspace: basename(agent.home),
+                scope: agent.scope,
+                ...(agent.project ? { project: agent.project } : {}),
               })),
+              ...(archived ? { dismissedContacts: archived } : {}),
             });
           }
           if (input?.action !== "message") {
@@ -4528,7 +4568,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           hooks: false,
         } : { ...(sessionRoleToolFilter ? { toolFilter: sessionRoleToolFilter } : {}),
           ...(sessionRole?.readOnly ? { hooks: false } : {}) }),
-        extraTools: [agentContactTool, agentCreationTool, connectedCodingTool, followupTool].filter((tool): tool is Tool => Boolean(tool)),
+        extraTools: [agentContactTool, agentCreationTool, agentRestorationTool, connectedCodingTool, followupTool].filter((tool): tool is Tool => Boolean(tool)),
         ...(slashSkillPolicy ? { skillPolicies: [slashSkillPolicy] } : {}),
         taskIntake: {
           task: s.task,
@@ -5786,7 +5826,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           if (collaborationRemote) {
             methods.push("desk.connections.list", "desk.snapshot", "desk.task.get");
           }
-          if (deps.mailRequest) methods.push("mail.connections.list", "mail.auth.status", "mail.command");
+          if (deps.mailRequest) methods.push("mail.connections.list", "mail.runtime.status", "mail.auth.status", "mail.command");
           if (deps.taskbusRequest) methods.push("desk.taskbus.request");
           const collaborationRemoteManage =
             !!deps.deskTaskCreate
@@ -9214,6 +9254,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             return reply(rpcResult(id!, redactSensitiveValue(await deps.checkOrganizationConnection(p.id, targetCwd)).value));
           }
           case "mail.connections.list":
+          case "mail.runtime.status":
           case "mail.auth.status":
           case "mail.command":
           case "desk.taskbus.request": {
@@ -9222,7 +9263,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               || (p.input !== undefined && (!p.input || typeof p.input !== "object" || Array.isArray(p.input) || JSON.stringify(p.input).length > 64_000))) {
               return reply(rpcError(id, ERR.PARAMS, "valid profileId, spaceId and bounded object input required"));
             }
-            const operation = req.method === "mail.connections.list" ? "list" : req.method === "mail.auth.status" ? "auth.status" : p.operation;
+            const operation = req.method === "mail.connections.list" ? "list" : req.method === "mail.runtime.status" ? "runtime.status" : req.method === "mail.auth.status" ? "auth.status" : p.operation;
             if (typeof operation !== "string" || operation.length > 64) return reply(rpcError(id, ERR.PARAMS, "operation required"));
             const callback = req.method === "desk.taskbus.request" ? deps.taskbusRequest : deps.mailRequest;
             if (!callback) return reply(rpcError(id, ERR.METHOD, "mail/taskbus requires an updated Engine"));

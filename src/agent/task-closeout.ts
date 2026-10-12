@@ -87,6 +87,13 @@ export function pausedCloseoutText(task: TaskExecution, todos: readonly Todo[], 
   const done = lines(todos.filter((todo) => todo.status === "done").map((todo) => todo.text));
   const pending = lines(todos.filter((todo) => todo.status !== "done").map((todo) => todo.text));
   const checkpoint = task.checkpoint;
+  const progress = outcome?.progress ?? task.progress;
+  const progressReason = outcome?.stopReason === "no_progress" && progress?.trigger === "unattended_token_budget"
+    && [progress.tokens.total, progress.rounds, progress.checkpointStaleRounds].every((value) => Number.isSafeInteger(value) && value >= 0)
+    ? (zh
+      ? `耗量保护：第 ${progress.rounds} 轮，累计模型 I/O ${progress.tokens.total.toLocaleString("en-US")} token，连续 ${progress.checkpointStaleRounds} 个工作回合没有新增可核验进展。这是引擎停止继续消耗，不是已判断缺少你的授权或信息；模型 I/O 不等于实际账单或订阅抵扣。`
+      : `Usage guard: round ${progress.rounds}, ${progress.tokens.total.toLocaleString("en-US")} cumulative model I/O tokens, ${progress.checkpointStaleRounds} working rounds without new verifiable progress. The engine stopped further consumption; this is not a finding of missing permission or information from you. Model I/O is not a bill or subscription deduction.`)
+    : undefined;
   const remaining = pending.length ? pending : lines([checkpoint?.nextStep ?? checkpoint?.currentStep ?? ""]);
   const blocked = outcome !== undefined && (outcome.status === "error" || outcome.status === "empty"
     || (outcome.status === "halted" && !isRecoverableRunPause(outcome)));
@@ -106,7 +113,7 @@ export function pausedCloseoutText(task: TaskExecution, todos: readonly Todo[], 
         ? zh ? "安全检查或执行条件阻止了本次执行。" : "A safety or execution gate stopped this run."
         : outcome?.stopReason === "completion_verification"
           ? zh ? "操作已有结果，但最终验收记录不完整。" : "Work produced a result, but its final acceptance record is incomplete."
-          : (outcome?.stopReason && boundaryReasons[outcome.stopReason])
+          : progressReason || (outcome?.stopReason && boundaryReasons[outcome.stopReason])
             || (zh ? "已到达安全停止边界。" : "A safe stopping boundary was reached.");
   return (blocked
     ? zh ? "任务受阻，执行已停止，尚未确认全部完成。" : "The task is blocked and execution has stopped; full completion has not been verified."

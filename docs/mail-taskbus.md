@@ -22,6 +22,8 @@ visibility, dispatch/execute/review grants and independent result acceptance.
    Ordinary IMAP/SMTP needs the version with `mail-imap-*`, `mail-smtp-send` and
    configurable six-field server settings. Provision this dependency on each
    actual receiver host; it is not automatically installed by npm or Desktop.
+   Settings checks only local command help, without logging in or reading a mailbox.
+   Missing/incompatible helpers or Python disable local binding, not Desk work.
 4. In Desktop Settings → Connections, enter the exact mailbox, dedicated client
    password and IMAP/SMTP servers. Feishu is a one-click server preset, not a
    required provider choice. No Tencent account setup is needed.
@@ -39,12 +41,16 @@ Credentials and pending/attempt journals stay under private `~/.hara/mail`
 nonsecret binding metadata and work; passwords are not cloud-synchronized. A
 second receiver requires its own explicit authorization on that host. Do not
 change server parameters remotely to reuse an old password: Hara requires rebind.
+Leaving the password blank is allowed only for this host's same verified enrollment
+and exact server settings. Changed endpoints or enrollment require a new explicit
+password; credentials are never silently forwarded to a different endpoint.
 
 ## CLI
 
 Commands select an enrolled organization profile and its exact Space:
 
 ```sh
+hara mail runtime.status --profile COMPANY_PROFILE
 hara mail list --profile COMPANY_PROFILE
 hara mail bind --profile COMPANY_PROFILE --input-file /private/path/binding.json
 hara mail start --profile COMPANY_PROFILE --input-file /private/path/start.json

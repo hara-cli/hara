@@ -100,6 +100,11 @@ export function dismissedAgentRefs(home = homedir()): Set<string> {
   return new Set(loadRoster(home).roster.dismissed.map((entry) => entry.ref));
 }
 
+/** Minimal recovery metadata, never the source instructions or conversation history. */
+export function dismissedAgentRecords(home = homedir()): ReadonlyArray<Readonly<DismissedAgentRecord>> {
+  return loadRoster(home).roster.dismissed.map((entry) => ({ ...entry }));
+}
+
 export function isAgentRefDismissed(ref: string, home = homedir()): boolean {
   if (!AGENT_REF.test(ref)) return false;
   return dismissedAgentRefs(home).has(ref);
@@ -125,12 +130,17 @@ export function dismissAgentRef(ref: string, home = homedir()): AgentRosterFile 
 }
 
 /** Re-hiring restores discovery without touching the source prompt or any old conversation. */
-export function restoreAgentRef(refInput: string, home = homedir()): boolean {
+export function restoreAgentRef(refInput: string, home = homedir(), expectedDismissedAt?: string): boolean {
   const ref = checkedRef(refInput);
-  if (!dismissedAgentRefs(home).has(ref)) return false;
-  saveRoster(home, (current) => ({
-    version: STORE_VERSION,
-    dismissed: current.dismissed.filter((entry) => entry.ref !== ref),
-  }));
-  return true;
+  if (expectedDismissedAt === undefined && !dismissedAgentRefs(home).has(ref)) return false;
+  let restored = false;
+  saveRoster(home, (current) => {
+    const target = current.dismissed.find((entry) => entry.ref === ref);
+    if (expectedDismissedAt !== undefined && target?.dismissedAt !== expectedDismissedAt) {
+      throw new Error("Agent dismissal changed; refresh the archived contact list and confirm again");
+    }
+    restored = !!target;
+    return { version: STORE_VERSION, dismissed: current.dismissed.filter((entry) => entry.ref !== ref) };
+  });
+  return restored;
 }
