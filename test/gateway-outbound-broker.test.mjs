@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   processGatewayOutboundOnce,
   sendThroughConnectedGateway,
@@ -33,6 +35,71 @@ function fakeAdapter(sent, fail = false) {
     },
   };
 }
+
+test("idle outbound polling retains only its current cancellation listener", async () => {
+  const home = temporaryHome();
+  const scope = gatewayRuntimeScope("feishu", "idle-poll-app");
+  const abort = new AbortController();
+  const sent = [];
+  const worker = serveGatewayOutboundRequests(fakeAdapter(sent), scope, abort.signal, { home, pollMs: 25 });
+  const observed = [];
+  try {
+    for (let poll = 0; poll < 12; poll++) {
+      await delay(30);
+      observed.push(getEventListeners(abort.signal, "abort").length);
+    }
+    assert.equal(Math.max(...observed), 1, "completed idle waits must not accumulate abort listeners");
+    assert.deepEqual(sent, [], "idle polling never sends a platform message");
+  } finally {
+    abort.abort();
+    await worker;
+    assert.equal(getEventListeners(abort.signal, "abort").length, 0);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("outbound receipt polling removes expired listeners and preserves unrelated cancellation handlers", async () => {
+  const home = temporaryHome();
+  const scope = gatewayRuntimeScope("feishu", "receipt-poll-app");
+  const abort = new AbortController();
+  const unrelated = () => {};
+  abort.signal.addEventListener("abort", unrelated);
+  try {
+    const result = await submitGatewayOutbound(scope, "feishu", "oc_group", "queued text", "receipt-poll", abort.signal, {
+      home, waitMs: 80, pollMs: 10,
+    });
+    assert.equal(result.status, "queued");
+    assert.deepEqual(getEventListeners(abort.signal, "abort"), [unrelated]);
+    const sent = [];
+    assert.equal(await processGatewayOutboundOnce(fakeAdapter(sent), scope, new AbortController().signal, { home }), 1);
+    assert.equal(sent.length, 1, "the timed-out caller leaves exactly one request for normal delivery");
+  } finally {
+    abort.signal.removeEventListener("abort", unrelated);
+    abort.abort();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("cancelling an outbound receipt wait releases its listener and retains the queued request", async () => {
+  const home = temporaryHome();
+  const scope = gatewayRuntimeScope("feishu", "cancel-receipt-app");
+  const abort = new AbortController();
+  try {
+    const waiting = submitGatewayOutbound(scope, "feishu", "oc_group", "queued text", "cancel-wait", abort.signal, {
+      home, waitMs: 60_000, pollMs: 1_000,
+    });
+    assert.equal(getEventListeners(abort.signal, "abort").length, 1);
+    abort.abort();
+    assert.equal((await waiting).status, "queued");
+    assert.equal(getEventListeners(abort.signal, "abort").length, 0);
+    const sent = [];
+    assert.equal(await processGatewayOutboundOnce(fakeAdapter(sent), scope, new AbortController().signal, { home }), 1);
+    assert.equal(sent.length, 1);
+  } finally {
+    abort.abort();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
 
 test("credential-free outbound requests are delivered once by the target gateway", async () => {
   const home = temporaryHome();

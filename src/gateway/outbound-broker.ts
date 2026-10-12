@@ -195,10 +195,17 @@ function writeReceiptOnce(home: string, scope: string, receipt: GatewayOutboundR
 }
 
 function wait(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted || ms <= 0) return Promise.resolve();
   return new Promise((resolve) => {
-    if (signal?.aborted || ms <= 0) return resolve();
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+    // The daemon reuses one signal for every idle poll. A once-only listener is removed on abort,
+    // not on timer expiry; retaining expired waits makes a long-lived idle gateway steadily slower.
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal?.addEventListener("abort", finish, { once: true });
   });
 }
 
