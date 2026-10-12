@@ -26,6 +26,11 @@ its fixture's 5 s question deadline during three real WebSocket decisions. The c
 its 20 s test limit. Give non-expiry colleague fixtures the longest enclosing test's 40 s window; retain the explicit
 120 ms expiry case and all late-answer/lease assertions. Production question deadlines are unchanged.
 
+The Intel run for the earlier test fix still crossed the native relay fixture's arbitrary 3 s log-poll
+deadline. Await an IPC readiness event emitted after the actual fixture prompt entry instead, propagate
+early submit failures, and retain the original 10 s overall test limit. A separate 3.5 s delayed-entry
+regression retains a bounded 20 s overall limit and the exactly-one-prompt/no-interrupt assertions.
+
 ### Metadata
 
 - Source: CI failure and isolated reproduction

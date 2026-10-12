@@ -15,6 +15,8 @@ All notable changes to `@nanhara/hara`.
   separately verify expiry before dispatch. This removes a runner-speed race without changing runtime deadlines.
 - Keep non-expiry colleague test inputs valid for their enclosing test; dedicated expiry and late-answer
   cases retain their explicit short deadlines and authorization assertions. Production input lifetimes are unchanged.
+- Wait for explicit fixture-child readiness in native relay cancellation tests instead of polling its log for
+  three seconds. Cover delayed readiness without retrying delivery or interrupting the original terminal.
 
 ## 0.186.0 — 2026-10-11 — named Agent delegation and exact session follow-ups
 
