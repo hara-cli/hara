@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.187.1 — 2026-10-13 — retire the local WeChat group scene
+
+- Remove the local visible-WeChat-group Agent controller from the shipped Serve runtime. It no
+  longer advertises group scanning, reply drafting, filling, permissions or automatic managed sends.
+  Saved local scene configuration and audit data are not deleted or automatically restored.
+- Preserve the official QR-linked owner private-chat connector, Feishu gateway, global Computer Use,
+  Jev/Laya decision settings and the bundled OpenCode/Pi executors. Removing one scene does not
+  remove an Agent identity or grant new tool permissions.
+- Verify both absence of the retired scene and presence of the independent computer/gateway
+  capabilities against the real compiled native Serve in release smoke tests.
+
 ## 0.187.0 — 2026-10-12 — verified diagnostics and mailbox task intake
 
 - Recognize narrowly bounded literal read-only shell compounds during investigate tasks, including

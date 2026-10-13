@@ -190,6 +190,15 @@ try {
   }
   const methods = new Set(initialized.result?.capabilities?.methods ?? []);
   const features = new Set(initialized.result?.capabilities?.features ?? []);
+  if ([...methods].some(method => method.startsWith("settings.wechat-group."))
+    || [...features].some(feature => feature.startsWith("wechat-group."))) {
+    throw new Error("the retired local WeChat group scene is still advertised");
+  }
+  for (const method of ["settings.computer.get", "settings.decision.get", "settings.gateways.list"]) {
+    if (!methods.has(method)) throw new Error(`independent retained capability is missing ${method}`);
+  }
+  const retiredStart = await call(ws, 98, "settings.wechat-group.start", { confirmGroup: true, confirmManaged: true });
+  if (retiredStart.error?.code !== -32601) throw new Error("the retired group scene can still be started");
   for (const method of ["desk.connections.list", "desk.snapshot", "desk.task.get"]) {
     if (!methods.has(method)) throw new Error(`serve capability is missing ${method}`);
   }

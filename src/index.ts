@@ -4682,7 +4682,6 @@ program
     const { startServe } = await import("./serve/server.js");
     const { GatewayLoginManager } = await import("./gateway/login.js");
     const { GatewaySupervisor } = await import("./gateway/supervisor.js");
-    const { WeChatGroupSceneController } = await import("./wechat-group-scene.js");
     const { MobileDesktopAuthorizationCoordinator } = await import("./mobile/desktop-authorization.js");
     const { MobilePairingCoordinator } = await import("./mobile/pairing.js");
     const { MobileRelaySupervisor } = await import("./mobile/relay-supervisor.js");
@@ -4696,7 +4695,6 @@ program
     const gatewaySupervisor = new GatewaySupervisor({
       log: (message) => process.stderr.write(`${message}\n`),
     });
-    const wechatGroupScene = new WeChatGroupSceneController();
     const mobileDesktopAuthorization = new MobileDesktopAuthorizationCoordinator();
     const mobilePairing = new MobilePairingCoordinator();
     const mobileRelay = new MobileRelaySupervisor({
@@ -4959,22 +4957,9 @@ program
         saveDecisionSettings: (input, targetCwd) => saveDecisionSettings(input, targetCwd ?? cwd),
         testDecisionSettings: (input, targetCwd) => testDecisionSettings(input, targetCwd ?? cwd),
         prepareDecisionRuntime: (confirmed) => prepareDecisionRuntime(confirmed),
-        wechatGroupStatus: () => wechatGroupScene.status(),
-        saveWechatGroupSettings: (input) => wechatGroupScene.save(input),
-        prepareWechatGroupRuntime: () => wechatGroupScene.prepare(),
-        requestWechatGroupPermissions: () => wechatGroupScene.requestPermissions(),
-        startWechatGroupScene: (targetCwd, confirmGroup, confirmManaged) => (
-          wechatGroupScene.start(targetCwd, confirmGroup, confirmManaged)
-        ),
-        stopWechatGroupScene: () => wechatGroupScene.stop(),
-        scanWechatGroupScene: (targetCwd) => wechatGroupScene.scan(targetCwd),
-        wechatGroupReplyContext: (scanId) => wechatGroupScene.replyContext(scanId),
-        rememberWechatGroupDraft: (scanId, text) => wechatGroupScene.rememberDraft(scanId, text),
-        fillWechatGroupDraft: (draftId) => wechatGroupScene.fill(draftId),
-        wechatGroupManagedActive: () => wechatGroupScene.managedActive(),
-        claimWechatGroupManagedScan: (scanId, aliases) => wechatGroupScene.managedClaim(scanId, aliases),
-        pauseWechatGroupManaged: (reason, scanId, category) => wechatGroupScene.pauseManaged(reason, scanId, category),
-        sendWechatGroupManagedDraft: (draftId) => wechatGroupScene.sendManaged(draftId),
+        // The local visible-group Agent scene is retired. Do not instantiate its controller or
+        // advertise its read/draft/fill/managed-send hooks. Official owner DM gateways and global
+        // Computer Use/decision settings above remain independent and keep their existing policy.
         installCoreBrowser: () => {
           let browser = listInstalled().find((plugin) => plugin.name === "browser");
           if (!browser || browser.version !== "0.2.0") browser = installPlugin("bundled:browser");
@@ -5012,7 +4997,6 @@ program
         },
         closeGateways: async () => {
           mailEngine.close();
-          wechatGroupScene.stop();
           await gatewaySupervisor.close();
         },
         approveGatewayAuthorization: async (platform, requestId) => {

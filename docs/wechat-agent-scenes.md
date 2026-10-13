@@ -1,6 +1,15 @@
 # WeChat Agent scenes
 
-Hara exposes two intentionally separate WeChat paths.
+The official QR-linked owner private-chat path remains available. The separate local visible-group
+Agent scene is retired from the shipped Hara runtime in **0.187.1** at the user's request.
+It is not advertised or instantiated by `hara serve`; new versions cannot start group observation,
+draft filling or managed automatic replies through that scene. Existing local configuration, audits
+and OCR caches are retained rather than deleted. They do not reactivate the scene after restart.
+
+Desktop's owner connection stays in **Settings → Connections**. Global Computer Use and Jev/Laya
+remain under **Settings → Safety & permissions**, not under a WeChat-specific group setting.
+OpenCode/Pi and the Hara Agent identities are unchanged. When upgrading a running older engine,
+stop its active local group attachment before removing the old entry or restarting that engine.
 
 ## Owner private-chat remote control
 
@@ -8,7 +17,10 @@ The official iLink connector is for the QR-linked owner's direct chat with Hara.
 normal task engine and remain subject to the configured Computer Use and approval policy. It is not a
 WeChat group observer, and its reply token must come from a fresh owner message.
 
-## Local WeChat group Agent
+## Historical local WeChat group Agent contract (retired; not setup instructions)
+
+The following describes the removed scene in earlier versions, retained for configuration/audit
+provenance only. It must not be treated as an available capability in 0.187.1 or later.
 
 The macOS Desktop scene attaches one selected Hara Agent to the group currently visible in the local
 WeChat app:
