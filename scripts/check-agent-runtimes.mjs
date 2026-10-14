@@ -14,6 +14,8 @@ const groups = [
     files: ["agent-runtime-binding", "serve-agent-runtime"] },
   { id: "pi-sdk-session", scope: "real pinned Pi SDK with a loopback synthetic model, no Hara planner loop",
     files: ["pi-host-session"] },
+  { id: "pi-governed-runtime", scope: "real Pi SDK model-step Runtime, shared Hara governor and actual CLI dispatch; synthetic loopback only",
+    files: ["agent-runtime-pi", "agent-runtime-dispatch"] },
   { id: "coding-protocols", scope: "Codex/Claude/OpenCode adapter, ownership, grant and continuation protocol fixtures; not live vendor CLIs",
     files: ["coding-team", "external-coding-sessions", "coding-tools", "coding-continuations"] },
   { id: "pi-worker", scope: "real Pi coding-worker SDK and parent-chat cards; the OpenCode comparison uses a transport fixture",
@@ -47,8 +49,8 @@ const report = {
   sourceDirty: changed.status === 0 ? Boolean(changed.stdout.trim()) : null,
   modelTraffic: "loopback synthetic fixtures only; no real provider credentials or paid calls", suites: results, requested,
   endToEndReady: false,
-  remaining: ["production general-Agent drivers and exact native-session linkage", "main Hara Pi governance and default binding",
-    "Agent creation Runtime selection", "shared CLI/gateway/cron admission and durable recovery", "packaged Desktop end-to-end testing"],
+  remaining: ["external Codex/Claude/OpenCode general-Agent drivers and exact native-session linkage",
+    "real-model and packaged Desktop acceptance", "explicit migration of existing main/Agent preferences; never silently rebind old work"],
 };
 const reportPath = join(evidence, "report.json"); writeFileSync(reportPath, JSON.stringify(report, null, 2) + "\n", { mode: 0o600 });
 console.log(JSON.stringify({ ...report, reportPath }, null, 2));

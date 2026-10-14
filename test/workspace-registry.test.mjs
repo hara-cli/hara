@@ -42,6 +42,61 @@ function capture(f, profileId = "personal") {
   return captureWorkspaceRunConnection(f.registry, row.workspaceId, row.id, "model-one", f.resolve);
 }
 
+function identicalKeys() {
+  const profiles = [
+    { id: "key-in-a", kind: "byok", label: "A model connection", provider: "openai", apiKey: "synthetic-identical-key", baseURL: "https://same.invalid/v1" },
+    { id: "key-in-b", kind: "byok", label: "B model connection", provider: "openai", apiKey: "synthetic-identical-key", baseURL: "https://same.invalid/v1" },
+  ];
+  const initial = bootstrapWorkspaceRegistry([legacyWorkspaceConnection(profiles[0])], profiles[0].id);
+  const unconfigured = addWorkspace(initial, "B");
+  const a = initial.workspaces[0].id;
+  const b = unconfigured.workspaces.at(-1).id;
+  const registry = attachDirectWorkspaceConnection(unconfigured, b, legacyWorkspaceConnection(profiles[1]));
+  const connectionA = registry.connections.find((row) => row.workspaceId === a);
+  const connectionB = registry.connections.find((row) => row.workspaceId === b);
+  return { profiles, initial, unconfigured, registry, a, b, connectionA, connectionB, resolve: (id) => profiles.find((row) => row.id === id) };
+}
+
+test("identical key values require independently added Workspace connections and cannot grant cross-Workspace access", () => {
+  const f = identicalKeys();
+  assert.equal(f.profiles[0].apiKey, f.profiles[1].apiKey);
+  assert.deepEqual(workspaceConnections(f.unconfigured, f.b), [], "a new Workspace has no inherited key connection");
+  assert.equal(f.unconfigured.workspaces.at(-1).defaultConnectionId, null);
+  assert.throws(() => attachDirectWorkspaceConnection(f.unconfigured, f.b, legacyWorkspaceConnection(f.profiles[0])), /unassigned/);
+  assert.notEqual(f.connectionA.id, f.connectionB.id);
+  assert.notEqual(f.connectionA.profileId, f.connectionB.profileId);
+  assert.notEqual(f.connectionA.credentialGeneration, f.connectionB.credentialGeneration);
+  assert.notEqual(f.connectionA.routeFingerprint, f.connectionB.routeFingerprint);
+  assert.equal(f.registry.workspaces.at(-1).defaultConnectionId, null, "explicit adding still does not choose a default");
+  for (const [owner, foreign] of [[f.a, f.connectionB], [f.b, f.connectionA]]) {
+    assert.throws(() => setWorkspaceDefault(f.registry, owner, foreign.id), /unavailable/);
+    assert.throws(() => captureWorkspaceRunConnection(f.registry, owner, foreign.id, "model-one", f.resolve), /unavailable/);
+  }
+});
+
+test("switching restores saved connections while local revoke and rotation stay isolated even for identical keys", () => {
+  const f = identicalKeys();
+  let current = setWorkspaceDefault(f.registry, f.b, f.connectionB.id);
+  const bindingA = captureWorkspaceRunConnection(current, f.a, f.connectionA.id, "model-one", f.resolve);
+  const bindingB = captureWorkspaceRunConnection(current, f.b, f.connectionB.id, "model-two", f.resolve);
+  const saved = structuredClone(current.connections);
+  const defaults = current.workspaces.map((row) => row.defaultConnectionId);
+  current = selectWorkspace(selectWorkspace(current, f.b), f.a);
+  assert.equal(current.activeWorkspaceId, f.a);
+  assert.deepEqual(current.connections, saved, "returning to a configured Workspace does not re-add or reset its keys");
+  assert.deepEqual(current.workspaces.map((row) => row.defaultConnectionId), defaults);
+  current = revokeWorkspaceConnection(current, f.a, f.connectionA.id);
+  assert.throws(() => assertWorkspaceRunConnection(current, bindingA, f.resolve), /revoked/);
+  assert.equal(assertWorkspaceRunConnection(current, bindingB, f.resolve).id, f.profiles[1].id);
+  assert.equal(current.workspaces.find((row) => row.id === f.b).defaultConnectionId, f.connectionB.id);
+  f.profiles[0].apiKey = "synthetic-rotated-only-in-a";
+  current = reauthorizeWorkspaceConnection(current, f.a, f.connectionA.id, legacyWorkspaceConnection(f.profiles[0]));
+  assert.throws(() => assertWorkspaceRunConnection(current, bindingA, f.resolve), /revoked/);
+  assert.equal(assertWorkspaceRunConnection(current, bindingB, f.resolve).apiKey, "synthetic-identical-key");
+  assert.deepEqual(current.connections.find((row) => row.id === f.connectionB.id), f.connectionB);
+  assert.equal(current.workspaces.find((row) => row.id === f.a).defaultConnectionId, null);
+});
+
 test("legacy keys stay together while managed Space boundaries and active default are preserved", () => {
   const f = fixture();
   assert.equal(f.registry.workspaces.length, 3);

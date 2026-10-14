@@ -4,6 +4,7 @@ import { isAbsolute, join } from "node:path";
 const stages = new Set([
   "fixture_git", "fixture_provider", "profile", "serve_start", "discovery", "initialize",
   "settings", "session_create", "session_send", "worker_assertions", "shutdown",
+  "main_runtime_binding", "headless_main_resume",
 ]);
 const runtimes = new Set(["hara", "codex", "claude", "opencode", "pi"]);
 const statuses = new Set(["queued", "working", "stopping", "completed", "failed", "cancelled", "interrupted"]);

@@ -1,4 +1,4 @@
-import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment } from "../providers/types.js";
+import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment, TurnArgs, TurnResult } from "../providers/types.js";
 import { isTaskRuntimeBinding } from "../agent-runtime/bindings.js";
 import { createToolImageStore, redactOwnedToolImageText } from "../tools/tool-images.js";
 import { redactOwnedToolImageValue } from "../security/tool-media-redaction.js";
@@ -1165,6 +1165,19 @@ function hardStop(
 
 /** Provider-agnostic agentic loop. Mutates `history` in place. */
 export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<RunOutcome> {
+  return runGovernedAgent(history, opts, "hara");
+}
+
+/** Host-owned Runtime kernel, not renderer/persona configuration. Hara retains all admission, tool,
+ * approval, continuation, budget and physical-drain rules; the kernel owns the actual model step.
+ * There is one physical model request, not a Hara planner delegating its full task to a second planner. */
+export type AgentRuntimeTurn = (provider: Provider, args: TurnArgs) => Promise<TurnResult>;
+export async function runGovernedAgent(
+  history: NeutralMsg[], opts: RunOpts, runtimeId: "hara" | "pi", executeTurn?: AgentRuntimeTurn,
+): Promise<RunOutcome> {
+  if ((runtimeId !== "hara" && runtimeId !== "pi") || (runtimeId === "pi" && !executeTurn)) {
+    return { status: "error", error: "Agent Runtime kernel is unavailable; no fallback was started." };
+  }
   // CLI/headless callers also reach this compatibility engine directly. A persisted task bound to
   // another Runtime must not silently execute here merely because Serve's registry was bypassed.
   const initialTask = opts.taskIntake?.task;
@@ -1172,12 +1185,14 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
   if (initialTask?.runtimeBinding !== undefined || currentTask?.runtimeBinding !== undefined) {
     const binding = currentTask?.runtimeBinding;
     const initialBinding = initialTask?.runtimeBinding;
-    if (!isTaskRuntimeBinding(binding) || binding.runtimeId !== "hara" || binding.spaceId !== opts.ctx.spaceId
+    if (!isTaskRuntimeBinding(binding) || binding.runtimeId !== runtimeId || binding.spaceId !== opts.ctx.spaceId
       || binding.taskId !== currentTask?.id || currentTask?.id !== initialTask?.id
-      || (initialBinding && (!isTaskRuntimeBinding(initialBinding)
+      || (initialBinding !== undefined && (!isTaskRuntimeBinding(initialBinding)
         || (["version", "spaceId", "agentRef", "runtimeId", "revision", "taskId"] as const).some((key) => initialBinding[key] !== binding[key])))) {
       return { status: "error", error: "This task belongs to a different or invalid Agent Runtime; resume through its exact Runtime. No fallback was started." };
     }
+  } else if (runtimeId !== "hara") {
+    return { status: "error", error: "Agent Runtime requires a frozen task binding; no fallback was started." };
   }
   const life = createRunLifecycle(opts, runtimeCopyLanguage(history));
   const runTaskBinding = opts.taskIntake
@@ -1187,7 +1202,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
   const computerScope = createComputerRunScope();
   const media = new Map<string, { images: ImageAttachment[]; store: ReturnType<typeof createToolImageStore> }>();
   try {
-    const outcome = await runAgentInner(history, { ...opts, ctx: { ...opts.ctx, computerScope } }, life, media, taskAuthority);
+    const outcome = await runAgentInner(history, { ...opts, ctx: { ...opts.ctx, computerScope } }, life, media, taskAuthority, executeTurn);
     const task = opts.taskIntake?.current ? opts.taskIntake.current() : opts.taskIntake?.task;
     const sameTaskTurn = task && task.id === runTaskBinding?.id && task.turnId === runTaskBinding?.turnId;
     if (sameTaskTurn && task.brief?.intent === "change" && outcome.status !== "completed" && !opts.signal?.aborted) {
@@ -1279,6 +1294,7 @@ async function runAgentInner(
   history: NeutralMsg[], opts: RunOpts, life: RunLifecycle,
   media: Map<string, { images: ImageAttachment[]; store: ReturnType<typeof createToolImageStore> }>,
   taskAuthority?: RunTaskAuthority,
+  executeTurn?: AgentRuntimeTurn,
 ): Promise<RunOutcome> {
   const { provider, ctx } = opts;
   const runSignal = life.signal;
@@ -2121,7 +2137,7 @@ async function runAgentInner(
             ...(carried.continuation ? { continuation: carried.continuation } : {}),
           };
         }
-        return activeProvider.turn({
+        const turnArgs: TurnArgs = {
           system,
           systemParts: stableSystemParts,
           // Media receipts live only in this run and never enter durable history/runtime events.
@@ -2170,7 +2186,8 @@ async function runAgentInner(
         sink.reasoning("");
       },
           signal: attempt.signal,
-        });
+        };
+        return executeTurn ? executeTurn(activeProvider, turnArgs) : activeProvider.turn(turnArgs);
       });
       opts.onProviderTurn?.(providerTurn);
       r = await Promise.race([providerTurn, attemptStopped]);

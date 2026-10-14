@@ -141,3 +141,39 @@ and default binding, Agent creation Runtime selection, exact native-session link
 points, CLI/gateway/cron parity and packaged Desktop end-to-end acceptance remain open. Do not change
 the default or replace a running installation on the strength of these tests. No release, deployment,
 dependency upgrade or user-session migration was performed.
+
+## Real Pi model-step Driver and shared entry dispatch (2026-10-14)
+
+This supersedes the Hara-only candidate registry state above. `runGovernedAgent` preserves the shared
+task/understanding, tool/approval/question, progress, budget, cancellation, history and recovery
+governor. The pinned real Pi SDK performs a bounded model step through an isolated loopback host
+bridge, capturing exactly one authoritative provider turn and yielding before native tool execution.
+Only the governor validates/executes the batch. Frozen arguments, media/cache metadata, usage and
+opaque continuation stay authoritative. Pi is not a second full-context planner; no token/speed
+saving is claimed. Its private step transcript is ephemeral, not main-Agent Pi-native JSONL recovery.
+
+The registry registers Hara compatibility and Pi only. New Agent creation validates availability
+and reserves the private binding before persona publication, including through approved `agent_create`;
+available Pi is its default. Failed/ambiguous creation retains a non-executable reservation rather
+than deleting it and silently falling back. No Runtime/persona change grants tools or retargets old
+work. Existing main/preferences absent a binding remain Hara compatibility until explicitly migrated;
+only the isolated dev fixture binds main Pi. Codex/Claude/OpenCode general Drivers remain unavailable.
+
+CLI/TUI/headless admission now freezes exact trusted Runtime bindings on fresh tasks; recovery uses
+stored bindings, not current defaults. Gateway/cron retain the existing CLI transport, not a second
+authority. Cancelled non-cooperative model calls physically drain before releasing execution leases.
+Real SDK/governor/dispatch and Serve restart/creation tests bring diagnostics to **128/128**. The report
+still returns `endToEndReady: false`, exit 2: external native Drivers, real models, packaged Desktop
+and deliberate existing-binding migration remain open. Report:
+`/private/var/folders/ct/lcxjhj5n6gxf4x0k1mmshy4r0000gq/T/hara-runtime-acceptance-6uVAni/report.json`.
+
+The standalone `--main-pi` smoke passed compiled authenticated Serve, governed Pi coding-worker
+continuations, exact usage, persisted main binding and a separate CLI continuation from the exact
+stored project cwd. Log: `/private/tmp/hara-pi-dev-binary.wtXLFs/main-smoke-final.log`. The initial
+wrong-cwd harness was corrected, not the project/audience guard. All traffic used synthetic loopback
+and private temporary homes, without real credentials or paid requests.
+
+Same-key Workspace regressions prove independent explicit credential/profile references, IDs,
+generations/defaults, no foreign attachment/default/run borrowing, independent local revoke/rotation
+and saved-state restoration on return. They do not activate new execution Workspaces or prove full
+membership/storage partitioning; `(workspaceId, accountId)` authorization remains a next-stage gate.

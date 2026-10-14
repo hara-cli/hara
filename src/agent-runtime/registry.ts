@@ -1,4 +1,5 @@
 import { runAgent, type RunOpts, type RunOutcome } from "../agent/loop.js";
+import { runPiAgent } from "./pi.js";
 import type { NeutralMsg } from "../providers/types.js";
 import { AGENT_RUNTIME_IDS, isTaskRuntimeBinding, type AgentRuntimeId, type TaskRuntimeBinding } from "./bindings.js";
 
@@ -25,7 +26,7 @@ const LABELS: Record<AgentRuntimeId, string> = {
 export class AgentRuntimeRegistry {
   private readonly drivers = new Map<AgentRuntimeId, GovernedAgentRuntimeDriver>();
 
-  constructor(drivers: readonly GovernedAgentRuntimeDriver[] = [{ id: "hara", run: runAgent }]) {
+  constructor(drivers: readonly GovernedAgentRuntimeDriver[] = [{ id: "hara", run: runAgent }, { id: "pi", run: runPiAgent }]) {
     for (const driver of drivers) {
       if (!AGENT_RUNTIME_IDS.includes(driver.id) || this.drivers.has(driver.id) || typeof driver.run !== "function") {
         throw new Error("invalid or duplicate governed Agent Runtime driver");

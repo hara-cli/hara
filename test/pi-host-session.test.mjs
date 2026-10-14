@@ -64,8 +64,8 @@ test("real Pi SDK performs an ordinary chat through one Hara model call, with no
   for (const name of ["auth.json", "models.json", "models-store.json"]) {
     assert.deepEqual(JSON.parse(readFileSync(join(f.home, ".hara", "agent-runtime", "pi-probe", name), "utf8")), {});
   }
-  assert.equal(new AgentRuntimeRegistry().options().find((option) => option.id === "pi").available, false,
-    "a tested SDK primitive does not automatically register a governed main-Agent Driver");
+  assert.equal(new AgentRuntimeRegistry().options().find((option) => option.id === "pi").available, true,
+    "the separately-tested governed Pi Runtime is now explicitly registered, not inferred from this primitive");
 });
 
 test("explicit SDK context reconstruction retains the same synthetic chat memory without reading ambient history", async (t) => {

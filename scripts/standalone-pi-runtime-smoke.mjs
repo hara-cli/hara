@@ -10,9 +10,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { readStandalonePiSmokeWorkerFailure, standalonePiSmokeDiagnostic } from "./standalone-pi-runtime-diagnostics.mjs";
 
-const [binaryArg, expectedVersion] = process.argv.slice(2);
-if (!binaryArg || !expectedVersion) {
-  console.error("usage: node scripts/standalone-pi-runtime-smoke.mjs <native-binary> <expected-version>");
+const [binaryArg, expectedVersion, mode] = process.argv.slice(2);
+const mainPi = mode === "--main-pi";
+if (!binaryArg || !expectedVersion || (mode !== undefined && !mainPi)) {
+  console.error("usage: node scripts/standalone-pi-runtime-smoke.mjs <native-binary> <expected-version> [--main-pi]");
   process.exit(2);
 }
 const binary = resolve(binaryArg);
@@ -30,7 +31,7 @@ const env = {
   HARA_API_KEY: "synthetic-loopback-only-not-a-credential",
   ...(process.platform === "win32" ? { SystemRoot: process.env.SystemRoot ?? "C:\\Windows" } : {}),
 };
-let child, ws, failedRequest;
+let child, replayChild, ws, failedRequest;
 let childOutput = "";
 let rootRounds = 0, workerRounds = 0, requests = 0;
 let stage = "fixture_git", diagnosticWorker, diagnosticSessionId;
@@ -62,7 +63,11 @@ const server = createServer(async (req, res) => {
       assert.ok(workerRounds <= 3, "unexpected repeated worker execution");
     } else if (body.tools?.length) {
       rootRounds += 1;
-      if (rootRounds === 1) {
+      if (mainPi && rootRounds === 7) {
+        assert.ok(body.messages.some(item => String(item.content).includes("synthetic-pi-memory-314")),
+          "compiled headless continuation must recover the canonical main-Agent history");
+        text = "Main Pi remembered synthetic-pi-memory-314.";
+      } else if (rootRounds === 1) {
         name = "task_intake"; input = { intent: "change", goal: "Exercise the isolated synthetic Pi worker twice",
           constraints: ["read only source.txt; do not send messages or contact external services"],
           acceptance: ["the worker reads the synthetic marker and recalls it in a second generation"],
@@ -186,6 +191,14 @@ try {
   stage = "settings";
   const settings = await rpc("settings.coding.get");
   assert.equal(settings.error, undefined); assert.equal(settings.result.effectiveExecutor, "pi");
+  if (mainPi) {
+    stage = "main_runtime_binding";
+    const catalog = await rpc("agents.list"); assert.equal(catalog.error, undefined);
+    assert.equal(catalog.result.runtimeOptions.find(item => item.id === "pi").available, true);
+    const main = catalog.result.agents.find(item => item.ref === "main");
+    const bound = await rpc("agents.set-runtime", { ref: "main", runtimeId: "pi", expectedRevision: main.runtime.revision, expectedAgentRevision: main.revision });
+    assert.equal(bound.error, undefined); assert.equal(bound.result.binding.runtimeId, "pi");
+  }
   stage = "session_create";
   const created = await rpc("session.create"); assert.equal(created.error, undefined);
   const sessionId = created.result.sessionId;
@@ -214,7 +227,26 @@ try {
     child.once("exit", code => { clearTimeout(timer); code === 0 ? done() : reject(new Error("native shutdown failed")); });
   });
   assert.equal(existsSync(discovery), false);
-  console.log("✓ compiled Pi SDK: authenticated Serve, real read tool, same-session resume and exact usage; loopback synthetic only");
+  if (mainPi) {
+    stage = "headless_main_resume";
+    const saved = JSON.parse(readFileSync(join(home, ".hara", "sessions", sessionId + ".json"), "utf8"));
+    assert.equal(saved.task.runtimeBinding.runtimeId, "pi");
+    const resumed = await new Promise((done, reject) => {
+      replayChild = spawn(binary, ["--resume", sessionId, "--print", "Recall the earlier synthetic marker only. Do not use tools or perform further work."],
+        { cwd, env, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+      let output = "";
+      replayChild.stdout.on("data", chunk => { output = (output + String(chunk)).slice(-8_000); });
+      const timer = setTimeout(() => { replayChild.kill(); reject(new Error("compiled headless continuation timed out")); }, 20_000);
+      replayChild.once("error", error => { clearTimeout(timer); reject(error); });
+      replayChild.once("exit", code => { clearTimeout(timer); done({ code, output }); });
+    });
+    assert.equal(resumed.code, 0, "compiled headless main-Pi continuation failed");
+    assert.ok(resumed.output.includes("Main Pi remembered synthetic-pi-memory-314"));
+    assert.equal(rootRounds, 7); assert.equal(workerRounds, 3);
+  }
+  console.log(mainPi
+    ? "✓ compiled main Pi Runtime: authenticated Serve, governed Pi worker, exact usage, persisted binding and headless history recovery; loopback synthetic only"
+    : "✓ compiled Pi SDK: authenticated Serve, real read tool, same-session resume and exact usage; loopback synthetic only");
 } catch (error) {
   console.error("standalone Pi runtime smoke failed");
   const workerFailure = readStandalonePiSmokeWorkerFailure(home, diagnosticSessionId, diagnosticWorker?.id);
@@ -225,13 +257,14 @@ try {
 } finally {
   for (const item of pending.values()) { clearTimeout(item.timer); item.reject(new Error("fixture stopped")); }
   ws?.close();
-  if (child && child.exitCode === null && child.signalCode === null) {
-    child.kill();
-    await Promise.race([new Promise(done => child.once("exit", done)), new Promise(done => setTimeout(done, 3_000))]);
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  for (const process of [child, replayChild]) {
+    if (!process || process.exitCode !== null || process.signalCode !== null) continue;
+    process.kill();
+    await Promise.race([new Promise(done => process.once("exit", done)), new Promise(done => setTimeout(done, 3_000))]);
+    if (process.exitCode === null && process.signalCode === null) process.kill("SIGKILL");
   }
   server.closeAllConnections();
   await new Promise(done => server.close(done));
-  if (!child || child.exitCode !== null || child.signalCode !== null) rmSync(root, { recursive: true, force: true });
+  if ([child, replayChild].every(process => !process || process.exitCode !== null || process.signalCode !== null)) rmSync(root, { recursive: true, force: true });
   else { console.error("standalone Pi runtime smoke: preserving private fixture until child exits"); process.exitCode = 1; }
 }

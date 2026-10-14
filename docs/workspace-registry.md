@@ -30,6 +30,26 @@ a previously unassigned direct profile; attaching does not select a default. Rea
 existing profile is refused, including a revoked one. Managed attachment requires a future
 authenticated Workspace/enrollment mapping, not a caller-supplied tenant label.
 
+### Confirmed independent-connection rule (2026-10-14)
+
+A new Workspace requires an explicit connection addition even when its owner enters exactly the same
+provider key used elsewhere. Each addition has a distinct private credential/profile reference,
+connection ID, generation, default and lifecycle. Never deduplicate, transfer, discover or grant access
+across Workspaces by key value/hash, provider account, label or the global login identity. Returning to
+an already configured Workspace restores its own saved configuration; switching does not require
+entering the key again and does not reauthorize an old run.
+
+Local revocation or rotation of A's connection must leave B's stored connection and default unchanged.
+This is not a claim of independent provider billing: the same upstream key can share quota, and
+revoking that key at the provider can invalidate both connections. The new regressions prove only
+the registry/frozen-binding rules using synthetic keys, not full data or membership isolation.
+
+The login account is shared identity, not a global role. Future Membership authority is keyed by
+`(workspaceId, accountId)` with independent roles, grants and revocation revisions. A's administrator
+must not become B's administrator or be able to read B's credentials, history, memory or tasks.
+Membership and full storage partitioning remain unimplemented next-stage gates below; this local
+registry is deliberately not exposed as their substitute.
+
 ## Storage and display
 
 `WorkspaceRegistryStore` requires an explicit absolute home and has no constructor side effects.

@@ -62,7 +62,8 @@ import {
   type ApprovalMode,
   type ProviderId,
 } from "./config.js";
-import { runAgent, type RunOpts, type RunOutcome, type RunRuntimeItemEvent } from "./agent/loop.js";
+import { type RunOpts, type RunOutcome, type RunRuntimeItemEvent } from "./agent/loop.js";
+import { runConfiguredAgent as runAgent, bindNewAgentTask } from "./agent-runtime/dispatch.js";
 import {
   formatAgentDuration,
   parseAgentRunTimeoutMs,
@@ -7389,9 +7390,11 @@ program.action(async (opts) => {
         await closeMcp();
         return;
       }
-      task = continued.ok ? continued.task : createTaskExecution(String(opts.print), headlessInteraction.turnId);
+      task = continued.ok ? continued.task : bindNewAgentTask(createTaskExecution(String(opts.print), headlessInteraction.turnId),
+        meta?.spaceId ?? headlessLaunchSpaceId, meta?.agentRef ?? requestedHeadlessAgentRef ?? "main");
     } else {
-      task = createTaskExecution(String(opts.print), headlessInteraction.turnId);
+      task = bindNewAgentTask(createTaskExecution(String(opts.print), headlessInteraction.turnId),
+        meta?.spaceId ?? headlessLaunchSpaceId, meta?.agentRef ?? requestedHeadlessAgentRef ?? "main");
       clearTodos();
       if (meta) meta.todos = [];
     }
@@ -9377,7 +9380,7 @@ program.action(async (opts) => {
                 if (!continued.ok) return void h.sink.notice(`(steer rejected: ${continued.reason})`);
                 task = continued.task;
               } else {
-                task = createTaskExecution(arg || `enter ${sk.id}`, skillInteraction.turnId);
+                task = bindNewAgentTask(createTaskExecution(arg || `enter ${sk.id}`, skillInteraction.turnId), meta.spaceId ?? spaceIdForProfile(assertInteractiveAudience()), meta.agentRef ?? "main");
               }
               const skillExecutionContext = taskExecutionContext(task, skillInteraction);
               history.push({ role: "user", content: skillContent });
@@ -9432,7 +9435,7 @@ program.action(async (opts) => {
             }
             task = continued.task;
           } else {
-            task = createTaskExecution(objective, submittedInteraction.turnId);
+            task = bindNewAgentTask(createTaskExecution(objective, submittedInteraction.turnId), meta.spaceId ?? spaceIdForProfile(assertInteractiveAudience()), meta.agentRef ?? "main");
             clearTodos();
             meta.todos = [];
           }
@@ -9690,7 +9693,7 @@ program.action(async (opts) => {
           resumeTaskPending = false;
           clearTodos();
           meta.todos = [];
-          task = createTaskExecution(rest.join(" ") || `enter ${sk.id}`, skillInteraction.turnId);
+          task = bindNewAgentTask(createTaskExecution(rest.join(" ") || `enter ${sk.id}`, skillInteraction.turnId), meta.spaceId, meta.agentRef ?? "main");
           const skillExecutionContext = taskExecutionContext(task, skillInteraction);
           history.push({ role: "user", content: skillContent });
           persistSession();
@@ -9751,7 +9754,7 @@ program.action(async (opts) => {
       }
       task = continued.task;
     } else {
-      task = createTaskExecution(line, interaction.turnId);
+      task = bindNewAgentTask(createTaskExecution(line, interaction.turnId), meta.spaceId, meta.agentRef ?? "main");
       clearTodos();
       meta.todos = [];
     }

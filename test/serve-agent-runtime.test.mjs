@@ -52,9 +52,9 @@ test("real Serve exposes honest Runtime availability and refuses unavailable or 
   const f = await fixture(t); const catalog = (await f.client.call("agents.list")).result;
   const main = catalog.agents.find((agent) => agent.ref === "main");
   assert.equal(main.runtime.runtimeId, "hara"); assert.equal(main.runtime.revision, 0);
-  assert.equal(catalog.runtimeOptions.find((option) => option.id === "pi").available, false);
+  assert.equal(catalog.runtimeOptions.find((option) => option.id === "pi").available, true);
   const params = { ref: "main", runtimeId: "pi", expectedRevision: 0, expectedAgentRevision: main.revision };
-  for (const runtimeId of ["pi", "codex", "claude", "opencode"]) {
+  for (const runtimeId of ["codex", "claude", "opencode"]) {
     assert.match((await f.client.call("agents.set-runtime", { ...params, runtimeId })).error.message, /not available.*no fallback/);
   }
   assert.match((await f.client.call("agents.set-runtime", { ...params, runtimeId: "hara", allowTools: ["bash"] })).error.message, /unsupported/);
@@ -67,6 +67,32 @@ test("real Serve exposes honest Runtime availability and refuses unavailable or 
     "local Personal state cannot select an organization engine");
   assert.match((await f.client.call("agents.set-runtime", { ...params, runtimeId: "hara", expectedRevision: 1 })).error.message, /organization administrators/);
   assert.equal(f.calls, 0);
+});
+
+test("real Serve dispatches the registered Pi SDK Runtime, persists history and retains its task binding after restart", { timeout: 20000 }, async (t) => {
+  const f = await fixture(t); const catalog = (await f.client.call("agents.list")).result;
+  const main = catalog.agents.find((agent) => agent.ref === "main");
+  assert.equal((await f.client.call("agents.set-runtime", { ref: "main", runtimeId: "pi", expectedRevision: 0, expectedAgentRevision: main.revision })).error, undefined);
+  const sessionId = (await f.client.call("session.create", { cwd: f.cwd })).result.sessionId;
+  assert.equal((await f.client.call("session.send", { sessionId, text: "hello" })).error, undefined);
+  assert.equal(f.calls, 1); assert.equal(f.store.saved.get(sessionId).task.runtimeBinding.runtimeId, "pi");
+  assert.equal(f.store.saved.get(sessionId).history.at(-1).text, "你好，收到。");
+  await f.restart(); await f.client.call("session.resume", { sessionId });
+  assert.equal((await f.client.call("session.send", { sessionId, text: "a separate greeting" })).error, undefined);
+  assert.equal(f.calls, 2); assert.equal(f.store.saved.get(sessionId).task.runtimeBinding.runtimeId, "pi");
+});
+
+test("new Agents receive an explicit Pi binding; unsupported choices fail before publishing a persona", { timeout: 15000 }, async (t) => {
+  const f = await fixture(t);
+  const input = { id: "pi-colleague", profile: { displayName: "Pi colleague" }, instructions: "Help with synthetic tasks." };
+  const rejected = await f.client.call("agents.create", { ...input, runtimeId: "codex" });
+  assert.match(rejected.error.message, /not available/);
+  assert.equal((await f.client.call("agents.list")).result.agents.some((agent) => agent.ref === "global:pi-colleague"), false);
+  const created = await f.client.call("agents.create", input);
+  assert.equal(created.error, undefined); assert.equal(created.result.agent.runtime.runtimeId, "pi");
+  assert.equal(created.result.agent.runtime.revision, 1); assert.equal(f.calls, 0);
+  const legacy = await f.client.call("agents.create", { ...input, id: "compat-colleague", runtimeId: "hara" });
+  assert.equal(legacy.error, undefined); assert.equal(legacy.result.agent.runtime.runtimeId, "hara");
 });
 
 test("a trusted fixture driver change affects the next task, not an in-flight run or resumed task", { timeout: 20000 }, async (t) => {
@@ -111,11 +137,11 @@ test("imported persona Runtime fields cannot choose an engine and an unavailable
   assert.equal((await f.client.call("session.send", { sessionId: session, text: "hello" })).error, undefined);
   const before = structuredClone(f.store.saved.get(session)); const count = f.calls;
   assert.equal(before.task.runtimeBinding.runtimeId, "hara");
-  new AgentRuntimeBindingStore(f.home).set("personal", "global:coder", "pi", 0);
+  new AgentRuntimeBindingStore(f.home).set("personal", "global:coder", "codex", 0);
   const rejected = await f.client.call("session.send", { sessionId: session, text: "hello, another task" });
   assert.match(rejected.error.message, /not available.*no fallback/);
   assert.equal(f.calls, count); assert.deepEqual(f.store.saved.get(session), before);
   assert.match((await f.client.call("session.create", { cwd: f.cwd, agentRef: "global:coder" })).error.message, /not available/);
   const state = JSON.parse(readFileSync(join(f.home, ".hara", "agent-runtime-bindings.json"), "utf8"));
-  assert.equal(state.bindings[0].runtimeId, "pi");
+  assert.equal(state.bindings[0].runtimeId, "codex");
 });

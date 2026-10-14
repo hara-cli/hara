@@ -32,7 +32,7 @@ import { createAgentCreationTool } from "./agent-creator.js";
 import { createAgentRestorationTool, type AgentRestorationTarget } from "./agent-restorer.js";
 import { createServeRuntimeLogger, serveRuntimeFailureCategory } from "./runtime-log.js";
 import { type RunOpts, type RunProgressEvent, type RunRuntimeItemEvent } from "../agent/loop.js";
-import { AgentRuntimeBindingStore, freezeTaskRuntimeBinding, isTaskRuntimeBinding, isAgentRuntimeId, type AgentRuntimeBinding, type TaskRuntimeBinding } from "../agent-runtime/bindings.js";
+import { AgentRuntimeBindingStore, freezeTaskRuntimeBinding, isTaskRuntimeBinding, isAgentRuntimeId, type AgentRuntimeBinding, type AgentRuntimeId, type TaskRuntimeBinding } from "../agent-runtime/bindings.js";
 import { AgentRuntimeRegistry, type AgentRuntimeOption, type GovernedAgentRuntimeDriver } from "../agent-runtime/registry.js";
 import {
   COMPACT_SYSTEM,
@@ -1800,6 +1800,18 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const configuredAgentRuntime = (spaceId: string, agentRef: string): AgentRuntimeBinding => spaceId === "personal"
     ? agentRuntimeBindings.read(spaceId, agentRef)
     : { version: 1, spaceId, agentRef, runtimeId: "hara", revision: 0 };
+  const createRuntimeBoundAgent = async (input: Parameters<typeof createNativeGlobalAgent>[0], requested?: AgentRuntimeId) => {
+    const ref = `global:${input.id.trim().toLowerCase()}`;
+    const runtimeId = requested ?? (agentRuntimeRegistry.options().some((entry) => entry.id === "pi" && entry.available) ? "pi" : "hara");
+    agentRuntimeRegistry.assertAvailable(runtimeId);
+    const prior = agentRuntimeBindings.read("personal", ref);
+    // Reserve before publishing the persona. A failed file creation leaves only a non-executable
+    // reservation; retrying the same username/runtime is safe. Never remove it after an ambiguous
+    // write or concurrent retry, which could silently turn a newly-created Pi Agent back into Hara.
+    if (prior.revision === 0) agentRuntimeBindings.set("personal", ref, runtimeId, 0);
+    else if (prior.runtimeId !== runtimeId) throw new Error("This username already has another Runtime reservation; retry its exact Runtime before editing the Agent.");
+    return createNativeGlobalAgent(input);
+  };
   const serveAgentCatalog = (cwd: string, profileId: string | undefined, spaceId: string): ServeAgentCatalog => {
     const catalog = buildServeAgentCatalog(cwd, profileId, spaceId);
     const runtimeOptions = agentRuntimeRegistry.options();
@@ -4051,7 +4063,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               const existing = catalog.agents.find((agent) => agent.ref === ref || agent.name.toLowerCase() === input.id);
               if (existing) return { ref: existing.ref, name: existing.identity.displayName, created: false };
               if (catalog.dismissedAgentRefs.includes(ref)) throw new Error("This username belongs to a dismissed Agent. Use agent_contact(action=list, includeDismissed=true), then propose agent_restore with its exact ref, revision and dismissal time for human confirmation; its instructions and history will not be overwritten.");
-              const created = await createNativeGlobalAgent(input);
+              const created = await createRuntimeBoundAgent(input);
               broadcast("event.agents_changed", { sessionId });
               return { ref, name: created.identity.displayName, created: true };
             },
@@ -7553,6 +7565,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               || (p.description !== undefined && typeof p.description !== "string")
               || (p.instructions !== undefined && typeof p.instructions !== "string")
               || (p.blueprint !== undefined && (!p.blueprint || typeof p.blueprint !== "object" || Array.isArray(p.blueprint)))
+              || (p.runtimeId !== undefined && !isAgentRuntimeId(p.runtimeId))
             ) {
               return reply(rpcError(id, ERR.PARAMS, "id and profile are required; description and instructions must be strings; blueprint must be an object"));
             }
@@ -7568,6 +7581,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.PARAMS, "Agent username must use 1-64 lowercase letters, numbers, dots, underscores, or dashes and cannot be reserved"));
             }
             const ref = `global:${username}`;
+            if (p.runtimeId !== undefined) {
+              try { agentRuntimeRegistry.assertAvailable(p.runtimeId); }
+              catch (error) { return reply(rpcError(id, ERR.PARAMS, error instanceof Error ? error.message : String(error))); }
+            }
             const before = serveAgentCatalog(cwd, profileId, spaceId);
             if (before.agents.some((agent) => agent.name.toLowerCase() === username || agent.ref.toLowerCase() === ref)) {
               return reply(rpcError(id, ERR.CONFLICT, "Agent username is already in use"));
@@ -7581,6 +7598,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 ? resolveServeAgent(ref, cwd, profileId, { includeDismissed: true })
                 : null;
               if (existing && !("ambiguous" in existing)) {
+                if (p.runtimeId !== undefined) {
+                  const prior = agentRuntimeBindings.read(spaceId, ref);
+                  if (prior.runtimeId !== p.runtimeId) agentRuntimeBindings.set(spaceId, ref, p.runtimeId, prior.revision);
+                }
                 restoreAgentRef(ref);
                 const catalog = serveAgentCatalog(cwd, profileId, spaceId);
                 return reply(rpcResult(id!, {
@@ -7589,13 +7610,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                   restored: true,
                 }));
               }
-              await createNativeGlobalAgent({
+              await createRuntimeBoundAgent({
                 id: username,
                 description: p.description,
                 instructions: p.instructions,
                 profile: p.profile,
                 blueprint: p.blueprint,
-              });
+              }, p.runtimeId);
               // A stale roster tombstone may outlive an uninstalled source role. Explicit hiring owns the
               // new prompt creation, so make that new employee visible only after creation succeeds.
               if (dismissed) restoreAgentRef(ref);
