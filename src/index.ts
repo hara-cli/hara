@@ -100,6 +100,8 @@ import {
   loadActiveProfile,
   listProfiles,
   useProfile,
+  useSpaceProfile,
+  profileSpaceSnapshot,
   addProfile,
   removeProfile,
   syncStoredPersonalProfile,
@@ -1720,9 +1722,9 @@ function organizationConnectionsSnapshot(targetCwd: string) {
  * company Space so reconnecting cannot fork identity or mix history. */
 function spaceDirectorySnapshot(targetCwd: string) {
   const resolution = resolveActive(targetCwd);
-  const profiles = listProfiles();
-  const activeProfile = profiles.find((profile) => profile.id === resolution.id)
-    ?? profiles.find((profile) => profile.id === PERSONAL_ID)!;
+  const { profiles, selections } = profileSpaceSnapshot();
+  const activeProfile = profiles.find((profile) => profile.id === resolution.id);
+  if (!activeProfile) throw new Error("the active Space connection changed; refresh before switching");
   const activeSpaceId = spaceIdForProfile(activeProfile);
   const organizationSpaces = new Map<string, { profile: Profile; profileIds: string[] }>();
   for (const profile of profiles) {
@@ -1734,9 +1736,13 @@ function spaceDirectorySnapshot(targetCwd: string) {
       continue;
     }
     existing.profileIds.push(profile.id);
-    if (profile.id === resolution.id) existing.profile = profile;
+    if (profile.id === resolution.id || (
+      existing.profile.id !== resolution.id && profile.id === selections[spaceId]
+    )) existing.profile = profile;
   }
-  const personalRoute = activeProfile.kind === "byok" ? activeProfile : profiles.find((profile) => profile.id === PERSONAL_ID)!;
+  const personalRoute = activeProfile.kind === "byok" ? activeProfile : profiles.find((profile) => (
+    profile.kind === "byok" && profile.id === (selections[PERSONAL_ID] ?? PERSONAL_ID)
+  ))!;
   const personalProfileIds = profiles.filter((profile) => profile.kind === "byok").map((profile) => profile.id);
   const spaces = [
     {
@@ -1789,8 +1795,7 @@ function useSpaceConnection(spaceId: string, targetCwd: string) {
   if (target.kind === "organization" && (target.accessState === "expired" || target.accessState === "invalid")) {
     throw new Error("this company connection is unavailable; re-enroll it in AI & Models before switching");
   }
-  const profileId = target.kind === "personal" ? PERSONAL_ID : target.profileId;
-  const switched = useProfile(profileId);
+  const switched = useSpaceProfile(spaceId, target.profileId);
   if (!switched.ok) throw new Error(switched.reason);
   return spaceDirectorySnapshot(targetCwd);
 }

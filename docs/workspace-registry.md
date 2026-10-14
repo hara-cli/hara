@@ -3,7 +3,9 @@
 This branch implements a local Workspace metadata store and an additional frozen-connection guard.
 It does **not** enable a Workspace product in Serve, CLI or Desktop, advertise `workspace.v2`,
 migrate a real installation, or establish full tenant/process isolation. The maintenance release
-branch and current profile/session selection remain unchanged.
+branch and current session binding remain unchanged. A subsequent, separate legacy Space connection
+memory fix is described in [the compatibility increment](workspace-compatibility-integration.md);
+it does not activate this registry or create new execution audiences.
 
 ## Model
 
@@ -93,5 +95,5 @@ is involved. Full-suite results are recorded in the workspace-level implementati
    authorized rollout. Desk's current single-organization deployment does not become multi-tenant
    through a new local metadata file.
 
-Until these stages are verified, do not offer Workspace switching as an execution feature or claim
+Until these stages are verified, do not offer new registry Workspaces as an execution feature or claim
 that all Hara information is isolated merely because this metadata layer's tests pass.

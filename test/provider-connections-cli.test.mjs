@@ -195,6 +195,10 @@ test("real serve keeps multiple accounts from the same provider independent and 
         visionBaseURL: provider.baseURL,
         visionApiKey: keyA,
       },
+      {
+        id: "workspace-team", kind: "gateway", tenantId: "workspace-team", tenantName: "Workspace Team",
+        gatewayUrl: provider.baseURL, deviceToken: "synthetic-workspace-token", tokenNeverExpires: true,
+      },
     ],
   }, null, 2)}\n`, { mode: 0o600 });
 
@@ -252,6 +256,17 @@ test("real serve keeps multiple accounts from the same provider independent and 
     client = await connect(port);
     const initialized = await client.call("initialize", { token });
     assert.ok(initialized.result.capabilities.methods.includes("settings.providers.connections.create"));
+
+    const teamSpace = await client.call("spaces.use", { spaceId: "org:workspace-team", cwd: project });
+    assert.equal(teamSpace.error, undefined, teamSpace.error?.message);
+    assert.equal(teamSpace.result.activeProfileId, "workspace-team");
+    assert.equal(teamSpace.result.spaces.find((space) => space.id === "personal").profileId, "legacy-openai");
+    const returnToPrivate = await client.call("spaces.use", { spaceId: "personal", cwd: project });
+    assert.equal(returnToPrivate.error, undefined, returnToPrivate.error?.message);
+    assert.equal(returnToPrivate.result.activeProfileId, "legacy-openai", "real RPC restores the named account, not reserved Personal");
+    assert.equal(provider.requests.length, 0, "switching Workspace alone must not call a model or send a message");
+    assert.equal(JSON.stringify(teamSpace).includes(keyA), false);
+    assert.equal(JSON.stringify(teamSpace).includes("synthetic-workspace-token"), false);
 
     const initial = await client.call("settings.providers.list", {});
     assert.equal(initial.result.current.profileId, "legacy-openai");
@@ -349,7 +364,7 @@ test("real serve keeps multiple accounts from the same provider independent and 
 
     const stored = JSON.parse(readFileSync(profilesPath, "utf8"));
     assert.equal(stored.active, "team-openai-b");
-    assert.deepEqual(stored.profiles.map((profile) => profile.id), ["personal", "legacy-openai", "team-openai-a", "team-openai-b"]);
+    assert.deepEqual(stored.profiles.map((profile) => profile.id), ["personal", "legacy-openai", "workspace-team", "team-openai-a", "team-openai-b"]);
     assert.equal(stored.profiles.find((profile) => profile.id === "team-openai-a").apiKey, keyB);
     assert.equal(stored.profiles.find((profile) => profile.id === "team-openai-b").apiKey, keyC);
     assert.equal(stored.profiles.find((profile) => profile.id === "team-openai-a").reasoningEffort, "high");

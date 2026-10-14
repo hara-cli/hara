@@ -136,6 +136,9 @@ export interface Profile {
 export interface ProfilesFile {
   active: string;
   profiles: Profile[];
+  /** Compatibility pointer only, not Workspace membership/authority. Kept with `active` so a route
+   * switch cannot commit one without the other. The Workspace registry will replace this legacy view. */
+  spaceProfileSelections?: Record<string, string>;
 }
 
 const PERSONAL_ID = "personal";
@@ -213,6 +216,7 @@ function validProfilesFileStructure(value: unknown): value is ProfilesFile {
   // produce its focused "legacy invalid id" migration error without rewriting or discarding credentials.
   if (typeof file.active !== "string" || !file.active || !Array.isArray(file.profiles) || file.profiles.length === 0) return false;
   const ids = new Set<string>();
+  const profilesById = new Map<string, Profile>();
   for (const entry of file.profiles) {
     if (
       !entry
@@ -223,8 +227,20 @@ function validProfilesFileStructure(value: unknown): value is ProfilesFile {
       || ids.has(entry.id)
     ) return false;
     ids.add(entry.id);
+    profilesById.set(entry.id, entry);
   }
-  return ids.has(file.active);
+  if (!ids.has(file.active)) return false;
+  if (file.spaceProfileSelections !== undefined) {
+    const selections = file.spaceProfileSelections;
+    if (!selections || typeof selections !== "object" || Array.isArray(selections)) return false;
+    if (Object.keys(selections).length > file.profiles.length) return false;
+    for (const [spaceId, profileId] of Object.entries(selections)) {
+      if (!isValidSpaceId(spaceId) || typeof profileId !== "string") return false;
+      const profile = profilesById.get(profileId);
+      if (!profile || spaceIdForProfile(profile) !== spaceId) return false;
+    }
+  }
+  return true;
 }
 
 function validProfilesFile(value: unknown): boolean {
@@ -352,6 +368,7 @@ function maybeMigrateUnlocked(): ProfilesState {
     }
     if (missingPersonalCompatibilityFile(existing.value)) {
       const healed: ProfilesFile = {
+        ...existing.value,
         active: existing.value.active,
         profiles: [readPersonalFromConfig(), ...existing.value.profiles],
       };
@@ -413,6 +430,69 @@ function maybeMigrate(): ProfilesFile {
 
 export function listProfiles(): Profile[] {
   return maybeMigrate().profiles;
+}
+
+/** Read the last explicitly selected route in each legacy Space. Reading a flag/env/project pin never
+ * changes this preference; those temporary overrides remain separate from the global selector. */
+export function spaceProfileSelections(): Readonly<Record<string, string>> {
+  return profileSpaceSnapshot().selections;
+}
+
+/** One verified registry snapshot for directory presentation; never combine preference pointers from
+ * one revision with a connection catalog from another. */
+export function profileSpaceSnapshot(): { profiles: Profile[]; selections: Readonly<Record<string, string>> } {
+  const state = maybeMigrate();
+  const active = state.profiles.find((profile) => profile.id === state.active)!;
+  return { profiles: state.profiles, selections: { ...state.spaceProfileSelections, [spaceIdForProfile(active)]: active.id } };
+}
+
+function rememberSpaceProfile(state: ProfilesFile): void {
+  const active = state.profiles.find((profile) => profile.id === state.active)!;
+  state.spaceProfileSelections = {
+    ...state.spaceProfileSelections,
+    [spaceIdForProfile(active)]: active.id,
+  };
+}
+
+function activateProfile(state: ProfilesFile, id: string): void {
+  // Also capture the departing route for pre-upgrade registries with no selection map yet.
+  rememberSpaceProfile(state);
+  state.active = id;
+  rememberSpaceProfile(state);
+}
+
+function pruneSpaceProfileSelections(state: ProfilesFile): void {
+  if (!state.spaceProfileSelections) return;
+  state.spaceProfileSelections = Object.fromEntries(Object.entries(state.spaceProfileSelections).filter(
+    ([spaceId, profileId]) => state.profiles.some((profile) => (
+      profile.id === profileId && spaceIdForProfile(profile) === spaceId
+    )),
+  ));
+}
+
+/** Switch only the displayed legacy Space/route pair, rechecking ownership under the same lock as
+ * profile writes. Concurrent re-enrollment/removal must not redirect a click into another audience. */
+export function useSpaceProfile(spaceId: string, expectedProfileId: string): { ok: true; profile: Profile } | { ok: false; reason: string } {
+  if (!isValidSpaceId(spaceId)) return { ok: false, reason: "invalid Space id" };
+  return withProfilesLock(() => {
+    const state = maybeMigrateUnlocked();
+    const target = state.value.profiles.find((profile) => profile.id === expectedProfileId);
+    if (!target || spaceIdForProfile(target) !== spaceId) {
+      return { ok: false, reason: "the Space connection changed; refresh before switching" };
+    }
+    const active = state.value.profiles.find((profile) => profile.id === state.value.active)!;
+    const preferred = spaceIdForProfile(active) === spaceId
+      ? active.id
+      : state.value.spaceProfileSelections?.[spaceId]
+        ?? (spaceId === PERSONAL_ID ? PERSONAL_ID
+          : state.value.profiles.find((profile) => spaceIdForProfile(profile) === spaceId)?.id);
+    if (preferred !== expectedProfileId) {
+      return { ok: false, reason: "the Space connection changed; refresh before switching" };
+    }
+    activateProfile(state.value, target.id);
+    persistProfilesFile(state.value, state.snapshot.text);
+    return { ok: true, profile: target };
+  });
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
@@ -689,7 +769,7 @@ export function useProfile(id: string): { ok: true; profile: Profile } | { ok: f
     const state = maybeMigrateUnlocked();
     const p = state.value.profiles.find((x) => x.id === id);
     if (!p) return { ok: false, reason: `no profile '${id}' — try \`hara profile list\`` };
-    state.value.active = id;
+    activateProfile(state.value, id);
     persistProfilesFile(state.value, state.snapshot.text);
     return { ok: true, profile: p };
   });
@@ -706,7 +786,7 @@ export function addProfile(
     const state = maybeMigrateUnlocked();
     if (state.value.profiles.some((x) => x.id === p.id)) return { ok: false, reason: `profile '${p.id}' already exists` };
     state.value.profiles.push(p);
-    if (options.activate) state.value.active = p.id;
+    if (options.activate) activateProfile(state.value, p.id);
     persistProfilesFile(state.value, state.snapshot.text);
     return { ok: true };
   });
@@ -721,6 +801,8 @@ export function upsertProfile(p: Profile): void {
     const i = state.value.profiles.findIndex((x) => x.id === p.id);
     if (i >= 0) state.value.profiles[i] = p;
     else state.value.profiles.push(p);
+    pruneSpaceProfileSelections(state.value);
+    if (state.value.active === p.id) rememberSpaceProfile(state.value);
     persistProfilesFile(state.value, state.snapshot.text);
   });
 }
@@ -738,6 +820,8 @@ export function removeProfile(id: string): { ok: true; activeChanged: boolean; r
       state.value.active = PERSONAL_ID;
       activeChanged = true;
     }
+    pruneSpaceProfileSelections(state.value);
+    if (activeChanged) rememberSpaceProfile(state.value);
     persistProfilesFile(state.value, state.snapshot.text);
     return { ok: true, activeChanged, removedKind: removed.kind, removed };
   });
@@ -758,6 +842,8 @@ export function removeHistoricalPersonalRoutes(): number {
     if (!retained.some((profile) => profile.id === state.value.active)) {
       state.value.active = PERSONAL_ID;
     }
+    pruneSpaceProfileSelections(state.value);
+    rememberSpaceProfile(state.value);
     persistProfilesFile(state.value, state.snapshot.text);
     return removed;
   });
@@ -776,7 +862,7 @@ export function archiveHistoricalPersonalRoutes(options: { activatePersonal?: bo
     });
     if (options.activatePersonal) {
       if (state.value.active !== PERSONAL_ID) {
-        state.value.active = PERSONAL_ID;
+        activateProfile(state.value, PERSONAL_ID);
         changed += 1;
       }
     }
