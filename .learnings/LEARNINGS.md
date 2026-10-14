@@ -87,6 +87,17 @@ Claude Code launch. Keep the bundled OpenCode executable product-neutral as Hara
   made eligible Hara Agents inherit available coding executors automatically, and changed every actual
   Codex/Claude launch to require a fresh in-context approval. Added CLI, Serve, and Desktop regression tests.
 
+### Updated product decision (2026-10-14)
+
+Jeff now explicitly wants one configured Runtime per persistent Agent, with built-in Pi as the eventual
+main/general-Agent default and OpenCode/Codex/Claude as alternatives. This supersedes the September
+recommendation to omit Runtime identity configuration, not the tool-authorization boundary. Runtime,
+model connection, persona, native Session and live tool grants are distinct. Only trusted host/human
+configuration selects an engine; imported Markdown cannot do so. New tasks freeze that configuration,
+old work keeps its original binding, and unavailable engines never silently fall back. Pi is still only
+a coding worker until a governed general-Agent adapter is implemented and verified; do not advertise
+that migration as complete from a selector, fixture driver or coding preference change.
+
 ---
 
 ## [LRN-20260923-003] architecture

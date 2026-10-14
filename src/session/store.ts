@@ -1671,6 +1671,7 @@ function redactedSessionCopy(data: SessionData): SessionData {
     }
   }
   if (data.task && safe.task) {
+    if (data.task.runtimeBinding !== undefined) safe.task.runtimeBinding = { ...data.task.runtimeBinding };
     // Task objective/steering are free-form and stay redacted. Execution identity and transition metadata
     // are structural: preserve them exactly so resume/expectedTurnId validation cannot be corrupted by a
     // credential-looking identifier.
@@ -2660,6 +2661,10 @@ function persistSessionSnapshot(
   updatedAt: string,
 ): void {
   checkedSessionId(meta.id);
+  if (task?.runtimeBinding && (!isTaskExecution(task) || task.runtimeBinding.spaceId !== meta.spaceId
+    || task.runtimeBinding.agentRef !== (meta.agentRef ?? "main"))) {
+    throw new Error("invalid task Runtime audience; existing session was not replaced");
+  }
   // Also clean the live object. Deep-copy redaction alone protected disk, but could leave a credential in
   // the current renderer until the next reload and allowed the RPC rename response to echo it.
   meta.title = sanitizeSessionTitle(meta.title);
@@ -3087,7 +3092,9 @@ function isSessionData(d: unknown): d is SessionData {
   const o = d as { meta?: unknown; history?: unknown; task?: unknown; storageGeneration?: unknown } | null;
   return !!o && typeof o === "object" && !Array.isArray(o) && isSessionMeta(o.meta) &&
     Array.isArray(o.history) && o.history.every(isNeutralMessage) &&
-    (o.task === undefined || isTaskExecution(o.task)) &&
+    (o.task === undefined || (isTaskExecution(o.task) && (!o.task.runtimeBinding || (
+      o.task.runtimeBinding.spaceId === o.meta.spaceId && o.task.runtimeBinding.agentRef === (o.meta.agentRef ?? "main")
+    )))) &&
     (o.storageGeneration === undefined
       || (typeof o.storageGeneration === "string" && SESSION_STORAGE_GENERATION.test(o.storageGeneration)));
 }

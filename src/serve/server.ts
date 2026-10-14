@@ -31,7 +31,9 @@ import type { AgentCreationApproval, Tool } from "../tools/registry.js";
 import { createAgentCreationTool } from "./agent-creator.js";
 import { createAgentRestorationTool, type AgentRestorationTarget } from "./agent-restorer.js";
 import { createServeRuntimeLogger, serveRuntimeFailureCategory } from "./runtime-log.js";
-import { runAgent, type RunOpts, type RunProgressEvent, type RunRuntimeItemEvent } from "../agent/loop.js";
+import { type RunOpts, type RunProgressEvent, type RunRuntimeItemEvent } from "../agent/loop.js";
+import { AgentRuntimeBindingStore, freezeTaskRuntimeBinding, isTaskRuntimeBinding, isAgentRuntimeId, type AgentRuntimeBinding, type TaskRuntimeBinding } from "../agent-runtime/bindings.js";
+import { AgentRuntimeRegistry, type AgentRuntimeOption, type GovernedAgentRuntimeDriver } from "../agent-runtime/registry.js";
 import {
   COMPACT_SYSTEM,
   autoCompactTokenCap,
@@ -369,6 +371,9 @@ export interface GatewayConnectionTestResult {
 
 /** What the CLI entry injects (built in index.ts, where config/providers/guardian already live). */
 export interface ServeDeps {
+  /** Trusted composition-root adapters only; never supplied by RPC, Agent Markdown, or model tools. */
+  agentRuntimeDrivers?: readonly GovernedAgentRuntimeDriver[];
+  agentRuntimeHome?: string;
   version: string;
   providerId: string;
   model: string;
@@ -684,10 +689,13 @@ export interface ServeAgentInfo {
   allowedActions: Array<"chat" | "edit_profile" | "archive">;
   /** Optimistic-concurrency token for editable public identity metadata. */
   revision?: string;
+  /** Execution engine selection, separate from model/connection and private native session ids. */
+  runtime?: AgentRuntimeBinding & { available: boolean };
 }
 
 export interface ServeAgentCatalog {
   agents: ServeAgentInfo[];
+  runtimeOptions?: AgentRuntimeOption[];
   /** Qualified Personal refs hidden from the active directory; source prompts and history remain intact. */
   dismissedAgentRefs: string[];
 }
@@ -747,7 +755,7 @@ function resolveServeAgent(
   };
 }
 
-function serveAgentCatalog(cwd: string, profileId: string | undefined, spaceId: string): ServeAgentCatalog {
+function buildServeAgentCatalog(cwd: string, profileId: string | undefined, spaceId: string): ServeAgentCatalog {
   const allProjects = loadProjects();
   const canonicalCwd = canonicalProjectPath(cwd);
   const currentProject = allProjects.find((project) => canonicalProjectPath(project.path) === canonicalCwd);
@@ -1787,6 +1795,22 @@ function automationScheduleForRequest(
 }
 
 export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<ServeHandle> {
+  const agentRuntimeRegistry = new AgentRuntimeRegistry(deps.agentRuntimeDrivers);
+  const agentRuntimeBindings = new AgentRuntimeBindingStore(deps.agentRuntimeHome ?? homedir());
+  const configuredAgentRuntime = (spaceId: string, agentRef: string): AgentRuntimeBinding => spaceId === "personal"
+    ? agentRuntimeBindings.read(spaceId, agentRef)
+    : { version: 1, spaceId, agentRef, runtimeId: "hara", revision: 0 };
+  const serveAgentCatalog = (cwd: string, profileId: string | undefined, spaceId: string): ServeAgentCatalog => {
+    const catalog = buildServeAgentCatalog(cwd, profileId, spaceId);
+    const runtimeOptions = agentRuntimeRegistry.options();
+    // Local Personal preferences never become organization Runtime policy.
+    const bindings = spaceId === "personal" ? agentRuntimeBindings.readMany(spaceId, catalog.agents.map((agent) => agent.ref))
+      : catalog.agents.map((agent) => configuredAgentRuntime(spaceId, agent.ref));
+    return { ...catalog, runtimeOptions, agents: catalog.agents.map((agent, index) => {
+      const binding = bindings[index]!;
+      return { ...agent, runtime: { ...binding, available: runtimeOptions.some((option) => option.id === binding.runtimeId && option.available) } };
+    }) };
+  };
   // Best-effort private-state hygiene; never delays or prevents the local server from starting.
   pruneStoredToolResults();
   const runtimeLog = createServeRuntimeLogger({ enabled: !deps.quietDiscovery });
@@ -3613,6 +3637,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     contactDispatch?.signal.addEventListener("abort", abortFromContact, { once: true });
     s.abort = turnAbort;
     let interaction: TaskInteraction;
+    let runtimeBinding: Readonly<TaskRuntimeBinding>;
     let executionContext: string;
     try {
       const recoveredSteering = materializePendingSteering(s);
@@ -3621,6 +3646,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         (recoveredSteering.length > 0 || answeringDurableQuestion || requestsTaskContinuation(text))
         ? newSteerInteraction(s.task.turnId)
         : newTurnInteraction();
+      let nextTask: NonNullable<ServeSession["task"]>;
       if (interaction.kind === "steer") {
         if (answeringDurableQuestion) {
           const recorded = recordAwaitingTaskDecision(s.task, displayText);
@@ -3629,13 +3655,29 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         }
         const continued = continueTaskExecution(s.task, interaction);
         if (!continued.ok) throw new Error(continued.reason);
-        s.task = continued.task;
+        nextTask = continued.task;
       } else {
-        s.task = createTaskExecution(text, interaction.turnId);
-        // Checklists belong to executions, not to the surrounding conversation thread. An unrelated task
-        // must not inherit old pending todos and be forced back into paused state after a successful turn.
-        s.meta.todos = [];
+        nextTask = createTaskExecution(text, interaction.turnId);
       }
+      // A legacy unfinished task belongs to the old Hara engine even if its Agent preference has since
+      // changed. A new task reads trusted host configuration once; steering never reads it again.
+      runtimeBinding = nextTask.runtimeBinding ?? freezeTaskRuntimeBinding(
+        interaction.kind === "steer"
+          ? { version: 1, spaceId: spaceBinding.spaceId, agentRef: s.meta.agentRef ?? "main", runtimeId: "hara", revision: 0 }
+          : configuredAgentRuntime(spaceBinding.spaceId, s.meta.agentRef ?? "main"), nextTask.id,
+      );
+      if (!isTaskRuntimeBinding(runtimeBinding) || runtimeBinding.taskId !== nextTask.id
+        || runtimeBinding.spaceId !== spaceBinding.spaceId || runtimeBinding.agentRef !== (s.meta.agentRef ?? "main")) {
+        throw new Error("the frozen Agent Runtime binding does not belong to this task and Space");
+      }
+      if (spaceBinding.spaceId !== "personal" && (runtimeBinding.runtimeId !== "hara" || runtimeBinding.revision !== 0)) {
+        throw new Error("organization Agent Runtime policy is not authorized by local Personal configuration");
+      }
+      agentRuntimeRegistry.assertAvailable(runtimeBinding.runtimeId);
+      nextTask.runtimeBinding = Object.freeze({ ...runtimeBinding });
+      s.task = nextTask;
+      // Only commit a new task/checklist after Runtime admission succeeds.
+      if (interaction.kind === "turn") s.meta.todos = [];
       executionContext = taskExecutionContext(s.task, interaction, s.meta.todos ?? []);
       const previousConsent = delegatedInputTurns.get(sessionId);
       const inputNegotiated = Boolean(taskApprovalOwner
@@ -4423,7 +4465,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         if (taskApprovalOwner) taskExecutionOwners.set(sessionId, taskApprovalOwner);
         taskExecution = { agentId, isCurrent };
         try {
-        outcome = await runAgent(s.history, {
+        outcome = await agentRuntimeRegistry.run(s.history, {
         ...(taskApprovalsNegotiated ? { taskApprovals: { agentId, store: taskApprovalStore, isCurrent } } : {}),
         provider: s.provider,
         organizationPolicyVersion: sessionRolePolicyVersion,
@@ -4637,7 +4679,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         ...(turnFallbackProviders.length ? { fallback: { providers: turnFallbackProviders } } : {}),
         guardian: turnGuardian,
         ...(deps.runLimits?.(s.meta.cwd) ?? {}),
-        });
+        }, runtimeBinding);
         } finally {
           taskApprovalStore.revokeTask({ sessionId, taskId: taskId ?? "", agentId });
           if (activeTaskExecutions.get(sessionId) === agentId) activeTaskExecutions.delete(sessionId);
@@ -5796,7 +5838,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "session.coding-link.get", "session.coding-link.set",
             "agent.question.reply", "agent.approval.reply",
-            "approval.reply", "session.task-approval.revoke", "external.question.reply", "external.approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
+            "approval.reply", "session.task-approval.revoke", "external.question.reply", "external.approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.set-runtime", "agents.archive", "files.search", "project.panels",
             "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.resume", "external.sessions.fork",
             "external.sessions.submit", "external.sessions.steer", "external.sessions.interrupt", "external.sessions.remove",
             "external.sessions.terminal.snapshot", "external.sessions.terminal.input", "external.sessions.terminal.key",
@@ -7357,6 +7399,45 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             return reply(rpcResult(id!, serveAgentCatalog(cwd, agentProfileId, spaceId)));
           }
+          case "agents.set-runtime": {
+            if (typeof p.ref !== "string" || !p.ref.trim() || !isAgentRuntimeId(p.runtimeId)
+              || !Number.isSafeInteger(p.expectedRevision) || p.expectedRevision < 0
+              || typeof p.expectedAgentRevision !== "string" || !/^[a-f0-9]{32}$/.test(p.expectedAgentRevision)
+              || (p.sessionId !== undefined && (typeof p.sessionId !== "string" || !p.sessionId))) {
+              return reply(rpcError(id, ERR.PARAMS, "ref, runtimeId, expectedRevision and expectedAgentRevision are required"));
+            }
+            // The caller may select an engine, not an audience, tool grant, native session, or executable.
+            if (Object.keys(p).some((key) => !["ref", "runtimeId", "expectedRevision", "expectedAgentRevision", "sessionId", "cwd"].includes(key))) {
+              return reply(rpcError(id, ERR.PARAMS, "unsupported Agent Runtime update fields"));
+            }
+            const sessionMeta = typeof p.sessionId === "string" ? hub.peekMeta(p.sessionId) : undefined;
+            if (typeof p.sessionId === "string" && !sessionMeta) return reply(rpcError(id, ERR.NO_SESSION, "no such session"));
+            const cwd = sessionMeta?.cwd ?? (typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd);
+            const runtime = runtimeInfo(cwd, undefined, sessionMeta?.profileId, sessionMeta?.spaceId);
+            let profileId = sessionMeta?.profileId ?? runtime.profileId ?? "personal";
+            let spaceId = runtime.spaceId ?? failClosedSpaceId(profileId);
+            if (sessionMeta) {
+              const binding = sessionSpaceBinding(sessionMeta);
+              profileId = binding.profileId;
+              spaceId = binding.spaceId;
+            }
+            if (spaceId !== "personal") return reply(rpcError(id, ERR.UNAUTHORIZED, "company Agent Runtime bindings are managed by organization administrators"));
+            const ref = p.ref.trim();
+            const target = serveAgentCatalog(cwd, profileId, spaceId).agents.find((agent) => agent.ref === ref);
+            if (!target || !target.allowedActions.includes("edit_profile")) {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "this Agent Runtime binding is not editable"));
+            }
+            if (target.revision !== p.expectedAgentRevision) return reply(rpcError(id, ERR.CONFLICT, "Agent profile changed; refresh before editing its Runtime"));
+            try {
+              agentRuntimeRegistry.assertAvailable(p.runtimeId);
+              const binding = agentRuntimeBindings.set(spaceId, ref, p.runtimeId, p.expectedRevision);
+              // Binding edits affect future tasks only. Do not interrupt, restart, migrate, or clear history.
+              return reply(rpcResult(id!, { binding, catalog: serveAgentCatalog(cwd, profileId, spaceId) }));
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              return reply(rpcError(id, /changed|refresh/.test(message) ? ERR.CONFLICT : ERR.PARAMS, message));
+            }
+          }
           case "agents.update-profile": {
             if (typeof p.ref !== "string" || !p.ref.trim() || typeof p.expectedRevision !== "string" || !/^[a-f0-9]{32}$/.test(p.expectedRevision)) {
               return reply(rpcError(id, ERR.PARAMS, "ref and a valid expectedRevision are required"));
@@ -7679,6 +7760,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.PARAMS, "approval must be suggest, auto-edit, or full-auto"));
             }
             const approval = isApprovalMode(p.approval) ? p.approval : deps.approval;
+            agentRuntimeRegistry.assertAvailable(configuredAgentRuntime(spaceId, resolvedAgent?.ref ?? "main").runtimeId);
             const s = hub.create({
               cwd,
               profileId,
@@ -8822,6 +8904,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             } catch (error) {
               return reply(rpcError(id, ERR.UNAUTHORIZED, error instanceof Error ? error.message : String(error)));
             }
+            const forkAgentRef = targetProfileId === sourceProfileId && targetSpaceId === sourceSpaceId
+              ? source.meta.agentRef ?? "main" : "main";
+            const forkRuntimeBinding = configuredAgentRuntime(targetSpaceId, forkAgentRef);
+            agentRuntimeRegistry.assertAvailable(forkRuntimeBinding.runtimeId);
             const r = hub.fork(p.sessionId, {
               profileId: targetProfileId,
               spaceId: targetSpaceId,
@@ -8841,6 +8927,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               approval: deps.approval,
               projectContext: undefined,
               sourceSnapshot: source,
+              runtimeBinding: forkRuntimeBinding,
             });
             if ("missing" in r) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
             if ("busy" in r) return reply(rpcError(id, ERR.BUSY, "source session is changing configuration — retry fork shortly"));

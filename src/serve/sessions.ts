@@ -33,6 +33,7 @@ import {
   type SessionTaskLifecycleInput,
 } from "../session/store.js";
 import { forkTaskExecution, recoverTaskExecution, type TaskExecution } from "../session/task.js";
+import { freezeTaskRuntimeBinding, type AgentRuntimeBinding } from "../agent-runtime/bindings.js";
 
 export interface SessionStore {
   load(id: string): SessionData | null;
@@ -626,6 +627,8 @@ export class SessionHub {
       /** Immutable source captured before asynchronous target-provider setup. A live turn may continue
        * changing after this snapshot, but the fork remains one coherent point-in-time copy. */
       sourceSnapshot?: SessionData;
+      /** Trusted host selection for a NEW task; never a client-provided native session or permission. */
+      runtimeBinding?: AgentRuntimeBinding;
     },
   ): { session: ServeSession } | { missing: true } | { busy: true } {
     const live = this.sessions.get(id);
@@ -665,6 +668,15 @@ export class SessionHub {
         ? { agentRef: src.meta.agentRef }
         : {}),
     };
+    const task = forkTaskExecution(src.task);
+    const runtimeBinding = o.runtimeBinding ?? src.task?.runtimeBinding;
+    if (task && runtimeBinding) {
+      if (runtimeBinding.spaceId !== targetSpaceId || runtimeBinding.agentRef !== (meta.agentRef ?? "main")) {
+        throw new Error("fork Runtime binding does not belong to the target Agent and Space");
+      }
+      task.runtimeBinding = freezeTaskRuntimeBinding({ version: 1, spaceId: runtimeBinding.spaceId,
+        agentRef: runtimeBinding.agentRef, runtimeId: runtimeBinding.runtimeId, revision: runtimeBinding.revision }, task.id);
+    }
     const lock = this.store.acquire(meta.id);
     if (!lock.ok) throw new Error(`could not acquire fork lock for ${meta.id}${lock.pid ? ` (held by pid ${lock.pid})` : ""}`);
     const history = structuredClone(src.history);
@@ -676,7 +688,7 @@ export class SessionHub {
     const s: ServeSession = {
       meta,
       history,
-      task: forkTaskExecution(src.task),
+      task,
       provider: o.provider,
       approval,
       autoApprove: new Set(),

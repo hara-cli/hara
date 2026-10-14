@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { RunOutcome, RunProgressEvent } from "../agent/loop.js";
 import type { Todo } from "../tools/todo.js";
 import { redactSensitiveText, requestsCredentialDisclosure } from "../security/secrets.js";
+import { isTaskRuntimeBinding, type TaskRuntimeBinding } from "../agent-runtime/bindings.js";
 
 export const TASK_SCHEMA_VERSION = 1;
 export const MAX_TASK_OBJECTIVE_CHARS = 4096;
@@ -167,6 +168,8 @@ export interface TaskCheckpoint {
 export interface TaskExecution {
   schemaVersion: typeof TASK_SCHEMA_VERSION;
   id: string;
+  /** Host-frozen Runtime provenance; never an execution grant or model-authored checkpoint field. */
+  runtimeBinding?: Readonly<TaskRuntimeBinding>;
   /** The request that created the task. Later chat/steering must not silently replace it. */
   objective: string;
   status: TaskExecutionStatus;
@@ -1273,6 +1276,8 @@ export function forkTaskExecution(task: TaskExecution | undefined, at: Date | st
   const now = iso(at);
   return {
     ...task,
+    // A fork is a new task identity, not a second owner of a native Runtime session.
+    runtimeBinding: undefined,
     id: randomUUID(),
     status: "paused",
     turnId: randomUUID(),
@@ -1589,6 +1594,8 @@ function validTaskProgress(value: unknown): value is RunProgressEvent {
 export function isTaskExecution(value: unknown): value is TaskExecution {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const task = value as Record<string, unknown>;
+  if (task.runtimeBinding !== undefined && (!isTaskRuntimeBinding(task.runtimeBinding)
+    || task.runtimeBinding.taskId !== task.id)) return false;
   if (
     task.schemaVersion !== TASK_SCHEMA_VERSION ||
     !validId(task.id) ||

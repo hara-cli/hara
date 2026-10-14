@@ -39,6 +39,7 @@ const HARA_PRIVATE_FILES = new Set([
   "config.json",
   "qwen-oauth.json",
   "profiles.json",
+  "agent-runtime-bindings.json",
   "serve.json",
   "desk.json",
   "desk-connections.json",

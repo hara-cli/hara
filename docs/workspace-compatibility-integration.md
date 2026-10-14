@@ -53,3 +53,42 @@ budgets and audit still need stable Workspace/audience partitions. New isolated 
 unified direct/managed connection management, Collab/Desk membership and persistent Runtime bindings
 must not be enabled until those real storage and authorization paths are verified. No `workspace.v2`
 capability is advertised by this increment.
+
+## Agent Runtime binding foundation (2026-10-14)
+
+The Serve entry now reads owner-only `agent-runtime-bindings.json`, separate from imported Agent
+Markdown, model connections and tool grants. Records use an exact legacy Space + qualified Agent ref,
+an engine id and a monotonic revision. The store is bounded, locked and CAS-written; malformed/future
+state is refused rather than repaired. The binding file is a protected Hara control-plane path.
+The directory batches its reads rather than parsing the same file once per Agent.
+
+`agents.list` returns credential-free binding/availability metadata. `agents.set-runtime` authenticates
+the existing Personal Agent, checks profile and binding revisions, and admits only a host-registered
+general-Agent driver. It accepts no tool permissions, commands, keys or audience override. Personal
+configuration cannot define an organization Runtime policy. An edit neither stops old work nor resets
+identity, history, memory or native sessions.
+
+Each new Serve task freezes its Runtime and configuration revision before provider/tool side effects.
+Steering and recovery keep that task's original binding; legacy unfinished tasks keep Hara. A fork gets
+a new task binding from the host without inheriting a native-session handle. Persistence checks the
+task id, Agent and Space and refuses an invalid binding before replacing an existing transcript.
+Runtime dispatch is through the exact registered driver with the existing Hara RunOpts/tool authority;
+there is no automatic engine fallback.
+
+Production currently registers ONLY the Hara compatibility driver. Pi remains the product default
+direction, not an implemented general-Agent default. Pi/OpenCode/Codex/Claude coding workers remain
+separate existing capabilities; no CLI-presence check upgrades one into a general-Agent driver. Tests
+inject clearly identified trusted fixture drivers, not a claimed Pi SDK integration. No model call,
+dependency upgrade, installation, native migration, or commercial Raft code import is part of this slice.
+
+The matching Desktop candidate adds a folded Runtime setting in Agent profile editing, separate from
+model/reasoning controls and saved separately from the persona draft. It follows actual engine
+availability, blocks stale/duplicate saves and tolerates old engines. Agent creation, the real Pi
+general-Agent adapter, remaining CLI/gateway/cron surfaces and new Workspace authority are unfinished.
+Do not enable those capabilities or change the default to Pi on the strength of these fixture tests.
+
+Verification: both full CLI runs passed 2688 tests with one existing Windows-only skip; a 61-test
+session/Space/runtime follow-up passed. The final full run includes the additional fork-lock and
+protected configuration changes; no failure or cancellation was reported.
+The Desktop candidate passed all 558 tests and production build with 36 asset checks. These are local
+source/automated results, not a release, installed-app test, native pixel QA or full Workspace isolation.
