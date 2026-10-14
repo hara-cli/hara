@@ -234,7 +234,10 @@ test("Serve creation survives reconnect, preserves the full card, and joins the 
     await client.call("approval.reply", { approvalId: request.approvalId, allow: true });
     assert.equal(readFileSync(file, "utf8"), beforeDuplicate, "a duplicate reply never creates or rewrites another Bot");
     const catalog = await client.call("agents.list", { sessionId: session.result.sessionId });
-    assert.ok(catalog.result.agents.some((agent) => agent.ref === "global:analyst"));
+    const createdAgent = catalog.result.agents.find((agent) => agent.ref === "global:analyst");
+    assert.ok(createdAgent);
+    assert.equal(createdAgent.runtime.runtimeId, "pi", "approved chat creation uses the trusted Host default");
+    assert.equal(createdAgent.runtime.revision, 1, "the persona is published with an explicit Runtime binding");
     await client.wait("event.turn_end");
     const submitted = await submission;
     assert.equal(submitted.error, undefined, JSON.stringify(submitted.error));

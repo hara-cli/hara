@@ -6001,6 +6001,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "learning.review.v1",
             "agent.action-ownership.v1",
             "agent.public-profile-edit.v1",
+            "agent.creation.v1",
             "agent.blueprint-provenance.v1",
             "agents.durable-team.v1",
             "agents.tree-budget.v1",

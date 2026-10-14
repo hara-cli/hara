@@ -177,3 +177,22 @@ Same-key Workspace regressions prove independent explicit credential/profile ref
 generations/defaults, no foreign attachment/default/run borrowing, independent local revoke/rotation
 and saved-state restoration on return. They do not activate new execution Workspaces or prove full
 membership/storage partitioning; `(workspaceId, accountId)` authorization remains a next-stage gate.
+
+## Guided colleague creation capability (2026-10-15)
+
+Serve advertises `agent.creation.v1` for the existing main-personal-chat `agent_create` workflow and
+single-use foreground review. It is deliberately distinct from the long-standing manual
+`agents.create` RPC, allowing Desktop to retain manual setup on older engines instead of guessing
+that a chat tool exists. This additive protocol-v1 flag grants no authority and does not enable
+organization/new-Workspace creation. The tool still accepts only persona fields; Host selects and
+reserves its available default Runtime before publication. The real reconnect/approval test now
+also checks that the approved colleague enters the catalog with an explicit Pi revision-1 binding.
+
+Creation/Serve Runtime focused tests passed **13/13**; the final full candidate suite passed
+**2709 / 1 Windows-only skip / 0 fail/cancel**, including the extra catalog-binding assertion.
+The first full run had one stale exact feature-list expectation; it now includes the additional flag,
+retains the complete strict list, and passed the targeted real handshake before the full rerun.
+Private logs: `/private/tmp/hara-chat-first-creation.TF4zcm/{cli-focused,cli-full,cli-handshake-fixed,cli-full-final}.log`.
+No runtime default for old Agents, historical task,
+dependency, version or release asset changes in this increment. External general-Agent Drivers and
+full Workspace authority remain separately gated.

@@ -368,6 +368,10 @@
 //     presentation:{kind:"agent-create",username,name,role,description,instructions} is a foreground
 //     single-use creation review. It grants no execution authority and is restored in events.snapshot
 //     approvals, never in ambient event.task_state. Older clients can review the full question instead.
+//     agent.creation.v1 advertises this foreground agent_create workflow, not merely agents.create RPC.
+//     New clients may open a guided draft only when advertised; older engines retain manual creation.
+//     The tool accepts persona fields only; Host selects the available default Agent Runtime, never a
+//     provider-supplied runtime grant. This feature does not open organization/new-Workspace creation.
 //   event.agents_changed {sessionId} → refresh the current authorized Agent catalog after creation
 //   event.task_state {version,streamId,sequence,taskId,turnId,objective,state,taskStatus,phase,checkpoint,…}
 //                     authoritative execution plane; clients feature-detect it via capabilities.events.

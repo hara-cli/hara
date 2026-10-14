@@ -39,17 +39,19 @@ async function fixture(t, extra = {}) {
     buildProviderFor: async () => provider, spawnSubagent: async () => "unused", sandbox: "off", approval: "suggest", store,
     quietDiscovery: true, agentRuntimeHome: home, agentTeamHome: home,
     runtimeInfo: () => ({ providerId: "fixture", model: provider.model, profileId: spaceId === "personal" ? "personal" : "company", spaceId }), ...extra };
-  let handle, client;
+  let handle, client, initialized;
   const open = async () => { handle = await startServe({ host: "127.0.0.1", port: 0, token: "fixture-token", cwd }, deps);
-    client = await connect(handle.port); await client.call("initialize", { token: "fixture-token" }); return client; };
+    client = await connect(handle.port); initialized = await client.call("initialize", { token: "fixture-token" }); return client; };
   await open();
   t.after(async () => { client?.close(); await handle?.close(); if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome; });
-  return { home, cwd, store, provider, deps, get client() { return client; }, get calls() { return calls; }, setSpace: (value) => { spaceId = value; },
+  return { home, cwd, store, provider, deps, get client() { return client; }, get initialized() { return initialized; }, get calls() { return calls; }, setSpace: (value) => { spaceId = value; },
     restart: async () => { client.close(); await handle.close(); return open(); } };
 }
 
 test("real Serve exposes honest Runtime availability and refuses unavailable or privilege-bearing selections", { timeout: 15000 }, async (t) => {
   const f = await fixture(t); const catalog = (await f.client.call("agents.list")).result;
+  assert.ok(f.initialized.result.capabilities.features.includes("agent.creation.v1"),
+    "guided creation is explicitly advertised, not inferred from the manual agents.create RPC");
   const main = catalog.agents.find((agent) => agent.ref === "main");
   assert.equal(main.runtime.runtimeId, "hara"); assert.equal(main.runtime.revision, 0);
   assert.equal(catalog.runtimeOptions.find((option) => option.id === "pi").available, true);
