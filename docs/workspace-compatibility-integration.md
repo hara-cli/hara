@@ -92,3 +92,52 @@ session/Space/runtime follow-up passed. The final full run includes the addition
 protected configuration changes; no failure or cancellation was reported.
 The Desktop candidate passed all 558 tests and production build with 36 asset checks. These are local
 source/automated results, not a release, installed-app test, native pixel QA or full Workspace isolation.
+
+## Runtime acceptance and shared Pi SDK primitive (2026-10-14)
+
+`src/agent-runtime/pi-session.ts` now owns the exact reviewed Pi 1.1.0 SDK initialization, shared with
+the existing coding worker. The host supplies the persona, SessionManager, authorized custom tools
+and frozen loopback model/tool bridge. The constructor refuses foreign endpoints, mismatched tools,
+widened budgets, ambient account/model stores and cancelled work. Built-in tools, ambient resources,
+provider discovery, automatic retries, compaction, telemetry and cache warming remain disabled.
+Cancellation aborts the SDK; callers still own physical drain, bridge closure, durable state and task
+governance. The `hara/coding` model alias and nominal SDK context/cost fields describe the existing
+proxy transport, not the actual provider's limits, pricing or a new general-Agent capability.
+
+This is a shared SDK primitive, **not** a registered Pi general-Agent driver or a tool grant. Tests
+exercise the real SDK for one-call ordinary chat, explicit in-memory context reconstruction, waiting
+for a host tool decision, cancellation and rejected authority changes. The reconstruction test is
+not production main-Agent durable recovery. The coding worker retains its signed native state,
+leases, ordered mailbox, continuation and live authorization rules.
+
+The direct CLI/headless compatibility loop also refuses a task whose frozen Runtime is not Hara,
+or whose binding/task/audience is invalid. Four regressions first reproduced one unwanted model call
+for Pi/OpenCode/Codex/Claude-bound tasks; all now assert zero calls and unchanged history. A Serve
+routing fixture returns its own synthetic Pi response instead of silently delegating back to Hara.
+
+Repeatable credential-free diagnostics:
+
+```sh
+npm run check:agent-runtimes
+```
+
+Use the repository-approved Node runtime. The command builds first and runs isolated test homes with
+scrubbed child environments, then writes private logs and `report.json` under a temporary directory.
+Exit 1 means a test failed. Exit **2** means the scoped tests passed but the requested general-Agent
+end-to-end gates remain unverified; it must not be presented as a release-ready success. The report
+records source SHA/dirty state and explicitly distinguishes real SDK/Serve tests from vendor CLI
+transport fixtures. No flag can green missing production drivers or native live-session acceptance.
+
+Verified on local macOS arm64: all **118** diagnostic tests passed; the full CLI suite passed
+**2697**, with **1** existing Windows-only skip and **0** failures/cancellations. A private Bun 1.3.9
+`desktop-sidecar`-mode build also passed `standalone-pi-runtime-smoke.mjs`: authenticated compiled
+Serve, actual Pi SDK read tool, same native worker session across two generations, exact usage and
+clean shutdown. This smoke uses only a loopback synthetic model and an isolated temporary HOME.
+It verifies the compiled Pi **coding worker**, not a main Pi driver, external vendor terminal,
+embedded OpenCode artifact, Desktop installer or real-model cost/performance comparison.
+
+Production still registers Hara only. General Codex/Claude/OpenCode/Pi drivers, main Hara Pi governance
+and default binding, Agent creation Runtime selection, exact native-session linkage across entry
+points, CLI/gateway/cron parity and packaged Desktop end-to-end acceptance remain open. Do not change
+the default or replace a running installation on the strength of these tests. No release, deployment,
+dependency upgrade or user-session migration was performed.

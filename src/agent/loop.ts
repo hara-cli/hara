@@ -1,4 +1,5 @@
 import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment } from "../providers/types.js";
+import { isTaskRuntimeBinding } from "../agent-runtime/bindings.js";
 import { createToolImageStore, redactOwnedToolImageText } from "../tools/tool-images.js";
 import { redactOwnedToolImageValue } from "../security/tool-media-redaction.js";
 import { createComputerRunScope, closeComputerRunScope } from "../tools/computer-run.js";
@@ -1164,6 +1165,20 @@ function hardStop(
 
 /** Provider-agnostic agentic loop. Mutates `history` in place. */
 export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<RunOutcome> {
+  // CLI/headless callers also reach this compatibility engine directly. A persisted task bound to
+  // another Runtime must not silently execute here merely because Serve's registry was bypassed.
+  const initialTask = opts.taskIntake?.task;
+  const currentTask = opts.taskIntake?.current ? opts.taskIntake.current() : initialTask;
+  if (initialTask?.runtimeBinding !== undefined || currentTask?.runtimeBinding !== undefined) {
+    const binding = currentTask?.runtimeBinding;
+    const initialBinding = initialTask?.runtimeBinding;
+    if (!isTaskRuntimeBinding(binding) || binding.runtimeId !== "hara" || binding.spaceId !== opts.ctx.spaceId
+      || binding.taskId !== currentTask?.id || currentTask?.id !== initialTask?.id
+      || (initialBinding && (!isTaskRuntimeBinding(initialBinding)
+        || (["version", "spaceId", "agentRef", "runtimeId", "revision", "taskId"] as const).some((key) => initialBinding[key] !== binding[key])))) {
+      return { status: "error", error: "This task belongs to a different or invalid Agent Runtime; resume through its exact Runtime. No fallback was started." };
+    }
+  }
   const life = createRunLifecycle(opts, runtimeCopyLanguage(history));
   const runTaskBinding = opts.taskIntake
     ? { id: opts.taskIntake.task.id, turnId: opts.taskIntake.task.turnId }

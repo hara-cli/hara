@@ -8,6 +8,7 @@ import { AgentRuntimeRegistry } from "../dist/agent-runtime/registry.js";
 import { createTaskExecution, recoverTaskExecution, forkTaskExecution, isTaskExecution } from "../dist/session/task.js";
 import { saveSession, loadSession, newSessionId } from "../dist/session/store.js";
 import { isSensitiveFilePath } from "../dist/security/sensitive-files.js";
+import { runAgent } from "../dist/agent/loop.js";
 
 function fixture() {
   const home = mkdtempSync(join(tmpdir(), "hara-runtime-binding-"));
@@ -113,3 +114,17 @@ test("real session persistence keeps binding provenance and rejects a forged tas
   assert.throws(() => saveSession(meta, [], { ...task, runtimeBinding: { ...task.runtimeBinding, spaceId: "org:other" } }), /invalid|session/i);
   assert.deepEqual(loadSession(id).task.runtimeBinding, task.runtimeBinding);
 });
+
+for (const runtimeId of ["pi", "opencode", "codex", "claude"]) {
+  test(`the compatibility loop cannot silently run a task bound to ${runtimeId} outside Serve`, async () => {
+    const task = createTaskExecution("hello", "fixture-turn");
+    task.runtimeBinding = freezeTaskRuntimeBinding({ version: 1, spaceId: "personal", agentRef: "main", runtimeId, revision: 1 }, task.id);
+    const history = [{ role: "user", content: "hello" }]; let calls = 0;
+    const result = await runAgent(history, { provider: { id: "fixture", model: "fixture-model", async turn() {
+      calls++; return { text: "must not run on the wrong engine", toolUses: [], stop: "end" };
+    } }, ctx: { cwd: tmpdir(), spaceId: "personal", sandbox: "off" }, approval: "full-auto", quiet: true, taskIntake: { task } });
+    assert.equal(calls, 0, "do not spend model tokens or change tools on an implicit fallback");
+    assert.equal(result.status, "error"); assert.match(result.error, /Runtime.*no fallback/i);
+    assert.deepEqual(history, [{ role: "user", content: "hello" }]);
+  });
+}

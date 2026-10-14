@@ -54,7 +54,9 @@ test("real Serve exposes honest Runtime availability and refuses unavailable or 
   assert.equal(main.runtime.runtimeId, "hara"); assert.equal(main.runtime.revision, 0);
   assert.equal(catalog.runtimeOptions.find((option) => option.id === "pi").available, false);
   const params = { ref: "main", runtimeId: "pi", expectedRevision: 0, expectedAgentRevision: main.revision };
-  assert.match((await f.client.call("agents.set-runtime", params)).error.message, /not available.*no fallback/);
+  for (const runtimeId of ["pi", "codex", "claude", "opencode"]) {
+    assert.match((await f.client.call("agents.set-runtime", { ...params, runtimeId })).error.message, /not available.*no fallback/);
+  }
   assert.match((await f.client.call("agents.set-runtime", { ...params, runtimeId: "hara", allowTools: ["bash"] })).error.message, /unsupported/);
   const changed = await f.client.call("agents.set-runtime", { ...params, runtimeId: "hara" }); assert.equal(changed.error, undefined);
   assert.equal(changed.result.binding.revision, 1);
@@ -70,9 +72,13 @@ test("real Serve exposes honest Runtime availability and refuses unavailable or 
 test("a trusted fixture driver change affects the next task, not an in-flight run or resumed task", { timeout: 20000 }, async (t) => {
   const observed = []; let release; let enter;
   const entered = new Promise((resolve) => { enter = resolve; }); const held = new Promise((resolve) => { release = resolve; });
-  // These are deterministic host fixtures using the governed Hara loop, NOT a claimed Pi SDK integration.
+  // These are routing fixtures, NOT a claimed Pi SDK integration. The Pi fixture has its own response;
+  // it must not call the Hara compatibility loop with Pi provenance and conceal an implicit fallback.
   const driver = (id) => ({ id, async run(history, options, binding) {
-    observed.push({ ...binding }); if (observed.length === 1) { enter(); await held; } return runAgent(history, options);
+    observed.push({ ...binding }); if (observed.length === 1) { enter(); await held; }
+    if (id === "hara") return runAgent(history, options);
+    history.push({ role: "assistant", text: "Synthetic fixture Runtime reply.", toolUses: [] });
+    return { status: "completed" };
   } });
   const f = await fixture(t, { agentRuntimeDrivers: [driver("hara"), driver("pi")] });
   const session = (await f.client.call("session.create", { cwd: f.cwd })).result.sessionId;
