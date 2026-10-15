@@ -345,14 +345,15 @@ export class WorkspaceCollaborationClient {
   }
   sendWithMentions(params: Record<string, unknown>): Promise<CollaborationResult<CollaborationSent>> {
     return this.result(async () => {
+      const channelId = typeof params.channelId === "string" ? params.channelId.toLowerCase() : "";
       input(Object.keys(params).length === 6 && Object.keys(params).every(key => ["workspaceId", "channelId", "body", "idempotencyKey", "accountScope", "mentions"].includes(key))
-        && text(params.accountScope, 64) && workspace(params.workspaceId) && uuid(params.channelId)
+        && text(params.accountScope, 64) && workspace(params.workspaceId) && uuid(channelId)
         && text(params.body, 8192) && (params.body as string).trim() && Buffer.byteLength(params.body as string, "utf8") <= 8192
         && text(params.idempotencyKey, 128) && /^[A-Za-z0-9_-]+$/.test(params.idempotencyKey as string)
         && Array.isArray(params.mentions) && params.mentions.length > 0);
       let targets: CollaborationMention[];
       try { targets = mentions(params.mentions, true); } catch { throw new Failure("INVALID_INPUT"); }
-      const workspaceId = params.workspaceId as string, channelId = (params.channelId as string).toLowerCase();
+      const workspaceId = params.workspaceId as string;
       const data = await this.scoped(workspaceId, `channels/${channelId}/messages/with-mentions`, this.state(params.accountScope),
         { body: params.body, mentions: targets }, params.idempotencyKey as string);
       let confirmed: CollaborationMention[];

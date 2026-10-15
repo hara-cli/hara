@@ -47,6 +47,8 @@ Methods:
   requires workspace.collaboration.mentions.v1 and its exact method. Nonempty 1..10 unique human
   principal IDs, sorted by JS code-unit comparison, never display names, roles, @all or Agent IDs.
   Uses the separate Workspace /messages/with-mentions HTTP route. Old plain-send wire is unchanged.
+  Typed channel UUIDs are lowercased before validation/network/receipt matching; principal IDs are
+  never case-normalized. Workspace identity and the old plain-send validation stay unchanged.
 
 Replies are {ok:true,value} or {ok:false,error:{code}}. Code-only failures do not reflect
 upstream HTML, database details, credentials or message bodies. Receipts omit internal Realm
