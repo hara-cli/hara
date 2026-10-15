@@ -8,7 +8,7 @@ export const WORKSPACE_COLLABORATION_METHODS = [
   "workspace.collaboration.sync", "workspace.collaboration.send", "workspace.collaboration.create-channel",
 ] as const;
 export type CollaborationErrorCode = "AUTH_REQUIRED" | "SCOPE_CHANGED" | "ACCESS_CHANGED"
-  | "PROJECTION_PENDING" | "INVALID_INPUT" | "UNAVAILABLE" | "OUTCOME_UNKNOWN";
+  | "PROJECTION_PENDING" | "DIRECTORY_STALE" | "INVALID_INPUT" | "UNAVAILABLE" | "OUTCOME_UNKNOWN";
 export type CollaborationResult<T> = { ok: true; value: T } | { ok: false; error: { code: CollaborationErrorCode } };
 export interface CollaborationDirectory {
   schemaVersion: 1;
@@ -136,6 +136,10 @@ export class WorkspaceCollaborationClient {
         // Do not reflect upstream error text, HTML, request IDs, tokens, or message bodies.
         await response.body?.cancel();
         if (response.status === 401) throw new Failure("AUTH_REQUIRED");
+        if (base === this.accountOrigin && path.startsWith("/v1/workspaces?")) {
+          if ([400, 409].includes(response.status)) throw new Failure("DIRECTORY_STALE");
+          if (response.status === 404 || response.status >= 500) throw new Failure("UNAVAILABLE");
+        }
         if ([403, 404, 409].includes(response.status)) throw new Failure("ACCESS_CHANGED");
         if (response.status === 400) throw new Failure("INVALID_INPUT");
         if (response.status === 503 && !mutation) throw new Failure("PROJECTION_PENDING");
@@ -149,7 +153,9 @@ export class WorkspaceCollaborationClient {
           const part = await reader.read();
           if (part.done) break;
           bytes += part.value.byteLength;
-          if (bytes > 512 * 1024) { await reader.cancel(); throw new Failure(mutation ? "OUTCOME_UNKNOWN" : "UNAVAILABLE"); }
+          // 100 legal 8 KiB messages can expand 6x under JSON escaping. Keep a hard streaming cap
+          // above that contract ceiling, not one that permanently rejects a valid cursor page.
+          if (bytes > 6 * 1024 * 1024) { await reader.cancel(); throw new Failure(mutation ? "OUTCOME_UNKNOWN" : "UNAVAILABLE"); }
           chunks.push(part.value);
         }
       } finally { reader.releaseLock(); }

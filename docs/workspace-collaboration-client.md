@@ -46,7 +46,9 @@ credential. A stale selection is rejected before network I/O after login/token/d
 Core rechecks the sign-in after each asynchronous response and before sending to Collab.
 Changing this token does not select or grant a local profile or execution Runtime.
 
-HTTP uses redirect:error, request timeouts and a streaming 512 KiB response cap. There is no
+HTTP uses redirect:error, request timeouts and a streaming 6 MiB response cap (including
+worst-case JSON escaping for a legal page). Directory pagination failures are DIRECTORY_STALE,
+not permission revocation; they never discard pending sends. There is no
 service fallback or automatic POST retry. Unknown/malformed send outcomes remain
 OUTCOME_UNKNOWN; explicit retry must preserve the exact Workspace/channel/body/key/scope.
 Idempotency authority remains the server's transactional receipt, not a renderer flag.

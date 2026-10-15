@@ -116,7 +116,7 @@ test("HTTP errors are redacted, access errors distinct and UTF-8 input is bounde
 });
 test("bounded response reader cancels overlarge streamed responses", async () => {
   const f = fixture(); let cancelled = false;
-  f.handler(() => new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(512 * 1024 + 1)); },
+  f.handler(() => new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(6 * 1024 * 1024 + 1)); },
     cancel() { cancelled = true; } })));
   assert.equal((await f.client.list()).error.code, "UNAVAILABLE");
   assert.equal(cancelled, true);
@@ -129,4 +129,21 @@ test("channel-created sync projects only validated public metadata, not arbitrar
   const result = await f.client.sync({ workspaceId: A, accountScope, cursor: "cursor" });
   assert.deepEqual(result.value.events[0].channel, { id: C, slug: "new-channel", displayName: "New" });
   assert.doesNotMatch(JSON.stringify(result), /credential|omit-me/);
+});
+test("directory cursor errors are not authority revocation; unavailable features are not membership denial", async () => {
+  const f = fixture();
+  for (const httpCode of [400, 409]) {
+    f.handler(() => new Response("no upstream text exposed", { status: httpCode }));
+    assert.deepEqual(await f.client.list({ cursor: "stale" }), { ok: false, error: { code: "DIRECTORY_STALE" } });
+  }
+  f.handler(() => new Response("", { status: 404 }));
+  assert.equal((await f.client.list()).error.code, "UNAVAILABLE");
+});
+test("maximum legal message page survives JSON control-character expansion", async () => {
+  const f = fixture(), accountScope = await f.scope();
+  f.handler(url => url.includes("/sync?") ? f.json({ schemaVersion: 1, workspaceId: A, data: { cursor: "next", hasMore: false,
+    events: Array.from({ length: 100 }, (_, i) => ({ id: "event-" + i, type: "message.created",
+      message: { id: M, channelId: C, senderPrincipalId: "principal-a", body: "\u0001".repeat(8192), createdAt: "2033-05-18T03:33:20.000Z" } })) } }) : undefined);
+  const result = await f.client.sync({ workspaceId: A, accountScope, cursor: "cursor" });
+  assert.equal(result.ok, true); assert.equal(result.value.events.length, 100);
 });
