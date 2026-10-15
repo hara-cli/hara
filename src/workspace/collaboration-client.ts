@@ -1,0 +1,259 @@
+import { loadMobileState, type MobileCompanionState } from "../mobile/state.js";
+import { createHmac, randomBytes } from "node:crypto";
+
+// This is a hosted collaboration client, not an execution grant or a replacement for local spaces.
+export const WORKSPACE_COLLABORATION_FEATURE = "workspace.collaboration.v1";
+export const WORKSPACE_COLLABORATION_METHODS = [
+  "workspace.collaboration.list", "workspace.collaboration.bootstrap",
+  "workspace.collaboration.sync", "workspace.collaboration.send", "workspace.collaboration.create-channel",
+] as const;
+export type CollaborationErrorCode = "AUTH_REQUIRED" | "SCOPE_CHANGED" | "ACCESS_CHANGED"
+  | "PROJECTION_PENDING" | "INVALID_INPUT" | "UNAVAILABLE" | "OUTCOME_UNKNOWN";
+export type CollaborationResult<T> = { ok: true; value: T } | { ok: false; error: { code: CollaborationErrorCode } };
+export interface CollaborationDirectory {
+  schemaVersion: 1;
+  /** Opaque process/session boundary, not an Account credential. Required on every selected-scope RPC. */
+  accountScope: string;
+  accountRegion: "CN" | "GLOBAL";
+  workspaces: { workspaceId: string; membership: { role: "OWNER" | "ADMIN" | "MEMBER"; membershipVersion: number; policyVersion: number } }[];
+  nextCursor: string | null;
+}
+export interface CollaborationChannel { id: string; slug: string; displayName: string }
+export interface CollaborationBootstrap {
+  workspaceId: string;
+  displayName: string;
+  cursor: string;
+  membership: { principalId: string; role: "OWNER" | "ADMIN" | "MEMBER"; epoch: number };
+  channels: CollaborationChannel[];
+}
+export interface CollaborationMessage { id: string; channelId: string; senderPrincipalId: string; body: string; createdAt: string }
+export interface CollaborationSync {
+  workspaceId: string; cursor: string; hasMore: boolean;
+  events: { id: string; type: string; message: CollaborationMessage | null; channel?: CollaborationChannel | null }[];
+}
+export interface CollaborationSent { workspaceId: string; messageId: string; channelId: string; senderPrincipalId: string; createdAt: string }
+export interface CollaborationCreated { workspaceId: string; channel: CollaborationChannel }
+
+class Failure extends Error {
+  constructor(readonly code: CollaborationErrorCode) { super(code); }
+}
+const record = (value: unknown): Record<string, unknown> => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Failure("UNAVAILABLE");
+  return value as Record<string, unknown>;
+};
+const text = (value: unknown, max: number): value is string => typeof value === "string" && value.length > 0 && value.length <= max;
+const uuid = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
+const workspace = (value: unknown): value is string => typeof value === "string" && value.startsWith("ws_") && uuid(value.slice(3));
+const role = (value: unknown): value is "OWNER" | "ADMIN" | "MEMBER" => value === "OWNER" || value === "ADMIN" || value === "MEMBER";
+const version = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 1;
+const timestamp = (value: unknown): value is string => text(value, 40) && Number.isFinite(Date.parse(value));
+const input = (condition: unknown): void => { if (!condition) throw new Failure("INVALID_INPUT"); };
+const valid = (condition: unknown): void => { if (!condition) throw new Failure("UNAVAILABLE"); };
+function channel(value: unknown): CollaborationChannel {
+  const item = record(value);
+  valid(uuid(item.id) && item.kind === "TEXT" && text(item.slug, 80) && text(item.displayName, 160));
+  return { id: item.id as string, slug: item.slug as string, displayName: item.displayName as string };
+}
+function message(value: unknown): CollaborationMessage {
+  const item = record(value);
+  valid(uuid(item.id) && uuid(item.channelId) && text(item.senderPrincipalId, 128)
+    && text(item.body, 8192) && Buffer.byteLength(item.body as string, "utf8") <= 8192 && timestamp(item.createdAt));
+  return { id: item.id as string, channelId: item.channelId as string, senderPrincipalId: item.senderPrincipalId as string,
+    body: item.body as string, createdAt: item.createdAt as string };
+}
+function origin(value: string, insecureLoopback = false): string {
+  const url = new URL(value);
+  if (url.username || url.password || url.search || url.hash || url.pathname !== "/"
+    || (url.protocol !== "https:" && !(insecureLoopback && url.protocol === "http:"
+      && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)))) throw new Failure("UNAVAILABLE");
+  return url.origin;
+}
+
+interface Options {
+  collabOrigin: string;
+  // Account origin override and insecure HTTP are test-only injections, never RPC parameters.
+  accountOrigin?: string;
+  allowInsecureLoopback?: boolean;
+  fetcher?: typeof fetch;
+  loadState?: () => MobileCompanionState | null;
+  now?: () => number;
+  timeoutMs?: number;
+}
+
+/** Tokens remain in Core. Every Collab operation obtains a fresh assertion from Account; no inferred
+ * enrollment, token fallback, automatic POST retry, credential writes or model call occurs here. */
+export class WorkspaceCollaborationClient {
+  private readonly accountOrigin: string;
+  private readonly collabOrigin: string;
+  private readonly fetcher: typeof fetch;
+  private readonly loadState: () => MobileCompanionState | null;
+  private readonly now: () => number;
+  private readonly timeoutMs: number;
+  private readonly scopeKey = randomBytes(32);
+  constructor(options: Options) {
+    this.accountOrigin = origin(options.accountOrigin ?? "https://api.hara.nanhara.tech", options.allowInsecureLoopback);
+    this.collabOrigin = origin(options.collabOrigin, options.allowInsecureLoopback);
+    this.fetcher = options.fetcher ?? fetch;
+    this.loadState = options.loadState ?? (() => loadMobileState());
+    this.now = options.now ?? Date.now;
+    this.timeoutMs = options.timeoutMs ?? 8000;
+  }
+  private scope(state: MobileCompanionState): string {
+    return createHmac("sha256", this.scopeKey).update(JSON.stringify([
+      state.account.id, state.account.region, state.desktop.id, state.accessToken,
+    ])).digest("hex");
+  }
+  private state(expectedScope?: unknown): MobileCompanionState {
+    const state = this.loadState();
+    if (!state || state.accessTokenExpiresAt <= this.now() + 1000) throw new Failure("AUTH_REQUIRED");
+    if (expectedScope !== undefined && expectedScope !== this.scope(state)) throw new Failure("SCOPE_CHANGED");
+    return state;
+  }
+  private unchanged(initial: MobileCompanionState): void {
+    const current = this.loadState();
+    if (!current || current.account.id !== initial.account.id || current.account.region !== initial.account.region
+      || current.desktop.id !== initial.desktop.id || current.accessToken !== initial.accessToken
+      || current.accessTokenExpiresAt <= this.now()) throw new Failure("SCOPE_CHANGED");
+  }
+  private async result<T>(operation: () => Promise<T>): Promise<CollaborationResult<T>> {
+    try { return { ok: true, value: await operation() }; }
+    catch (error) { return { ok: false, error: { code: error instanceof Failure ? error.code : "UNAVAILABLE" } }; }
+  }
+  private async request(base: string, path: string, token: string, initial: MobileCompanionState,
+    body?: unknown, key?: string): Promise<unknown> {
+    this.unchanged(initial);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const mutation = key !== undefined;
+    try {
+      const response = await this.fetcher(base + path, {
+        method: body === undefined ? "GET" : "POST", redirect: "error", signal: controller.signal,
+        headers: { Accept: "application/json", "Cache-Control": "no-store", Authorization: `Bearer ${token}`,
+          ...(body === undefined ? {} : { "Content-Type": "application/json" }), ...(key ? { "Idempotency-Key": key } : {}) },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      if (!response.ok) {
+        // Do not reflect upstream error text, HTML, request IDs, tokens, or message bodies.
+        await response.body?.cancel();
+        if (response.status === 401) throw new Failure("AUTH_REQUIRED");
+        if ([403, 404, 409].includes(response.status)) throw new Failure("ACCESS_CHANGED");
+        if (response.status === 400) throw new Failure("INVALID_INPUT");
+        if (response.status === 503 && !mutation) throw new Failure("PROJECTION_PENDING");
+        throw new Failure(mutation ? "OUTCOME_UNKNOWN" : "UNAVAILABLE");
+      }
+      const reader = response.body?.getReader();
+      if (!reader) throw new Failure(mutation ? "OUTCOME_UNKNOWN" : "UNAVAILABLE");
+      const chunks: Uint8Array[] = []; let bytes = 0;
+      try {
+        while (true) {
+          const part = await reader.read();
+          if (part.done) break;
+          bytes += part.value.byteLength;
+          if (bytes > 512 * 1024) { await reader.cancel(); throw new Failure(mutation ? "OUTCOME_UNKNOWN" : "UNAVAILABLE"); }
+          chunks.push(part.value);
+        }
+      } finally { reader.releaseLock(); }
+      this.unchanged(initial);
+      try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+      catch { throw new Failure(mutation ? "OUTCOME_UNKNOWN" : "UNAVAILABLE"); }
+    } catch (error) {
+      if (error instanceof Failure) throw error;
+      throw new Failure(mutation ? "OUTCOME_UNKNOWN" : "UNAVAILABLE");
+    } finally { clearTimeout(timer); }
+  }
+  private async context(workspaceId: string, initial: MobileCompanionState): Promise<string> {
+    input(workspace(workspaceId));
+    const response = record(await this.request(this.accountOrigin, `/v1/workspaces/${workspaceId}/context`, initial.accessToken, initial, {}));
+    valid(response.workspaceId === workspaceId && response.tokenType === "Bearer" && text(response.token, 16384)
+      && Number.isInteger(response.expiresInSeconds) && (response.expiresInSeconds as number) > 0 && (response.expiresInSeconds as number) <= 600);
+    return response.token as string;
+  }
+  private async scoped(workspaceId: string, path: string, initial: MobileCompanionState, body?: unknown, key?: string) {
+    const token = await this.context(workspaceId, initial);
+    try {
+      const response = record(await this.request(this.collabOrigin, `/v1/workspaces/${workspaceId}/${path}`, token, initial, body, key));
+      valid(response.schemaVersion === 1 && response.workspaceId === workspaceId);
+      return record(response.data);
+    } catch (error) {
+      // A malformed successful mutation cannot be called safely failed: retain its idempotency identity.
+      if (key && error instanceof Failure && error.code === "UNAVAILABLE") throw new Failure("OUTCOME_UNKNOWN");
+      throw error;
+    }
+  }
+  list(params: Record<string, unknown> = {}): Promise<CollaborationResult<CollaborationDirectory>> {
+    return this.result(async () => {
+      input(Object.keys(params).every(key => key === "cursor") && (params.cursor === undefined || text(params.cursor, 4096)));
+      const initial = this.state();
+      const response = record(await this.request(this.accountOrigin, `/v1/workspaces?limit=50${params.cursor ? `&cursor=${encodeURIComponent(params.cursor as string)}` : ""}`, initial.accessToken, initial));
+      valid(response.schemaVersion === 1 && response.accountRegion === (initial.account.region === "cn" ? "CN" : "GLOBAL")
+        && Array.isArray(response.workspaces) && response.workspaces.length <= 50 && (response.nextCursor === null || text(response.nextCursor, 4096)));
+      const workspaces = (response.workspaces as unknown[]).map(value => {
+        const item = record(value), membership = record(item.membership);
+        valid(workspace(item.workspaceId) && role(membership.role) && version(membership.membershipVersion) && version(membership.policyVersion));
+        return { workspaceId: item.workspaceId as string, membership: { role: membership.role as "OWNER" | "ADMIN" | "MEMBER",
+          membershipVersion: membership.membershipVersion as number, policyVersion: membership.policyVersion as number } };
+      });
+      valid(new Set(workspaces.map(item => item.workspaceId)).size === workspaces.length);
+      return { schemaVersion: 1, accountScope: this.scope(initial), accountRegion: response.accountRegion as "CN" | "GLOBAL", workspaces, nextCursor: response.nextCursor as string | null };
+    });
+  }
+  bootstrap(params: Record<string, unknown>): Promise<CollaborationResult<CollaborationBootstrap>> {
+    return this.result(async () => {
+      input(Object.keys(params).length === 2 && workspace(params.workspaceId) && text(params.accountScope, 64));
+      const workspaceId = params.workspaceId as string, initial = this.state(params.accountScope);
+      const data = await this.scoped(workspaceId, "bootstrap", initial), membership = record(data.membership);
+      valid(text(data.cursor, 4096) && text(membership.principalId, 128) && role(membership.role) && version(membership.epoch)
+        && Array.isArray(data.channels) && data.channels.length <= 1000);
+      const channels = (data.channels as unknown[]).map(channel);
+      valid(new Set(channels.map(item => item.id)).size === channels.length);
+      return { workspaceId, displayName: text(data.displayName, 160) ? data.displayName : workspaceId,
+        cursor: data.cursor as string, membership: { principalId: membership.principalId as string,
+          role: membership.role as "OWNER" | "ADMIN" | "MEMBER", epoch: membership.epoch as number }, channels };
+    });
+  }
+  sync(params: Record<string, unknown>): Promise<CollaborationResult<CollaborationSync>> {
+    return this.result(async () => {
+      input(Object.keys(params).every(key => ["workspaceId", "cursor", "accountScope"].includes(key)) && workspace(params.workspaceId) && text(params.cursor, 4096) && text(params.accountScope, 64));
+      const workspaceId = params.workspaceId as string;
+      const data = await this.scoped(workspaceId, `sync?limit=100&cursor=${encodeURIComponent(params.cursor as string)}`, this.state(params.accountScope));
+      valid(text(data.cursor, 4096) && typeof data.hasMore === "boolean" && Array.isArray(data.events) && data.events.length <= 100);
+      const events = (data.events as unknown[]).map(value => { const event = record(value);
+        valid(text(event.id, 160) && text(event.type, 80));
+        const payload = event.type === "channel.created" ? record(event.payload) : null;
+        return { id: event.id as string, type: event.type as string, message: event.message === null ? null : message(event.message),
+          channel: payload ? channel({ id: payload.channelId, kind: payload.kind, slug: payload.slug, displayName: payload.displayName }) : null };
+      });
+      return { workspaceId, cursor: data.cursor as string, hasMore: data.hasMore as boolean, events };
+    });
+  }
+  send(params: Record<string, unknown>): Promise<CollaborationResult<CollaborationSent>> {
+    return this.result(async () => {
+      input(Object.keys(params).length === 5 && Object.keys(params).every(key => ["workspaceId", "channelId", "body", "idempotencyKey", "accountScope"].includes(key)) && text(params.accountScope, 64)
+        && workspace(params.workspaceId) && uuid(params.channelId) && text(params.body, 8192) && (params.body as string).trim()
+        && Buffer.byteLength(params.body as string, "utf8") <= 8192 && text(params.idempotencyKey, 128) && /^[A-Za-z0-9_-]+$/.test(params.idempotencyKey as string));
+      const workspaceId = params.workspaceId as string;
+      const data = await this.scoped(workspaceId, `channels/${params.channelId}/messages`, this.state(params.accountScope), { body: params.body }, params.idempotencyKey as string);
+      if (!uuid(data.messageId) || data.channelId !== params.channelId || !text(data.senderPrincipalId, 128) || !timestamp(data.createdAt)) throw new Failure("OUTCOME_UNKNOWN");
+      return { workspaceId, messageId: data.messageId, channelId: data.channelId as string,
+        senderPrincipalId: data.senderPrincipalId, createdAt: data.createdAt };
+    });
+  }
+  createChannel(params: Record<string, unknown>): Promise<CollaborationResult<CollaborationCreated>> {
+    return this.result(async () => {
+      input(Object.keys(params).length === 5 && Object.keys(params).every(key => ["workspaceId", "slug", "displayName", "idempotencyKey", "accountScope"].includes(key)) && text(params.accountScope, 64)
+        && workspace(params.workspaceId) && text(params.slug, 80) && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(params.slug as string)
+        && text(params.displayName, 160) && (params.displayName as string).trim() && text(params.idempotencyKey, 128) && /^[A-Za-z0-9_-]+$/.test(params.idempotencyKey as string));
+      const workspaceId = params.workspaceId as string;
+      const data = await this.scoped(workspaceId, "channels", this.state(params.accountScope), { slug: params.slug, displayName: params.displayName }, params.idempotencyKey as string);
+      if (!uuid(data.channelId) || data.slug !== params.slug || data.displayName !== params.displayName) throw new Failure("OUTCOME_UNKNOWN");
+      return { workspaceId, channel: { id: data.channelId, slug: data.slug as string, displayName: data.displayName as string } };
+    });
+  }
+}
+
+/** Default-off. A malformed/partial host configuration cannot break pure-local startup or leak credentials. */
+export function configuredWorkspaceCollaboration(env: NodeJS.ProcessEnv = process.env): WorkspaceCollaborationClient | undefined {
+  if (env.HARA_WORKSPACE_COLLAB_ENABLED !== "1" || !env.HARA_WORKSPACE_COLLAB_ORIGIN) return undefined;
+  try { return new WorkspaceCollaborationClient({ collabOrigin: env.HARA_WORKSPACE_COLLAB_ORIGIN }); }
+  catch { return undefined; }
+}

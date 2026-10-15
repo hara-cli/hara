@@ -4691,6 +4691,7 @@ program
     const { MobileDesktopAuthorizationCoordinator } = await import("./mobile/desktop-authorization.js");
     const { MobilePairingCoordinator } = await import("./mobile/pairing.js");
     const { MobileRelaySupervisor } = await import("./mobile/relay-supervisor.js");
+    const { configuredWorkspaceCollaboration } = await import("./workspace/collaboration-client.js");
     const {
       configureMobileSessionPublication,
       mobileSessionPublications,
@@ -4702,6 +4703,7 @@ program
       log: (message) => process.stderr.write(`${message}\n`),
     });
     const mobileDesktopAuthorization = new MobileDesktopAuthorizationCoordinator();
+    const workspaceCollaboration = configuredWorkspaceCollaboration();
     const mobilePairing = new MobilePairingCoordinator();
     const mobileRelay = new MobileRelaySupervisor({
       log: (message) => process.stderr.write(`${message}\n`),
@@ -5049,6 +5051,7 @@ program
           ...mobilePairing.status(),
           relay: mobileRelay.status(),
         }),
+        workspaceCollaboration,
         mobileRelayManaged: true,
         closeMobileRelay: () => mobileRelay.close(),
         createMobileDesktopAuthorization: () => mobileDesktopAuthorization.create(),

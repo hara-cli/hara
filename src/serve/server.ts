@@ -4,6 +4,7 @@
 // bridging. Provider building / subagent spawn / guardian stay in index.ts and are injected as ServeDeps
 // (no import cycle back into the CLI entry).
 import { WebSocketServer, type WebSocket } from "ws";
+import { WORKSPACE_COLLABORATION_FEATURE, WORKSPACE_COLLABORATION_METHODS, type WorkspaceCollaborationClient } from "../workspace/collaboration-client.js";
 import { createCodingUsageAccumulator } from "../coding/accounting.js";
 import { randomBytes, randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
@@ -484,6 +485,8 @@ export interface ServeDeps {
   /** Hara Account + Mobile pairing. Only redacted account state and a short-lived one-time invitation
    * cross authenticated loopback. Account tokens, device credentials, and private keys remain in Core. */
   mobileCompanionStatus?: () => MobileCompanionStatus;
+  /** Hosted collaboration only. Core retains credentials; never grants local execution or selects a profile. */
+  workspaceCollaboration?: Pick<WorkspaceCollaborationClient, "list" | "bootstrap" | "sync" | "send" | "createChannel">;
   /** Serve owns the single long-lived Relay bridge when this is set. The close hook lets every shutdown
    * path release the private loopback connection, Relay socket, terminal streams, and routing listeners. */
   mobileRelayManaged?: boolean;
@@ -5902,6 +5905,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             );
           }
           if (deps.unpinProjectProfile) methods.push("settings.profiles.unpin");
+          if (deps.workspaceCollaboration) methods.push(...WORKSPACE_COLLABORATION_METHODS);
           const mobilePairing =
             !!deps.mobileCompanionStatus
             && !!deps.createMobilePairing
@@ -6026,6 +6030,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sessions.runtime-remove.v1",
           ];
           if (deps.spaces && deps.useSpace) features.push("spaces.tenant-boundary.v1");
+          if (deps.workspaceCollaboration) features.push(WORKSPACE_COLLABORATION_FEATURE);
           if (deps.computerSettings && deps.saveComputerSettings) features.push("computer-use.core.v1");
           if (deps.codingSettings && deps.saveCodingSettings && externalSessionSpaceId() === "personal") features.push("coding.settings.v1");
           if (deps.decisionSettings && deps.saveDecisionSettings) features.push("action-guard.settings.v1");
@@ -6096,6 +6101,19 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         if (!authed.has(ws)) return reply(rpcError(id, ERR.UNAUTHORIZED, "initialize first"));
 
         switch (req.method) {
+          case "workspace.collaboration.list":
+          case "workspace.collaboration.bootstrap":
+          case "workspace.collaboration.sync":
+          case "workspace.collaboration.send":
+          case "workspace.collaboration.create-channel": {
+            if (!deps.workspaceCollaboration) return reply(rpcError(id, ERR.METHOD, "Workspace collaboration is not configured"));
+            const operation = {
+              "workspace.collaboration.list": "list", "workspace.collaboration.bootstrap": "bootstrap",
+              "workspace.collaboration.sync": "sync", "workspace.collaboration.send": "send",
+              "workspace.collaboration.create-channel": "createChannel",
+            } as const;
+            return reply(rpcResult(id!, await deps.workspaceCollaboration[operation[req.method]](req.params ?? {})));
+          }
           case "mobile.status": {
             if (!deps.mobileCompanionStatus) {
               return reply(rpcError(id, ERR.METHOD, "mobile pairing is not supported by this server"));

@@ -278,6 +278,13 @@
 //   mobile.status      {}                          → redacted Desktop account/device readiness plus Serve-owned
 //                                                     Relay state (waiting/connecting/online/retrying/unavailable);
 //                                                     transport errors and credentials never cross loopback
+//   workspace.collaboration.list {cursor?}         → {ok,value:{schemaVersion:1,accountScope,accountRegion,workspaces,nextCursor}}
+//   workspace.collaboration.bootstrap {workspaceId,accountScope} → {ok,value:{workspaceId,displayName,membership,channels,cursor}}
+//   workspace.collaboration.sync {workspaceId,cursor,accountScope} → {ok,value:{workspaceId,cursor,hasMore,events}}
+//   workspace.collaboration.send {workspaceId,channelId,body,idempotencyKey,accountScope} → redacted receipt, no auto retry
+//   workspace.collaboration.create-channel {workspaceId,slug,displayName,idempotencyKey,accountScope} → channel receipt
+//                                                     feature workspace.collaboration.v1; host-configured/default-off;
+//                                                     typed errors contain code only; Account/assertion tokens stay in Core.
 //   mobile.authorization.create {}                 → unsigned Desktop QR invitation; public one-time code only
 //   mobile.authorization.status {}                 → redacted wait/approval/sign-in state; approved state is
 //                                                     exchanged inside Core and never returns account/device tokens
