@@ -36,6 +36,120 @@ test("host feature is default off and never accepts renderer origins or insecure
     assert.throws(() => new WorkspaceCollaborationClient({ collabOrigin }));
   }
 });
+const memberPage = (members, nextCursor = null) => ({ schemaVersion: 1, workspaceId: A, accountRegion: "CN", members, nextCursor });
+const rosterMember = (principalId = "person-a", extra = {}) => ({ principalId, kind: "human", displayName: "Synthetic person", role: "MEMBER", ...extra });
+test("member directory uses private Account auth and projects only human public identity", async () => {
+  const f = fixture(), accountScope = await f.scope();
+  f.handler(url => url.includes("/members?") ? f.json(memberPage([rosterMember("person-a", { email: "private@example.invalid", accountId: "private-account", token: "private-token" })], "page+two")) : undefined);
+  const result = await f.client.members({ workspaceId: A, accountScope });
+  assert.deepEqual(result.value.members, [rosterMember()]);
+  assert.equal(result.value.nextCursor, "page+two");
+  assert.doesNotMatch(JSON.stringify(result), /email|accountId|token|private-account/);
+  assert.equal(f.requests.at(-1).url, "https://account.example/v1/workspaces/" + A + "/members?limit=50");
+  assert.equal(f.requests.at(-1).options.method, "GET");
+  assert.equal(f.requests.at(-1).options.headers.Authorization, "Bearer private-account-token");
+  assert.equal(f.requests.some(item => item.url.startsWith("https://collab.example")), false);
+  await f.client.members({ workspaceId: A, accountScope, cursor: "page+two" });
+  assert.match(f.requests.at(-1).url, /cursor=page%2Btwo$/);
+});
+test("member pages reject foreign scope/region, forged kinds, duplicates and unbounded data", async () => {
+  const f = fixture(), accountScope = await f.scope();
+  for (const page of [
+    { ...memberPage([rosterMember()]), workspaceId: B }, { ...memberPage([rosterMember()]), accountRegion: "GLOBAL" },
+    memberPage([rosterMember("p", { kind: "agent" })]), memberPage([rosterMember("p", { role: "OWNER_FROM_CLIENT" })]),
+    memberPage([rosterMember("p", { displayName: "x".repeat(121) })]), memberPage([rosterMember("p", { displayName: "  " })]),
+    memberPage([rosterMember("person@example.invalid")]), memberPage([rosterMember("p\nsecret")]),
+    memberPage([rosterMember("p", { displayName: "聯繫名@example.invalid" })]), memberPage([rosterMember("p", { displayName: "name\nprivate" })]),
+    memberPage([rosterMember(), rosterMember()]), memberPage(Array.from({ length: 51 }, (_, i) => rosterMember("p" + i))),
+    memberPage([], "empty-continuation"),
+  ]) {
+    f.handler(url => url.includes("/members?") ? f.json(page) : undefined);
+    assert.equal((await f.client.members({ workspaceId: A, accountScope })).error.code, "UNAVAILABLE");
+  }
+});
+test("roster cursor errors preserve authority while account denial and sign-in drift stay distinct", async () => {
+  const f = fixture(), accountScope = await f.scope();
+  for (const [httpCode, upstream, expected] of [[400, "WORKSPACE_MEMBERS_CURSOR_INVALID", "MEMBERS_STALE"],
+    [409, "WORKSPACE_MEMBERS_CURSOR_STALE", "MEMBERS_STALE"], [403, "WORKSPACE_MEMBERSHIP_INACTIVE", "ACCESS_CHANGED"],
+    [401, "AUTH_REQUIRED", "AUTH_REQUIRED"], [404, "NOT_FOUND", "UNAVAILABLE"], [503, "UNAVAILABLE", "UNAVAILABLE"]]) {
+    f.handler(url => url.includes("/members?") ? new Response(JSON.stringify({ error: { code: upstream, message: "private detail" } }), { status: httpCode }) : undefined);
+    assert.deepEqual(await f.client.members({ workspaceId: A, accountScope, cursor: "opaque" }), { ok: false, error: { code: expected } });
+  }
+  f.handler(url => { if (url.includes("/members?")) { f.setState({ ...f.getState(), accessToken: "other-login" });
+    return new Response(JSON.stringify({ error: { code: "WORKSPACE_MEMBERS_CURSOR_INVALID" } }), { status: 400 }); } });
+  assert.equal((await f.client.members({ workspaceId: A, accountScope })).error.code, "SCOPE_CHANGED");
+  const before = f.requests.length;
+  assert.equal((await f.client.members({ workspaceId: A, accountScope })).error.code, "SCOPE_CHANGED");
+  assert.equal(f.requests.length, before);
+});
+test("member caller cannot override identity, endpoint, role, Realm or page size", async () => {
+  const f = fixture(), accountScope = await f.scope(), before = f.requests.length;
+  for (const extra of [{ principalId: "forged" }, { kind: "agent" }, { role: "OWNER" }, { realmId: "private" },
+    { origin: "https://other.example" }, { accessToken: "forged" }, { limit: 1000 }]) {
+    assert.equal((await f.client.members({ workspaceId: A, accountScope, ...extra })).error.code, "INVALID_INPUT");
+  }
+  assert.equal(f.requests.length, before);
+});
+const target = principalId => ({ kind: "human", principalId });
+test("typed mentions use a distinct route and canonical IDs; no name, role or private fields escape", async () => {
+  const f = fixture(), accountScope = await f.scope();
+  f.handler((url, options) => url.endsWith("/messages/with-mentions") ? f.json({ schemaVersion: 1, workspaceId: A, data: {
+    messageId: M, channelId: C, senderPrincipalId: "principal-a", createdAt: "2033-05-18T03:33:20.000Z", realmSeq: "12",
+    mentions: JSON.parse(options.body).mentions.map(item => ({ ...item, displayName: "private name", email: "private@example.invalid", role: "OWNER" })), token: "private-token",
+  } }) : undefined);
+  const input = { workspaceId: A, channelId: C, accountScope, body: "ordinary text", idempotencyKey: "frozen-mention-1", mentions: [target("z"), target("A"), target("人")] };
+  const result = await f.client.sendWithMentions(input);
+  assert.equal(result.ok, true); assert.deepEqual(result.value.mentions, [target("A"), target("z"), target("人")]);
+  assert.doesNotMatch(JSON.stringify(result), /email|displayName|role|token|private/);
+  const request = f.requests.at(-1); assert.equal(request.url, "https://collab.example/v1/workspaces/" + A + "/channels/" + C + "/messages/with-mentions");
+  assert.equal(request.options.headers["Idempotency-Key"], "frozen-mention-1");
+  assert.deepEqual(JSON.parse(request.options.body), { body: "ordinary text", mentions: result.value.mentions });
+  const plain = await f.client.send({ workspaceId: A, channelId: C, accountScope, body: "@A is just text", idempotencyKey: "plain-1" });
+  assert.equal(plain.ok, true); assert.equal(Object.hasOwn(plain.value, "mentions"), false);
+  assert.deepEqual(JSON.parse(f.requests.at(-1).options.body), { body: "@A is just text" });
+});
+test("malformed mention identities and routing overrides are rejected before any I/O", async () => {
+  const f = fixture(), accountScope = await f.scope(), before = f.requests.length;
+  const input = { workspaceId: A, channelId: C, accountScope, body: "text", idempotencyKey: "key" };
+  for (const mentions of [[], [target("same"), target("same")], [target(" bad ")], [target("a\nb")], [target("person@example.invalid")],
+    [{ kind: "agent", principalId: "p" }], [{ kind: "all", principalId: "p" }], [{ ...target("p"), role: "OWNER" }],
+    [{ kind: "human", displayName: "Person" }], Array.from({ length: 11 }, (_, i) => target("p" + i))]) {
+    assert.equal((await f.client.sendWithMentions({ ...input, mentions })).error.code, "INVALID_INPUT");
+  }
+  assert.equal((await f.client.sendWithMentions({ ...input, mentions: [target("p")], origin: "https://other.example" })).error.code, "INVALID_INPUT");
+  assert.equal((await f.client.send({ ...input, mentions: [target("p")] })).error.code, "INVALID_INPUT");
+  assert.equal(f.requests.length, before);
+});
+test("a missing route or unconfirmed mention receipt never downgrades or confirms a possibly accepted send", async () => {
+  const f = fixture(), accountScope = await f.scope();
+  const input = { workspaceId: A, channelId: C, accountScope, body: "text", idempotencyKey: "frozen", mentions: [target("p")] };
+  for (const mentions of [undefined, [], [target("wrong")], [target("p"), target("p")]]) {
+    f.handler(url => url.endsWith("/messages/with-mentions") ? f.json({ schemaVersion: 1, workspaceId: A, data: {
+      messageId: M, channelId: C, senderPrincipalId: "principal-a", createdAt: "2033-05-18T03:33:20.000Z", mentions,
+    } }) : undefined);
+    assert.equal((await f.client.sendWithMentions(input)).error.code, "OUTCOME_UNKNOWN");
+  }
+  for (const [httpCode, code, expected] of [[404, "NOT_FOUND", "OUTCOME_UNKNOWN"], [400, "MENTION_TARGET_UNAVAILABLE", "MENTION_TARGET_UNAVAILABLE"],
+    [400, "INVALID_MENTIONS", "INVALID_INPUT"], [503, "UNAVAILABLE", "OUTCOME_UNKNOWN"], [403, "ACCESS_CHANGED", "ACCESS_CHANGED"]]) {
+    f.handler(url => url.endsWith("/messages/with-mentions") ? new Response(JSON.stringify({ error: { code, message: "private" } }), { status: httpCode }) : undefined);
+    assert.deepEqual(await f.client.sendWithMentions(input), { ok: false, error: { code: expected } });
+  }
+  assert.equal(f.requests.filter(item => item.url.endsWith("/messages")).length, 0);
+  assert.ok(f.requests.filter(item => item.url.endsWith("/messages/with-mentions")).every(item => item.options.headers["Idempotency-Key"] === "frozen"));
+});
+test("typed mention reads are projected in sync and history without adding metadata to legacy messages", async () => {
+  const f = fixture(), accountScope = await f.scope();
+  const row = { id: M, channelId: C, senderPrincipalId: "principal-a", body: "text", createdAt: "2033-05-18T03:33:20.000Z" };
+  f.handler(url => url.includes("/messages?") ? f.json({ schemaVersion: 1, workspaceId: A, data: { channelId: C,
+    messages: [{ ...row, sequence: "12", mentions: [{ ...target("p"), private: "omit" }] }], nextBefore: null } }) : undefined);
+  assert.deepEqual((await f.client.history({ workspaceId: A, channelId: C, accountScope })).value.messages[0].mentions, [target("p")]);
+  f.handler(url => url.includes("/sync?") ? f.json({ schemaVersion: 1, workspaceId: A, data: { cursor: "next", hasMore: false, events: [
+    { id: M, type: "message.created", realmSeq: "12", message: { ...row, mentions: [target("p")] } },
+    { id: C, type: "message.created", realmSeq: "13", message: { ...row, id: C } },
+  ] } }) : undefined);
+  const sync = await f.client.sync({ workspaceId: A, accountScope, cursor: "start" });
+  assert.deepEqual(sync.value.events[0].message.mentions, [target("p")]); assert.equal(Object.hasOwn(sync.value.events[1].message, "mentions"), false);
+});
 test("directory and collaboration responses contain neither credentials nor Realm/payload internals", async () => {
   const f = fixture(), accountScope = await f.scope();
   assert.match(accountScope, /^[a-f0-9]{64}$/);

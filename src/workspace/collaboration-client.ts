@@ -5,12 +5,16 @@ import { createHmac, randomBytes } from "node:crypto";
 export const WORKSPACE_COLLABORATION_FEATURE = "workspace.collaboration.v1";
 export const WORKSPACE_HISTORY_FEATURE = "workspace.collaboration.history.v1";
 export const WORKSPACE_HISTORY_METHOD = "workspace.collaboration.history";
+export const WORKSPACE_MEMBERS_FEATURE = "workspace.collaboration.members.v1";
+export const WORKSPACE_MEMBERS_METHOD = "workspace.collaboration.members";
+export const WORKSPACE_MENTIONS_FEATURE = "workspace.collaboration.mentions.v1";
+export const WORKSPACE_MENTIONS_METHOD = "workspace.collaboration.send-with-mentions";
 export const WORKSPACE_COLLABORATION_METHODS = [
   "workspace.collaboration.list", "workspace.collaboration.bootstrap",
   "workspace.collaboration.sync", "workspace.collaboration.send", "workspace.collaboration.create-channel",
 ] as const;
 export type CollaborationErrorCode = "AUTH_REQUIRED" | "SCOPE_CHANGED" | "ACCESS_CHANGED"
-  | "PROJECTION_PENDING" | "DIRECTORY_STALE" | "HISTORY_STALE" | "INVALID_INPUT" | "UNAVAILABLE" | "OUTCOME_UNKNOWN";
+  | "PROJECTION_PENDING" | "DIRECTORY_STALE" | "HISTORY_STALE" | "MEMBERS_STALE" | "MENTION_TARGET_UNAVAILABLE" | "INVALID_INPUT" | "UNAVAILABLE" | "OUTCOME_UNKNOWN";
 export type CollaborationResult<T> = { ok: true; value: T } | { ok: false; error: { code: CollaborationErrorCode } };
 export interface CollaborationDirectory {
   schemaVersion: 1;
@@ -21,6 +25,10 @@ export interface CollaborationDirectory {
   nextCursor: string | null;
 }
 export interface CollaborationChannel { id: string; slug: string; displayName: string }
+/** Account-authoritative human identity only. This is neither an Agent registry nor an execution grant. */
+export interface CollaborationMember { principalId: string; kind: "human"; displayName: string; role: "OWNER" | "ADMIN" | "MEMBER" }
+export interface CollaborationMembers { workspaceId: string; members: CollaborationMember[]; nextCursor: string | null }
+export interface CollaborationMention { kind: "human"; principalId: string }
 export interface CollaborationBootstrap {
   workspaceId: string;
   displayName: string;
@@ -28,13 +36,13 @@ export interface CollaborationBootstrap {
   membership: { principalId: string; role: "OWNER" | "ADMIN" | "MEMBER"; epoch: number };
   channels: CollaborationChannel[];
 }
-export interface CollaborationMessage { id: string; channelId: string; senderPrincipalId: string; body: string; createdAt: string; sequence?: string }
+export interface CollaborationMessage { id: string; channelId: string; senderPrincipalId: string; body: string; createdAt: string; sequence?: string; mentions?: CollaborationMention[] }
 export interface CollaborationHistory { workspaceId: string; channelId: string; messages: CollaborationMessage[]; nextBefore: string | null }
 export interface CollaborationSync {
   workspaceId: string; cursor: string; hasMore: boolean;
   events: { id: string; type: string; message: CollaborationMessage | null; channel?: CollaborationChannel | null }[];
 }
-export interface CollaborationSent { workspaceId: string; messageId: string; channelId: string; senderPrincipalId: string; createdAt: string; sequence?: string }
+export interface CollaborationSent { workspaceId: string; messageId: string; channelId: string; senderPrincipalId: string; createdAt: string; sequence?: string; mentions?: CollaborationMention[] }
 export interface CollaborationCreated { workspaceId: string; channel: CollaborationChannel }
 
 class Failure extends Error {
@@ -50,9 +58,22 @@ const workspace = (value: unknown): value is string => typeof value === "string"
 const role = (value: unknown): value is "OWNER" | "ADMIN" | "MEMBER" => value === "OWNER" || value === "ADMIN" || value === "MEMBER";
 const version = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 1;
 const timestamp = (value: unknown): value is string => text(value, 40) && Number.isFinite(Date.parse(value));
+const publicIdentity = (value: unknown, max: number): value is string => text(value, max) && value.trim() === value
+  && !/[\u0000-\u001f\u007f]/.test(value) && !/[^\s@]+@[^\s@]+\.[^\s@]+/u.test(value);
 const sequence = (value: unknown): value is string => typeof value === "string" && /^[1-9][0-9]{0,18}$/.test(value) && BigInt(value) <= 9223372036854775807n;
 const input = (condition: unknown): void => { if (!condition) throw new Failure("INVALID_INPUT"); };
 const valid = (condition: unknown): void => { if (!condition) throw new Failure("UNAVAILABLE"); };
+function mentions(value: unknown, strict = false): CollaborationMention[] {
+  valid(Array.isArray(value) && value.length <= 10);
+  const items = (value as unknown[]).map(value => {
+    const item = record(value);
+    valid(item.kind === "human" && publicIdentity(item.principalId, 128)
+      && (!strict || (Object.keys(item).length === 2 && Object.keys(item).every(key => key === "kind" || key === "principalId"))));
+    return { kind: "human" as const, principalId: item.principalId as string };
+  });
+  valid(new Set(items.map(item => item.principalId)).size === items.length);
+  return items.sort((a, b) => a.principalId < b.principalId ? -1 : a.principalId > b.principalId ? 1 : 0);
+}
 function channel(value: unknown): CollaborationChannel {
   const item = record(value);
   valid(uuid(item.id) && item.kind === "TEXT" && text(item.slug, 80) && text(item.displayName, 160));
@@ -64,7 +85,8 @@ function message(value: unknown): CollaborationMessage {
     && text(item.body, 8192) && Buffer.byteLength(item.body as string, "utf8") <= 8192 && timestamp(item.createdAt)
     && (item.sequence === undefined || sequence(item.sequence)));
   return { id: item.id as string, channelId: item.channelId as string, senderPrincipalId: item.senderPrincipalId as string,
-    body: item.body as string, createdAt: item.createdAt as string, ...(item.sequence === undefined ? {} : { sequence: item.sequence as string }) };
+    body: item.body as string, createdAt: item.createdAt as string, ...(item.sequence === undefined ? {} : { sequence: item.sequence as string }),
+    ...(item.mentions === undefined ? {} : { mentions: mentions(item.mentions) }) };
 }
 function origin(value: string, insecureLoopback = false): string {
   const url = new URL(value);
@@ -159,8 +181,17 @@ export class WorkspaceCollaborationClient {
         // Do not reflect upstream error text, HTML, request IDs, tokens, or message bodies.
         const code = await errorCode(response);
         if (response.status === 401) throw new Failure("AUTH_REQUIRED");
+        if (base === this.collabOrigin && path.endsWith("/messages/with-mentions")
+          && response.status === 400 && code === "MENTION_TARGET_UNAVAILABLE") throw new Failure("MENTION_TARGET_UNAVAILABLE");
+        if (base === this.collabOrigin && path.endsWith("/messages/with-mentions")
+          && response.status === 404 && code !== "CHANNEL_NOT_FOUND") throw new Failure("OUTCOME_UNKNOWN");
         if (base === this.accountOrigin && path.startsWith("/v1/workspaces?")) {
           if ([400, 409].includes(response.status)) throw new Failure("DIRECTORY_STALE");
+          if (response.status === 404 || response.status >= 500) throw new Failure("UNAVAILABLE");
+        }
+        if (base === this.accountOrigin && path.includes("/members?")) {
+          if ((response.status === 400 && code === "WORKSPACE_MEMBERS_CURSOR_INVALID")
+            || (response.status === 409 && code === "WORKSPACE_MEMBERS_CURSOR_STALE")) throw new Failure("MEMBERS_STALE");
           if (response.status === 404 || response.status >= 500) throw new Failure("UNAVAILABLE");
         }
         if (base === this.collabOrigin && body === undefined && path.includes("/channels/") && path.includes("/messages?")) {
@@ -247,6 +278,30 @@ export class WorkspaceCollaborationClient {
           role: membership.role as "OWNER" | "ADMIN" | "MEMBER", epoch: membership.epoch as number }, channels };
     });
   }
+  members(params: Record<string, unknown>): Promise<CollaborationResult<CollaborationMembers>> {
+    return this.result(async () => {
+      input(Object.keys(params).every(key => ["workspaceId", "accountScope", "cursor"].includes(key))
+        && workspace(params.workspaceId) && text(params.accountScope, 64)
+        && (params.cursor === undefined || text(params.cursor, 4096)));
+      const workspaceId = params.workspaceId as string, initial = this.state(params.accountScope);
+      const path = `/v1/workspaces/${workspaceId}/members?limit=50`
+        + (params.cursor === undefined ? "" : "&cursor=" + encodeURIComponent(params.cursor as string));
+      const response = record(await this.request(this.accountOrigin, path, initial.accessToken, initial));
+      valid(response.schemaVersion === 1 && response.workspaceId === workspaceId
+        && response.accountRegion === (initial.account.region === "cn" ? "CN" : "GLOBAL")
+        && Array.isArray(response.members) && response.members.length <= 50
+        && (response.nextCursor === null || text(response.nextCursor, 4096)) && response.nextCursor !== params.cursor);
+      const members = (response.members as unknown[]).map(value => {
+        const item = record(value);
+        valid(publicIdentity(item.principalId, 128) && item.kind === "human"
+          && publicIdentity(item.displayName, 120) && role(item.role));
+        return { principalId: item.principalId as string, kind: "human" as const, displayName: item.displayName as string,
+          role: item.role as "OWNER" | "ADMIN" | "MEMBER" };
+      });
+      valid(new Set(members.map(item => item.principalId)).size === members.length && (members.length > 0 || response.nextCursor === null));
+      return { workspaceId, members, nextCursor: response.nextCursor as string | null };
+    });
+  }
   sync(params: Record<string, unknown>): Promise<CollaborationResult<CollaborationSync>> {
     return this.result(async () => {
       input(Object.keys(params).every(key => ["workspaceId", "cursor", "accountScope"].includes(key)) && workspace(params.workspaceId) && text(params.cursor, 4096) && text(params.accountScope, 64));
@@ -286,6 +341,26 @@ export class WorkspaceCollaborationClient {
       const data = await this.scoped(workspaceId, "channels", this.state(params.accountScope), { slug: params.slug, displayName: params.displayName }, params.idempotencyKey as string);
       if (!uuid(data.channelId) || data.slug !== params.slug || data.displayName !== params.displayName) throw new Failure("OUTCOME_UNKNOWN");
       return { workspaceId, channel: { id: data.channelId, slug: data.slug as string, displayName: data.displayName as string } };
+    });
+  }
+  sendWithMentions(params: Record<string, unknown>): Promise<CollaborationResult<CollaborationSent>> {
+    return this.result(async () => {
+      input(Object.keys(params).length === 6 && Object.keys(params).every(key => ["workspaceId", "channelId", "body", "idempotencyKey", "accountScope", "mentions"].includes(key))
+        && text(params.accountScope, 64) && workspace(params.workspaceId) && uuid(params.channelId)
+        && text(params.body, 8192) && (params.body as string).trim() && Buffer.byteLength(params.body as string, "utf8") <= 8192
+        && text(params.idempotencyKey, 128) && /^[A-Za-z0-9_-]+$/.test(params.idempotencyKey as string)
+        && Array.isArray(params.mentions) && params.mentions.length > 0);
+      let targets: CollaborationMention[];
+      try { targets = mentions(params.mentions, true); } catch { throw new Failure("INVALID_INPUT"); }
+      const workspaceId = params.workspaceId as string;
+      const data = await this.scoped(workspaceId, `channels/${params.channelId}/messages/with-mentions`, this.state(params.accountScope),
+        { body: params.body, mentions: targets }, params.idempotencyKey as string);
+      let confirmed: CollaborationMention[];
+      try { confirmed = mentions(data.mentions); } catch { throw new Failure("OUTCOME_UNKNOWN"); }
+      if (!uuid(data.messageId) || data.channelId !== params.channelId || !text(data.senderPrincipalId, 128) || !timestamp(data.createdAt)
+        || (data.realmSeq !== undefined && !sequence(data.realmSeq)) || JSON.stringify(confirmed) !== JSON.stringify(targets)) throw new Failure("OUTCOME_UNKNOWN");
+      return { workspaceId, messageId: data.messageId, channelId: data.channelId as string, senderPrincipalId: data.senderPrincipalId,
+        createdAt: data.createdAt, mentions: confirmed, ...(data.realmSeq === undefined ? {} : { sequence: data.realmSeq as string }) };
     });
   }
   history(params: Record<string, unknown>): Promise<CollaborationResult<CollaborationHistory>> {

@@ -1,6 +1,6 @@
 # Hosted Workspace client — local preview
 
-2026-10-15 candidate, not deployed or released. This client connects authenticated Desktop
+2026-10-16 candidate, not deployed or released. This client connects authenticated Desktop
 to Account Workspace discovery/context and Collab channels. It is not a replacement for
 local profile selection and grants no Agent, Host, model, file or computer execution.
 
@@ -39,11 +39,20 @@ Methods:
   an older page, ascending canonical bigint sequence, with opaque nextBefore or null.
   This additive method requires the separate workspace.collaboration.history.v1 feature;
   older injected Core transports need not implement it. It never replaces the live-sync cursor.
+- workspace.collaboration.members {workspaceId,accountScope,cursor?}: Account-authoritative public
+  human roster, fixed 50/page. Requires workspace.collaboration.members.v1 and its exact method.
+  Uses Account access directly, not a context/Collab fan-out or the local Agent roster. Public
+  projection contains only principalId, kind:human, bounded displayName and Workspace role.
+- workspace.collaboration.send-with-mentions {workspaceId,channelId,body,idempotencyKey,accountScope,mentions}:
+  requires workspace.collaboration.mentions.v1 and its exact method. Nonempty 1..10 unique human
+  principal IDs, sorted by JS code-unit comparison, never display names, roles, @all or Agent IDs.
+  Uses the separate Workspace /messages/with-mentions HTTP route. Old plain-send wire is unchanged.
 
 Replies are {ok:true,value} or {ok:false,error:{code}}. Code-only failures do not reflect
 upstream HTML, database details, credentials or message bodies. Receipts omit internal Realm
 IDs and signing material. Account/access and short-lived Workspace tokens stay inside Core;
-each collaboration operation obtains a fresh assertion from Account.
+each Collab operation obtains a fresh assertion from Account. Member directory reads use the
+current Account access token and never send that credential to Collab.
 
 accountScope is a per-process HMAC boundary over the current private sign-in identity, not a
 credential. A stale selection is rejected before network I/O after login/token/device changes.
@@ -67,6 +76,24 @@ service fallback or automatic POST retry. Unknown/malformed send outcomes remain
 OUTCOME_UNKNOWN; explicit retry must preserve the exact Workspace/channel/body/key/scope.
 Idempotency authority remains the server's transactional receipt, not a renderer flag.
 
+Account must opt in with HARA_ACCOUNT_WORKSPACE_MEMBERS_ENABLED=1 and its separately provisioned
+directory cursor key. Invalid/stale member cursors map to MEMBERS_STALE, clearing roster names and
+pagination but retaining pending mutation identities and drafts. Actual Account denial still clears
+the old scoped view. Contact-like/control-bearing names or principal IDs are not accepted into Core's
+public roster; Account substitutes a neutral Member for unsafe names without mutating source records.
+Member roles are presentation, never client-side authority to grant tools or impersonate a sender.
+
+Collab must separately opt in with HARA_COLLAB_WORKSPACE_MENTIONS_ENABLED=1. Never send typed fields
+to the old endpoint: it may ignore unknown fields. A missing new route remains OUTCOME_UNKNOWN,
+without plain-send fallback. A first definite MENTION_TARGET_UNAVAILABLE rejection can return to
+an editable draft; any earlier unknown outcome is latched, preserving the original targets/body/key
+even if a later retry is rejected. Accepted same-key recovery remains server-authoritative after a
+target leaves; a never-accepted write must pass fresh target checks. Missing/mismatched receipt
+targets cannot confirm delivery. Typed metadata is a message reference only, not notification delivery,
+Desk acceptance, Agent dispatch, or an execution grant. History/sync preserve optional typed references;
+legacy records remain unchanged. Collab's creation-event retention governs metadata recovery, not a
+new durable notification queue.
+
 ## Desktop preview boundaries
 
 The feature-gated collaboration surface hides local chat/files/Agent state while open and
@@ -86,6 +113,13 @@ in the current in-memory account scope. Unvisited directory entries still show t
 No hidden context fan-out populates directory-wide names. Full member profiles, private channels,
 DMs, attachments, push delivery, Agent channel identity and Desk cards are not yet implemented.
 All channel members currently share the same Realm-wide authorized TEXT-channel audience.
+
+The on-demand, non-modal member panel searches only loaded roster pages (maximum 1,000 entries),
+with explicit More/Refresh and honest partial counts. Equal names are disambiguated with stable IDs;
+missing current-roster names use neutral ID labels, not an inferred 'left' status. No profile/avatar
+network fetches or fake online/Agent badges occur. Explicit member selection adds removable draft
+chips without sending. Literal @name text remains ordinary text. Targets are Workspace/channel-scoped
+and frozen on send; changing the roster cannot rewrite an uncertain request.
 
 Native screenshot acceptance, full Workspace key/memory/file/session partitioning, browser
 account authentication and Host/Agent Runtime dispatch remain separate gates. This preview

@@ -284,6 +284,13 @@
 //   workspace.collaboration.history {workspaceId,channelId,accountScope,before?} → {ok,value:{workspaceId,channelId,messages,nextBefore}}
 //                                                     optional feature workspace.collaboration.history.v1; latest/older 50;
 //                                                     opaque history cursor is distinct from live-sync cursor; canonical bigint sequence.
+//   workspace.collaboration.members {workspaceId,accountScope,cursor?} → {ok,value:{workspaceId,members,nextCursor}}
+//                                                     optional feature workspace.collaboration.members.v1; Account-only human roster,
+//                                                     fixed 50/page; public principal/name/role only, no local Agent fallback.
+//   workspace.collaboration.send-with-mentions {workspaceId,channelId,body,idempotencyKey,accountScope,mentions}
+//                                                     optional feature workspace.collaboration.mentions.v1; separate typed route,
+//                                                     mentions:[{kind:"human",principalId}], 1..10 unique canonical code-unit sorted IDs.
+//                                                     no notification/Agent/task claim; unknown outcomes freeze exact IDs/body/key.
 //   workspace.collaboration.send {workspaceId,channelId,body,idempotencyKey,accountScope} → redacted receipt, no auto retry
 //   workspace.collaboration.create-channel {workspaceId,slug,displayName,idempotencyKey,accountScope} → channel receipt
 //                                                     feature workspace.collaboration.v1; host-configured/default-off;
