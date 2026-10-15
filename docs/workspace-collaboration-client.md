@@ -35,6 +35,10 @@ Methods:
   allowlisted channel-created metadata, never arbitrary event payloads.
 - workspace.collaboration.send {workspaceId,channelId,body,idempotencyKey,accountScope}.
 - workspace.collaboration.create-channel {workspaceId,slug,displayName,idempotencyKey,accountScope}.
+- workspace.collaboration.history {workspaceId,channelId,accountScope,before?}: latest 50 or
+  an older page, ascending canonical bigint sequence, with opaque nextBefore or null.
+  This additive method requires the separate workspace.collaboration.history.v1 feature;
+  older injected Core transports need not implement it. It never replaces the live-sync cursor.
 
 Replies are {ok:true,value} or {ok:false,error:{code}}. Code-only failures do not reflect
 upstream HTML, database details, credentials or message bodies. Receipts omit internal Realm
@@ -46,9 +50,19 @@ credential. A stale selection is rejected before network I/O after login/token/d
 Core rechecks the sign-in after each asynchronous response and before sending to Collab.
 Changing this token does not select or grant a local profile or execution Runtime.
 
-HTTP uses redirect:error, request timeouts and a streaming 6 MiB response cap (including
+Success and failure paths both recheck the sign-in scope, including HTTP error-body reads,
+aborted/failed transport and streamed-body failures. SCOPE_CHANGED takes precedence over
+retryable errors so the old account's view cannot remain visible after a late failed request.
+
+HTTP uses redirect:error, request timeouts and a streaming 6 MiB success response cap (including
 worst-case JSON escaping for a legal page). Directory pagination failures are DIRECTORY_STALE,
-not permission revocation; they never discard pending sends. There is no
+not permission revocation; they never discard pending sends. History's 400 HISTORY_CURSOR_INVALID
+and 409 HISTORY_CURSOR_STALE become HISTORY_STALE, preserving uncertain mutation identities and
+drafts while clearing the stale transcript/page cursor. Actual AUTH_CONTEXT_STALE remains
+ACCESS_CHANGED; an unavailable history route is not a membership revocation. Only Collab's
+AUTH_PROJECTION_LAG read error is PROJECTION_PENDING; unrelated 503s remain unavailable.
+Upstream error bodies have a separate streaming 4 KiB ceiling and only an allowlisted-shaped code
+is extracted; raw text is never reflected. There is no
 service fallback or automatic POST retry. Unknown/malformed send outcomes remain
 OUTCOME_UNKNOWN; explicit retry must preserve the exact Workspace/channel/body/key/scope.
 Idempotency authority remains the server's transactional receipt, not a renderer flag.
@@ -61,11 +75,16 @@ Account/Workspace/request epochs fence delayed A→B→A results. Drafts and pen
 in memory only, keyed to their exact scope. Leaving with pending requests requires explicit
 acknowledgment; restart/close is not a durable retry queue and cannot undo a server effect.
 
-Only new events after the connection's bootstrap cursor are shown. Historic transcripts,
-readable directory-wide names, full member profiles, private channels, DMs, attachments,
-push delivery, Agent channel identity and Desk cards are not yet implemented. The existing
-Realm sync API's history capability is not claimed as a finished Desktop history UX.
-Workspace names currently fall back to the opaque ID when the server supplies no display metadata.
+With history capability, channel selection loads the latest 50 authorized messages. Explicit older
+paging and live sync share an ID-deduplicated timeline, sorted by exact bigint sequence (not timestamps)
+and capped at 500 in memory. Workspace/channel/request generations fence delayed replies. A history
+read never advances the live cursor or submits/retries a draft. Older engines explicitly retain the
+post-connection-only limitation. No durable transcript queue or full-text search is claimed.
+
+Workspace bootstrap supplies an authoritative displayName; selected/visited names are retained only
+in the current in-memory account scope. Unvisited directory entries still show their opaque ID.
+No hidden context fan-out populates directory-wide names. Full member profiles, private channels,
+DMs, attachments, push delivery, Agent channel identity and Desk cards are not yet implemented.
 All channel members currently share the same Realm-wide authorized TEXT-channel audience.
 
 Native screenshot acceptance, full Workspace key/memory/file/session partitioning, browser

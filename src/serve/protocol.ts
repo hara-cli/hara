@@ -281,6 +281,9 @@
 //   workspace.collaboration.list {cursor?}         → {ok,value:{schemaVersion:1,accountScope,accountRegion,workspaces,nextCursor}}
 //   workspace.collaboration.bootstrap {workspaceId,accountScope} → {ok,value:{workspaceId,displayName,membership,channels,cursor}}
 //   workspace.collaboration.sync {workspaceId,cursor,accountScope} → {ok,value:{workspaceId,cursor,hasMore,events}}
+//   workspace.collaboration.history {workspaceId,channelId,accountScope,before?} → {ok,value:{workspaceId,channelId,messages,nextBefore}}
+//                                                     optional feature workspace.collaboration.history.v1; latest/older 50;
+//                                                     opaque history cursor is distinct from live-sync cursor; canonical bigint sequence.
 //   workspace.collaboration.send {workspaceId,channelId,body,idempotencyKey,accountScope} → redacted receipt, no auto retry
 //   workspace.collaboration.create-channel {workspaceId,slug,displayName,idempotencyKey,accountScope} → channel receipt
 //                                                     feature workspace.collaboration.v1; host-configured/default-off;

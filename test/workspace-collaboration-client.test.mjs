@@ -79,6 +79,34 @@ test("late collaboration responses are not returned after a sign-in switch", asy
   const result = await f.client.bootstrap({ workspaceId: A, accountScope });
   assert.deepEqual(result, { ok: false, error: { code: "SCOPE_CHANGED" } });
 });
+test("sign-in drift outranks HTTP and transport failures on Account and Collab responses", async () => {
+  for (const endpoint of ["/context", "/messages?"]) for (const outcome of ["http", "network", "stream", "oversized", "error-stream"]) {
+    const f = fixture(), accountScope = await f.scope();
+    const drift = () => f.setState({ ...f.getState(), account: { ...f.getState().account, id: "account-b" } });
+    f.handler(url => {
+      if (!url.includes(endpoint)) return;
+      if (outcome === "http") {
+        drift(); return new Response(JSON.stringify({ error: { code: "HISTORY_CURSOR_INVALID" } }), { status: 400 });
+      }
+      if (outcome === "network") { drift(); throw new Error("synthetic transport failure"); }
+      return new Response(new ReadableStream({ pull(controller) {
+        drift();
+        if (outcome === "oversized") controller.enqueue(new Uint8Array(6 * 1024 * 1024 + 1));
+        else controller.error(new Error("synthetic interrupted body"));
+      } }), { status: outcome === "error-stream" ? 400 : 200 });
+    });
+    assert.deepEqual(await f.client.history({ workspaceId: A, channelId: C, accountScope }),
+      { ok: false, error: { code: "SCOPE_CHANGED" } }, endpoint + " " + outcome);
+    if (endpoint === "/context") assert.equal(f.requests.some(item => item.url.startsWith("https://collab.example")), false);
+  }
+});
+test("sign-out after a mutation response is lost clears account authority without retrying", async () => {
+  const f = fixture(), accountScope = await f.scope();
+  f.handler(url => { if (url.endsWith("/messages")) { f.setState(null); throw new Error("synthetic lost receipt"); } });
+  assert.deepEqual(await f.client.send({ workspaceId: A, channelId: C, accountScope, body: "synthetic", idempotencyKey: "frozen" }),
+    { ok: false, error: { code: "SCOPE_CHANGED" } });
+  assert.equal(f.requests.filter(item => item.url.endsWith("/messages")).length, 1);
+});
 test("untrusted role, token, endpoint and Realm overrides fail locally", async () => {
   const f = fixture(), accountScope = await f.scope(), before = f.requests.length;
   for (const extra of [{ role: "OWNER" }, { realmId: "other" }, { token: "override" }, { origin: "https://other.example" }]) {
@@ -106,7 +134,7 @@ test("a lost or malformed send receipt is outcome-unknown and is never retried a
 });
 test("HTTP errors are redacted, access errors distinct and UTF-8 input is bounded before I/O", async () => {
   const f = fixture(), accountScope = await f.scope();
-  for (const [httpCode, code] of [[401, "AUTH_REQUIRED"], [403, "ACCESS_CHANGED"], [409, "ACCESS_CHANGED"], [503, "PROJECTION_PENDING"]]) {
+  for (const [httpCode, code] of [[401, "AUTH_REQUIRED"], [403, "ACCESS_CHANGED"], [409, "ACCESS_CHANGED"], [503, "UNAVAILABLE"]]) {
     f.handler(url => url.endsWith("/context") ? new Response("credential=secret", { status: httpCode }) : undefined);
     assert.deepEqual(await f.client.bootstrap({ workspaceId: A, accountScope }), { ok: false, error: { code } });
   }
@@ -146,4 +174,60 @@ test("maximum legal message page survives JSON control-character expansion", asy
       message: { id: M, channelId: C, senderPrincipalId: "principal-a", body: "\u0001".repeat(8192), createdAt: "2033-05-18T03:33:20.000Z" } })) } }) : undefined);
   const result = await f.client.sync({ workspaceId: A, accountScope, cursor: "cursor" });
   assert.equal(result.ok, true); assert.equal(result.value.events.length, 100);
+});
+const historyPage = (messages, nextBefore = null) => ({ schemaVersion: 1, workspaceId: A, data: { channelId: C, messages, nextBefore } });
+const historicalMessage = (index, extra = {}) => ({ id: "44444444-4444-4444-8444-" + String(index).padStart(12, "0"),
+  channelId: C, senderPrincipalId: "principal-a", body: "record " + index, createdAt: "2033-05-18T03:33:20.000Z", sequence: String(index), ...extra });
+test("history is channel-scoped, chronological by sequence and projects no arbitrary fields", async () => {
+  const f = fixture(), accountScope = await f.scope();
+  f.handler(url => url.includes("/messages?") ? f.json(historyPage([historicalMessage(1, { private: "omit" }), historicalMessage(2)], "older-cursor")) : undefined);
+  const result = await f.client.history({ workspaceId: A, accountScope, channelId: C });
+  assert.equal(result.ok, true); assert.deepEqual(result.value.messages.map(item => item.sequence), ["1", "2"]);
+  assert.equal(result.value.nextBefore, "older-cursor"); assert.doesNotMatch(JSON.stringify(result), /private|omit|realmId|token/);
+  assert.equal(f.requests.at(-1).options.method, "GET");
+  assert.equal(f.requests.at(-1).url, "https://collab.example/v1/workspaces/" + A + "/channels/" + C + "/messages?limit=50");
+  await f.client.history({ workspaceId: A, accountScope, channelId: C, before: "signed+older" });
+  assert.match(f.requests.at(-1).url, /before=signed%2Bolder$/);
+});
+test("malformed history, mismatched channel, repeated IDs and unsafe sequences fail closed", async () => {
+  const f = fixture(), accountScope = await f.scope();
+  const first = historicalMessage(1), second = historicalMessage(2);
+  for (const messages of [[second, first], [first, first], [first, { ...second, channelId: M }],
+    [{ ...first, sequence: undefined }], [{ ...first, sequence: "9223372036854775808" }], [{ ...first, sequence: "01" }]]) {
+    f.handler(url => url.includes("/messages?") ? f.json(historyPage(messages)) : undefined);
+    assert.equal((await f.client.history({ workspaceId: A, accountScope, channelId: C })).error.code, "UNAVAILABLE");
+  }
+  f.handler(url => url.includes("/messages?") ? f.json(historyPage([first], "same")) : undefined);
+  assert.equal((await f.client.history({ workspaceId: A, accountScope, channelId: C, before: "same" })).error.code, "UNAVAILABLE");
+});
+test("history pagination errors preserve authority; real context/access errors stay distinct", async () => {
+  const f = fixture(), accountScope = await f.scope();
+  for (const [httpCode, code] of [[400, "HISTORY_STALE"], [409, "HISTORY_STALE"], [404, "UNAVAILABLE"], [401, "AUTH_REQUIRED"], [403, "ACCESS_CHANGED"]]) {
+    f.handler(url => url.includes("/messages?") ? new Response(JSON.stringify({ error: {
+      code: httpCode === 400 ? "HISTORY_CURSOR_INVALID" : httpCode === 409 ? "HISTORY_CURSOR_STALE" : "OTHER",
+      message: "never reflect upstream body",
+    } }), { status: httpCode }) : undefined);
+    assert.deepEqual(await f.client.history({ workspaceId: A, accountScope, channelId: C, before: "old" }), { ok: false, error: { code } });
+  }
+  f.handler(url => url.endsWith("/context") ? new Response("", { status: 409 }) : undefined);
+  assert.equal((await f.client.history({ workspaceId: A, accountScope, channelId: C })).error.code, "ACCESS_CHANGED");
+});
+test("history AUTH_CONTEXT_STALE is real access loss, not an ordinary cursor restart", async () => {
+  const f = fixture(), accountScope = await f.scope();
+  f.handler(url => url.includes("/messages?") ? new Response(JSON.stringify({ error: { code: "AUTH_CONTEXT_STALE" } }), { status: 409 }) : undefined);
+  assert.equal((await f.client.history({ workspaceId: A, accountScope, channelId: C, before: "cursor" })).error.code, "ACCESS_CHANGED");
+  for (const [code, expected] of [["AUTH_PROJECTION_LAG", "PROJECTION_PENDING"], ["DATABASE_UNAVAILABLE", "UNAVAILABLE"]]) {
+    f.handler(url => url.endsWith("/bootstrap") ? new Response(JSON.stringify({ error: { code } }), { status: 503 }) : undefined);
+    assert.equal((await f.client.bootstrap({ workspaceId: A, accountScope })).error.code, expected);
+  }
+});
+test("history overrides and stale account scope are refused before I/O", async () => {
+  const f = fixture(), accountScope = await f.scope(), before = f.requests.length;
+  for (const extra of [{ role: "OWNER" }, { realmId: "other" }, { origin: "https://other.example" }, { limit: 1000 }, { before: "" }]) {
+    assert.equal((await f.client.history({ workspaceId: A, channelId: C, accountScope, ...extra })).error.code, "INVALID_INPUT");
+  }
+  assert.equal(f.requests.length, before);
+  f.setState({ ...f.getState(), accessToken: "new-sign-in" });
+  assert.equal((await f.client.history({ workspaceId: A, channelId: C, accountScope })).error.code, "SCOPE_CHANGED");
+  assert.equal(f.requests.length, before);
 });

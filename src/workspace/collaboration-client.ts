@@ -3,12 +3,14 @@ import { createHmac, randomBytes } from "node:crypto";
 
 // This is a hosted collaboration client, not an execution grant or a replacement for local spaces.
 export const WORKSPACE_COLLABORATION_FEATURE = "workspace.collaboration.v1";
+export const WORKSPACE_HISTORY_FEATURE = "workspace.collaboration.history.v1";
+export const WORKSPACE_HISTORY_METHOD = "workspace.collaboration.history";
 export const WORKSPACE_COLLABORATION_METHODS = [
   "workspace.collaboration.list", "workspace.collaboration.bootstrap",
   "workspace.collaboration.sync", "workspace.collaboration.send", "workspace.collaboration.create-channel",
 ] as const;
 export type CollaborationErrorCode = "AUTH_REQUIRED" | "SCOPE_CHANGED" | "ACCESS_CHANGED"
-  | "PROJECTION_PENDING" | "DIRECTORY_STALE" | "INVALID_INPUT" | "UNAVAILABLE" | "OUTCOME_UNKNOWN";
+  | "PROJECTION_PENDING" | "DIRECTORY_STALE" | "HISTORY_STALE" | "INVALID_INPUT" | "UNAVAILABLE" | "OUTCOME_UNKNOWN";
 export type CollaborationResult<T> = { ok: true; value: T } | { ok: false; error: { code: CollaborationErrorCode } };
 export interface CollaborationDirectory {
   schemaVersion: 1;
@@ -26,12 +28,13 @@ export interface CollaborationBootstrap {
   membership: { principalId: string; role: "OWNER" | "ADMIN" | "MEMBER"; epoch: number };
   channels: CollaborationChannel[];
 }
-export interface CollaborationMessage { id: string; channelId: string; senderPrincipalId: string; body: string; createdAt: string }
+export interface CollaborationMessage { id: string; channelId: string; senderPrincipalId: string; body: string; createdAt: string; sequence?: string }
+export interface CollaborationHistory { workspaceId: string; channelId: string; messages: CollaborationMessage[]; nextBefore: string | null }
 export interface CollaborationSync {
   workspaceId: string; cursor: string; hasMore: boolean;
   events: { id: string; type: string; message: CollaborationMessage | null; channel?: CollaborationChannel | null }[];
 }
-export interface CollaborationSent { workspaceId: string; messageId: string; channelId: string; senderPrincipalId: string; createdAt: string }
+export interface CollaborationSent { workspaceId: string; messageId: string; channelId: string; senderPrincipalId: string; createdAt: string; sequence?: string }
 export interface CollaborationCreated { workspaceId: string; channel: CollaborationChannel }
 
 class Failure extends Error {
@@ -47,6 +50,7 @@ const workspace = (value: unknown): value is string => typeof value === "string"
 const role = (value: unknown): value is "OWNER" | "ADMIN" | "MEMBER" => value === "OWNER" || value === "ADMIN" || value === "MEMBER";
 const version = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 1;
 const timestamp = (value: unknown): value is string => text(value, 40) && Number.isFinite(Date.parse(value));
+const sequence = (value: unknown): value is string => typeof value === "string" && /^[1-9][0-9]{0,18}$/.test(value) && BigInt(value) <= 9223372036854775807n;
 const input = (condition: unknown): void => { if (!condition) throw new Failure("INVALID_INPUT"); };
 const valid = (condition: unknown): void => { if (!condition) throw new Failure("UNAVAILABLE"); };
 function channel(value: unknown): CollaborationChannel {
@@ -57,9 +61,10 @@ function channel(value: unknown): CollaborationChannel {
 function message(value: unknown): CollaborationMessage {
   const item = record(value);
   valid(uuid(item.id) && uuid(item.channelId) && text(item.senderPrincipalId, 128)
-    && text(item.body, 8192) && Buffer.byteLength(item.body as string, "utf8") <= 8192 && timestamp(item.createdAt));
+    && text(item.body, 8192) && Buffer.byteLength(item.body as string, "utf8") <= 8192 && timestamp(item.createdAt)
+    && (item.sequence === undefined || sequence(item.sequence)));
   return { id: item.id as string, channelId: item.channelId as string, senderPrincipalId: item.senderPrincipalId as string,
-    body: item.body as string, createdAt: item.createdAt as string };
+    body: item.body as string, createdAt: item.createdAt as string, ...(item.sequence === undefined ? {} : { sequence: item.sequence as string }) };
 }
 function origin(value: string, insecureLoopback = false): string {
   const url = new URL(value);
@@ -67,6 +72,24 @@ function origin(value: string, insecureLoopback = false): string {
     || (url.protocol !== "https:" && !(insecureLoopback && url.protocol === "http:"
       && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)))) throw new Failure("UNAVAILABLE");
   return url.origin;
+}
+async function errorCode(response: Response): Promise<string | undefined> {
+  const reader = response.body?.getReader();
+  if (!reader) return undefined;
+  const chunks: Uint8Array[] = []; let bytes = 0;
+  try {
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      bytes += part.value.byteLength;
+      if (bytes > 4096) { await reader.cancel(); return undefined; }
+      chunks.push(part.value);
+    }
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const code: unknown = body?.error?.code ?? body?.code;
+    return typeof code === "string" && /^[A-Z][A-Z0-9_]{0,127}$/.test(code) ? code : undefined;
+  } catch { return undefined; }
+  finally { reader.releaseLock(); }
 }
 
 interface Options {
@@ -134,15 +157,19 @@ export class WorkspaceCollaborationClient {
       });
       if (!response.ok) {
         // Do not reflect upstream error text, HTML, request IDs, tokens, or message bodies.
-        await response.body?.cancel();
+        const code = await errorCode(response);
         if (response.status === 401) throw new Failure("AUTH_REQUIRED");
         if (base === this.accountOrigin && path.startsWith("/v1/workspaces?")) {
           if ([400, 409].includes(response.status)) throw new Failure("DIRECTORY_STALE");
           if (response.status === 404 || response.status >= 500) throw new Failure("UNAVAILABLE");
         }
+        if (base === this.collabOrigin && body === undefined && path.includes("/channels/") && path.includes("/messages?")) {
+          if ((response.status === 400 && code === "HISTORY_CURSOR_INVALID") || (response.status === 409 && code === "HISTORY_CURSOR_STALE")) throw new Failure("HISTORY_STALE");
+          if (response.status === 404) throw new Failure("UNAVAILABLE");
+        }
         if ([403, 404, 409].includes(response.status)) throw new Failure("ACCESS_CHANGED");
         if (response.status === 400) throw new Failure("INVALID_INPUT");
-        if (response.status === 503 && !mutation) throw new Failure("PROJECTION_PENDING");
+        if (response.status === 503 && !mutation && base === this.collabOrigin && code === "AUTH_PROJECTION_LAG") throw new Failure("PROJECTION_PENDING");
         throw new Failure(mutation ? "OUTCOME_UNKNOWN" : "UNAVAILABLE");
       }
       const reader = response.body?.getReader();
@@ -163,6 +190,9 @@ export class WorkspaceCollaborationClient {
       try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
       catch { throw new Failure(mutation ? "OUTCOME_UNKNOWN" : "UNAVAILABLE"); }
     } catch (error) {
+      // A failed/aborted response belongs to its original sign-in too. Account drift must
+      // outrank a retryable read error, otherwise Desktop can retain the old account's text.
+      this.unchanged(initial);
       if (error instanceof Failure) throw error;
       throw new Failure(mutation ? "OUTCOME_UNKNOWN" : "UNAVAILABLE");
     } finally { clearTimeout(timer); }
@@ -225,8 +255,10 @@ export class WorkspaceCollaborationClient {
       valid(text(data.cursor, 4096) && typeof data.hasMore === "boolean" && Array.isArray(data.events) && data.events.length <= 100);
       const events = (data.events as unknown[]).map(value => { const event = record(value);
         valid(text(event.id, 160) && text(event.type, 80));
+        valid(event.realmSeq === undefined || sequence(event.realmSeq));
         const payload = event.type === "channel.created" ? record(event.payload) : null;
-        return { id: event.id as string, type: event.type as string, message: event.message === null ? null : message(event.message),
+        return { id: event.id as string, type: event.type as string,
+          message: event.message === null ? null : message({ ...record(event.message), ...(event.realmSeq === undefined ? {} : { sequence: event.realmSeq }) }),
           channel: payload ? channel({ id: payload.channelId, kind: payload.kind, slug: payload.slug, displayName: payload.displayName }) : null };
       });
       return { workspaceId, cursor: data.cursor as string, hasMore: data.hasMore as boolean, events };
@@ -239,9 +271,10 @@ export class WorkspaceCollaborationClient {
         && Buffer.byteLength(params.body as string, "utf8") <= 8192 && text(params.idempotencyKey, 128) && /^[A-Za-z0-9_-]+$/.test(params.idempotencyKey as string));
       const workspaceId = params.workspaceId as string;
       const data = await this.scoped(workspaceId, `channels/${params.channelId}/messages`, this.state(params.accountScope), { body: params.body }, params.idempotencyKey as string);
-      if (!uuid(data.messageId) || data.channelId !== params.channelId || !text(data.senderPrincipalId, 128) || !timestamp(data.createdAt)) throw new Failure("OUTCOME_UNKNOWN");
+      if (!uuid(data.messageId) || data.channelId !== params.channelId || !text(data.senderPrincipalId, 128) || !timestamp(data.createdAt)
+        || (data.realmSeq !== undefined && !sequence(data.realmSeq))) throw new Failure("OUTCOME_UNKNOWN");
       return { workspaceId, messageId: data.messageId, channelId: data.channelId as string,
-        senderPrincipalId: data.senderPrincipalId, createdAt: data.createdAt };
+        senderPrincipalId: data.senderPrincipalId, createdAt: data.createdAt, ...(data.realmSeq === undefined ? {} : { sequence: data.realmSeq as string }) };
     });
   }
   createChannel(params: Record<string, unknown>): Promise<CollaborationResult<CollaborationCreated>> {
@@ -253,6 +286,25 @@ export class WorkspaceCollaborationClient {
       const data = await this.scoped(workspaceId, "channels", this.state(params.accountScope), { slug: params.slug, displayName: params.displayName }, params.idempotencyKey as string);
       if (!uuid(data.channelId) || data.slug !== params.slug || data.displayName !== params.displayName) throw new Failure("OUTCOME_UNKNOWN");
       return { workspaceId, channel: { id: data.channelId, slug: data.slug as string, displayName: data.displayName as string } };
+    });
+  }
+  history(params: Record<string, unknown>): Promise<CollaborationResult<CollaborationHistory>> {
+    return this.result(async () => {
+      input(Object.keys(params).every(key => ["workspaceId", "channelId", "accountScope", "before"].includes(key))
+        && workspace(params.workspaceId) && uuid(params.channelId) && text(params.accountScope, 64)
+        && (params.before === undefined || text(params.before, 4096)));
+      const workspaceId = params.workspaceId as string;
+      const path = "channels/" + params.channelId + "/messages?limit=50"
+        + (params.before === undefined ? "" : "&before=" + encodeURIComponent(params.before as string));
+      const data = await this.scoped(workspaceId, path, this.state(params.accountScope));
+      valid(data.channelId === params.channelId && Array.isArray(data.messages) && data.messages.length <= 50
+        && (data.nextBefore === null || text(data.nextBefore, 4096)) && data.nextBefore !== params.before);
+      const messages = (data.messages as unknown[]).map(message);
+      valid(messages.every((item, index) => item.channelId === params.channelId && sequence(item.sequence)
+        && (index === 0 || BigInt(item.sequence!) > BigInt(messages[index - 1].sequence!)))
+        && new Set(messages.map(item => item.id)).size === messages.length
+        && (messages.length > 0 || data.nextBefore === null));
+      return { workspaceId, channelId: params.channelId as string, messages, nextBefore: data.nextBefore as string | null };
     });
   }
 }

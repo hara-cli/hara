@@ -7,12 +7,13 @@ import WebSocket from "ws";
 import { startServe } from "../dist/serve/server.js";
 import { WORKSPACE_COLLABORATION_METHODS } from "../dist/workspace/collaboration-client.js";
 
-async function fixture(t, enabled = true) {
+async function fixture(t, enabled = true, history = false) {
   const home = realpathSync.native(mkdtempSync(join(tmpdir(), "hara-collab-rpc-")));
   const calls = [];
   const workspaceCollaboration = Object.fromEntries(["list", "bootstrap", "sync", "send", "createChannel"].map(method => [
     method, async params => { calls.push([method, params]); return { ok: true, value: { fixture: method } }; },
   ]));
+  if (history) workspaceCollaboration.history = async params => { calls.push(["history", params]); return { ok: true, value: { fixture: "history" } }; };
   const server = await startServe({ host: "127.0.0.1", port: 0, token: "fixture-token", cwd: home }, {
     version: "test", providerId: "synthetic", model: "synthetic", buildSessionProvider: async () => null,
     spawnSubagent: async () => "unused", sandbox: "off", approval: "suggest", quietDiscovery: true,
@@ -50,4 +51,18 @@ test("unconfigured engines keep local chat and expose no hosted collaboration ca
     assert.equal(init.result.capabilities.methods.includes(method), false);
     assert.equal((await f.call(method)).error.code, -32601);
   }
+});
+test("history support is negotiated independently and remains behind authenticated Serve", async t => {
+  const old = await fixture(t);
+  const previous = await old.call("initialize", { token: "fixture-token" });
+  assert.equal(previous.result.capabilities.features.includes("workspace.collaboration.history.v1"), false);
+  assert.equal((await old.call("workspace.collaboration.history")).error.code, -32601);
+  const f = await fixture(t, true, true);
+  assert.ok((await f.call("workspace.collaboration.history")).error);
+  const init = await f.call("initialize", { token: "fixture-token" });
+  assert.ok(init.result.capabilities.features.includes("workspace.collaboration.history.v1"));
+  assert.ok(init.result.capabilities.methods.includes("workspace.collaboration.history"));
+  const params = { workspaceId: "frozen-workspace", channelId: "channel", accountScope: "frozen", before: "signed" };
+  assert.equal((await f.call("workspace.collaboration.history", params)).result.ok, true);
+  assert.deepEqual(f.calls, [["history", params]]);
 });
