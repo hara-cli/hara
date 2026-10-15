@@ -122,6 +122,16 @@ test("malformed mention identities and routing overrides are rejected before any
   assert.equal((await f.client.send({ ...input, mentions: [target("p")] })).error.code, "INVALID_INPUT");
   assert.equal(f.requests.length, before);
 });
+test("typed channel UUID casing is canonicalized without rewriting principal IDs", async () => {
+  const f = fixture(), accountScope = await f.scope(), channelId = "abcdef00-1234-4abc-8abc-abcdefabcdef";
+  f.handler(url => url.endsWith("/messages/with-mentions") ? f.json({ schemaVersion: 1, workspaceId: A, data: {
+    messageId: M, channelId, senderPrincipalId: "principal-a", createdAt: "2033-05-18T03:33:20.000Z", mentions: [target("PERSON")],
+  } }) : undefined);
+  const result = await f.client.sendWithMentions({ workspaceId: A, channelId: channelId.toUpperCase(), accountScope,
+    body: "text", idempotencyKey: "canonical-channel", mentions: [target("PERSON")] });
+  assert.equal(result.ok, true); assert.equal(result.value.channelId, channelId); assert.deepEqual(result.value.mentions, [target("PERSON")]);
+  assert.ok(f.requests.at(-1).url.includes("/channels/" + channelId + "/"));
+});
 test("a missing route or unconfirmed mention receipt never downgrades or confirms a possibly accepted send", async () => {
   const f = fixture(), accountScope = await f.scope();
   const input = { workspaceId: A, channelId: C, accountScope, body: "text", idempotencyKey: "frozen", mentions: [target("p")] };

@@ -352,12 +352,12 @@ export class WorkspaceCollaborationClient {
         && Array.isArray(params.mentions) && params.mentions.length > 0);
       let targets: CollaborationMention[];
       try { targets = mentions(params.mentions, true); } catch { throw new Failure("INVALID_INPUT"); }
-      const workspaceId = params.workspaceId as string;
-      const data = await this.scoped(workspaceId, `channels/${params.channelId}/messages/with-mentions`, this.state(params.accountScope),
+      const workspaceId = params.workspaceId as string, channelId = (params.channelId as string).toLowerCase();
+      const data = await this.scoped(workspaceId, `channels/${channelId}/messages/with-mentions`, this.state(params.accountScope),
         { body: params.body, mentions: targets }, params.idempotencyKey as string);
       let confirmed: CollaborationMention[];
       try { confirmed = mentions(data.mentions); } catch { throw new Failure("OUTCOME_UNKNOWN"); }
-      if (!uuid(data.messageId) || data.channelId !== params.channelId || !text(data.senderPrincipalId, 128) || !timestamp(data.createdAt)
+      if (!uuid(data.messageId) || data.channelId !== channelId || !text(data.senderPrincipalId, 128) || !timestamp(data.createdAt)
         || (data.realmSeq !== undefined && !sequence(data.realmSeq)) || JSON.stringify(confirmed) !== JSON.stringify(targets)) throw new Failure("OUTCOME_UNKNOWN");
       return { workspaceId, messageId: data.messageId, channelId: data.channelId as string, senderPrincipalId: data.senderPrincipalId,
         createdAt: data.createdAt, mentions: confirmed, ...(data.realmSeq === undefined ? {} : { sequence: data.realmSeq as string }) };
