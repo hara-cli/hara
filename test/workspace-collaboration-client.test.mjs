@@ -60,6 +60,8 @@ test("member pages reject foreign scope/region, forged kinds, duplicates and unb
     memberPage([rosterMember("p", { displayName: "x".repeat(121) })]), memberPage([rosterMember("p", { displayName: "  " })]),
     memberPage([rosterMember("person@example.invalid")]), memberPage([rosterMember("p\nsecret")]),
     memberPage([rosterMember("p", { displayName: "聯繫名@example.invalid" })]), memberPage([rosterMember("p", { displayName: "name\nprivate" })]),
+    memberPage([rosterMember("internal@mailbox")]), memberPage([rosterMember("p\u202esecret")]),
+    memberPage([rosterMember("p", { displayName: "名@邮箱" })]), memberPage([rosterMember("p", { displayName: "name\u2028private" })]),
     memberPage([rosterMember(), rosterMember()]), memberPage(Array.from({ length: 51 }, (_, i) => rosterMember("p" + i))),
     memberPage([], "empty-continuation"),
   ]) {
@@ -111,7 +113,7 @@ test("typed mentions use a distinct route and canonical IDs; no name, role or pr
 test("malformed mention identities and routing overrides are rejected before any I/O", async () => {
   const f = fixture(), accountScope = await f.scope(), before = f.requests.length;
   const input = { workspaceId: A, channelId: C, accountScope, body: "text", idempotencyKey: "key" };
-  for (const mentions of [[], [target("same"), target("same")], [target(" bad ")], [target("a\nb")], [target("person@example.invalid")],
+  for (const mentions of [[], [target("same"), target("same")], [target(" bad ")], [target("a\nb")], [target("person@example.invalid")], [target("person@mailbox")], [target("a\u202eb")],
     [{ kind: "agent", principalId: "p" }], [{ kind: "all", principalId: "p" }], [{ ...target("p"), role: "OWNER" }],
     [{ kind: "human", displayName: "Person" }], Array.from({ length: 11 }, (_, i) => target("p" + i))]) {
     assert.equal((await f.client.sendWithMentions({ ...input, mentions })).error.code, "INVALID_INPUT");

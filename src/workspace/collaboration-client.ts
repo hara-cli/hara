@@ -59,7 +59,7 @@ const role = (value: unknown): value is "OWNER" | "ADMIN" | "MEMBER" => value ==
 const version = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 1;
 const timestamp = (value: unknown): value is string => text(value, 40) && Number.isFinite(Date.parse(value));
 const publicIdentity = (value: unknown, max: number): value is string => text(value, max) && value.trim() === value
-  && !/[\u0000-\u001f\u007f]/.test(value) && !/[^\s@]+@[^\s@]+\.[^\s@]+/u.test(value);
+  && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value) && !/[^\s@]+@[^\s@]+/u.test(value);
 const sequence = (value: unknown): value is string => typeof value === "string" && /^[1-9][0-9]{0,18}$/.test(value) && BigInt(value) <= 9223372036854775807n;
 const input = (condition: unknown): void => { if (!condition) throw new Failure("INVALID_INPUT"); };
 const valid = (condition: unknown): void => { if (!condition) throw new Failure("UNAVAILABLE"); };
