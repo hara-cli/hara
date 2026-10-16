@@ -1,6 +1,6 @@
 # Workspace resource storage — local host slice
 
-Status: explicit host-private adapters, not activated in CLI/Serve/Desktop startup. No new RPC,
+Status: explicit host-private adapters and bounded Account admission, not activated in CLI/Serve/Desktop startup. No new RPC,
 `workspace.v2`, execution capability, migration, release, or deployment is implied.
 
 ## Implemented boundary
@@ -149,14 +149,62 @@ global/project memory bucket, original context and pinned directories. Generic w
 protected-file policy; copied options, another root/context, cancelled work and wider private directories
 cannot use this permit. No ambient-context-wide bypass is introduced.
 
+## Hosted Account resource admission slice (2026-10-16)
+
+`AccountWorkspaceResources` is trusted host composition for exactly one pre-enrolled Account scope.
+It is not an RPC, a second default Workspace registry, or an execution/Host grant. The host pins the
+full HTTPS issuer/region/Workspace/Realm tuple and the existing workspace-context audience outside
+renderer/model input. Every operation sends a new authenticated empty-body POST to Account's existing
+context endpoint, then reads the issuer's fixed public JWKS endpoint without forwarding credentials.
+No redirect, token-supplied key URL, automatic retry, cached assertion or fallback authority is used.
+Both responses are streamed under a 64 KiB cap. Account failure text and tokens are not reflected.
+
+Core verifies native ES256/P-256 signatures and Account's existing `workspace_context` v1 claims:
+exact issuer/single audience/subject/account/region/Workspace/Realm, membership/principal/version/policy
+and role, bounded times/lifetime, token ID and current request freshness. Wrong purposes, arrays of
+audiences, unknown header controls or duplicate/private/mismatched signing keys fail closed. The
+existing Account service remains responsible for enrollment and current ACTIVE membership. A signed
+token alone is not a fresh online check, and neither proves tools, coding execution or Host placement.
+
+An explicit synchronous host policy is required independently of Account membership. The facade
+checks real method actions (`read`, `configure`, `history-write`, `memory-write`, `task-binding`), not
+just the callback's label; an admitted action may also read only if host policy permits it. A `read`
+callback cannot modify credentials, persona, history or memory. Normal bound-store initialization and
+empty metadata/cache maintenance may still occur; this is not an OS-level read-only filesystem grant.
+All facade results, including model profiles and private persona snapshots, remain **host-private**.
+The callback is trusted application code, never code or a callback supplied through RPC or a model.
+
+The original operation retains its storage binding and authority guard through real config/profile,
+Agent, memory and Session writers. Its five-second maximum lease starts **before** Account/JWKS I/O,
+not after verification, and a timer aborts pending network acquisition. Current login/token/device,
+expiry, monotonic observed clock, cancellation, host policy and explicit invalidation are checked at
+resource use and irreversible commits. An observed denial is latched: swallowing the exception and
+restoring the old login or clock cannot revive that operation. Observed Account errors invalidate
+other pending operations on this same access object before any response-body cleanup can yield.
+Borrowed store handles become unusable when their callback ends. Cleanup must not prolong authority.
+Long-lived Session `acquire`/`release` and `delete` (which acquires internally) are deliberately refused
+before acquisition by this bounded Account lane. They require a future original-owner cleanup receipt
+that survives revoked business authority without releasing a successor or writing an index marker.
+Short ownership-proven private publication mutexes and ordinary bounded save remain available; raw
+legacy/resource APIs are unchanged. Do not lend this five-second facade to a long-running SessionHub.
+
+Host composition must call `invalidate()` on foreground switch/logout/disconnect, including A→B→A;
+entirely unobserved switches cannot be inferred from equal login fields. This slice is not yet wired
+to Desktop or CLI selection. Callback cancellation is cooperative at the next guard, not proof of
+physical drain or rollback. Remote membership removal and another device's logout are **not atomically
+visible at a local commit**: Account context is a sampled assertion and access JWTs are not introspected
+logout receipts. The bounded lease plus fresh next-operation request does not replace future Host/run
+authorization, cloud projection/version checks, or externally accepted-action recovery.
+
 ## Compatibility and activation gates
 
 No user data, registry, main Agent binding, native session, gateway or Dev process is moved, deleted,
 stopped or upgraded. Legacy storage remains the startup default. New APIs are not advertised to users.
 Before activation, implement and independently verify:
 
-1. Trusted local/Account enrollment and fresh membership for resource operations; explicit connection
-   mapping and immutable RunBindingV2 without a second default authority.
+1. Wire trusted local registration and the bounded Account resource admission into real startup and
+   selection; add explicit scoped connection generations/mapping and immutable RunBindingV2 without
+   a second default authority. The Account adapter above alone does not activate hosted execution.
 2. Wire the explicit Agent/persona/Runtime catalog into authenticated admission, then isolate Host
    grants, per-Agent private memory, tools, skills, attachments/files, other indexes, connectors,
    queues, approvals, budgets, results and audit. These are not covered by the current storage adapters.
@@ -186,3 +234,10 @@ projections, corrupt/foreign/partial state, full snapshot capacity, zero-call le
 generation/owner changes around staging/claim. Writer tests independently verify denied-claim restoration
 and reject Promise authority callbacks. An initial nested-tree protection red receipt and exact final
 fixed-source results are retained separately from fixture and restricted-loopback failures in the inbox.
+
+`test/workspace-account-resources.test.mjs` exercises native signatures and the actual bound stores,
+including fresh denial, wrong authority, no-retry/secret suppression, per-method action denial, retained
+handle expiry, observed drift that cannot recover, concurrent leases and delayed body cancellation.
+Late config/profile claim tests require that the hook actually fires and original bytes/inode survive.
+The independently run Account/PostgreSQL HTTP chain and fixed-source gate receipts live in the inbox;
+synthetic signature fixtures alone do not establish real Account-route compatibility or production access.

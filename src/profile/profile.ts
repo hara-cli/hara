@@ -62,6 +62,7 @@ import {
   parseOrganizationServiceBindings,
   type OrganizationServiceBinding,
 } from "./organization-service.js";
+import { workspaceResourceCommitGuard } from "../workspace/resource-context.js";
 
 export type ProfileKind = "byok" | "gateway";
 
@@ -206,7 +207,7 @@ function persistProfilesFile(f: ProfilesFile, expectedText?: string, expectedMis
   const binding = bindPrivateHaraStateFile(workspaceStateHome(), [], "profiles.json");
   const text = JSON.stringify(f, null, 2) + "\n";
   if (Buffer.byteLength(text, "utf8") > MAX_PROFILE_STATE_BYTES) throw new Error("profiles registry is too large; existing credentials were preserved");
-  writePrivateStateFileSync(binding, text, { expectedText, expectedMissing });
+  writePrivateStateFileSync(binding, text, { expectedText, expectedMissing, assertCurrent: workspaceResourceCommitGuard() });
   const snapshot = readPrivateStateFileSnapshotSync(binding.path, MAX_PROFILE_STATE_BYTES);
   if (!snapshot) throw new Error("profiles registry disappeared after commit");
   return snapshot;

@@ -180,7 +180,8 @@ export class WorkspaceResourceStorage {
   private readonly directories: string[];
   private context?: StorageContext;
 
-  constructor(home: string, scope: WorkspaceResourceScope) {
+  constructor(home: string, scope: WorkspaceResourceScope, private readonly assertAuthority?: () => void) {
+    if (assertAuthority !== undefined && typeof assertAuthority !== "function") throw new Error("invalid Workspace resource authority fence");
     if (typeof home !== "string" || !isAbsolute(home)) throw new Error("Workspace resources require an explicit absolute host home");
     const canonical = realpathSync.native(home);
     const info = lstatSync(canonical);
@@ -194,6 +195,7 @@ export class WorkspaceResourceStorage {
   /** Explicit first initialization/reopen; never copies profiles, memory, sessions, or Account login.
    * Missing/corrupt markers beside existing state fail closed rather than reassigning ownership. */
   initialize(): void {
+    this.checkAuthority();
     if (this.context) { this.context.assertCurrent(); return; }
     verifyDirectory(this.host);
     const context = withPrivateStateLockSync(this.host.path, this.directories, "scope", () => {
@@ -205,7 +207,7 @@ export class WorkspaceResourceStorage {
         if (stateExisted) {
           throw new Error("Workspace resource scope marker is missing; existing state was preserved");
         }
-        writePrivateStateFileSync(marker, JSON.stringify({ schemaVersion: 1, scope: this.scope, generation: randomUUID() }) + "\n", { expectedMissing: true });
+        writePrivateStateFileSync(marker, JSON.stringify({ schemaVersion: 1, scope: this.scope, generation: randomUUID() }) + "\n", { expectedMissing: true, assertCurrent: () => this.checkAuthority() });
         snapshot = readPrivateStateFileSnapshotSync(marker.path, 4096);
       }
       if (!snapshot) throw new Error("Workspace resource scope marker disappeared");
@@ -226,7 +228,7 @@ export class WorkspaceResourceStorage {
       const dataSnapshot = readPrivateStateFileSnapshotSync(dataMarker.path, 4096);
       if (!dataSnapshot) {
         if (stateExisted) throw new Error("Workspace data binding is missing; existing state was preserved");
-        writePrivateStateFileSync(dataMarker, dataText, { expectedMissing: true });
+        writePrivateStateFileSync(dataMarker, dataText, { expectedMissing: true, assertCurrent: () => this.checkAuthority() });
       } else if (dataSnapshot.text !== dataText) {
         throw new Error("Workspace resource storage generation or data binding mismatch; state was preserved");
       }
@@ -239,6 +241,7 @@ export class WorkspaceResourceStorage {
         verifyDirectory(directory);
         tracked.set(directory.path, { ...directory });
       }, assertCurrent: () => {
+        this.checkAuthority();
         verifyDirectory(this.host);
         verifyDirectory(marker.directory);
         verifyDirectory(state);
@@ -251,6 +254,12 @@ export class WorkspaceResourceStorage {
       } }) satisfies StorageContext;
     });
     this.context = context;
+  }
+
+  private checkAuthority(): void {
+    if (this.assertAuthority && this.assertAuthority() !== undefined) {
+      throw new Error("Workspace resource authority fence must be synchronous and return void");
+    }
   }
 
   run<T>(operation: () => T): T {

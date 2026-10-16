@@ -1,4 +1,4 @@
-import { workspaceStateHome } from "./workspace/resource-context.js";
+import { workspaceStateHome, workspaceResourceCommitGuard } from "./workspace/resource-context.js";
 import { join, dirname, resolve } from "node:path";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import type { SandboxMode } from "./sandbox.js";
@@ -560,7 +560,7 @@ function readProjectConfig(cwd: string): Record<string, any> {
 function persistConfig(cfg: Record<string, unknown>, expectedText?: string, expectedMissing = false): void {
   ensurePrivateHaraState(workspaceStateHome());
   const binding = bindPrivateHaraStateFile(workspaceStateHome(), [], "config.json");
-  writePrivateStateFileSync(binding, JSON.stringify(cfg, null, 2) + "\n", { expectedText, expectedMissing });
+  writePrivateStateFileSync(binding, JSON.stringify(cfg, null, 2) + "\n", { expectedText, expectedMissing, assertCurrent: workspaceResourceCommitGuard() });
 }
 
 /** Mutate global config without exposing a second direct-write implementation to feature modules. */
