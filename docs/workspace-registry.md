@@ -7,6 +7,10 @@ branch and current session binding remain unchanged. A subsequent, separate lega
 memory fix is described in [the compatibility increment](workspace-compatibility-integration.md);
 it does not activate this registry or create new execution audiences.
 
+The [explicit local resource-storage increment](workspace-resource-storage.md) now supplies bound
+adapters for keys/config, sessions, memory and lexical recall. It also remains host-private and
+unactivated; it does not establish membership, full resource isolation or an Agent/Host execution grant.
+
 ## Model
 
 `WorkspaceRecord` has an opaque `ws_<uuid>` id, name, creation time, optional legacy audience

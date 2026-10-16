@@ -5,6 +5,7 @@ import { searchAssetsAsync, titleOf, type Recalled } from "../recall.js";
 import { loadConfig } from "../config.js";
 import { getEmbedder } from "./embed.js";
 import { queryIndex, indexExists } from "./semindex.js";
+import { currentWorkspaceResourceBinding } from "../workspace/resource-context.js";
 
 export async function searchHybrid(
   query: string,
@@ -13,6 +14,9 @@ export async function searchHybrid(
 ): Promise<Recalled[]> {
   const limit = opts.limit ?? 5;
   const lex = await searchAssetsAsync(query, limit, opts.roots, { signal: opts.signal, timeoutMs: opts.timeoutMs });
+  // Project semantic indexes and embedding credentials are still legacy-scoped. Explicit resource
+  // stores stay lexical-only: no shared index lookup, ambient credential read, or paid embedding call.
+  if (currentWorkspaceResourceBinding()) return lex;
   const embed = getEmbedder(loadConfig());
   if (!embed || !indexExists(opts.indexName, cwd)) return lex;
 

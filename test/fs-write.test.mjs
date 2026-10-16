@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -43,6 +44,28 @@ test("atomicWriteText preserves mode and refuses to overwrite a stale edit base"
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("atomicWriteText rechecks host authority after claiming and restores the original entry on denial", async () => {
+  const dir = fixture(), file = join(dir, "authority.txt"); writeFileSync(file, "original authority-owned bytes");
+  const before = lstatSync(file);
+  try {
+    await assert.rejects(atomicWriteText(file, "forbidden replacement", {
+      expected: "original authority-owned bytes",
+      assertCurrent: () => { if (!existsSync(file)) throw new Error("host authority changed after claim"); },
+    }), /authority changed after claim/);
+    assert.equal(readFileSync(file, "utf8"), "original authority-owned bytes");
+    assert.equal(lstatSync(file).ino, before.ino);
+    assert.deepEqual(readdirSync(dir), ["authority.txt"]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("atomicWriteText rejects asynchronous authority fences before any namespace write", async () => {
+  const dir = fixture(), file = join(dir, "unchanged.txt"); writeFileSync(file, "unchanged");
+  try {
+    await assert.rejects(atomicWriteText(file, "must not write", { assertCurrent: () => Promise.resolve() }), /synchronous/);
+    assert.equal(readFileSync(file, "utf8"), "unchanged"); assert.deepEqual(readdirSync(dir), ["unchanged.txt"]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("atomicWriteText checks the opened staging parent before any content write", async () => {

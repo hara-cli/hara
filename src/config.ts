@@ -1,4 +1,4 @@
-import { homedir } from "node:os";
+import { workspaceStateHome } from "./workspace/resource-context.js";
 import { join, dirname, resolve } from "node:path";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import type { SandboxMode } from "./sandbox.js";
@@ -405,7 +405,7 @@ function filterProjectConfig(input: Record<string, any>): Record<string, any> {
 }
 
 export function configPath(): string {
-  return join(homedir(), ".hara", "config.json");
+  return join(workspaceStateHome(), ".hara", "config.json");
 }
 
 interface RawConfigState {
@@ -414,8 +414,8 @@ interface RawConfigState {
 }
 
 function readRawConfigState(): RawConfigState | null {
-  ensurePrivateHaraState();
-  const binding = bindPrivateHaraStateFile(homedir(), [], "config.json");
+  ensurePrivateHaraState(workspaceStateHome());
+  const binding = bindPrivateHaraStateFile(workspaceStateHome(), [], "config.json");
   const snapshot = readPrivateStateFileSnapshotSync(binding.path, MAX_GLOBAL_CONFIG_BYTES);
   if (!snapshot) return null;
   let parsed: unknown;
@@ -431,7 +431,7 @@ function readRawConfigState(): RawConfigState | null {
 }
 
 function withConfigLock<T>(fn: () => T): T {
-  return withPrivateStateLockSync(homedir(), [], "config", fn, {
+  return withPrivateStateLockSync(workspaceStateHome(), [], "config", fn, {
     busyMessage: "global Hara config is busy; retry the operation",
   });
 }
@@ -558,8 +558,8 @@ function readProjectConfig(cwd: string): Record<string, any> {
 
 /** Atomically replace the global 0600 config through the shared private-state CAS boundary. */
 function persistConfig(cfg: Record<string, unknown>, expectedText?: string, expectedMissing = false): void {
-  ensurePrivateHaraState();
-  const binding = bindPrivateHaraStateFile(homedir(), [], "config.json");
+  ensurePrivateHaraState(workspaceStateHome());
+  const binding = bindPrivateHaraStateFile(workspaceStateHome(), [], "config.json");
   writePrivateStateFileSync(binding, JSON.stringify(cfg, null, 2) + "\n", { expectedText, expectedMissing });
 }
 

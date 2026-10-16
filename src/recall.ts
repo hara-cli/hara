@@ -7,6 +7,7 @@ import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { walkFiles, walkFilesAsync, type FileWalkOptions } from "./fs-walk.js";
 import { skillsDirs } from "./skills/skills.js";
 import { readModelContextFileSync } from "./fs-read.js";
+import { currentWorkspaceResourceBinding, readWorkspaceResourceText } from "./workspace/resource-context.js";
 
 const MAX_RECALL_SOURCE_BYTES = 256 * 1024;
 const SEARCH_SNIPPET_CHARS = 800;
@@ -171,7 +172,9 @@ export function searchAssets(query: string, limit = 5, roots?: string[]): Recall
     for (const rel of walkFiles(dir).filter((f) => f.endsWith(".md"))) {
       let text: string;
       try {
-        text = readModelContextFileSync(join(dir, rel), MAX_RECALL_SOURCE_BYTES);
+        text = currentWorkspaceResourceBinding()
+          ? readWorkspaceResourceText(join(dir, rel), MAX_RECALL_SOURCE_BYTES)
+          : readModelContextFileSync(join(dir, rel), MAX_RECALL_SOURCE_BYTES);
       } catch {
         continue;
       }
@@ -237,7 +240,9 @@ export async function searchAssetsAsync(
       }
       let text: string;
       try {
-        text = readModelContextFileSync(join(dir, rel), MAX_RECALL_SOURCE_BYTES);
+        text = currentWorkspaceResourceBinding()
+          ? readWorkspaceResourceText(join(dir, rel), MAX_RECALL_SOURCE_BYTES)
+          : readModelContextFileSync(join(dir, rel), MAX_RECALL_SOURCE_BYTES);
       } catch {
         continue;
       }

@@ -30,6 +30,7 @@
 // tolerates reading it from a legacy config.json (it just maps to the migrated gateway profile).
 // ────────────────────────────────────────────────────────────────────────────────
 import { homedir } from "node:os";
+import { workspaceStateHome } from "../workspace/resource-context.js";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join, dirname, parse as parsePath, relative, resolve as resolvePath } from "node:path";
@@ -190,7 +191,7 @@ interface PrivateJsonState<T> {
 }
 
 function readPrivateJSON<T>(filename: string): PrivateJsonState<T> | null {
-  const binding = bindPrivateHaraStateFile(homedir(), [], filename);
+  const binding = bindPrivateHaraStateFile(workspaceStateHome(), [], filename);
   const snapshot = readPrivateStateFileSnapshotSync(binding.path, MAX_PROFILE_STATE_BYTES);
   if (!snapshot) return null;
   try {
@@ -202,8 +203,10 @@ function readPrivateJSON<T>(filename: string): PrivateJsonState<T> | null {
 
 /** Write the profiles file 0600 (it can hold device tokens / api keys). */
 function persistProfilesFile(f: ProfilesFile, expectedText?: string, expectedMissing = false): PrivateStateFileSnapshot {
-  const binding = bindPrivateHaraStateFile(homedir(), [], "profiles.json");
-  writePrivateStateFileSync(binding, JSON.stringify(f, null, 2) + "\n", { expectedText, expectedMissing });
+  const binding = bindPrivateHaraStateFile(workspaceStateHome(), [], "profiles.json");
+  const text = JSON.stringify(f, null, 2) + "\n";
+  if (Buffer.byteLength(text, "utf8") > MAX_PROFILE_STATE_BYTES) throw new Error("profiles registry is too large; existing credentials were preserved");
+  writePrivateStateFileSync(binding, text, { expectedText, expectedMissing });
   const snapshot = readPrivateStateFileSnapshotSync(binding.path, MAX_PROFILE_STATE_BYTES);
   if (!snapshot) throw new Error("profiles registry disappeared after commit");
   return snapshot;
@@ -282,7 +285,7 @@ function scrubLegacyConfigProfileSelectors(): void {
 }
 
 function withProfilesLock<T>(fn: () => T): T {
-  return withPrivateStateLockSync(homedir(), [], "profiles", fn, {
+  return withPrivateStateLockSync(workspaceStateHome(), [], "profiles", fn, {
     busyMessage: "profiles registry is busy; retry the operation",
   });
 }
@@ -395,7 +398,7 @@ function maybeMigrateUnlocked(): ProfilesState {
   // fails, leave org.json untouched; profiles.json already makes the migration idempotent.
   if (org && legacyOrg) {
     try {
-      const archive = bindPrivateHaraStateFile(homedir(), [], "org.json.legacy");
+      const archive = bindPrivateHaraStateFile(workspaceStateHome(), [], "org.json.legacy");
       writePrivateStateFileSync(archive, legacyOrg.snapshot.text);
       removePrivateStateFile(legacyOrg.binding.path, legacyOrg.snapshot, legacyOrg.binding.directory);
     } catch {

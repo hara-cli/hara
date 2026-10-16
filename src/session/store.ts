@@ -2,26 +2,19 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import {
-  chmodSync,
   closeSync,
   constants,
-  existsSync,
   fstatSync,
   fchmodSync,
   fsyncSync,
-  lstatSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
   readSync,
-  readdirSync,
   realpathSync,
-  renameSync,
-  rmSync,
   type Stats,
-  writeFileSync,
 } from "node:fs";
-import { opendir as openDirAsync } from "node:fs/promises";
+import {
+  chmodSync, existsSync, lstatSync, mkdirSync, openSync, openDirAsync, readFileSync,
+  readdirSync, renameSync, rmSync, writeFileSync,
+} from "../workspace/resource-fs.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   MAX_ASSISTANT_CONTINUATION_CHARS,
@@ -39,6 +32,10 @@ import { isTaskExecution, type TaskExecution } from "./task.js";
 import type { ApprovalMode } from "../config.js";
 import { isValidHaraVersion } from "../version.js";
 import { isConversationCodingLink } from "../serve/coding-link.js";
+import {
+  currentWorkspaceResourceBinding, isWorkspaceResourceBinding, sameWorkspaceResourceBinding,
+  workspaceResourceDirectory, type WorkspaceResourceBinding,
+} from "../workspace/resource-context.js";
 
 /** Durable transcripts are local input on resume. Bound both allocation and post-parse traversal so a
  * corrupt/hostile session cannot turn startup or `hara sessions` into an unbounded resource operation. */
@@ -158,6 +155,8 @@ export function automatedTitle(source: SessionSource, sourceName: string | undef
 export interface SessionMeta {
   id: string;
   cwd: string;
+  /** Host-private storage ownership. Not a Runtime/Host grant or a replacement for legacy Space policy. */
+  resourceBinding?: WorkspaceResourceBinding;
   /** Hara runtime that last opened/wrote this session. Optional only for legacy transcripts. */
   haraVersion?: string;
   /** Identity route that owns this conversation. New sessions always persist it; legacy sessions may
@@ -745,6 +744,7 @@ function canonicalSessionCwd(value: string): string {
 }
 
 function sessionsDir(): string {
+  if (currentWorkspaceResourceBinding()) return workspaceResourceDirectory(["sessions"]);
   const d = join(homedir(), ".hara", "sessions");
   mkdirSync(d, { recursive: true, mode: 0o700 });
   // `mode` is ignored when the directory already exists. Tighten legacy installs too: a session holds
@@ -754,6 +754,7 @@ function sessionsDir(): string {
 }
 
 function sessionIndexDir(): string {
+  if (currentWorkspaceResourceBinding()) return workspaceResourceDirectory(["session-index", `v${SESSION_INDEX_VERSION}`]);
   const d = join(homedir(), ".hara", "session-index", `v${SESSION_INDEX_VERSION}`);
   mkdirSync(d, { recursive: true, mode: 0o700 });
   chmodSync(d, 0o700);
@@ -779,6 +780,7 @@ function sessionIndexRouteRoot(route = "all", create = false): string {
   if (!SESSION_INDEX_ROUTE.test(route)) throw new Error("invalid session index route");
   const root = sessionIndexDir();
   if (route === "all") return root;
+  if (currentWorkspaceResourceBinding()) return workspaceResourceDirectory(["session-index", `v${SESSION_INDEX_VERSION}`, "routes", route]);
   const routes = join(root, "routes");
   const selected = join(routes, route);
   if (create) {
@@ -802,6 +804,10 @@ function sessionIndexBucketFile(bucket: string, create = false, route = "all"): 
   const day = bucket.slice(6, 8);
   const hour = bucket.slice(8, 10);
   const dayDir = join(root, year, month, day);
+  if (currentWorkspaceResourceBinding()) {
+    const prefix = ["session-index", `v${SESSION_INDEX_VERSION}`, ...(route === "all" ? [] : ["routes", route])];
+    return join(workspaceResourceDirectory([...prefix, year, month, day]), `${hour}.ndjson`);
+  }
   if (create) {
     mkdirSync(dayDir, { recursive: true, mode: 0o700 });
     for (const path of [join(root, year), join(root, year, month), dayDir]) {
@@ -1222,6 +1228,11 @@ const sessionFile = (id: string) => join(sessionsDir(), `${checkedSessionId(id)}
 const lockFile = (id: string) => join(sessionsDir(), `${checkedSessionId(id)}.lock`);
 const reclaimFile = (id: string) => join(sessionsDir(), `${checkedSessionId(id)}.lock.reclaim`);
 
+function resourceStateKey(path: string): string {
+  const binding = currentWorkspaceResourceBinding();
+  return binding ? `${binding.scopeKey}:${binding.generation}:${path}` : `legacy:${path}`;
+}
+
 /** Distinguish a missing session from an existing but unreadable/corrupt one without exposing its path. */
 export function sessionFileExists(id: unknown): boolean {
   if (!validSessionId(id)) return false;
@@ -1353,8 +1364,8 @@ export function acquireSessionLock(id: string): { ok: boolean; pid?: number } {
   const claim = newLockRecord();
   try {
     writeExclusive(f, claim);
-    ownedLocks.set(id, claim.token);
-    ownedLockKnownDirectoryState.set(id, knownDirectoryState);
+    ownedLocks.set(resourceStateKey(f), claim.token);
+    ownedLockKnownDirectoryState.set(resourceStateKey(f), knownDirectoryState);
     return { ok: true };
   } catch (error: any) {
     if (error?.code !== "EEXIST") return { ok: false };
@@ -1362,7 +1373,7 @@ export function acquireSessionLock(id: string): { ok: boolean; pid?: number } {
 
   const held = readLockRecord(f);
   if (!held) return { ok: false }; // malformed/unreadable is not proof that the owner is dead
-  if (held.pid === process.pid && !!held.token && ownedLocks.get(id) === held.token) return { ok: true }; // re-entrant
+  if (held.pid === process.pid && !!held.token && ownedLocks.get(resourceStateKey(f)) === held.token) return { ok: true }; // re-entrant
   if (pidAlive(held.pid)) return { ok: false, pid: held.pid };
 
   // Serialize stale takeover. All participants check this guard before attempting the primary O_EXCL create,
@@ -1376,14 +1387,14 @@ export function acquireSessionLock(id: string): { ok: boolean; pid?: number } {
   try {
     const current = readLockRecord(f);
     if (!current) return { ok: false }; // disappeared/corrupted unexpectedly: fail closed
-    if (current.pid === process.pid && !!current.token && ownedLocks.get(id) === current.token) return { ok: true };
+    if (current.pid === process.pid && !!current.token && ownedLocks.get(resourceStateKey(f)) === current.token) return { ok: true };
     if (pidAlive(current.pid)) return { ok: false, pid: current.pid };
 
     rmSync(f); // known-dead, well-formed owner; protected by the reclaim guard
     const replacement = newLockRecord();
     writeExclusive(f, replacement);
-    ownedLocks.set(id, replacement.token);
-    ownedLockKnownDirectoryState.set(id, knownDirectoryState);
+    ownedLocks.set(resourceStateKey(f), replacement.token);
+    ownedLockKnownDirectoryState.set(resourceStateKey(f), knownDirectoryState);
     return { ok: true };
   } catch {
     return { ok: false };
@@ -1471,16 +1482,17 @@ export function reclaimOrphanedSessionLocks(): SessionLockRecoveryReport {
 
 /** Release a session lock we hold (only removes it if the pid matches ours — never steals another's). */
 export function releaseSessionLock(id: string): void {
-  const token = ownedLocks.get(id);
-  if (!token) return;
   try {
     const f = lockFile(id);
+    const ownerKey = resourceStateKey(f);
+    const token = ownedLocks.get(ownerKey);
+    if (!token) return;
     const held = readLockRecord(f);
     const removedOwnLock = held?.pid === process.pid && held.token === token;
     if (removedOwnLock) rmSync(f);
-    ownedLocks.delete(id);
-    if (removedOwnLock && ownedLockKnownDirectoryState.get(id)) writeCurrentWriterDirectoryMarker();
-    ownedLockKnownDirectoryState.delete(id);
+    ownedLocks.delete(ownerKey);
+    if (removedOwnLock && ownedLockKnownDirectoryState.get(ownerKey)) writeCurrentWriterDirectoryMarker();
+    ownedLockKnownDirectoryState.delete(ownerKey);
   } catch {
     // Keep the ownership token so a later cleanup attempt can still prove ownership. Never unlink blindly.
   }
@@ -1497,7 +1509,7 @@ export function deleteSession(id: string): boolean {
     return false;
   }
   if (!existsSync(f)) return false;
-  const ownedBefore = ownedLocks.has(id);
+  const ownedBefore = ownedLocks.has(resourceStateKey(lockFile(id)));
   const lock = acquireSessionLock(id);
   if (!lock.ok) return false;
   let deleted = false;
@@ -2661,6 +2673,16 @@ function persistSessionSnapshot(
   updatedAt: string,
 ): void {
   checkedSessionId(meta.id);
+  const resourceBinding = currentWorkspaceResourceBinding();
+  if (resourceBinding) {
+    if ((meta.resourceBinding !== undefined && !sameWorkspaceResourceBinding(meta.resourceBinding, resourceBinding))
+      || (meta.resourceBinding === undefined && existsSync(sessionFile(meta.id)))) {
+      throw new Error("session does not belong to this Workspace resource scope; existing history was preserved");
+    }
+    meta.resourceBinding = { ...resourceBinding };
+  } else if (meta.resourceBinding !== undefined) {
+    throw new Error("Workspace-bound sessions cannot be written through the legacy store");
+  }
   if (task?.runtimeBinding && (!isTaskExecution(task) || task.runtimeBinding.spaceId !== meta.spaceId
     || task.runtimeBinding.agentRef !== (meta.agentRef ?? "main"))) {
     throw new Error("invalid task Runtime audience; existing session was not replaced");
@@ -2668,7 +2690,7 @@ function persistSessionSnapshot(
   // Also clean the live object. Deep-copy redaction alone protected disk, but could leave a credential in
   // the current renderer until the next reload and allowed the RPC rename response to echo it.
   meta.title = sanitizeSessionTitle(meta.title);
-  const owned = ownedLocks.has(meta.id);
+  const owned = ownedLocks.has(resourceStateKey(lockFile(meta.id)));
   const knownDirectoryState = !owned && sessionDirectoryMatchesCurrentState();
   if (!isTimestamp(updatedAt)) throw new Error("invalid session update timestamp");
   meta.updatedAt = updatedAt;
@@ -3025,6 +3047,10 @@ function isSessionMeta(value: unknown): value is SessionMeta {
   return (
     validSessionId(meta.id) &&
     typeof meta.cwd === "string" &&
+    (currentWorkspaceResourceBinding()
+      ? isWorkspaceResourceBinding(meta.resourceBinding)
+        && sameWorkspaceResourceBinding(meta.resourceBinding, currentWorkspaceResourceBinding()!)
+      : meta.resourceBinding === undefined) &&
     (meta.haraVersion === undefined || isValidHaraVersion(meta.haraVersion)) &&
     (meta.profileId === undefined || isValidProfileId(meta.profileId)) &&
     (meta.spaceId === undefined || isValidSpaceId(meta.spaceId)) &&
@@ -3183,8 +3209,9 @@ function cacheSessionAuthority(
   signature: string,
   authority: SessionAuthority | null,
 ): SessionAuthority | null {
-  sessionAuthorityCache.delete(id);
-  sessionAuthorityCache.set(id, { signature, authority });
+  const cacheKey = resourceStateKey(sessionFile(id));
+  sessionAuthorityCache.delete(cacheKey);
+  sessionAuthorityCache.set(cacheKey, { signature, authority });
   if (sessionAuthorityCache.size > MAX_SESSION_AUTHORITY_CACHE_ENTRIES) {
     const oldest = sessionAuthorityCache.keys().next().value;
     if (typeof oldest === "string") sessionAuthorityCache.delete(oldest);
@@ -3251,10 +3278,11 @@ function authoritativeSessionMetadata(
   info: Stats,
 ): SessionAuthority | null {
   const signature = sessionTranscriptSignature(info);
-  const cached = sessionAuthorityCache.get(id);
+  const cacheKey = resourceStateKey(sessionFile(id));
+  const cached = sessionAuthorityCache.get(cacheKey);
   if (cached?.signature === signature) {
-    sessionAuthorityCache.delete(id);
-    sessionAuthorityCache.set(id, cached);
+    sessionAuthorityCache.delete(cacheKey);
+    sessionAuthorityCache.set(cacheKey, cached);
     return cached.authority;
   }
 
@@ -3859,7 +3887,7 @@ function legacySessionCandidate(id: string): SessionData | null {
  * inert, and after the rename every older duplicate `legacy` record stops matching the authoritative file. */
 function migrateLegacySession(id: string): boolean {
   if (!legacySessionCandidate(id)) return false;
-  const alreadyOwned = ownedLocks.has(id);
+  const alreadyOwned = ownedLocks.has(resourceStateKey(lockFile(id)));
   const lock = acquireSessionLock(id);
   if (!lock.ok) return false;
   try {
@@ -3971,7 +3999,7 @@ function writeMigrationMarker(inspected: number, migrated: number): void {
  * O(1); persistent Serve calls `audit` frequently, but only the first check after the daily interval sweeps.
  * `force` is reserved for an operator/test requesting an immediate complete compatibility import. */
 export function ensureSessionMetadataIndex(options: { force?: boolean; audit?: boolean } = {}): Promise<void> {
-  const root = sessionIndexDir();
+  const root = resourceStateKey(sessionIndexDir());
   const existing = activeSessionIndexMigrations.get(root);
   if (existing) return existing;
   if (

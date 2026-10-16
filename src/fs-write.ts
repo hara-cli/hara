@@ -33,6 +33,9 @@ export interface AtomicWriteOptions {
   boundary?: AtomicWriteBoundary;
   /** Agent lifecycle boundary. Checked immediately before every visible namespace commit. */
   signal?: AbortSignal;
+  /** Host-private synchronous authority fence, checked alongside cancellation before commits. Cleanup
+   * may still restore the verified old inode after denial. This callback must never perform an action. */
+  assertCurrent?: () => void;
 }
 
 export interface AtomicWriteBoundary {
@@ -354,6 +357,8 @@ async function syncDirectory(path: string): Promise<void> {
 export async function atomicWriteText(path: string, content: string, options: AtomicWriteOptions = {}): Promise<AtomicWriteResult> {
   const throwIfCancelled = (): void => {
     if (options.signal?.aborted) throw new Error(`write cancelled before commit: ${path}`);
+    const checked: unknown = options.assertCurrent?.();
+    if (checked !== undefined) throw new Error("atomic write authority fence must be synchronous and return void");
   };
   throwIfCancelled();
   if (options.boundary) {

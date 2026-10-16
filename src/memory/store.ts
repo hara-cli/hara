@@ -9,6 +9,10 @@ import { readModelContextFileSync, readVerifiedRegularFileSnapshot, type Regular
 import { atomicWriteText, bindAtomicWritePath, type AtomicWriteBoundary } from "../fs-write.js";
 import { sanitizeMemoryForPrompt } from "./guard.js";
 import { learningDigest } from "../learning/store.js";
+import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { basename, isAbsolute } from "node:path";
+import { currentWorkspaceResourceBinding, inspectWorkspaceResourceFile, readWorkspaceResourceText, workspaceResourceDirectory } from "../workspace/resource-context.js";
 
 export type Scope = "global" | "project";
 export type Target = "memory" | "user" | "log";
@@ -29,6 +33,13 @@ function capAtLine(text: string, cap: number): string {
 }
 
 export function memoryDir(scope: Scope, cwd: string): string {
+  if (currentWorkspaceResourceBinding()) {
+    if (scope === "global") return workspaceResourceDirectory(["memory", "global"]);
+    if (!isAbsolute(cwd)) throw new Error("Workspace project memory requires an explicit absolute cwd");
+    const project = realpathSync.native(findProjectRoot(cwd));
+    const key = createHash("sha256").update("hara-workspace-project-memory-v1\0").update(project).digest("hex");
+    return workspaceResourceDirectory(["memory", "projects", key]);
+  }
   if (scope === "global") return process.env.HARA_MEMORY || join(homedir(), ".hara", "memory");
   return join(findProjectRoot(cwd), ".hara", "memory");
 }
@@ -45,14 +56,45 @@ function today(): string {
 function targetFile(scope: Scope, target: Target, cwd: string): string {
   const dir = memoryDir(scope, cwd);
   if (target === "user") return join(dir, "USER.md");
-  if (target === "log") return join(dir, "log", `${today()}.md`);
+  if (target === "log") return join(memoryLogDir(scope, cwd), `${today()}.md`);
   return join(dir, "MEMORY.md");
+}
+
+function memoryLogDir(scope: Scope, cwd: string): string {
+  const dir = memoryDir(scope, cwd);
+  if (currentWorkspaceResourceBinding()) {
+    // memoryDir has verified the complete root; add the log directory through the same private binder.
+    const relativeRoot = scope === "global" ? ["memory", "global"] : ["memory", "projects", basename(dir)];
+    return workspaceResourceDirectory([...relativeRoot, "log"]);
+  }
+  return join(dir, "log");
+}
+
+function readMemoryText(path: string): string {
+  return currentWorkspaceResourceBinding()
+    ? readWorkspaceResourceText(path, MAX_MEMORY_SOURCE_BYTES)
+    : readModelContextFileSync(path, MAX_MEMORY_SOURCE_BYTES);
+}
+
+function assertScopedMemorySize(content: string): void {
+  if (currentWorkspaceResourceBinding() && Buffer.byteLength(content, "utf8") > MAX_MEMORY_SOURCE_BYTES) {
+    throw new Error("Workspace memory file is too large; existing memory was preserved");
+  }
 }
 
 async function inspectMemoryWrite(
   path: string,
   action: string,
-): Promise<{ boundary: AtomicWriteBoundary; snapshot: RegularFileSnapshot | null }> {
+): Promise<{ boundary: AtomicWriteBoundary; snapshot: RegularFileSnapshot | null; assertCurrent?: () => void }> {
+  // The legacy atomic writer binds a canonical target. Scoped stores first reject a file alias rather
+  // than canonicalizing it into another Workspace, and then retain the existing identity/CAS fence.
+  if (currentWorkspaceResourceBinding()) {
+    const inspected = inspectWorkspaceResourceFile(path, MAX_MEMORY_SOURCE_BYTES);
+    const boundary = bindAtomicWritePath(path, action);
+    if (boundary.target !== inspected.path) throw new Error("Workspace memory target alias changed; existing memory was preserved");
+    inspected.assertCurrent();
+    return { boundary, snapshot: inspected.snapshot, assertCurrent: inspected.assertCurrent };
+  }
   const boundary = bindAtomicWritePath(path, action);
   try {
     return {
@@ -66,24 +108,30 @@ async function inspectMemoryWrite(
 }
 
 async function commitMemoryText(path: string, text: string, action: string, signal?: AbortSignal): Promise<void> {
-  const { boundary, snapshot } = await inspectMemoryWrite(path, action);
+  assertScopedMemorySize(text);
+  const { boundary, snapshot, assertCurrent } = await inspectMemoryWrite(path, action);
   await atomicWriteText(boundary.target, text, {
     expected: snapshot?.text ?? null,
     expectedIdentity: snapshot ?? undefined,
     boundary,
     signal,
+    assertCurrent,
+    ...(currentWorkspaceResourceBinding() ? { mode: 0o600 } : {}),
   });
 }
 
 export async function appendMemory(scope: Scope, target: Target, content: string, cwd: string, signal?: AbortSignal): Promise<string> {
   const f = targetFile(scope, target, cwd);
-  const { boundary, snapshot } = await inspectMemoryWrite(f, "append memory");
+  const { boundary, snapshot, assertCurrent } = await inspectMemoryWrite(f, "append memory");
   const text = (snapshot ? `${snapshot.text}\n` : "") + content.trim() + "\n";
+  assertScopedMemorySize(text);
   await atomicWriteText(boundary.target, text, {
     expected: snapshot?.text ?? null,
     expectedIdentity: snapshot ?? undefined,
     boundary,
     signal,
+    assertCurrent,
+    ...(currentWorkspaceResourceBinding() ? { mode: 0o600 } : {}),
   });
   return f;
 }
@@ -108,18 +156,21 @@ export async function appendMemoryOnce(
   signal?: AbortSignal,
 ): Promise<{ path: string; appended: boolean }> {
   const f = targetFile(scope, target, cwd);
-  const { boundary, snapshot } = await inspectMemoryWrite(f, "append memory");
+  const { boundary, snapshot, assertCurrent } = await inspectMemoryWrite(f, "append memory");
   const wanted = comparableEntry(content);
   const exists = snapshot?.text
     .split("\n")
     .some((line) => comparableEntry(line) === wanted);
   if (wanted && exists) return { path: f, appended: false };
   const text = (snapshot ? `${snapshot.text}\n` : "") + content.trim() + "\n";
+  assertScopedMemorySize(text);
   await atomicWriteText(boundary.target, text, {
     expected: snapshot?.text ?? null,
     expectedIdentity: snapshot ?? undefined,
     boundary,
     signal,
+    assertCurrent,
+    ...(currentWorkspaceResourceBinding() ? { mode: 0o600 } : {}),
   });
   return { path: f, appended: true };
 }
@@ -131,7 +182,7 @@ export async function replaceMemory(scope: Scope, target: Target, content: strin
 export async function forgetMemory(scope: Scope, target: Target, match: string, cwd: string, signal?: AbortSignal): Promise<number> {
   const f = targetFile(scope, target, cwd);
   if (!match) return 0;
-  const { boundary, snapshot } = await inspectMemoryWrite(f, "forget memory");
+  const { boundary, snapshot, assertCurrent } = await inspectMemoryWrite(f, "forget memory");
   if (!snapshot) return 0;
   const lines = snapshot.text.split("\n");
   const kept = lines.filter((l) => !l.includes(match));
@@ -142,6 +193,8 @@ export async function forgetMemory(scope: Scope, target: Target, match: string, 
     expectedIdentity: snapshot,
     boundary,
     signal,
+    assertCurrent,
+    ...(currentWorkspaceResourceBinding() ? { mode: 0o600 } : {}),
   });
   return removed;
 }
@@ -166,13 +219,15 @@ export function memoryDigest(
     const f = targetFile(scope, target, cwd);
     if (!existsSync(f)) continue;
     try {
-      const t = sanitizeMemoryForPrompt(readModelContextFileSync(f, MAX_MEMORY_SOURCE_BYTES)).text.trim();
+      const t = sanitizeMemoryForPrompt(readMemoryText(f)).text.trim();
       if (t) parts.push(`## ${label}\n${capAtLine(t, SOURCE_CAP[target])}`);
     } catch {
       /* skip unreadable */
     }
   }
-  if (options.includeReviewedLearning !== false) {
+  // Reviewed learning is a separate authority that has not been migrated into these resource stores.
+  // Never silently import it from the legacy home, even when an embedder asks to include it.
+  if (!currentWorkspaceResourceBinding() && options.includeReviewedLearning !== false) {
     const reviewedLearning = learningDigest(cwd, profileId, stateHome);
     if (reviewedLearning) parts.push(reviewedLearning);
   }
@@ -182,7 +237,7 @@ export function memoryDigest(
 /** Concatenate the daily logs (`log/YYYY-MM-DD.md`) from the last `days` for one scope — the short-term
  *  tier `hara memory distill` consolidates into evergreen MEMORY. Empty if there's no log dir. */
 export function readRecentLogs(scope: Scope, cwd: string, days: number): string {
-  const dir = join(memoryDir(scope, cwd), "log");
+  const dir = memoryLogDir(scope, cwd);
   if (!existsSync(dir)) return "";
   const cutoff = Date.now() - days * 86_400_000;
   const out: string[] = [];
@@ -191,7 +246,7 @@ export function readRecentLogs(scope: Scope, cwd: string, days: number): string 
     const m = /^(\d{4})-(\d{2})-(\d{2})\.md$/.exec(f);
     if (m && new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime() < cutoff) continue;
     try {
-      const t = sanitizeMemoryForPrompt(readModelContextFileSync(join(dir, f), MAX_MEMORY_SOURCE_BYTES)).text.trim();
+      const t = sanitizeMemoryForPrompt(readMemoryText(join(dir, f))).text.trim();
       if (t) out.push(`### ${f}\n${t}`);
     } catch {
       /* skip unreadable */
@@ -205,21 +260,25 @@ export async function scaffoldMemory(cwd: string): Promise<string[]> {
   const written: string[] = [];
   for (const scope of ["global", "project"] as Scope[]) {
     const mem = join(memoryDir(scope, cwd), "MEMORY.md");
-    const { boundary, snapshot } = await inspectMemoryWrite(mem, "scaffold memory");
+    const { boundary, snapshot, assertCurrent } = await inspectMemoryWrite(mem, "scaffold memory");
     if (!snapshot) {
       await atomicWriteText(boundary.target, `# hara ${scope} memory\n\nDurable facts & decisions hara records and recalls across sessions. Git-versionable — edit freely.\n`, {
         expected: null,
         boundary,
+        assertCurrent,
+        ...(currentWorkspaceResourceBinding() ? { mode: 0o600 } : {}),
       });
       written.push(mem);
     }
   }
   const user = join(memoryDir("global", cwd), "USER.md");
-  const { boundary, snapshot } = await inspectMemoryWrite(user, "scaffold memory");
+  const { boundary, snapshot, assertCurrent } = await inspectMemoryWrite(user, "scaffold memory");
   if (!snapshot) {
     await atomicWriteText(boundary.target, "# User preferences\n\nHow you like hara to work — voice, conventions, do/don't.\n", {
       expected: null,
       boundary,
+      assertCurrent,
+      ...(currentWorkspaceResourceBinding() ? { mode: 0o600 } : {}),
     });
     written.push(user);
   }
