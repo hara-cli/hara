@@ -3,6 +3,7 @@ import type { RunOutcome, RunProgressEvent } from "../agent/loop.js";
 import type { Todo } from "../tools/todo.js";
 import { redactSensitiveText, requestsCredentialDisclosure } from "../security/secrets.js";
 import { isTaskRuntimeBinding, type TaskRuntimeBinding } from "../agent-runtime/bindings.js";
+import { isWorkspaceAgentTaskBinding, type WorkspaceAgentTaskBinding } from "../workspace/agent-binding.js";
 
 export const TASK_SCHEMA_VERSION = 1;
 export const MAX_TASK_OBJECTIVE_CHARS = 4096;
@@ -170,6 +171,9 @@ export interface TaskExecution {
   id: string;
   /** Host-frozen Runtime provenance; never an execution grant or model-authored checkpoint field. */
   runtimeBinding?: Readonly<TaskRuntimeBinding>;
+  /** New scoped provenance is never downgraded to the legacy runner. Private persona snapshots stay
+   * in their owner-only catalog, not in this object or the public transcript. */
+  workspaceAgentBinding?: Readonly<WorkspaceAgentTaskBinding>;
   /** The request that created the task. Later chat/steering must not silently replace it. */
   objective: string;
   status: TaskExecutionStatus;
@@ -1273,6 +1277,7 @@ export function recoverTaskExecution(task: TaskExecution | undefined, at: Date |
 
 export function forkTaskExecution(task: TaskExecution | undefined, at: Date | string = new Date()): TaskExecution | undefined {
   if (!task) return undefined;
+  if (task.workspaceAgentBinding !== undefined) throw new Error("Workspace Agent task forks require explicit scoped admission; no legacy fork was created");
   const now = iso(at);
   return {
     ...task,
@@ -1594,6 +1599,8 @@ function validTaskProgress(value: unknown): value is RunProgressEvent {
 export function isTaskExecution(value: unknown): value is TaskExecution {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const task = value as Record<string, unknown>;
+  if (task.workspaceAgentBinding !== undefined && (task.runtimeBinding !== undefined
+    || !isWorkspaceAgentTaskBinding(task.workspaceAgentBinding) || task.workspaceAgentBinding.taskId !== task.id)) return false;
   if (task.runtimeBinding !== undefined && (!isTaskRuntimeBinding(task.runtimeBinding)
     || task.runtimeBinding.taskId !== task.id)) return false;
   if (

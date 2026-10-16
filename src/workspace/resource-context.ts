@@ -69,6 +69,7 @@ export function sameWorkspaceResourceBinding(a: WorkspaceResourceBinding, b: Wor
 interface StorageContext {
   readonly home: string;
   readonly binding: WorkspaceResourceBinding;
+  readonly scope: WorkspaceResourceScope;
   assertCurrent(): void;
   trackDirectory(directory: PrivateStateDirectoryIdentity): void;
 }
@@ -82,6 +83,10 @@ export function workspaceStateHome(): string {
 }
 export function currentWorkspaceResourceBinding(): WorkspaceResourceBinding | undefined {
   return contexts.getStore()?.binding;
+}
+/** @internal Structural scope for validating stored provenance, not fresh membership authority. */
+export function currentWorkspaceResourceScope(): WorkspaceResourceScope | undefined {
+  return contexts.getStore()?.scope;
 }
 
 /** @internal Capture the original context before awaiting file preparation; never follow a later
@@ -127,7 +132,33 @@ export function bindWorkspaceResourceFile(path: string) {
   context.trackDirectory(binding.directory);
   const assertCurrent = (): void => { context.assertCurrent(); verifyDirectory(binding.directory); };
   assertCurrent();
-  return { path: binding.path, assertCurrent };
+  return { path: binding.path, directory: binding.directory, assertCurrent };
+}
+
+/** @internal A narrow read-only inventory permit for one exact memory bucket. Never a generic
+ * allowProtected flag: profiles, Agent config, other Workspaces and arbitrary roots are refused. */
+export function bindWorkspaceMemoryInventory(root: string) {
+  const context = contexts.getStore();
+  if (!context) throw new Error("Workspace memory inventory requires an explicit resource context");
+  const home = workspaceStateHome();
+  const parts = relative(join(home, ".hara", "memory"), root).split(sep);
+  if (!isAbsolute(root) || ((parts.length !== 1 || parts[0] !== "global")
+    && (parts.length !== 2 || parts[0] !== "projects" || !HASH.test(parts[1]!)))) {
+    throw new Error("Workspace memory inventory requires one exact bound memory bucket");
+  }
+  const assertDirectory = (path: string): void => {
+    if (contexts.getStore() !== context) throw new Error("Workspace memory inventory permit belongs to another resource context");
+    context.assertCurrent();
+    const rel = relative(root, path);
+    if (!isAbsolute(path) || isAbsolute(rel) || rel.split(sep).includes("..")) throw new Error("directory escaped Workspace memory inventory");
+    const info = lstatSync(path);
+    if (!info.isDirectory() || info.isSymbolicLink() || realpathSync.native(path) !== path
+      || (process.platform !== "win32" && (info.mode & 0o077) !== 0)) throw new Error("unsafe Workspace memory inventory directory");
+    context.trackDirectory({ path, dev: info.dev, ino: info.ino });
+    context.assertCurrent();
+  };
+  assertDirectory(root);
+  return Object.freeze({ root, assertDirectory });
 }
 
 function pathExists(path: string): boolean {
@@ -201,7 +232,7 @@ export class WorkspaceResourceStorage {
       }
       const frozenText = snapshot.text;
       const tracked = new Map<string, PrivateStateDirectoryIdentity>();
-      return Object.freeze({ home: state.path, binding, trackDirectory: (directory: PrivateStateDirectoryIdentity) => {
+      return Object.freeze({ home: state.path, binding, scope: this.scope, trackDirectory: (directory: PrivateStateDirectoryIdentity) => {
         const known = tracked.get(directory.path);
         if (known) { verifyDirectory(known); return; }
         if (tracked.size >= 10_000) throw new Error("Workspace resource directory tracking limit exceeded");

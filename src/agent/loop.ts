@@ -1,5 +1,6 @@
 import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment, TurnArgs, TurnResult } from "../providers/types.js";
 import { isTaskRuntimeBinding } from "../agent-runtime/bindings.js";
+import { WORKSPACE_AGENT_EXECUTION_PENDING } from "../workspace/agent-binding.js";
 import { createToolImageStore, redactOwnedToolImageText } from "../tools/tool-images.js";
 import { redactOwnedToolImageValue } from "../security/tool-media-redaction.js";
 import { createComputerRunScope, closeComputerRunScope } from "../tools/computer-run.js";
@@ -1182,6 +1183,9 @@ export async function runGovernedAgent(
   // another Runtime must not silently execute here merely because Serve's registry was bypassed.
   const initialTask = opts.taskIntake?.task;
   const currentTask = opts.taskIntake?.current ? opts.taskIntake.current() : initialTask;
+  if (initialTask?.workspaceAgentBinding !== undefined || currentTask?.workspaceAgentBinding !== undefined) {
+    return { status: "error", error: WORKSPACE_AGENT_EXECUTION_PENDING };
+  }
   if (initialTask?.runtimeBinding !== undefined || currentTask?.runtimeBinding !== undefined) {
     const binding = currentTask?.runtimeBinding;
     const initialBinding = initialTask?.runtimeBinding;

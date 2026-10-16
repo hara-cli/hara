@@ -29,12 +29,14 @@ import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { isValidProfileId, isValidSpaceId } from "../profile/profile.js";
 import { sleepSync } from "../sync-sleep.js";
 import { isTaskExecution, type TaskExecution } from "./task.js";
+import { isWorkspaceAgentId } from "../workspace/agent-binding.js";
+import { withPrivateStateLockSync } from "../security/private-state.js";
 import type { ApprovalMode } from "../config.js";
 import { isValidHaraVersion } from "../version.js";
 import { isConversationCodingLink } from "../serve/coding-link.js";
 import {
-  currentWorkspaceResourceBinding, isWorkspaceResourceBinding, sameWorkspaceResourceBinding,
-  workspaceResourceDirectory, type WorkspaceResourceBinding,
+  currentWorkspaceResourceBinding, currentWorkspaceResourceScope, isWorkspaceResourceBinding, sameWorkspaceResourceBinding,
+  workspaceResourceDirectory, workspaceStateHome, type WorkspaceResourceBinding,
 } from "../workspace/resource-context.js";
 
 /** Durable transcripts are local input on resume. Bound both allocation and post-parse traversal so a
@@ -157,6 +159,8 @@ export interface SessionMeta {
   cwd: string;
   /** Host-private storage ownership. Not a Runtime/Host grant or a replacement for legacy Space policy. */
   resourceBinding?: WorkspaceResourceBinding;
+  /** Stable scoped Agent identity; not a legacy role ref, membership or executable Host grant. */
+  workspaceAgentId?: string;
   /** Hara runtime that last opened/wrote this session. Optional only for legacy transcripts. */
   haraVersion?: string;
   /** Identity route that owns this conversation. New sessions always persist it; legacy sessions may
@@ -1656,6 +1660,7 @@ function redactedSessionCopy(data: SessionData): SessionData {
   if (data.meta.archived !== undefined) safe.meta.archived = data.meta.archived;
   if (data.meta.gatewayOwner !== undefined) safe.meta.gatewayOwner = data.meta.gatewayOwner;
   if (data.meta.agentRef !== undefined) safe.meta.agentRef = data.meta.agentRef;
+  if (data.meta.workspaceAgentId !== undefined) safe.meta.workspaceAgentId = data.meta.workspaceAgentId;
   if (data.meta.agentDelegation !== undefined) safe.meta.agentDelegation = { ...data.meta.agentDelegation };
   if (data.meta.codingSessionLink !== undefined) {
     safe.meta.codingSessionLink = { ...data.meta.codingSessionLink,
@@ -1684,6 +1689,9 @@ function redactedSessionCopy(data: SessionData): SessionData {
   }
   if (data.task && safe.task) {
     if (data.task.runtimeBinding !== undefined) safe.task.runtimeBinding = { ...data.task.runtimeBinding };
+    if (data.task.workspaceAgentBinding !== undefined) safe.task.workspaceAgentBinding = {
+      ...data.task.workspaceAgentBinding, resourceBinding: { ...data.task.workspaceAgentBinding.resourceBinding },
+    };
     // Task objective/steering are free-form and stay redacted. Execution identity and transition metadata
     // are structural: preserve them exactly so resume/expectedTurnId validation cannot be corrupted by a
     // credential-looking identifier.
@@ -2673,6 +2681,25 @@ function persistSessionSnapshot(
   updatedAt: string,
 ): void {
   checkedSessionId(meta.id);
+  if (currentWorkspaceResourceBinding()) {
+    // Serialize ownership checks with every scoped transcript publication, including callers without
+    // a live Session lock. Concurrent first creates may not each claim the same ID for another Agent.
+    const key = createHash("sha256").update(meta.id).digest("hex");
+    workspaceResourceDirectory(["sessions", "workspace-publication-locks"]);
+    return withPrivateStateLockSync(workspaceStateHome(), ["sessions", "workspace-publication-locks"], key, () => {
+      persistSessionSnapshotInner(meta, history, task, updatedAt);
+    });
+  }
+  persistSessionSnapshotInner(meta, history, task, updatedAt);
+}
+
+function persistSessionSnapshotInner(
+  meta: SessionMeta,
+  history: NeutralMsg[],
+  task: TaskExecution | undefined,
+  updatedAt: string,
+): void {
+  checkedSessionId(meta.id);
   const resourceBinding = currentWorkspaceResourceBinding();
   if (resourceBinding) {
     if ((meta.resourceBinding !== undefined && !sameWorkspaceResourceBinding(meta.resourceBinding, resourceBinding))
@@ -2686,6 +2713,17 @@ function persistSessionSnapshot(
   if (task?.runtimeBinding && (!isTaskExecution(task) || task.runtimeBinding.spaceId !== meta.spaceId
     || task.runtimeBinding.agentRef !== (meta.agentRef ?? "main"))) {
     throw new Error("invalid task Runtime audience; existing session was not replaced");
+  }
+  if ((meta.workspaceAgentId !== undefined && (!resourceBinding || !isWorkspaceAgentId(meta.workspaceAgentId) || meta.agentRef !== undefined))
+    || (task !== undefined && (meta.workspaceAgentId !== undefined || task.workspaceAgentBinding !== undefined)
+      && (!isTaskExecution(task) || !workspaceAgentSessionMatches(meta, task)))) {
+    throw new Error("invalid Workspace Agent task audience; existing session was not replaced");
+  }
+  if (resourceBinding && existsSync(sessionFile(meta.id))) {
+    const previous = readSessionFile(sessionFile(meta.id));
+    if (!previous || previous.meta.workspaceAgentId !== meta.workspaceAgentId) {
+      throw new Error("Workspace Agent session owner affiliation cannot be removed, adopted or reassigned; existing history was preserved");
+    }
   }
   // Also clean the live object. Deep-copy redaction alone protected disk, but could leave a credential in
   // the current renderer until the next reload and allowed the RPC rename response to echo it.
@@ -3051,6 +3089,8 @@ function isSessionMeta(value: unknown): value is SessionMeta {
       ? isWorkspaceResourceBinding(meta.resourceBinding)
         && sameWorkspaceResourceBinding(meta.resourceBinding, currentWorkspaceResourceBinding()!)
       : meta.resourceBinding === undefined) &&
+    (meta.workspaceAgentId === undefined || (currentWorkspaceResourceBinding() !== undefined
+      && isWorkspaceAgentId(meta.workspaceAgentId) && meta.agentRef === undefined)) &&
     (meta.haraVersion === undefined || isValidHaraVersion(meta.haraVersion)) &&
     (meta.profileId === undefined || isValidProfileId(meta.profileId)) &&
     (meta.spaceId === undefined || isValidSpaceId(meta.spaceId)) &&
@@ -3120,9 +3160,20 @@ function isSessionData(d: unknown): d is SessionData {
     Array.isArray(o.history) && o.history.every(isNeutralMessage) &&
     (o.task === undefined || (isTaskExecution(o.task) && (!o.task.runtimeBinding || (
       o.task.runtimeBinding.spaceId === o.meta.spaceId && o.task.runtimeBinding.agentRef === (o.meta.agentRef ?? "main")
-    )))) &&
+    )) && workspaceAgentSessionMatches(o.meta, o.task))) &&
     (o.storageGeneration === undefined
       || (typeof o.storageGeneration === "string" && SESSION_STORAGE_GENERATION.test(o.storageGeneration)));
+}
+
+/** Structural history validation only. Archiving an Agent must deny execution, not hide its existing
+ * conversation/receipts. Live epochs, snapshots and membership are checked separately by admission. */
+function workspaceAgentSessionMatches(meta: SessionMeta, task: TaskExecution): boolean {
+  const binding = task.workspaceAgentBinding;
+  if (binding === undefined) return meta.workspaceAgentId === undefined;
+  return meta.resourceBinding !== undefined && meta.workspaceAgentId === binding.agentId
+    && meta.agentRef === undefined && binding.taskId === task.id
+    && binding.workspaceId === currentWorkspaceResourceScope()?.workspaceId
+    && sameWorkspaceResourceBinding(binding.resourceBinding, meta.resourceBinding);
 }
 
 /** Read only. Legacy plaintext is redacted in the returned in-memory copy but intentionally not migrated

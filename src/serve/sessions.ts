@@ -217,6 +217,9 @@ export class SessionHub {
   ): { session: ServeSession } | { missing: true } | { lockedBy: number } | { busy: true } {
     const live = this.sessions.get(id);
     if (live?.busy || live?.configuring) return { busy: true };
+    if (live?.meta.workspaceAgentId !== undefined || live?.task?.workspaceAgentBinding !== undefined) {
+      throw new Error("Workspace Agent sessions require explicit scoped admission; no legacy resume was started");
+    }
     if (live) return { session: live }; // already attached to this server
     const lock = this.store.acquire(id);
     if (!lock.ok) return { lockedBy: lock.pid ?? 0 };
@@ -224,6 +227,9 @@ export class SessionHub {
     try {
       const prior = this.store.load(id); // lock-before-load: this is the authoritative latest snapshot
       if (!prior) return { missing: true };
+      if (prior.meta.workspaceAgentId !== undefined || prior.task?.workspaceAgentBinding !== undefined) {
+        throw new Error("Workspace Agent sessions require explicit scoped admission; no legacy resume was started");
+      }
       // Credentials are refreshed live inside the session's persisted identity route; the model remains
       // the session's explicit pin.
       prior.meta.provider = o.provider.id;
@@ -636,6 +642,9 @@ export class SessionHub {
     const src: { meta: SessionMeta; history: NeutralMsg[]; task?: TaskExecution } | null =
       o.sourceSnapshot ?? live ?? this.store.load(id);
     if (!src) return { missing: true };
+    if (src.meta.resourceBinding !== undefined || src.meta.workspaceAgentId !== undefined || src.task?.workspaceAgentBinding !== undefined) {
+      throw new Error("Workspace-scoped session forks require explicit scoped admission; no legacy fork was created");
+    }
     const sourceProfileId = src.meta.profileId ?? "personal";
     const targetProfileId = o.profileId ?? sourceProfileId;
     const sourceSpaceId = src.meta.spaceId ?? failClosedSpaceId(sourceProfileId);

@@ -61,6 +61,9 @@ export interface PrivateStateFileBinding {
 }
 
 export interface PrivateStateWriteOptions {
+  /** Host-private synchronous fence. Recovery may restore the original inode after denial, but must
+   * never authorize publishing replacement bytes. Not a renderer/model callback or a Promise. */
+  assertCurrent?: () => void;
   /**
    * Optional compare-and-swap guard. When present, the current file must exist with exactly this text
    * before replacement; otherwise no caller data is written.
@@ -871,6 +874,11 @@ export function writePrivateStateFileSync(
   options: PrivateStateWriteOptions = {},
 ): void {
   const { directory, path } = binding;
+  const assertCurrent = (): void => {
+    const result: unknown = options.assertCurrent?.();
+    if (result !== undefined) throw new Error("private state authority fence must be synchronous and return void");
+  };
+  assertCurrent();
   verifyPrivateDirectory(directory);
   if (resolve(path) !== join(directory.path, checkedPrivateComponent(basename(path)))) {
     throw new Error(`private Hara state file is outside '${directory.path}'`);
@@ -891,6 +899,8 @@ export function writePrivateStateFileSync(
     // `wx` maps to O_WRONLY|O_CREAT|O_EXCL/CREATE_NEW and refuses an already-present symlink or file.
     // Bun's Windows numeric-open compatibility can otherwise turn this valid create into a false ENOENT.
     fd = openSync(temp, "wx", 0o600);
+    assertCurrent();
+    verifyPrivateDirectory(directory);
     writeFileSync(fd, text, "utf8");
     tightenPrivateDescriptorMode(fd, 0o600);
     fsyncSync(fd);
@@ -908,6 +918,7 @@ export function writePrivateStateFileSync(
     if (!existing) {
       try {
         verifyPrivateDirectory(directory);
+        assertCurrent();
         linkSync(temp, path);
       } catch (error: any) {
         if (error?.code === "EEXIST") {
@@ -919,6 +930,7 @@ export function writePrivateStateFileSync(
       const claimed = join(directory.path, `.hara-claim-${process.pid}-${randomUUID()}.tmp`);
       try {
         verifyPrivateDirectory(directory);
+        assertCurrent();
         renameSync(path, claimed);
       } catch (error: any) {
         if (error?.code === "ENOENT") {
@@ -952,6 +964,7 @@ export function writePrivateStateFileSync(
       }
       try {
         verifyPrivateDirectory(directory);
+        assertCurrent();
         linkSync(temp, path);
       } catch (error: any) {
         let recovery = "";

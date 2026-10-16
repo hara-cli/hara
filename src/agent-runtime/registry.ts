@@ -2,6 +2,7 @@ import { runAgent, type RunOpts, type RunOutcome } from "../agent/loop.js";
 import { runPiAgent } from "./pi.js";
 import type { NeutralMsg } from "../providers/types.js";
 import { AGENT_RUNTIME_IDS, isTaskRuntimeBinding, type AgentRuntimeId, type TaskRuntimeBinding } from "./bindings.js";
+import { WORKSPACE_AGENT_EXECUTION_PENDING } from "../workspace/agent-binding.js";
 
 /** Host-owned code only. Imported persona text and renderer fields cannot register a driver or grant
  * tools. New drivers must implement the same Hara admission, approval, cancellation and recovery rules. */
@@ -45,6 +46,8 @@ export class AgentRuntimeRegistry {
   }
 
   run(history: NeutralMsg[], options: RunOpts, binding: Readonly<TaskRuntimeBinding>): Promise<RunOutcome> {
+    if (options.taskIntake?.task.workspaceAgentBinding !== undefined
+      || options.taskIntake?.current?.()?.workspaceAgentBinding !== undefined) throw new Error(WORKSPACE_AGENT_EXECUTION_PENDING);
     if (!isTaskRuntimeBinding(binding) || options.ctx.spaceId !== binding.spaceId
       || (options.taskIntake?.current?.() ?? options.taskIntake?.task)?.id !== binding.taskId) throw new Error("Agent Runtime execution binding does not match this task audience");
     this.assertAvailable(binding.runtimeId);

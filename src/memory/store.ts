@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { existsSync, readdirSync } from "node:fs";
 import { findProjectRoot } from "../context/agents-md.js";
 import { readModelContextFileSync, readVerifiedRegularFileSnapshot, type RegularFileSnapshot } from "../fs-read.js";
-import { atomicWriteText, bindAtomicWritePath, type AtomicWriteBoundary } from "../fs-write.js";
+import { atomicWriteText, bindAtomicWritePath, bindHaraPrivateStateWritePath, type AtomicWriteBoundary } from "../fs-write.js";
 import { sanitizeMemoryForPrompt } from "./guard.js";
 import { learningDigest } from "../learning/store.js";
 import { createHash } from "node:crypto";
@@ -90,7 +90,7 @@ async function inspectMemoryWrite(
   // than canonicalizing it into another Workspace, and then retain the existing identity/CAS fence.
   if (currentWorkspaceResourceBinding()) {
     const inspected = inspectWorkspaceResourceFile(path, MAX_MEMORY_SOURCE_BYTES);
-    const boundary = bindAtomicWritePath(path, action);
+    const boundary = bindHaraPrivateStateWritePath(inspected.path, inspected.directory.path, action);
     if (boundary.target !== inspected.path) throw new Error("Workspace memory target alias changed; existing memory was preserved");
     inspected.assertCurrent();
     return { boundary, snapshot: inspected.snapshot, assertCurrent: inspected.assertCurrent };

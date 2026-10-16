@@ -40,6 +40,8 @@ const HARA_PRIVATE_FILES = new Set([
   "qwen-oauth.json",
   "profiles.json",
   "agent-runtime-bindings.json",
+  "workspace-agents.json",
+  "workspace-agents-owner.json",
   "serve.json",
   "desk.json",
   "desk-connections.json",
@@ -52,7 +54,7 @@ const HARA_PRIVATE_FILES = new Set([
   "flows-pending.json",
   "permissions.json",
 ]);
-const HARA_PRIVATE_DIRS = new Set(["sessions", "checkpoints", "index", "gateway", "cron", "agent-teams"]);
+const HARA_PRIVATE_DIRS = new Set(["sessions", "checkpoints", "index", "gateway", "cron", "agent-teams", "workspace-data"]);
 const HARA_AGENT_CONTENT_DIRS = new Set([
   "workspace", "plugins", "skills", "roles", "org-roles", "memory", "code-assets", "bin", "tts",
 ]);
@@ -147,6 +149,9 @@ function haraStateReason(path: string): string | null {
   // basename. `config.json::$DATA`, `sessions:stream/...`, and trailing-dot/space variants all address
   // protected state on NTFS and must retain that identity on every platform where the policy is tested.
   const parts = securityPathComponents(absolute);
+  // A Workspace partition contains its own .hara. Looking only at the last .hara would let its
+  // content-directory names hide the outer private tree when a host home is not the ambient home.
+  if (parts.some((part, index) => part === ".hara" && parts[index + 1] === "workspace-data")) return "private Hara state";
   const haraAt = parts.lastIndexOf(".hara");
   if (haraAt >= 0) {
     const after = parts.slice(haraAt + 1);
@@ -312,6 +317,7 @@ function protectedDirectoryReason(path: string): string | null {
     return "private Hara state";
   }
   const parts = securityPathComponents(absolute);
+  if (parts.some((part, index) => part === ".hara" && parts[index + 1] === "workspace-data")) return "private Hara state";
   const haraAt = parts.lastIndexOf(".hara");
   if (haraAt >= 0 && HARA_PRIVATE_DIRS.has(parts[haraAt + 1] ?? "")) return "private Hara state";
   if (normalizedSecurityBasename(basename(absolute)) === ".direnv") return "direnv secret state";

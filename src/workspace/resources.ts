@@ -6,6 +6,8 @@ import * as profiles from "../profile/profile.js";
 import type { SessionStore } from "../serve/sessions.js";
 import { searchHybrid } from "../search/hybrid.js";
 import { sanitizeMemoryForPrompt } from "../memory/guard.js";
+import { WorkspaceAgentStore } from "./agents.js";
+import { isTaskExecution, type TaskExecution } from "../session/task.js";
 import {
   currentWorkspaceResourceBinding, sameWorkspaceResourceBinding, WorkspaceResourceStorage,
   type WorkspaceResourceScope,
@@ -31,11 +33,26 @@ export class WorkspaceResources {
   };
   readonly connections;
   readonly memory;
+  readonly agents;
 
   constructor(hostHome: string, scope: WorkspaceResourceScope) {
     this.storage = new WorkspaceResourceStorage(hostHome, scope);
     const bind = <A extends unknown[], R>(fn: (...args: A) => R) => (...args: A): R => this.storage.run(() => fn(...args));
     const bindAsync = <A extends unknown[], R>(fn: (...args: A) => Promise<R>) => async (...args: A): Promise<R> => this.storage.run(() => fn(...args));
+    const agents = new WorkspaceAgentStore(this.storage.scope);
+    this.agents = Object.freeze({
+      list: bind(agents.list.bind(agents)), get: bind(agents.get.bind(agents)),
+      initializeMain: bind(agents.initializeMain.bind(agents)), create: bind(agents.create.bind(agents)),
+      updatePersona: bind(agents.updatePersona.bind(agents)), setRuntime: bind(agents.setRuntime.bind(agents)),
+      setArchived: bind(agents.setArchived.bind(agents)), runtimeOptions: bind(agents.runtimeOptions.bind(agents)),
+      resolveTask: bind(agents.resolveTask.bind(agents)),
+      bindTask: bind((task: TaskExecution, agentId: string, configRevision: number, agentEpoch: number): TaskExecution => {
+        if (!isTaskExecution(task) || task.runtimeBinding !== undefined || task.workspaceAgentBinding !== undefined) {
+          throw new Error("a new Workspace Agent task requires unbound valid task state");
+        }
+        return { ...task, workspaceAgentBinding: agents.freezeTask(task.id, agentId, configRevision, agentEpoch) };
+      }),
+    });
     this.sessions = Object.freeze({
       load: bind(sessions.loadSession), save: bind(sessions.saveSession), list: bind(sessions.listSessions),
       listPage: bind((options: sessions.SessionMetadataPageOptions = {}) => {

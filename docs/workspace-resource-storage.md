@@ -6,7 +6,7 @@ Status: explicit host-private adapters, not activated in CLI/Serve/Desktop start
 ## Implemented boundary
 
 `WorkspaceResources(explicitHostHome, verifiedScope)` binds the existing profile/config, session,
-memory and lexical-recall implementations to one private partition. Construction performs no writes;
+memory and lexical-recall implementations and the new explicit Agent catalog to one private partition. Construction performs no writes;
 `initialize()` deliberately creates or reopens it. It never changes HOME, USERPROFILE, cwd, a foreground
 selection or environment overrides. Concurrent A/B operations retain their original contexts.
 
@@ -27,6 +27,8 @@ scope.json                        immutable scope + storage generation
 state/.hara/resource-binding.json  independent data-side generation binding
 state/.hara/profiles.json          this scope's private connection profiles
 state/.hara/config.json            this scope's optional base configuration
+state/.hara/workspace-agents-owner.json  immutable main Agent/storage owner
+state/.hara/workspace-agents.json   Agent identities, lifecycle epochs and private config snapshots
 state/.hara/sessions/              transcripts, metadata, journals, locks
 state/.hara/session-index/         this scope's acceleration index
 state/.hara/memory/global/         this Workspace's shared memory
@@ -90,6 +92,63 @@ These are application/storage safeguards, **not encryption, an OS sandbox, or pr
 host administrator who can forge every file**. They do not authorize arbitrary filesystem/tool access.
 External side effects still require their own receipts and uncertain-outcome recovery.
 
+## Explicit Agent and Runtime configuration slice (2026-10-16)
+
+`resources.agents` never discovers legacy, project, Claude, OpenClaw/Hermes or plugin roles. A read of a
+new partition returns an empty catalog. Only `initializeMain()` explicitly creates its stable `ag_UUID`
+main Hara, with the packaged Hara brand and available Pi default. New colleagues have their own stable
+IDs, immutable usernames and available Pi default; names/persona are presentation, not identity or
+permission. Existing main/legacy Agents are not rebound. Codex/Claude/OpenCode general-Agent drivers
+remain unavailable and cannot be selected merely because their CLI or coding worker is installed.
+
+One bounded owner-only manifest is authoritative for identities, persona and one effective Runtime
+configuration. The separate immutable owner marker reserves exactly one main identity, not a second
+mutable default. Main cannot be archived/replaced or impersonated by create input. Missing either
+half, bad/future format, wrong scope/generation, altered hashes, duplicate IDs/usernames or unexpected
+fields deny reads/writes rather than repair or import. A failed first publication can retain its owner
+reservation for explicit repair; it never silently creates another main. No repair/migration UI exists
+in this slice.
+
+Create uses catalog revision CAS; per-Agent edits use exact Agent ID, configuration revision and
+lifecycle epoch under the shared interprocess lock. Configuration edits append immutable private
+snapshots and advance the effective pointer in one commit. Old tasks keep their exact persona, Runtime,
+hash and revision across restart rather than resolving today's config. The manifest caps 256 retained
+Agents, 64 configurations per Agent and 2 MiB; a full catalog refuses edits instead of pruning old
+snapshots or reusing an archived username/ID. Instructions are capped at 32,000 characters and stay
+host-private. List/get projections include only allowlisted public identity/status/Runtime metadata,
+not private instructions, past configs, hashes, paths, imported role policy or model credentials.
+
+Archive and explicit restore each advance a separate lifecycle epoch. Archive denies private execution
+snapshot resolution; restoring the same identity does not revive a prior task epoch. Neither operation
+deletes historical sessions, receipts or configs. Structural history validation is independent from live
+admission so authorized retained conversation history remains readable after archival. These are local
+catalog fences, not a cloud revocation service or cancellation of a running external action.
+
+`bindTask()` freezes a separate `workspaceAgentBinding` containing schema, full resource binding,
+Workspace/Agent ID, lifecycle epoch, config revision/hash, Runtime and task ID. It grants no membership,
+Host/placement, native session, tool, Skill or model connection authority. Scoped Session persistence
+checks exact task/Agent/resource attribution on both read and write; provenance contains no private
+persona body. Existing transcript IDs cannot lose, adopt or change their Agent affiliation. Scoped
+publications serialize that check in a separately pinned private lock directory before index, staging or
+journal writes; its keys cannot collide with normal Session locks. Legacy fresh-task admission,
+configured/direct Hara/Pi runners, driver registry and fork
+all explicitly refuse this new provenance, including malformed/future/dual legacy+scoped data, before
+model/tools. A new scoped fork still requires future explicit admission; it cannot drop provenance and
+fall through to Hara. This slice does **not** enable Workspace Agent execution.
+Legacy SessionHub also refuses Agent-bound resume and every scoped-resource fork, even with no task;
+authorized history remains available through the bound store's read/list operations.
+
+The synchronous private-state writer now accepts a host-owned void authority fence before staging
+content, namespace claims and publication. Denial after claiming a catalog restores its verified old
+inode without publishing new bytes. Context and owner marker remain checked at commit. The whole
+Workspace resource tree is protected from generic model file tools even outside the ambient home,
+including an inner `.hara` that would otherwise hide its outer private partition.
+Authorized memory writes reuse the existing object-identity private-state binder for their exact
+inspected immediate parent. Memory recall gets a separate bounded inventory permit for only one
+global/project memory bucket, original context and pinned directories. Generic walkers retain their
+protected-file policy; copied options, another root/context, cancelled work and wider private directories
+cannot use this permit. No ambient-context-wide bypass is introduced.
+
 ## Compatibility and activation gates
 
 No user data, registry, main Agent binding, native session, gateway or Dev process is moved, deleted,
@@ -98,8 +157,9 @@ Before activation, implement and independently verify:
 
 1. Trusted local/Account enrollment and fresh membership for resource operations; explicit connection
    mapping and immutable RunBindingV2 without a second default authority.
-2. Agent/persona, Runtime, Host grants, tools, skills, attachments/files, other indexes, connectors,
-   queues, approvals, budgets, results and audit isolation. These are not covered by the four adapters.
+2. Wire the explicit Agent/persona/Runtime catalog into authenticated admission, then isolate Host
+   grants, per-Agent private memory, tools, skills, attachments/files, other indexes, connectors,
+   queues, approvals, budgets, results and audit. These are not covered by the current storage adapters.
 3. Frozen scope through actual CLI/Serve/gateway/cron/provider/tool/vision/judge/native-runtime paths,
    cancellation/drain and restart. Do not inject only the SessionStore while leaving other dependencies
    on the legacy home.
@@ -119,3 +179,10 @@ an actual suspended-search root swap, and a suspended write denied before commit
 also tests denial after claim restoring the original inode and rejection of an asynchronous fence.
 Whole-CLI and fixed-source receipts are recorded in the workspace inbox. No paid model, real account,
 native external-engine control, signed Desktop package or production acceptance is claimed.
+
+`test/workspace-agents.test.mjs` additionally exercises real catalog/Session stores, actual SessionHub,
+two host processes racing the same Agent revision, retained config/lifecycle recovery, private public
+projections, corrupt/foreign/partial state, full snapshot capacity, zero-call legacy refusals and late
+generation/owner changes around staging/claim. Writer tests independently verify denied-claim restoration
+and reject Promise authority callbacks. An initial nested-tree protection red receipt and exact final
+fixed-source results are retained separately from fixture and restricted-loopback failures in the inbox.

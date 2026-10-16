@@ -4,7 +4,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
-import { walkFiles, walkFilesAsync, type FileWalkOptions } from "./fs-walk.js";
+import { walkFiles, walkFilesAsync, workspaceMemoryWalkOptions, type FileWalkOptions } from "./fs-walk.js";
 import { skillsDirs } from "./skills/skills.js";
 import { readModelContextFileSync } from "./fs-read.js";
 import { currentWorkspaceResourceBinding, readWorkspaceResourceText } from "./workspace/resource-context.js";
@@ -169,7 +169,8 @@ export function searchAssets(query: string, limit = 5, roots?: string[]): Recall
   const hits: (Recalled & { boost: number })[] = [];
   for (const dir of dirs) {
     if (!existsSync(dir)) continue;
-    for (const rel of walkFiles(dir).filter((f) => f.endsWith(".md"))) {
+    const inventory = walkFiles(dir, 8_000, currentWorkspaceResourceBinding() ? workspaceMemoryWalkOptions(dir) : {});
+    for (const rel of inventory.filter((f) => f.endsWith(".md"))) {
       let text: string;
       try {
         text = currentWorkspaceResourceBinding()
@@ -217,14 +218,15 @@ export async function searchAssetsAsync(
     const remainingMs = timeoutMs - (Date.now() - startedAt);
     if (remainingMs <= 0 || filesLeft <= 0 || directoriesLeft <= 0 || entriesLeft <= 0) break;
     if (!existsSync(dir)) continue;
-    const inventory = await walkFilesAsync(dir, {
+    const walkOptions = {
       maxFiles: filesLeft,
       maxDirectories: directoriesLeft,
       maxEntries: entriesLeft,
       timeoutMs: remainingMs,
       signal: options.signal,
       yieldEvery: options.yieldEvery,
-    });
+    };
+    const inventory = await walkFilesAsync(dir, currentWorkspaceResourceBinding() ? workspaceMemoryWalkOptions(dir, walkOptions) : walkOptions);
     filesLeft = Math.max(0, filesLeft - inventory.files.length);
     directoriesLeft = Math.max(0, directoriesLeft - inventory.directoriesVisited);
     entriesLeft = Math.max(0, entriesLeft - inventory.entriesVisited);

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { optionalPosixOpenFlag } from "../dist/fs-open-flags.js";
@@ -87,4 +87,30 @@ test("private-state creates and replaces a file without leaking staging entries"
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+test("private-state authority denial after claim restores the original inode without publishing bytes", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-private-fence-"));
+  try {
+    const binding = bindPrivateHaraStateFile(home, [], "config.json");
+    writePrivateStateFileSync(binding, "original\n");
+    let denied = false;
+    assert.throws(() => writePrivateStateFileSync(binding, "replacement\n", { expectedText: "original\n", assertCurrent() {
+      if (readdirSync(join(home, ".hara")).some(name => name.startsWith(".hara-claim-"))) {
+        denied = true; throw new Error("authority revoked");
+      }
+    } }), /authority revoked/);
+    assert.equal(denied, true);
+    assert.equal(readFileSync(binding.path, "utf8"), "original\n");
+    assert.deepEqual(readdirSync(join(home, ".hara")), ["config.json"]);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test("private-state rejects asynchronous authority callbacks before creating content", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-private-async-fence-"));
+  try {
+    const binding = bindPrivateHaraStateFile(home, [], "config.json");
+    assert.throws(() => writePrivateStateFileSync(binding, "must not appear", { assertCurrent: async () => {} }), /synchronous.*void/);
+    assert.equal(existsSync(binding.path), false);
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });

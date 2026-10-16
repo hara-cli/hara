@@ -8,6 +8,7 @@ import { fuzzyRank } from "./fuzzy.js";
 import { isSensitiveFilePath } from "./security/sensitive-files.js";
 import { toolSubprocessEnv } from "./security/subprocess-env.js";
 import { recursiveRootContainsHome } from "./context/workspace-scope.js";
+import { bindWorkspaceMemoryInventory } from "./workspace/resource-context.js";
 
 export const IGNORE_DIRS = new Set([
   ".git", "node_modules", "dist", "build", "out", ".next", ".nuxt", ".cache",
@@ -45,6 +46,23 @@ interface NormalizedWalkOptions {
   timeoutMs: number;
   signal?: AbortSignal;
   yieldEvery: number;
+}
+
+const privateMemoryInventories = new WeakMap<FileWalkOptions, ReturnType<typeof bindWorkspaceMemoryInventory>>();
+/** @internal Mint an object-identity permit for a single already-scoped memory bucket. Generic tool
+ * callers have no boolean bypass; reusing it for a foreign root fails before enumeration. */
+export function workspaceMemoryWalkOptions(root: string, options: FileWalkOptions = {}): FileWalkOptions {
+  const bound = bindWorkspaceMemoryInventory(root), result = { ...options };
+  privateMemoryInventories.set(result, bound);
+  return result;
+}
+function memoryInventory(root: string, options: FileWalkOptions) {
+  const bound = privateMemoryInventories.get(options);
+  if (bound) {
+    if (root !== bound.root) throw new Error("Workspace memory inventory permit belongs to another root");
+    bound.assertDirectory(root);
+  }
+  return bound;
 }
 
 const DEFAULT_MAX_FILES = 8_000;
@@ -126,6 +144,7 @@ function yieldToEventLoop(): Promise<void> {
  * deadline's timer can run even when a large tree is entirely cached in memory.
  */
 export async function walkFilesAsync(root: string, options: FileWalkOptions = {}): Promise<FileWalkResult> {
+  const bound = memoryInventory(root, options);
   const cfg = normalizeOptions(options, DEFAULT_ASYNC_TIMEOUT_MS);
   const startedAt = Date.now();
   throwIfAborted(cfg.signal);
@@ -167,6 +186,7 @@ export async function walkFilesAsync(root: string, options: FileWalkOptions = {}
     const dir = stack.pop()!;
     directoriesVisited++;
     if (recursiveRootContainsHome(dir)) continue;
+    bound?.assertDirectory(dir);
     let directory;
     try {
       // Stream Dirents so maxEntries is an allocation boundary too; readdir() would first materialize a
@@ -178,6 +198,7 @@ export async function walkFilesAsync(root: string, options: FileWalkOptions = {}
     }
     try {
       throwIfAborted(cfg.signal);
+      bound?.assertDirectory(dir);
       if (timedOut()) return await finishAtTimeLimit();
       for await (const entry of directory) {
         throwIfAborted(cfg.signal);
@@ -196,6 +217,8 @@ export async function walkFilesAsync(root: string, options: FileWalkOptions = {}
           if (timedOut()) return await finishAtTimeLimit();
         }
 
+        bound?.assertDirectory(dir);
+
         if (entry.name.startsWith(".") && entry.name !== ".env" && entry.isDirectory() && IGNORE_DIRS.has(entry.name)) {
           continue;
         }
@@ -204,7 +227,7 @@ export async function walkFilesAsync(root: string, options: FileWalkOptions = {}
           stack.push(join(dir, entry.name));
         } else if (entry.isFile()) {
           const absolute = join(dir, entry.name);
-          if (isSensitiveFilePath(absolute)) continue;
+          if (!bound && isSensitiveFilePath(absolute)) continue;
           files.push(toPosix(relative(root, absolute)));
           if (files.length >= cfg.maxFiles) {
             return result(files, directoriesVisited, entriesVisited, "file_limit");
@@ -224,6 +247,7 @@ export async function walkFilesAsync(root: string, options: FileWalkOptions = {}
       }
       // Closing a descriptor is itself asynchronous; cancellation can arrive during that final await.
       throwIfAborted(cfg.signal);
+      bound?.assertDirectory(dir);
     }
 
     // Empty-directory forests do not increment the Dirent counter while they are being popped. Yield on
@@ -244,6 +268,7 @@ export async function walkFilesAsync(root: string, options: FileWalkOptions = {}
  * This legacy path is nevertheless bounded by directory count, Dirent count and a short wall budget.
  */
 export function walkFiles(root: string, cap = DEFAULT_MAX_FILES, options: Omit<FileWalkOptions, "maxFiles" | "signal"> = {}): string[] {
+  const bound = memoryInventory(root, options);
   // Defense in depth: callers that need an explicitly selected child directory pass that child as root.
   // No generic inventory helper may silently turn the user's entire home into a project corpus.
   if (recursiveRootContainsHome(root)) return [];
@@ -259,12 +284,14 @@ export function walkFiles(root: string, cap = DEFAULT_MAX_FILES, options: Omit<F
     const dir = stack.pop()!;
     directoriesVisited++;
     if (recursiveRootContainsHome(dir)) continue;
+    bound?.assertDirectory(dir);
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
     } catch {
       continue;
     }
+    bound?.assertDirectory(dir);
     for (const e of entries) {
       if (files.length >= cfg.maxFiles || entriesVisited >= cfg.maxEntries) break;
       if (Date.now() - startedAt >= cfg.timeoutMs) break;
@@ -277,11 +304,12 @@ export function walkFiles(root: string, cap = DEFAULT_MAX_FILES, options: Omit<F
         stack.push(join(dir, e.name));
       } else if (e.isFile()) {
         const absolute = join(dir, e.name);
-        if (isSensitiveFilePath(absolute)) continue;
+        if (!bound && isSensitiveFilePath(absolute)) continue;
         files.push(toPosix(relative(root, absolute)));
       }
     }
   }
+  bound?.assertDirectory(root);
   return files;
 }
 
