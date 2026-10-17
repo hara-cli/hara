@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+// New scoped execution uses this store, never the compatibility profileId-only resolver below.
+export { WorkspaceConnectionStoreV2 } from "./scoped-connections.js";
 import { isValidProfileId, spaceIdForProfile, type Profile } from "../profile/profile.js";
 import type { Provider } from "../providers/types.js";
 import {

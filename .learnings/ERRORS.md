@@ -1,5 +1,33 @@
 # Errors
 
+## [ERR-20261017-LOCAL-CATALOG-COMMIT-SELF-READ] Do not re-read the claimed publication target
+
+**Logged**: 2026-10-17
+**Priority**: high
+**Status**: resolved
+**Area**: backend
+
+The first S1 synthetic contract run passed 23 existing Agent cases and failed all five new cases:
+the catalog commit callback re-read its own destination while the private atomic writer had
+temporarily claimed that file. This was a false "registration disappeared" refusal, not missing
+user state. Preserve `s1-contract.log` in the task-private evidence directory. Validate pinned
+registration before mutation and retain the private writer's exact expected-text CAS and directory
+checks; do not weaken the writer, generation checks or test assertions. Independent owner markers
+may be checked during commit, but never infer revocation from the writer's own claimed target.
+
+Initial restricted `ps` failed EPERM; the authorized read-only process inventory succeeded with
+elevation. Some exploratory paths were absent; discover real file names with rg before searches
+or naming test gates. No process was stopped and no real Home/model credentials were used.
+
+Related files: src/workspace/local-catalog.ts, test/workspace-local-contract.test.mjs
+
+Resolution: retained the original private atomic writer/CAS and moved registration validation outside
+the self-publication callback. Original assertions unchanged. S1 build passed; the exact new contract,
+existing Workspace Agent and registry tests passed 71/71, no failures/skips/cancellation. These are
+synthetic contract tests only; no execution capability has been enabled and no model was called.
+
+---
+
 ## [ERR-20261012-MAIL-RELEASE-BOUNDARIES] Mail integration needs endpoint-bound credentials and a final pause check
 
 **Logged**: 2026-10-12
