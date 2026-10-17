@@ -10522,3 +10522,26 @@ For Hara CLI, select the repository-required Node 22.23.1 explicitly (or derive 
 - Recurrence-Count: 1
 
 ---
+
+## [ERR-20261017-WORKSPACE-REAL-KEY-TYPES] Real-key opt-in type boundary
+
+**Logged**: 2026-10-17
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+First compile caught an optional modelMode budget and cross-platform optional process.getuid call.
+Used explicit optional access without changing runtime guards. The Key-file reader deliberately does
+not reuse private-state's migration reader: that helper may chmod an unsafe file; a referenced external
+Key must remain strictly read-only and reject unsafe modes instead. Fake-file tests verify this.
+An initial combined learning patch had an incorrect EOF anchor and applied no changes; reread exact
+headings and retried without modifying unrelated entries.
+
+### Metadata
+
+- Related Files: `src/workspace/file-credential.ts`, `src/serve/local-workspace.ts`
+- Pattern-Key: workspace.credentials_readonly_reference_not_migration_reader
+
+---

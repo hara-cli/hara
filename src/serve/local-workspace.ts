@@ -10,14 +10,14 @@ function tokenMatches(actual: unknown, expected: string): boolean {
   if (typeof actual !== "string" || !/^[a-f0-9]{64}$/.test(actual) || actual.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
 }
-export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; allowedOrigins?: readonly string[] }): Promise<ServeHandle> {
+export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; realKeyFile?: string; allowedOrigins?: readonly string[] }): Promise<ServeHandle> {
   if (opts.host !== "127.0.0.1" || !Number.isSafeInteger(opts.port) || opts.port < 0 || opts.port > 65535) throw new Error("Workspace Dev listens only on explicit IPv4 loopback");
   const token = opts.token ?? randomBytes(32).toString("hex");
   if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("invalid Workspace Dev transport token");
   const origins = new Set(["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost", ...(input.allowedOrigins ?? [])]);
   const clients = new Map<WebSocket, { id: string; initialized: boolean }>();
   let closing = false;
-  const host = new LocalWorkspaceHost(input.root, { onChange(event) {
+  const host = new LocalWorkspaceHost(input.root, { realKeyFile: input.realKeyFile, onChange(event) {
     for (const [client, state] of clients) if (state.initialized && client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ jsonrpc: "2.0", method: "workspace.changed", params: event }));
   } });
   const wss = new WebSocketServer({ host: opts.host, port: opts.port, maxPayload: 128 * 1024,
@@ -37,7 +37,8 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (!dead) { wss.close(); await host.close(); throw new Error("Workspace Dev discovery is already owned or malformed"); }
     removePrivateStateFile(receiptFile.path, previous, receiptFile.directory);
   }
-  const receipt = { schemaVersion: 2, instanceId: randomUUID(), pid: process.pid, port, token, capability: CAPABILITY };
+  const receipt = { schemaVersion: 2, instanceId: randomUUID(), pid: process.pid, port, token, capability: CAPABILITY,
+    ...(input.realKeyFile ? { executionMode: "ark-real-key" } : {}) };
   try { writePrivateStateFileSync(receiptFile, JSON.stringify(receipt) + "\n", { expectedMissing: true }); }
   catch (error) { wss.close(); await host.close(); throw error; }
   const ownedReceipt = readPrivateStateFileSnapshotSync(receiptFile.path, 4096)!;
@@ -46,8 +47,10 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (method === "initialize") {
       if (!tokenMatches(params.token, token)) throw new Error("unauthorized");
       client.initialized = true;
-      return { name: "hara", version: input.version, protocol: 1, provider: "synthetic", model: "hara-synthetic-v1", cwd: host.project,
-        instanceId: receipt.instanceId, capabilities: [CAPABILITY], workspace: host.list(), syntheticOnly: true };
+      const mode = host.modelMode();
+      return { name: "hara", version: input.version, protocol: 1, provider: mode.syntheticOnly ? "synthetic" : "openai",
+        model: mode.budget?.model ?? "hara-synthetic-v1", cwd: host.project,
+        instanceId: receipt.instanceId, capabilities: [CAPABILITY, ...(!mode.syntheticOnly ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
@@ -60,6 +63,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     host.assertGeneration(workspaceId, params.expectedGeneration);
     if (method === "workspace.agent.select") { fields(["workspaceId", "expectedGeneration", "agentId"]); if (!text(params.agentId)) throw new Error("invalid Agent selection"); host.selectAgent(client.id, workspaceId, params.agentId); return host.snapshot(workspaceId, params.agentId, client.id); }
     if (method === "workspace.connection.synthetic") { fields(["workspaceId", "expectedGeneration", "expectedRevision"]); if (!Number.isSafeInteger(params.expectedRevision) || Number(params.expectedRevision) < 0) throw new Error("invalid connection revision"); host.configureSynthetic(workspaceId, params.expectedRevision as number); return host.snapshot(workspaceId, undefined, client.id); }
+    if (method === "workspace.connection.approved") { fields(["workspaceId", "expectedGeneration", "expectedRevision"]); if (!Number.isSafeInteger(params.expectedRevision) || Number(params.expectedRevision) < 0) throw new Error("invalid connection revision"); host.configureApprovedConnection(workspaceId, params.expectedRevision as number); return host.snapshot(workspaceId, undefined, client.id); }
     if (method === "workspace.connection.add") { fields(["workspaceId", "expectedGeneration", "input", "expectedRevision"]); host.configureConnection(workspaceId, params.input, params.expectedRevision as number); return { configured: true }; }
     if (method === "workspace.connection.revoke") { fields(["workspaceId", "expectedGeneration", "connectionId", "expectedRevision"]); if (!text(params.connectionId)) throw new Error("invalid connection"); host.revokeConnection(workspaceId, params.connectionId, params.expectedRevision as number); return { revoked: true }; }
     if (method === "workspace.approval.respond") { fields(["workspaceId", "expectedGeneration", "approvalId", "approved"]); if (!text(params.approvalId) || typeof params.approved !== "boolean") throw new Error("invalid approval"); host.answerApproval(client.id, workspaceId, params.approvalId, params.approved); return { accepted: true }; }

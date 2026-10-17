@@ -26,7 +26,7 @@ export function createWorkspaceSyntheticProvider(connection: ScopedConnection, b
     const creation = context.agent.kind === "main" && /(?:建立|创建|新建|create|hire).*(?:同事|agent|colleague)|(?:同事|colleague).*(?:建立|创建|create)/i.test(objective);
     const delegation = context.agent.kind === "main" && /(?:委派|安排|交给|交給|delegate)/i.test(objective);
     const fileTask = /hello\.md|(?:生成|写|寫|create|write).*(?:文件|file)/i.test(objective);
-    if (!creation && !delegation && !fileTask) return response("你好，我是 Hara。這是本機合成驗收模式，不會連接真實模型。可以請我「建立 Pi 同事 Coder」，再「委派 Coder 生成 hello.md 並驗證」。");
+    if (!creation && !delegation && !fileTask) return response("你好，我是 Hara。這是本機合成驗收模式，不會連接真實模型。可以請我「建立同事 Coder」，再「委派 Coder 生成 hello.md 並驗證」。");
     if (!calls.some(call => call.name === "task_intake")) return response("", [tool("task_intake", { intent: "change", goal: objective.slice(0, 1500),
       constraints: ["僅本空間與已授權本機 fixture 項目；不連外、不發布、不調用真實模型"],
       acceptance: [creation ? "同事經使用者確認後建立" : delegation ? "同事任務有已驗證的完成回執" : "hello.md 內容與雜湊經工具驗證"], steps: ["執行", "驗證", "回覆結果"] })]);
@@ -34,7 +34,7 @@ export function createWorkspaceSyntheticProvider(connection: ScopedConnection, b
     if (creation && !calls.some(call => call.name === "agent_create")) return response("", [tool("agent_create", { username: "coder", displayName: "Coder", title: "Coding colleague", instructions: "在授權項目內完成文件工作並驗證，不連外。" })]);
     if (delegation && !calls.some(call => call.name === "agent_contact")) {
       const colleague = context.colleagues().find(agent => agent.kind === "colleague" && agent.state === "active");
-      if (!colleague) return response("請先建立一位 Pi 同事，再委派任務。");
+      if (!colleague) return response("請先建立一位同事，再委派任務。");
       return response("", [tool("agent_contact", { agentId: colleague.agentId, task: "生成 hello.md，內容為 hello workspace\\n（實際換行），並驗證。" })]);
     }
     if (!creation && !delegation) {

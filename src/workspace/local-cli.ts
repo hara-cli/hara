@@ -7,14 +7,14 @@ import { text } from "./local-state.js";
 export async function mainLocalWorkspaceCli(args: string[]): Promise<void> {
   const command = args[0];
   if (!command || ["--help", "-h", "help"].includes(command)) {
-    console.log("hara workspace-dev <init|status|serve|run> --root /absolute/private/fixture-root\nSynthetic Provider only. No real model/Key calls, global profile import, deployment or existing Dev control.\nserve: --port 0; run: --workspace ws_ID --agent ag_ID --message TEXT [--resume]"); return;
+    console.log("hara workspace-dev <init|status|serve|run> --root /absolute/private/fixture-root\nSynthetic by default. Explicit --ark-key-file ABS opts into the approved bounded real-key slice (300k tokens / 24 requests).\nNo global profile import, deployment or existing Dev control.\nserve: --port 0; run: --workspace ws_ID --agent ag_ID --message TEXT [--resume]"); return;
   }
   if (!["init", "status", "serve", "run"].includes(command)) throw new Error("unsupported Workspace Dev command");
   const values = new Map<string, string>(); let resume = false;
   for (let index = 1; index < args.length; index++) {
     const key = args[index]!;
     if (key === "--resume" && !resume) { resume = true; continue; }
-    if (!["--root", "--port", "--workspace", "--agent", "--message", "--request-id"].includes(key) || values.has(key) || index + 1 >= args.length) throw new Error("invalid Workspace Dev option");
+    if (!["--root", "--port", "--workspace", "--agent", "--message", "--request-id", "--ark-key-file"].includes(key) || values.has(key) || index + 1 >= args.length) throw new Error("invalid Workspace Dev option");
     values.set(key, args[++index]!);
   }
   const root = values.get("--root"); if (!text(root, 4096)) throw new Error("explicit --root private fixture directory is required");
@@ -22,13 +22,13 @@ export async function mainLocalWorkspaceCli(args: string[]): Promise<void> {
     const port = Number(values.get("--port") ?? 0);
     const handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port, cwd: root,
       ...(process.env.HARA_WORKSPACE_DEV_TOKEN ? { token: process.env.HARA_WORKSPACE_DEV_TOKEN } : {}) },
-      { root, version: "0.187.1-local-workspace-dev", allowedOrigins: ["http://127.0.0.1:1437", "http://localhost:1437"] });
-    console.log(JSON.stringify({ type: "workspace-dev-ready", protocol: 1, capability: "workspace.local-dev.v2", port: handle.port, syntheticOnly: true }));
+      { root, realKeyFile: values.get("--ark-key-file"), version: "0.187.1-local-workspace-dev", allowedOrigins: ["http://127.0.0.1:1437", "http://localhost:1437"] });
+    console.log(JSON.stringify({ type: "workspace-dev-ready", protocol: 1, capability: "workspace.local-dev.v2", port: handle.port, syntheticOnly: !values.has("--ark-key-file") }));
     let stopping = false;
     const stop = () => { if (stopping) return; stopping = true; void handle.close().catch(() => { process.exitCode = 1; }); };
     process.once("SIGTERM", stop); process.once("SIGINT", stop); return;
   }
-  const host = new LocalWorkspaceHost(root, { interactiveApprovals: false });
+  const host = new LocalWorkspaceHost(root, { interactiveApprovals: false, realKeyFile: values.get("--ark-key-file") });
   try {
     if (command === "init" || command === "status") { console.log(JSON.stringify(host.list())); return; }
     const workspaceId = values.get("--workspace"), agentId = values.get("--agent"), message = values.get("--message");

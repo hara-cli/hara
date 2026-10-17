@@ -130,7 +130,10 @@ export function createOpenAIProvider(opts: {
   /** Explicit session capability decision. Applies to ephemeral tool media; user attachments retain
    * the existing upstream vision-first handling. Unknown native capabilities fail closed by default. */
   supportsImages?: boolean;
+  /** Host-owned bounded acceptance lanes may require a smaller output ceiling. */
+  maxOutputTokens?: number;
 }): Provider {
+  if (opts.maxOutputTokens !== undefined && (!Number.isSafeInteger(opts.maxOutputTokens) || opts.maxOutputTokens < 1 || opts.maxOutputTokens > 32000)) throw new Error("Invalid OpenAI output limit");
   const client = new OpenAI({
     apiKey: opts.apiKey,
     // Hara owns retry safety/backoff above every provider. SDK-local retries cannot know whether another
@@ -156,7 +159,7 @@ export function createOpenAIProvider(opts: {
       const params: any = {
         model: opts.model,
         messages: toOpenAI(system, history, style, supportsToolImages),
-        max_tokens: 32000, // was 8192 — too small: a big write_file's args got truncated → unparseable → loop
+        max_tokens: opts.maxOutputTokens ?? 32000, // preserve the normal route; bounded lanes explicitly opt in
         stream: true,
         stream_options: { include_usage: true },
       };

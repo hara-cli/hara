@@ -21,6 +21,7 @@ import { localWorkspaceFileTools } from "./local-tools.js";
 import { createWorkspaceSyntheticProvider, SYNTHETIC_CONNECTION } from "./synthetic-provider.js";
 import { canonical, exact, plain, positive, text, UUID } from "./local-state.js";
 import type { WorkspaceAgentView } from "./agents.js";
+import { WorkspaceRealKeyLane } from "./real-key-provider.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
 interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string }
@@ -51,14 +52,22 @@ export class LocalWorkspaceHost {
   private readonly pending = new Map<string, PendingApproval>();
   private readonly clients = new Map<string, { workspaceId: string | null; agentId: string | null; epoch: number }>();
   private closing = false;
+  private readonly realKey?: WorkspaceRealKeyLane;
   constructor(root: string, private readonly options: {
     providerFactory?: LocalWorkspaceProviderFactory;
+    realKeyFile?: string;
     interactiveApprovals?: boolean;
     onChange?: (event: { workspaceId: string; agentId?: string }) => void;
   } = {}) {
     const opened = openLocalWorkspaceDevRoot(root); this.root = opened.root; this.home = opened.home; this.project = opened.project;
     this.catalog = new LocalWorkspaceCatalog(this.home);
+    if (options.realKeyFile) {
+      if (options.providerFactory) throw new Error("Real-key acceptance cannot replace its trusted Provider factory");
+      this.realKey = new WorkspaceRealKeyLane(this.root, options.realKeyFile);
+    }
   }
+  modelMode() { return this.realKey ? { syntheticOnly: false, executionMode: "ark-real-key" as const, budget: this.realKey.summary() }
+    : { syntheticOnly: true, executionMode: "synthetic" as const }; }
   private context(workspaceId: string): WorkspaceHostContext {
     const row = this.catalog.resolve(workspaceId);
     const found = this.contexts.get(workspaceId);
@@ -84,7 +93,7 @@ export class LocalWorkspaceHost {
   list() {
     const value = this.catalog.read();
     return { revision: value.revision, activeWorkspaceId: value.activeWorkspaceId,
-      workspaces: value.workspaces.map(row => ({ workspaceId: row.scope.workspaceId, label: row.label, role: "owner", active: row.active })), syntheticOnly: true };
+      workspaces: value.workspaces.map(row => ({ workspaceId: row.scope.workspaceId, label: row.label, role: "owner", active: row.active })), ...this.modelMode() };
   }
   createWorkspace(label: string, expectedRevision: number) {
     if (this.closing) throw new Error("Workspace Host is closing");
@@ -108,9 +117,15 @@ export class LocalWorkspaceHost {
     for (const pending of [...this.pending.values()]) if (pending.clientId === clientId) pending.finish(false);
   }
   configureSynthetic(workspaceId: string, expectedRevision: number): void {
+    if (this.realKey) throw new Error("This explicit real-key lane cannot substitute synthetic results");
     this.context(workspaceId).connections.add({ ...SYNTHETIC_CONNECTION }, expectedRevision); this.changed(workspaceId);
   }
+  configureApprovedConnection(workspaceId: string, expectedRevision: number): void {
+    if (!this.realKey) throw new Error("Real-key acceptance was not explicitly enabled");
+    this.context(workspaceId).connections.add(this.realKey.connectionInput(), expectedRevision); this.changed(workspaceId);
+  }
   configureConnection(workspaceId: string, input: unknown, expectedRevision: number): void {
+    if (this.realKey) throw new Error("This acceptance lane only permits its approved file-reference connection");
     if (!plain(input)) throw new Error("invalid connection input");
     this.context(workspaceId).connections.add(input as unknown as Parameters<WorkspaceConnectionStoreV2["add"]>[0], expectedRevision);
     this.changed(workspaceId);
@@ -133,12 +148,13 @@ export class LocalWorkspaceHost {
           : value.attempt?.state === "running" || value.attempt?.state === "draining" ? "needs_recovery" : value.attempt?.state ?? "idle",
         taskId: value.task?.id ?? null, objective: value.task?.objective ?? "", taskState: value.task?.status ?? null,
         runId: value.task?.workspaceRunBinding?.runId ?? null,
-        completion: value.task?.checkpoint?.completion ?? null, usage: value.usage, runUsage: value.runUsage, pastTaskCount: value.pastTasks.length,
+        completion: value.task?.checkpoint?.completion ?? null, blockReason: value.task?.checkpoint?.blockReason ?? null,
+        usage: value.usage, runUsage: value.runUsage, pastTaskCount: value.pastTasks.length,
         history: value.history.map(message => message.role === "assistant" ? { role: message.role, text: message.text, tools: message.toolUses.map(tool => tool.name) }
           : message.role === "tool" ? { role: message.role, results: message.results.map(result => ({ id: result.id, name: result.name, content: result.content, isError: result.isError ?? false })) }
           : { role: message.role, content: message.content }) },
       approvals: [...this.pending.values()].filter(pending => pending.card.workspaceId === workspaceId && pending.card.agentId === selected && pending.clientId === clientId).map(pending => pending.card),
-      syntheticOnly: true };
+      ...this.modelMode() };
   }
   answerApproval(clientId: string, workspaceId: string, id: string, approved: boolean): void {
     const pending = this.pending.get(id), selection = this.clients.get(clientId);
@@ -176,7 +192,7 @@ export class LocalWorkspaceHost {
     const assertCurrent = () => { assertWorkspaceRunAdmission(job.permit, job.options!, "pi"); };
     const tools = localWorkspaceFileTools(job.context.project, assertCurrent);
     if (agent.kind !== "main") return tools;
-    tools.push({ name: "agent_create", description: "Propose one Pi colleague in this Workspace; a fresh human confirmation card is mandatory.", kind: "edit",
+    tools.push({ name: "agent_create", description: "Propose one colleague in this Workspace; a fresh human confirmation card is mandatory. The internal runtime is pi; call them 同事 in user-facing text.", kind: "edit",
       input_schema: { type: "object", properties: { username: { type: "string" }, displayName: { type: "string" }, title: { type: "string" }, instructions: { type: "string" } }, required: ["username", "displayName", "title", "instructions"] },
       async run(input) {
         if (!plain(input) || !exact(input, ["username", "displayName", "title", "instructions"]) || !text(input.username, 64)
@@ -189,13 +205,13 @@ export class LocalWorkspaceHost {
         host.changed(job.workspaceId, job.agentId); return JSON.stringify({ created: true, agent: created });
       } });
     const host = this;
-    tools.push({ name: "agent_contact", description: "Delegate one bounded same-Workspace file task to an existing Pi colleague and await its actual result.", kind: "edit",
+    tools.push({ name: "agent_contact", description: "Delegate one bounded same-Workspace file task to an existing colleague by exact agentId and await its actual verified result.", kind: "edit",
       input_schema: { type: "object", properties: { agentId: { type: "string" }, task: { type: "string" } }, required: ["agentId", "task"] },
       async run(input, toolContext) {
         if (!plain(input) || !exact(input, ["agentId", "task"]) || !text(input.agentId) || !text(input.task, 2000)) throw new Error("invalid colleague task");
         assertCurrent();
         const target = job.context.resources.agents.get(input.agentId);
-        if (!target || target.kind !== "colleague" || target.state !== "active" || target.runtime.id !== "pi") throw new Error("同空間 Pi 同事不可用");
+        if (!target || target.kind !== "colleague" || target.state !== "active" || target.runtime.id !== "pi") throw new Error("同空間同事不可用");
         const prior = new WorkspaceConversationStore(job.context.storage, target.agentId).read();
         const sameDelegation = prior.task?.workspaceRunBinding?.lineage.parentRunId === job.id;
         if (sameDelegation && prior.task?.status === "completed" && prior.task.checkpoint?.completion?.state === "verified") {
@@ -250,13 +266,15 @@ export class LocalWorkspaceHost {
           project: { root: context.project, dev: project.dev, ino: project.ino }, sessionId: store.sessionId, runId: randomUUID(),
           lineage: parent ? { rootRunId: parent.binding.lineage.rootRunId ?? parent.id, parentRunId: parent.id, depth: 1 } : { rootRunId: null, parentRunId: null, depth: 0 },
           createdAt: new Date().toISOString(), host: { hostId: host.hostId, hostEpoch: host.hostEpoch, grantId: row.grantId, grantRevision: row.grantRevision, actorId: row.actorId, policyRevision: row.policyRevision },
-          budget: parent ? { ...parent.binding.budget } : { maxRounds: 12, maxToolCalls: 32, maxTokens: 32000, timeoutMs: 120000 } });
+          budget: parent ? { ...parent.binding.budget } : { maxRounds: 12, maxToolCalls: 32, maxTokens: this.realKey ? 80000 : 32000, timeoutMs: this.realKey ? 300000 : 120000 } });
         value.runUsage = ZERO_USAGE();
       }
       const binding = task.workspaceRunBinding!, controller = new AbortController();
       if (binding.project.root !== context.project) throw new Error("Workspace project root changed; old task retained read-only, no implicit project migration");
-      const provider = (this.options.providerFactory ?? createWorkspaceSyntheticProvider)(context.connections.resolve(binding.connection), binding.connection,
-        { agent, objective: task.objective, colleagues: () => context.resources.agents.list().agents });
+      const connection = context.connections.resolve(binding.connection);
+      const provider = this.realKey ? this.realKey.createProvider(connection, binding.connection)
+        : (this.options.providerFactory ?? createWorkspaceSyntheticProvider)(connection, binding.connection,
+          { agent, objective: task.objective, colleagues: () => context.resources.agents.list().agents });
       value.history.push({ role: "user", content: message }); value.task = task;
       value.attempt = { attemptId: lease.attemptId, fence: (value.attempt?.fence ?? 0) + 1, runId: binding.runId, state: "running", startedAt: new Date().toISOString(), endedAt: null };
       value.requests.push({ requestId, digest, taskId: task.id, runId: binding.runId }); value = store.save(value.revision, value);
@@ -275,7 +293,11 @@ export class LocalWorkspaceHost {
       const configuration = context.resources.agents.resolveTask(binding.agent);
       owned.options = bindWorkspaceRunOptions(owned.permit, { ctx: { cwd: context.project, sessionId: store.sessionId, todoScope: `workspace-${binding.runId}`, sandbox: "off" },
         signal: owned.signal, approval: "auto-edit", approvalChannel: true, confirm: async () => false, quiet: true, hooks: false, extraTools: tools,
-        systemOverride: `You are ${configuration.identity.displayName}, a clearly identified Hara AI colleague. ${configuration.instructions}\nUse only this Workspace's supplied tools. Never claim completion without observed evidence.`,
+        systemOverride: `You are ${configuration.identity.displayName}, a clearly identified Hara AI colleague. ${configuration.instructions}\nUse only this Workspace's supplied tools. Never claim completion without observed evidence.\n`
+          + `Reply naturally in the user's language. Call AI coworkers 同事, not Pi 同事; pi is only an internal runtime. A greeting needs no tools.\n`
+          + `For creation use agent_create and wait for the human card; for delegation use agent_contact with an existing exact agentId.\n`
+          + `Current authorized colleagues: ${JSON.stringify(context.resources.agents.list().agents.map(item => ({ agentId: item.agentId, name: item.identity.displayName, kind: item.kind })))}.\n`
+          + `For file tasks read first; write only if necessary, then workspace_verify. End accepted tasks with task_checkpoint completion and observed tool_call_ids, not a prose-only claim.`,
         continuationSession: value.history.length > 1,
         taskIntake: { task, current: () => owned.value.task!, onUpdate: next => { owned.value.task = next; },
           onCheckpoint: next => this.commit(owned, next), onRoundUsage: next => this.commit(owned, next) } });
