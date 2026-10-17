@@ -1,6 +1,7 @@
 import { workspaceStateHome, workspaceResourceCommitGuard } from "./workspace/resource-context.js";
 import { join, dirname, resolve } from "node:path";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
+import type { BigIntStats } from "node:fs";
 import type { SandboxMode } from "./sandbox.js";
 import type { HooksConfig } from "./hooks.js";
 import type { NotifyMode } from "./notify.js";
@@ -11,6 +12,7 @@ import {
   readPrivateStateFileSnapshotSync,
   withPrivateStateLockSync,
   writePrivateStateFileSync,
+  type PrivateStateFileBinding,
   type PrivateStateFileSnapshot,
 } from "./security/private-state.js";
 import { readVerifiedRegularFileSnapshotSync } from "./fs-read.js";
@@ -413,9 +415,12 @@ interface RawConfigState {
   snapshot: PrivateStateFileSnapshot;
 }
 
-function readRawConfigState(): RawConfigState | null {
+function configStateBinding(): PrivateStateFileBinding {
   ensurePrivateHaraState(workspaceStateHome());
-  const binding = bindPrivateHaraStateFile(workspaceStateHome(), [], "config.json");
+  return bindPrivateHaraStateFile(workspaceStateHome(), [], "config.json");
+}
+
+function readRawConfigState(binding = configStateBinding()): RawConfigState | null {
   const snapshot = readPrivateStateFileSnapshotSync(binding.path, MAX_GLOBAL_CONFIG_BYTES);
   if (!snapshot) return null;
   let parsed: unknown;
@@ -440,10 +445,36 @@ function configRecord(value: unknown): Record<string, any> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, any>) : {};
 }
 
+/** An absent optional config need not create/fsync a writer lock on every policy/role lookup. Prove
+ * absence inside one unchanged private-directory namespace, with neither writer nor reclaim marker.
+ * A CAS move-claim, replacement, permission repair or racing creator changes that namespace or leaves
+ * its lock present, so uncertain reads still recheck under the original exclusive fence. No values or
+ * absence are cached: newly created/rotated config is read on the next lookup. */
+function uncontendedConfigAbsence(binding: PrivateStateFileBinding, before: BigIntStats): boolean {
+  for (const name of ["config.lock", "config.lock.reclaim"]) {
+    try {
+      lstatSync(join(binding.directory.path, name));
+      return false; // Includes dangling links/malformed locks: never use existsSync (which follows them).
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  const after = lstatSync(binding.directory.path, { bigint: true });
+  return before.isDirectory() && after.isDirectory() && !after.isSymbolicLink()
+    && before.ino === BigInt(binding.directory.ino) && before.dev === BigInt(binding.directory.dev)
+    && before.dev === after.dev && before.ino === after.ino && before.mode === after.mode
+    && before.mtimeNs > 0n && before.ctimeNs > 0n
+    && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs
+    && realpathSync.native(binding.directory.path) === binding.directory.path;
+}
+
 export function readRawConfig(): Record<string, any> {
   try {
-    const current = readRawConfigState();
+    const binding = configStateBinding();
+    const before = lstatSync(binding.directory.path, { bigint: true });
+    const current = readRawConfigState(binding);
     if (current) return current.value;
+    if (uncontendedConfigAbsence(binding, before)) return {};
   } catch {
     // Retry once under the writer fence. A namespace race succeeds here; a static malformed/unsafe config
     // throws again and can never be mistaken for an empty file by a later update.
