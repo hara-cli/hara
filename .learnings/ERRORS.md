@@ -10550,7 +10550,7 @@ headings and retried without modifying unrelated entries.
 
 **Logged**: 2026-10-17
 **Priority**: high
-**Status**: in_progress
+**Status**: resolved
 **Area**: backend
 
 ### Summary
@@ -10574,5 +10574,49 @@ transcript and budget. Synthetic tests alone did not establish real model behavi
 - Related Files: `src/workspace/local-host.ts`, `src/workspace/local-tools.ts`, `test/workspace-real-key.test.mjs`
 - Private evidence: `/private/tmp/hara-real-key-acceptance-20261017.yB2RBp/after-colleague.json`
 - Pattern-Key: workspace.real_model_receipt_ids_and_consumed_approval_are_explicit
+
+---
+
+### Resolution for ERR-20261017-WORKSPACE-CITATION-AND-APPROVAL-STATE
+
+The same real-key fixture recovered under code 9f4ddfc using only agent_list and a fresh verified
+receipt: no duplicate colleague, old failed transcript and budget preserved. This proves this recovery
+case, not general semantic correctness for every model or task. A subsequent file delegation exposed
+the separate budget/body-validation limitations recorded below; the whole slice is NOT fully passed.
+
+## [ERR-20261017-WORKSPACE-REAL-CONTEXT-BUDGET] File written and verified but main closure hits frozen 80k limit
+
+**Logged**: 2026-10-17
+**Priority**: high
+**Status**: pending
+**Area**: backend
+
+### Summary
+
+Real-key same-fixture test made 14 HTTP-200 requests, reporting 149,538 total input+output tokens.
+Coder completed and verified the exact 16-byte hello.md; main also read/verified it, but its last
+completion round reached 80,770 tokens against the frozen per-run 80k ceiling. Main remained blocked.
+The fixture-wide 300k limit was not exhausted. Did not raise the old binding, reset a task, delete
+history or keep spending. Read-only restart preserved all state and added zero model calls.
+
+### Details and next decision
+
+New task requests carried the earlier failed/recovered full transcript and continuation context;
+main input grew from 4,008 to 17,050 per turn. The first agent_contact also rejected a multiline
+body through the metadata-oriented text() validator; the model later used one line and delegation
+succeeded. No production restriction was relaxed. Next slice should separate bounded message bodies
+from IDs and design current-task context plus scoped durable summaries without deleting history.
+Jeff must approve the next real-test count/budget strategy; do not solve this by silently raising limits.
+
+Minor diagnostic failures in this slice caused no model requests or data changes: one ad-hoc JSON
+projection had an extra closing parenthesis; git grep has -f but no --file long option. Corrected the
+projection and used git grep -q -F -f SOURCE HEAD. All actual-Key scans returned exit 1 (zero matches);
+never supplied the Key value in argv, stdout or logs.
+
+### Metadata
+
+- Related Files: `src/workspace/local-host.ts`, `src/workspace/execution.ts`, `src/workspace/local-state.ts`
+- Evidence: `/private/tmp/hara-real-key-acceptance-20261017.yB2RBp/verified-result.json`
+- Pattern-Key: workspace.real_context_is_not_synthetic_usage_and_frozen_budgets_must_not_reset
 
 ---
