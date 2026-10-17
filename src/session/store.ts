@@ -1692,6 +1692,7 @@ function redactedSessionCopy(data: SessionData): SessionData {
     if (data.task.workspaceAgentBinding !== undefined) safe.task.workspaceAgentBinding = {
       ...data.task.workspaceAgentBinding, resourceBinding: { ...data.task.workspaceAgentBinding.resourceBinding },
     };
+    if (data.task.workspaceRunBinding !== undefined) safe.task.workspaceRunBinding = structuredClone(data.task.workspaceRunBinding);
     // Task objective/steering are free-form and stay redacted. Execution identity and transition metadata
     // are structural: preserve them exactly so resume/expectedTurnId validation cannot be corrupted by a
     // credential-looking identifier.

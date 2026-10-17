@@ -1,5 +1,26 @@
 # Errors
 
+## [ERR-20261017-LEASE-CHILD-FIXTURE-URL] Observe child startup failure before waiting for readiness
+
+**Logged**: 2026-10-17
+**Priority**: medium
+**Status**: resolved
+**Area**: tests
+
+The first S2 run passed 34 cases but cancelled the two-process lease case: `resolve` removed the
+directory URL's trailing slash, so the child imported a nonexistent module before emitting readiness.
+The parent had awaited only stdout and hid stderr/exit, producing an unhelpful event-loop cancellation.
+Fix the explicit file URL and race readiness against the already-attached exit receipt. Preserve
+`s2-lifecycle.log`; no test assertion is removed and the cancelled run is not two-process evidence.
+
+Related files: test/workspace-local-lifecycle.test.mjs
+
+Resolution: explicit directory URL and startup/exit diagnostics repaired. Exact final build succeeded;
+78/78 scoped contract/lifecycle and existing Agent/registry cases passed, including two real isolated
+Node processes, live-owner contention and proven-dead child takeover. No model requests were made.
+
+---
+
 ## [ERR-20261017-LOCAL-CATALOG-COMMIT-SELF-READ] Do not re-read the claimed publication target
 
 **Logged**: 2026-10-17

@@ -4,6 +4,7 @@ import type { Todo } from "../tools/todo.js";
 import { redactSensitiveText, requestsCredentialDisclosure } from "../security/secrets.js";
 import { isTaskRuntimeBinding, type TaskRuntimeBinding } from "../agent-runtime/bindings.js";
 import { isWorkspaceAgentTaskBinding, type WorkspaceAgentTaskBinding } from "../workspace/agent-binding.js";
+import { workspaceRunMatchesTask, type WorkspaceRunBinding } from "../workspace/run-binding.js";
 
 export const TASK_SCHEMA_VERSION = 1;
 export const MAX_TASK_OBJECTIVE_CHARS = 4096;
@@ -174,6 +175,8 @@ export interface TaskExecution {
   /** New scoped provenance is never downgraded to the legacy runner. Private persona snapshots stay
    * in their owner-only catalog, not in this object or the public transcript. */
   workspaceAgentBinding?: Readonly<WorkspaceAgentTaskBinding>;
+  /** Provenance only: execution additionally requires a fresh trusted Host permit and attempt lease. */
+  workspaceRunBinding?: Readonly<WorkspaceRunBinding>;
   /** The request that created the task. Later chat/steering must not silently replace it. */
   objective: string;
   status: TaskExecutionStatus;
@@ -1599,6 +1602,7 @@ function validTaskProgress(value: unknown): value is RunProgressEvent {
 export function isTaskExecution(value: unknown): value is TaskExecution {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const task = value as Record<string, unknown>;
+  if (task.workspaceRunBinding !== undefined && !workspaceRunMatchesTask(task.workspaceRunBinding, task)) return false;
   if (task.workspaceAgentBinding !== undefined && (task.runtimeBinding !== undefined
     || !isWorkspaceAgentTaskBinding(task.workspaceAgentBinding) || task.workspaceAgentBinding.taskId !== task.id)) return false;
   if (task.runtimeBinding !== undefined && (!isTaskRuntimeBinding(task.runtimeBinding)

@@ -48,3 +48,8 @@ export function freezeWorkspaceRunBinding(value: WorkspaceRunBinding): Readonly<
 export function workspaceRunBindingsEqual(a: WorkspaceRunBinding, b: WorkspaceRunBinding): boolean {
   return isWorkspaceRunBinding(a) && isWorkspaceRunBinding(b) && canonical(a) === canonical(b);
 }
+export function workspaceRunMatchesTask(binding: unknown, task: { id?: unknown; workspaceAgentBinding?: unknown; runtimeBinding?: unknown }): binding is WorkspaceRunBinding {
+  return isWorkspaceRunBinding(binding) && task.runtimeBinding === undefined
+    && isWorkspaceAgentTaskBinding(task.workspaceAgentBinding) && binding.agent.taskId === task.id
+    && canonical(binding.agent) === canonical(task.workspaceAgentBinding);
+}
