@@ -1,7 +1,7 @@
 import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment, TurnArgs, TurnResult } from "../providers/types.js";
 import { isTaskRuntimeBinding } from "../agent-runtime/bindings.js";
 import { WORKSPACE_AGENT_EXECUTION_PENDING } from "../workspace/agent-binding.js";
-import { beginWorkspaceGovernedRun, executeWorkspaceTool, workspaceRunToolAllowed, type WorkspaceRunPermit } from "../workspace/execution.js";
+import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, workspaceRunToolAllowed, type WorkspaceRunPermit } from "../workspace/execution.js";
 import { createToolImageStore, redactOwnedToolImageText } from "../tools/tool-images.js";
 import { redactOwnedToolImageValue } from "../security/tool-media-redaction.js";
 import { createComputerRunScope, closeComputerRunScope } from "../tools/computer-run.js";
@@ -1987,7 +1987,8 @@ async function runAgentInner(
     const system = turnContext
       ? stableSystemParts.map((part) => part.content).join("\n\n")
       : assembledSystem.text;
-    const prepared = prepareHistoryForModel(history, {
+    const requestHistory = opts.workspaceRun ? prepareWorkspaceRunHistory(opts.workspaceRun, history) : history;
+    const prepared = prepareHistoryForModel(requestHistory, {
       model: activeProvider.model,
       // Budget against the full context: the trailing turn message costs the same tokens as before.
       system: assembledSystem.text,

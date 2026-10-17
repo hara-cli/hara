@@ -10620,3 +10620,20 @@ never supplied the Key value in argv, stdout or logs.
 - Pattern-Key: workspace.real_context_is_not_synthetic_usage_and_frozen_budgets_must_not_reset
 
 ---
+
+### Follow-up for ERR-20261017-WORKSPACE-REAL-CONTEXT-BUDGET (2026-10-17, authorized context-trim slice)
+
+Jeff approved a new, separate 24 request / 150k-token slice. Keep the existing ledger append-only,
+freeze the prior offset/digest once, and disable the original allowance when this slice activates.
+New task context is an attempt-scoped view; full durable history, old blocked tasks and frozen usage
+remain intact. Recovery receives the original task objective/checkpoint but must obtain fresh evidence.
+
+Diagnostics also repeated an avoidable path error: a Core search included a Desktop file and an
+assumed test filename. No state changed. Resolve files with rg --files in the exact worktree first;
+do not combine another repository's test path into a read command. All original error output is retained
+in the tool transcript; this is not a product failure or a passed verification.
+
+The first Desktop full regression in this slice reported 21 localhost-listen EPERM failures under the
+managed sandbox (656 pass). The identical suite with authorized loopback permission passed 677/677;
+no assertion or product check was weakened. Logs are retained separately as desktop-test.log and
+desktop-test-loopback.log in the task-private context-trim evidence directory.

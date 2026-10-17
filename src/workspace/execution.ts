@@ -1,7 +1,8 @@
 // A serialized RunBinding is provenance, never an execution capability. Only trusted Host composition
 // calls this factory; renderer/Agent arguments cannot populate the private WeakMap below.
+import { createHash } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
-import type { Provider, TurnResult } from "../providers/types.js";
+import type { NeutralMsg, Provider, TurnResult } from "../providers/types.js";
 import type { RunOpts } from "../agent/loop.js";
 import type { TaskExecution } from "../session/task.js";
 import type { Tool } from "../tools/registry.js";
@@ -13,6 +14,7 @@ import { canonical } from "./local-state.js";
 import { workspaceStateHome, type WorkspaceResourceStorage } from "./resource-context.js";
 import { freezeWorkspaceRunBinding, workspaceRunBindingsEqual, workspaceRunMatchesTask, type WorkspaceRunBinding } from "./run-binding.js";
 import type { WorkspaceUsage } from "./conversations.js";
+import { workspaceTaskHistory } from "./model-context.js";
 
 export interface WorkspaceRunPermit { readonly binding: Readonly<WorkspaceRunBinding> }
 interface PermitState {
@@ -29,6 +31,7 @@ interface PermitState {
   lease: WorkspaceSessionLease;
   retired: boolean;
   started: boolean;
+  modelHistory?: { history: NeutralMsg[]; start: number; prefixDigest: string };
 }
 const permits = new WeakMap<object, PermitState>();
 function stateOf(permit: unknown): PermitState {
@@ -65,6 +68,8 @@ export function createWorkspaceRunPermit(input: {
   signal: AbortSignal;
   toolNames: readonly string[];
   usage: WorkspaceUsage;
+  /** Trusted Host-only attempt boundary. Persisted history stays complete and append-only. */
+  modelHistory?: { history: NeutralMsg[]; start: number };
   updateUsage(value: Readonly<WorkspaceUsage>): void;
 }): WorkspaceRunPermit {
   const binding = freezeWorkspaceRunBinding(input.binding), cwd = realpathSync.native(input.cwd);
@@ -74,6 +79,7 @@ export function createWorkspaceRunPermit(input: {
     throw new Error("Workspace Host dependencies do not match RunBinding");
   }
   const started = Date.now();
+  if (input.modelHistory) workspaceTaskHistory(input.modelHistory.history, input.modelHistory.start);
   const permit = Object.freeze({ binding });
   const stateHome = input.storage.run(() => workspaceStateHome());
   let state: PermitState;
@@ -134,7 +140,9 @@ export function createWorkspaceRunPermit(input: {
     },
   };
   state = { assertLive, provider, cwd, stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
-    updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false };
+    updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false,
+    ...(input.modelHistory ? { modelHistory: { ...input.modelHistory,
+      prefixDigest: createHash("sha256").update(canonical(input.modelHistory.history.slice(0, input.modelHistory.start))).digest("hex") } } : {}) };
   for (const value of Object.values(state.usage)) if (!Number.isSafeInteger(value) || value < 0) throw new Error("invalid Workspace persisted usage");
   permits.set(permit, state);
   assertLive();
@@ -188,6 +196,16 @@ export function beginWorkspaceGovernedRun(permit: WorkspaceRunPermit, options: R
   state.started = true;
 }
 export function workspaceRunToolAllowed(permit: WorkspaceRunPermit, name: string): boolean { return stateOf(permit).tools.has(name); }
+export function prepareWorkspaceRunHistory(permit: WorkspaceRunPermit, history: NeutralMsg[]): NeutralMsg[] {
+  const state = stateOf(permit); state.assertLive();
+  if (!state.started) throw new Error("Workspace model context requires the governed entry");
+  const pinned = state.modelHistory;
+  if (!pinned) return history; // Existing trusted non-Host fixtures already contain one attempt only.
+  if (history !== pinned.history || createHash("sha256").update(canonical(history.slice(0, pinned.start))).digest("hex") !== pinned.prefixDigest) {
+    throw new Error("Workspace durable history prefix changed; model request refused");
+  }
+  return workspaceTaskHistory(history, pinned.start);
+}
 export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string, execute: () => Promise<T>): Promise<T> {
   const state = stateOf(permit); state.assertLive();
   if (!state.started || !state.tools.has(name) || state.usage.toolCalls >= permit.binding.budget.maxToolCalls) throw new Error("Workspace tool unavailable or budget exhausted");

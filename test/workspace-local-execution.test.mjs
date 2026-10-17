@@ -11,7 +11,7 @@ import { WorkspaceResources } from "../dist/workspace/resources.js";
 import { WorkspaceConnectionStoreV2 } from "../dist/workspace/connections.js";
 import { freezeWorkspaceRunBinding, workspaceAgentBindingHash } from "../dist/workspace/run-binding.js";
 import { WorkspaceSessionLease } from "../dist/workspace/session-lease.js";
-import { createWorkspaceRunPermit, bindWorkspaceRunOptions, closeWorkspaceRunPermit } from "../dist/workspace/execution.js";
+import { createWorkspaceRunPermit, bindWorkspaceRunOptions, beginWorkspaceGovernedRun, closeWorkspaceRunPermit, prepareWorkspaceRunHistory } from "../dist/workspace/execution.js";
 import { createTaskExecution, finishTaskExecution } from "../dist/session/task.js";
 import { runConfiguredAgent, bindNewAgentTask } from "../dist/agent-runtime/dispatch.js";
 import { runAgent } from "../dist/agent/loop.js";
@@ -21,7 +21,7 @@ const temporary=[];
 after(()=>{for(const path of temporary)fs.rmSync(path,{recursive:true,force:true});});
 function dir(){const path=fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(),"hara-local-execution-")));temporary.push(path);return path;}
 const reply=text=>({text,toolUses:[],stop:"end",usage:{input:7,output:3}});
-function fixture(turn,extraTools=[]){
+function fixture(turn,extraTools=[],modelHistory){
  const home=dir(),project=dir(),catalog=new LocalWorkspaceCatalog(home),row=catalog.create("Personal",1);
  const resources=new WorkspaceResources(home,row.scope);resources.initialize();const main=resources.agents.initializeMain();
  const storage=new WorkspaceResourceStorage(home,row.scope);storage.initialize();
@@ -36,7 +36,7 @@ function fixture(turn,extraTools=[]){
  let requests=0,usage={modelCalls:0,toolCalls:0,inputTokens:0,outputTokens:0};
  const permit=createWorkspaceRunPermit({binding,catalog,resources,storage,connections,lease,cwd:project,signal:controller.signal,
   provider:{id:"openai",model:binding.connection.model,async turn(args){requests++;return turn(args,requests);}},
-  toolNames:["task_intake","task_checkpoint","todo_write",...extraTools.map(tool=>tool.name)],usage,
+  toolNames:["task_intake","task_checkpoint","todo_write",...extraTools.map(tool=>tool.name)],usage,modelHistory,
   updateUsage(value){usage={...value};}});
  const input={ctx:{cwd:project,sessionId,todoScope:`local-${sessionId}`,sandbox:"off"},signal:controller.signal,
   approval:"auto-edit",approvalChannel:true,confirm:async()=>false,hooks:false,quiet:true,extraTools,
@@ -54,6 +54,18 @@ test("actual Pi execution reaches the frozen scoped provider once, without legac
   assert.equal(result.status,"completed");assert.equal(a.requests,1);assert.equal(history.at(-1).text,"Hello from scoped Pi");
   assert.equal(a.usage.modelCalls,1);assert.equal(a.usage.inputTokens,7);
   assert.equal(fs.existsSync(join(a.home,".hara","profiles.json")),false);
+ }finally{await a.close();}
+});
+test("attempt context is pinned to the actual durable transcript and refuses a replaced or rewritten prefix",async()=>{
+ const history=[{role:"user",content:"retained older task"},{role:"assistant",text:"old result",toolUses:[]},{role:"user",content:"current task"}];
+ const a=fixture(async()=>reply("must not run"),[],{history,start:2});
+ try{
+  assert.throws(()=>prepareWorkspaceRunHistory(a.permit,history),/governed entry/);
+  beginWorkspaceGovernedRun(a.permit,a.options,"pi");
+  assert.deepEqual(prepareWorkspaceRunHistory(a.permit,history),history.slice(2));
+  assert.throws(()=>prepareWorkspaceRunHistory(a.permit,structuredClone(history)),/prefix changed/);
+  history[0].content="rewritten old task";
+  assert.throws(()=>prepareWorkspaceRunHistory(a.permit,history),/prefix changed/);assert.equal(a.requests,0);
  }finally{await a.close();}
 });
 test("forged JSON handles, direct legacy kernel, changed provider and stripped provenance start zero models",async()=>{

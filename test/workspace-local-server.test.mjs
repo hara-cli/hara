@@ -33,9 +33,12 @@ test("formal startServe local branch boots without provider/global config and en
   const listed=await client.request("workspace.list");await client.request("workspace.select",{workspaceId:created.workspaceId,expectedRevision:listed.revision});
   await assert.rejects(client.request("workspace.session.send",{workspaceId:created.workspaceId,expectedGeneration:randomUUID(),agentId:created.selectedAgentId,message:"hello",requestId:randomUUID()}),/generation/);
   await assert.rejects(client.request("workspace.session.send",{workspaceId:created.workspaceId,expectedGeneration:created.resourceGeneration,agentId:created.selectedAgentId,message:"hello",requestId:randomUUID(),workspaceRunBinding:{authorized:true}}),/unsupported/);
-  const run=await client.request("workspace.session.send",{workspaceId:created.workspaceId,expectedGeneration:created.resourceGeneration,agentId:created.selectedAgentId,message:"hello",requestId:randomUUID()});assert.equal(typeof run.runId,"string");
+  await assert.rejects(client.request("workspace.session.send",{workspaceId:created.workspaceId,expectedGeneration:created.resourceGeneration,agentId:created.selectedAgentId+"\n",message:"hello",requestId:randomUUID()}),/invalid/);
+  await assert.rejects(client.request("workspace.session.send",{workspaceId:created.workspaceId,expectedGeneration:created.resourceGeneration,agentId:created.selectedAgentId,message:"hello\x1bworld",requestId:randomUUID()}),/invalid/);
+  const run=await client.request("workspace.session.send",{workspaceId:created.workspaceId,expectedGeneration:created.resourceGeneration,agentId:created.selectedAgentId,message:"hello\n你好\r\n第二行\t內容",requestId:randomUUID()});assert.equal(typeof run.runId,"string");
   const snapshot=await until(async()=>{const view=await client.request("workspace.snapshot",{workspaceId:created.workspaceId,agentId:null});return view.conversation.state==="completed"?view:null;});
   assert.equal(snapshot.conversation.usage.modelCalls,1);assert.equal(snapshot.syntheticOnly,true);
+  assert.equal(snapshot.conversation.history[0].content,"hello\n你好\r\n第二行\t內容");
   const blocked=new WebSocket(`ws://127.0.0.1:${handle.port}`,{origin:"https://evil.example.invalid"});blocked.on("error",()=>{});
   const [error]=await once(blocked,"error");assert.match(error.message,/403/);blocked.terminate();
  }finally{await client.close();await handle.close();}

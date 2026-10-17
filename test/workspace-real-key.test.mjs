@@ -4,7 +4,7 @@ import fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
-import { WorkspaceRealKeyLane, ARK_REAL_KEY_SLICE } from "../dist/workspace/real-key-provider.js";
+import { WorkspaceRealKeyLane, ARK_REAL_KEY_SLICE, ARK_CONTEXT_TRIM_SLICE } from "../dist/workspace/real-key-provider.js";
 import { captureWorkspaceFileCredential, resolveWorkspaceFileCredential } from "../dist/workspace/file-credential.js";
 import { withProviderRetry } from "../dist/providers/retry.js";
 import { withWorkspaceToolReceipts } from "../dist/workspace/local-tools.js";
@@ -102,6 +102,41 @@ test("Workspace result citations use the actual host toolCallId, never a model-a
   assert.deepEqual(value.receipt, { toolCallId: "call_actual_host_id", toolName: "fixture" });
   const [failed] = withWorkspaceToolReceipts([{ name: "fixture", input_schema: {}, kind: "read", async run() { throw new Error("denied"); } }]);
   await assert.rejects(failed.run({}, { toolCallId: "failed-id" }), /denied/);
+});
+test("new 150k authorization appends cumulative receipts without resetting old usage, freezes its offset and disables the old allowance", async () => {
+  const a = fixture(); let calls = 0;
+  const wire = async () => { calls++; return stream({ input: 20, output: 3 }); };
+  const priorLane = new WorkspaceRealKeyLane(a.root, a.file, wire); await provider(priorLane).turn(args());
+  const ledgerFile = join(a.root, ".hara/real-key-budget-v1.json"), prior = JSON.parse(fs.readFileSync(ledgerFile, "utf8"));
+  let lane = new WorkspaceRealKeyLane(a.root, a.file, wire, ARK_CONTEXT_TRIM_SLICE);
+  assert.equal(lane.summary().maxTokens, 150000); assert.equal(lane.summary().priorRequests, 1);
+  for (let i = 0; i < 24; i++) {
+    if (i === 8) lane = new WorkspaceRealKeyLane(a.root, a.file, wire, ARK_CONTEXT_TRIM_SLICE);
+    assert.equal((await provider(lane).turn(args())).stop, "end");
+  }
+  assert.equal((await provider(lane).turn(args())).stop, "error"); assert.equal(calls, 25);
+  const summary = lane.summary(); assert.equal(summary.requests, 24); assert.equal(summary.cumulativeRequests, 25);
+  assert.equal(summary.inputTokens + summary.outputTokens, 24 * 23);
+  assert.equal(summary.cumulativeInputTokens + summary.cumulativeOutputTokens, 25 * 23); assert.equal(summary.paused, true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(ledgerFile, "utf8")).requests.slice(0, 1), prior.requests);
+  assert.throws(() => new WorkspaceRealKeyLane(a.root, a.file, wire), /暫停/);
+  assert.throws(() => new WorkspaceRealKeyLane(a.root, a.file, wire, "unapproved"), /暫停/);
+});
+test("150k slice reserves before IO and rejects a changed offset or rewritten old receipt", async () => {
+  const a = fixture(); let calls = 0;
+  const lane = new WorkspaceRealKeyLane(a.root, a.file, async () => { calls++; return stream({ input: 50000, output: 1 }); }, ARK_CONTEXT_TRIM_SLICE);
+  const p = provider(lane), large = args("x".repeat(50000));
+  assert.equal((await p.turn(large)).stop, "end"); assert.equal((await p.turn(large)).stop, "end");
+  assert.equal((await p.turn(large)).stop, "error"); assert.equal(calls, 2);
+  assert.equal(lane.summary().inputTokens + lane.summary().outputTokens, 100002);
+  const budgetFile = join(a.root, ".hara/real-key-context-trim-20261017-v1.json"), budget = JSON.parse(fs.readFileSync(budgetFile, "utf8"));
+  fs.writeFileSync(budgetFile, JSON.stringify({ ...budget, requestOffset: 2 }));
+  assert.throws(() => new WorkspaceRealKeyLane(a.root, a.file, undefined, ARK_CONTEXT_TRIM_SLICE), /暫停/);
+  const b = fixture(), oldLane = new WorkspaceRealKeyLane(b.root, b.file, async () => stream()); await provider(oldLane).turn(args());
+  new WorkspaceRealKeyLane(b.root, b.file, undefined, ARK_CONTEXT_TRIM_SLICE);
+  const oldFile = join(b.root, ".hara/real-key-budget-v1.json"), old = JSON.parse(fs.readFileSync(oldFile, "utf8")); old.requests[0].input++;
+  fs.writeFileSync(oldFile, JSON.stringify(old));
+  assert.throws(() => new WorkspaceRealKeyLane(b.root, b.file, undefined, ARK_CONTEXT_TRIM_SLICE), /暫停/);
 });
 test("a paused human-dependency receipt is not surfaced as a completed Workspace task", async () => {
   const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-real-key-paused-"))); temporary.push(root);

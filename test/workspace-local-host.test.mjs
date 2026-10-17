@@ -138,3 +138,11 @@ test("actual CLI routes before legacy startup and does not create caller Home st
  const {stdout}=await execute(process.execPath,[cli,"workspace-dev","init","--root",root],{cwd:dir(),env:{PATH:process.env.PATH,HOME:callerHome,USERPROFILE:callerHome}});
  const result=JSON.parse(stdout);assert.equal(result.syntheticOnly,true);assert.equal(result.workspaces.length,0);assert.deepEqual(fs.readdirSync(callerHome),[]);
 });
+test("actual CLI sends multiline bodies unchanged through its isolated governed entry",async()=>{
+ const a=setup(),callerHome=dir(),execute=promisify(execFile),cli=resolve("dist/cli.js");await a.host.close();
+ const message="hello\n你好\r\n第二行\t內容";
+ const {stdout}=await execute(process.execPath,[cli,"workspace-dev","run","--root",a.root,"--workspace",a.workspaceId,"--agent",a.main,"--message",message],
+  {cwd:dir(),env:{PATH:process.env.PATH,HOME:callerHome,USERPROFILE:callerHome}});
+ const result=JSON.parse(stdout);assert.equal(result.conversation.state,"completed");assert.equal(result.conversation.history[0].content,message);
+ assert.deepEqual(fs.readdirSync(callerHome),[]);
+});

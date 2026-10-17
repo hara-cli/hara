@@ -18,6 +18,12 @@ export function text(value: unknown, max = 256): value is string {
   return typeof value === "string" && value.length > 0 && value === value.trim() && value.length <= max
     && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
 }
+/** Chat/delegation bodies may contain LF, CR and tabs. IDs, paths and metadata still use text().
+ * Do not normalize: request digests must distinguish different bodies, including their newlines. */
+export function messageBody(value: unknown, max = 4000): value is string {
+  return typeof value === "string" && value.length > 0 && value.trim().length > 0 && value.length <= max
+    && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(value);
+}
 export const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 export function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;

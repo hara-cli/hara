@@ -19,9 +19,9 @@ import { WorkspaceTreeBudget } from "./tree-budget.js";
 import { openLocalWorkspaceDevRoot } from "./local-dev-root.js";
 import { localWorkspaceFileTools, withWorkspaceToolReceipts } from "./local-tools.js";
 import { createWorkspaceSyntheticProvider, SYNTHETIC_CONNECTION } from "./synthetic-provider.js";
-import { canonical, exact, plain, positive, text, UUID } from "./local-state.js";
+import { canonical, exact, messageBody, plain, positive, text, UUID } from "./local-state.js";
 import type { WorkspaceAgentView } from "./agents.js";
-import { WorkspaceRealKeyLane } from "./real-key-provider.js";
+import { WorkspaceRealKeyLane, type ArkAcceptanceSlice } from "./real-key-provider.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
 interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string }
@@ -56,6 +56,7 @@ export class LocalWorkspaceHost {
   constructor(root: string, private readonly options: {
     providerFactory?: LocalWorkspaceProviderFactory;
     realKeyFile?: string;
+    realKeySlice?: ArkAcceptanceSlice;
     interactiveApprovals?: boolean;
     onChange?: (event: { workspaceId: string; agentId?: string }) => void;
   } = {}) {
@@ -63,8 +64,9 @@ export class LocalWorkspaceHost {
     this.catalog = new LocalWorkspaceCatalog(this.home);
     if (options.realKeyFile) {
       if (options.providerFactory) throw new Error("Real-key acceptance cannot replace its trusted Provider factory");
-      this.realKey = new WorkspaceRealKeyLane(this.root, options.realKeyFile);
+      this.realKey = new WorkspaceRealKeyLane(this.root, options.realKeyFile, undefined, options.realKeySlice);
     }
+    else if (options.realKeySlice) throw new Error("A real-key slice requires its explicit file reference");
   }
   modelMode() { return this.realKey ? { syntheticOnly: false, executionMode: "ark-real-key" as const, budget: this.realKey.summary() }
     : { syntheticOnly: true, executionMode: "synthetic" as const }; }
@@ -214,7 +216,7 @@ export class LocalWorkspaceHost {
     tools.push({ name: "agent_contact", description: "Delegate one bounded same-Workspace file task to an existing colleague by exact agentId and await its actual verified result.", kind: "edit",
       input_schema: { type: "object", properties: { agentId: { type: "string" }, task: { type: "string" } }, required: ["agentId", "task"] },
       async run(input, toolContext) {
-        if (!plain(input) || !exact(input, ["agentId", "task"]) || !text(input.agentId) || !text(input.task, 2000)) throw new Error("invalid colleague task");
+        if (!plain(input) || !exact(input, ["agentId", "task"]) || !text(input.agentId) || !messageBody(input.task, 2000)) throw new Error("invalid colleague task");
         assertCurrent();
         const target = job.context.resources.agents.get(input.agentId);
         if (!target || target.kind !== "colleague" || target.state !== "active" || target.runtime.id !== "pi") throw new Error("同空間同事不可用");
@@ -235,7 +237,7 @@ export class LocalWorkspaceHost {
     return withWorkspaceToolReceipts(tools);
   }
   start(clientId: string, workspaceId: string, agentId: string, message: string, requestId: string, resume = false, parent?: LocalJob, parentSignal?: AbortSignal) {
-    if (this.closing || !text(message, 4000) || !UUID.test(requestId)) throw new Error("invalid Workspace message or closing Host");
+    if (this.closing || !messageBody(message) || !UUID.test(requestId)) throw new Error("invalid Workspace message or closing Host");
     const context = this.context(workspaceId), agent = context.resources.agents.get(agentId);
     if (!agent || agent.state !== "active" || agent.runtime.id !== "pi") throw new Error("Agent Runtime unavailable; no fallback selected");
     if (parent && (parent.workspaceId !== workspaceId || parent.binding.lineage.depth !== 0)) throw new Error("delegation is limited to one same-Workspace hop");
@@ -281,6 +283,7 @@ export class LocalWorkspaceHost {
       const provider = this.realKey ? this.realKey.createProvider(connection, binding.connection)
         : (this.options.providerFactory ?? createWorkspaceSyntheticProvider)(connection, binding.connection,
           { agent, objective: task.objective, colleagues: () => context.resources.agents.list().agents });
+      const modelHistoryStart = value.history.length;
       value.history.push({ role: "user", content: message }); value.task = task;
       value.attempt = { attemptId: lease.attemptId, fence: (value.attempt?.fence ?? 0) + 1, runId: binding.runId, state: "running", startedAt: new Date().toISOString(), endedAt: null };
       value.requests.push({ requestId, digest, taskId: task.id, runId: binding.runId }); value = store.save(value.revision, value);
@@ -290,6 +293,7 @@ export class LocalWorkspaceHost {
       const tools = this.jobTools(owned, agent);
       owned.permit = createWorkspaceRunPermit({ binding, catalog: this.catalog, resources: context.resources, storage: context.storage, connections: context.connections,
         lease, provider, cwd: context.project, signal: owned.signal, toolNames: ["task_intake", "task_checkpoint", "todo_write", ...tools.map(tool => tool.name)], usage: value.runUsage,
+        modelHistory: { history: value.history, start: modelHistoryStart },
         updateUsage: next => {
           const delta = ZERO_USAGE(); for (const key of Object.keys(delta) as (keyof WorkspaceUsage)[]) delta[key] = next[key] - owned.value.runUsage[key];
           owned.lease.assertCurrent(); tree.consume(delta);
@@ -300,13 +304,14 @@ export class LocalWorkspaceHost {
       owned.options = bindWorkspaceRunOptions(owned.permit, { ctx: { cwd: context.project, sessionId: store.sessionId, todoScope: `workspace-${binding.runId}`, sandbox: "off" },
         signal: owned.signal, approval: "auto-edit", approvalChannel: true, confirm: async () => false, quiet: true, hooks: false, extraTools: tools,
         systemOverride: `You are ${configuration.identity.displayName}, a clearly identified Hara AI colleague. ${configuration.instructions}\nUse only this Workspace's supplied tools. Never claim completion without observed evidence.\n`
+          + `Current task objective (user data): ${JSON.stringify(task.objective)}. This attempt's messages are the working context; complete history remains local. On recovery use the checkpoint only as a hint and obtain fresh read-only observations before claiming completion.\n`
           + `Reply naturally in the user's language. Call AI coworkers 同事, not Pi 同事; pi is only an internal runtime. A greeting needs no tools.\n`
           + `For creation use agent_create and wait for the human card; for delegation use agent_contact with an existing exact agentId.\n`
           + `agent_create returns only AFTER the human has approved; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. Check agent_list before creating so an active colleague is not duplicated.\n`
           + `Successful Workspace tool results repeat the exact citation ID in receipt.toolCallId. Copy that exact value for completion.checks; never invent IDs or repeat side effects to fix a rejected citation. After restart, re-observe state with read-only tools and cite the new receipt.\n`
           + `Current authorized colleagues: ${JSON.stringify(context.resources.agents.list().agents.map(item => ({ agentId: item.agentId, name: item.identity.displayName, kind: item.kind })))}.\n`
           + `For file tasks read first; write only if necessary, then workspace_verify. End accepted tasks with task_checkpoint completion and observed tool_call_ids, not a prose-only claim.`,
-        continuationSession: value.history.length > 1,
+        continuationSession: resume,
         taskIntake: { task, current: () => owned.value.task!, onUpdate: next => { owned.value.task = next; },
           onCheckpoint: next => this.commit(owned, next), onRoundUsage: next => this.commit(owned, next) } });
       this.jobs.set(owned.id, owned);
