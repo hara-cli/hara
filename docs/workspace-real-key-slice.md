@@ -26,6 +26,13 @@ import native auth/plugins. Main Hara proposes a colleague, a fresh scoped human
 then it may delegate one same-Workspace hop and only close with an observed verified result. The UI
 calls them 同事; Pi is an internal runtime label, not a type of employee.
 
+Successful local tools repeat the actual host toolCallId in a `receipt` citation hint. It is not a new
+attestation: the existing completion-evidence ledger still rejects fabricated/failed/stale IDs. The
+creation result explicitly states humanConfirmed and approvalState=consumed; it never returns a pending
+proposal as a created colleague. A same-Workspace read-only agent_list permits re-observation after
+restart without recreating an Agent or importing a prior run's evidence. An attempt that ended with a
+paused task is projected as blocked, not completed.
+
 `test/workspace-real-key.test.mjs` uses fake key files and an injected in-memory SSE transport only.
 It does not call a model. Real acceptance results, exact SHAs, timings, usage and leak scans are in
 the workspace inbox report, not in this generic source document. Existing fixture-marker v1's

@@ -10545,3 +10545,34 @@ headings and retried without modifying unrelated entries.
 - Pattern-Key: workspace.credentials_readonly_reference_not_migration_reader
 
 ---
+
+## [ERR-20261017-WORKSPACE-CITATION-AND-APPROVAL-STATE] Real model invented citation IDs after confirmed creation
+
+**Logged**: 2026-10-17
+**Priority**: high
+**Status**: in_progress
+**Area**: backend
+
+### Summary
+
+In the approved real-model Lab, the native user confirmed the creation card and Coder became active.
+The model cited an invented toolu_ ID, not the actual call_ ID. The existing evidence ledger correctly
+rejected verified completion. The next model step misinterpreted created:true as a pending proposal and
+returned awaiting_user for a confirmation already consumed. Host snapshot also projected the completed
+attempt as completed despite the durable task being paused.
+
+### Fix under verification
+
+Keep the evidence gate unchanged. Repeat the exact host-owned citation ID in structured Workspace tool
+results; explicitly state that agent_create returns only after human confirmation is consumed. Add a
+same-Workspace read-only agent_list so restart/recovery can observe current state without repeating a
+side effect. Project paused task state as blocked rather than completed. Preserve the original failed
+transcript and budget. Synthetic tests alone did not establish real model behavior.
+
+### Metadata
+
+- Related Files: `src/workspace/local-host.ts`, `src/workspace/local-tools.ts`, `test/workspace-real-key.test.mjs`
+- Private evidence: `/private/tmp/hara-real-key-acceptance-20261017.yB2RBp/after-colleague.json`
+- Pattern-Key: workspace.real_model_receipt_ids_and_consumed_approval_are_explicit
+
+---

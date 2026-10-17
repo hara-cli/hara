@@ -17,7 +17,7 @@ import { freezeWorkspaceRunBinding, workspaceAgentBindingHash, type WorkspaceRun
 import { createWorkspaceRunPermit, bindWorkspaceRunOptions, assertWorkspaceRunAdmission, closeWorkspaceRunPermit, type WorkspaceRunPermit } from "./execution.js";
 import { WorkspaceTreeBudget } from "./tree-budget.js";
 import { openLocalWorkspaceDevRoot } from "./local-dev-root.js";
-import { localWorkspaceFileTools } from "./local-tools.js";
+import { localWorkspaceFileTools, withWorkspaceToolReceipts } from "./local-tools.js";
 import { createWorkspaceSyntheticProvider, SYNTHETIC_CONNECTION } from "./synthetic-provider.js";
 import { canonical, exact, plain, positive, text, UUID } from "./local-state.js";
 import type { WorkspaceAgentView } from "./agents.js";
@@ -145,7 +145,8 @@ export class LocalWorkspaceHost {
       label: row.label, agentRevision: catalog.revision, agents: catalog.agents, selectedAgentId: selected,
       connections: context.connections.list(), conversation: { revision: value.revision, sessionId: value.sessionId,
         state: live ? live.controller.signal.aborted ? "draining" : "running"
-          : value.attempt?.state === "running" || value.attempt?.state === "draining" ? "needs_recovery" : value.attempt?.state ?? "idle",
+          : value.attempt?.state === "running" || value.attempt?.state === "draining" ? "needs_recovery"
+          : value.attempt?.state === "completed" && value.task?.status !== "completed" ? "blocked" : value.attempt?.state ?? "idle",
         taskId: value.task?.id ?? null, objective: value.task?.objective ?? "", taskState: value.task?.status ?? null,
         runId: value.task?.workspaceRunBinding?.runId ?? null,
         completion: value.task?.checkpoint?.completion ?? null, blockReason: value.task?.checkpoint?.blockReason ?? null,
@@ -191,8 +192,13 @@ export class LocalWorkspaceHost {
   private jobTools(job: LocalJob, agent: WorkspaceAgentView): Tool[] {
     const assertCurrent = () => { assertWorkspaceRunAdmission(job.permit, job.options!, "pi"); };
     const tools = localWorkspaceFileTools(job.context.project, assertCurrent);
-    if (agent.kind !== "main") return tools;
-    tools.push({ name: "agent_create", description: "Propose one colleague in this Workspace; a fresh human confirmation card is mandatory. The internal runtime is pi; call them 同事 in user-facing text.", kind: "edit",
+    if (agent.kind !== "main") return withWorkspaceToolReceipts(tools);
+    tools.push({ name: "agent_list", description: "Read the active colleagues of THIS Workspace only. Check existing names/IDs before creating or delegating; never recreate an already active colleague to repair a completion citation.", kind: "read",
+      input_schema: { type: "object", properties: {} }, async run(input) {
+        if (!plain(input) || !exact(input, [])) throw new Error("invalid colleague listing");
+        assertCurrent(); return JSON.stringify({ agents: job.context.resources.agents.list().agents });
+      } });
+    tools.push({ name: "agent_create", description: "Create one colleague AFTER a fresh human confirmation. This tool waits while the card is pending; created:true is returned ONLY AFTER the card was approved and the colleague is active. Never ask for confirmation again after success. The internal runtime is pi; call them 同事 in user-facing text.", kind: "edit",
       input_schema: { type: "object", properties: { username: { type: "string" }, displayName: { type: "string" }, title: { type: "string" }, instructions: { type: "string" } }, required: ["username", "displayName", "title", "instructions"] },
       async run(input) {
         if (!plain(input) || !exact(input, ["username", "displayName", "title", "instructions"]) || !text(input.username, 64)
@@ -202,7 +208,7 @@ export class LocalWorkspaceHost {
         if (!approved) throw new Error("同事建立未獲確認；沒有建立 Agent");
         assertCurrent();
         const created = job.context.resources.agents.create({ username: input.username, profile: { displayName: input.displayName, title: input.title }, instructions: input.instructions, runtimeId: "pi" }, job.context.resources.agents.list().revision);
-        host.changed(job.workspaceId, job.agentId); return JSON.stringify({ created: true, agent: created });
+        host.changed(job.workspaceId, job.agentId); return JSON.stringify({ created: true, humanConfirmed: true, approvalState: "consumed", agent: created });
       } });
     const host = this;
     tools.push({ name: "agent_contact", description: "Delegate one bounded same-Workspace file task to an existing colleague by exact agentId and await its actual verified result.", kind: "edit",
@@ -226,7 +232,7 @@ export class LocalWorkspaceHost {
         return JSON.stringify({ completed: true, agentId: target.agentId, taskId: child.value.task.id, runId: child.id,
           completion: child.value.task.checkpoint?.completion ?? null });
       } });
-    return tools;
+    return withWorkspaceToolReceipts(tools);
   }
   start(clientId: string, workspaceId: string, agentId: string, message: string, requestId: string, resume = false, parent?: LocalJob, parentSignal?: AbortSignal) {
     if (this.closing || !text(message, 4000) || !UUID.test(requestId)) throw new Error("invalid Workspace message or closing Host");
@@ -296,6 +302,8 @@ export class LocalWorkspaceHost {
         systemOverride: `You are ${configuration.identity.displayName}, a clearly identified Hara AI colleague. ${configuration.instructions}\nUse only this Workspace's supplied tools. Never claim completion without observed evidence.\n`
           + `Reply naturally in the user's language. Call AI coworkers 同事, not Pi 同事; pi is only an internal runtime. A greeting needs no tools.\n`
           + `For creation use agent_create and wait for the human card; for delegation use agent_contact with an existing exact agentId.\n`
+          + `agent_create returns only AFTER the human has approved; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. Check agent_list before creating so an active colleague is not duplicated.\n`
+          + `Successful Workspace tool results repeat the exact citation ID in receipt.toolCallId. Copy that exact value for completion.checks; never invent IDs or repeat side effects to fix a rejected citation. After restart, re-observe state with read-only tools and cite the new receipt.\n`
           + `Current authorized colleagues: ${JSON.stringify(context.resources.agents.list().agents.map(item => ({ agentId: item.agentId, name: item.identity.displayName, kind: item.kind })))}.\n`
           + `For file tasks read first; write only if necessary, then workspace_verify. End accepted tasks with task_checkpoint completion and observed tool_call_ids, not a prose-only claim.`,
         continuationSession: value.history.length > 1,

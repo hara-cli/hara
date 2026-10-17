@@ -6,6 +6,17 @@ import { readVerifiedRegularFileSnapshotSync } from "../fs-read.js";
 import type { Tool } from "../tools/registry.js";
 import { exact, plain, text } from "./local-state.js";
 
+/** Transport IDs are easy for a model to miscopy. Repeat the actual host-owned ID inside a successful
+ * structured result; this is a citation hint, NOT evidence authority. The engine ledger still checks it. */
+export function withWorkspaceToolReceipts(tools: Tool[]): Tool[] {
+  return tools.map(tool => ({ ...tool, async run(input, ctx) {
+    const result = await tool.run(input, ctx);
+    if (!ctx.toolCallId) return result;
+    let value: unknown; try { value = JSON.parse(result); } catch { return result; }
+    return plain(value) ? JSON.stringify({ ...value, receipt: { toolCallId: ctx.toolCallId, toolName: tool.name } }) : result;
+  } }));
+}
+
 /** Fixture-only project tools. No shell, symlinks, protected files, arbitrary outputs or external IO. */
 export function localWorkspaceFileTools(project: string, assertCurrent: () => void): Tool[] {
   const target = (value: unknown): string => {

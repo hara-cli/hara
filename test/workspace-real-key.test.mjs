@@ -7,6 +7,8 @@ import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { WorkspaceRealKeyLane, ARK_REAL_KEY_SLICE } from "../dist/workspace/real-key-provider.js";
 import { captureWorkspaceFileCredential, resolveWorkspaceFileCredential } from "../dist/workspace/file-credential.js";
 import { withProviderRetry } from "../dist/providers/retry.js";
+import { withWorkspaceToolReceipts } from "../dist/workspace/local-tools.js";
+import { randomUUID } from "node:crypto";
 
 const temporary = [], key = "fixture-secret-never-a-real-credential";
 after(() => { for (const path of temporary) fs.rmSync(path, { recursive: true, force: true }); });
@@ -93,4 +95,26 @@ test("file rotation, secret-bearing model output and concurrent requests fail cl
   const serial = new WorkspaceRealKeyLane(c.root, c.file, async () => { parallel++; await gate; return stream(); }), pc = provider(serial);
   const pending = pc.turn(args()); while (!parallel) await new Promise(r => setImmediate(r));
   assert.equal((await pc.turn(args())).stop, "error"); assert.equal(parallel, 1); release(); assert.equal((await pending).stop, "end");
+});
+test("Workspace result citations use the actual host toolCallId, never a model-authored lookalike", async () => {
+  const [tool] = withWorkspaceToolReceipts([{ name: "fixture", input_schema: {}, kind: "read", async run() { return JSON.stringify({ receipt: { toolCallId: "forged" }, verified: true }); } }]);
+  const value = JSON.parse(await tool.run({}, { toolCallId: "call_actual_host_id" }));
+  assert.deepEqual(value.receipt, { toolCallId: "call_actual_host_id", toolName: "fixture" });
+  const [failed] = withWorkspaceToolReceipts([{ name: "fixture", input_schema: {}, kind: "read", async run() { throw new Error("denied"); } }]);
+  await assert.rejects(failed.run({}, { toolCallId: "failed-id" }), /denied/);
+});
+test("a paused human-dependency receipt is not surfaced as a completed Workspace task", async () => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-real-key-paused-"))); temporary.push(root);
+  const host = new LocalWorkspaceHost(root, { providerFactory(_connection, binding) { return { id: "openai", model: binding.model, async turn(turn) {
+    const action = (name, input) => ({ id: randomUUID(), name, input });
+    if (!turn.history.some(m => m.role === "tool")) return { text: "", toolUses: [action("task_intake", { intent: "change", goal: "wait for physical fixture", constraints: [], acceptance: ["human arrives"], steps: ["wait"] })], stop: "tool_use" };
+    return { text: "", toolUses: [action("task_checkpoint", { completion: { state: "awaiting_user", evidence: ["physical fixture is not present"], dependency: { kind: "physical_action", detail: "bring fixture", evidence: ["fixture is absent"] }, final_answer: "等待實體物品" } })], stop: "tool_use" };
+  } }; } });
+  try {
+    const workspace = host.createWorkspace("Paused", host.list().revision); host.configureSynthetic(workspace.workspaceId, 0);
+    const run = host.start("test", workspace.workspaceId, workspace.selectedAgentId, "wait", randomUUID()); await host.wait(run.runId);
+    const conversation = host.snapshot(workspace.workspaceId).conversation;
+    assert.equal(conversation.taskState, "paused"); assert.equal(conversation.state, "blocked");
+    assert.ok(conversation.blockReason); assert.equal(conversation.completion.state, "awaiting_user");
+  } finally { await host.close(); }
 });
