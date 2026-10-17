@@ -23,7 +23,7 @@ test("actual process death after writing recovers the frozen task, closes protoc
  try{
   const ready=once(child.stdout,"data").then(([bytes])=>bytes.toString());
   assert.match(await Promise.race([ready,exited.then(([exitCode])=>{throw new Error(`isolated child exited before write: ${exitCode}: ${stderr}`);})]),/AFTER_WRITE/);
-  const file=join(root,"project","hello.md"),before=fs.statSync(file),hash=createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+  const file=join(root,"project",workspace.workspaceId,"hello.md"),before=fs.statSync(file),hash=createHash("sha256").update(fs.readFileSync(file)).digest("hex");
   child.kill("SIGKILL");await exited;
   const restored=new LocalWorkspaceHost(root);try{
    const pending=restored.snapshot(workspace.workspaceId);assert.equal(pending.conversation.state,"needs_recovery");

@@ -1,5 +1,29 @@
 # Errors
 
+## [ERR-20261017-LOCAL-PROJECT-ISOLATION] Workspace artifacts need distinct project roots
+
+**Logged**: 2026-10-17
+**Priority**: high
+**Status**: resolved
+**Area**: workspace
+
+Native cross-space acceptance exposed that isolated chats/connections/budgets still used the same
+fixture project. A/B could observe the same relative file. Bind tools, cwd and frozen RunBinding
+to an owner-only `project/WORKSPACE_ID` directory; retain the container as non-executable. Reject
+old shared-project resumes before Provider construction instead of implicitly migrating them.
+The new A/B regression fails against the prior compiled candidate (retained red log), then passes
+with the partitioned project. Keep A's inode/history unchanged and require B's initial read to be
+missing. The additional old-run fixture initially forgot storage.initialize; correct the fixture,
+not admission checks or assertions. Preserve previous candidate data for audit, use a fresh root.
+
+Full regression runner lessons: a tool-host SIGTERM (143) is not a pass. A detached owned runner
+records completion independently. Do not inject HARA_UPDATE_CHECK=0 into config-default tests:
+that makes their expected true default correctly false. Remove the runner override, not product
+behavior or test assertions. The unchanged prior source then passed 2846 plus 1 existing skip;
+the project-isolation fix still needs its own final full-source gate.
+
+---
+
 ## [ERR-20261017-LOCAL-SERVE-STRICT-GATE] Keep compiler and handshake contracts explicit
 
 **Logged**: 2026-10-17

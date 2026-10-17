@@ -6,6 +6,7 @@ import type { RunOpts, RunOutcome } from "../agent/loop.js";
 import type { Provider } from "../providers/types.js";
 import type { Tool } from "../tools/registry.js";
 import { redactSensitiveText } from "../security/secrets.js";
+import { ensurePrivateStateSubdirectory } from "../security/private-state.js";
 import { LocalWorkspaceCatalog } from "./local-catalog.js";
 import { WorkspaceResources } from "./resources.js";
 import { currentWorkspaceResourceBinding, WorkspaceResourceStorage } from "./resource-context.js";
@@ -22,7 +23,7 @@ import { canonical, exact, plain, positive, text, UUID } from "./local-state.js"
 import type { WorkspaceAgentView } from "./agents.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
-interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2 }
+interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string }
 export interface LocalWorkspaceApproval {
   id: string; workspaceId: string; agentId: string; runId: string; expiresAt: string;
   resourceGeneration: string;
@@ -69,7 +70,10 @@ export class LocalWorkspaceHost {
     };
     const storage = new WorkspaceResourceStorage(this.home, row.scope, assertAuthority); storage.initialize();
     const resources = new WorkspaceResources(this.home, row.scope, { assertCurrent: assertAuthority }); resources.initialize();
-    const context = { storage, resources, connections: new WorkspaceConnectionStoreV2(storage) };
+    // The fixture project is workspace data too. Sharing the container root would let B observe
+    // or reuse A's same-relative-path artifacts despite isolated chat/config/budget state.
+    const project = storage.run(() => ensurePrivateStateSubdirectory(this.project, [row.scope.workspaceId]).path);
+    const context = { storage, resources, connections: new WorkspaceConnectionStoreV2(storage), project };
     this.contexts.set(workspaceId, context); return context;
   }
   private changed(workspaceId: string, agentId?: string): void { this.options.onChange?.({ workspaceId, ...(agentId ? { agentId } : {}) }); }
@@ -170,7 +174,7 @@ export class LocalWorkspaceHost {
   }
   private jobTools(job: LocalJob, agent: WorkspaceAgentView): Tool[] {
     const assertCurrent = () => { assertWorkspaceRunAdmission(job.permit, job.options!, "pi"); };
-    const tools = localWorkspaceFileTools(this.project, assertCurrent);
+    const tools = localWorkspaceFileTools(job.context.project, assertCurrent);
     if (agent.kind !== "main") return tools;
     tools.push({ name: "agent_create", description: "Propose one Pi colleague in this Workspace; a fresh human confirmation card is mandatory.", kind: "edit",
       input_schema: { type: "object", properties: { username: { type: "string" }, displayName: { type: "string" }, title: { type: "string" }, instructions: { type: "string" } }, required: ["username", "displayName", "title", "instructions"] },
@@ -240,16 +244,17 @@ export class LocalWorkspaceHost {
       } else {
         if (value.task) value.pastTasks.push({ task: value.task, usage: value.runUsage, endedAt: new Date().toISOString() });
         task = context.resources.agents.bindTask(createTaskExecution(message, randomUUID()), agentId, agent.configRevision, agent.agentEpoch);
-        const project = lstatSync(this.project);
+        const project = lstatSync(context.project);
         task.workspaceRunBinding = freezeWorkspaceRunBinding({ schemaVersion: 1, scope: row.scope, agent: task.workspaceAgentBinding!,
           agentBindingHash: workspaceAgentBindingHash(task.workspaceAgentBinding!), connection: context.connections.capture(), runtimeContract: "hara-governed-pi-v1",
-          project: { root: this.project, dev: project.dev, ino: project.ino }, sessionId: store.sessionId, runId: randomUUID(),
+          project: { root: context.project, dev: project.dev, ino: project.ino }, sessionId: store.sessionId, runId: randomUUID(),
           lineage: parent ? { rootRunId: parent.binding.lineage.rootRunId ?? parent.id, parentRunId: parent.id, depth: 1 } : { rootRunId: null, parentRunId: null, depth: 0 },
           createdAt: new Date().toISOString(), host: { hostId: host.hostId, hostEpoch: host.hostEpoch, grantId: row.grantId, grantRevision: row.grantRevision, actorId: row.actorId, policyRevision: row.policyRevision },
           budget: parent ? { ...parent.binding.budget } : { maxRounds: 12, maxToolCalls: 32, maxTokens: 32000, timeoutMs: 120000 } });
         value.runUsage = ZERO_USAGE();
       }
       const binding = task.workspaceRunBinding!, controller = new AbortController();
+      if (binding.project.root !== context.project) throw new Error("Workspace project root changed; old task retained read-only, no implicit project migration");
       const provider = (this.options.providerFactory ?? createWorkspaceSyntheticProvider)(context.connections.resolve(binding.connection), binding.connection,
         { agent, objective: task.objective, colleagues: () => context.resources.agents.list().agents });
       value.history.push({ role: "user", content: message }); value.task = task;
@@ -260,7 +265,7 @@ export class LocalWorkspaceHost {
       const owned = job, tree = new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget);
       const tools = this.jobTools(owned, agent);
       owned.permit = createWorkspaceRunPermit({ binding, catalog: this.catalog, resources: context.resources, storage: context.storage, connections: context.connections,
-        lease, provider, cwd: this.project, signal: owned.signal, toolNames: ["task_intake", "task_checkpoint", "todo_write", ...tools.map(tool => tool.name)], usage: value.runUsage,
+        lease, provider, cwd: context.project, signal: owned.signal, toolNames: ["task_intake", "task_checkpoint", "todo_write", ...tools.map(tool => tool.name)], usage: value.runUsage,
         updateUsage: next => {
           const delta = ZERO_USAGE(); for (const key of Object.keys(delta) as (keyof WorkspaceUsage)[]) delta[key] = next[key] - owned.value.runUsage[key];
           owned.lease.assertCurrent(); tree.consume(delta);
@@ -268,7 +273,7 @@ export class LocalWorkspaceHost {
           owned.value.runUsage = { ...next }; this.commit(owned);
         } });
       const configuration = context.resources.agents.resolveTask(binding.agent);
-      owned.options = bindWorkspaceRunOptions(owned.permit, { ctx: { cwd: this.project, sessionId: store.sessionId, todoScope: `workspace-${binding.runId}`, sandbox: "off" },
+      owned.options = bindWorkspaceRunOptions(owned.permit, { ctx: { cwd: context.project, sessionId: store.sessionId, todoScope: `workspace-${binding.runId}`, sandbox: "off" },
         signal: owned.signal, approval: "auto-edit", approvalChannel: true, confirm: async () => false, quiet: true, hooks: false, extraTools: tools,
         systemOverride: `You are ${configuration.identity.displayName}, a clearly identified Hara AI colleague. ${configuration.instructions}\nUse only this Workspace's supplied tools. Never claim completion without observed evidence.`,
         continuationSession: value.history.length > 1,

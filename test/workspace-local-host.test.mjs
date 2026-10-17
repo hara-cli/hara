@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { SYNTHETIC_CONNECTION } from "../dist/workspace/synthetic-provider.js";
 import { WorkspaceTreeBudget } from "../dist/workspace/tree-budget.js";
-import { WorkspaceResourceStorage } from "../dist/workspace/resource-context.js";
+import { WorkspaceResourceStorage, workspaceStateHome } from "../dist/workspace/resource-context.js";
 
 const temporary=[];
 after(()=>{for(const path of temporary)fs.rmSync(path,{recursive:true,force:true});});
@@ -36,7 +36,7 @@ test("no-key boot, main chat, explicit creation card, colleague task and same-ro
   const delegated=a.host.start("client",a.workspaceId,a.main,"委派 Coder 生成 hello.md 並驗證",randomUUID());await a.host.wait(delegated.runId);
   snapshot=a.host.snapshot(a.workspaceId,a.main,"client");
   assert.equal(snapshot.conversation.taskState,"completed");assert.equal(snapshot.conversation.completion.state,"verified");
-  assert.equal(fs.readFileSync(join(a.root,"project","hello.md"),"utf8"),"hello workspace\n");
+  assert.equal(fs.readFileSync(join(a.root,"project",a.workspaceId,"hello.md"),"utf8"),"hello workspace\n");
   const child=a.host.snapshot(a.workspaceId,colleague.agentId);assert.equal(child.conversation.taskState,"completed");
   assert.equal(child.conversation.completion.state,"verified");assert.ok(child.conversation.history.some(message=>message.role==="tool"));
   assert.equal(JSON.stringify(snapshot).includes(SYNTHETIC_CONNECTION.apiKey),false);assert.equal(JSON.stringify(snapshot).includes("configHash"),false);
@@ -44,6 +44,38 @@ test("no-key boot, main chat, explicit creation card, colleague task and same-ro
   let factories=0;const restored=new LocalWorkspaceHost(a.root,{providerFactory(){factories++;throw new Error("read must not create provider");}});
   try{assert.equal(JSON.stringify(restored.snapshot(a.workspaceId,a.main,"client").conversation),before);assert.equal(factories,0);assert.equal(restored.snapshot(a.workspaceId).agents.length,2);}finally{await restored.close();}
  }finally{await a.host.close();}
+});
+test("different Workspaces cannot share same-relative-path project artifacts or reuse each other's verification",async()=>{
+ const a=setup();try{
+  const b=a.host.createWorkspace("Other",a.host.list().revision);a.host.configureSynthetic(b.workspaceId,0);
+  const first=a.host.start("client",a.workspaceId,a.main,"生成 hello.md 並驗證",randomUUID());await a.host.wait(first.runId);
+  const fileA=join(a.root,"project",a.workspaceId,"hello.md"),fileB=join(a.root,"project",b.workspaceId,"hello.md");
+  assert.equal(fs.existsSync(fileA),true,"A must write only its own project root");assert.equal(fs.existsSync(fileB),false);
+  const before=a.host.snapshot(a.workspaceId).conversation,inode=fs.statSync(fileA).ino;
+  const second=a.host.start("other",b.workspaceId,b.selectedAgentId,"生成 hello.md 並驗證",randomUUID());await a.host.wait(second.runId);
+  assert.equal(fs.readFileSync(fileB,"utf8"),"hello workspace\n");assert.equal(fs.statSync(fileA).ino,inode);
+  assert.notEqual(fs.statSync(fileB).ino,inode);assert.deepEqual(a.host.snapshot(a.workspaceId).conversation,before);
+  const bRead=a.host.snapshot(b.workspaceId).conversation.history.flatMap(row=>row.role==="tool"?row.results:[]).find(row=>row.name==="workspace_read");
+  assert.equal(JSON.parse(bRead.content).exists,false,"B must not observe A's file even with an identical connection value");
+  assert.equal(fs.existsSync(join(a.root,"project","hello.md")),false,"the shared fixture container is not an executable project");
+ }finally{await a.host.close();}
+});
+test("old shared-project run remains readable but cannot resume or construct a Provider",async()=>{
+ let entered,release;const ready=new Promise(r=>entered=r),pending=new Promise(r=>release=r);
+ const a=setup({providerFactory(_connection,binding){return{id:"openai",model:binding.model,async turn(){entered();await pending;return{text:"late",toolUses:[],stop:"end",usage:{input:1,output:1}};}};}});
+ try{
+  const run=a.host.start("client",a.workspaceId,a.main,"hello",randomUUID());await ready;a.host.cancel(a.workspaceId,a.main,run.runId);release();await a.host.wait(run.runId);
+  const row=a.host.catalog.resolve(a.workspaceId),storage=new WorkspaceResourceStorage(a.host.home,row.scope);storage.initialize();
+  const path=storage.run(()=>join(workspaceStateHome(),".hara",`conversation-${a.main.slice(3)}.json`));
+  await a.host.close();const raw=JSON.parse(fs.readFileSync(path,"utf8")),base=fs.statSync(join(a.root,"project"));
+  // Seed an earlier candidate's valid on-disk snapshot, not an authorized live mutation.
+  raw.task.workspaceRunBinding.project={root:join(a.root,"project"),dev:base.dev,ino:base.ino};fs.writeFileSync(path,JSON.stringify(raw)+"\n",{mode:0o600});
+  let constructed=0;const restored=new LocalWorkspaceHost(a.root,{providerFactory(){constructed++;throw new Error("must not construct");}});
+  try{const history=restored.snapshot(a.workspaceId).conversation.history;
+   assert.throws(()=>restored.start("client",a.workspaceId,a.main,"/continue",randomUUID(),true),/project root changed/);
+   assert.equal(constructed,0);assert.deepEqual(restored.snapshot(a.workspaceId).conversation.history,history);
+  }finally{await restored.close();}
+ }finally{release();await a.host.close();}
 });
 test("durable request IDs deduplicate messages after completion and restart, without another model call",async()=>{
  const a=setup(),id=randomUUID();try{
