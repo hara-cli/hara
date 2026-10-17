@@ -15,7 +15,8 @@ import { closedWorkspaceHistory, WorkspaceConversationStore, type WorkspaceConve
 import { WorkspaceSessionLease } from "./session-lease.js";
 import { freezeWorkspaceRunBinding, workspaceAgentBindingHash, type WorkspaceRunBinding } from "./run-binding.js";
 import { createWorkspaceRunPermit, bindWorkspaceRunOptions, assertWorkspaceRunAdmission, assertWorkspaceRunContextCurrent, closeWorkspaceRunPermit, type WorkspaceRunPermit } from "./execution.js";
-import { WorkspaceTreeBudget } from "./tree-budget.js";
+import { WorkspaceBudgetAdmissionError, WorkspaceTreeBudget } from "./tree-budget.js";
+import { WorkspaceRequestJournal, type WorkspaceRequestOrigin } from "./request-journal.js";
 import { openLocalWorkspaceDevRoot } from "./local-dev-root.js";
 import { localWorkspaceFileTools, withWorkspaceToolReceipts } from "./local-tools.js";
 import { createWorkspaceSyntheticProvider, SYNTHETIC_CONNECTION } from "./synthetic-provider.js";
@@ -157,11 +158,27 @@ export class LocalWorkspaceHost {
         runId: value.task?.workspaceRunBinding?.runId ?? null,
         completion: value.task?.checkpoint?.completion ?? null, blockReason: value.task?.checkpoint?.blockReason ?? null,
         usage: value.usage, runUsage: value.runUsage, pastTaskCount: value.pastTasks.length,
+        resumeAdmission: this.resumeAdmission(context, value),
         history: value.history.map(message => message.role === "assistant" ? { role: message.role, text: message.text, tools: message.toolUses.map(tool => tool.name) }
           : message.role === "tool" ? { role: message.role, results: message.results.map(result => ({ id: result.id, name: result.name, content: result.content, isError: result.isError ?? false })) }
           : { role: message.role, content: message.content }) },
       approvals: [...this.pending.values()].filter(pending => pending.card.workspaceId === workspaceId && pending.card.agentId === selected && pending.clientId === clientId).map(pending => pending.card),
       ...this.modelMode() };
+  }
+  private resumeAdmission(context: WorkspaceHostContext, value: WorkspaceConversation) {
+    const binding = value.task?.workspaceRunBinding;
+    if (!binding || value.task?.status === "completed") return { allowed: false, reason: "no_resumable_task" };
+    try { new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget).assertResumeAdmission(value.runUsage); return { allowed: true, reason: null }; }
+    catch (error) { return { allowed: false, reason: error instanceof WorkspaceBudgetAdmissionError ? error.reason : "budget_unavailable" }; }
+  }
+  requestReceipt(workspaceId: string, agentId: string, requestId: string) {
+    if (!UUID.test(requestId) || !this.context(workspaceId).resources.agents.get(agentId)) throw new Error("invalid Workspace receipt identity");
+    const context = this.context(workspaceId), value = new WorkspaceConversationStore(context.storage, agentId).read();
+    const accepted = value.requests.find(row => row.requestId === requestId), entry = new WorkspaceRequestJournal(context.storage, agentId).find(requestId);
+    return { workspaceId, agentId, requestId, resourceGeneration: context.storage.run(() => currentWorkspaceResourceBinding()!.generation),
+      state: accepted ? "accepted" : entry?.state === "rejected" ? "rejected" : "unknown",
+      runId: accepted?.runId ?? null, reason: entry?.reason ?? null,
+      source: entry?.source ?? "unknown_legacy", sourceAssurance: entry?.channel === "rpc" ? "client_declared" : entry ? "host_recorded" : "unrecorded" };
   }
   answerApproval(clientId: string, workspaceId: string, id: string, approved: boolean): void {
     const pending = this.pending.get(id), selection = this.clients.get(clientId);
@@ -236,7 +253,8 @@ export class LocalWorkspaceHost {
           return handoff({ completed: true, agentId: target.agentId, taskId: prior.task.id,
             runId: prior.task.workspaceRunBinding!.runId, completion: prior.task.checkpoint.completion, retainedReceipt: true });
         }
-        const receipt = host.start(job.clientId, job.workspaceId, target.agentId, input.task, randomUUID(), sameDelegation, job, toolContext.signal);
+        const receipt = host.start(job.clientId, job.workspaceId, target.agentId, input.task, randomUUID(), sameDelegation, job, toolContext.signal,
+          { source: "delegation", channel: "internal", clientId: job.clientId });
         const child = host.jobs.get(receipt.runId)!;
         await child.promise; assertCurrent();
         if (!child.outcome || child.outcome.status !== "completed" || child.value.task?.status !== "completed"
@@ -246,22 +264,37 @@ export class LocalWorkspaceHost {
       } });
     return withWorkspaceToolReceipts(tools);
   }
-  start(clientId: string, workspaceId: string, agentId: string, message: string, requestId: string, resume = false, parent?: LocalJob, parentSignal?: AbortSignal) {
+  start(clientId: string, workspaceId: string, agentId: string, message: string, requestId: string, resume = false, parent?: LocalJob, parentSignal?: AbortSignal,
+    origin: WorkspaceRequestOrigin = { source: "host", channel: "internal", clientId }) {
     if (this.closing || !messageBody(message) || !UUID.test(requestId)) throw new Error("invalid Workspace message or closing Host");
     const context = this.context(workspaceId), agent = context.resources.agents.get(agentId);
     if (!agent || agent.state !== "active" || agent.runtime.id !== "pi") throw new Error("Agent Runtime unavailable; no fallback selected");
     if (parent && (parent.workspaceId !== workspaceId || parent.binding.lineage.depth !== 0)) throw new Error("delegation is limited to one same-Workspace hop");
+    const isContinue = message.trim() === "/continue";
+    resume ||= isContinue; // A typed command must not silently open a new task/budget.
     const store = new WorkspaceConversationStore(context.storage, agentId), digest = createHash("sha256").update(canonical([message, resume])).digest("hex");
     const duplicate = store.read().requests.find(request => request.requestId === requestId);
     if (duplicate) {
       if (duplicate.digest !== digest) throw new Error("message id already belongs to another request");
       return { runId: duplicate.runId, duplicate: true };
     }
-    if ([...this.jobs.values()].some(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId)) throw new Error("Agent is still running or draining");
-    const lease = WorkspaceSessionLease.acquire(context.storage, store.sessionId);
+    const journal = new WorkspaceRequestJournal(context.storage, agentId), previous = journal.find(requestId);
+    if (previous) {
+      if (previous.digest !== digest) throw new Error("message id already belongs to another request");
+      if (previous.state === "rejected") throw new Error(`Workspace request was rejected (${previous.reason}); no new model call`);
+      throw new Error("Workspace request outcome is unknown; inspect its receipt, do not resend");
+    }
+    journal.receive({ requestId, digest, operation: isContinue ? "continue" : resume ? "resume" : "send" }, origin);
+    let lease: WorkspaceSessionLease | undefined;
     let job: LocalJob | undefined;
     try {
+      if ([...this.jobs.values()].some(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId)) throw new Error("Agent is still running or draining");
+      lease = WorkspaceSessionLease.acquire(context.storage, store.sessionId);
       let value = store.read(); // lock BEFORE loading the resumable state
+      if (resume && value.task?.workspaceRunBinding) {
+        const binding = value.task.workspaceRunBinding;
+        new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget).assertResumeAdmission(value.runUsage);
+      }
       if (value.attempt?.state === "running" || value.attempt?.state === "draining") {
         value.attempt = { ...value.attempt, state: "interrupted", endedAt: new Date().toISOString() };
         if (value.task) value.task = finishTaskExecution(value.task, undefined, [], true)!;
@@ -297,6 +330,7 @@ export class LocalWorkspaceHost {
       value.history.push({ role: "user", content: message }); value.task = task;
       value.attempt = { attemptId: lease.attemptId, fence: (value.attempt?.fence ?? 0) + 1, runId: binding.runId, state: "running", startedAt: new Date().toISOString(), endedAt: null };
       value.requests.push({ requestId, digest, taskId: task.id, runId: binding.runId }); value = store.save(value.revision, value);
+      journal.settle(requestId, "accepted", { taskId: task.id, runId: binding.runId });
       job = { id: binding.runId, workspaceId, agentId, clientId, context, store, value, lease, controller,
         signal: parent ? AbortSignal.any([controller.signal, parent.signal, ...(parentSignal ? [parentSignal] : [])]) : controller.signal, binding, promise: Promise.resolve(), closed: false };
       const owned = job, tree = new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget);
@@ -330,10 +364,13 @@ export class LocalWorkspaceHost {
         taskIntake: { task, current: () => owned.value.task!, onUpdate: next => { owned.value.task = next; },
           onCheckpoint: next => this.commit(owned, next), onRoundUsage: next => this.commit(owned, next) } });
       this.jobs.set(owned.id, owned);
-      owned.promise = this.run(owned); this.changed(workspaceId, agentId);
+      // Yield the transport ACK before beginning model/tool preparation. The job is already
+      // durably accepted and cancellable; the promise still owns/drains the entire execution.
+      owned.promise = new Promise<void>(resolve => setImmediate(resolve)).then(() => this.run(owned)); this.changed(workspaceId, agentId);
       return { runId: owned.id, duplicate: false };
     } catch (error) {
-      if (job?.permit) void closeWorkspaceRunPermit(job.permit).catch(() => {}); else lease.release();
+      try { journal.settle(requestId, "rejected", { reason: error instanceof WorkspaceBudgetAdmissionError ? error.reason : "admission_rejected" }); }
+      finally { if (job?.permit) void closeWorkspaceRunPermit(job.permit).catch(() => {}); else lease?.release(); }
       throw error;
     }
   }

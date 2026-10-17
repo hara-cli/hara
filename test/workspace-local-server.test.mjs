@@ -60,3 +60,20 @@ test("RPC creation approval is tied to original controller and Workspace, not a 
   assert.equal(done.agents.length,2);assert.equal((await a.request("workspace.snapshot",{workspaceId:other.workspaceId,agentId:null})).agents.length,1);
  }finally{await a.close();await b.close();await handle.close();}
 });
+test("RPC acknowledges a slow mock task, records its source, and receipt lookup never resends or calls a Provider",async()=>{
+ const root=dir();let release,entered,calls=0;const ready=new Promise(r=>entered=r),pending=new Promise(r=>release=r);
+ const handle=await startLocalWorkspaceServe({host:"127.0.0.1",port:0,cwd:root},{root,version:"synthetic",providerFactory(_connection,binding){return{id:"openai",model:binding.model,async turn(){calls++;entered();await pending;return{text:"mock",toolUses:[],stop:"end",usage:{input:1,output:1}};}};}});
+ const c=await connect(handle);try{
+  const init=await c.request("initialize",{token:handle.token}),w=await c.request("workspace.create",{label:"Slow mock",expectedRevision:init.workspace.revision});
+  await c.request("workspace.connection.synthetic",{workspaceId:w.workspaceId,expectedGeneration:w.resourceGeneration,expectedRevision:0});
+  const requestId=randomUUID(),params={workspaceId:w.workspaceId,expectedGeneration:w.resourceGeneration,agentId:w.selectedAgentId,message:"hello",requestId,source:"ui"};
+  const ack=await c.request("workspace.session.send",params);assert.equal(typeof ack.runId,"string");await ready;
+  const receiptParams={workspaceId:w.workspaceId,expectedGeneration:w.resourceGeneration,agentId:w.selectedAgentId,requestId};
+  const receipt=await c.request("workspace.session.receipt",receiptParams);assert.equal(receipt.state,"accepted");assert.equal(receipt.runId,ack.runId);assert.equal(receipt.source,"ui");assert.equal(receipt.sourceAssurance,"client_declared");
+  assert.equal((await c.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId})).conversation.state,"running");
+  for(let i=0;i<3;i++)await c.request("workspace.session.receipt",receiptParams);assert.equal(calls,1);
+  await assert.rejects(c.request("workspace.session.send",{...params,requestId:randomUUID(),source:"delegation"}),/source/);
+  await assert.rejects(c.request("workspace.session.receipt",{...receiptParams,expectedGeneration:randomUUID()}),/generation/);
+  release();await until(async()=>{const view=await c.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId});return view.conversation.state==="completed";});assert.equal(calls,1);
+ }finally{release();await c.close();await handle.close();}
+});

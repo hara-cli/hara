@@ -3,6 +3,7 @@ import { startLocalWorkspaceServe } from "../serve/local-workspace.js";
 import { LocalWorkspaceHost } from "./local-host.js";
 import { messageBody, text } from "./local-state.js";
 import { ARK_CONTEXT_TRIM_SLICE } from "./real-key-provider.js";
+import { WorkspaceBudgetAdmissionError } from "./tree-budget.js";
 
 /** Real CLI entry for the explicitly opted-in synthetic local Workspace lane. No legacy boot/config. */
 export async function mainLocalWorkspaceCli(args: string[]): Promise<void> {
@@ -36,8 +37,15 @@ export async function mainLocalWorkspaceCli(args: string[]): Promise<void> {
     if (command === "init" || command === "status") { console.log(JSON.stringify(host.list())); return; }
     const workspaceId = values.get("--workspace"), agentId = values.get("--agent"), message = values.get("--message");
     if (!text(workspaceId) || !text(agentId) || !messageBody(message)) throw new Error("run requires explicit --workspace, --agent and --message");
-    const started = host.start("headless-cli", workspaceId, agentId, message, values.get("--request-id") ?? randomUUID(), resume);
+    const started = host.start("headless-cli", workspaceId, agentId, message, values.get("--request-id") ?? randomUUID(), resume, undefined, undefined,
+      { source: "cli", channel: "cli", clientId: "headless-cli" });
     await host.wait(started.runId); const snapshot = host.snapshot(workspaceId, agentId);
     console.log(JSON.stringify(snapshot)); if (snapshot.conversation.state !== "completed") process.exitCode = 2;
+  } catch (error) {
+    // A fixed trusted classification is safe to show; arbitrary startup/provider errors remain
+    // hidden by the early CLI boundary, so paths, credentials or response bodies cannot leak.
+    if (!(error instanceof WorkspaceBudgetAdmissionError)) throw error;
+    console.error(`hara workspace-dev: resume budget exhausted (${error.reason}); no model call or new chat turn started.`);
+    process.exitCode = 2;
   } finally { await host.close(); }
 }

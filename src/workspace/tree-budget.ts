@@ -5,6 +5,9 @@ import type { WorkspaceUsage } from "./conversations.js";
 
 interface TreeBudgetState { schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding;
   rootRunId: string; limits: WorkspaceRunBinding["budget"]; usage: WorkspaceUsage }
+export class WorkspaceBudgetAdmissionError extends Error {
+  constructor(readonly reason: string) { super(`Workspace resume budget exhausted (${reason}); no model call or new chat turn started`); }
+}
 /** Reserve before effects. A failed downstream journal may conservatively overcount, never undercount. */
 export class WorkspaceTreeBudget {
   private readonly state: WorkspaceJsonState<TreeBudgetState>;
@@ -22,6 +25,16 @@ export class WorkspaceTreeBudget {
       usage: { modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 } }));
   }
   read(): Readonly<TreeBudgetState> { return this.state.read(); }
+  /** Read-only admission BEFORE provider construction, continuation/fence or chat persistence. */
+  assertResumeAdmission(runUsage: WorkspaceUsage): void {
+    const tree = this.read();
+    for (const [scope, usage] of [["run", runUsage], ["tree", tree.usage]] as const) {
+      if (usage.modelCalls >= tree.limits.maxRounds) throw new WorkspaceBudgetAdmissionError(`${scope}_rounds`);
+      if (usage.toolCalls >= tree.limits.maxToolCalls) throw new WorkspaceBudgetAdmissionError(`${scope}_tools`);
+      if (usage.inputTokens + usage.outputTokens >= tree.limits.maxTokens) throw new WorkspaceBudgetAdmissionError(`${scope}_tokens`);
+    }
+    if (tree.revision === 0 && Object.values(runUsage).some(value => value > 0)) throw new WorkspaceBudgetAdmissionError("missing_tree_receipt");
+  }
   consume(delta: WorkspaceUsage): void {
     const before = this.state.read();
     this.state.update(before.revision, current => {

@@ -10658,6 +10658,11 @@ acceptance requirements: the atomic recent tool/continuation unit retained 26.13
 15-20%, despite triggering at 73.27% budget and producing a 1,111-character summary. Keep this as an
 explicit exception for Jeff, not a passed ratio or reason to strip provider continuation unsafely.
 
+Jeff subsequently approved the measured 26.1% atomic-unit exception. Keep tool-call/result pairs and
+their matching provider continuation intact even when the smallest complete recent unit exceeds the
+15-20% target. Record the actual ratio; never rewrite history or the measurement to claim 18%.
+This acceptance does not resolve the separate old-resume provenance or UI RPC-state issues below.
+
 ## [ERR-20261017-WORKSPACE-OLD-RESUME-APPEND] Strict old-file immutability failed during zero-request boot
 
 **Logged**: 2026-10-17
@@ -10723,3 +10728,42 @@ The separate offline diagnostic first compared the whole old UI snapshot, includ
 shared live test-slice budget view; that view must advance after new calls in another Workspace. Its
 scoped-state comparisons now explicitly exclude only that global counter projection. The original
 strict old-file assertion remains unchanged and failed. Boolean comparisons avoid dumping histories.
+
+### Authorized synthetic follow-up for old resume / UI RPC state (2026-10-17)
+
+Budget admission was after durable continuation append. The fixed Host now checks both frozen run and
+shared-tree tokens/model rounds/tools under the session lease before changing a task, fence or history
+and before constructing a Provider. A separate scoped request journal records source/channel/controller,
+nonce, operation and admission result; no message bodies, keys or model usage are stored in that audit.
+Typing /continue is a resume, not a fresh task/budget. A missing tree receipt with nonzero run usage is
+refused. CLI displays only a trusted fixed budget classification, not arbitrary provider errors.
+
+Old-source forensics is limited: the last added attempt started at 19:31:20.214, before this session's
+first app observation at 19:31:31.785 and only click at 19:31:58.591 (new Workspace button, not resume).
+No recorded execution call in that window contains a resume/continue request, and the owned launcher
+only initializes/starts the server/frontend/native shell. Old request entries contain no client/source
+fields, so they cannot identify the actual UI user, CLI or other controller retroactively. Preserve
+unknown_legacy; never backfill a guessed author. New RPC source is client-declared diagnostic metadata,
+not authenticated user identity or execution authority.
+
+The native renderer client previously treated any 15-second RPC expiry as a request failure, dropped
+the late ACK, and its "verify" action resent the mutation with the old nonce. It now distinguishes
+transport waiting from task state and checks the original scope/generation/Agent/nonce via a read-only
+receipt method. Unknown stays unknown; it is never automatically resent. Read-only snapshot expiry
+keeps known task state and shows synchronization status, not task failure. A coalesced refresh must
+also await the actual snapshot rather than return immediately against stale configuration.
+
+Real-loopback synthetic integration held the ACK past the unchanged 15,000ms deadline (observed
+15,067ms): one mutation, one mock Provider call, zero paid calls, final completed state with no error
+or pending-unknown flag. This uses the same native renderer client/model, not a new Tauri-window test.
+Core focused gates 32/32 and renderer/transport gates 29/29 passed; full frozen-source gates follow.
+
+Diagnostic failures are retained, not represented as passed product gates: sandbox Pi tests hit
+localhost EPERM and passed unchanged with authorized loopback; the private old-source comparison
+initially assumed three added messages but its mock path adds two (the unchanged invariant is no
+continuation/history write at all). Native Node strip-types required an ordinary property declaration
+and explicit .ts runtime import, not parameter properties/extensionless imports. The CLI test exposed
+the generic error-wrapper obscuring budget refusal; fixed by emitting only the trusted classification.
+The first end-to-end fixture awaited a coalesced refresh that returned early, so no task was sent and
+the test timed out; precisely identified owned test PIDs 40080/40056 were stopped, failure data retained.
+The corrected refresh and bounded fixture cleanup passed the original 15-second transport experiment.

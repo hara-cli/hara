@@ -954,3 +954,37 @@ native standalone self-reentry in every platform CI lane so future runtime path 
   cron self-reentry smoke shared by Windows, Linux, and Darwin CI.
 
 ---
+
+## [LRN-20261017-WORKSPACE-ATOMIC-CONTEXT] accepted_exception
+
+**Logged**: 2026-10-17
+**Priority**: high
+**Status**: resolved
+**Area**: backend
+
+### Summary
+
+Jeff accepted the measured 26.1% recent-history retention exception after context compaction.
+Tool-call/result pairs and the matching provider continuation are indivisible protocol units.
+
+### Details
+
+The real slice triggered compaction at 73.27125% of the unchanged 80k task budget, retained
+3,352 / 12,828 characters (26.13034%) and generated a 1,111-character summary. Preserve the actual
+measurement and full durable history. Never split a call/result pair, strip provider continuation,
+or relabel the observed ratio as the configured 18% target to make a numerical gate look green.
+This exception does not waive evidence, authorization, per-task token limits or request budgets.
+
+### Metadata
+
+- Source: user_feedback
+- Related Files: `src/workspace/model-context.ts`, `test/workspace-model-context.test.mjs`
+- Pattern-Key: workspace.atomic_context_units_override_recent_share_target
+- See Also: ERR-20261017-WORKSPACE-REAL-CONTEXT-BUDGET
+
+### Resolution
+
+- **Resolved**: 2026-10-17, Jeff explicit approval in this task
+- **Notes**: Accepted protocol-preserving exception; no ratio/history or runtime policy was rewritten.
+
+---
