@@ -10799,3 +10799,41 @@ do not broaden into legacy Serve changes or keep repeating full runs until one h
 - Pattern-Key: tests.preserve_full_suite_timing_failures_without_weakening_deadlines
 
 ---
+
+### Authorized old-Serve timing investigation (2026-10-17, partial resolution)
+
+The natural original pair (18/18) and four-file concurrency-4 cohort (40/40) passed, so the historical
+full-suite failures were not naturally stable on demand. Private per-fsync/WS timing found 5,196 of
+5,490 fsyncs in the colleague file came from missing optional config reads acquiring a durable writer
+lock (three syncs per read). Existing profile-selector cleanup/plugin discovery amplify those reads
+at each nested delegation-current fence. A new structural regression observed 90 syncs for 30 reads.
+
+Core 5a0716e adds a verified unchanged-private-namespace/no-writer absence fast path; namespace races,
+unsafe markers and CAS claimed-inode gaps still enter the original lock. No empty config/value cache,
+credential changes or actual write/lock/fsync weakening. Four new regressions plus existing config,
+private-state and Workspace gates passed 63/63. The identical natural cohort dropped 54.269s to 11.021s,
+colleague syncs 5,490 to 294; original Serve fixtures, assertions, timers and concurrency remain unchanged.
+
+Storage stress is deliberately NOT erased: isolated fresh-process original cases with fixed 40ms added
+per fsync and concurrency 1 reproduced both original errors. The candidate passed colleague input lease
+(3.610s), but the 5s session.submit still expired: full-run completion and durable snapshot/index/journal/
+terminal receipt are on the response path; a correct result was sent after about 7.565s. It is not an
+infinite provider wait. Do not remove durable evidence, silently return accepted as completed, raise the
+timer or resend to hide this. Historical exact I/O timing was not captured; shared predecessor state is
+not needed for the controlled reproduction but cannot be categorically excluded from every past run.
+
+Frozen 5a0716e original npm test ran exactly twice consecutively with no probes, injected delay or source
+changes: each 2,887 pass / 0 fail / 0 cancelled / 1 existing platform skip (2,888 tests), 208.679s then
+202.222s test duration, exits 0. The 5s storage-stress residual and milestone decision remain pending;
+full-suite green does not retroactively make all stress/historical questions resolved.
+
+Incidental diagnostic failures retained: wrong relative inbox cwd and unmatched zsh discovery globs were
+read-only; sandbox ps denial was followed only by approved CPU-only metadata. An added CAS-gap fixture
+initially compared /var with canonical /private/var, missing its hook; fixed its private root, not the
+original Serve assertion. The actual config amplification red (90 versus 0 syncs) remains preserved.
+
+Evidence/report: /private/tmp/hara-serve-timeout-20261017.66F2uI/ and workspace inbox
+2026-10-17-codex-to-jeff-serve-timeout-root-cause.md. No paid calls/model-Key input; all 42 prior real files,
+29-request/244858-token ledger, main WIP and Control ahead-2 are unchanged. No push/deploy/release.
+
+---

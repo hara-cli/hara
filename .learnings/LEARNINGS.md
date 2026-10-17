@@ -988,3 +988,44 @@ This exception does not waive evidence, authorization, per-task token limits or 
 - **Notes**: Accepted protocol-preserving exception; no ratio/history or runtime policy was rewritten.
 
 ---
+
+## [LRN-20261017-CONFIG-ABSENCE-CONTENTION] best_practice
+
+**Logged**: 2026-10-17
+**Priority**: high
+**Status**: resolved
+**Area**: backend
+
+### Summary
+
+A missing optional config is a normal read result, not a reason to publish/fsync a writer lock on every
+policy lookup. Nested authority checks can turn that fallback into thousands of syncs and starve timers.
+
+### Details
+
+Keep every actual write's existing CAS, lock, permissions and durability. Return empty only after a
+verified private-directory namespace is unchanged across the absence lookup and neither writer nor
+reclaim marker is present. Use lstat, not existsSync (dangling links must not disappear). Namespace
+changes, unsafe entries or unknown stamps retain the original serialized retry. Never cache absence
+across future creation/credential rotation or mistake a CAS move-claim gap for a genuinely absent file.
+
+Structural count regression: 30 absent reads, 90 fsyncs before / 0 after. Real child paused in the writer
+gap, namespace ABA and unsafe marker tests pass; existing writer-race, rotation and Workspace isolation
+tests remain unchanged. Synthetic controlled storage failures are separate evidence from naturally
+reproducible full-suite failures; passing two full runs does not guarantee an arbitrary storage SLA.
+
+### Metadata
+
+- Source: error
+- Related Files: src/config.ts, test/config-read-contention.test.mjs
+- Pattern-Key: config.optional_absence_is_not_a_write_transaction
+- See Also: ERR-20261017-LEGACY-SERVE-FULL-TIMING
+
+### Resolution
+
+- **Resolved**: 2026-10-17
+- **Commit/PR**: 5a0716eb4bbd60680657ab18dd176f103a15e6f3 (local feat only)
+- **Notes**: Only the missing-config amplification is resolved; 5s legacy completed-RPC storage stress
+  remains in the error/report for Jeff's contract decision. No timeout/assertion or durability weakening.
+
+---
