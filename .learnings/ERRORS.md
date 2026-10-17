@@ -10836,4 +10836,10 @@ Evidence/report: /private/tmp/hara-serve-timeout-20261017.66F2uI/ and workspace 
 2026-10-17-codex-to-jeff-serve-timeout-root-cause.md. No paid calls/model-Key input; all 42 prior real files,
 29-request/244858-token ledger, main WIP and Control ahead-2 are unchanged. No push/deploy/release.
 
+Feedback closeout readback first hit `Feishu App Secret is unavailable in Keychain` at the sandbox
+boundary after a successful send receipt. It was a read-only permission failure, not a failed send.
+Approved exact-message readback through the same global feishu-communicate helper/config succeeded;
+original chat/root/parent and candidate/residual text verified. No account/backend substitution, message
+resend, model-Key access or duplicate release notice. Initial empty readback output retained privately.
+
 ---
