@@ -10,6 +10,7 @@ import { exact, plain, text } from "./local-state.js";
  * structured result; this is a citation hint, NOT evidence authority. The engine ledger still checks it. */
 export function withWorkspaceToolReceipts(tools: Tool[]): Tool[] {
   return tools.map(tool => ({ ...tool, async run(input, ctx) {
+    if (ctx.toolCallId !== undefined && !text(ctx.toolCallId, 240)) throw new Error("invalid Workspace tool receipt id");
     const result = await tool.run(input, ctx);
     if (!ctx.toolCallId) return result;
     let value: unknown; try { value = JSON.parse(result); } catch { return result; }

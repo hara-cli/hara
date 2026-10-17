@@ -46,6 +46,7 @@ for (const [name, options] of [
   ["interaction", { effect: "interactive" }],
   ["memory recall", { name: "memory_search" }],
   ["schema discovery", { name: "tool_search" }],
+  ["Workspace retained preview disguised as read", { name: "workspace_receipt_read" }],
   ["unknown effect", { effect: undefined }],
 ]) test(`${name} cannot attest to an acceptance criterion`, () => {
   const current = task(), ledger = new CompletionEvidenceLedger();

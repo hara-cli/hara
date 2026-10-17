@@ -1,7 +1,7 @@
 import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment, TurnArgs, TurnResult } from "../providers/types.js";
 import { isTaskRuntimeBinding } from "../agent-runtime/bindings.js";
 import { WORKSPACE_AGENT_EXECUTION_PENDING } from "../workspace/agent-binding.js";
-import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, workspaceRunToolAllowed, type WorkspaceRunPermit } from "../workspace/execution.js";
+import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, type WorkspaceRunPermit } from "../workspace/execution.js";
 import { createToolImageStore, redactOwnedToolImageText } from "../tools/tool-images.js";
 import { redactOwnedToolImageValue } from "../security/tool-media-redaction.js";
 import { createComputerRunScope, closeComputerRunScope } from "../tools/computer-run.js";
@@ -553,13 +553,14 @@ export function composeSystem(
   profileId?: string,
   runtimeTime?: RuntimeTimePromptOptions,
   scopedWorkspace = false,
+  workspaceWakeContext?: string,
 ): AssembledSystemPrompt {
   const assembler = new PromptAssembler();
   assembler.add("core", "static", "core", override || HARA_SYSTEM());
   const skills = scopedWorkspace ? "" : skillsDigest(cwd);
   const roles = scopedWorkspace || override ? "" : rolesDigest(cwd, profileId);
-  const checkpointContext = taskCheckpointContext(intake?.checkpoint, intake?.decisions);
-  const intakeContext = !intake?.enabled
+  const checkpointContext = scopedWorkspace ? "" : taskCheckpointContext(intake?.checkpoint, intake?.decisions);
+  const intakeContext = scopedWorkspace && workspaceWakeContext ? workspaceWakeContext : !intake?.enabled
     ? ""
     : intake.brief
       ? (
@@ -1967,6 +1968,7 @@ async function runAgentInner(
       ctx.profileId,
       undefined,
       Boolean(opts.workspaceRun),
+      opts.workspaceRun ? prepareWorkspaceRunWakeBrief(opts.workspaceRun) : undefined,
     );
     // Turn-tier parts (accepted brief, checkpoint, clock) change between provider requests. Left in the
     // system prompt they sit in FRONT of the whole conversation, so every request misses the provider's
@@ -3678,7 +3680,9 @@ async function runAgentInner(
           "Fix this task-state update, then send them again.";
       }
     }
-    const boundedContents = limitToolResultBatch(results.map((result) => result.content));
+    // Scoped Workspace history is the full local record. Its private model-view layer bounds/paginates
+    // output without spooling into the ambient homedir cache or rewriting canonical tool results.
+    const boundedContents = opts.workspaceRun ? results.map(result => result.content) : limitToolResultBatch(results.map((result) => result.content));
     for (let i = 0; i < results.length; i++) results[i].content = boundedContents[i];
     history.push({ role: "tool", results });
     const acceptedCompletionReply = Boolean(

@@ -14,7 +14,10 @@ import { canonical } from "./local-state.js";
 import { workspaceStateHome, type WorkspaceResourceStorage } from "./resource-context.js";
 import { freezeWorkspaceRunBinding, workspaceRunBindingsEqual, workspaceRunMatchesTask, type WorkspaceRunBinding } from "./run-binding.js";
 import type { WorkspaceUsage } from "./conversations.js";
-import { workspaceTaskHistory } from "./model-context.js";
+import { workspaceTaskHistory, workspaceTaskProjection, workspaceWakeBrief, type WorkspaceContextStats } from "./model-context.js";
+import { historyChars } from "../agent/context-budget.js";
+import type { ToolResult } from "../providers/types.js";
+import type { WorkspaceContextObservation } from "./context-audit.js";
 
 export interface WorkspaceRunPermit { readonly binding: Readonly<WorkspaceRunBinding> }
 interface PermitState {
@@ -31,7 +34,9 @@ interface PermitState {
   lease: WorkspaceSessionLease;
   retired: boolean;
   started: boolean;
-  modelHistory?: { history: NeutralMsg[]; start: number; prefixDigest: string };
+  modelHistory?: { history: NeutralMsg[]; start: number; prefixDigest: string; retain?: (result: ToolResult) => string; usedTokens?: () => number };
+  contextStats?: WorkspaceContextStats;
+  wakeChars: number;
 }
 const permits = new WeakMap<object, PermitState>();
 function stateOf(permit: unknown): PermitState {
@@ -69,7 +74,8 @@ export function createWorkspaceRunPermit(input: {
   toolNames: readonly string[];
   usage: WorkspaceUsage;
   /** Trusted Host-only attempt boundary. Persisted history stays complete and append-only. */
-  modelHistory?: { history: NeutralMsg[]; start: number };
+  modelHistory?: { history: NeutralMsg[]; start: number; retain?: (result: ToolResult) => string; usedTokens?: () => number };
+  observeContext?(value: WorkspaceContextObservation): void;
   updateUsage(value: Readonly<WorkspaceUsage>): void;
 }): WorkspaceRunPermit {
   const binding = freezeWorkspaceRunBinding(input.binding), cwd = realpathSync.native(input.cwd);
@@ -122,6 +128,9 @@ export function createWorkspaceRunPermit(input: {
       if (args.signal?.aborted || state.usage.modelCalls >= binding.budget.maxRounds
         || state.usage.inputTokens + state.usage.outputTokens >= binding.budget.maxTokens) throw new Error("Workspace model budget exhausted or cancelled");
       publishUsage(state, { modelCalls: 1 });
+      const observation = { modelCall: state.usage.modelCalls, systemChars: args.system.length, toolSchemaChars: JSON.stringify(args.tools).length,
+        systemAndToolsUtf8Bytes: Buffer.byteLength(args.system + JSON.stringify(args.tools)), modelHistoryChars: historyChars(args.history), wakeChars: state.wakeChars,
+        ...(state.contextStats ?? { compacted: false, originalChars: historyChars(args.history), recentChars: historyChars(args.history), summaryChars: 0, toolMaxChars: 0, agedToolMaxChars: 0 }) };
       const revoked = new AbortController();
       const signals = [input.signal, revoked.signal, ...(args.signal ? [args.signal] : [])];
       const forward = <A extends unknown[]>(fn: ((...values: A) => void) | undefined) => (...values: A): void => {
@@ -133,14 +142,16 @@ export function createWorkspaceRunPermit(input: {
       const operation = Promise.resolve().then(() => { assertLive(); if (guardedArgs.signal.aborted) throw new Error("Workspace model cancelled"); return input.provider.turn(guardedArgs); });
       const result: TurnResult = await track(state, operation);
       // Even a cancelled/late request consumes its recorded telemetry, but never releases more tools.
-      if (result.usage) publishUsage(state, { inputTokens: result.usage.input, outputTokens: result.usage.output });
+      try { if (result.usage) publishUsage(state, { inputTokens: result.usage.input, outputTokens: result.usage.output }); }
+      finally { input.observeContext?.({ ...observation, input: result.usage?.input ?? null, output: result.usage?.output ?? null,
+        inputWarning: (result.usage?.input ?? 0) > 12000 }); }
       assertLive();
       if (state.usage.inputTokens + state.usage.outputTokens > binding.budget.maxTokens) throw new Error("Workspace token telemetry safety ceiling reached");
       return result;
     },
   };
   state = { assertLive, provider, cwd, stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
-    updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false,
+    updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false, wakeChars: 0,
     ...(input.modelHistory ? { modelHistory: { ...input.modelHistory,
       prefixDigest: createHash("sha256").update(canonical(input.modelHistory.history.slice(0, input.modelHistory.start))).digest("hex") } } : {}) };
   for (const value of Object.values(state.usage)) if (!Number.isSafeInteger(value) || value < 0) throw new Error("invalid Workspace persisted usage");
@@ -196,6 +207,8 @@ export function beginWorkspaceGovernedRun(permit: WorkspaceRunPermit, options: R
   state.started = true;
 }
 export function workspaceRunToolAllowed(permit: WorkspaceRunPermit, name: string): boolean { return stateOf(permit).tools.has(name); }
+/** Trusted Host composition may retain a long instruction reference before options are pinned. */
+export function assertWorkspaceRunContextCurrent(permit: WorkspaceRunPermit): void { stateOf(permit).assertLive(); }
 export function prepareWorkspaceRunHistory(permit: WorkspaceRunPermit, history: NeutralMsg[]): NeutralMsg[] {
   const state = stateOf(permit); state.assertLive();
   if (!state.started) throw new Error("Workspace model context requires the governed entry");
@@ -204,7 +217,15 @@ export function prepareWorkspaceRunHistory(permit: WorkspaceRunPermit, history: 
   if (history !== pinned.history || createHash("sha256").update(canonical(history.slice(0, pinned.start))).digest("hex") !== pinned.prefixDigest) {
     throw new Error("Workspace durable history prefix changed; model request refused");
   }
-  return workspaceTaskHistory(history, pinned.start);
+  const projected = workspaceTaskProjection(history, pinned.start, { usedTokens: pinned.usedTokens?.() ?? state.usage.inputTokens + state.usage.outputTokens,
+    maxTokens: permit.binding.budget.maxTokens, task: state.options?.taskIntake?.current?.(), retain: pinned.retain });
+  state.contextStats = projected.stats; return projected.history;
+}
+export function prepareWorkspaceRunWakeBrief(permit: WorkspaceRunPermit): string {
+  const state = stateOf(permit); state.assertLive();
+  const task = state.options?.taskIntake?.current?.() ?? state.options?.taskIntake?.task;
+  if (!state.started || !task) throw new Error("Workspace wake context requires the governed task");
+  const brief = workspaceWakeBrief(task, state.modelHistory?.retain); state.wakeChars = brief.length; return brief;
 }
 export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string, execute: () => Promise<T>): Promise<T> {
   const state = stateOf(permit); state.assertLive();

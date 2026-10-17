@@ -102,6 +102,8 @@ test("Workspace result citations use the actual host toolCallId, never a model-a
   assert.deepEqual(value.receipt, { toolCallId: "call_actual_host_id", toolName: "fixture" });
   const [failed] = withWorkspaceToolReceipts([{ name: "fixture", input_schema: {}, kind: "read", async run() { throw new Error("denied"); } }]);
   await assert.rejects(failed.run({}, { toolCallId: "failed-id" }), /denied/);
+  let effects = 0; const [guarded] = withWorkspaceToolReceipts([{ name: "fixture", input_schema: {}, kind: "edit", async run() { effects++; return "{}"; } }]);
+  await assert.rejects(guarded.run({}, { toolCallId: "bad\nid" }), /receipt id/); assert.equal(effects, 0);
 });
 test("new 150k authorization appends cumulative receipts without resetting old usage, freezes its offset and disables the old allowance", async () => {
   const a = fixture(); let calls = 0;

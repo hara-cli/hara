@@ -10637,3 +10637,13 @@ The first Desktop full regression in this slice reported 21 localhost-listen EPE
 managed sandbox (656 pass). The identical suite with authorized loopback permission passed 677/677;
 no assertion or product check was weakened. Logs are retained separately as desktop-test.log and
 desktop-test-loopback.log in the task-private context-trim evidence directory.
+
+### 19:31 acceptance supplement for ERR-20261017-WORKSPACE-REAL-CONTEXT-BUDGET
+
+Stopped the isolated Lab before its first paid request to implement the added runtime criteria:
+72% shared-budget compaction, whole recent tool batches, 2k summary, 8k/aged2k previews, scoped full
+receipt files, bounded coworker handoffs and wake briefs. A retained receipt read is reference-only,
+explicitly excluded from completion evidence. No ambient HOME cache is used by this Workspace lane.
+The CUA quit returned an app-change transport warning, but the owned runner exited normally and recorded
+alive: []; do not reopen an exited Lab without its explicit fixture environment. A sandbox ps probe was
+denied; its failure is not proof of process absence. Use the owned-process receipt/exit and verified PIDs.

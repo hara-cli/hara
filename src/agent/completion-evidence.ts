@@ -7,7 +7,7 @@ const MAX_OBSERVATIONS = 512;
 const MAX_REFERENCES = 4;
 const EXCLUDED_TOOLS = new Set([
   "task_intake", "task_checkpoint", "todo_write", "ask_user", "tool_search", "tool_result_read",
-  "memory_search", "session_search", "skill", "mcp_connect",
+  "memory_search", "session_search", "skill", "mcp_connect", "workspace_receipt_read",
 ]);
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
 

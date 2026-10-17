@@ -14,7 +14,7 @@ import { WorkspaceConnectionStoreV2, type ScopedConnection, type ScopedRunConnec
 import { closedWorkspaceHistory, WorkspaceConversationStore, type WorkspaceConversation, type WorkspaceUsage } from "./conversations.js";
 import { WorkspaceSessionLease } from "./session-lease.js";
 import { freezeWorkspaceRunBinding, workspaceAgentBindingHash, type WorkspaceRunBinding } from "./run-binding.js";
-import { createWorkspaceRunPermit, bindWorkspaceRunOptions, assertWorkspaceRunAdmission, closeWorkspaceRunPermit, type WorkspaceRunPermit } from "./execution.js";
+import { createWorkspaceRunPermit, bindWorkspaceRunOptions, assertWorkspaceRunAdmission, assertWorkspaceRunContextCurrent, closeWorkspaceRunPermit, type WorkspaceRunPermit } from "./execution.js";
 import { WorkspaceTreeBudget } from "./tree-budget.js";
 import { openLocalWorkspaceDevRoot } from "./local-dev-root.js";
 import { localWorkspaceFileTools, withWorkspaceToolReceipts } from "./local-tools.js";
@@ -22,6 +22,9 @@ import { createWorkspaceSyntheticProvider, SYNTHETIC_CONNECTION } from "./synthe
 import { canonical, exact, messageBody, plain, positive, text, UUID } from "./local-state.js";
 import type { WorkspaceAgentView } from "./agents.js";
 import { WorkspaceRealKeyLane, type ArkAcceptanceSlice } from "./real-key-provider.js";
+import { WorkspaceContextReceipts } from "./context-receipts.js";
+import { WorkspaceContextAudit } from "./context-audit.js";
+import { boundWorkspaceText } from "./model-context.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
 interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string }
@@ -37,6 +40,7 @@ interface LocalJob {
   context: WorkspaceHostContext; store: WorkspaceConversationStore; value: WorkspaceConversation;
   lease: WorkspaceSessionLease; controller: AbortController; signal: AbortSignal; binding: Readonly<WorkspaceRunBinding>;
   permit?: WorkspaceRunPermit; options?: RunOpts; promise: Promise<void>; outcome?: RunOutcome; error?: string; closed: boolean;
+  receipts?: WorkspaceContextReceipts;
 }
 export type LocalWorkspaceProviderFactory = (connection: ScopedConnection, binding: ScopedRunConnection,
   context: { agent: WorkspaceAgentView; objective: string; colleagues: () => WorkspaceAgentView[] }) => Provider;
@@ -193,7 +197,7 @@ export class LocalWorkspaceHost {
   }
   private jobTools(job: LocalJob, agent: WorkspaceAgentView): Tool[] {
     const assertCurrent = () => { assertWorkspaceRunAdmission(job.permit, job.options!, "pi"); };
-    const tools = localWorkspaceFileTools(job.context.project, assertCurrent);
+    const tools = [...localWorkspaceFileTools(job.context.project, assertCurrent), job.receipts!.tool()];
     if (agent.kind !== "main") return withWorkspaceToolReceipts(tools);
     tools.push({ name: "agent_list", description: "Read the active colleagues of THIS Workspace only. Check existing names/IDs before creating or delegating; never recreate an already active colleague to repair a completion citation.", kind: "read",
       input_schema: { type: "object", properties: {} }, async run(input) {
@@ -213,7 +217,13 @@ export class LocalWorkspaceHost {
         host.changed(job.workspaceId, job.agentId); return JSON.stringify({ created: true, humanConfirmed: true, approvalState: "consumed", agent: created });
       } });
     const host = this;
-    tools.push({ name: "agent_contact", description: "Delegate one bounded same-Workspace file task to an existing colleague by exact agentId and await its actual verified result.", kind: "edit",
+    const handoff = (value: { completed: boolean; agentId: string; taskId: string; runId: string; completion: unknown; retainedReceipt?: boolean }) => {
+      const raw = JSON.stringify(value);
+      if (raw.length <= 1200) return raw;
+      const fullReceiptFile = job.receipts!.retain({ id: value.runId, name: "colleague_handoff", content: raw });
+      return JSON.stringify({ ...value, completion: { state: "verified", summary: boundWorkspaceText(JSON.stringify(value.completion).replace(/[\u0000-\u001f\u007f-\u009f]/g, " "), 200) }, fullReceiptFile });
+    };
+    tools.push({ name: "agent_contact", description: "Delegate one same-Workspace file task to an existing colleague by exact agentId; task accepts multiline text up to 2000 characters. Await its actual verified, bounded handoff.", kind: "edit",
       input_schema: { type: "object", properties: { agentId: { type: "string" }, task: { type: "string" } }, required: ["agentId", "task"] },
       async run(input, toolContext) {
         if (!plain(input) || !exact(input, ["agentId", "task"]) || !text(input.agentId) || !messageBody(input.task, 2000)) throw new Error("invalid colleague task");
@@ -223,7 +233,7 @@ export class LocalWorkspaceHost {
         const prior = new WorkspaceConversationStore(job.context.storage, target.agentId).read();
         const sameDelegation = prior.task?.workspaceRunBinding?.lineage.parentRunId === job.id;
         if (sameDelegation && prior.task?.status === "completed" && prior.task.checkpoint?.completion?.state === "verified") {
-          return JSON.stringify({ completed: true, agentId: target.agentId, taskId: prior.task.id,
+          return handoff({ completed: true, agentId: target.agentId, taskId: prior.task.id,
             runId: prior.task.workspaceRunBinding!.runId, completion: prior.task.checkpoint.completion, retainedReceipt: true });
         }
         const receipt = host.start(job.clientId, job.workspaceId, target.agentId, input.task, randomUUID(), sameDelegation, job, toolContext.signal);
@@ -231,7 +241,7 @@ export class LocalWorkspaceHost {
         await child.promise; assertCurrent();
         if (!child.outcome || child.outcome.status !== "completed" || child.value.task?.status !== "completed"
           || child.value.task.checkpoint?.completion?.state !== "verified") throw new Error("同事任務未完成；請查看同事聊天，不重複執行");
-        return JSON.stringify({ completed: true, agentId: target.agentId, taskId: child.value.task.id, runId: child.id,
+        return handoff({ completed: true, agentId: target.agentId, taskId: child.value.task.id, runId: child.id,
           completion: child.value.task.checkpoint?.completion ?? null });
       } });
     return withWorkspaceToolReceipts(tools);
@@ -290,10 +300,14 @@ export class LocalWorkspaceHost {
       job = { id: binding.runId, workspaceId, agentId, clientId, context, store, value, lease, controller,
         signal: parent ? AbortSignal.any([controller.signal, parent.signal, ...(parentSignal ? [parentSignal] : [])]) : controller.signal, binding, promise: Promise.resolve(), closed: false };
       const owned = job, tree = new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget);
+      owned.receipts = new WorkspaceContextReceipts(context.storage, binding.runId, agentId, () => { assertWorkspaceRunContextCurrent(owned.permit!); });
+      const audit = new WorkspaceContextAudit(context.storage, binding.runId, agentId);
       const tools = this.jobTools(owned, agent);
       owned.permit = createWorkspaceRunPermit({ binding, catalog: this.catalog, resources: context.resources, storage: context.storage, connections: context.connections,
         lease, provider, cwd: context.project, signal: owned.signal, toolNames: ["task_intake", "task_checkpoint", "todo_write", ...tools.map(tool => tool.name)], usage: value.runUsage,
-        modelHistory: { history: value.history, start: modelHistoryStart },
+        modelHistory: { history: value.history, start: modelHistoryStart, retain: result => owned.receipts!.retain(result),
+          usedTokens: () => { const usage = tree.read().usage; return usage.inputTokens + usage.outputTokens; } },
+        observeContext: observation => { owned.lease.assertCurrent(); audit.append(observation); },
         updateUsage: next => {
           const delta = ZERO_USAGE(); for (const key of Object.keys(delta) as (keyof WorkspaceUsage)[]) delta[key] = next[key] - owned.value.runUsage[key];
           owned.lease.assertCurrent(); tree.consume(delta);
@@ -301,17 +315,18 @@ export class LocalWorkspaceHost {
           owned.value.runUsage = { ...next }; this.commit(owned);
         } });
       const configuration = context.resources.agents.resolveTask(binding.agent);
+      const instructions = boundWorkspaceText(configuration.instructions, 1600) + (configuration.instructions.length > 1600
+        ? ` Full instructions: ${owned.receipts.retain({ id: String(binding.agent.configRevision), name: "agent_instructions", content: configuration.instructions })}; use workspace_receipt_read before relying on omitted instructions.` : "");
       owned.options = bindWorkspaceRunOptions(owned.permit, { ctx: { cwd: context.project, sessionId: store.sessionId, todoScope: `workspace-${binding.runId}`, sandbox: "off" },
         signal: owned.signal, approval: "auto-edit", approvalChannel: true, confirm: async () => false, quiet: true, hooks: false, extraTools: tools,
-        systemOverride: `You are ${configuration.identity.displayName}, a clearly identified Hara AI colleague. ${configuration.instructions}\nUse only this Workspace's supplied tools. Never claim completion without observed evidence.\n`
-          + `Current task objective (user data): ${JSON.stringify(task.objective)}. This attempt's messages are the working context; complete history remains local. On recovery use the checkpoint only as a hint and obtain fresh read-only observations before claiming completion.\n`
+        systemOverride: `You are ${configuration.identity.displayName}, a clearly identified Hara AI colleague. ${instructions}\nUse only this Workspace's supplied tools. Never claim completion without observed evidence.\n`
           + `Reply naturally in the user's language. Call AI coworkers 同事, not Pi 同事; pi is only an internal runtime. A greeting needs no tools.\n`
           + `For creation use agent_create and wait for the human card; for delegation use agent_contact with an existing exact agentId.\n`
           + `agent_create returns only AFTER the human has approved; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. Check agent_list before creating so an active colleague is not duplicated.\n`
           + `Successful Workspace tool results repeat the exact citation ID in receipt.toolCallId. Copy that exact value for completion.checks; never invent IDs or repeat side effects to fix a rejected citation. After restart, re-observe state with read-only tools and cite the new receipt.\n`
-          + `Current authorized colleagues: ${JSON.stringify(context.resources.agents.list().agents.map(item => ({ agentId: item.agentId, name: item.identity.displayName, kind: item.kind })))}.\n`
+          + `Current authorized colleagues (bounded preview; use agent_list if needed): ${boundWorkspaceText(JSON.stringify(context.resources.agents.list().agents.map(item => ({ agentId: item.agentId, name: item.identity.displayName, kind: item.kind }))), 2000)}.\n`
           + `For file tasks read first; write only if necessary, then workspace_verify. End accepted tasks with task_checkpoint completion and observed tool_call_ids, not a prose-only claim.`,
-        continuationSession: resume,
+        continuationSession: false, // Workspace recovery has its own bounded, fresh-observation wake brief.
         taskIntake: { task, current: () => owned.value.task!, onUpdate: next => { owned.value.task = next; },
           onCheckpoint: next => this.commit(owned, next), onRoundUsage: next => this.commit(owned, next) } });
       this.jobs.set(owned.id, owned);
