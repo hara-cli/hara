@@ -77,6 +77,15 @@ test("old shared-project run remains readable but cannot resume or construct a P
   }finally{await restored.close();}
  }finally{release();await a.host.close();}
 });
+test("a replaced project container cannot redirect a newly opened Workspace through an alias",async()=>{
+ const a=setup(),outside=dir(),container=join(a.root,"project"),original=join(a.root,"project-retained");
+ try{
+  const before=a.host.snapshot(a.workspaceId).conversation;fs.renameSync(container,original);fs.symlinkSync(outside,container,"dir");
+  assert.throws(()=>a.host.createWorkspace("Aliased",a.host.list().revision),/not a real directory|symlink|directory changed/);
+  assert.deepEqual(fs.readdirSync(outside),[],"no workspace/tool state may be written through a project-container alias");
+  assert.deepEqual(a.host.snapshot(a.workspaceId).conversation,before);
+ }finally{if(fs.lstatSync(container).isSymbolicLink()){fs.unlinkSync(container);fs.renameSync(original,container);}await a.host.close();}
+});
 test("durable request IDs deduplicate messages after completion and restart, without another model call",async()=>{
  const a=setup(),id=randomUUID();try{
   const first=a.host.start("client",a.workspaceId,a.main,"hello",id);await a.host.wait(first.runId);

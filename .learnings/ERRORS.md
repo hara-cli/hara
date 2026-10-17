@@ -10,6 +10,10 @@
 Native cross-space acceptance exposed that isolated chats/connections/budgets still used the same
 fixture project. A/B could observe the same relative file. Bind tools, cwd and frozen RunBinding
 to an owner-only `project/WORKSPACE_ID` directory; retain the container as non-executable. Reject
+new context creation through a replaced project-container alias by walking components from the
+trusted fixture root, not by first canonicalizing the mutable project container as a new base.
+The additional container-alias regression fails against the previous compiled candidate.
+Reject
 old shared-project resumes before Provider construction instead of implicitly migrating them.
 The new A/B regression fails against the prior compiled candidate (retained red log), then passes
 with the partitioned project. Keep A's inode/history unchanged and require B's initial read to be

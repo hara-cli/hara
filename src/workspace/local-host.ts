@@ -72,7 +72,7 @@ export class LocalWorkspaceHost {
     const resources = new WorkspaceResources(this.home, row.scope, { assertCurrent: assertAuthority }); resources.initialize();
     // The fixture project is workspace data too. Sharing the container root would let B observe
     // or reuse A's same-relative-path artifacts despite isolated chat/config/budget state.
-    const project = storage.run(() => ensurePrivateStateSubdirectory(this.project, [row.scope.workspaceId]).path);
+    const project = storage.run(() => ensurePrivateStateSubdirectory(this.root, ["project", row.scope.workspaceId]).path);
     const context = { storage, resources, connections: new WorkspaceConnectionStoreV2(storage), project };
     this.contexts.set(workspaceId, context); return context;
   }
