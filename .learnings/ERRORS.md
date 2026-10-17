@@ -10843,3 +10843,49 @@ original chat/root/parent and candidate/residual text verified. No account/backe
 resend, model-Key access or duplicate release notice. Initial empty readback output retained privately.
 
 ---
+
+## [ERR-20261017-RELEASE-PREP-FIXTURE] Local inspection harness errors are not product failures
+
+**Logged**: 2026-10-17
+**Priority**: low
+**Status**: resolved_with_native_visual_boundary
+**Area**: tests
+
+### Summary
+
+Preserve release-preparation diagnostic mistakes separately from the actual Desktop/Core six-step result.
+
+### Details
+
+These isolated feature repositories have origin/main but no local main ref; resolve the protected main
+checkout's actual HEAD and inspect its object directory read-only. Do not merge or fetch to manufacture
+a comparison. Git porcelain -z must preserve its leading status spaces; trim() corrupted the first path
+in a private inspection script (ENOENT), corrected without touching a user file. Wrong-cwd discovery and
+unmatched zsh globs were also read-only command errors, not Hara defects.
+
+The actual Desktop client initialize() validates capability/mode and returns void. A private acceptance
+script incorrectly dereferenced that return value before any business mutation. Retained the failed
+log, corrected only the new harness, then completed all six steps with the same real client/model and
+mock Core/Pi. No original test assertion or product timeout changed.
+
+The native Lab built and launched; Computer Use could not resolve its window (Invalid app followed by
+cgWindowNotFound), including after local bundling/activation. Stop this inspection strategy: successful
+process startup and a client/model integration test are not pixel/AX acceptance. Keep native visual
+acceptance unverified. The unsigned Lab wrapper is not the signed production distribution.
+
+### Resolution and evidence
+
+- Desktop/Core six-step synthetic integration passed; 12 synthetic model steps, zero paid calls.
+- Whole Lab restarted at the same root; connections/credential generation, Agents, sessions, receipts,
+  history hashes and artifact inode/hash matched, with zero new model steps.
+- Evidence: /private/tmp/hara-release-prep-20261017.AYE2S0/ (initial fixture failure retained).
+- User restricted this slice to local work; no new external issue/release posts or paid calls.
+- Pattern-Key: tests.actual_client_contract_and_native_window_evidence_are_distinct
+
+### Milestone decision
+
+Jeff / Elon accepted ERR-20261017-LEGACY-SERVE-FULL-TIMING's investigation and closed the first local
+milestone. Its 5-second slow-storage residual is now FR-20261017-LEGACY-SERVE-SLOW-DISK-RECEIPT,
+explicitly deferred with two alternatives. Earlier historical failures and stress evidence stay intact.
+
+---

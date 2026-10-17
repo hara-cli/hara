@@ -29,6 +29,79 @@ for continuing an unfinished task rather than switching a saved session.
 
 ---
 
+## [FR-20261017-LEGACY-SERVE-SLOW-DISK-RECEIPT] Separate receipt latency from durable completion
+
+**Logged**: 2026-10-17
+**Priority**: medium
+**Status**: deferred_by_user
+**Area**: backend
+
+### Requested Capability
+
+Keep the controlled slow-storage `session.submit` 5-second expiry as an explicit backlog item.
+Jeff / Elon accepted the first local Workspace milestone; this residual does not authorize a timeout
+increase, automatic resend, relaxed durability, or a silent change from completed to accepted semantics.
+
+### Alternatives requiring a separate decision
+
+1. A versioned durable accepted receipt for the original request, with completion queried separately.
+   Acceptance must not be described as completion and unknown outcomes must never trigger resend.
+2. Retain today's completion-receipt contract, but design non-blocking durable persistence with proven
+   CAS/lock, event ordering, cancellation and crash-recovery boundaries.
+
+### Evidence and boundary
+
+Fixed 40ms/fsync stress still produced a correct response after about 7.565 seconds. Natural full gates
+passed twice without changing the original deadlines or assertions. No implementation in this slice.
+
+### Metadata
+
+- Requested By: Jeff / Elon, local-release-preparation slice
+- Pattern-Key: serve.received_vs_completed_receipt_under_slow_storage
+- Related Files: src/serve/server.ts, src/session/store.ts
+- See Also: ERR-20261017-LEGACY-SERVE-FULL-TIMING
+- Report: hara/inbox/2026-10-17-codex-to-jeff-local-release-preparation.md
+
+---
+
+## [FR-20261017-PI-ONLY-DISTRIBUTION] Pi-only default distribution and explicit optional runtime acquisition
+
+**Logged**: 2026-10-17
+**Priority**: high
+**Status**: pending_separate_implementation
+**Area**: infra
+
+### Requested Capability
+
+Ship the built-in Pi SDK, not automatically preinstall every optional coding runtime. Other runtimes
+need an explicit host-owned, approved, integrity-checked acquisition/use path; installing a CLI is not
+equivalent to a registered governed general-Agent driver.
+
+### Verified current gap
+
+The actual npm tarball still declares eight OpenCode native optional packages and an optional Claude
+Agent SDK. Standalone builds default to embedded OpenCode. Desktop externalBin, refresh, signing and
+CI/package checks still require hara-code-runtime (OpenCode 1.18.32). Legacy coding auto selects OpenCode.
+Workspace general Agents presently run Pi; Codex/Claude/OpenCode general-Agent drivers are unavailable.
+The new Workspace renderer is Dev-gated and the Desktop sidecar lock still points at the old tag source.
+Passing the Lab with externalBin=[] is not production Pi-only packaging evidence.
+
+### Suggested next slice
+
+Align npm/standalone/Desktop/CI/smoke and legacy-auto policy together; preserve exact runtime/session
+bindings of existing work and do not silently substitute Pi. Retain required non-Agent helpers, licenses,
+runtime version/integrity receipts and rollback. Do not remove OpenCode pins alone or disable package
+assertions. Release-preparation work only recorded this blocker; no packaging/product code changed.
+
+### Metadata
+
+- Requested By: Jeff / Elon
+- Pattern-Key: packaging.agent_default_is_not_installed_runtime_inventory
+- Related Files: package.json, scripts/build-binary.ts, src/coding-settings.ts, src/agent-runtime/registry.ts
+- Report: hara/inbox/2026-10-17-codex-to-jeff-local-release-preparation.md
+
+---
+
 ## [FR-20260927-OPENCODE-INTERNAL-RUNTIME] Provider-neutral OpenCode runtime behind Hara conversations
 
 **Logged**: 2026-09-27T16:00:00+08:00
