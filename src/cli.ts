@@ -7,6 +7,12 @@ const runtimeError = unsupportedNodeMessage();
 if (runtimeError) {
   process.stderr.write(`${runtimeError}\n`);
   process.exitCode = 1;
+} else if (process.argv[2] === "workspace-dev") {
+  // Route before portable/legacy profile startup. The explicit fixture root is the sole state owner.
+  void import("./workspace/local-cli.js").then(module => module.mainLocalWorkspaceCli(process.argv.slice(3))).catch(() => {
+    process.stderr.write("hara workspace-dev: startup/request failed; verify the explicit private fixture root and options. No legacy fallback was started.\n");
+    process.exitCode = 1;
+  });
 } else {
   applyPortableHomeEnv();
   void import("./index.js").catch((error: unknown) => {

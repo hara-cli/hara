@@ -28,6 +28,7 @@ export interface WorkspaceConversation {
   usage: WorkspaceUsage;
   runUsage: WorkspaceUsage;
   pastTasks: { task: TaskExecution; usage: WorkspaceUsage; endedAt: string }[];
+  requests: { requestId: string; digest: string; taskId: string; runId: string }[];
 }
 const validTime = (value: unknown) => typeof value === "string" && Number.isFinite(Date.parse(value));
 function usageValid(value: unknown): value is WorkspaceUsage {
@@ -48,6 +49,19 @@ function historyValid(value: unknown): value is NeutralMsg[] {
     return false;
   });
 }
+/** Persist accounting during an open tool batch without publishing orphaned tool_use messages. */
+export function closedWorkspaceHistory(history: NeutralMsg[]): NeutralMsg[] {
+  for (let index = 0; index < history.length; index++) {
+    const message = history[index]!;
+    if (message.role === "tool") return history.slice(0, index); // an unpaired result is not canonical
+    if (message.role !== "assistant" || !message.toolUses.length) continue;
+    const result = history[index + 1];
+    if (result?.role !== "tool" || result.results.length !== message.toolUses.length
+      || message.toolUses.some(use => result.results.filter(row => row.id === use.id && row.name === use.name).length !== 1)) return history.slice(0, index);
+    index++;
+  }
+  return history.slice();
+}
 
 /** New scoped history is intentionally not opened through legacy SessionHub/profile resume. */
 export class WorkspaceConversationStore {
@@ -59,10 +73,20 @@ export class WorkspaceConversationStore {
     const binding = () => this.state.binding();
     this.state = new WorkspaceJsonState(storage, `conversation-${this.sessionId}.json`, value => {
       const fail = (): never => { throw new Error("invalid scoped conversation; history preserved and execution refused"); };
-      if (!plain(value) || !exact(value, ["schemaVersion", "resourceBinding", "revision", "sessionId", "agentId", "history", "task", "attempt", "usage", "runUsage", "pastTasks"])
+      if (!plain(value) || !exact(value, ["schemaVersion", "resourceBinding", "revision", "sessionId", "agentId", "history", "task", "attempt", "usage", "runUsage", "pastTasks", "requests"])
         || value.schemaVersion !== 2 || !positive(value.revision) || value.sessionId !== this.sessionId || value.agentId !== agentId
         || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, binding()) || !historyValid(value.history)
-        || !usageValid(value.usage) || !usageValid(value.runUsage) || !Array.isArray(value.pastTasks) || value.pastTasks.length > 128) return fail();
+        || closedWorkspaceHistory(value.history).length !== value.history.length
+        || !usageValid(value.usage) || !usageValid(value.runUsage) || !Array.isArray(value.pastTasks) || value.pastTasks.length > 128
+        || !Array.isArray(value.requests) || value.requests.length > 512) return fail();
+      const requests = new Set<string>();
+      for (const request of value.requests) {
+        if (!plain(request) || !exact(request, ["requestId", "digest", "taskId", "runId"])
+          || typeof request.requestId !== "string" || !UUID.test(request.requestId) || requests.has(request.requestId)
+          || typeof request.digest !== "string" || !/^[a-f0-9]{64}$/.test(request.digest)
+          || typeof request.taskId !== "string" || typeof request.runId !== "string") return fail();
+        requests.add(request.requestId);
+      }
       for (const archived of value.pastTasks) {
         if (!plain(archived) || !exact(archived, ["task", "usage", "endedAt"]) || !isTaskExecution(archived.task)
           || !workspaceRunMatchesTask(archived.task.workspaceRunBinding, archived.task)
@@ -82,7 +106,7 @@ export class WorkspaceConversationStore {
       return structuredClone(value) as unknown as WorkspaceConversation;
     }, () => ({ schemaVersion: 2, resourceBinding: binding(), revision: 0, sessionId: this.sessionId, agentId,
       history: [], task: null, attempt: null, usage: { modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 },
-      runUsage: { modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 }, pastTasks: [] }));
+      runUsage: { modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 }, pastTasks: [], requests: [] }));
   }
   read(): WorkspaceConversation { return this.state.read(); }
   save(expectedRevision: number, value: WorkspaceConversation): WorkspaceConversation {
@@ -97,6 +121,8 @@ export class WorkspaceConversationStore {
       if (task.workspaceRunBinding) target.workspaceRunBinding = structuredClone(task.workspaceRunBinding);
     }
     return this.state.update(expectedRevision, previous => {
+      if (canonical(value.requests.slice(0, previous.requests.length)) !== canonical(previous.requests)
+        || value.requests.length < previous.requests.length || value.requests.length > previous.requests.length + 1) throw new Error("Workspace request receipts cannot be rewritten");
       if (previous.attempt && value.attempt && value.attempt.fence < previous.attempt.fence) throw new Error("stale Workspace attempt fence");
       if (previous.attempt?.state === "running" && value.attempt?.attemptId !== previous.attempt.attemptId) throw new Error("running attempt must be recovered before replacement");
       if (previous.attempt && value.attempt?.attemptId !== previous.attempt.attemptId

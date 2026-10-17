@@ -1104,6 +1104,11 @@ export interface ServeOpts {
   cwd: string;
 }
 
+export interface LocalWorkspaceServeDeps {
+  version: string;
+  localWorkspace: { root: string; allowedOrigins?: readonly string[] };
+}
+
 export interface ServeHandle {
   port: number;
   token: string;
@@ -1797,7 +1802,11 @@ function automationScheduleForRequest(
   return parsed;
 }
 
-export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<ServeHandle> {
+export async function startServe(opts: ServeOpts, deps: ServeDeps | LocalWorkspaceServeDeps): Promise<ServeHandle> {
+  if ("localWorkspace" in deps) {
+    const { startLocalWorkspaceServe } = await import("./local-workspace.js");
+    return startLocalWorkspaceServe(opts, { ...deps.localWorkspace, version: deps.version });
+  }
   const agentRuntimeRegistry = new AgentRuntimeRegistry(deps.agentRuntimeDrivers);
   const agentRuntimeBindings = new AgentRuntimeBindingStore(deps.agentRuntimeHome ?? homedir());
   const configuredAgentRuntime = (spaceId: string, agentRef: string): AgentRuntimeBinding => spaceId === "personal"

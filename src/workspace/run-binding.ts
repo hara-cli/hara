@@ -15,6 +15,7 @@ export interface WorkspaceRunBinding {
   project: { root: string; dev: number; ino: number };
   sessionId: string;
   runId: string;
+  lineage: { rootRunId: string | null; parentRunId: string | null; depth: number };
   createdAt: string;
   host: { hostId: string; hostEpoch: number; grantId: string; grantRevision: number; actorId: string; policyRevision: number };
   budget: { maxRounds: number; maxToolCalls: number; maxTokens: number; timeoutMs: number };
@@ -25,10 +26,14 @@ export function workspaceAgentBindingHash(binding: WorkspaceAgentTaskBinding): s
 const safeId = (value: unknown) => text(value, 220) && !/[\\/]/.test(value);
 function parse(value: unknown): WorkspaceRunBinding {
   const fail = (): never => { throw new Error("invalid or unsupported Workspace RunBinding; execution refused"); };
-  if (!plain(value) || !exact(value, ["schemaVersion", "scope", "agent", "agentBindingHash", "connection", "runtimeContract", "project", "sessionId", "runId", "createdAt", "host", "budget"])
+  if (!plain(value) || !exact(value, ["schemaVersion", "scope", "agent", "agentBindingHash", "connection", "runtimeContract", "project", "sessionId", "runId", "lineage", "createdAt", "host", "budget"])
     || value.schemaVersion !== 1 || !isWorkspaceAgentTaskBinding(value.agent) || value.agent.runtimeId !== "pi"
     || value.agentBindingHash !== workspaceAgentBindingHash(value.agent) || !isScopedRunConnection(value.connection)
     || value.runtimeContract !== "hara-governed-pi-v1" || !safeId(value.sessionId) || !safeId(value.runId)
+    || !plain(value.lineage) || !exact(value.lineage, ["rootRunId", "parentRunId", "depth"])
+    || !(value.lineage.depth === 0 ? value.lineage.rootRunId === null && value.lineage.parentRunId === null
+      : value.lineage.depth === 1 && safeId(value.lineage.rootRunId) && safeId(value.lineage.parentRunId)
+        && value.lineage.rootRunId !== value.runId && value.lineage.parentRunId !== value.runId)
     || !plain(value.project) || !exact(value.project, ["root", "dev", "ino"]) || !text(value.project.root, 4096) || !isAbsolute(value.project.root)
     || ![value.project.dev, value.project.ino].every(v => Number.isSafeInteger(v) && Number(v) >= 0)
     || typeof value.createdAt !== "string" || !Number.isFinite(Date.parse(value.createdAt))

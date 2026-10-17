@@ -3547,6 +3547,11 @@ const invocationCwd = (() => {
 })();
 
 const program = new Command();
+program.command("workspace-dev [args...]").description("Opt-in isolated local Workspace Dev (synthetic Provider only)")
+  .allowUnknownOption().action(async (args: string[]) => {
+    const { mainLocalWorkspaceCli } = await import("./workspace/local-cli.js");
+    await mainLocalWorkspaceCli(args);
+  });
 program
   .name("hara")
   .description("A coding agent CLI that runs like an engineering org.")

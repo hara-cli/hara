@@ -1,5 +1,30 @@
 # Errors
 
+## [ERR-20261017-LOCAL-SERVE-STRICT-GATE] Keep compiler and handshake contracts explicit
+
+**Logged**: 2026-10-17
+**Priority**: medium
+**Status**: resolved
+**Area**: tests
+
+S4 first builds identified unsupported ES2023 findLast helpers under the existing compiler target,
+then a WebSocket verifyClient overload lacked a contextual parameter type. Retain the repository's
+strict target; use a typed callback and supported array operations. An exploratory Host test run
+after the failed compile is not the final source-bound gate, even though its seven cases passed.
+The following complete build/integration gate passed nine cases including actual crash-after-write
+recovery; the Origin refusal test failed because ws's boolean verifier defaults to HTTP 401 rather
+than the intended 403. Set an explicit denial status using the callback overload, not a weaker test.
+Preserve s4-host-build.log, s4-build-3.log and s4-integration.log; require a clean build before rerun.
+
+Related files: src/serve/local-workspace.ts, src/workspace/synthetic-provider.ts
+
+Resolution: retained the compiler target/strictness and explicit HTTP 403 Origin contract. The final
+source-bound S4 build and 105-case integration/Runtime regression gate passed with zero failures,
+cancellation or skips. Actual private child death after a verified write resumed without rewriting
+the file (same inode/hash), and restored history reads made zero Provider constructions.
+
+---
+
 ## [ERR-20261017-PI-LOOPBACK-SANDBOX] Pi integration needs the actual private loopback bridge
 
 **Logged**: 2026-10-17
