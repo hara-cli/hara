@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isAbsolute } from "node:path";
 import { isWorkspaceAgentTaskBinding, type WorkspaceAgentTaskBinding } from "./agent-binding.js";
 import { isScopedRunConnection, type ScopedRunConnection } from "./scoped-connections.js";
 import { parseWorkspaceResourceScope, workspaceResourceScopeKey, type WorkspaceResourceScope } from "./resource-context.js";
@@ -11,6 +12,7 @@ export interface WorkspaceRunBinding {
   agentBindingHash: string;
   connection: Readonly<ScopedRunConnection>;
   runtimeContract: "hara-governed-pi-v1";
+  project: { root: string; dev: number; ino: number };
   sessionId: string;
   runId: string;
   createdAt: string;
@@ -23,10 +25,12 @@ export function workspaceAgentBindingHash(binding: WorkspaceAgentTaskBinding): s
 const safeId = (value: unknown) => text(value, 220) && !/[\\/]/.test(value);
 function parse(value: unknown): WorkspaceRunBinding {
   const fail = (): never => { throw new Error("invalid or unsupported Workspace RunBinding; execution refused"); };
-  if (!plain(value) || !exact(value, ["schemaVersion", "scope", "agent", "agentBindingHash", "connection", "runtimeContract", "sessionId", "runId", "createdAt", "host", "budget"])
+  if (!plain(value) || !exact(value, ["schemaVersion", "scope", "agent", "agentBindingHash", "connection", "runtimeContract", "project", "sessionId", "runId", "createdAt", "host", "budget"])
     || value.schemaVersion !== 1 || !isWorkspaceAgentTaskBinding(value.agent) || value.agent.runtimeId !== "pi"
     || value.agentBindingHash !== workspaceAgentBindingHash(value.agent) || !isScopedRunConnection(value.connection)
     || value.runtimeContract !== "hara-governed-pi-v1" || !safeId(value.sessionId) || !safeId(value.runId)
+    || !plain(value.project) || !exact(value.project, ["root", "dev", "ino"]) || !text(value.project.root, 4096) || !isAbsolute(value.project.root)
+    || ![value.project.dev, value.project.ino].every(v => Number.isSafeInteger(v) && Number(v) >= 0)
     || typeof value.createdAt !== "string" || !Number.isFinite(Date.parse(value.createdAt))
     || !plain(value.host) || !exact(value.host, ["hostId", "hostEpoch", "grantId", "grantRevision", "actorId", "policyRevision"])
     || !text(value.host.hostId) || !text(value.host.grantId) || !text(value.host.actorId)

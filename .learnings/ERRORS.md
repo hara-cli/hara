@@ -1,5 +1,28 @@
 # Errors
 
+## [ERR-20261017-PI-LOOPBACK-SANDBOX] Pi integration needs the actual private loopback bridge
+
+**Logged**: 2026-10-17
+**Priority**: medium
+**Status**: resolved
+**Area**: tests
+
+The first S3 restricted-host integration run had 39 pass, 4 fail and 7 cancellation. A separate
+minimal legacy-Pi diagnostic returned `listen EPERM ... 127.0.0.1` with zero provider calls; the
+bounded Pi model-step bridge could not bind a local port. These failures do not establish a
+product or legacy-runtime regression. Preserve `s3-execution.log`. Rerun the same actual Pi bridge,
+original assertions and synthetic provider on an authorized isolated host; never remove the bridge
+boundary or replace it with a mock merely to make this integration gate green.
+
+Related files: test/workspace-local-execution.test.mjs, src/agent-runtime/pi.ts
+
+Resolution: authorized isolated-host execution of the same real loopback bridge passed all 50 original
+focused cases. Expanded final gate passed 90/90, including original Pi/dispatch and intake/finalization
+regressions, once-only permits, fake-handle refusal, real fixture edits and physical cancellation drain.
+No assertions were removed; real model and credentials were never used.
+
+---
+
 ## [ERR-20261017-LEASE-CHILD-FIXTURE-URL] Observe child startup failure before waiting for readiness
 
 **Logged**: 2026-10-17

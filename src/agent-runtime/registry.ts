@@ -3,6 +3,7 @@ import { runPiAgent } from "./pi.js";
 import type { NeutralMsg } from "../providers/types.js";
 import { AGENT_RUNTIME_IDS, isTaskRuntimeBinding, type AgentRuntimeId, type TaskRuntimeBinding } from "./bindings.js";
 import { WORKSPACE_AGENT_EXECUTION_PENDING } from "../workspace/agent-binding.js";
+import { assertWorkspaceRunAdmission } from "../workspace/execution.js";
 
 /** Host-owned code only. Imported persona text and renderer fields cannot register a driver or grant
  * tools. New drivers must implement the same Hara admission, approval, cancellation and recovery rules. */
@@ -45,9 +46,22 @@ export class AgentRuntimeRegistry {
     if (!this.drivers.has(id)) throw new Error(`Agent Runtime '${id}' is not available for general Agents; no fallback was selected`);
   }
 
+  /** Separate trusted entry: no legacy TaskRuntimeBinding or personal/org Space substitution. */
+  runWorkspace(history: NeutralMsg[], options: RunOpts): Promise<RunOutcome> {
+    if (!options.workspaceRun) throw new Error(WORKSPACE_AGENT_EXECUTION_PENDING);
+    assertWorkspaceRunAdmission(options.workspaceRun, options, "pi");
+    this.assertAvailable("pi");
+    // This contract supports the built-in bounded Pi kernel only, not an arbitrary legacy driver.
+    return runPiAgent(history, options);
+  }
+
   run(history: NeutralMsg[], options: RunOpts, binding: Readonly<TaskRuntimeBinding>): Promise<RunOutcome> {
-    if (options.taskIntake?.task.workspaceAgentBinding !== undefined
-      || options.taskIntake?.current?.()?.workspaceAgentBinding !== undefined) throw new Error(WORKSPACE_AGENT_EXECUTION_PENDING);
+    if (options.workspaceRun !== undefined || options.taskIntake?.task.workspaceRunBinding !== undefined || options.taskIntake?.current?.()?.workspaceRunBinding !== undefined
+      || options.taskIntake?.task.workspaceAgentBinding !== undefined
+      || options.taskIntake?.current?.()?.workspaceAgentBinding !== undefined) {
+      if (!options.workspaceRun) throw new Error(WORKSPACE_AGENT_EXECUTION_PENDING);
+      return this.runWorkspace(history, options);
+    }
     if (!isTaskRuntimeBinding(binding) || options.ctx.spaceId !== binding.spaceId
       || (options.taskIntake?.current?.() ?? options.taskIntake?.task)?.id !== binding.taskId) throw new Error("Agent Runtime execution binding does not match this task audience");
     this.assertAvailable(binding.runtimeId);

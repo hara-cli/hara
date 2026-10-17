@@ -1,6 +1,7 @@
 import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment, TurnArgs, TurnResult } from "../providers/types.js";
 import { isTaskRuntimeBinding } from "../agent-runtime/bindings.js";
 import { WORKSPACE_AGENT_EXECUTION_PENDING } from "../workspace/agent-binding.js";
+import { beginWorkspaceGovernedRun, executeWorkspaceTool, workspaceRunToolAllowed, type WorkspaceRunPermit } from "../workspace/execution.js";
 import { createToolImageStore, redactOwnedToolImageText } from "../tools/tool-images.js";
 import { redactOwnedToolImageValue } from "../security/tool-media-redaction.js";
 import { createComputerRunScope, closeComputerRunScope } from "../tools/computer-run.js";
@@ -551,11 +552,12 @@ export function composeSystem(
   },
   profileId?: string,
   runtimeTime?: RuntimeTimePromptOptions,
+  scopedWorkspace = false,
 ): AssembledSystemPrompt {
   const assembler = new PromptAssembler();
   assembler.add("core", "static", "core", override || HARA_SYSTEM());
-  const skills = skillsDigest(cwd);
-  const roles = override ? "" : rolesDigest(cwd, profileId);
+  const skills = scopedWorkspace ? "" : skillsDigest(cwd);
+  const roles = scopedWorkspace || override ? "" : rolesDigest(cwd, profileId);
   const checkpointContext = taskCheckpointContext(intake?.checkpoint, intake?.decisions);
   const intakeContext = !intake?.enabled
     ? ""
@@ -613,7 +615,7 @@ export function composeSystem(
         );
   assembler
     .add("working-directory", "session", "runtime", `Working directory: ${cwd}`)
-    .add("gateway-channel", "session", "channel", gatewayNote())
+    .add("gateway-channel", "session", "channel", scopedWorkspace ? "" : gatewayNote())
     .add("continuation", "session", "task", continuationSession ? CONTINUATION_SYSTEM : "")
     .add("execution", "session", "task", executionContext)
     .add("project", "session", "project", projectContext ? `# Project context (AGENTS.md)\n${projectContext}` : "")
@@ -638,6 +640,8 @@ export interface TaskApprovalOffer {
 }
 
 export interface RunOpts {
+  /** Host-only live permit. Persisted Workspace JSON is deliberately insufficient. */
+  workspaceRun?: WorkspaceRunPermit;
   provider: Provider;
   ctx: ToolContext;
   approval: ApprovalMode;
@@ -1183,8 +1187,11 @@ export async function runGovernedAgent(
   // another Runtime must not silently execute here merely because Serve's registry was bypassed.
   const initialTask = opts.taskIntake?.task;
   const currentTask = opts.taskIntake?.current ? opts.taskIntake.current() : initialTask;
-  if (initialTask?.workspaceAgentBinding !== undefined || currentTask?.workspaceAgentBinding !== undefined) {
-    return { status: "error", error: WORKSPACE_AGENT_EXECUTION_PENDING };
+  if (opts.workspaceRun !== undefined || initialTask?.workspaceRunBinding !== undefined || currentTask?.workspaceRunBinding !== undefined
+    || initialTask?.workspaceAgentBinding !== undefined || currentTask?.workspaceAgentBinding !== undefined) {
+    if (!opts.workspaceRun) return { status: "error", error: WORKSPACE_AGENT_EXECUTION_PENDING };
+    try { beginWorkspaceGovernedRun(opts.workspaceRun, opts, runtimeId); }
+    catch (error) { return { status: "error", error: error instanceof Error ? error.message : "Workspace admission refused" }; }
   }
   if (initialTask?.runtimeBinding !== undefined || currentTask?.runtimeBinding !== undefined) {
     const binding = currentTask?.runtimeBinding;
@@ -1195,7 +1202,7 @@ export async function runGovernedAgent(
         || (["version", "spaceId", "agentRef", "runtimeId", "revision", "taskId"] as const).some((key) => initialBinding[key] !== binding[key])))) {
       return { status: "error", error: "This task belongs to a different or invalid Agent Runtime; resume through its exact Runtime. No fallback was started." };
     }
-  } else if (runtimeId !== "hara") {
+  } else if (runtimeId !== "hara" && !opts.workspaceRun) {
     return { status: "error", error: "Agent Runtime requires a frozen task binding; no fallback was started." };
   }
   const life = createRunLifecycle(opts, runtimeCopyLanguage(history));
@@ -1306,13 +1313,14 @@ async function runAgentInner(
   // Local/plugin hooks are arbitrary shell programs. Until Control has an explicit hook allow/approval
   // policy, a company run must not let a harmless-looking read tool trigger an unmanaged write through
   // PreToolUse/PostToolUse.
-  const hooksEnabled = opts.hooks !== false && !companyExecution;
+  const hooksEnabled = !opts.workspaceRun && opts.hooks !== false && !companyExecution;
   let organizationPolicy: OrganizationExecutionPolicy | null = null;
   let organizationPolicyVersion = opts.organizationPolicyVersion;
   const organizationAllowsTool = (name: string): boolean =>
     !organizationPolicy?.toolDeny?.includes(name);
   const runtimeToolAllowed = (name: string): boolean =>
     organizationAllowsTool(name)
+    && (!opts.workspaceRun || workspaceRunToolAllowed(opts.workspaceRun, name))
     && (ctx.agentTeam !== undefined || !DURABLE_AGENT_TEAM_TOOLS.has(name))
     && (!opts.toolFilter || RUNTIME_HELPER_TOOLS.has(name) || opts.toolFilter(name));
   const activatedDeferredTools = new Set<string>();
@@ -1608,8 +1616,10 @@ async function runAgentInner(
   ];
   const runExtraToolNames = new Set(runExtraTools.map((tool) => tool.name));
   const runtimeDispatchAllowed = (name: string): boolean =>
-    organizationAllowsTool(name) && (runExtraToolNames.has(name) || runtimeToolAllowed(name));
-  const permRules = loadPermissionRules(ctx.cwd); // command-level allow/ask/deny policy for the bash tool
+    organizationAllowsTool(name) && (!opts.workspaceRun || workspaceRunToolAllowed(opts.workspaceRun, name))
+    && (runExtraToolNames.has(name) || runtimeToolAllowed(name));
+  const permissionRules = () => opts.workspaceRun ? { allow: [], deny: [], readonlyAutorun: false } : loadPermissionRules(ctx.cwd);
+  const permRules = permissionRules(); // Workspace tools use explicit Host grants, never ambient shell rules.
   let activeProvider = provider; // may switch to a fallback model on a recoverable error (app-failover)
   const fallbackProviders = [
     ...(opts.fallback?.providers ?? []),
@@ -1917,6 +1927,7 @@ async function runAgentInner(
     const baseSpecs = visibleSpecs.filter((tool) => runtimeToolAllowed(tool.name));
     const visibleExtraTools = runExtraTools.filter((tool) =>
       skillToolAllowed(activeSkillToolPolicy, tool.name)
+      && (!opts.workspaceRun || workspaceRunToolAllowed(opts.workspaceRun, tool.name))
       && organizationAllowsTool(tool.name));
     let specs = visibleExtraTools.length
       ? [...baseSpecs, ...visibleExtraTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.input_schema }))]
@@ -1954,6 +1965,8 @@ async function runAgentInner(
         decisions: intakeTask?.decisions,
       },
       ctx.profileId,
+      undefined,
+      Boolean(opts.workspaceRun),
     );
     // Turn-tier parts (accepted brief, checkpoint, clock) change between provider requests. Left in the
     // system prompt they sit in FRONT of the whole conversation, so every request misses the provider's
@@ -2548,7 +2561,7 @@ async function runAgentInner(
       }
       history.pop();
       try {
-        captureLearning({
+        if (!opts.workspaceRun) captureLearning({
           patternKey: "agent.authorized_action_execution_ownership",
           kind: "action_ownership",
           scope: "personal",
@@ -2851,7 +2864,7 @@ async function runAgentInner(
       try {
         const operation = toolOperationTraits(tool, input, toolCtx);
         const decision = tool.kind === "exec" && typeof input.command === "string"
-          ? decideCommand(input.command, loadPermissionRules(ctx.cwd)) : null;
+          ? decideCommand(input.command, permissionRules()) : null;
         const fresh = freshTaskApproval(tool, input, operation, decision, false);
         const accepted = Boolean(active && fresh && fresh.revision === planned.revision && fresh.scope.key === planned.scope.key && !runSignal.aborted);
         if (active && !accepted) taskAuthority?.store.revokeScope(planned.scope);
@@ -3262,7 +3275,7 @@ async function runAgentInner(
               isCurrent: () => {
                 const freshOperation = toolOperationTraits(tool, input, toolCtx);
                 const freshDecision = tool.kind === "exec" && typeof input.command === "string"
-                  ? decideCommand(input.command, loadPermissionRules(ctx.cwd)) : null;
+                  ? decideCommand(input.command, permissionRules()) : null;
                 const fresh = freshTaskApproval(tool, input, freshOperation, freshDecision, false);
                 return Boolean(fresh && fresh.revision === taskCandidate.revision && fresh.scope.key === taskCandidate.scope.key);
               },
@@ -3421,7 +3434,7 @@ async function runAgentInner(
       }
       const taskDispatchRejection = (): string | undefined => {
         const freshDecision = p.tool!.kind === "exec" && typeof (p.tu.input as Record<string, unknown>)?.command === "string"
-          ? decideCommand((p.tu.input as { command: string }).command, loadPermissionRules(ctx.cwd)) : null;
+          ? decideCommand((p.tu.input as { command: string }).command, permissionRules()) : null;
         if (freshDecision === "deny") {
           taskAuthority?.store.revokeTask(taskAuthority.binding);
           return "Denied by a permission rule immediately before execution. This action was not executed.";
@@ -3508,7 +3521,10 @@ async function runAgentInner(
           return;
         }
         if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return;
-        const observedTool = p.tool!.run(p.tu.input, executionToolCtx).then(
+        const physicalTool = opts.workspaceRun
+          ? executeWorkspaceTool(opts.workspaceRun, p.tool!.name, () => p.tool!.run(p.tu.input, executionToolCtx))
+          : p.tool!.run(p.tu.input, executionToolCtx);
+        const observedTool = physicalTool.then(
           (value) => { settled = { ok: true, value }; return value; },
           (error) => { settled = { ok: false, error }; throw error; },
         );

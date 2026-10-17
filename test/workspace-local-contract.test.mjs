@@ -70,7 +70,7 @@ test("RunBinding is strict, frozen and preserves all provenance; unsupported run
   const task=a.resources.agents.bindTask(createTaskExecution("synthetic","turn"),main.agentId,main.configRevision,main.agentEpoch);
   const binding=freezeWorkspaceRunBinding({schemaVersion:1,scope:a.row.scope,agent:task.workspaceAgentBinding,
     agentBindingHash:workspaceAgentBindingHash(task.workspaceAgentBinding),connection:a.connections.capture(),runtimeContract:"hara-governed-pi-v1",
-    sessionId:"conversation",runId:randomUUID(),createdAt:new Date().toISOString(),
+    project:{root:a.home,dev:fs.statSync(a.home).dev,ino:fs.statSync(a.home).ino},sessionId:"conversation",runId:randomUUID(),createdAt:new Date().toISOString(),
     host:{hostId:a.catalog.read().hostId,hostEpoch:1,grantId:a.row.grantId,grantRevision:1,actorId:a.row.actorId,policyRevision:1},
     budget:{maxRounds:16,maxToolCalls:32,maxTokens:32000,timeoutMs:60000}});
   assert.equal(isWorkspaceRunBinding(binding),true);assert.equal(Object.isFrozen(binding.agent.resourceBinding),true);
