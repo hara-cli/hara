@@ -10767,3 +10767,35 @@ the generic error-wrapper obscuring budget refusal; fixed by emitting only the t
 The first end-to-end fixture awaited a coalesced refresh that returned early, so no task was sent and
 the test timed out; precisely identified owned test PIDs 40080/40056 were stopped, failure data retained.
 The corrected refresh and bounded fixture cleanup passed the original 15-second transport experiment.
+
+## [ERR-20261017-LEGACY-SERVE-FULL-TIMING] Full gates expose two unconfirmed timing failures outside the local Workspace route
+
+**Logged**: 2026-10-17
+**Priority**: high
+**Status**: pending
+**Area**: tests
+
+### Summary
+
+Frozen Core 2cb27f0 full test run reported 2,882 pass / 1 fail / 1 existing skip: the unchanged
+serve-task-closeout fixture hit its 5-second session.submit deadline. An identical full rerun reported
+2,882 pass / 0 fail / 1 cancelled / 1 existing skip: the unchanged serve-colleague-questions input-lease
+test hit its 20-second test deadline. Both full commands exited 1; do NOT call the full gate passed.
+The original files then passed alone, 11/11 and 7/7, with the same deadlines/assertions. Current local
+Workspace focused cases 32/32, Desktop full 686/686 and the actual 15s lost-ACK mock integration pass.
+
+### Boundary and next action
+
+No generic Serve, colleague fixture, timeout or assertion was changed to make this slice green.
+Those fixtures do not select startServe's localWorkspace branch, and none of their implementation files
+changed here; this does not prove that resource contention is the cause. Preserve both complete failure
+logs and treat full-suite stability as unresolved. Stop after the requested synthetic slice/report;
+do not broaden into legacy Serve changes or keep repeating full runs until one happens to pass.
+
+### Metadata
+
+- Related Files: `test/serve-task-closeout.test.mjs`, `test/serve-colleague-questions.test.mjs`
+- Evidence: `/private/tmp/hara-resume-rpc-20261017.mpBJ24/core-full-2cb27f0.log`, `core-full-2cb27f0-rerun.log`
+- Pattern-Key: tests.preserve_full_suite_timing_failures_without_weakening_deadlines
+
+---
