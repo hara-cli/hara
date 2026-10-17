@@ -10647,3 +10647,79 @@ explicitly excluded from completion evidence. No ambient HOME cache is used by t
 The CUA quit returned an app-change transport warning, but the owned runner exited normally and recorded
 alive: []; do not reopen an exited Lab without its explicit fixture environment. A sandbox ps probe was
 denied; its failure is not proof of process absence. Use the owned-process receipt/exit and verified PIDs.
+
+### Real context-trim result (2026-10-17)
+
+Runtime candidate 610ac19 completed the new six-step Pi flow in 15 HTTP-200 requests,
+86,903 input + 8,417 output = 95,320 tokens. Main and Coder both reached verified completion;
+restart added zero calls. Inputs peaked at 7,896; original 80k task/tree budgets were not raised.
+The old 14 receipt prefix remained exact. This resolves the observed new-task closure failure, not all
+acceptance requirements: the atomic recent tool/continuation unit retained 26.13%, above the requested
+15-20%, despite triggering at 73.27% budget and producing a 1,111-character summary. Keep this as an
+explicit exception for Jeff, not a passed ratio or reason to strip provider continuation unsafely.
+
+## [ERR-20261017-WORKSPACE-OLD-RESUME-APPEND] Strict old-file immutability failed during zero-request boot
+
+**Logged**: 2026-10-17
+**Priority**: high
+**Status**: pending
+**Area**: backend
+
+### Summary
+
+An old blocked parent's history grew from 31 to 37 messages during the initial Lab boot: two
+`/continue` requests each appended an empty assistant and budget-refusal receipt. Latest attempt began
+19:31:20 local. The trigger actor is unknown; startup source inspection is not proof of auto-resume.
+No new wire call occurred, original history prefix/model usage/14 receipts stayed exact, and 10 of 11
+protected old files were byte/hash/inode-identical. This still fails the strict no-old-file-change gate.
+The old snapshot was exact from before-first-request through all new paid steps and the final restart.
+
+### Suggested Action
+
+Preserve the original baseline, failing verifier/log and appended refusal receipts; do not overwrite
+the file to erase evidence. Investigate per-client resume provenance and preflight an exhausted frozen
+run/shared-tree budget before persisting a resume. Do not infer the actor or broaden the current slice.
+
+### Metadata
+
+- Related Files: `src/workspace/local-host.ts`, `src/workspace/local-state.ts`
+- Evidence: `/private/tmp/hara-context-trim-20261017.5W9Ssw/strict-old-state-failure.log`
+- See Also: ERR-20261017-WORKSPACE-REAL-CONTEXT-BUDGET
+
+---
+
+## [ERR-20261017-WORKSPACE-UI-RPC-TIMEOUT] Native UI timeout while task continued
+
+**Logged**: 2026-10-17
+**Priority**: medium
+**Status**: pending
+**Area**: frontend
+
+### Summary
+
+The native Lab displayed `Error: Workspace 回應逾時` once after file delegation. No resend was made;
+independent bounded read-only RPC observed execution continuing, then both parent and child verified.
+The banner cleared later and restart restored the completed result. The root cause remains unproved.
+The client has a 15-second pending-RPC deadline; increasing that value alone is not a verified fix.
+
+### Suggested Action
+
+Correlate RPC IDs, server acknowledgments and UI pending state in a new synthetic test. Preserve the
+original nonce/outcome-unknown semantics so a timeout never triggers a duplicate effect or paid request.
+
+### Metadata
+
+- Related Files: Desktop `src/workspace-dev-rpc.ts`
+- Evidence: `/private/tmp/hara-context-trim-20261017.5W9Ssw/delegation-send-observed.json`
+
+---
+
+### Diagnostic command note (2026-10-17)
+
+An offline ad-hoc Node projection repeated an extra closing-brace syntax error; no operation ran.
+Replaced large inline projections with a syntax-checked private diagnostic script. Polling an already
+closed exec session returned Unknown process id; verified the owned stop receipt instead (alive: []).
+The separate offline diagnostic first compared the whole old UI snapshot, including its intentionally
+shared live test-slice budget view; that view must advance after new calls in another Workspace. Its
+scoped-state comparisons now explicitly exclude only that global counter projection. The original
+strict old-file assertion remains unchanged and failed. Boolean comparisons avoid dumping histories.
