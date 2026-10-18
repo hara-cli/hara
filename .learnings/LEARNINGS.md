@@ -1,5 +1,15 @@
 # Learnings
 
+## [LRN-20261018-CROSS-ENGINE-SOURCE-IDENTITY] native acceptance finding
+
+- Node and Bun expose filesystem timestamps at different precision. Never build persistent
+  approval/source identities from mtimeMs stringification. Use a hash of the bounded private
+  source bytes plus its canonical location/record identity; keep file-safety checks separate.
+- A real native UI batch failed before vault writes despite Node and mock suites passing.
+  Added a fractional-mtime Node/Bun cross-process regression: red before, green after content
+  fingerprints. Fresh owned fixtures were recreated; no real user migration state was rewritten.
+
+
 ## [LRN-20261018-READONLY-DISCOVERY-ROOTS] user correction
 
 - Jeff 22:35: isolate writable Hara/SDK data, not installation discovery. Desktop resolves the

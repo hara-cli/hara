@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
 import { LegacyConnectionCatalog } from "../dist/workspace/legacy-connections.js";
 import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
@@ -43,4 +45,12 @@ test("same endpoint and model do not collapse two independent accounts",()=>{
  const source=directory();write(source,"config.json",{provider:"openai",baseURL:"https://example.invalid/v1",model:"same",apiKey:"fake-personal"});
  write(source,"profiles.json",{active:"named",profiles:[{id:"named",provider:"openai",baseURL:"https://example.invalid/v1",model:"same",apiKey:"fake-other"}]});
  assert.equal(new LegacyConnectionCatalog(source,new MemoryCredentialVault()).personalSeeds().length,2);
+});
+test("Node and the packaged Bun engine agree on source IDs despite fractional filesystem timestamps",{skip:spawnSync("bun",["--version"]).status!==0},()=>{
+ const source=directory(),file=join(source,".hara/profiles.json");write(source,"profiles.json",{active:"one",profiles:[{id:"one",provider:"openai",model:"same",apiKey:"fake-only"}]});
+ fs.utimesSync(file,1770000000.123456,1770000000.123456);
+ const expected=new LegacyConnectionCatalog(source,new MemoryCredentialVault()).personalSeeds().map(row=>row.id);
+ const module=pathToFileURL(join(process.cwd(),"dist/workspace/legacy-connections.js")).href;
+ const result=spawnSync("bun",["-e",`import {LegacyConnectionCatalog} from ${JSON.stringify(module)};console.log(JSON.stringify(new LegacyConnectionCatalog(process.argv[1],{get(){throw new Error("No credential reads");}}).personalSeeds().map(row=>row.id)));`,source],{encoding:"utf8",env:{PATH:process.env.PATH,HOME:source},timeout:5000});
+ assert.equal(result.status,0,"Bun source-ID probe must succeed");assert.deepEqual(JSON.parse(result.stdout),expected);
 });

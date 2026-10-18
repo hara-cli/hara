@@ -13,7 +13,9 @@ function read(path: string): { value: any; revision: string } | null {
   try { const info = lstatSync(path); if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || realpathSync.native(path) !== path || info.size > 4 * 1024 * 1024
       || process.platform !== "win32" && (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0)) return null;
     const snapshot = readPrivateStateFileSnapshotSync(path, 4 * 1024 * 1024); if (!snapshot) return null;
-    return { value: JSON.parse(snapshot.text), revision: `${snapshot.ino}:${snapshot.text.length}:${info.mtimeMs}` }; } catch { return null; }
+    // Stats timestamps are represented with different precision by Node and Bun. Source identity
+    // must survive a CLI/sidecar handoff, while still rejecting any changed credential or metadata.
+    return { value: JSON.parse(snapshot.text), revision: createHash("sha256").update(snapshot.text).digest("hex") }; } catch { return null; }
 }
 const clean = (value: unknown, max = 256) => redactSensitiveText(String(value ?? "")).text.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, max).trim();
 const baseFor = (provider: unknown) => isProviderId(provider) ? providerDefaultBaseURL(provider)
