@@ -63,7 +63,7 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     this.vault.set(keyRef, value.apiKey);
     try { this.document.update(expected, current => ({ ...current, activeConnectionId: current.activeConnectionId ?? id, connections: [...current.connections,
       { ...metadata, id, keyRef, credentialGeneration: generation, revision: 1, status: "active", createdAt: now, updatedAt: now, ...(importId ? { importId } : {}) }] })); }
-    catch (error) { this.vault.remove(keyRef); throw error; }
+    catch (error) { this.discardUncommittedCredential(keyRef, expected); throw error; }
     return this.list().connections.find(row => row.id === id)!;
   }
   edit(id: string, value: unknown, expected: number): void {
@@ -75,10 +75,18 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     this.vault.set(ref, key);
     try { this.document.update(expected, current => ({ ...current, connections: current.connections.map(item => item.id === id
       ? { ...item, ...metadata, keyRef: ref, retiredKeyRefs: [...new Set([...(item.retiredKeyRefs ?? []), item.keyRef])], credentialGeneration: generation, revision: item.revision + 1, updatedAt: new Date().toISOString() } : item) })); }
-    catch (error) { this.vault.remove(ref); throw error; }
+    catch (error) { this.discardUncommittedCredential(ref, expected); throw error; }
     this.cleanupCredentials(id, this.document.read().value.revision);
   }
   override replace(id: string, value: ScopedConnectionInput, expected: number) { this.edit(id, value, expected); }
+  private discardUncommittedCredential(ref: string, beforeRevision: number) {
+    // A post-commit recovery-copy failure is not a rollback. Remove only when the unchanged primary
+    // positively proves no commit; on unknown outcome retain the credential, never destroy valid data.
+    try {
+      const current = this.document.read();
+      if (!current.readOnly && current.value.revision === beforeRevision && !current.value.connections.some(row => row.keyRef === ref || row.retiredKeyRefs?.includes(ref))) this.vault.remove(ref);
+    } catch { /* Unknown outcome: preserve the private credential for recovery, never log it. */ }
+  }
   override revoke(id: string, expected: number): void {
     const state = this.document.read(), row = state.value.connections.find(row => row.id === id);
     if (!row || state.readOnly || state.value.revision !== expected) throw new Error("Connection changed; refresh before removal");

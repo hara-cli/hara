@@ -14,6 +14,9 @@
   Preview metadata only; require an explicit copy into the current scope; keep generations frozen per run.
 - Fixed-service Keychain refs belong to scope/connection/generation. Rotate/revoke metadata before cleanup;
   persist pending removals so denial/crash is explicitly retryable without reviving an old binding.
+- A recovery-copy error after primary commit is not a rollback. Remove a newly staged credential only
+  when unchanged primary metadata positively proves no commit; uncertain outcomes preserve it. Fault
+  injection must target the private writer's actual link-based commit, not an assumed rename-to-target.
 - Schema migrations must back up recoverable, keyRef-only metadata before replacing a plaintext source.
   Unknown future schemas and backup recovery are read-only; a backup must not resurrect deleted keys.
 - A global skill is versioned source material, not authority. Pin a verified text bundle per Workspace;

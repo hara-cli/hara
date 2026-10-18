@@ -17,6 +17,9 @@
 - An 80ms fixture version-command budget was scheduling-sensitive under concurrent fsync. Inject version
   responses for source-order tests; test actual process-group timeout/exit separately. Production bounds
   were not lengthened. The shared redactor returns `{text, redactions}`, not a string; consume `.text`.
+- The post-commit failure fixture initially assumed rename-to-target; the private writer commits by
+  hard-link after claiming the old file. Inject failure on the actual second backup link, retaining
+  the strong assertions that the new credential remains usable and retired cleanup remains pending.
 
 Retained evidence: `/private/tmp/hara-runtime-connections-20261018.jOD1Cw/`.
 

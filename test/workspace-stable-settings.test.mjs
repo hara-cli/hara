@@ -5,6 +5,7 @@ import {tmpdir} from "node:os";
 import {join,dirname} from "node:path";
 import {randomUUID} from "node:crypto";
 import {spawnSync} from "node:child_process";
+import {syncBuiltinESMExports} from "node:module";
 import {WorkspaceResourceStorage,workspaceStateHome} from "../dist/workspace/resource-context.js";
 import {WorkspaceConnectionStoreV2} from "../dist/workspace/scoped-connections.js";
 import {WorkspaceSecureConnections} from "../dist/workspace/secure-connections.js";
@@ -64,6 +65,17 @@ test("denied old-Key cleanup is persisted, revoked immediately and explicitly re
  deny=false;resumed.cleanupCredentials(row.id,resumed.list().revision);assert.equal(resumed.list().connections[0].cleanupPending,false);assert.equal(resumed.resolve(resumed.capture()).apiKey,fakeKey);
  deny=true;assert.throws(()=>resumed.revoke(row.id,resumed.list().revision),/denied/);assert.throws(()=>resumed.capture());assert.equal(resumed.list().connections[0].cleanupPending,true);
  deny=false;resumed.cleanupCredentials(row.id,resumed.list().revision);assert.equal(resumed.list().connections[0].cleanupPending,false);
+});
+test("post-commit backup failure never deletes a new credential referenced by durable metadata",()=>{
+ const storage=resource(),vault=new MemoryCredentialVault(),store=new WorkspaceSecureConnections(storage,vault),backup=file(storage,"workspace-connections-v2-backup.json"),original=fs.linkSync;let backups=0;
+ fs.linkSync=function(from,to){if(to===backup&&++backups===2)throw new Error("fixture backup commit denied");return original.apply(this,arguments);};syncBuiltinESMExports();
+ try {assert.throws(()=>store.add(input(),0),/denied/);}finally{fs.linkSync=original;syncBuiltinESMExports();}
+ assert.equal(store.list().connections.length,1);assert.equal(store.resolve(store.capture()).apiKey,fakeKey);
+ // Rotate under the same uncertain post-commit boundary; neither the new key nor the pending old
+ // cleanup may be lost. A later explicit action can clean the retired generation.
+ backups=0;fs.linkSync=function(from,to){if(to===backup&&++backups===2)throw new Error("fixture backup commit denied");return original.apply(this,arguments);};syncBuiltinESMExports();
+ try {assert.throws(()=>store.edit(store.list().connections[0].id,{...input(),apiKey:""},store.list().revision),/denied/);}finally{fs.linkSync=original;syncBuiltinESMExports();}
+ assert.equal(store.resolve(store.capture()).apiKey,fakeKey);assert.equal(store.list().connections[0].cleanupPending,true);
 });
 test("legacy source preview rejects aliases, public/hard-linked config and excludes the current workspace source",()=>{
  const home=dir(),path=join(home,".hara/config.json");fs.mkdirSync(dirname(path),{recursive:true,mode:0o700});fs.writeFileSync(path,JSON.stringify(input()),{mode:0o600});const catalog=new LegacyConnectionCatalog(home,new MemoryCredentialVault());
