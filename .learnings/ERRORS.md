@@ -1,5 +1,14 @@
 # Errors
 
+## [ERR-20261018-LEGACY-COPY-FIXTURE] resolved test setup
+
+- The new legacy-copy test initially put an empty .hara into the Workspace root before Host
+  initialization. The existing no-adoption guard correctly rejected that unmarked nonempty root.
+  Corrected the fixture, not the safety assertion; the focused 33-test regression then passed.
+- Resolve exact filenames with rg --files before mixed-repository reads; several diagnostic reads
+  used the wrong repository cwd or a guessed filename. No data was edited by those failed reads.
+
+
 ## [ERR-20261018-SETTINGS-PRIVATE-LOOPBACK] local verification environment
 
 **Logged**: 2026-10-18

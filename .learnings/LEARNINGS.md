@@ -1,5 +1,17 @@
 # Learnings
 
+## [LRN-20261018-READONLY-DISCOVERY-ROOTS] user correction
+
+- Jeff 22:35: isolate writable Hara/SDK data, not installation discovery. Desktop resolves the
+  OS account with getpwuid_r; Core receives separate host-only discovery and legacy-source roots.
+  Finder PATH discovery is a bounded literal zsh -lic PATH read, with all NVM versions and known
+  local/Volta/Bun/system fallbacks. Version subprocess HOME/XDG roots remain private.
+- Personal profile metadata does not contain its credential route: join it to config.json without
+  hiding named providers. Import keyless read-only copies as editable metadata, never as saved keys
+  or permanently pending batches. Do not inherit a credential across a changed provider overlay.
+- Real legacy writes and real credential authorization remain separate user approval boundaries.
+
+
 ## [LRN-20261018-SETTINGS-BATCH-AND-HANDOFF] best_practice
 
 **Logged**: 2026-10-18

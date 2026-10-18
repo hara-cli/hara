@@ -5,10 +5,10 @@ import { deepFreeze, plain, positive, text } from "./local-state.js";
 import { VersionedSettings, SettingsMigrationPendingError } from "./versioned-settings.js";
 import type { CredentialVault } from "./credential-vault.js";
 
-interface Metadata extends Omit<ScopedConnection, "apiKey" | "credentialFile"> { keyRef: string; createdAt: string; updatedAt: string; importId?: string; retiredKeyRefs?: string[]; credentialInvalid?: boolean }
+interface Metadata extends Omit<ScopedConnection, "apiKey" | "credentialFile"> { keyRef: string; createdAt: string; updatedAt: string; importId?: string; retiredKeyRefs?: string[]; credentialInvalid?: boolean; credentialMissing?: boolean }
 interface LegacyImport { state: "pending" | "complete"; rows: { sourceId: string; connectionId: string }[] }
 interface Document { schemaVersion: 3; resourceBinding: WorkspaceResourceBinding; revision: number; activeConnectionId: string | null; connections: Metadata[]; legacyImport?: LegacyImport }
-export interface LegacyConnectionSeed { id: string; label: string; provider: "openai" | "anthropic"; baseURL: string; defaultModel: string; isDefault?: boolean }
+export interface LegacyConnectionSeed { id: string; label: string; provider: "openai" | "anthropic"; baseURL: string; defaultModel: string; isDefault?: boolean; keySaved?: boolean }
 function checked(value: unknown) {
   if (!plain(value) || !text(value.label, 80) || !text(value.defaultModel) || !text(value.baseURL, 4096) || !["openai", "anthropic"].includes(String(value.provider))) throw new Error("Invalid model connection metadata");
   let url: URL; try { url = new URL(value.baseURL); } catch { throw new Error("Invalid model endpoint"); }
@@ -29,11 +29,12 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
           || !positive(row.revision) || !["active", "revoked"].includes(String(row.status)) || typeof row.keyRef !== "string" || !row.keyRef.startsWith(`${binding().scopeKey}:${row.id}:`)
           || row.status === "active" && row.keyRef !== `${binding().scopeKey}:${row.id}:${row.credentialGeneration}`
           || row.credentialInvalid !== undefined && typeof row.credentialInvalid !== "boolean"
+          || row.credentialMissing !== undefined && typeof row.credentialMissing !== "boolean"
           || typeof row.createdAt !== "string" || !Number.isFinite(Date.parse(row.createdAt)) || typeof row.updatedAt !== "string" || !Number.isFinite(Date.parse(row.updatedAt))) throw new Error("Invalid secure connection");
         const retiredKeyRefs = row.retiredKeyRefs ?? [];
         if (!Array.isArray(retiredKeyRefs) || retiredKeyRefs.length > 256 || retiredKeyRefs.some(ref => typeof ref !== "string" || !ref.startsWith(`${binding().scopeKey}:${row.id}:`) || !isCredentialGeneration(ref.slice(ref.lastIndexOf(":") + 1)))) throw new Error("Invalid credential cleanup record");
         ids.add(row.id); return { ...checked(row), id: row.id, keyRef: row.keyRef, credentialGeneration: row.credentialGeneration, revision: row.revision,
-          status: row.status as "active" | "revoked", createdAt: row.createdAt, updatedAt: row.updatedAt, retiredKeyRefs, credentialInvalid: row.credentialInvalid === true, ...(typeof row.importId === "string" ? { importId: row.importId } : {}) };
+          status: row.status as "active" | "revoked", createdAt: row.createdAt, updatedAt: row.updatedAt, retiredKeyRefs, credentialInvalid: row.credentialInvalid === true, credentialMissing: row.credentialMissing === true, ...(typeof row.importId === "string" ? { importId: row.importId } : {}) };
       });
       if (raw.activeConnectionId !== null && !connections.some(row => row.id === raw.activeConnectionId && row.status === "active")) throw new Error("Invalid active connection");
       const legacy = raw.legacyImport;
@@ -66,9 +67,9 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
   override list(): ReturnType<WorkspaceConnectionStoreV2["list"]> & { activeConnectionId: string | null; readOnly: boolean; recovered: boolean; migrationPending: boolean } {
     const state = this.document.read();
     const pending = state.value.legacyImport?.state === "pending";
-    return { revision: state.value.revision, defaultConnectionId: pending || state.value.connections.some(row => row.id === state.value.activeConnectionId && row.credentialInvalid) ? null : state.value.activeConnectionId, activeConnectionId: state.value.activeConnectionId, readOnly: state.readOnly || pending, recovered: state.recovered, migrationPending: state.migrationPending || pending,
+    return { revision: state.value.revision, defaultConnectionId: pending || state.value.connections.some(row => row.id === state.value.activeConnectionId && (row.credentialInvalid || row.credentialMissing)) ? null : state.value.activeConnectionId, activeConnectionId: state.value.activeConnectionId, readOnly: state.readOnly || pending, recovered: state.recovered, migrationPending: state.migrationPending || pending,
       connections: state.value.connections.map(row => ({ id: row.id, label: row.label, provider: row.provider, baseURL: row.baseURL, defaultModel: row.defaultModel,
-        credentialGeneration: row.credentialGeneration, revision: row.revision, status: row.status, keySaved: !pending && row.status === "active", keyState: pending ? "pending" : row.credentialInvalid ? "invalid" : "saved", cleanupPending: Boolean(row.retiredKeyRefs?.length), createdAt: row.createdAt, updatedAt: row.updatedAt })) };
+        credentialGeneration: row.credentialGeneration, revision: row.revision, status: row.status, keySaved: !pending && !row.credentialMissing && row.status === "active", keyState: pending || row.credentialMissing ? "pending" : row.credentialInvalid ? "invalid" : "saved", credentialRequired: row.credentialMissing === true, cleanupPending: Boolean(row.retiredKeyRefs?.length), createdAt: row.createdAt, updatedAt: row.updatedAt })) };
   }
   /** Metadata-only prefill, once per personal Workspace. No vault access or secret persistence. */
   stageLegacyImport(rows: readonly LegacyConnectionSeed[]): void {
@@ -78,10 +79,11 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     const now = new Date().toISOString(), fresh = rows.filter(row => !state.value.connections.some(old => old.importId === row.id));
     const entries: Metadata[] = fresh.map(row => { const id = `mc_${randomUUID()}`, generation = `gen_${randomUUID()}`;
       return { ...checked(row), id, credentialGeneration: generation, keyRef: `${state.value.resourceBinding.scopeKey}:${id}:${generation}`,
-        revision: 1, status: "active", createdAt: now, updatedAt: now, importId: row.id }; });
+        revision: 1, status: "active", credentialMissing: row.keySaved === false, createdAt: now, updatedAt: now, importId: row.id }; });
+    const authorizations = entries.flatMap((row, index) => row.credentialMissing ? [] : [{ connectionId: row.id, sourceId: fresh[index]!.id }]);
     this.document.update(state.value.revision, current => ({ ...current, connections: [...current.connections, ...entries],
       activeConnectionId: current.activeConnectionId ?? entries[fresh.findIndex(row => row.isDefault)]?.id ?? entries[0]?.id ?? null,
-      legacyImport: { state: entries.length ? "pending" : "complete", rows: entries.map((row, index) => ({ connectionId: row.id, sourceId: fresh[index]!.id })) } }));
+      legacyImport: { state: authorizations.length ? "pending" : "complete", rows: authorizations } }));
   }
   retryMigration(expected: number): ReturnType<WorkspaceSecureConnections["list"]> {
     const state = this.document.read();
@@ -118,12 +120,12 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
   edit(id: string, value: unknown, expected: number): void {
     const metadata = checked(value), state = this.document.read(), row = state.value.connections.find(row => row.id === id && row.status === "active");
     if (!row || state.readOnly || state.value.legacyImport?.state === "pending" || state.value.revision !== expected || !plain(value)) throw new Error("Connection changed; refresh before editing");
-    const key = value.apiKey === "" || value.apiKey === undefined ? this.vault.get(row.keyRef) : value.apiKey;
+    const key = value.apiKey === "" || value.apiKey === undefined ? row.credentialMissing ? undefined : this.vault.get(row.keyRef) : value.apiKey;
     if (typeof key !== "string" || !key) throw new Error("Saved credential is unavailable");
     const generation = `gen_${randomUUID()}`, ref = `${state.value.resourceBinding.scopeKey}:${id}:${generation}`;
     this.vault.set(ref, key);
     try { this.document.update(expected, current => ({ ...current, connections: current.connections.map(item => item.id === id
-      ? { ...item, ...metadata, keyRef: ref, credentialInvalid: false, retiredKeyRefs: [...new Set([...(item.retiredKeyRefs ?? []), item.keyRef])], credentialGeneration: generation, revision: item.revision + 1, updatedAt: new Date().toISOString() } : item) })); }
+      ? { ...item, ...metadata, keyRef: ref, credentialInvalid: false, credentialMissing: false, retiredKeyRefs: [...new Set([...(item.retiredKeyRefs ?? []), item.keyRef])], credentialGeneration: generation, revision: item.revision + 1, updatedAt: new Date().toISOString() } : item) })); }
     catch (error) { this.discardUncommittedCredential(ref, expected); throw error; }
     this.cleanupCredentials(id, this.document.read().value.revision);
   }
@@ -166,7 +168,7 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     const state = this.document.read().value;
     if (state.legacyImport?.state === "pending") throw new Error("Credential authorization pending; no model call allowed");
     const row = state.connections.find(row => row.id === (id ?? state.activeConnectionId) && row.status === "active");
-    if (!row || row.credentialInvalid || model !== undefined && !text(model)) throw new Error("invalid or unavailable scoped model connection; no fallback was selected");
+    if (!row || row.credentialInvalid || row.credentialMissing || model !== undefined && !text(model)) throw new Error("invalid or unavailable scoped model connection; no fallback was selected");
     return deepFreeze({ connectionId: row.id, credentialGeneration: row.credentialGeneration, connectionRevision: row.revision, model: model ?? row.defaultModel, reasoning: null });
   }
   override resolve(binding: ScopedRunConnection): Readonly<ScopedConnection> {
@@ -174,7 +176,7 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     const state = this.document.read().value;
     if (state.legacyImport?.state === "pending") throw new Error("Credential authorization pending; no model call allowed");
     const row = state.connections.find(row => row.id === binding.connectionId && row.status === "active");
-    if (!row || row.credentialInvalid || row.credentialGeneration !== binding.credentialGeneration || row.revision !== binding.connectionRevision) throw new Error("Original connection generation unavailable");
+    if (!row || row.credentialInvalid || row.credentialMissing || row.credentialGeneration !== binding.credentialGeneration || row.revision !== binding.connectionRevision) throw new Error("Original connection generation unavailable");
     const apiKey = this.vault.get(row.keyRef); if (!apiKey) throw new Error("Original credential unavailable; no fallback selected");
     const { keyRef: _ref, ...metadata } = row; return deepFreeze({ ...metadata, apiKey });
   }

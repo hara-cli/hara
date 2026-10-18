@@ -80,6 +80,8 @@ export class LocalWorkspaceHost {
   constructor(root: string, private readonly options: {
     mode?: "workspace";
     hostHome?: string;
+    discoveryHome?: string;
+    legacySourceHome?: string;
     credentialVault?: CredentialVault;
     runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1];
     providerFactory?: LocalWorkspaceProviderFactory;
@@ -93,7 +95,7 @@ export class LocalWorkspaceHost {
     this.catalog = new LocalWorkspaceCatalog(this.home);
     const unavailable = () => { throw new Error("Host OS credential vault is unavailable; no plaintext fallback"); };
     this.vault = options.credentialVault ?? (options.hostHome ? new MacKeychainCredentialVault(options.hostHome) : { get: unavailable, set: unavailable, remove: unavailable });
-    if (options.mode === "workspace" && options.hostHome) this.legacy = new LegacyConnectionCatalog(options.hostHome, this.vault);
+    if (options.mode === "workspace" && (options.legacySourceHome ?? options.hostHome)) this.legacy = new LegacyConnectionCatalog((options.legacySourceHome ?? options.hostHome)!, this.vault);
     this.preferences = new WorkspacePreferences(this.home, options.mode === "workspace" ? options.hostHome : undefined);
     if (options.realKeyFile) {
       if (options.providerFactory) throw new Error("Real-key acceptance cannot replace its trusted Provider factory");
@@ -128,7 +130,7 @@ export class LocalWorkspaceHost {
     }
     const context: WorkspaceHostContext = { storage, resources, connections, project,
       features: new WorkspaceFeatures(storage, project, workspaceId, this.options.mode === "workspace" ? this.options.hostHome : undefined),
-      runtimes: new WorkspaceRuntimeInstaller(storage, { ...(this.options.hostHome ? { discovery: { home: this.options.hostHome, shell: process.env.HARA_WORKSPACE_HOST_SHELL } } : {}),
+      runtimes: new WorkspaceRuntimeInstaller(storage, { ...((this.options.discoveryHome ?? this.options.hostHome) ? { discovery: { home: (this.options.discoveryHome ?? this.options.hostHome)!, probeHome: this.options.hostHome, shell: process.env.HARA_WORKSPACE_HOST_SHELL } } : {}),
         ...this.options.runtimeInstallerOptions, onChange: () => this.changed(workspaceId) }) };
     context.scheduler = new WorkspaceScheduler(storage, context.features, {
       available: agentId => !this.closing && !this.updateLease && Boolean(resources.agents.get(agentId)?.state === "active")

@@ -16,6 +16,8 @@ function read(path: string): { value: any; revision: string } | null {
     return { value: JSON.parse(snapshot.text), revision: `${snapshot.ino}:${snapshot.text.length}:${info.mtimeMs}` }; } catch { return null; }
 }
 const clean = (value: unknown, max = 256) => redactSensitiveText(String(value ?? "")).text.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, max).trim();
+const baseFor = (provider: unknown) => isProviderId(provider) ? providerDefaultBaseURL(provider)
+  ?? (provider === "anthropic" ? "https://api.anthropic.com" : provider === "openai" ? "https://api.openai.com/v1" : undefined) : undefined;
 /** Known private Hara locations only; never uses loadConfig()/env, migrates, or changes old source. */
 export class LegacyConnectionCatalog {
   private sources: Source[] = [];
@@ -24,21 +26,51 @@ export class LegacyConnectionCatalog {
     const sources: Source[] = [];
     const add = (row: any, path: string, revision: string, fallbackLabel: string, isDefault = false) => {
       if (path === excludeSource || !plain(row) || row.kind === "gateway" || row.provider === "qwen-oauth") return;
-      const rawURL = typeof row.baseURL === "string" ? row.baseURL : isProviderId(row.provider) ? providerDefaultBaseURL(row.provider) : undefined;
-      const rawModel = row.model ?? row.defaultModel ?? (isProviderId(row.provider) ? providerDefaultModel(row.provider) : undefined);
-      if (!rawURL || typeof rawModel !== "string" || !(typeof row.apiKey === "string" && row.apiKey.length > 0) && !(typeof row.keyRef === "string" && row.keyRef.length > 0)) return;
+      const providerId = row.provider ?? "anthropic";
+      const rawURL = typeof row.baseURL === "string" && row.baseURL.trim() ? row.baseURL : baseFor(providerId);
+      const rawModel = row.model ?? row.defaultModel ?? (isProviderId(providerId) ? providerDefaultModel(providerId) : undefined);
+      if (!rawURL || typeof rawModel !== "string") return;
+      const keySaved = typeof row.apiKey === "string" && row.apiKey.length > 0 || typeof row.keyRef === "string" && row.keyRef.length > 0;
       let url: URL; try { url = new URL(rawURL); } catch { return; }
       if (url.username || url.password || url.hash || url.search || !["https:", "http:"].includes(url.protocol) || url.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) return;
-      const label = clean(row.label ?? row.name, 80) || clean(row.provider, 80) || clean(fallbackLabel, 80) || "旧版连接", provider = row.provider === "anthropic" || url.pathname.includes("anthropic") ? "anthropic" as const : "openai" as const;
+      const label = clean(row.label ?? row.name, 80) || clean(providerId, 80) || clean(fallbackLabel, 80) || "旧版连接", provider = providerId === "anthropic" || url.pathname.includes("anthropic") ? "anthropic" as const : "openai" as const;
       const defaultModel = clean(rawModel); if (!defaultModel || rawURL.length > 4096) return;
       const id = createHash("sha256").update(`${path}\0${row.id ?? fallbackLabel}\0${revision}`).digest("hex");
-      sources.push({ id, label, provider, baseURL: url.href.replace(/\/$/, ""), defaultModel, keySaved: true, source: path, isDefault,
+      sources.push({ id, label, provider, baseURL: url.href.replace(/\/$/, ""), defaultModel, keySaved, source: path, isDefault,
         read: () => typeof row.apiKey === "string" ? row.apiKey : this.vault.get(String(row.keyRef)) });
     };
-    const profilesPath = join(this.home, ".hara/profiles.json"), profiles = read(profilesPath);
-    if (profiles && Array.isArray(profiles.value.profiles)) for (const row of profiles.value.profiles.slice(0, 256)) add(row, profilesPath, profiles.revision, String(row.id ?? "舊連接"), row.id === (profiles.value.active ?? profiles.value.activeProfileId ?? profiles.value.activeId ?? profiles.value.defaultProfileId));
     const configPath = join(this.home, ".hara/config.json"), config = read(configPath);
-    if (config && !sources.length) add(config.value, configPath, config.revision, "舊個人連接", true);
+    const profilesPath = join(this.home, ".hara/profiles.json"), profiles = read(profilesPath);
+    const active = profiles?.value.active ?? profiles?.value.activeProfileId ?? profiles?.value.activeId ?? profiles?.value.defaultProfileId;
+    let personal = false;
+    if (profiles && Array.isArray(profiles.value.profiles)) for (const row of profiles.value.profiles.slice(0, 256)) {
+      if (!plain(row)) continue;
+      if (row.id === "personal" && row.kind !== "gateway" && config) {
+        // The reserved Personal row is presentation metadata. Its actual provider/key/model live
+        // in config.json; a named profile existing alongside it must not hide the Personal route.
+        add({ ...config.value, id: "personal", label: row.label || config.value.label }, configPath, `${config.revision}:${profiles.revision}`, "Personal", active === "personal");
+        personal = true;
+      } else add(row, profilesPath, profiles.revision, String(row.id ?? "舊連接"), row.id === active);
+    }
+    if (config && !personal) {
+      const same = (Array.isArray(profiles?.value.profiles) ? profiles.value.profiles : []).some((row: any) => plain(row) && row.kind !== "gateway"
+        && typeof row.apiKey === "string" && row.apiKey.length > 0 && row.apiKey === config.value.apiKey && row.provider === config.value.provider
+        && String(row.baseURL ?? "").replace(/\/$/, "") === String(config.value.baseURL ?? "").replace(/\/$/, "")
+        && (row.model ?? row.defaultModel) === (config.value.model ?? config.value.defaultModel));
+      if (!same) add({ ...config.value, id: "personal" }, configPath, config.revision, "舊個人連接", !active || active === "personal");
+    }
+    // Old config-level presets were named `profiles`, then `overlays`. Read them without invoking
+    // loadConfig (which could migrate data, read env keys, or write the legacy identity registry).
+    const overlays = config?.value.overlays ?? config?.value.profiles;
+    if (plain(overlays)) for (const [id, row] of Object.entries(overlays).slice(0, 256)) {
+      if (plain(row)) {
+        const changed = row.provider && row.provider !== config!.value.provider;
+        add({ ...config!.value, ...row, ...(changed ? { apiKey: row.apiKey, keyRef: row.keyRef,
+          baseURL: row.baseURL ?? baseFor(row.provider),
+          model: row.model ?? row.defaultModel ?? (isProviderId(row.provider) ? providerDefaultModel(row.provider) : undefined) } : {}),
+          id: `overlay:${id}`, label: row.label ?? id }, configPath, config!.revision, id);
+      }
+    }
     const scoped = join(this.home, ".hara/workspaces-v1/home/.hara/workspace-data/v1");
     let entries: string[] = []; try { if (includeWorkspaceSources) entries = readdirSync(scoped).filter(name => /^[a-f0-9]{64}$/.test(name)).slice(0, 128); } catch { /* none */ }
     for (const scope of entries) {
