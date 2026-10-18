@@ -14,6 +14,6 @@ export function createWorkspaceProvider(connection: ScopedConnection, binding: S
   if (!apiKey) throw new Error("Workspace credential unavailable");
   // Deliberately no automatic retry/provider/model failover at this authority boundary.
   return connection.provider === "anthropic"
-    ? createAnthropicProvider({ apiKey, baseURL: connection.baseURL, model: binding.model })
-    : createOpenAIProvider({ apiKey, baseURL: connection.baseURL, model: binding.model });
+    ? createAnthropicProvider({ apiKey, baseURL: connection.baseURL, model: binding.model, workspaceScoped: true })
+    : createOpenAIProvider({ apiKey, baseURL: connection.baseURL, model: binding.model, workspaceScoped: true });
 }

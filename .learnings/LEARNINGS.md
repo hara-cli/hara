@@ -1050,3 +1050,22 @@ reproducible full-suite failures; passing two full runs does not guarantee an ar
   record old-contract failures and environmental errors rather than repeatedly rerunning for green.
 
 ---
+
+## [LRN-20261018-SCOPED-SDK-DEFAULTS] An explicit API key does not isolate all SDK credential defaults
+
+- Logged: 2026-10-18
+- Status: implemented and tested only with fake credential subprocesses; no real Key access
+- The pinned Anthropic SDK separately inherits an auth token when its `authToken` option is omitted,
+  even with an explicit API key. The pinned OpenAI SDK similarly inherits organization/project IDs,
+  admin/webhook metadata and debug logging preferences. A sanitized Desktop child alone does not
+  protect an independently started CLI process.
+- Workspace factories must explicitly null those ambient credential/audience options and disable
+  SDK debug logging; do not temporarily mutate process.env (concurrent Workspaces could race).
+- Preserve unspecified legacy factory behavior with a host-only scoped option. Test a completely
+  replaced subprocess environment of fake poison values against a loopback endpoint and assert
+  exact auth headers, absent foreign audience/token headers, quiet stdout/stderr and unchanged Home.
+- Evidence: `/private/tmp/hara-pi-only-20261018.M9EdmB/provider-env-red-2.log`; local SDK source is the
+  authority for constructor behavior. Official API authentication docs explain that explicit
+  organization/project headers determine request audience; never assume API key choice alone clears them.
+
+---

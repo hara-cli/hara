@@ -153,10 +153,12 @@ export function buildThinkingParam(model: string, effort?: Effort):
   return { type: "enabled", budget_tokens: 24000 };
 }
 
-export function createAnthropicProvider(opts: { apiKey: string; model: string; baseURL?: string; reasoningEffort?: Effort; fetch?: typeof fetch; supportsImages?: boolean }): Provider {
+export function createAnthropicProvider(opts: { apiKey: string; model: string; baseURL?: string; reasoningEffort?: Effort; fetch?: typeof fetch; supportsImages?: boolean; workspaceScoped?: boolean }): Provider {
   const client = new Anthropic({
     apiKey: opts.apiKey,
     maxRetries: 0,
+    // Explicit API keys do not suppress the SDK's independent env authToken fallback by themselves.
+    ...(opts.workspaceScoped ? { authToken: null, webhookKey: null, logLevel: "off" as const } : {}),
     ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
     ...(opts.fetch ? { fetch: opts.fetch } : {}),
   });

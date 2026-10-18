@@ -132,6 +132,8 @@ export function createOpenAIProvider(opts: {
   supportsImages?: boolean;
   /** Host-owned bounded acceptance lanes may require a smaller output ceiling. */
   maxOutputTokens?: number;
+  /** Host-only Workspace boundary: suppress the SDK's ambient account metadata/secrets/logging. */
+  workspaceScoped?: boolean;
 }): Provider {
   if (opts.maxOutputTokens !== undefined && (!Number.isSafeInteger(opts.maxOutputTokens) || opts.maxOutputTokens < 1 || opts.maxOutputTokens > 32000)) throw new Error("Invalid OpenAI output limit");
   const client = new OpenAI({
@@ -139,6 +141,7 @@ export function createOpenAIProvider(opts: {
     // Hara owns retry safety/backoff above every provider. SDK-local retries cannot know whether another
     // adapter already emitted activity and make cancellation/attempt telemetry inconsistent.
     maxRetries: 0,
+    ...(opts.workspaceScoped ? { organization: null, project: null, adminAPIKey: null, webhookSecret: null, logLevel: "off" as const } : {}),
     ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
     ...(opts.omitAuthorization ? { defaultHeaders: { Authorization: null } } : {}),
     ...(opts.fetch ? { fetch: opts.fetch } : {}),
