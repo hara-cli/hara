@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { WorkspaceConnectionStoreV2, isScopedRunConnection, isConnectionId, isCredentialGeneration, type ScopedConnectionInput, type ScopedConnection, type ScopedConnectionView, type ScopedRunConnection } from "./scoped-connections.js";
 import { currentWorkspaceResourceBinding, sameWorkspaceResourceBinding, workspaceStateHome, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { deepFreeze, plain, positive, text } from "./local-state.js";
-import { VersionedSettings } from "./versioned-settings.js";
+import { VersionedSettings, SettingsMigrationPendingError } from "./versioned-settings.js";
 import type { CredentialVault } from "./credential-vault.js";
 
 interface Metadata extends Omit<ScopedConnection, "apiKey" | "credentialFile"> { keyRef: string; createdAt: string; updatedAt: string; importId?: string; retiredKeyRefs?: string[] }
@@ -36,22 +36,34 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     };
     this.document = new VersionedSettings(() => storage.run(() => workspaceStateHome()), "workspace-connections-v2.json", 3,
       () => ({ schemaVersion: 3, resourceBinding: binding(), revision: 0, activeConnectionId: null, connections: [] }), parse,
-      { 1: raw => ({ ...raw, schemaVersion: 2 }), 2: raw => {
+      { 1: raw => ({ ...raw, schemaVersion: 2 }), 2: (raw, options) => {
         if (!Array.isArray(raw.connections) || !sameWorkspaceResourceBinding(raw.resourceBinding, binding())) throw new Error("Invalid old connection store");
+        const credentials: { ref: string; key: string }[] = [];
         const connections = raw.connections.map((row: any, index: number) => {
           checked(row); if (!isConnectionId(row.id) || !isCredentialGeneration(row.credentialGeneration) || !text(row.apiKey, 16384)) throw new Error("Old credential requires explicit recovery");
-          const keyRef = `${binding().scopeKey}:${row.id}:${row.credentialGeneration}`; if (row.status === "active") this.vault.set(keyRef, row.apiKey);
+          const keyRef = `${binding().scopeKey}:${row.id}:${row.credentialGeneration}`; if (row.status === "active") credentials.push({ ref: keyRef, key: row.apiKey });
           const { apiKey: _key, credentialFile: _file, ...metadata } = row;
           return { ...metadata, keyRef, createdAt: new Date(index).toISOString(), updatedAt: new Date(index).toISOString() };
         });
-        return { schemaVersion: 3, resourceBinding: raw.resourceBinding, revision: raw.revision, activeConnectionId: raw.defaultConnectionId ?? null, connections };
+        const next = parse({ schemaVersion: 3, resourceBinding: raw.resourceBinding, revision: raw.revision, activeConnectionId: raw.defaultConnectionId ?? null, connections });
+        // Validate every source row before any external side effect. A backup is never migrated by
+        // writing the vault; unavailable/denied vault access must not be classified as damaged JSON.
+        if (options.readOnly && credentials.length) throw new SettingsMigrationPendingError();
+        try { for (const credential of credentials) this.vault.set(credential.ref, credential.key); }
+        catch { throw new SettingsMigrationPendingError(); }
+        return next;
       } }, storage, (_old, next) => next);
   }
-  override list(): ReturnType<WorkspaceConnectionStoreV2["list"]> & { activeConnectionId: string | null; readOnly: boolean; recovered: boolean } {
+  override list(): ReturnType<WorkspaceConnectionStoreV2["list"]> & { activeConnectionId: string | null; readOnly: boolean; recovered: boolean; migrationPending: boolean } {
     const state = this.document.read();
-    return { revision: state.value.revision, defaultConnectionId: state.value.activeConnectionId, activeConnectionId: state.value.activeConnectionId, readOnly: state.readOnly, recovered: state.recovered,
+    return { revision: state.value.revision, defaultConnectionId: state.value.activeConnectionId, activeConnectionId: state.value.activeConnectionId, readOnly: state.readOnly, recovered: state.recovered, migrationPending: state.migrationPending,
       connections: state.value.connections.map(row => ({ id: row.id, label: row.label, provider: row.provider, baseURL: row.baseURL, defaultModel: row.defaultModel,
         credentialGeneration: row.credentialGeneration, revision: row.revision, status: row.status, keySaved: row.status === "active", cleanupPending: Boolean(row.retiredKeyRefs?.length), createdAt: row.createdAt, updatedAt: row.updatedAt })) };
+  }
+  retryMigration(expected: number): ReturnType<WorkspaceSecureConnections["list"]> {
+    const state = this.document.read();
+    if (!state.migrationPending || state.recovered || state.value.revision !== expected) throw new Error("Migration state changed or requires backup recovery; original preserved");
+    this.document.retryMigration(); return this.list();
   }
   override add(value: ScopedConnectionInput, expected: number): ScopedConnectionView { return this.importConnection(value, expected); }
   importConnection(value: ScopedConnectionInput, expected: number, importId?: string): ScopedConnectionView {

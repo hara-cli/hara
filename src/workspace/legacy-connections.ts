@@ -15,7 +15,7 @@ function read(path: string): { value: any; revision: string } | null {
     const snapshot = readPrivateStateFileSnapshotSync(path, 4 * 1024 * 1024); if (!snapshot) return null;
     return { value: JSON.parse(snapshot.text), revision: `${snapshot.ino}:${snapshot.text.length}:${info.mtimeMs}` }; } catch { return null; }
 }
-const clean = (value: unknown) => redactSensitiveText(String(value ?? "")).text.slice(0, 256);
+const clean = (value: unknown, max = 256) => redactSensitiveText(String(value ?? "")).text.slice(0, max).trim();
 /** Known private Hara locations only; never uses loadConfig()/env, migrates, or changes old source. */
 export class LegacyConnectionCatalog {
   private sources: Source[] = [];
@@ -29,7 +29,7 @@ export class LegacyConnectionCatalog {
       if (!rawURL || typeof rawModel !== "string" || !(typeof row.apiKey === "string" && row.apiKey.length > 0) && !(typeof row.keyRef === "string" && row.keyRef.length > 0)) return;
       let url: URL; try { url = new URL(rawURL); } catch { return; }
       if (url.username || url.password || url.hash || url.search || !["https:", "http:"].includes(url.protocol) || url.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) return;
-      const label = clean(row.label ?? row.name ?? fallbackLabel), provider = row.provider === "anthropic" || url.pathname.includes("anthropic") ? "anthropic" as const : "openai" as const;
+      const label = clean(row.label ?? row.name ?? fallbackLabel, 80), provider = row.provider === "anthropic" || url.pathname.includes("anthropic") ? "anthropic" as const : "openai" as const;
       const id = createHash("sha256").update(`${path}\0${row.id ?? fallbackLabel}\0${revision}`).digest("hex");
       sources.push({ id, label, provider, baseURL: url.href.replace(/\/$/, ""), defaultModel: clean(rawModel), keySaved: true, source: path,
         read: () => typeof row.apiKey === "string" ? row.apiKey : this.vault.get(String(row.keyRef)) });

@@ -38,6 +38,9 @@ import { workspaceSkillTool } from "./skills.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
 interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; features: WorkspaceFeatures }
+type WorkspaceConnectionSnapshot = ReturnType<WorkspaceConnectionStoreV2["list"]> & {
+  readOnly?: boolean; recovered?: boolean; migrationPending?: boolean; unavailable?: boolean; activeConnectionId?: string | null;
+};
 export interface LocalWorkspaceApproval {
   id: string; workspaceId: string; agentId: string; runId: string; expiresAt: string;
   resourceGeneration: string;
@@ -193,6 +196,11 @@ export class LocalWorkspaceHost {
     if (!(store instanceof WorkspaceSecureConnections)) throw new Error("Secure credential cleanup requires Workspace mode");
     store.cleanupCredentials(id, expected); this.changed(workspaceId);
   }
+  retryConnectionMigration(workspaceId: string, expected: number, approved: boolean) {
+    const store = this.context(workspaceId).connections;
+    if (!approved || !(store instanceof WorkspaceSecureConnections)) throw new Error("Explicit secure migration retry approval required");
+    const value = store.retryMigration(expected); this.changed(workspaceId); return value;
+  }
   selectConnection(workspaceId: string, id: string, expected: number) { this.context(workspaceId).connections.select(id, expected); this.changed(workspaceId); }
   workspaceFeatures(workspaceId: string) { return this.context(workspaceId).features.list(); }
   updateFeature(workspaceId: string, kind: unknown, id: unknown, enabled: unknown, expected: number, version?: unknown) {
@@ -230,9 +238,10 @@ export class LocalWorkspaceHost {
     if (!selected || !catalog.agents.some(agent => agent.agentId === selected)) throw new Error("Workspace Agent unavailable; no legacy roster was selected");
     const value = new WorkspaceConversationStore(context.storage, selected).read();
     const live = [...this.jobs.values()].find(job => !job.closed && job.workspaceId === workspaceId && job.agentId === selected);
+    const connections = this.connectionSnapshot(context);
     return { workspaceId, resourceGeneration: context.storage.run(() => currentWorkspaceResourceBinding()!.generation),
       label: row.label, agentRevision: catalog.revision, agents: catalog.agents, selectedAgentId: selected,
-      connections: context.connections.list(), runtimes: context.runtimes.list(), conversation: { revision: value.revision, sessionId: value.sessionId,
+      connections, runtimes: context.runtimes.list(), conversation: { revision: value.revision, sessionId: value.sessionId,
         state: live ? live.controller.signal.aborted ? "draining" : "running"
           : value.attempt?.state === "running" || value.attempt?.state === "draining" ? "needs_recovery"
           : value.attempt?.state === "completed" && value.task?.status !== "completed" ? "blocked" : value.attempt?.state ?? "idle",
@@ -246,6 +255,15 @@ export class LocalWorkspaceHost {
           : { role: message.role, content: message.content }) },
       approvals: [...this.pending.values()].filter(pending => pending.card.workspaceId === workspaceId && pending.card.agentId === selected && pending.clientId === clientId).map(pending => pending.card),
       ...this.modelMode() };
+  }
+  private connectionSnapshot(context: WorkspaceHostContext): WorkspaceConnectionSnapshot {
+    try { return context.connections.list(); }
+    catch {
+      // Do not turn a revoked/unsafe Workspace resource context into a usable view. Only isolate the
+      // unavailable settings, retaining scoped history/roster; no global config or credential fallback.
+      context.storage.run(() => {});
+      return { revision: 0, defaultConnectionId: null, activeConnectionId: null, connections: [], readOnly: true, recovered: false, migrationPending: false, unavailable: true };
+    }
   }
   private resumeAdmission(context: WorkspaceHostContext, value: WorkspaceConversation) {
     const binding = value.task?.workspaceRunBinding;

@@ -1,5 +1,28 @@
 # Learnings
 
+## [LRN-20261018-SETTINGS-READONLY-MIGRATION] correction
+
+**Logged**: 2026-10-18
+**Priority**: high
+**Status**: implemented and synthetic-tested on isolated fix branch; not released
+**Area**: workspace
+
+- Jeff elevated four independent review findings to constraints, not optional polish. Read-only local
+  discovery must disable npm's notifier and use offline mode even for `npm config get prefix`.
+- Valid data plus a denied/timed-out/unsupported credential migration is pending, not corrupt. Validate
+  every row before side effects, preserve original bytes and return empty/read-only connections; keep
+  scoped roster/history available and model admission closed. Never serialize underlying vault errors.
+- Remember a blocked source fingerprint for the Host lifetime so ordinary snapshots cannot repeatedly
+  prompt. A confirmed generation/revision-scoped retry is distinct from refresh, polling or reconnect.
+- A missing primary is empty only when its recovery copy is also absent. Existing backups, including
+  older pure schemas, recover read-only in memory. A sole credential backup cannot trigger vault writes
+  or be overwritten by a newly initialized empty store.
+- Preview and import must share the 80-character label bound; do not shorten separate model-ID limits.
+- Evidence: 11 pre-fix red tests, 15 new passing regressions; preserve the related-suite timing failure
+  separately rather than silently replacing the full result with a later isolated pass.
+
+---
+
 ## [LRN-20261018-STABLE-WORKSPACE-SETTINGS] Stable storage, explicit import and version-locked skills
 
 **Logged**: 2026-10-18

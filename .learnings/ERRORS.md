@@ -1,5 +1,26 @@
 # Errors
 
+## [ERR-20261018-REVIEW-FORMAL-APPROVAL-DEADLINE] Related-suite approval wait did not settle
+
+**Logged**: 2026-10-18
+**Priority**: medium
+**Status**: unresolved timing failure; no timeout/assertion change
+**Area**: tests
+
+- The fixed-source related Core suite returned 295 pass / 1 fail out of 296. The unchanged formal
+  six-step Host test failed at its 5-second `until(approvals[0])` deadline (reported duration 11093ms).
+  The 15 newly added review tests all passed in that run. This is not a Core full-suite pass.
+- One bounded diagnostic of the unchanged production-entry file, alone with a fresh private HOME,
+  returned 4 pass / 0 fail; the six-step test took 9691ms overall. Its sequential steps have multiple
+  waits, so overall duration is not the duration of the approval wait itself.
+- Concurrent storage/CPU contention is a hypothesis, not a confirmed root cause. Do not change the
+  assertion/deadline, claim a proven fix, rerun until green, or mark the original suite passed. No
+  product change was made for this unrelated timing issue; report it to Jeff at this slice's stop.
+- Evidence: `/private/tmp/hara-review-fixes-20261018.YgoVYv/core-regression.log` and
+  `core-production-diagnostic.log`. All Providers/vaults used synthetic fixtures or loopback only.
+
+---
+
 ## [ERR-20261018-SETTINGS-FIXTURE-ENV] Fresh HOME and actual loopback capability are test preconditions
 
 **Logged**: 2026-10-18
