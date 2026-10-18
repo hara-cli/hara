@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { WorkspaceJsonState, exact, plain, UUID } from "./local-state.js";
 import { sameWorkspaceResourceBinding, workspaceResourceDirectory, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { OPTIONAL_RUNTIMES, RUNTIME_DOWNLOAD_HOSTS, RUNTIME_LABELS, resolveOfficialRuntimeArtifact } from "./runtime-catalog.js";
 import { runtimeArchiveMember } from "./runtime-archive.js";
 import { validOpenCodeNativeHeader } from "../coding/bundled-opencode.js";
+import { detectInstalledRuntimes, inspectLocalRuntime, type DetectionOptions, type DetectedRuntime } from "./runtime-detect.js";
 
 export type OptionalRuntimeId = "opencode" | "codex" | "claude";
 export interface RuntimeTarget { platform: NodeJS.Platform; arch: string }
@@ -26,6 +27,9 @@ export function optionalRuntimeId(value: unknown): value is OptionalRuntimeId { 
  * Host-only fixture resolver/fetch policy cannot be supplied by RPC, model tools or downloaded metadata. */
 export class WorkspaceRuntimeInstaller {
   private readonly state: WorkspaceJsonState<InstallState>;
+  private readonly locals: WorkspaceJsonState<{ resourceBinding: WorkspaceResourceBinding; revision: number; entries: DetectedRuntime[] }>;
+  private detected: DetectedRuntime[] = [];
+  private discovery?: Promise<void>;
   private readonly proposals = new Map<string, Proposal>();
   private readonly operations = new Map<string, Operation>();
   private readonly active = new Map<OptionalRuntimeId, Operation>();
@@ -37,6 +41,7 @@ export class WorkspaceRuntimeInstaller {
     fixtureOrigin?: string;
     resolveArtifact?: (id: OptionalRuntimeId, target: RuntimeTarget, signal?: AbortSignal) => Promise<RuntimeArtifact>;
     onChange?: () => void;
+    discovery?: DetectionOptions;
   } = {}) {
     this.target = Object.freeze({ platform: options.target?.platform ?? process.platform, arch: options.target?.arch ?? process.arch });
     if (options.fixtureOrigin) { const url = new URL(options.fixtureOrigin); if (url.origin !== options.fixtureOrigin || url.protocol !== "http:" || url.hostname !== "127.0.0.1") fail(); }
@@ -54,6 +59,43 @@ export class WorkspaceRuntimeInstaller {
       }
       return structuredClone(value) as unknown as InstallState;
     }, () => ({ resourceBinding: binding(), revision: 0, entries: [] }));
+    this.locals = new WorkspaceJsonState(storage, "runtime-local-v1.json", value => {
+      if (!plain(value) || !exact(value, ["resourceBinding", "revision", "entries"]) || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, this.state.binding())
+        || !Number.isSafeInteger(value.revision) || Number(value.revision) < 1 || !Array.isArray(value.entries) || value.entries.length > 3) return fail();
+      const seen = new Set<string>();
+      for (const row of value.entries) {
+        if (!plain(row) || !optionalRuntimeId(row.runtimeId) || seen.has(row.runtimeId) || !exact(row, ["runtimeId", "path", "realPath", "version", "fingerprint", "source"])
+          || typeof row.path !== "string" || typeof row.realPath !== "string" || typeof row.version !== "string" || typeof row.source !== "string" || typeof row.fingerprint !== "string" || !HASH.test(row.fingerprint)) return fail();
+        seen.add(row.runtimeId);
+      }
+      return structuredClone(value) as unknown as { resourceBinding: WorkspaceResourceBinding; revision: number; entries: DetectedRuntime[] };
+    }, () => ({ resourceBinding: this.state.binding(), revision: 0, entries: [] }));
+  }
+  async discover(): Promise<void> {
+    if (this.closed || !this.options.discovery) return;
+    if (!this.discovery) this.discovery = (async () => {
+      this.storage.run(() => {});
+      const found = await detectInstalledRuntimes(this.options.discovery!);
+      if (this.closed) return;
+      this.storage.run(() => {}); this.detected = found;
+    })().finally(() => { this.discovery = undefined; });
+    return this.discovery;
+  }
+  registerLocal(runtimeId: OptionalRuntimeId, fingerprint: string): void {
+    if (this.closed) return fail();
+    const found = this.detected.find(row => row.runtimeId === runtimeId && row.fingerprint === fingerprint);
+    const current = found && inspectLocalRuntime(found.path, true);
+    if (!found || !current || current.realPath !== found.realPath || current.fingerprint !== fingerprint) return fail();
+    const state = this.locals.read();
+    this.locals.update(state.revision, value => ({ ...value, entries: [...value.entries.filter(row => row.runtimeId !== runtimeId), found] }));
+  }
+  resolveLocal(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv } {
+    const row = this.locals.read().entries.find(row => row.runtimeId === runtimeId), checked = row && inspectLocalRuntime(row.path, true);
+    if (!row || !checked || checked.realPath !== row.realPath || checked.fingerprint !== row.fingerprint) return fail();
+    const privateHome = this.storage.run(() => workspaceResourceDirectory(["runtime-homes", runtimeId]));
+    return { command: row.path, env: { HOME: privateHome, USERPROFILE: privateHome, CODEX_HOME: join(privateHome, ".codex"),
+      CLAUDE_CONFIG_DIR: join(privateHome, ".claude"), PATH: `${dirname(row.path)}:${this.options.discovery?.path ?? "/usr/bin:/bin:/usr/sbin:/sbin"}`,
+      DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" } };
   }
   private assertUrl(raw: string): URL {
     const url = new URL(raw);
@@ -97,6 +139,8 @@ export class WorkspaceRuntimeInstaller {
     return fail();
   }
   async propose(runtimeId: OptionalRuntimeId, controllerId: string, assertCurrent: () => void, assertInstallCurrent = () => this.storage.run(() => {})): Promise<RuntimeInstallCard> {
+    await this.discover();
+    if (this.detected.some(row => row.runtimeId === runtimeId && inspectLocalRuntime(row.path))) throw new Error("A local installation is already available; confirm registration instead of downloading");
     for (const [id, proposal] of this.proposals) if (Date.parse(proposal.card.expiresAt) <= Date.now()) this.proposals.delete(id);
     if (this.closed || !optionalRuntimeId(runtimeId) || this.proposals.size + this.metadata.size >= 16) return fail(); assertCurrent();
     const controller = new AbortController(); this.metadata.add(controller);
@@ -185,8 +229,16 @@ export class WorkspaceRuntimeInstaller {
     } catch { operation.state = operation.controller.signal.aborted ? "cancelled" : "failed"; }
   }
   list() {
-    const value = this.state.read();
+    const value = this.state.read(), locals = this.locals.read();
     return { revision: value.revision, builtIn: "pi", options: OPTIONAL_RUNTIMES.map(runtimeId => {
+      const local = locals.entries.find(row => row.runtimeId === runtimeId), detected = this.detected.find(row => row.runtimeId === runtimeId);
+      if (local || detected) {
+        const selected = local ?? detected!, inspected = inspectLocalRuntime(selected.path);
+        const valid = Boolean(inspected && inspected.realPath === selected.realPath && inspected.fingerprint === selected.fingerprint);
+        return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: valid, registered: Boolean(local && valid), version: selected.version,
+          path: selected.path, fingerprint: valid ? selected.fingerprint : null, source: selected.source,
+          generalAgentDriverAvailable: false, state: valid ? local ? "local_registered" : "detected" : "integrity_failed" };
+      }
       const installed = value.entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
       let verified = false; if (installed) try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* tampering revokes use, never repair or fallback */ }
       return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: verified, registered: verified, version: installed?.artifact.version ?? null,

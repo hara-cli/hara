@@ -12,12 +12,13 @@ import { WebSocket } from "ws";
 import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { startLocalWorkspaceServe } from "../dist/serve/local-workspace.js";
 import { createWorkspaceSyntheticProvider, SYNTHETIC_CONNECTION } from "../dist/workspace/synthetic-provider.js";
+import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
 const temporary = [];
 function dir() { const path = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-production-entry-"))); temporary.push(path); return path; }
 after(() => { for (const path of temporary) fs.rmSync(path, { recursive: true, force: true }); });
 async function until(check) { const deadline = Date.now() + 5000; while (Date.now() < deadline) { const value = check(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 10)); } throw new Error("Formal fixture did not settle"); }
 test("formal six-step Host flow uses an explicit mock Provider; no DEV flags, lab markers or key-lane inheritance", async () => {
-  const root = dir(), options = { mode: "workspace", providerFactory: createWorkspaceSyntheticProvider }, host = new LocalWorkspaceHost(root, options);
+  const root = dir(), options = { mode: "workspace", credentialVault: new MemoryCredentialVault(), providerFactory: createWorkspaceSyntheticProvider }, host = new LocalWorkspaceHost(root, options);
   let restored;
   try {
     assert.equal(host.list().executionMode, "workspace"); assert.equal(host.list().syntheticOnly, false);
@@ -64,7 +65,7 @@ test("formal default factory sends exactly the scoped fake credential/model to a
   const server = createServer(async (request, response) => { let raw = ""; for await (const bytes of request) raw += bytes; received.push({ auth: request.headers.authorization, body: JSON.parse(raw), url: request.url });
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.end(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: "Local mock received" }, finish_reason: "stop" }], usage: { prompt_tokens: 50, completion_tokens: 5 } })}\n\ndata: [DONE]\n\n`); });
-  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve)); const root = dir(), host = new LocalWorkspaceHost(root, { mode: "workspace" });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve)); const root = dir(), host = new LocalWorkspaceHost(root, { mode: "workspace", credentialVault: new MemoryCredentialVault() });
   try {
     const workspace = host.createWorkspace("Mock", host.list().revision);
     host.configureConnection(workspace.workspaceId, { label: "Mock only", provider: "openai", baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: "local-fake-workspace-credential", defaultModel: "local-mock-model" }, 0);

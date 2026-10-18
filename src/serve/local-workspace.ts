@@ -7,13 +7,14 @@ import { bindPrivateHaraStateFile, readPrivateStateFileSnapshotSync, removePriva
 import type { ServeHandle, ServeOpts } from "./server.js";
 import { workspaceRequestSource } from "../workspace/request-journal.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
+import type { CredentialVault } from "../workspace/credential-vault.js";
 
 const CAPABILITY = "workspace.local-dev.v2";
 function tokenMatches(actual: unknown, expected: string): boolean {
   if (typeof actual !== "string" || !/^[a-f0-9]{64}$/.test(actual) || actual.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
 }
-export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1] }): Promise<ServeHandle> {
+export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; hostHome?: string; credentialVault?: CredentialVault; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1] }): Promise<ServeHandle> {
   if (opts.host !== "127.0.0.1" || !Number.isSafeInteger(opts.port) || opts.port < 0 || opts.port > 65535) throw new Error("Workspace Dev listens only on explicit IPv4 loopback");
   const token = opts.token ?? randomBytes(32).toString("hex");
   if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("invalid Workspace Dev transport token");
@@ -21,7 +22,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
   const clients = new Map<WebSocket, { id: string; initialized: boolean }>();
   let closing = false;
   const capability = input.mode === "workspace" ? "workspace.v1" : CAPABILITY;
-  const host = new LocalWorkspaceHost(input.root, { mode: input.mode, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, runtimeInstallerOptions: input.runtimeInstallerOptions, onChange(event) {
+  const host = new LocalWorkspaceHost(input.root, { mode: input.mode, hostHome: input.hostHome, credentialVault: input.credentialVault, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, runtimeInstallerOptions: input.runtimeInstallerOptions, onChange(event) {
     for (const [client, state] of clients) if (state.initialized && client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ jsonrpc: "2.0", method: "workspace.changed", params: event }));
   } });
   const wss = new WebSocketServer({ host: opts.host, port: opts.port, maxPayload: 128 * 1024,
@@ -60,11 +61,20 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
     if (method === "workspace.list") { fields([]); return host.list(); }
     if (method === "workspace.create") { fields(["label", "expectedRevision"]); if (!text(params.label, 80) || !positive(params.expectedRevision)) throw new Error("invalid Workspace creation"); return host.createWorkspace(params.label, params.expectedRevision); }
+    if (method === "workspace.preferences.get") { fields([]); return host.getPreferences(); }
+    if (method === "workspace.preferences.set") { fields(["theme", "expectedRevision"]); return host.setPreferences(params.theme, params.expectedRevision as number); }
     const workspaceId = params.workspaceId;
     if (!text(workspaceId)) throw new Error("Workspace must be explicit");
     if (method === "workspace.select") { fields(["workspaceId", "expectedRevision"]); if (!positive(params.expectedRevision)) throw new Error("invalid Workspace selection"); host.select(client.id, workspaceId, params.expectedRevision); return host.snapshot(workspaceId, undefined, client.id); }
     if (method === "workspace.snapshot") { fields(["workspaceId", "agentId"]); if (params.agentId !== null && !text(params.agentId)) throw new Error("invalid Agent selection"); return host.snapshot(workspaceId, typeof params.agentId === "string" ? params.agentId : undefined, client.id); }
     host.assertGeneration(workspaceId, params.expectedGeneration);
+    if (method === "workspace.features.list") { fields(["workspaceId", "expectedGeneration"]); return host.workspaceFeatures(workspaceId); }
+    if (method === "workspace.features.update") { fields(["workspaceId", "expectedGeneration", "kind", "id", "enabled", "expectedRevision", ...(Object.hasOwn(params, "version") ? ["version"] : [])]); return host.updateFeature(workspaceId, params.kind, params.id, params.enabled, params.expectedRevision as number, params.version); }
+    if (method === "workspace.skill.read") { fields(["workspaceId", "expectedGeneration", "id"]); if (!text(params.id)) throw new Error("Invalid skill"); return host.workspaceSkill(workspaceId, params.id); }
+    if (method === "workspace.skill.fork") { fields(["workspaceId", "expectedGeneration", "id", "content", "approved", "expectedRevision"]); if (!text(params.id) || params.approved !== true) throw new Error("Private skill fork requires confirmation"); return host.forkWorkspaceSkill(workspaceId, params.id, params.content, params.expectedRevision as number); }
+    if (method === "workspace.runtime.detect") { fields(["workspaceId", "expectedGeneration"]); await host.detectRuntimes(workspaceId); host.assertGeneration(workspaceId, params.expectedGeneration); return host.snapshot(workspaceId, undefined, client.id).runtimes; }
+    if (method === "workspace.runtime.registerLocal") { fields(["workspaceId", "expectedGeneration", "runtimeId", "fingerprint", "approved"]);
+      if (params.approved !== true) throw new Error("Explicit local runtime approval required"); host.registerLocalRuntime(workspaceId, params.runtimeId, params.fingerprint); return { registered: true }; }
     if (method === "workspace.runtime.propose") { fields(["workspaceId", "expectedGeneration", "runtimeId"]); return host.proposeRuntime(client.id, workspaceId, params.runtimeId); }
     if (method === "workspace.runtime.approve") { fields(["workspaceId", "expectedGeneration", "proposalId", "approved"]);
       if (typeof params.proposalId !== "string" || !UUID.test(params.proposalId) || typeof params.approved !== "boolean") throw new Error("invalid runtime approval");
@@ -76,6 +86,12 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (method === "workspace.connection.synthetic") { fields(["workspaceId", "expectedGeneration", "expectedRevision"]); if (!Number.isSafeInteger(params.expectedRevision) || Number(params.expectedRevision) < 0) throw new Error("invalid connection revision"); host.configureSynthetic(workspaceId, params.expectedRevision as number); return host.snapshot(workspaceId, undefined, client.id); }
     if (method === "workspace.connection.approved") { fields(["workspaceId", "expectedGeneration", "expectedRevision"]); if (!Number.isSafeInteger(params.expectedRevision) || Number(params.expectedRevision) < 0) throw new Error("invalid connection revision"); host.configureApprovedConnection(workspaceId, params.expectedRevision as number); return host.snapshot(workspaceId, undefined, client.id); }
     if (method === "workspace.connection.add") { fields(["workspaceId", "expectedGeneration", "input", "expectedRevision"]); host.configureConnection(workspaceId, params.input, params.expectedRevision as number); return { configured: true }; }
+    if (method === "workspace.connection.legacy") { fields(["workspaceId", "expectedGeneration"]); return host.legacyConnections(workspaceId); }
+    if (method === "workspace.connection.import") { fields(["workspaceId", "expectedGeneration", "sourceId", "approved", "expectedRevision"]); if (typeof params.sourceId !== "string" || typeof params.approved !== "boolean") throw new Error("Invalid import approval"); host.importConnection(workspaceId, params.sourceId, params.expectedRevision as number, params.approved); return { imported: true }; }
+    if (method === "workspace.connection.edit") { fields(["workspaceId", "expectedGeneration", "connectionId", "input", "expectedRevision"]); if (typeof params.connectionId !== "string") throw new Error("Invalid connection"); host.editConnection(workspaceId, params.connectionId, params.input, params.expectedRevision as number); return { edited: true }; }
+    if (method === "workspace.connection.select") { fields(["workspaceId", "expectedGeneration", "connectionId", "expectedRevision"]); if (typeof params.connectionId !== "string") throw new Error("Invalid connection"); host.selectConnection(workspaceId, params.connectionId, params.expectedRevision as number); return { selected: true }; }
+    if (method === "workspace.connection.delete") { fields(["workspaceId", "expectedGeneration", "connectionId", "expectedRevision", "approved"]); if (params.approved !== true || typeof params.connectionId !== "string") throw new Error("Explicit connection deletion approval required"); host.revokeConnection(workspaceId, params.connectionId, params.expectedRevision as number); return { deleted: true }; }
+    if (method === "workspace.connection.cleanup") { fields(["workspaceId", "expectedGeneration", "connectionId", "expectedRevision", "approved"]); if (params.approved !== true || typeof params.connectionId !== "string") throw new Error("Explicit credential cleanup approval required"); host.cleanupCredentials(workspaceId, params.connectionId, params.expectedRevision as number); return { cleaned: true }; }
     if (method === "workspace.connection.revoke") { fields(["workspaceId", "expectedGeneration", "connectionId", "expectedRevision"]); if (!text(params.connectionId)) throw new Error("invalid connection"); host.revokeConnection(workspaceId, params.connectionId, params.expectedRevision as number); return { revoked: true }; }
     if (method === "workspace.approval.respond") { fields(["workspaceId", "expectedGeneration", "approvalId", "approved"]); if (!text(params.approvalId) || typeof params.approved !== "boolean") throw new Error("invalid approval"); host.answerApproval(client.id, workspaceId, params.approvalId, params.approved); return { accepted: true }; }
     if (method === "workspace.session.send" || method === "workspace.session.resume") {

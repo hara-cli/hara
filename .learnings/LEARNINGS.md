@@ -1,5 +1,29 @@
 # Learnings
 
+## [LRN-20261018-STABLE-WORKSPACE-SETTINGS] Stable storage, explicit import and version-locked skills
+
+**Logged**: 2026-10-18
+**Priority**: high
+**Status**: implemented on isolated fix branch; not released
+**Area**: workspace
+
+- A GUI's short launchd PATH and private SDK HOME are different boundaries. Pass trusted host Home
+  separately for bounded discovery/import; never reuse it as a runtime's credential/config Home.
+- Hara already stores Workspace resources under a bundle-independent root. Missing legacy connections
+  came from intentional scope isolation without an import path, not evidence that bundle-id data vanished.
+  Preview metadata only; require an explicit copy into the current scope; keep generations frozen per run.
+- Fixed-service Keychain refs belong to scope/connection/generation. Rotate/revoke metadata before cleanup;
+  persist pending removals so denial/crash is explicitly retryable without reviving an old binding.
+- Schema migrations must back up recoverable, keyRef-only metadata before replacing a plaintext source.
+  Unknown future schemas and backup recovery are read-only; a backup must not resurrect deleted keys.
+- A global skill is versioned source material, not authority. Pin a verified text bundle per Workspace;
+  private edits fork it. Pi reads only enabled locked copies, via supplied tools and the original scope.
+  A skill's allowed-tools policy narrows execution, including same-round batched calls; it never widens it.
+- Cron inventory is read-only evidence. Fixture migration/receipt and unchanged real scheduler state are
+  separate from an approved live cutover. Never label an empty scoped list as absence of old schedules.
+
+---
+
 ## [LRN-20261018-WIP-EXECUTION-RULES] best_practice
 
 **Logged**: 2026-10-18

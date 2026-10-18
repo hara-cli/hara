@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstatSync } from "node:fs";
+import { join } from "node:path";
 import { runConfiguredAgent } from "../agent-runtime/dispatch.js";
 import { continueTaskExecution, createTaskExecution, finishTaskExecution, type TaskExecution } from "../session/task.js";
 import type { RunOpts, RunOutcome } from "../agent/loop.js";
@@ -9,7 +10,7 @@ import { redactSensitiveText } from "../security/secrets.js";
 import { ensurePrivateStateSubdirectory } from "../security/private-state.js";
 import { LocalWorkspaceCatalog } from "./local-catalog.js";
 import { WorkspaceResources } from "./resources.js";
-import { currentWorkspaceResourceBinding, WorkspaceResourceStorage } from "./resource-context.js";
+import { currentWorkspaceResourceBinding, workspaceStateHome, WorkspaceResourceStorage } from "./resource-context.js";
 import { WorkspaceConnectionStoreV2, type ScopedConnection, type ScopedRunConnection } from "./scoped-connections.js";
 import { closedWorkspaceHistory, WorkspaceConversationStore, type WorkspaceConversation, type WorkspaceUsage } from "./conversations.js";
 import { WorkspaceSessionLease } from "./session-lease.js";
@@ -28,9 +29,15 @@ import { WorkspaceContextAudit } from "./context-audit.js";
 import { boundWorkspaceText } from "./model-context.js";
 import { createWorkspaceProvider } from "./provider.js";
 import { WorkspaceRuntimeInstaller, optionalRuntimeId } from "./runtime-install.js";
+import { WorkspaceSecureConnections } from "./secure-connections.js";
+import { MacKeychainCredentialVault, type CredentialVault } from "./credential-vault.js";
+import { LegacyConnectionCatalog } from "./legacy-connections.js";
+import { WorkspacePreferences } from "./preferences.js";
+import { WorkspaceFeatures } from "./features.js";
+import { workspaceSkillTool } from "./skills.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
-interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller }
+interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; features: WorkspaceFeatures }
 export interface LocalWorkspaceApproval {
   id: string; workspaceId: string; agentId: string; runId: string; expiresAt: string;
   resourceGeneration: string;
@@ -60,8 +67,13 @@ export class LocalWorkspaceHost {
   private readonly clients = new Map<string, { workspaceId: string | null; agentId: string | null; epoch: number }>();
   private closing = false;
   private readonly realKey?: WorkspaceRealKeyLane;
+  private readonly vault: CredentialVault;
+  private readonly legacy?: LegacyConnectionCatalog;
+  private readonly preferences: WorkspacePreferences;
   constructor(root: string, private readonly options: {
     mode?: "workspace";
+    hostHome?: string;
+    credentialVault?: CredentialVault;
     runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1];
     providerFactory?: LocalWorkspaceProviderFactory;
     realKeyFile?: string;
@@ -72,6 +84,10 @@ export class LocalWorkspaceHost {
     if (options.mode && (options.realKeyFile || options.realKeySlice)) throw new Error("Workspace mode cannot inherit an acceptance Key lane");
     const opened = openLocalWorkspaceDevRoot(root, options.mode ?? "synthetic"); this.root = opened.root; this.home = opened.home; this.project = opened.project;
     this.catalog = new LocalWorkspaceCatalog(this.home);
+    const unavailable = () => { throw new Error("Host OS credential vault is unavailable; no plaintext fallback"); };
+    this.vault = options.credentialVault ?? (options.hostHome ? new MacKeychainCredentialVault(options.hostHome) : { get: unavailable, set: unavailable, remove: unavailable });
+    if (options.mode === "workspace" && options.hostHome) this.legacy = new LegacyConnectionCatalog(options.hostHome, this.vault);
+    this.preferences = new WorkspacePreferences(this.home, options.mode === "workspace" ? options.hostHome : undefined);
     if (options.realKeyFile) {
       if (options.providerFactory) throw new Error("Real-key acceptance cannot replace its trusted Provider factory");
       this.realKey = new WorkspaceRealKeyLane(this.root, options.realKeyFile, undefined, options.realKeySlice);
@@ -95,8 +111,10 @@ export class LocalWorkspaceHost {
     // The fixture project is workspace data too. Sharing the container root would let B observe
     // or reuse A's same-relative-path artifacts despite isolated chat/config/budget state.
     const project = storage.run(() => ensurePrivateStateSubdirectory(this.root, ["project", row.scope.workspaceId]).path);
-    const context = { storage, resources, connections: new WorkspaceConnectionStoreV2(storage), project,
-      runtimes: new WorkspaceRuntimeInstaller(storage, { ...this.options.runtimeInstallerOptions, onChange: () => this.changed(workspaceId) }) };
+    const context = { storage, resources, connections: this.options.mode === "workspace" ? new WorkspaceSecureConnections(storage, this.vault) : new WorkspaceConnectionStoreV2(storage), project,
+      features: new WorkspaceFeatures(storage, project, workspaceId, this.options.mode === "workspace" ? this.options.hostHome : undefined),
+      runtimes: new WorkspaceRuntimeInstaller(storage, { ...(this.options.hostHome ? { discovery: { home: this.options.hostHome, shell: process.env.HARA_WORKSPACE_HOST_SHELL } } : {}),
+        ...this.options.runtimeInstallerOptions, onChange: () => this.changed(workspaceId) }) };
     this.contexts.set(workspaceId, context); return context;
   }
   private changed(workspaceId: string, agentId?: string): void { this.options.onChange?.({ workspaceId, ...(agentId ? { agentId } : {}) }); }
@@ -144,6 +162,50 @@ export class LocalWorkspaceHost {
     return this.context(workspaceId).runtimes.approve(id, approved, clientId);
   }
   cancelRuntime(workspaceId: string, operationId: string): void { this.context(workspaceId).runtimes.cancel(operationId); }
+  async detectRuntimes(workspaceId: string): Promise<void> { await this.context(workspaceId).runtimes.discover(); }
+  registerLocalRuntime(workspaceId: string, runtimeId: unknown, fingerprint: unknown): void {
+    if (!optionalRuntimeId(runtimeId) || typeof fingerprint !== "string") throw new Error("Invalid local runtime registration");
+    this.context(workspaceId).runtimes.registerLocal(runtimeId, fingerprint); this.changed(workspaceId);
+  }
+  getPreferences() { const current = this.preferences.read(); if (!current.readOnly && current.revision === 0) this.preferences.save(current.theme, 0); return this.preferences.read(); }
+  setPreferences(theme: unknown, expected: number) { this.preferences.save(theme, expected); return this.preferences.read(); }
+  private connectionSource(workspaceId: string) { return this.context(workspaceId).storage.run(() => join(workspaceStateHome(), ".hara/workspace-connections-v2.json")); }
+  legacyConnections(workspaceId: string) { return this.legacy?.list(this.connectionSource(workspaceId)) ?? []; }
+  importConnection(workspaceId: string, id: string, expected: number, approved: boolean): void {
+    if (!approved || !this.legacy) throw new Error("Explicit old connection import approval required");
+    const store = this.context(workspaceId).connections;
+    if (!(store instanceof WorkspaceSecureConnections)) throw new Error("Import requires formal Workspace mode");
+    const source = this.legacy.resolve(id, this.connectionSource(workspaceId)); store.importConnection(source.input, expected, source.importId); this.changed(workspaceId);
+  }
+  editConnection(workspaceId: string, id: string, input: unknown, expected: number): void {
+    const store = this.context(workspaceId).connections;
+    if (!(store instanceof WorkspaceSecureConnections)) throw new Error("Secure connection editing requires Workspace mode");
+    try { store.edit(id, input, expected); }
+    finally { this.abortObsoleteConnectionRuns(workspaceId, id); this.changed(workspaceId); }
+  }
+  private abortObsoleteConnectionRuns(workspaceId: string, id: string) {
+    let row; try { row = this.context(workspaceId).connections.list().connections.find(item => item.id === id); } catch { /* Fail closed if metadata itself became unavailable. */ }
+    for (const job of this.jobs.values()) if (!job.closed && job.workspaceId === workspaceId && job.binding.connection.connectionId === id
+      && (!row || row.status !== "active" || row.revision !== job.binding.connection.connectionRevision || row.credentialGeneration !== job.binding.connection.credentialGeneration)) job.controller.abort();
+  }
+  cleanupCredentials(workspaceId: string, id: string, expected: number) {
+    const store = this.context(workspaceId).connections;
+    if (!(store instanceof WorkspaceSecureConnections)) throw new Error("Secure credential cleanup requires Workspace mode");
+    store.cleanupCredentials(id, expected); this.changed(workspaceId);
+  }
+  selectConnection(workspaceId: string, id: string, expected: number) { this.context(workspaceId).connections.select(id, expected); this.changed(workspaceId); }
+  workspaceFeatures(workspaceId: string) { return this.context(workspaceId).features.list(); }
+  updateFeature(workspaceId: string, kind: unknown, id: unknown, enabled: unknown, expected: number, version?: unknown) {
+    if (typeof id !== "string" || typeof enabled !== "boolean" || !["schedule", "skill"].includes(String(kind))) throw new Error("Invalid scoped feature change");
+    const features = this.context(workspaceId).features;
+    if (version !== undefined && (typeof version !== "string" || !/^[a-f0-9]{64}$/.test(version))) throw new Error("Invalid skill version");
+    if (kind === "skill") features.setSkillEnabled(id, enabled, expected, version as string | undefined); else features.setScheduleEnabled(id, enabled, expected);
+    this.changed(workspaceId); return features.list();
+  }
+  workspaceSkill(workspaceId: string, id: string) { return this.context(workspaceId).features.skillContent(id); }
+  forkWorkspaceSkill(workspaceId: string, id: string, content: unknown, expected: number) {
+    this.context(workspaceId).features.forkSkill(id, content, expected); this.changed(workspaceId); return this.workspaceFeatures(workspaceId);
+  }
   configureSynthetic(workspaceId: string, expectedRevision: number): void {
     if (this.realKey || this.options.mode === "workspace") throw new Error("Synthetic connections require the explicit isolated Lab");
     this.context(workspaceId).connections.add({ ...SYNTHETIC_CONNECTION }, expectedRevision); this.changed(workspaceId);
@@ -159,9 +221,8 @@ export class LocalWorkspaceHost {
     this.changed(workspaceId);
   }
   revokeConnection(workspaceId: string, connectionId: string, expectedRevision: number): void {
-    this.context(workspaceId).connections.revoke(connectionId, expectedRevision);
-    for (const job of this.jobs.values()) if (!job.closed && job.workspaceId === workspaceId && job.binding.connection.connectionId === connectionId) job.controller.abort();
-    this.changed(workspaceId);
+    try { this.context(workspaceId).connections.revoke(connectionId, expectedRevision); }
+    finally { this.abortObsoleteConnectionRuns(workspaceId, connectionId); this.changed(workspaceId); }
   }
   snapshot(workspaceId: string, agentId?: string, clientId?: string) {
     const row = this.catalog.resolve(workspaceId), context = this.context(workspaceId), catalog = context.resources.agents.list();
@@ -235,7 +296,9 @@ export class LocalWorkspaceHost {
   }
   private jobTools(job: LocalJob, agent: WorkspaceAgentView): Tool[] {
     const assertCurrent = () => { assertWorkspaceRunAdmission(job.permit, job.options!, "pi"); };
-    const tools = [...localWorkspaceFileTools(job.context.project, assertCurrent), job.receipts!.tool()];
+    const bundles = job.context.features.enabledSkills();
+    const tools = [...localWorkspaceFileTools(job.context.project, assertCurrent), job.receipts!.tool(),
+      ...(bundles.length ? [workspaceSkillTool(bundles, (id, version) => { assertCurrent(); job.context.features.assertSkill(id, version); })] : [])];
     if (agent.kind !== "main") return withWorkspaceToolReceipts(tools);
     tools.push({ name: "agent_list", description: "Read the active colleagues of THIS Workspace only. Check existing names/IDs before creating or delegating; never recreate an already active colleague to repair a completion citation.", kind: "read",
       input_schema: { type: "object", properties: {} }, async run(input) {
@@ -380,6 +443,7 @@ export class LocalWorkspaceHost {
           + `agent_create returns only AFTER the human has approved; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. Check agent_list before creating so an active colleague is not duplicated.\n`
           + `Successful Workspace tool results repeat the exact citation ID in receipt.toolCallId. Copy that exact value for completion.checks; never invent IDs or repeat side effects to fix a rejected citation. After restart, re-observe state with read-only tools and cite the new receipt.\n`
           + `Current authorized colleagues (bounded preview; use agent_list if needed): ${boundWorkspaceText(JSON.stringify(context.resources.agents.list().agents.map(item => ({ agentId: item.agentId, name: item.identity.displayName, kind: item.kind }))), 2000)}.\n`
+          + `Enabled version-locked Workspace skills (load every page of instructions via workspace_skill before acting; no extra permissions): ${boundWorkspaceText(JSON.stringify(context.features.enabledSkills().map(item => ({ id: item.id, description: item.description, version: item.version }))), 1200)}.\n`
           + `For file tasks read first; write only if necessary, then workspace_verify. End accepted tasks with task_checkpoint completion and observed tool_call_ids, not a prose-only claim.`,
         continuationSession: false, // Workspace recovery has its own bounded, fresh-observation wake brief.
         taskIntake: { task, current: () => owned.value.task!, onUpdate: next => { owned.value.task = next; },

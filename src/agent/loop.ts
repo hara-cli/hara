@@ -2898,7 +2898,7 @@ async function runAgentInner(
     }
     // Loading instructions and changing their execution authority is one transaction boundary. Do not let a
     // provider batch work beside `skill` using the wider schema it saw before the allowlist became active.
-    const skillPolicyTransitionInRound = r.toolUses.some((tu) => tu.name === "skill");
+    const skillPolicyTransitionInRound = r.toolUses.some((tu) => tu.name === "skill" || tu.name === "workspace_skill");
     for (const tu of r.toolUses) {
       if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return finalizeStoppedToolRound();
       if (breakerHalt) {
@@ -2917,7 +2917,7 @@ async function runAgentInner(
         });
         continue;
       }
-      if (skillPolicyTransitionInRound && tu.name !== "skill") {
+      if (skillPolicyTransitionInRound && tu.name !== "skill" && tu.name !== "workspace_skill") {
         plans.push({
           tu,
           tool: resolveTool(tu.name),

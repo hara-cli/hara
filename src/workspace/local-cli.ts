@@ -4,6 +4,7 @@ import { LocalWorkspaceHost } from "./local-host.js";
 import { messageBody, text } from "./local-state.js";
 import { ARK_CONTEXT_TRIM_SLICE } from "./real-key-provider.js";
 import { WorkspaceBudgetAdmissionError } from "./tree-budget.js";
+import { homedir } from "node:os";
 
 /** Real CLI entry for the explicitly opted-in synthetic local Workspace lane. No legacy boot/config. */
 export async function mainLocalWorkspaceCli(args: string[], mode?: "workspace"): Promise<void> {
@@ -28,13 +29,13 @@ export async function mainLocalWorkspaceCli(args: string[], mode?: "workspace"):
     const port = Number(values.get("--port") ?? 0);
     const handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port, cwd: root,
       ...(process.env.HARA_WORKSPACE_DEV_TOKEN ? { token: process.env.HARA_WORKSPACE_DEV_TOKEN } : {}) },
-      { root, mode, realKeyFile: values.get("--ark-key-file"), realKeySlice: slice, version: "0.187.1", allowedOrigins: ["http://127.0.0.1:1437", "http://localhost:1437", "http://localhost:1420", "http://127.0.0.1:1420"] });
+      { root, mode, ...(mode ? { hostHome: process.env.HARA_WORKSPACE_HOST_HOME ?? homedir() } : {}), realKeyFile: values.get("--ark-key-file"), realKeySlice: slice, version: "0.187.1", allowedOrigins: ["http://127.0.0.1:1437", "http://localhost:1437", "http://localhost:1420", "http://127.0.0.1:1420"] });
     console.log(JSON.stringify({ type: mode ? "workspace-ready" : "workspace-dev-ready", protocol: 1, capability: mode ? "workspace.v1" : "workspace.local-dev.v2", port: handle.port, syntheticOnly: !mode && !values.has("--ark-key-file") }));
     let stopping = false;
     const stop = () => { if (stopping) return; stopping = true; void handle.close().catch(() => { process.exitCode = 1; }); };
     process.once("SIGTERM", stop); process.once("SIGINT", stop); return;
   }
-  const host = new LocalWorkspaceHost(root, { mode, interactiveApprovals: false, realKeyFile: values.get("--ark-key-file"), realKeySlice: slice });
+  const host = new LocalWorkspaceHost(root, { mode, ...(mode ? { hostHome: process.env.HARA_WORKSPACE_HOST_HOME ?? homedir() } : {}), interactiveApprovals: false, realKeyFile: values.get("--ark-key-file"), realKeySlice: slice });
   try {
     if (command === "init" || command === "status") { console.log(JSON.stringify(host.list())); return; }
     const workspaceId = values.get("--workspace"), agentId = values.get("--agent"), message = values.get("--message");

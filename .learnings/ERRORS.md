@@ -1,5 +1,27 @@
 # Errors
 
+## [ERR-20261018-SETTINGS-FIXTURE-ENV] Fresh HOME and actual loopback capability are test preconditions
+
+**Logged**: 2026-10-18
+**Priority**: medium
+**Status**: resolved for this slice
+**Area**: tests
+
+- Workspace parent is not a Git repository: run repo commands from the exact independently verified
+  worktree. A failed parent status command does not establish that a product tree is dirty or missing.
+- Restricted loopback made Pi's local host bridge fail before any fake Provider call; Desktop's 21 proxy
+  tests failed for the same EPERM. Preserve the red logs, rerun the unchanged authorized synthetic suite
+  with loopback permission, not larger timeouts or weakened assertions. No paid request was made.
+- Reusing the same synthetic HOME left `legacy-only-key` from the first suite; addProfile correctly
+  rejected it on the second run. Use a new private HOME per verification, not repeated reruns for green.
+- An 80ms fixture version-command budget was scheduling-sensitive under concurrent fsync. Inject version
+  responses for source-order tests; test actual process-group timeout/exit separately. Production bounds
+  were not lengthened. The shared redactor returns `{text, redactions}`, not a string; consume `.text`.
+
+Retained evidence: `/private/tmp/hara-runtime-connections-20261018.jOD1Cw/`.
+
+---
+
 ## [ERR-20261018-WIP-VERIFICATION-RULES] Preserve useful verification lessons without importing stale acceptance states
 
 **Logged**: 2026-10-18
