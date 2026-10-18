@@ -1,5 +1,44 @@
 # Learnings
 
+## [LRN-20261018-WIP-EXECUTION-RULES] best_practice
+
+**Logged**: 2026-10-18
+**Priority**: high
+**Status**: resolved
+**Area**: architecture
+
+### Summary
+
+Carry useful main-WIP execution lessons into the Workspace branch as bounded rules, not another
+prompt or executor. Full originals remain at `wip/main-backup-20261018` / `864ef3a`.
+
+### Retained rules
+
+1. Acceptance is based on fresh, task-scoped tool/artifact receipts. Failed, unknown, bookkeeping,
+   duplicate or stale evidence cannot close a task; a public prompting talk is not runtime authority.
+2. An accepted completion receipt may produce a bounded human closeout without another paid model
+   turn. Keep unfinished human dependencies and authoritative state visible; final prose is not
+   proof that an upload, message or deployment actually completed.
+3. Measure parent-loop round trips, input reuse and whole delegation-tree cost before adding engines.
+   Historical 87% latency observations are measurements of their original corpus, not a current SLO.
+4. Native question support is not parent-chat input wiring. Preserve the exact worker/provider,
+   canonical worktree, frozen task/session lineage, single writer, original consent and input lease;
+   UI reconnect must not upgrade authority or duplicate a child card.
+5. Reuse one progress/budget decision across compatible adapters while preserving distinct task,
+   turn and native-session lifetimes. Hiding execution UI alone does not reduce model consumption.
+6. Bun Windows `B:/~BUN/...` and POSIX virtual entry forms require real compiled-platform checks.
+   Local source execution cannot establish Windows bootstrap or installed-package correctness.
+
+### Sources
+
+Main-WIP entries `LRN-20261010-ACCEPTANCE-SOURCES`, `LRN-20261008-FB1521-RECEIPT-ONLY-FINALIZATION`,
+`LRN-20261005-AGENT-LATENCY-IS-ROOT-LOOP-ROUNDS`, `LRN-20261008-STRUCTURED-WORKER-INPUT`,
+`LRN-20261009-TASK-CLOSEOUT`, `LRN-20261009-RUNTIME-CONSOLIDATION` and the Windows virtual-entry
+record. Dated candidate/test/publication states remain historical on the backup; no live Key call,
+new runtime implementation or current release acceptance is implied by this consolidation.
+
+---
+
 ## [LRN-20260828-EXTERNAL-SESSIONS-ONE-AUTHORITY] best_practice
 
 **Logged**: 2026-08-28T00:00:00+08:00

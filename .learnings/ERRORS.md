@@ -1,5 +1,51 @@
 # Errors
 
+## [ERR-20261018-WIP-VERIFICATION-RULES] Preserve useful verification lessons without importing stale acceptance states
+
+**Logged**: 2026-10-18
+**Priority**: high
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+Jeff approved reviewing main WIP before Workspace v1 integration. The original two files are preserved
+byte-for-byte in local branch `wip/main-backup-20261018`, commit
+`864ef3a412542febd427fc644786042e1da3ed3f`. Retain these deduplicated lessons from that history;
+old per-version outcomes, private evidence paths and unresolved historical reports are not new gates.
+
+### Retained rules
+
+- Investigate/read-only intent must not be rewritten to bypass the understanding gate. A composition
+  classified as execution or a missing chat recovery tool is a real capability gap, not permission to
+  modify history or claim that dismissal removed the underlying Agent.
+- Distinguish restricted loopback, Keychain and process-inspection failures from product defects or
+  missing credentials. Retry only the same authorized operation in its approved environment; no
+  account/backend substitution, permission expansion, guessed service or hidden test omission.
+- Fixture readiness needs observable first-request/PID/card handshakes. Create private HOME before
+  imports; publish fixture JSON by same-directory atomic rename. A cancelled caller must be checked
+  again around asynchronous admission; cancel its owned transport/worker, not an independent target.
+- Parent/root ownership, live input leases, session identity and original card deadlines remain exact
+  across delegation and recovery. No replay or fresh command after an uncertain external delivery.
+- Measure provider calls per accepted request. Repeated cumulative SSE usage is not a second call;
+  SDK setup failures and contaminated trials are not valid engine-capability comparisons.
+- Validate compiled ESM/standalone entry points as well as typechecking; source-run success can miss
+  initialization cycles. Discover actual paths and match the candidate's exact patch preimage first.
+- Use the pinned Node/Bun/Rust, two distinct private npmrc paths, completed locked dependencies and
+  explicit candidate cwd. Preserve original timeout/assertions and first failures; no rerun-until-green.
+- A green local run is not cross-platform release evidence. Resolve actual workflow/job IDs, retain
+  failed immutable tags, independently verify registry/native/container publication and never infer
+  completion from a successful submission or polling timestamp.
+
+### Provenance and limits
+
+This consolidates the backup's gate-audit, delegated-input/cancellation, isolated-fixture, usage,
+compiled-entry and publication-readback records (2026-10-01 through 2026-10-12). Original error bodies
+and historical statuses remain on the permanent backup branch; no old status was overwritten or
+promoted to a v1 acceptance claim. Runtime/tool policy is unchanged.
+
+---
+
 ## [ERR-20261017-LOCAL-PROJECT-ISOLATION] Workspace artifacts need distinct project roots
 
 **Logged**: 2026-10-17
