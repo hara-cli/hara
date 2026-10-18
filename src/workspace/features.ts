@@ -8,10 +8,10 @@ import { WorkspaceSkillLibrary, forkWorkspaceSkill, validateWorkspaceSkill, type
 import { parseCron, type Schedule } from "../cron/schedule.js";
 import { redactSensitiveText } from "../security/secrets.js";
 
-interface WorkspaceSchedule { id: string; name: string; schedule: Schedule; enabled: boolean; workspaceId: string; migrationId: string; source: string; definition: Record<string, unknown> }
+export interface WorkspaceSchedule { id: string; name: string; schedule: Schedule; enabled: boolean; workspaceId: string; migrationId: string; source: string; definition: Record<string, unknown> }
 interface FeatureState { resourceBinding: WorkspaceResourceBinding; revision: number; schedules: WorkspaceSchedule[]; disabledSkills: string[]; skills: WorkspaceSkillBundle[] }
 const safe = (value: string) => redactSensitiveText(value).text;
-function validSchedule(value: any): value is Schedule {
+export function validWorkspaceSchedule(value: any): value is Schedule {
   return plain(value) && (value.kind === "cron" && typeof value.expr === "string" && Boolean(parseCron(value.expr))
     || value.kind === "every" && Number.isSafeInteger(value.everyMs) && Number(value.everyMs) > 0 && typeof value.display === "string"
     || value.kind === "once" && typeof value.runAt === "number" && Number.isFinite(value.runAt) && typeof value.display === "string");
@@ -24,7 +24,7 @@ export class WorkspaceFeatures {
     this.state = new WorkspaceJsonState(storage, "workspace-features-v1.json", raw => {
       if (!plain(raw) || !sameWorkspaceResourceBinding(raw.resourceBinding as WorkspaceResourceBinding, this.state.binding()) || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 1
         || !Array.isArray(raw.schedules) || raw.schedules.length > 4096 || !Array.isArray(raw.disabledSkills) || raw.disabledSkills.some(id => !text(id))) throw new Error("Invalid workspace feature settings");
-      for (const item of raw.schedules) if (!plain(item) || item.workspaceId !== workspaceId || !text(item.id) || !text(item.name, 256) || !validSchedule(item.schedule)
+      for (const item of raw.schedules) if (!plain(item) || item.workspaceId !== workspaceId || !text(item.id) || !text(item.name, 256) || !validWorkspaceSchedule(item.schedule)
         || typeof item.enabled !== "boolean" || typeof item.migrationId !== "string" || typeof item.source !== "string" || !plain(item.definition)) throw new Error("Invalid scoped schedule");
       const skills = raw.skills === undefined ? [] : Array.isArray(raw.skills) && raw.skills.length <= 128 ? raw.skills.map(validateWorkspaceSkill) : null;
       if (!skills || new Set(skills.map(row => row.id)).size !== skills.length) throw new Error("Invalid skill locks");
@@ -42,6 +42,23 @@ export class WorkspaceFeatures {
   }
   setScheduleEnabled(id: string, enabled: boolean, expected: number) {
     this.state.update(expected, current => { const row = current.schedules.find(row => row.id === id); if (!row) throw new Error("Scoped schedule unavailable"); row.enabled = enabled; return current; });
+  }
+  schedules(): WorkspaceSchedule[] { return this.state.read().schedules; }
+  saveSchedule(input: unknown, expected: number) {
+    if (!plain(input) || !text(input.id) || !text(input.name, 256) || !validWorkspaceSchedule(input.schedule) || typeof input.enabled !== "boolean"
+      || !text(input.task, 8000) || typeof input.agentId !== "string" || redactSensitiveText(JSON.stringify(input)).redactions.length) throw new Error("Invalid scheduled task");
+    this.state.update(expected, current => {
+      const previous = current.schedules.find(row => row.id === input.id);
+      const row: WorkspaceSchedule = { id: input.id as string, name: input.name as string, enabled: input.enabled as boolean, schedule: structuredClone(input.schedule) as Schedule,
+        workspaceId: this.workspaceId, migrationId: previous?.migrationId ?? "", source: previous?.source ?? "workspace",
+        definition: { task: input.task, agentId: input.agentId, mode: "print", createdAt: previous?.definition.createdAt ?? Date.now() } };
+      return { ...current, schedules: [...current.schedules.filter(item => item.id !== row.id), row] };
+    });
+  }
+  deleteSchedule(id: string, expected: number) { this.state.update(expected, current => ({ ...current, schedules: current.schedules.filter(row => row.id !== id) })); }
+  removeMigration(ids: readonly string[]) {
+    const current = this.state.read(); if (!current.schedules.some(row => ids.includes(row.migrationId))) return;
+    this.state.update(current.revision, value => ({ ...value, schedules: value.schedules.filter(row => !ids.includes(row.migrationId)) }));
   }
   setSkillEnabled(id: string, enabled: boolean, expected: number, version?: string) {
     const state = this.state.read(), pinned = state.skills.find(row => row.id === id), candidate = this.library.candidates(this.project).find(row => row.id === id);
@@ -61,6 +78,7 @@ export class WorkspaceFeatures {
   /** Offline migration only, deliberately not exposed to RPC/startup or a scheduler. */
   importLegacy(rows: WorkspaceSchedule[]) {
     const state = this.state.read(), fresh = rows.filter(row => row.workspaceId === this.workspaceId && !state.schedules.some(old => old.migrationId === row.migrationId));
+    if (fresh.some(row => state.schedules.some(old => old.id === row.id)) || new Set(fresh.map(row => row.id)).size !== fresh.length) throw new Error("Schedule ID collision; original tasks preserved");
     if (fresh.length) this.state.update(state.revision, current => ({ ...current, schedules: [...current.schedules, ...fresh] }));
     return fresh.length;
   }
@@ -68,11 +86,12 @@ export class WorkspaceFeatures {
 export function planLegacySchedules(raw: unknown, personalWorkspaceId: string, source: string): { state: string; jobs: WorkspaceSchedule[] } {
   const rows = Array.isArray(raw) ? raw : plain(raw) && Array.isArray(raw.jobs) ? raw.jobs : null;
   if (!text(personalWorkspaceId) || !rows || rows.length > 4096) return { state: "invalid_source", jobs: [] };
-  const jobs: WorkspaceSchedule[] = [];
+  const jobs: WorkspaceSchedule[] = [], ids = new Set<string>();
   for (const row of rows) {
-    if (!plain(row) || !text(row.id) || !text(row.name, 256) || !validSchedule(row.schedule) || typeof row.enabled !== "boolean") return { state: "invalid_source", jobs: [] };
+    if (!plain(row) || !text(row.id) || !text(row.name, 256) || !validWorkspaceSchedule(row.schedule) || typeof row.enabled !== "boolean") return { state: "invalid_source", jobs: [] };
     if (redactSensitiveText(JSON.stringify(row)).redactions.length) return { state: "requires_secret_cleanup", jobs: [] };
     const workspaceId = text(row.workspaceId) ? row.workspaceId : text(row.workspace) ? row.workspace : personalWorkspaceId;
+    const identity = `${workspaceId}:${row.id}`; if (ids.has(identity)) return { state: "invalid_source", jobs: [] }; ids.add(identity);
     jobs.push({ id: row.id, name: row.name, schedule: structuredClone(row.schedule), enabled: row.enabled, workspaceId, source,
       migrationId: createHash("sha256").update(`${source}\0${row.id}`).digest("hex"), definition: structuredClone(row) });
   }

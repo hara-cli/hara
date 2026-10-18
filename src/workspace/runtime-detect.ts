@@ -65,7 +65,7 @@ export async function detectInstalledRuntimes(options: DetectionOptions): Promis
   for (const bin of bins) for (const id of ids) add(id, join(bin.path, id), bin.source);
   const npmPath = [...versions.map(v => join(options.home, ".nvm/versions/node", v, "bin/npm")), ...path.split(":").filter(safePath).map(p => join(p, "npm"))].find(p => { try { accessSync(p, constants.X_OK); return true; } catch { return false; } });
   const prefix = npmPath ? await run(npmPath, ["config", "get", "prefix"], { ...env, PATH: `${dirname(npmPath)}:${path}`,
-    npm_config_update_notifier: "false", NO_UPDATE_NOTIFIER: "1", npm_config_offline: "true" }, timeout) : null;
+    npm_config_update_notifier: "false", NO_UPDATE_NOTIFIER: "1", npm_config_offline: "true", npm_config_logs_max: "0" }, timeout) : null;
   const extras = [prefix && safePath(prefix.trim()) ? join(prefix.trim(), "bin") : "", join(options.home, ".npm-global/bin"), join(options.home, ".volta/bin"), join(options.home, ".bun/bin")];
   for (const bin of extras.filter(Boolean)) for (const id of ids) add(id, join(bin, id), "npm-or-user-toolchain");
   // Inherited PATH is still useful on CLI/Windows hosts, but never outranks explicit login/nvm sources.

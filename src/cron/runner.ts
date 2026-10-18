@@ -46,6 +46,7 @@ import {
 } from "../session/store.js";
 import { HARA_RUNTIME_VERSION } from "../version.js";
 import { RUNTIME_TIME_ZONE_ENV } from "../runtime-time.js";
+import { legacySchedulerGate } from "../workspace/schedule-migration.js";
 
 /** Jobs that are enabled AND due at `nowMs` (pure — for the tick and for testing). */
 export function dueJobs(jobs: CronJob[], nowMs: number): CronJob[] {
@@ -569,6 +570,7 @@ function capLog(log: string): void {
 /** Run one job's task in a fresh hara process (full-auto, no prompts), appending output to its log.
  *  Exported so `hara cron run <id>` can fire a job on demand, ignoring its schedule. */
 export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<CronRunResult> {
+  if (legacySchedulerGate() !== "enabled") return Promise.resolve({ ok: false, output: "", error: "Old scheduler handed off to Workspace or gate requires review; no work launched" });
   const occurrenceStartedAt = Date.now();
   let occurrenceSessionId: string | undefined;
   if (job.mode === "print") {
@@ -1084,6 +1086,7 @@ export async function runTick(
   run: CronJobRunner = runJobOnce,
   options: CronTickOptions = {},
 ): Promise<CronTickResult> {
+  if (legacySchedulerGate() !== "enabled") return { ran: [], stopped: "Old scheduler handed off to Workspace or gate requires review" };
   mkdirSync(cronDir(), { recursive: true, mode: 0o700 });
   try { chmodSync(cronDir(), 0o700); } catch { /* best effort */ }
   const lock = lockPath();
@@ -1177,6 +1180,7 @@ export async function runTick(
     const jobSkips: Array<{ id: string; code: CronSkipCode; reason: string }> = [];
     let stopped: string | undefined;
     for (const job of due) {
+      if (legacySchedulerGate() !== "enabled") return { ran: [], stopped: "Old scheduler handoff became active; no further work launched" };
       if (tickSignal.aborted) {
         stopped = tickDeadline.signal.aborted
           ? `tick watchdog timed out after ${tickTimeoutMs}ms`

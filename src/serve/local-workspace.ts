@@ -62,13 +62,20 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (method === "workspace.list") { fields([]); return host.list(); }
     if (method === "workspace.create") { fields(["label", "expectedRevision"]); if (!text(params.label, 80) || !positive(params.expectedRevision)) throw new Error("invalid Workspace creation"); return host.createWorkspace(params.label, params.expectedRevision); }
     if (method === "workspace.preferences.get") { fields([]); return host.getPreferences(); }
-    if (method === "workspace.preferences.set") { fields(["theme", "expectedRevision"]); return host.setPreferences(params.theme, params.expectedRevision as number); }
+    if (method === "workspace.preferences.set") { fields(["theme", "expectedRevision", ...["executionDetails", "collapseDetails", "updates"].filter(key => Object.hasOwn(params, key))]); return host.setPreferences(params.theme, params.expectedRevision as number, params); }
+    if (method === "workspace.activity") { fields([]); return host.activity(); }
+    if (method === "workspace.update.prepare") { fields(["approved"]); if (params.approved !== true) throw new Error("Explicit restart approval required"); return host.prepareUpdate(client.id); }
+    if (method === "workspace.update.release") { fields(["id"]); if (!text(params.id)) throw new Error("Invalid update lease"); host.releaseUpdate(client.id, params.id); return { released: true }; }
     const workspaceId = params.workspaceId;
     if (!text(workspaceId)) throw new Error("Workspace must be explicit");
-    if (method === "workspace.select") { fields(["workspaceId", "expectedRevision"]); if (!positive(params.expectedRevision)) throw new Error("invalid Workspace selection"); host.select(client.id, workspaceId, params.expectedRevision); return host.snapshot(workspaceId, undefined, client.id); }
+    if (method === "workspace.select" || method === "workspace.settings.select") { fields(["workspaceId", "expectedRevision"]); if (!positive(params.expectedRevision)) throw new Error("invalid Workspace selection"); host.select(client.id, workspaceId, params.expectedRevision, method === "workspace.settings.select"); return host.snapshot(workspaceId, undefined, client.id); }
     if (method === "workspace.snapshot") { fields(["workspaceId", "agentId"]); if (params.agentId !== null && !text(params.agentId)) throw new Error("invalid Agent selection"); return host.snapshot(workspaceId, typeof params.agentId === "string" ? params.agentId : undefined, client.id); }
     host.assertGeneration(workspaceId, params.expectedGeneration);
     if (method === "workspace.features.list") { fields(["workspaceId", "expectedGeneration"]); return host.workspaceFeatures(workspaceId); }
+    if (method === "workspace.tasks") { fields(["workspaceId", "expectedGeneration"]); return host.workspaceTasks(workspaceId); }
+    if (method === "workspace.schedule.save") { fields(["workspaceId", "expectedGeneration", "input", "expectedRevision", "approved"]); return host.saveSchedule(workspaceId, params.input, params.expectedRevision as number, params.approved === true); }
+    if (method === "workspace.schedule.delete") { fields(["workspaceId", "expectedGeneration", "id", "expectedRevision", "approved"]); if (!text(params.id)) throw new Error("Invalid schedule"); return host.deleteSchedule(workspaceId, params.id, params.expectedRevision as number, params.approved === true); }
+    if (method === "workspace.schedule.run") { fields(["workspaceId", "expectedGeneration", "id", "approved"]); if (!text(params.id)) throw new Error("Invalid schedule"); return host.runSchedule(workspaceId, params.id, params.approved === true); }
     if (method === "workspace.features.update") { fields(["workspaceId", "expectedGeneration", "kind", "id", "enabled", "expectedRevision", ...(Object.hasOwn(params, "version") ? ["version"] : [])]); return host.updateFeature(workspaceId, params.kind, params.id, params.enabled, params.expectedRevision as number, params.version); }
     if (method === "workspace.skill.read") { fields(["workspaceId", "expectedGeneration", "id"]); if (!text(params.id)) throw new Error("Invalid skill"); return host.workspaceSkill(workspaceId, params.id); }
     if (method === "workspace.skill.fork") { fields(["workspaceId", "expectedGeneration", "id", "content", "approved", "expectedRevision"]); if (!text(params.id) || params.approved !== true) throw new Error("Private skill fork requires confirmation"); return host.forkWorkspaceSkill(workspaceId, params.id, params.content, params.expectedRevision as number); }
@@ -133,6 +140,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       })();
     });
   });
+  host.startScheduler();
   return { port, token, async close() {
     if (closing) return; closing = true;
     await host.close();

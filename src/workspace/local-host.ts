@@ -35,9 +35,10 @@ import { LegacyConnectionCatalog } from "./legacy-connections.js";
 import { WorkspacePreferences } from "./preferences.js";
 import { WorkspaceFeatures } from "./features.js";
 import { workspaceSkillTool } from "./skills.js";
+import { WorkspaceScheduler } from "./scheduler.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
-interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; features: WorkspaceFeatures }
+interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; features: WorkspaceFeatures; scheduler?: WorkspaceScheduler }
 type WorkspaceConnectionSnapshot = ReturnType<WorkspaceConnectionStoreV2["list"]> & {
   readOnly?: boolean; recovered?: boolean; migrationPending?: boolean; unavailable?: boolean; activeConnectionId?: string | null;
 };
@@ -69,6 +70,9 @@ export class LocalWorkspaceHost {
   private readonly pending = new Map<string, PendingApproval>();
   private readonly clients = new Map<string, { workspaceId: string | null; agentId: string | null; epoch: number }>();
   private closing = false;
+  private updateLease: { clientId: string; id: string } | null = null;
+  private scheduleTimer?: ReturnType<typeof setInterval>;
+  private schedulerTicking = false;
   private readonly realKey?: WorkspaceRealKeyLane;
   private readonly vault: CredentialVault;
   private readonly legacy?: LegacyConnectionCatalog;
@@ -114,10 +118,26 @@ export class LocalWorkspaceHost {
     // The fixture project is workspace data too. Sharing the container root would let B observe
     // or reuse A's same-relative-path artifacts despite isolated chat/config/budget state.
     const project = storage.run(() => ensurePrivateStateSubdirectory(this.root, ["project", row.scope.workspaceId]).path);
-    const context = { storage, resources, connections: this.options.mode === "workspace" ? new WorkspaceSecureConnections(storage, this.vault) : new WorkspaceConnectionStoreV2(storage), project,
+    const source = storage.run(() => join(workspaceStateHome(), ".hara/workspace-connections-v2.json"));
+    const connections = this.options.mode === "workspace" ? new WorkspaceSecureConnections(storage, this.vault, id => {
+      if (!this.legacy) throw new Error("Legacy source unavailable"); return this.legacy.resolve(id, source, true);
+    }) : new WorkspaceConnectionStoreV2(storage);
+    if (connections instanceof WorkspaceSecureConnections && this.legacy && this.catalog.read().workspaces[0]?.scope.workspaceId === workspaceId) {
+      try { connections.stageLegacyImport(this.legacy.personalSeeds(source)); }
+      catch { /* Snapshot isolates unavailable connections; history/roster must remain usable. */ }
+    }
+    const context: WorkspaceHostContext = { storage, resources, connections, project,
       features: new WorkspaceFeatures(storage, project, workspaceId, this.options.mode === "workspace" ? this.options.hostHome : undefined),
       runtimes: new WorkspaceRuntimeInstaller(storage, { ...(this.options.hostHome ? { discovery: { home: this.options.hostHome, shell: process.env.HARA_WORKSPACE_HOST_SHELL } } : {}),
         ...this.options.runtimeInstallerOptions, onChange: () => this.changed(workspaceId) }) };
+    context.scheduler = new WorkspaceScheduler(storage, context.features, {
+      available: agentId => !this.closing && !this.updateLease && Boolean(resources.agents.get(agentId)?.state === "active")
+        && ![...this.jobs.values()].some(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId),
+      execute: async (agentId, task, requestId) => {
+        const accepted = this.start(`schedule:${workspaceId}`, workspaceId, agentId, task, requestId);
+        await this.wait(accepted.runId); const result = this.snapshot(workspaceId, agentId);
+        this.changed(workspaceId, agentId); return { runId: accepted.runId, completed: result.conversation.taskState === "completed" };
+      } });
     this.contexts.set(workspaceId, context); return context;
   }
   private changed(workspaceId: string, agentId?: string): void { this.options.onChange?.({ workspaceId, ...(agentId ? { agentId } : {}) }); }
@@ -136,8 +156,9 @@ export class LocalWorkspaceHost {
     context.resources.agents.initializeMain(); this.changed(row.scope.workspaceId);
     return this.snapshot(row.scope.workspaceId);
   }
-  select(clientId: string, workspaceId: string, expectedRevision: number): void {
-    this.catalog.select(workspaceId, expectedRevision);
+  select(clientId: string, workspaceId: string, expectedRevision: number, settingsOnly = false): void {
+    if (settingsOnly) { if (this.catalog.read().revision !== expectedRevision) throw new Error("Workspace directory changed"); this.catalog.resolve(workspaceId); }
+    else this.catalog.select(workspaceId, expectedRevision);
     const previous = this.clients.get(clientId);
     this.clients.set(clientId, { workspaceId, agentId: this.context(workspaceId).resources.agents.list().mainAgentId, epoch: (previous?.epoch ?? 0) + 1 });
     this.dismissApprovals(clientId); // selection never cancels/retargets a background run
@@ -147,7 +168,13 @@ export class LocalWorkspaceHost {
     if (!selection || selection.workspaceId !== workspaceId || !this.context(workspaceId).resources.agents.get(agentId)) throw new Error("Agent selection belongs to another Workspace view");
     this.clients.set(clientId, { workspaceId, agentId, epoch: selection.epoch + 1 }); this.dismissApprovals(clientId);
   }
-  disconnect(clientId: string): void { this.dismissApprovals(clientId); this.clients.delete(clientId); }
+  disconnect(clientId: string): void { this.dismissApprovals(clientId); this.clients.delete(clientId); if (this.updateLease?.clientId === clientId) this.updateLease = null; }
+  activity() { return { running: [...this.jobs.values()].filter(job => !job.closed).length }; }
+  prepareUpdate(clientId: string) {
+    if (this.activity().running || this.updateLease) throw new Error("Colleagues are working; restart postponed");
+    this.updateLease = { clientId, id: randomUUID() }; return { id: this.updateLease.id };
+  }
+  releaseUpdate(clientId: string, id: string) { if (this.updateLease?.clientId !== clientId || this.updateLease.id !== id) throw new Error("Update lease changed"); this.updateLease = null; }
   private dismissApprovals(clientId: string): void {
     for (const pending of [...this.pending.values()]) if (pending.clientId === clientId) pending.finish(false);
     for (const context of this.contexts.values()) context.runtimes.dismiss(clientId);
@@ -171,7 +198,7 @@ export class LocalWorkspaceHost {
     this.context(workspaceId).runtimes.registerLocal(runtimeId, fingerprint); this.changed(workspaceId);
   }
   getPreferences() { const current = this.preferences.read(); if (!current.readOnly && current.revision === 0) this.preferences.save(current.theme, 0); return this.preferences.read(); }
-  setPreferences(theme: unknown, expected: number) { this.preferences.save(theme, expected); return this.preferences.read(); }
+  setPreferences(theme: unknown, expected: number, extra = {}) { this.preferences.save(theme, expected, extra); return this.preferences.read(); }
   private connectionSource(workspaceId: string) { return this.context(workspaceId).storage.run(() => join(workspaceStateHome(), ".hara/workspace-connections-v2.json")); }
   legacyConnections(workspaceId: string) { return this.legacy?.list(this.connectionSource(workspaceId)) ?? []; }
   importConnection(workspaceId: string, id: string, expected: number, approved: boolean): void {
@@ -202,7 +229,42 @@ export class LocalWorkspaceHost {
     const value = store.retryMigration(expected); this.changed(workspaceId); return value;
   }
   selectConnection(workspaceId: string, id: string, expected: number) { this.context(workspaceId).connections.select(id, expected); this.changed(workspaceId); }
-  workspaceFeatures(workspaceId: string) { return this.context(workspaceId).features.list(); }
+  workspaceFeatures(workspaceId: string) { const context = this.context(workspaceId); return { ...context.features.list(), scheduler: context.scheduler!.list() }; }
+  workspaceTasks(workspaceId: string) {
+    const context = this.context(workspaceId);
+    return context.resources.agents.list().agents.flatMap(agent => {
+      const value = new WorkspaceConversationStore(context.storage, agent.agentId).read();
+      return [...value.pastTasks.map(row => row.task), ...(value.task ? [value.task] : [])].map(task => ({ taskId: task.id,
+        objective: redactSensitiveText(task.objective).text.slice(0, 1000), status: task.status, colleague: agent.identity.displayName }));
+    }).slice(-256);
+  }
+  saveSchedule(workspaceId: string, input: unknown, expected: number, approved: boolean) {
+    if (!approved || !plain(input) || typeof input.agentId !== "string" || !this.context(workspaceId).resources.agents.get(input.agentId)) throw new Error("Scheduled task requires a confirmed same-Workspace colleague");
+    this.context(workspaceId).features.saveSchedule(input, expected); this.changed(workspaceId); return this.workspaceFeatures(workspaceId);
+  }
+  deleteSchedule(workspaceId: string, id: string, expected: number, approved: boolean) {
+    const context = this.context(workspaceId);
+    if (!approved || context.scheduler!.list().runs.some(run => run.scheduleId === id && ["running", "unknown"].includes(run.state))) throw new Error("Confirm removal after checking the active/unknown run");
+    context.features.deleteSchedule(id, expected); this.changed(workspaceId); return this.workspaceFeatures(workspaceId);
+  }
+  runSchedule(workspaceId: string, id: string, approved: boolean) {
+    if (!approved || !this.context(workspaceId).features.schedules().some(row => row.id === id)) throw new Error("Explicit scheduled run confirmation required");
+    const context = this.context(workspaceId);
+    void context.scheduler!.tick(context.resources.agents.list().mainAgentId!, Date.now(), id).catch(() => {}).finally(() => this.changed(workspaceId));
+    return this.workspaceFeatures(workspaceId);
+  }
+  startScheduler() {
+    if (this.scheduleTimer || this.options.mode !== "workspace") return;
+    this.scheduleTimer = setInterval(() => { void this.tickSchedules(); }, 15000); this.scheduleTimer.unref();
+  }
+  async tickSchedules(now = Date.now()) {
+    if (this.schedulerTicking || this.closing || this.updateLease) return; this.schedulerTicking = true;
+    try { for (const row of this.catalog.read().workspaces.filter(row => row.active)) {
+      if (this.closing || this.updateLease) break;
+      try { const context = this.context(row.scope.workspaceId); await context.scheduler!.tick(context.resources.agents.list().mainAgentId!, now); }
+      catch { /* Broken scoped state cannot route to another Workspace or old scheduler. */ }
+    } } finally { this.schedulerTicking = false; }
+  }
   updateFeature(workspaceId: string, kind: unknown, id: unknown, enabled: unknown, expected: number, version?: unknown) {
     if (typeof id !== "string" || typeof enabled !== "boolean" || !["schedule", "skill"].includes(String(kind))) throw new Error("Invalid scoped feature change");
     const features = this.context(workspaceId).features;
@@ -368,7 +430,7 @@ export class LocalWorkspaceHost {
   }
   start(clientId: string, workspaceId: string, agentId: string, message: string, requestId: string, resume = false, parent?: LocalJob, parentSignal?: AbortSignal,
     origin: WorkspaceRequestOrigin = { source: "host", channel: "internal", clientId }) {
-    if (this.closing || !messageBody(message) || !UUID.test(requestId)) throw new Error("invalid Workspace message or closing Host");
+    if (this.closing || this.updateLease || !messageBody(message) || !UUID.test(requestId)) throw new Error("invalid Workspace message or closing/updating Host");
     const context = this.context(workspaceId), agent = context.resources.agents.get(agentId);
     if (!agent || agent.state !== "active" || agent.runtime.id !== "pi") throw new Error("Agent Runtime unavailable; no fallback selected");
     if (parent && (parent.workspaceId !== workspaceId || parent.binding.lineage.depth !== 0)) throw new Error("delegation is limited to one same-Workspace hop");
@@ -480,10 +542,12 @@ export class LocalWorkspaceHost {
   private async run(job: LocalJob): Promise<void> {
     try {
       job.outcome = await job.context.storage.run(() => runConfiguredAgent(job.value.history, job.options!));
+      if (job.outcome.status === "error") this.noteCredentialFailure(job, job.outcome.error);
       job.value.task = finishTaskExecution(job.value.task!, job.outcome, [], job.signal.aborted)!;
       job.value.attempt = { ...job.value.attempt!, state: job.signal.aborted ? "cancelled" : job.outcome.status === "completed" ? "completed" : "blocked", endedAt: new Date().toISOString() };
       this.commit(job);
     } catch (error) {
+      this.noteCredentialFailure(job, error);
       job.error = redactSensitiveText(error instanceof Error ? error.message : "Workspace execution failed").text.replaceAll(this.root, "[Dev state]");
       job.outcome = { status: "error", error: job.error };
       try { job.value.task = finishTaskExecution(job.value.task!, job.outcome, [], job.signal.aborted)!;
@@ -495,6 +559,11 @@ export class LocalWorkspaceHost {
       this.changed(job.workspaceId, job.agentId);
     }
   }
+  private noteCredentialFailure(job: LocalJob, error: unknown) {
+    if (job.context.connections instanceof WorkspaceSecureConnections && /\b401\b|authentication_error|invalid.api.key/i.test(String(error))) {
+      try { job.context.connections.markCredentialInvalid(job.binding.connection); } catch { /* Preserve uncertain metadata; no probe or retry. */ }
+    }
+  }
   cancel(workspaceId: string, agentId: string, runId: string): void {
     const job = this.jobs.get(runId);
     if (!job || job.workspaceId !== workspaceId || job.agentId !== agentId || job.closed) throw new Error("active Workspace run unavailable");
@@ -502,6 +571,7 @@ export class LocalWorkspaceHost {
   }
   async wait(runId: string): Promise<void> { const job = this.jobs.get(runId); if (job) await job.promise; }
   async close(): Promise<void> {
+    if (this.scheduleTimer) clearInterval(this.scheduleTimer);
     this.closing = true; for (const pending of [...this.pending.values()]) pending.finish(false);
     for (const job of this.jobs.values()) if (!job.closed) job.controller.abort();
     await Promise.all([...this.jobs.values()].map(job => job.promise));

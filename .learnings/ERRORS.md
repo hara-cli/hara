@@ -1,5 +1,26 @@
 # Errors
 
+## [ERR-20261018-SETTINGS-PRIVATE-LOOPBACK] local verification environment
+
+**Logged**: 2026-10-18
+**Priority**: medium
+**Status**: resolved for focused tests; full gate recorded separately
+**Area**: tests
+
+### Summary
+
+The first scoped connection regression run had 33 passes and one `listen EPERM` at 127.0.0.1.
+It was sandbox socket denial, not a Serve timeout. The same focused source in a fresh private HOME
+with explicitly allowed loopback passed 34/34; no timeout/assertion was changed.
+
+### Prevention
+
+Use explicit repository cwd and resolve files with rg before cross-repository reads (several guessed
+sibling paths were absent during exploration). Keep full logs, use the pinned Node, and grant only the
+local socket/process access needed by synthetic tests. Never substitute a real provider after a test error.
+
+---
+
 ## [ERR-20261018-REVIEW-FORMAL-APPROVAL-DEADLINE] Related-suite approval wait did not settle
 
 **Logged**: 2026-10-18

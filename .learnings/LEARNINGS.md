@@ -1,5 +1,27 @@
 # Learnings
 
+## [LRN-20261018-SETTINGS-BATCH-AND-HANDOFF] best_practice
+
+**Logged**: 2026-10-18
+**Priority**: high
+**Status**: implemented on isolated settings feat branch; live cutover not authorized
+**Area**: workspace
+
+- Prefill legacy personal connection metadata without resolving credentials. A durable pending/complete
+  marker survives restart and deletion; a separate confirmed batch writes one scope-container Keychain
+  item. Connection/generation references remain distinct inside that item. Serialize scope-container
+  read/merge/write across processes so concurrent edits cannot lose another credential.
+- Automatic personal prefill must not enumerate other Workspaces. Preserve the legacy active provider,
+  sanitize blank/control-character labels identically in preview/import, and close model admission until
+  the entire batch is confirmed. Never use a fabricated empty-document revision as migration authority.
+- Settings use a second authenticated view selection, not a persisted catalog selection. Update restart
+  admission checks all running work and holds a Host lease before installation, closing the idle-check race.
+- A staged cron import is not scheduler cutover. Keep preserved legacy modes/delivery metadata gated;
+  refuse retirement when compatible execution/delivery adapters are absent. Unknown run outcomes remain
+  claimed after restart and cannot auto-replay. Real migration and OS service retirement need fresh approval.
+
+---
+
 ## [LRN-20261018-SETTINGS-READONLY-MIGRATION] correction
 
 **Logged**: 2026-10-18

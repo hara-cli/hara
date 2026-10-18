@@ -50,7 +50,10 @@ test("legacy import is confirmation-ready metadata only, repeated import idempot
  assert.equal(store.list().connections.length,1);fs.writeFileSync(join(home,".hara/config.json"),"broken");assert.deepEqual(catalog.list(),[]);assert.throws(()=>catalog.resolve(preview[0].id));
 });
 test("Keychain secret is stdin-only, fixed service, and diagnostics never surface credential values",()=>{
- const calls=[];const execute=(command,args,opts)=>{calls.push({args,input:opts.input});return args[0]==="find-generic-password"?{status:0,stdout:fakeKey+"\n"}:{status:0,stdout:"",stderr:fakeKey};};
+ const calls=[],items=new Map();const execute=(command,args,opts)=>{calls.push({args,input:opts.input});
+  if(args[0]==="-i"){const match=/-a ([\w.:-]+) -w (.*)\n/.exec(opts.input);items.set(match[1],JSON.parse(match[2]));return {status:0};}
+  if(args[0]==="find-generic-password"){const value=items.get(args[args.indexOf("-a")+1]);return value===undefined?{status:44}:{status:0,stdout:value+"\n"};}
+  return {status:44};};
  const vault=new MacKeychainCredentialVault(dir(),execute);vault.set("scope:connection:generation",fakeKey);assert.equal(vault.get("scope:connection:generation"),fakeKey);vault.remove("scope:connection:generation");
  assert(calls.every(c=>!c.args.join(" ").includes(fakeKey)));assert(calls.some(c=>c.input?.includes(WORKSPACE_CREDENTIAL_SERVICE)));
  const bad=new MacKeychainCredentialVault(dir(),()=>({status:1,stderr:fakeKey}));assert.throws(()=>bad.get("safe"),error=>!error.message.includes(fakeKey));

@@ -30,7 +30,7 @@ function binary(file, body) { fs.mkdirSync(dirname(file), { recursive: true, mod
 
 test("npm prefix discovery is offline/no-notifier and cannot create the host npm notifier cache", async () => {
   const home = dir(), npm = binary(join(home, ".nvm/versions/node/v22.23.1/bin/npm"),
-    'if [ "$npm_config_update_notifier" != "false" ] || [ "$NO_UPDATE_NOTIFIER" != "1" ] || [ "$npm_config_offline" != "true" ]; then mkdir -p "$HOME/.npm"; exit 1; fi\nprintf "%s\\n" "$HOME/prefix"');
+    'if [ "$npm_config_update_notifier" != "false" ] || [ "$NO_UPDATE_NOTIFIER" != "1" ] || [ "$npm_config_offline" != "true" ] || [ "$npm_config_logs_max" != "0" ]; then mkdir -p "$HOME/.npm"; exit 1; fi\nprintf "%s\\n" "$HOME/prefix"');
   const executable = binary(join(home, "prefix/bin/opencode"), 'echo "opencode 1.2.3"');
   const calls = [], previousFetch = globalThis.fetch; let networkCalls = 0;
   globalThis.fetch = () => { networkCalls++; throw new Error("network not allowed"); };
