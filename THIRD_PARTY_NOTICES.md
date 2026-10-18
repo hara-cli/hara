@@ -60,11 +60,12 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-## Hara Code Runtime (OpenCode)
+## Optional OpenCode (not preinstalled)
 
-Hara's npm installation includes the matching native optional OpenCode package. Hara Desktop supplies
-the separately checksum-pinned sidecar. Hara uses the executable behind its own model, workspace,
-tool and approval boundaries; the upstream Desktop and web applications are not included.
+Pi is the only preinstalled Agent runtime. This npm package and the standalone binary do not ship
+OpenCode, Codex, Claude Code native executables or the Claude Agent SDK. Optional CLIs are acquired
+only after explicit Workspace approval and checksum verification. The historical OpenCode notice
+below is retained for compatibility adapter/cache-reader source, not a bundled executable.
 
 - Upstream: https://github.com/anomalyco/opencode
 - Version: 1.18.32

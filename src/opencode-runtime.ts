@@ -36,7 +36,7 @@ export type HaraCodeRuntimeResolution = {
 };
 
 export const HARA_CODE_RUNTIME_UNAVAILABLE_MESSAGE =
-  "Hara's bundled coding runtime is unavailable. Reinstall the official Hara distribution; npm installs require optional dependencies enabled.";
+  "OpenCode is not preinstalled. Approve its installation in this Workspace; existing exact-session bindings are never silently replaced.";
 
 /** Programmatic test/platform seam only; these values must never come from project configuration. */
 export interface HaraCodeRuntimeResolveOptions {

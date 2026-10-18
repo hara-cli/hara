@@ -18,7 +18,7 @@ export interface BundledOpenCodeRuntimeMetadata {
   assetPath: string;
 }
 
-// Build plugin replaces precisely this compiled assignment, preserving the materializer below.
+// Legacy cache readers remain for protected old sessions. There is deliberately no build embedder.
 export const bundledOpenCodeRuntime: BundledOpenCodeRuntimeMetadata | undefined = undefined;
 
 /** Trusted programmatic test seam only. No project, environment or model payload supplies metadata. */

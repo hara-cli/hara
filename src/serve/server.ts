@@ -1106,7 +1106,7 @@ export interface ServeOpts {
 
 export interface LocalWorkspaceServeDeps {
   version: string;
-  localWorkspace: { root: string; allowedOrigins?: readonly string[] };
+  localWorkspace: { root: string; mode?: "workspace"; allowedOrigins?: readonly string[] };
 }
 
 export interface ServeHandle {

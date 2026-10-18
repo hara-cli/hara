@@ -3547,6 +3547,11 @@ const invocationCwd = (() => {
 })();
 
 const program = new Command();
+program.command("workspace [args...]").description("Workspace-scoped personal collaboration and Pi execution")
+  .allowUnknownOption().action(async (args: string[]) => {
+    const { mainLocalWorkspaceCli } = await import("./workspace/local-cli.js");
+    await mainLocalWorkspaceCli(args, "workspace");
+  });
 program.command("workspace-dev [args...]").description("Opt-in isolated local Workspace Dev (synthetic Provider only)")
   .allowUnknownOption().action(async (args: string[]) => {
     const { mainLocalWorkspaceCli } = await import("./workspace/local-cli.js");

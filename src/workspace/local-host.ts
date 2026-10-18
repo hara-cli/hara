@@ -26,9 +26,11 @@ import { WorkspaceRealKeyLane, type ArkAcceptanceSlice } from "./real-key-provid
 import { WorkspaceContextReceipts } from "./context-receipts.js";
 import { WorkspaceContextAudit } from "./context-audit.js";
 import { boundWorkspaceText } from "./model-context.js";
+import { createWorkspaceProvider } from "./provider.js";
+import { WorkspaceRuntimeInstaller, optionalRuntimeId } from "./runtime-install.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
-interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string }
+interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller }
 export interface LocalWorkspaceApproval {
   id: string; workspaceId: string; agentId: string; runId: string; expiresAt: string;
   resourceGeneration: string;
@@ -59,13 +61,16 @@ export class LocalWorkspaceHost {
   private closing = false;
   private readonly realKey?: WorkspaceRealKeyLane;
   constructor(root: string, private readonly options: {
+    mode?: "workspace";
+    runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1];
     providerFactory?: LocalWorkspaceProviderFactory;
     realKeyFile?: string;
     realKeySlice?: ArkAcceptanceSlice;
     interactiveApprovals?: boolean;
     onChange?: (event: { workspaceId: string; agentId?: string }) => void;
   } = {}) {
-    const opened = openLocalWorkspaceDevRoot(root); this.root = opened.root; this.home = opened.home; this.project = opened.project;
+    if (options.mode && (options.realKeyFile || options.realKeySlice)) throw new Error("Workspace mode cannot inherit an acceptance Key lane");
+    const opened = openLocalWorkspaceDevRoot(root, options.mode ?? "synthetic"); this.root = opened.root; this.home = opened.home; this.project = opened.project;
     this.catalog = new LocalWorkspaceCatalog(this.home);
     if (options.realKeyFile) {
       if (options.providerFactory) throw new Error("Real-key acceptance cannot replace its trusted Provider factory");
@@ -73,7 +78,8 @@ export class LocalWorkspaceHost {
     }
     else if (options.realKeySlice) throw new Error("A real-key slice requires its explicit file reference");
   }
-  modelMode() { return this.realKey ? { syntheticOnly: false, executionMode: "ark-real-key" as const, budget: this.realKey.summary() }
+  modelMode() { return this.options.mode === "workspace" ? { syntheticOnly: false, executionMode: "workspace" as const }
+    : this.realKey ? { syntheticOnly: false, executionMode: "ark-real-key" as const, budget: this.realKey.summary() }
     : { syntheticOnly: true, executionMode: "synthetic" as const }; }
   private context(workspaceId: string): WorkspaceHostContext {
     const row = this.catalog.resolve(workspaceId);
@@ -89,7 +95,8 @@ export class LocalWorkspaceHost {
     // The fixture project is workspace data too. Sharing the container root would let B observe
     // or reuse A's same-relative-path artifacts despite isolated chat/config/budget state.
     const project = storage.run(() => ensurePrivateStateSubdirectory(this.root, ["project", row.scope.workspaceId]).path);
-    const context = { storage, resources, connections: new WorkspaceConnectionStoreV2(storage), project };
+    const context = { storage, resources, connections: new WorkspaceConnectionStoreV2(storage), project,
+      runtimes: new WorkspaceRuntimeInstaller(storage, { ...this.options.runtimeInstallerOptions, onChange: () => this.changed(workspaceId) }) };
     this.contexts.set(workspaceId, context); return context;
   }
   private changed(workspaceId: string, agentId?: string): void { this.options.onChange?.({ workspaceId, ...(agentId ? { agentId } : {}) }); }
@@ -122,9 +129,23 @@ export class LocalWorkspaceHost {
   disconnect(clientId: string): void { this.dismissApprovals(clientId); this.clients.delete(clientId); }
   private dismissApprovals(clientId: string): void {
     for (const pending of [...this.pending.values()]) if (pending.clientId === clientId) pending.finish(false);
+    for (const context of this.contexts.values()) context.runtimes.dismiss(clientId);
   }
+  async proposeRuntime(clientId: string, workspaceId: string, runtimeId: unknown) {
+    const selection = this.clients.get(clientId), context = this.context(workspaceId);
+    if (!optionalRuntimeId(runtimeId) || !selection || selection.workspaceId !== workspaceId) throw new Error("Runtime installation belongs to another view");
+    const epoch = selection.epoch, generation = context.storage.run(() => currentWorkspaceResourceBinding()!.generation);
+    return context.runtimes.propose(runtimeId, clientId, () => {
+      if (this.closing || this.clients.get(clientId)?.workspaceId !== workspaceId || this.clients.get(clientId)?.epoch !== epoch) throw new Error("Runtime approval view changed");
+      this.assertGeneration(workspaceId, generation);
+    }, () => { if (this.closing) throw new Error("Workspace host is closing"); this.assertGeneration(workspaceId, generation); });
+  }
+  approveRuntime(clientId: string, workspaceId: string, id: string, approved: boolean) {
+    return this.context(workspaceId).runtimes.approve(id, approved, clientId);
+  }
+  cancelRuntime(workspaceId: string, operationId: string): void { this.context(workspaceId).runtimes.cancel(operationId); }
   configureSynthetic(workspaceId: string, expectedRevision: number): void {
-    if (this.realKey) throw new Error("This explicit real-key lane cannot substitute synthetic results");
+    if (this.realKey || this.options.mode === "workspace") throw new Error("Synthetic connections require the explicit isolated Lab");
     this.context(workspaceId).connections.add({ ...SYNTHETIC_CONNECTION }, expectedRevision); this.changed(workspaceId);
   }
   configureApprovedConnection(workspaceId: string, expectedRevision: number): void {
@@ -150,7 +171,7 @@ export class LocalWorkspaceHost {
     const live = [...this.jobs.values()].find(job => !job.closed && job.workspaceId === workspaceId && job.agentId === selected);
     return { workspaceId, resourceGeneration: context.storage.run(() => currentWorkspaceResourceBinding()!.generation),
       label: row.label, agentRevision: catalog.revision, agents: catalog.agents, selectedAgentId: selected,
-      connections: context.connections.list(), conversation: { revision: value.revision, sessionId: value.sessionId,
+      connections: context.connections.list(), runtimes: context.runtimes.list(), conversation: { revision: value.revision, sessionId: value.sessionId,
         state: live ? live.controller.signal.aborted ? "draining" : "running"
           : value.attempt?.state === "running" || value.attempt?.state === "draining" ? "needs_recovery"
           : value.attempt?.state === "completed" && value.task?.status !== "completed" ? "blocked" : value.attempt?.state ?? "idle",
@@ -324,7 +345,7 @@ export class LocalWorkspaceHost {
       if (binding.project.root !== context.project) throw new Error("Workspace project root changed; old task retained read-only, no implicit project migration");
       const connection = context.connections.resolve(binding.connection);
       const provider = this.realKey ? this.realKey.createProvider(connection, binding.connection)
-        : (this.options.providerFactory ?? createWorkspaceSyntheticProvider)(connection, binding.connection,
+        : (this.options.providerFactory ?? (this.options.mode === "workspace" ? createWorkspaceProvider : createWorkspaceSyntheticProvider))(connection, binding.connection,
           { agent, objective: task.objective, colleagues: () => context.resources.agents.list().agents });
       const modelHistoryStart = value.history.length;
       value.history.push({ role: "user", content: message }); value.task = task;
@@ -402,5 +423,6 @@ export class LocalWorkspaceHost {
     this.closing = true; for (const pending of [...this.pending.values()]) pending.finish(false);
     for (const job of this.jobs.values()) if (!job.closed) job.controller.abort();
     await Promise.all([...this.jobs.values()].map(job => job.promise));
+    await Promise.all([...this.contexts.values()].map(context => context.runtimes.close()));
   }
 }

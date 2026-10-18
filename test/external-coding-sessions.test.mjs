@@ -88,10 +88,10 @@ test("missing bundled OpenCode is a non-executing unavailable adapter without br
   assert.ok(registry.adapters.get("claude") instanceof ClaudeAgentSdkAdapter);
   const source = await adapter.inspect();
   assert.equal(source.state, "not_installed"); assert.equal(source.installed, false); assert.equal(source.available, false);
-  assert.match(source.remediation, /optional dependencies enabled/u);
+  assert.match(source.remediation, /not preinstalled.*Approve.*Workspace/u);
   assert.ok(Object.values(source.capabilities).every((value) => value === false));
-  await assert.rejects(registry.createCodingSession({ agentKind: "opencode", cwd }), /optional dependencies enabled/u);
-  await assert.rejects(registry.submit(`ext_opencode_${"a".repeat(24)}`, "task", output()), /optional dependencies enabled/u);
+  await assert.rejects(registry.createCodingSession({ agentKind: "opencode", cwd }), /not preinstalled.*Approve.*Workspace/u);
+  await assert.rejects(registry.submit(`ext_opencode_${"a".repeat(24)}`, "task", output()), /not preinstalled.*Approve.*Workspace/u);
   assert.equal(spawns, 0);
 });
 

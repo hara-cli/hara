@@ -25,13 +25,14 @@ test("standalone compile disables every ambient project config loader", () => {
   }
 });
 
-test("native and public standalone gates execute the embedded coding runtime without model credentials", () => {
+test("native and public standalone gates verify only Pi is preinstalled without model credentials", () => {
   assert.ok((ci.match(/standalone-coding-runtime-smoke\.mjs/g) ?? []).length >= 2);
   assert.ok((release.match(/standalone-coding-runtime-smoke\.mjs/g) ?? []).length >= 3);
-  assert.match(codingSmoke, /\["coding", "sessions", "--provider", "opencode"\]/);
-  assert.match(codingSmoke, /createHash\("sha256"\)/);
-  assert.match(codingSmoke, /0o500/);
-  assert.match(codingSmoke, /before\.ino !== after\.ino/);
+  assert.match(codingSmoke, /\["--runtime-manifest"\]/);
+  assert.match(codingSmoke, /manifest\.preinstalled, \["pi"\]/);
+  assert.match(codingSmoke, /\["workspace", "init", "--root", workspace\]/);
+  assert.match(codingSmoke, /no optional runtime may be materialized/);
+  assert.doesNotMatch(codingSmoke, /"coding", "sessions"|CODE_RUNTIME_VERSION/);
   assert.doesNotMatch(codingSmoke, /\.\.\.process\.env/);
 });
 

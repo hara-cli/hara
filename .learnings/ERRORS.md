@@ -10889,3 +10889,29 @@ milestone. Its 5-second slow-storage residual is now FR-20261017-LEGACY-SERVE-SL
 explicitly deferred with two alternatives. Earlier historical failures and stress evidence stay intact.
 
 ---
+
+## [ERR-20261018-PI-ONLY-SMOKE-ROOT] Strict Workspace smoke must canonicalize OS temporary roots
+
+- Logged: 2026-10-18
+- Status: resolved locally; not released
+- Context: Pi-only distribution native smoke, isolated feat only
+- Symptom: native version/manifest probes passed, but formal Workspace init failed before any model.
+- Cause: macOS tmpdir used a symlinked `/var/...` spelling; formal roots deliberately require the
+  canonical private path. The new smoke omitted the normalization already used by Host fixtures.
+- Fix: canonicalize the owned temporary root with `realpathSync.native`, not relax the Root guard.
+- Verification: `standalone-distribution.log` retains failure; `standalone-distribution-2.log` passes
+  under `/private/tmp/hara-pi-only-20261018.M9EdmB/`. Zero paid calls/global configuration changes.
+
+## [ERR-20261018-PI-ONLY-OFFLINE-CACHE] Source/pack success does not establish private npm installation
+
+- Logged: 2026-10-18
+- Status: resolved locally; initial failure retained
+- Context: actual Pi-only npm artifact gate
+- Offline install failed with incomplete public npm metadata/tarball cache; this was not called a
+  package pass. Bounded official-registry dependency hydration, with lifecycle scripts disabled and
+  private HOME/prefix, then passed installed CLI/Pi API checks. No optional Agent CLI was downloaded.
+- Desktop's initial sandbox run also retained 21 loopback `listen EPERM` failures separately from
+  three obsolete preinstallation contracts. After reviewed loopback access and explicit contract
+  updates, all 691 tests passed. Do not disable assertions or treat an access error as a product fix.
+
+---

@@ -233,8 +233,8 @@ test("external_agent rejects an unavailable bundled OpenCode without probing a P
     assert.equal(buildExternalArgv("opencode", "task", { cwd: root, sandbox: "read-only", trust: "gated" }), null);
     const result = await getTool("external_agent").run({ task: "task", backend: "opencode" },
       { cwd: root, sandbox: "read-only", ask: async () => true });
-    assert.match(result, /bundled coding runtime is unavailable/u);
-    assert.match(result, /optional dependencies enabled/u); assert.equal(existsSync(marker), false);
+    assert.match(result, /not preinstalled.*Approve.*Workspace/u);
+    assert.match(result, /never silently replaced/u); assert.equal(existsSync(marker), false);
   } finally {
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;

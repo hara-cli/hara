@@ -6,20 +6,22 @@ import type { ArkAcceptanceSlice } from "../workspace/real-key-provider.js";
 import { bindPrivateHaraStateFile, readPrivateStateFileSnapshotSync, removePrivateStateFile, writePrivateStateFileSync } from "../security/private-state.js";
 import type { ServeHandle, ServeOpts } from "./server.js";
 import { workspaceRequestSource } from "../workspace/request-journal.js";
+import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 
 const CAPABILITY = "workspace.local-dev.v2";
 function tokenMatches(actual: unknown, expected: string): boolean {
   if (typeof actual !== "string" || !/^[a-f0-9]{64}$/.test(actual) || actual.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
 }
-export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory }): Promise<ServeHandle> {
+export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1] }): Promise<ServeHandle> {
   if (opts.host !== "127.0.0.1" || !Number.isSafeInteger(opts.port) || opts.port < 0 || opts.port > 65535) throw new Error("Workspace Dev listens only on explicit IPv4 loopback");
   const token = opts.token ?? randomBytes(32).toString("hex");
   if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("invalid Workspace Dev transport token");
   const origins = new Set(["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost", ...(input.allowedOrigins ?? [])]);
   const clients = new Map<WebSocket, { id: string; initialized: boolean }>();
   let closing = false;
-  const host = new LocalWorkspaceHost(input.root, { realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, onChange(event) {
+  const capability = input.mode === "workspace" ? "workspace.v1" : CAPABILITY;
+  const host = new LocalWorkspaceHost(input.root, { mode: input.mode, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, runtimeInstallerOptions: input.runtimeInstallerOptions, onChange(event) {
     for (const [client, state] of clients) if (state.initialized && client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ jsonrpc: "2.0", method: "workspace.changed", params: event }));
   } });
   const wss = new WebSocketServer({ host: opts.host, port: opts.port, maxPayload: 128 * 1024,
@@ -30,7 +32,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
   catch (error) { wss.close(); await host.close(); throw error; }
   const port = (wss.address() as { port: number }).port;
   // Private IPC discovery only. Neither stdout logs nor RPC metadata contain this token.
-  const receiptFile = bindPrivateHaraStateFile(host.home, ["workspace-local-dev"], "serve-v2.json");
+  const receiptFile = bindPrivateHaraStateFile(host.home, [input.mode === "workspace" ? "workspace-runtime" : "workspace-local-dev"], "serve-v2.json");
   const previous = readPrivateStateFileSnapshotSync(receiptFile.path, 4096);
   if (previous) {
     let pid: number | undefined;
@@ -39,8 +41,8 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (!dead) { wss.close(); await host.close(); throw new Error("Workspace Dev discovery is already owned or malformed"); }
     removePrivateStateFile(receiptFile.path, previous, receiptFile.directory);
   }
-  const receipt = { schemaVersion: 2, instanceId: randomUUID(), pid: process.pid, port, token, capability: CAPABILITY,
-    ...(input.realKeyFile ? { executionMode: "ark-real-key" } : {}) };
+  const receipt = { schemaVersion: 2, instanceId: randomUUID(), pid: process.pid, port, token, capability,
+    ...(input.mode === "workspace" ? { executionMode: "workspace" } : input.realKeyFile ? { executionMode: "ark-real-key" } : {}) };
   try { writePrivateStateFileSync(receiptFile, JSON.stringify(receipt) + "\n", { expectedMissing: true }); }
   catch (error) { wss.close(); await host.close(); throw error; }
   const ownedReceipt = readPrivateStateFileSnapshotSync(receiptFile.path, 4096)!;
@@ -50,9 +52,9 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       if (!tokenMatches(params.token, token)) throw new Error("unauthorized");
       client.initialized = true;
       const mode = host.modelMode();
-      return { name: "hara", version: input.version, protocol: 1, provider: mode.syntheticOnly ? "synthetic" : "openai",
-        model: mode.budget?.model ?? "hara-synthetic-v1", cwd: host.project,
-        instanceId: receipt.instanceId, capabilities: [CAPABILITY, ...(!mode.syntheticOnly ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+      return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
+        model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
+        instanceId: receipt.instanceId, capabilities: [capability, ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
@@ -63,6 +65,13 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (method === "workspace.select") { fields(["workspaceId", "expectedRevision"]); if (!positive(params.expectedRevision)) throw new Error("invalid Workspace selection"); host.select(client.id, workspaceId, params.expectedRevision); return host.snapshot(workspaceId, undefined, client.id); }
     if (method === "workspace.snapshot") { fields(["workspaceId", "agentId"]); if (params.agentId !== null && !text(params.agentId)) throw new Error("invalid Agent selection"); return host.snapshot(workspaceId, typeof params.agentId === "string" ? params.agentId : undefined, client.id); }
     host.assertGeneration(workspaceId, params.expectedGeneration);
+    if (method === "workspace.runtime.propose") { fields(["workspaceId", "expectedGeneration", "runtimeId"]); return host.proposeRuntime(client.id, workspaceId, params.runtimeId); }
+    if (method === "workspace.runtime.approve") { fields(["workspaceId", "expectedGeneration", "proposalId", "approved"]);
+      if (typeof params.proposalId !== "string" || !UUID.test(params.proposalId) || typeof params.approved !== "boolean") throw new Error("invalid runtime approval");
+      return host.approveRuntime(client.id, workspaceId, params.proposalId, params.approved); }
+    if (method === "workspace.runtime.cancel") { fields(["workspaceId", "expectedGeneration", "operationId"]);
+      if (typeof params.operationId !== "string" || !UUID.test(params.operationId)) throw new Error("invalid runtime operation");
+      host.cancelRuntime(workspaceId, params.operationId); return { state: "cancelling" }; }
     if (method === "workspace.agent.select") { fields(["workspaceId", "expectedGeneration", "agentId"]); if (!text(params.agentId)) throw new Error("invalid Agent selection"); host.selectAgent(client.id, workspaceId, params.agentId); return host.snapshot(workspaceId, params.agentId, client.id); }
     if (method === "workspace.connection.synthetic") { fields(["workspaceId", "expectedGeneration", "expectedRevision"]); if (!Number.isSafeInteger(params.expectedRevision) || Number(params.expectedRevision) < 0) throw new Error("invalid connection revision"); host.configureSynthetic(workspaceId, params.expectedRevision as number); return host.snapshot(workspaceId, undefined, client.id); }
     if (method === "workspace.connection.approved") { fields(["workspaceId", "expectedGeneration", "expectedRevision"]); if (!Number.isSafeInteger(params.expectedRevision) || Number(params.expectedRevision) < 0) throw new Error("invalid connection revision"); host.configureApprovedConnection(workspaceId, params.expectedRevision as number); return host.snapshot(workspaceId, undefined, client.id); }

@@ -13,7 +13,7 @@ export interface CodingSettingsState {
   executor: CodingExecutorPreference;
   effectiveExecutor: CodingExecutorId;
   /** Engineering default; this is not a claim of benchmark superiority. */
-  recommendedExecutor: "opencode";
+  recommendedExecutor: "pi";
   executorEditable: boolean;
   experimental: boolean;
 }
@@ -43,7 +43,7 @@ export function normalizeCodingExecutorPreference(value: unknown): CodingExecuto
 /** Resolve only the engineering default. Runtime availability must never silently change selection. */
 export function resolveCodingExecutorPreference(preference: CodingExecutorPreference): CodingExecutorId {
   const executor = normalizeCodingExecutorPreference(preference);
-  return executor === "auto" ? "opencode" : executor;
+  return executor === "auto" ? "pi" : executor;
 }
 
 function closedRecord(value: unknown, allowedKeys: readonly string[]): Record<string, unknown> {
@@ -82,9 +82,9 @@ function snapshot(stored: StoredCodingSettings): CodingSettingsState {
     revision: stored.revision,
     executor,
     effectiveExecutor,
-    recommendedExecutor: "opencode",
+    recommendedExecutor: "pi",
     executorEditable: launchExecutorOverride === undefined,
-    experimental: effectiveExecutor === "pi",
+    experimental: false,
   };
 }
 

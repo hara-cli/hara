@@ -1,6 +1,10 @@
 # Hara 内置代码执行引擎
 
-Hara Bot 负责理解需求、安排任务和向用户汇报；OpenCode 与 Pi 是后台执行能力，不是要求用户另外维护的聊天对象。当前接入仅对个人空间开放，组织执行策略保持独立。
+Hara Bot 负责理解需求、安排任务和向用户汇报。当前 Workspace 正式入口默认将主 Hara 与同事绑定内置 Pi；只有 Pi 预装。OpenCode、Codex、Claude Code 是按需取得的可选原生工具，不是另一套聊天对象。
+
+Workspace 的连接、凭据代次、运行时注册表与任务记录彼此隔离。正式入口使用 `hara workspace` / `workspace.v1`，不依赖 Dev 环境变量；隔离合成 Lab 仍使用 `workspace-dev`，不能被正式模式当作模型回退。可选工具已提供明确批准、下载、SHA256/架构校验及本空间注册；安装不等于赋予任务权限，也不等于已经开放通用 Agent 驱动。主 Hara/同事六步流程本片仍仅运行 Pi。
+
+下面有关全局偏好及外部旧会话的说明属于显式回退入口的兼容路径，不是新 Workspace 的权限或存储来源。旧会话保持原绑定；不会因默认变成 Pi 而自动改绑。Claude 的旧 SDK adapter 在不预装 SDK 的候选中明确不可用，不会静默改用原生工具或读取其他账号配置。
 
 ## 使用方式
 
@@ -11,9 +15,9 @@ Hara Bot 负责理解需求、安排任务和向用户汇报；OpenCode 与 Pi �
 
 Desktop 的「设置 → 应用与更新 → 代码执行引擎」提供：
 
-- **自动**：目前固定推荐 OpenCode，是工程交付默认，不是性能排行榜或自动模型切换。
-- **OpenCode**：内置运行时，经 Hara 的模型连接和受控工具执行。
-- **Pi（实验性）**：内嵌 SDK，使用同一套 Hara 模型连接与工具边界。
+- **自动**：新任务固定推荐 Pi，不是性能排行榜或自动模型切换。
+- **OpenCode**：可选工具，不预装；安装与原会话授权是不同步骤。
+- **Pi**：默认内嵌 SDK，使用 Hara 模型连接与工具边界。
 - **Codex / Claude Code**：使用它们各自已有的本机登录；不会共享账号、复制认证凭据或替它们安装登录工具。
 
 偏好只影响新建代码任务。已绑定的 worker、引擎和原生 session ID 不因设置变更而替换；继续任务使用原来的会话。保存偏好不等于引擎已登录或就绪，不能静默换到另一个引擎。
@@ -71,12 +75,12 @@ Claude Code 的 SDK continuation 不等于给任意独立 CLI/tmux 实例实时�
 
 ## 安装与运行时
 
-- npm 安装固定版本的 Pi SDK 和匹配平台的 OpenCode 原生 optional dependency。不要使用 `--omit=optional`，也不需要额外安装 OpenCode/Pi 应用。
-- Desktop 使用独立校验的 OpenCode sidecar；Pi SDK 随 Hara 引擎编译。Desktop 构建使用 `desktop-sidecar` 模式，避免再在 CLI sidecar 内嵌一份相同运行时。开发源码通过检查不等于当前旧 sidecar 已升级，正式打包必须锁定包含这些修改的 CLI tag/commit。
-- standalone 构建从 lockfile 指定的官方 npm tarball 校验 SHA-512，为每个目标嵌入对应 OpenCode 原生文件；macOS 在原生构建机为副本签名后再嵌入。运行时按内嵌 SHA-256 校验并释放到用户私有缓存，不联网下载、不执行 npm 安装脚本、不从 PATH 寻找替代命令。
+- npm/standalone/Desktop 都只预装固定版本 Pi SDK；不依赖 OpenCode 原生 optional 包、Claude Agent SDK，也不嵌入 OpenCode 文件。`hara --runtime-manifest` 可离线检查声明，原生 Pi smoke 与实际包清单另行验证，不以声明代替证据。
+- Desktop `externalBin` 仅保留 Core（含 Pi）与非 Agent 的 Herdr helper。`pi-only` 和 `desktop-sidecar` 都不嵌入其他 Agent CLI。正式发布仍必须锁定同一精确 Core source/version，并满足既有签名、公证和原生平台检查；本片只是本地候选。
+- 空间设置中的可选运行时流程：读取官方稳定版本/摘要元数据 → 显示版本、来源与 SHA256 卡片 → 人工批准 → 有界下载 → 安全读取精确归档成员 → 校验平台/架构/摘要 → 本空间私有目录原子注册。不执行 vendor 安装脚本、postinstall 或下载的工具；不改全局 `~/.codex`/`~/.claude` 配置。拒绝零二进制下载、失败不注册、取消不自动重试，重启后仅重新核对已注册文件。
 - Bun 1.3.9 的 musl 构建需要显式传入匹配的 `bun-linux-arm64-musl` 或 `bun-linux-x64-musl-baseline` 目标；无法确认 libc 时拒绝猜测。跨平台构建成功仍须在目标系统执行 native runtime smoke，不能视为已经验收。
 - 显式 Desktop sidecar 无效、安装包缺失或缓存内容不匹配时拒绝执行并显示修复提示，不让 Codex/Claude 的注册一起崩溃，也不偷偷调用系统里同名的程序。
-- OpenCode 原生包较大。部分 musl 平台的 npm 安装可能同时保留两种 Linux optional 包；运行时只选择匹配的一个，不代表两个都执行。
+- 未批准安装或供应商没有可验证摘要时直接不可用，不探测 PATH 同名替代工具。旧嵌入缓存读取代码仅为兼容保留，没有可调用的构建嵌入器。
 - 许可声明随 npm 包和编译后的 CLI 交付，可离线运行 `hara licenses` 查看。
 
 ## 权限、状态与用量

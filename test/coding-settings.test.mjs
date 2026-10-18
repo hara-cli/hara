@@ -59,13 +59,13 @@ function inLaunchedHost(executor, body) {
   }));
 }
 
-test("coding settings default to auto with the OpenCode engineering default and no secret fields", () => {
+test("coding settings default to auto with the preinstalled Pi default and no secret fields", () => {
   assert.deepEqual(codingSettingsSnapshot(TEST_HOME), {
     version: 1,
     revision: 0,
     executor: "auto",
-    effectiveExecutor: "opencode",
-    recommendedExecutor: "opencode",
+    effectiveExecutor: "pi",
+    recommendedExecutor: "pi",
     executorEditable: true,
     experimental: false,
   });
@@ -73,7 +73,7 @@ test("coding settings default to auto with the OpenCode engineering default and 
   assert.equal(Object.isFrozen(CODING_EXECUTOR_PREFERENCES), true);
   for (const executor of CODING_EXECUTOR_PREFERENCES) {
     assert.equal(normalizeCodingExecutorPreference(executor), executor);
-    assert.equal(resolveCodingExecutorPreference(executor), executor === "auto" ? "opencode" : executor);
+    assert.equal(resolveCodingExecutorPreference(executor), executor === "auto" ? "pi" : executor);
   }
 });
 
@@ -85,7 +85,7 @@ test("coding settings persist only the executor and preserve other global config
     revision += 1;
     assert.equal(saved.revision, revision);
     assert.equal(saved.executor, executor);
-    assert.equal(saved.experimental, executor === "pi");
+    assert.equal(saved.experimental, false);
     assert.deepEqual(saved, codingSettingsSnapshot(TEST_HOME));
     assert.equal(JSON.stringify(saved).includes("synthetic-secret"), false);
     const raw = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
@@ -172,7 +172,7 @@ test("launch-time host environment selection is visible, locked, and unaffected 
   `);
   assert.equal(result.first.executor, "pi");
   assert.equal(result.first.effectiveExecutor, "pi");
-  assert.equal(result.first.experimental, true);
+  assert.equal(result.first.experimental, false);
   assert.equal(result.first.executorEditable, false);
   assert.equal(result.first.revision, 1);
   assert.deepEqual(result.second, result.first);

@@ -5,7 +5,8 @@ import type {
   SDKMessage,
   SDKSessionInfo,
   SessionMessage,
-} from "@anthropic-ai/claude-agent-sdk";
+  ClaudeAgentSdkFacade,
+} from "./claude-contract.js";
 import { redactSensitiveText } from "../security/secrets.js";
 import { opaqueProviderSessionId, type ExternalSessionOwnershipStore } from "./identity.js";
 import { normalizeExternalUserQuestions, validateExternalUserAnswers } from "./questions.js";
@@ -37,15 +38,9 @@ import { ExternalSessionInputError, ExternalSessionDeliveryUnknownError } from "
 const MAX_TEXT_BYTES = 128 * 1024;
 const MAX_MESSAGES = 1_000;
 
-export type ClaudeAgentSdkFacade = Pick<
-  typeof import("@anthropic-ai/claude-agent-sdk"),
-  "forkSession" | "getSessionInfo" | "getSessionMessages" | "listSessions" | "query"
->;
-
-let officialSdk: Promise<ClaudeAgentSdkFacade> | undefined;
-const loadOfficialSdk = (): Promise<ClaudeAgentSdkFacade> => {
-  officialSdk ??= import("@anthropic-ai/claude-agent-sdk");
-  return officialSdk;
+export type { ClaudeAgentSdkFacade } from "./claude-contract.js";
+const loadOfficialSdk = async (): Promise<ClaudeAgentSdkFacade> => {
+  throw new Error("The legacy Claude SDK integration is not preinstalled. Use the Workspace-approved native runtime; no global configuration was changed.");
 };
 
 interface ClaudeNativeRef {

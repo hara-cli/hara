@@ -13,7 +13,7 @@ const PUBLIC_PLUGIN_MANIFESTS = Object.freeze([
   "plugins/browser/.hara-plugin/plugin.json", "plugins/chrome/.hara-plugin/plugin.json",
 ]);
 export const REQUIRED_PACKAGE_FILES = Object.freeze([
-  "package.json", "runtime-bootstrap.cjs", "dist/cli.js", "dist/index.js",
+  "package.json", "runtime-bootstrap.cjs", "dist/cli.js", "dist/index.js", "dist/runtime-distribution.js",
   "dist/coding/pi.js", "dist/coding/host.js", "dist/coding/tools.js", "dist/coding/continuations.js",
   "dist/coding/accounting.js", "dist/coding/bundled-opencode.js", "dist/opencode-runtime.js",
   "dist/external-sessions/opencode-worker.js", "dist/third-party-notices.js",
@@ -177,7 +177,7 @@ export function packageSmokeCommandFailure(result, label, timeout, elapsedMs, of
 const INSTALLED_MODULE_PROBE = String.raw`
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 const root = realpathSync(process.argv[2]), prefix = realpathSync(process.argv[3]);
@@ -199,15 +199,19 @@ for (const [path, name] of [
 assert.equal((await load("dist/coding/bundled-opencode.js")).bundledOpenCodeRuntime, undefined);
 const runtime = await load("dist/opencode-runtime.js");
 const resolved = runtime.resolveHaraCodeRuntime();
-assert.equal(resolved.available, true, "matching native optional dependency unavailable");
-assert.equal(resolved.source, "installed-package");
-assert.equal(pkg.optionalDependencies[resolved.packageName], runtime.HARA_CODE_RUNTIME_VERSION);
-const native = spawnSync(owned(resolved.command), ["--version"], {
-  cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 30000, maxBuffer: 1024 * 1024,
-});
-assert.equal(native.error, undefined); assert.equal(native.status, 0);
-assert.equal(native.stdout.trim(), runtime.HARA_CODE_RUNTIME_VERSION);
-console.log(resolved.packageName);
+assert.equal(resolved.available, false, "private npm installation unexpectedly preinstalls an optional runtime");
+for (const name of Object.keys({ ...pkg.dependencies, ...pkg.optionalDependencies })) assert.ok(!/^opencode-/.test(name) && name !== "@anthropic-ai/claude-agent-sdk");
+assert.deepEqual((await load("dist/runtime-distribution.js")).runtimeDistribution.preinstalled, ["pi"]);
+const inventory = [join(prefix, "node_modules")]; let visited = 0;
+while (inventory.length) {
+  const directory = inventory.pop();
+  for (const name of readdirSync(directory)) {
+    assert.ok(++visited < 100000, "private installed package inventory exceeded bound");
+    assert.ok(!/^(?:opencode|codex|claude|hara-code-runtime)(?:[.]exe)?$/i.test(name) && name !== "claude-agent-sdk" && !/^opencode-(?:darwin|linux|windows)-/.test(name), "private npm dependency tree unexpectedly includes an optional Agent runtime");
+    const path = join(directory, name), info = lstatSync(path); if (info.isDirectory() && !info.isSymbolicLink()) inventory.push(path);
+  }
+}
+console.log("Pi-only private npm runtime inventory");
 `;
 
 /** Anchor ESM import conditions to the private installation before loading its contained SDK. */
@@ -285,7 +289,7 @@ export function runNpmPackageSmoke({ packageRoot = resolve(dirname(fileURLToPath
     const help = run(process.execPath, [bootstrap, "--help"], "installed CLI help");
     if (!help.includes("coding") || !help.includes("licenses")) throw new Error("installed CLI commands are missing");
     const moduleProbe = writeInstalledModuleProbe(installed);
-    const nativePackage = run(process.execPath, [moduleProbe, installed, prefix], "installed coding APIs/native runtime").trim();
+    const nativePackage = run(process.execPath, [moduleProbe, installed, prefix], "installed coding APIs/Pi-only inventory").trim();
     if (retainedDirectory) {
       const receipt = { name: pkg.name, version: pkg.version, filename: packed.filename, integrity: packed.integrity };
       inspectPackageReceipt(receipt, pkg);

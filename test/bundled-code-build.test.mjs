@@ -1,53 +1,27 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { codeRuntimeTarget, lockedCodeRuntimePackage, bundledCodeRuntimeModule } from "../scripts/bundled-opencode.mjs";
-
-const lock = JSON.parse(readFileSync(new URL("../package-lock.json", import.meta.url), "utf8"));
-const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-
-test("every standalone target selects a fixed exact-version native package and lock integrity", () => {
-  for (const target of ["bun-darwin-arm64", "bun-darwin-x64-baseline", "bun-linux-arm64", "bun-linux-arm64-musl",
-    "bun-linux-x64-baseline", "bun-linux-x64-musl-baseline", "bun-windows-x64-baseline"]) {
-    const native = codeRuntimeTarget(target), entry = lockedCodeRuntimePackage(lock, pkg, native);
-    assert.equal(native.bunTarget, target);
-    assert.equal(native.version, "1.18.32"); assert.match(entry.url, /^https:\/\/registry\.npmjs\.org\/opencode-/);
-    assert.match(entry.integrity, /^sha512-/);
+import { existsSync, readFileSync } from "node:fs";
+import { runtimeDistribution } from "../dist/runtime-distribution.js";
+const read = file => readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
+test("Pi is the only preinstalled Agent runtime in both dependency manifests", () => {
+  const pkg = JSON.parse(read("package.json")), lock = JSON.parse(read("package-lock.json"));
+  assert.equal(pkg.dependencies["@earendil-works/pi-coding-agent"], "1.1.0");
+  for (const name of Object.keys({ ...pkg.dependencies, ...pkg.optionalDependencies })) assert.ok(!/^opencode-/.test(name) && name !== "@anthropic-ai/claude-agent-sdk", name);
+  for (const name of Object.keys(lock.packages)) assert.ok(!/node_modules\/(?:opencode-(?:darwin|linux|windows)-|@anthropic-ai\/claude-agent-sdk(?:\/|$))/.test(name), name);
+  assert.deepEqual(runtimeDistribution.preinstalled, ["pi"]); assert.deepEqual(runtimeDistribution.optional, ["opencode", "codex", "claude"]);
+});
+test("standalone and Desktop sidecar compile only Pi, preserve CPU baseline and disable ambient loaders", () => {
+  const source = read("scripts/build-binary.ts");
+  assert.match(source, /process\.argv\[5\] \|\| "pi-only"/); assert.match(source, /\["pi-only", "desktop-sidecar"\]\.includes\(mode\)/);
+  assert.match(source, /process\.arch === "x64"[\s\S]*?-x64-baseline/); assert.match(source, /\$\{requested\}-baseline/);
+  for (const name of ["autoloadBunfig", "autoloadDotenv", "autoloadPackageJson", "autoloadTsconfig"]) assert.match(source, new RegExp(`${name}: false`));
+  assert.doesNotMatch(source, /prepareBundledCodeRuntime|bundledCodeRuntimeModule|type: "file"|codeRuntimeTarget|opencode-/);
+  assert.equal(existsSync(new URL("../scripts/bundled-opencode.mjs", import.meta.url)), false, "obsolete embedder must not remain callable");
+  assert.match(source, /__HARA_BUNDLED_PI_SDK_VERSION__/);
+});
+test("all native CI/release jobs still execute the standalone distribution and Pi gates", () => {
+  for (const path of [".github/workflows/ci.yml", ".github/workflows/release.yml"]) {
+    const source = read(path); assert.match(source, /standalone-coding-runtime-smoke\.mjs/); assert.match(source, /standalone-pi-runtime-smoke\.mjs/);
   }
-  assert.throws(() => codeRuntimeTarget("bun-darwin-x64"), /unsupported/);
-  assert.throws(() => codeRuntimeTarget("bun-linux-riscv64"), /unsupported/);
-  assert.throws(() => codeRuntimeTarget("bun-windows-arm64"), /unsupported/, "pinned Bun 1.3.9 has no Windows ARM64 standalone target");
-  assert.equal(codeRuntimeTarget(undefined, "darwin", "x64").bunTarget, "bun-darwin-x64-baseline");
-  assert.equal(codeRuntimeTarget(undefined, "win32", "x64").bunTarget, "bun-windows-x64-baseline");
-});
-
-test("build rejects changed package pins, registries, target architecture, and digest", () => {
-  const target = codeRuntimeTarget("bun-darwin-arm64"), key = `node_modules/${target.packageName}`;
-  for (const change of [entry => { entry.version = "latest"; }, entry => { entry.resolved = "https://example.test/runtime.tgz"; },
-    entry => { entry.cpu = ["x64"]; }, entry => { entry.integrity = "sha512-invalid"; }]) {
-    const copy = structuredClone(lock); change(copy.packages[key]);
-    assert.throws(() => lockedCodeRuntimePackage(copy, pkg, target), /invalid locked/);
-  }
-  assert.throws(() => lockedCodeRuntimePackage(lock, { optionalDependencies: {} }, target), /pin mismatch/);
-});
-
-test("embedded metadata replaces exactly the build sentinel and retains private extraction code", () => {
-  const source = "export const bundledOpenCodeRuntime = undefined;\nexport function materialize() { return true; }";
-  const built = bundledCodeRuntimeModule(source, { version: "1.18.32", sha256: "a".repeat(64) }, "/private/tmp/signed-runtime");
-  assert.match(built, /with \{ type: "file" \}/); assert.match(built, /assetPath: haraBundledOpenCodeAsset/);
-  assert.match(built, /export function materialize/);
-  assert.throws(() => bundledCodeRuntimeModule("", {}, "/tmp/runtime"), /sentinel/);
-  assert.throws(() => bundledCodeRuntimeModule(source + source, {}, "/tmp/runtime"), /sentinel/);
-});
-
-test("standalone embeds by default while Desktop explicitly reuses its external runtime", () => {
-  const source = readFileSync(new URL("../scripts/build-binary.ts", import.meta.url), "utf8");
-  assert.match(source, /const codeRuntimeMode = process\.argv\[5\] \?\? "embedded"/);
-  assert.match(source, /codeRuntimeMode !== "embedded" && codeRuntimeMode !== "desktop-sidecar"/);
-  assert.match(source, /codeRuntimeMode === "embedded" \? await prepareBundledCodeRuntime\(target\) : undefined/);
-  assert.match(source, /bundledCodeRuntime \? \[\{/);
-  assert.match(source, /bundledCodeRuntime\?\.cleanup\(\)/);
-  assert.match(source, /codeRuntimeTarget\(undefined\)\.bunTarget/);
-  assert.match(source, /result\.success && bundledCodeRuntime && embeddedModuleCount !== 1/);
-  assert.match(source, /if \(embeddedModuleCount !== 1\) throw/);
+  const gate = read("scripts/standalone-coding-runtime-smoke.mjs"); assert.match(gate, /--runtime-manifest/); assert.match(gate, /preinstalled/); assert.match(gate, /no optional runtime/);
 });

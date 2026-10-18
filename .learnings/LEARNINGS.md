@@ -1029,3 +1029,24 @@ reproducible full-suite failures; passing two full runs does not guarantee an ar
   remains in the error/report for Jeff's contract decision. No timeout/assertion or durability weakening.
 
 ---
+
+## [LRN-20261018-WORKSPACE-RUNTIME-ACQUISITION] Installation authority is not execution authority
+
+- Logged: 2026-10-18
+- Category: architecture / verification
+- Status: implemented on isolated feat; no deployment
+- Freeze the human card's runtime/version/public origin/target/hash; renderer/model cannot choose a
+  download URL, installer shell, global Home or replacement runtime. A refusal downloads no binary.
+- Dismiss unapproved cards on view switch, including A→B→A epochs. After approval, a background
+  install stays bound to its original resource generation rather than the foreground selection.
+- Verify archive hash, bounded exact regular-file extraction, architecture, private output and registry
+  binding; recheck the registered executable on every resolve. Never overwrite unsafe old residue.
+- Cap/abort metadata reads as well as binary downloads. A late/disconnected notification cannot undo
+  a durable outcome. Outcome-unknown Desktop Core startup must retain its original owned child.
+- Pi-only proof needs dependency graph/actual npm artifact inventory, standalone native Pi execution
+  and package inventory; a constant `--runtime-manifest` alone is not evidence. Registration does not
+  prove general-Agent driver availability, vendor login, platform ABI compatibility or signing.
+- Keep a fixed-source full-suite run distinct from intermediate tests while implementation changes;
+  record old-contract failures and environmental errors rather than repeatedly rerunning for green.
+
+---
