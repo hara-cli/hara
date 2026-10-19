@@ -36,6 +36,7 @@ import { WorkspacePreferences } from "./preferences.js";
 import { WorkspaceFeatures } from "./features.js";
 import { workspaceSkillTool } from "./skills.js";
 import { WorkspaceScheduler } from "./scheduler.js";
+import { legacyPolicyAllowsTool } from "./legacy-role-policy.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
 interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; features: WorkspaceFeatures; scheduler?: WorkspaceScheduler }
@@ -502,7 +503,8 @@ export class LocalWorkspaceHost {
       const owned = job, tree = new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget);
       owned.receipts = new WorkspaceContextReceipts(context.storage, binding.runId, agentId, () => { assertWorkspaceRunContextCurrent(owned.permit!); });
       const audit = new WorkspaceContextAudit(context.storage, binding.runId, agentId);
-      const tools = this.jobTools(owned, agent);
+      const configuration = context.resources.agents.resolveTask(binding.agent);
+      const tools = this.jobTools(owned, agent).filter(tool => legacyPolicyAllowsTool(configuration.toolPolicy, tool.name, tool.kind));
       owned.permit = createWorkspaceRunPermit({ binding, catalog: this.catalog, resources: context.resources, storage: context.storage, connections: context.connections,
         lease, provider, cwd: context.project, signal: owned.signal, toolNames: ["task_intake", "task_checkpoint", "todo_write", ...tools.map(tool => tool.name)], usage: value.runUsage,
         modelHistory: { history: value.history, start: modelHistoryStart, retain: result => owned.receipts!.retain(result),
@@ -514,7 +516,6 @@ export class LocalWorkspaceHost {
           for (const key of Object.keys(delta) as (keyof WorkspaceUsage)[]) owned.value.usage[key] += delta[key];
           owned.value.runUsage = { ...next }; this.commit(owned);
         } });
-      const configuration = context.resources.agents.resolveTask(binding.agent);
       const instructions = boundWorkspaceText(configuration.instructions, 1600) + (configuration.instructions.length > 1600
         ? ` Full instructions: ${owned.receipts.retain({ id: String(binding.agent.configRevision), name: "agent_instructions", content: configuration.instructions })}; use workspace_receipt_read before relying on omitted instructions.` : "");
       owned.options = bindWorkspaceRunOptions(owned.permit, { ctx: { cwd: context.project, sessionId: store.sessionId, todoScope: `workspace-${binding.runId}`, sandbox: "off" },

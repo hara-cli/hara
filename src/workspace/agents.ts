@@ -2,6 +2,9 @@
 // execution activation or automatic migration. Imported prompts never become configuration authority.
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { scanMemory } from "../memory/guard.js";
+import { redactSensitiveText } from "../security/secrets.js";
+import { validateWorkspaceLegacyToolPolicy, type WorkspaceLegacyToolPolicy } from "./legacy-role-policy.js";
 import { AgentRuntimeRegistry, type AgentRuntimeOption } from "../agent-runtime/registry.js";
 import { isAgentRuntimeId, type AgentRuntimeId } from "../agent-runtime/bindings.js";
 import {
@@ -44,6 +47,10 @@ export interface WorkspaceAgentConfiguration {
   instructions: string;
   runtimeId: AgentRuntimeId;
   hash: string;
+  toolPolicy?: WorkspaceLegacyToolPolicy;
+}
+export interface WorkspaceLegacyAgentInput extends WorkspaceAgentPersonaInput {
+  username: string; state: "active" | "archived"; importId: string; sourceHash: string; toolPolicy: WorkspaceLegacyToolPolicy;
 }
 interface AgentRecord {
   agentId: string;
@@ -53,6 +60,7 @@ interface AgentRecord {
   epoch: number;
   currentConfigRevision: number;
   configurations: WorkspaceAgentConfiguration[];
+  legacy?: { importId: string; sourceHash: string };
 }
 interface Owner {
   schemaVersion: 1;
@@ -105,17 +113,18 @@ function persona(value: unknown, username: string): Omit<WorkspaceAgentConfigura
   }
   return { identity: normalizeAgentPublicIdentityInput(value.profile, username, "global"), description, instructions };
 }
-function configuration(input: ReturnType<typeof persona>, revision: number, runtimeId: AgentRuntimeId): WorkspaceAgentConfiguration {
-  const value = { revision, ...input, runtimeId };
+function configuration(input: ReturnType<typeof persona>, revision: number, runtimeId: AgentRuntimeId, toolPolicy?: WorkspaceLegacyToolPolicy): WorkspaceAgentConfiguration {
+  const value = { revision, ...input, runtimeId, ...(toolPolicy ? { toolPolicy: validateWorkspaceLegacyToolPolicy(toolPolicy) } : {}) };
   return { ...value, hash: hashConfiguration(value) };
 }
 function parseConfiguration(value: unknown, username: string): WorkspaceAgentConfiguration {
-  if (!object(value) || !keys(value, ["revision", "identity", "description", "instructions", "runtimeId", "hash"])
+  if (!object(value) || !keys(value, ["revision", "identity", "description", "instructions", "runtimeId", "hash"], ["toolPolicy"])
     || !positive(value.revision) || !isAgentRuntimeId(value.runtimeId) || !object(value.identity)
     || !keys(value.identity, ["version", "displayName", "source"], PROFILE_FIELDS.slice(1))
     || value.identity.version !== 1 || value.identity.source !== "hara") return invalid();
   const { version: _version, source: _source, ...profile } = value.identity;
-  const next = configuration(persona({ profile, description: value.description, instructions: value.instructions }, username), value.revision, value.runtimeId);
+  const next = configuration(persona({ profile, description: value.description, instructions: value.instructions }, username), value.revision, value.runtimeId,
+    value.toolPolicy === undefined ? undefined : validateWorkspaceLegacyToolPolicy(value.toolPolicy));
   if (canonical(next.identity) !== canonical(value.identity) || next.hash !== value.hash) return invalid();
   return next;
 }
@@ -161,7 +170,7 @@ export class WorkspaceAgentStore {
     if (canonical(this.parseOwner(rawManifestOwner)) !== canonical(owner)) return invalid();
     const ids = new Set<string>(), usernames = new Set<string>();
     const rows: AgentRecord[] = agents.map(value => {
-      if (!object(value) || !keys(value, ["agentId", "username", "kind", "state", "epoch", "currentConfigRevision", "configurations"])
+      if (!object(value) || !keys(value, ["agentId", "username", "kind", "state", "epoch", "currentConfigRevision", "configurations"], ["legacy"])
         || !isWorkspaceAgentId(value.agentId) || ids.has(value.agentId)
         || typeof value.username !== "string" || !USERNAME.test(value.username) || usernames.has(value.username)
         || (value.kind !== "main" && value.kind !== "colleague") || (value.state !== "active" && value.state !== "archived")
@@ -169,6 +178,8 @@ export class WorkspaceAgentStore {
         || value.configurations.length < 1 || value.configurations.length > MAX_CONFIGS) return invalid();
       if (value.kind === "main" ? (value.agentId !== owner.mainAgentId || value.username !== "hara" || value.state !== "active")
         : (value.agentId === owner.mainAgentId || value.username === "hara" || value.username === "main")) return invalid();
+      if (value.legacy !== undefined && (!object(value.legacy) || !keys(value.legacy, ["importId", "sourceHash"])
+        || !/^[a-f0-9]{64}$/.test(String(value.legacy.importId)) || !/^[a-f0-9]{64}$/.test(String(value.legacy.sourceHash)) || value.kind !== "colleague")) return invalid();
       const configurations = value.configurations.map(entry => parseConfiguration(entry, value.username as string));
       if (configurations.some((entry, index) => entry.revision !== index + 1)
         || value.currentConfigRevision !== configurations.length) return invalid();
@@ -246,6 +257,7 @@ export class WorkspaceAgentStore {
       const loaded = this.load(), value = loaded.value;
       if (!value || value.revision !== expectedCatalogRevision) throw new Error("Workspace Agent catalog changed; reload before creating");
       if (value.agents.some(row => row.username === username)) throw new Error("Workspace Agent username is retained; restore the exact archived colleague or choose another");
+      if (value.agents.filter(row => row.kind === "colleague" && row.state === "active").length >= 10) throw new Error("Ten active colleague slots are full; archive one before creating another");
       const row: AgentRecord = { agentId: `ag_${randomUUID()}`, username, kind: "colleague", state: "active", epoch: 1,
         currentConfigRevision: 1, configurations: [configuration(normalized, 1, runtimeId)] };
       value.agents.push(row); this.advance(value); this.persist(loaded, value);
@@ -256,14 +268,14 @@ export class WorkspaceAgentStore {
     if (value.revision >= Number.MAX_SAFE_INTEGER) throw new Error("Workspace Agent catalog revision exhausted");
     value.revision++;
   }
-  private update(agentId: string, configRevision: number, agentEpoch: number, change: (row: AgentRecord) => void): WorkspaceAgentView {
+  private update(agentId: string, configRevision: number, agentEpoch: number, change: (row: AgentRecord, value: Manifest) => void): WorkspaceAgentView {
     this.binding();
     if (!isWorkspaceAgentId(agentId) || !positive(configRevision) || !positive(agentEpoch)) throw new Error("invalid Workspace Agent update");
     return withPrivateStateLockSync(workspaceStateHome(), [], "workspace-agents", () => {
       const loaded = this.load(), value = loaded.value;
       const row = value?.agents.find(entry => entry.agentId === agentId);
       if (!value || !row || row.currentConfigRevision !== configRevision || row.epoch !== agentEpoch) throw new Error("Workspace Agent changed; refresh the exact colleague before editing");
-      change(row); this.advance(value); this.persist(loaded, value);
+      change(row, value); this.advance(value); this.persist(loaded, value);
       return this.view(row);
     });
   }
@@ -271,7 +283,7 @@ export class WorkspaceAgentStore {
     if (row.state !== "active") throw new Error("restore the exact archived Workspace Agent before editing");
     if (row.configurations.length >= MAX_CONFIGS) throw new Error("Workspace Agent configuration history is full; no snapshot was removed");
     row.currentConfigRevision++;
-    row.configurations.push(configuration(input, row.currentConfigRevision, runtimeId));
+    row.configurations.push(configuration(input, row.currentConfigRevision, runtimeId, row.configurations.at(-1)!.toolPolicy));
   }
   updatePersona(agentId: string, input: WorkspaceAgentPersonaInput, configRevision: number, agentEpoch: number): WorkspaceAgentView {
     const normalized = persona(input, "agent");
@@ -289,11 +301,51 @@ export class WorkspaceAgentStore {
   }
   setArchived(agentId: string, archived: boolean, configRevision: number, agentEpoch: number): WorkspaceAgentView {
     if (typeof archived !== "boolean") throw new Error("invalid Workspace Agent lifecycle update");
-    return this.update(agentId, configRevision, agentEpoch, row => {
+    return this.update(agentId, configRevision, agentEpoch, (row, value) => {
       if (row.kind === "main") throw new Error("the Workspace main Hara cannot be archived or replaced");
       if ((row.state === "archived") === archived) throw new Error("Workspace Agent lifecycle already changed; refresh before editing");
       if (row.epoch >= Number.MAX_SAFE_INTEGER) throw new Error("Workspace Agent lifecycle epoch exhausted");
+      if (!archived && value.agents.filter(row => row.kind === "colleague" && row.state === "active").length >= 10) throw new Error("Ten active colleague slots are full; archive one before restoring another");
       row.state = archived ? "archived" : "active"; row.epoch++;
+    });
+  }
+  /** Explicit owner importer, NOT an Agent/RPC method or ambient roles discovery. All sources are
+   * validated before the atomic catalog update; a matching import never overwrites newer edits. */
+  importLegacy(rows: readonly WorkspaceLegacyAgentInput[], expected: number) {
+    this.binding();
+    if (!Array.isArray(rows) || rows.length > 128 || !positive(expected)) throw new Error("Invalid legacy Agent batch");
+    const normalized = rows.map(row => {
+      if (!object(row) || !keys(row, ["username", "profile", "state", "importId", "sourceHash", "toolPolicy"], ["description", "instructions"])
+        || typeof row.username !== "string" || !USERNAME.test(row.username) || ["hara", "main"].includes(row.username)
+        || typeof row.state !== "string" || !["active", "archived"].includes(row.state)
+        || typeof row.importId !== "string" || typeof row.sourceHash !== "string"
+        || !/^[a-f0-9]{64}$/.test(row.importId) || !/^[a-f0-9]{64}$/.test(row.sourceHash)) throw new Error("Invalid legacy Agent identity");
+      const { username, state, importId, sourceHash, toolPolicy, ...fields } = row;
+      const config = configuration(persona(fields, username), 1, "pi", validateWorkspaceLegacyToolPolicy(toolPolicy));
+      if (!scanMemory(config.instructions).ok || redactSensitiveText(JSON.stringify(config)).redactions.length) throw new Error("Legacy Agent source requires quarantine");
+      return { username, state: state as "active" | "archived", importId, sourceHash, config };
+    });
+    if (new Set(normalized.map(row => row.username)).size !== rows.length || new Set(normalized.map(row => row.importId)).size !== rows.length) throw new Error("Duplicate legacy Agent identity");
+    this.runtimes.assertAvailable("pi");
+    return withPrivateStateLockSync(workspaceStateHome(), [], "workspace-agents", () => {
+      const loaded = this.load(), value = loaded.value;
+      if (!value || value.revision !== expected) throw new Error("Workspace Agent catalog changed; refresh before inheritance");
+      const fresh = normalized.filter(row => {
+        const old = value.agents.find(agent => agent.legacy?.importId === row.importId);
+        if (old) {
+          if (old.username !== row.username || old.legacy!.sourceHash !== row.sourceHash || old.configurations[0]!.hash !== row.config.hash) throw new Error("Legacy Agent source changed; both versions preserved");
+          return false;
+        }
+        if (value.agents.some(agent => agent.username === row.username)) throw new Error("Legacy Agent conflicts with an existing colleague; neither was replaced");
+        return true;
+      });
+      if (value.agents.filter(row => row.kind === "colleague" && row.state === "active").length + fresh.filter(row => row.state === "active").length > 10) throw new Error("Legacy active selection exceeds ten colleague slots");
+      if (fresh.length) {
+        value.agents.push(...fresh.map(row => ({ agentId: `ag_${randomUUID()}`, username: row.username, kind: "colleague" as const, state: row.state, epoch: 1,
+          currentConfigRevision: 1, configurations: [row.config], legacy: { importId: row.importId, sourceHash: row.sourceHash } })));
+        this.advance(value); this.persist(loaded, value);
+      }
+      return { imported: fresh.length, agents: value.agents.filter(row => normalized.some(input => input.importId === row.legacy?.importId)).map(row => this.view(row)) };
     });
   }
   freezeTask(taskId: string, agentId: string, configRevision: number, agentEpoch: number): Readonly<WorkspaceAgentTaskBinding> {

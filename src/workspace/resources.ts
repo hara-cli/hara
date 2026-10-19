@@ -54,6 +54,7 @@ export class WorkspaceResources {
       initializeMain: bind(agents.initializeMain.bind(agents), "configure"), create: bind(agents.create.bind(agents), "configure"),
       updatePersona: bind(agents.updatePersona.bind(agents), "configure"), setRuntime: bind(agents.setRuntime.bind(agents), "configure"),
       setArchived: bind(agents.setArchived.bind(agents), "configure"), runtimeOptions: bind(agents.runtimeOptions.bind(agents)),
+      importLegacy: bind(agents.importLegacy.bind(agents), "configure"), // Trusted composition only; no RPC route.
       resolveTask: bind(agents.resolveTask.bind(agents)),
       bindTask: bind((task: TaskExecution, agentId: string, configRevision: number, agentEpoch: number): TaskExecution => {
         if (!isTaskExecution(task) || task.runtimeBinding !== undefined || task.workspaceAgentBinding !== undefined) {
