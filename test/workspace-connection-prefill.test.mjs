@@ -9,6 +9,7 @@ import { MemoryCredentialVault, MacKeychainCredentialVault } from "../dist/works
 import { LegacyConnectionCatalog } from "../dist/workspace/legacy-connections.js";
 import { WorkspaceResourceStorage, workspaceStateHome } from "../dist/workspace/resource-context.js";
 import { WorkspaceSecureConnections } from "../dist/workspace/secure-connections.js";
+import { withProcessPlatform } from "./helpers/process-platform.mjs";
 
 const roots = [], secret = "fixture-only-prefill-credential";
 const directory = () => { const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "hara-prefill-"))); roots.push(root); return root; };
@@ -78,7 +79,7 @@ test("labels containing controls or whitespace preview exactly as the import acc
   assert.deepEqual(store.list().connections.map(item => item.label), ["openai", "Two"]);
   const text = storage.run(() => fs.readFileSync(join(workspaceStateHome(), ".hara/workspace-connections-v2.json"), "utf8")); assert.equal(text.includes(secret), false);
 });
-test("OS vault batch uses one item write, stdin-only payload, one readback, and isolated scope accounts", () => {
+test("OS vault batch uses one item write, stdin-only payload, one readback, and isolated scope accounts", () => withProcessPlatform("darwin", () => {
   const entries = new Map(), calls = [];
   const execute = (_command, args, options) => {
     calls.push({ args, input: options.input });
@@ -90,7 +91,7 @@ test("OS vault batch uses one item write, stdin-only payload, one readback, and 
   assert.equal(calls.filter(call => call.args[0] === "-i").length, 1); assert.equal(calls.length, 3);
   assert.equal(calls.some(call => call.args.join(" ").includes(secret)), false); assert.equal(vault.get("scope:two:g2") === secret, true);
   assert.throws(() => vault.setMany([{ ref: "scope:one:g1", key: secret }, { ref: "other:two:g2", key: secret }]));
-});
+}));
 test("observed authentication rejection marks only the frozen credential generation invalid, without probing or revealing it", () => {
   const storage = new WorkspaceResourceStorage(directory(), { schemaVersion: 1, workspaceId: `ws_${randomUUID()}`, authority: { kind: "local", localAuthorityId: randomUUID() } }); storage.initialize();
   const store = new WorkspaceSecureConnections(storage, new MemoryCredentialVault()), input = { label: "Fixture", provider: "openai", baseURL: "https://example.invalid/v1", defaultModel: "fixture", apiKey: secret };

@@ -13,6 +13,7 @@ import {MemoryCredentialVault,MacKeychainCredentialVault,WORKSPACE_CREDENTIAL_SE
 import {WorkspacePreferences,readLegacyTheme} from "../dist/workspace/preferences.js";
 import {LegacyConnectionCatalog} from "../dist/workspace/legacy-connections.js";
 import {WorkspaceFeatures,migrateLegacyScheduleFixture} from "../dist/workspace/features.js";
+import {withProcessPlatform} from "./helpers/process-platform.mjs";
 const roots=[];function dir(){const p=fs.realpathSync(fs.mkdtempSync(join(tmpdir(),"hara-stable-test-")));roots.push(p);return p;}after(()=>roots.forEach(p=>fs.rmSync(p,{recursive:true,force:true})));
 function resource(home=dir()){const value=new WorkspaceResourceStorage(home,{schemaVersion:1,workspaceId:`ws_${randomUUID()}`,authority:{kind:"local",localAuthorityId:randomUUID()}});value.initialize();return value;}
 const fakeKey="fixture-private-model-key", input=(label="Mock")=>({label,provider:"openai",baseURL:"https://example.invalid/v1",defaultModel:"fixture-model",apiKey:fakeKey});
@@ -49,7 +50,7 @@ test("legacy import is confirmation-ready metadata only, repeated import idempot
  const storage=resource(),store=new WorkspaceSecureConnections(storage,vault),resolved=catalog.resolve(preview[0].id);store.importConnection(resolved.input,0,resolved.importId);store.importConnection(resolved.input,1,resolved.importId);
  assert.equal(store.list().connections.length,1);fs.writeFileSync(join(home,".hara/config.json"),"broken");assert.deepEqual(catalog.list(),[]);assert.throws(()=>catalog.resolve(preview[0].id));
 });
-test("Keychain secret is stdin-only, fixed service, and diagnostics never surface credential values",()=>{
+test("Keychain secret is stdin-only, fixed service, and diagnostics never surface credential values",()=>withProcessPlatform("darwin",()=>{
  const calls=[],items=new Map();const execute=(command,args,opts)=>{calls.push({args,input:opts.input});
   if(args[0]==="-i"){const match=/-a ([\w.:-]+) -w (.*)\n/.exec(opts.input);items.set(match[1],JSON.parse(match[2]));return {status:0};}
   if(args[0]==="find-generic-password"){const value=items.get(args[args.indexOf("-a")+1]);return value===undefined?{status:44}:{status:0,stdout:value+"\n"};}
@@ -58,6 +59,16 @@ test("Keychain secret is stdin-only, fixed service, and diagnostics never surfac
  assert(calls.every(c=>!c.args.join(" ").includes(fakeKey)));assert(calls.some(c=>c.input?.includes(WORKSPACE_CREDENTIAL_SERVICE)));
  const bad=new MacKeychainCredentialVault(dir(),()=>({status:1,stderr:fakeKey}));assert.throws(()=>bad.get("safe"),error=>!error.message.includes(fakeKey));
  const thrown=new MacKeychainCredentialVault(dir(),()=>{throw new Error(fakeKey);});assert.throws(()=>thrown.set("safe",fakeKey),error=>!error.message.includes(fakeKey));
+}));
+for(const platform of ["linux","win32"])test(`Keychain refuses ${platform} before any command, without plaintext fallback`,()=>withProcessPlatform(platform,()=>{
+ let calls=0;const vault=new MacKeychainCredentialVault(dir(),()=>{calls++;assert.fail("non-Darwin must not execute a Keychain command");});
+ for(const operation of [()=>vault.get("scope:connection:g1"),()=>vault.set("scope:connection:g1",fakeKey),()=>vault.setMany([{ref:"scope:connection:g1",key:fakeKey}]),()=>vault.remove("scope:connection:g1")])assert.throws(operation,/^Error: OS credential vault unavailable; no plaintext fallback$/);
+ assert.equal(calls,0);
+}));
+test("platform fixture restores the exact descriptor even when a synchronous assertion fails",()=>{
+ const original=Object.getOwnPropertyDescriptor(process,"platform"),failure=new Error("fixture failure");
+ assert.throws(()=>withProcessPlatform("darwin",()=>{assert.equal(process.platform,"darwin");throw failure;}),error=>error===failure);
+ assert.deepEqual(Object.getOwnPropertyDescriptor(process,"platform"),original);
 });
 test("denied old-Key cleanup is persisted, revoked immediately and explicitly retryable after restart",()=>{
  const storage=resource(),memory=new MemoryCredentialVault();let deny=true;

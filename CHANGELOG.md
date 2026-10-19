@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 1.0.1 — 2026-10-20 — Cross-platform Keychain test fixtures
+
+- Explicitly model macOS in the two simulated Keychain security tests and restore the real platform
+  afterward. Linux and Windows regression cases still refuse credential operations before executing
+  any command. Production Keychain guards, credential storage and all security assertions are unchanged.
+- Carry the verified 1.0.0 Workspace migration fixes forward without changing the fixed v1.0.0 tag.
+  The right-hand panel regression is deferred to 1.0.2 and is not included here.
+
 ## 1.0.0 — 2026-10-19 — Workspace candidate (not published)
 
 - Prepare the Workspace-first entry with isolated Agent identities, conversations, model connections,
