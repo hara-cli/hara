@@ -20,3 +20,24 @@ test("a newer toggle prevents rollback from silently restoring earlier enabled f
 test("changed dry-run source and absent cwd bindings fail before a schedule is written",async t=>{const f=fixture(t),s=await stage(f,[job("one")]);const args={...s.input,plan:s.plan.tasks,workspaceId:f.scope.workspaceId,mainAgentId:f.main.agentId,resources:f.folders};assert.throws(()=>legacyScheduleRows({...args,jobs:[job("one",{task:"changed"})]}),/changed/);const empty=new WorkspaceResourceStorage(f.home,{...f.scope,workspaceId:"ws_10000000-0000-4000-8000-000000000002"});empty.initialize();assert.throws(()=>legacyScheduleRows({...args,resources:new WorkspaceLegacyResources(empty)}),/not registered/);assert.equal(f.features.schedules().length,0);});
 test("a modified review cannot re-enable a disabled source or silently change its timezone",async t=>{const f=fixture(t),s=await stage(f,[job("off",{enabled:false})]),args={...s.input,plan:s.plan.tasks,workspaceId:f.scope.workspaceId,mainAgentId:f.main.agentId,resources:f.folders};for(const patch of[{importEnabled:true},{originalEnabled:true},{timezone:"Asia/Tokyo"}])assert.throws(()=>legacyScheduleRows({...args,plan:s.plan.tasks.map(row=>({...row,...patch}))}),/changed/);});
 test("an unknown old delivery noise policy is quarantined rather than defaulted to always-send",async t=>{const f=fixture(t),s=await stage(f,[job("unknown-policy",{deliver:"feishu:fixture",deliverMode:"unsupported"})]);assert.equal(s.rows[0].definition.legacy.quarantined,true);assert.equal(s.rows[0].enabled,false);assert.equal(s.rows[0].definition.deliver,undefined);});
+test("a repeated migration ID cannot conceal a changed definition or partially append a batch",async t=>{
+  const f=fixture(t),s=await stage(f,[job("one"),job("two")]);
+  f.features.importLegacy([s.rows[0]]);const before=f.features.schedules();
+  for(const change of [{definition:{...s.rows[0].definition,task:"changed fixture"}},
+    {name:"changed name"},{id:"another-id"},{source:"different-source"},
+    {schedule:{kind:"cron",expr:"0 * * * *"}}]){
+    assert.throws(()=>f.features.importLegacy([s.rows[1],{...s.rows[0],...change}]),/source changed|edited/);
+    assert.deepEqual(f.features.schedules(),before);
+  }
+});
+test("duplicate migration identities are rejected even when every row was already imported",async t=>{
+  const f=fixture(t),s=await stage(f,[job("one"),job("two")]);f.features.importLegacy(s.rows);const before=f.features.schedules();
+  assert.throws(()=>f.features.importLegacy([s.rows[0],s.rows[0]]),/Duplicate/);
+  assert.throws(()=>f.features.importLegacy([s.rows[0],{...s.rows[1],migrationId:s.rows[0].migrationId}]),/Duplicate/);
+  assert.deepEqual(f.features.schedules(),before);
+});
+test("an unchanged source replay preserves a user's newer enabled choice",async t=>{
+  const f=fixture(t),s=await stage(f,[job("one")]);f.features.importLegacy(s.rows);
+  f.features.setScheduleEnabled("one",false,f.features.list().revision);
+  assert.equal(f.features.importLegacy(s.rows),0);assert.equal(f.features.schedules()[0].enabled,false);
+});

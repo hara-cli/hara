@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, copyFileSync, constants, lstatSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, relative, join } from "node:path";
 import { tmpdir } from "node:os";
-import { WorkspaceJsonState, plain, text } from "./local-state.js";
+import { WorkspaceJsonState, canonical, plain, text } from "./local-state.js";
 import { sameWorkspaceResourceBinding, workspaceStateHome, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { WorkspaceSkillLibrary, forkWorkspaceSkill, validateWorkspaceSkill, type WorkspaceSkillBundle } from "./skills.js";
 import { parseCron, type Schedule } from "../cron/schedule.js";
@@ -81,7 +81,19 @@ export class WorkspaceFeatures {
   }
   /** Offline migration only, deliberately not exposed to RPC/startup or a scheduler. */
   importLegacy(rows: WorkspaceSchedule[]) {
-    const state = this.state.read(), fresh = rows.filter(row => row.workspaceId === this.workspaceId && !state.schedules.some(old => old.migrationId === row.migrationId));
+    const state = this.state.read(), scoped = rows.filter(row => row.workspaceId === this.workspaceId);
+    if (new Set(scoped.map(row => row.id)).size !== scoped.length || new Set(scoped.map(row => row.migrationId)).size !== scoped.length) {
+      throw new Error("Duplicate legacy schedule identity; original tasks preserved");
+    }
+    const fresh = scoped.filter(row => {
+      const old = state.schedules.find(item => item.migrationId === row.migrationId);
+      if (!old) return true;
+      // enabled is the user's mutable choice. The reviewed definition (including its original
+      // enabled flag/provenance) must still match; an ID alone is not an idempotency proof.
+      const { enabled: _oldEnabled, ...oldSource } = old, { enabled: _enabled, ...source } = row;
+      if (canonical(oldSource) !== canonical(source)) throw new Error("Legacy schedule source changed or imported task was edited; both versions preserved");
+      return false;
+    });
     if (fresh.some(row => state.schedules.some(old => old.id === row.id)) || new Set(fresh.map(row => row.id)).size !== fresh.length) throw new Error("Schedule ID collision; original tasks preserved");
     if (fresh.length) this.state.update(state.revision, current => ({ ...current, schedules: [...current.schedules, ...fresh] }));
     return fresh.length;

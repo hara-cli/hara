@@ -1328,3 +1328,34 @@ dispatch, native switching, business execution and post-release owner acceptance
 - Notes: Explicit compatibility metadata is under test; native Host bridge and live acceptance pending.
 
 ---
+
+## [LRN-20261019-MIGRATION-ID-NOT-PROOF] best_practice
+
+**Logged**: 2026-10-19
+**Priority**: high
+**Status**: resolved
+**Area**: backend
+
+### Summary
+
+An existing migration ID proves identity, not equivalent content. Validate every matching source
+and reject duplicate identities before appending any fresh rows in the same batch.
+
+### Details
+
+Copy acceptance exposed that schedule inheritance filtered matching IDs before checking definitions.
+A changed reviewed body could therefore look like a successful no-op, while other fresh rows in the
+batch were appended. Compare immutable source fields first, preserving the destination user's enabled
+choice without overwriting it. Changed source/imported definitions fail the whole batch. Add both
+negative replay cases and independent-process reopen/rollback evidence; a same-object reopen and an
+array count alone do not prove restart recovery or fidelity. Keep business execution, default-off
+guards, live handoff/24-hour observation and native package upgrade as separate acceptance states.
+
+### Metadata
+
+- Source: copy_acceptance
+- Related Files: src/workspace/features.ts, test/legacy-schedules.test.mjs, test/helpers/legacy-copy-roundtrip.mjs
+- Pattern-Key: migration.validate_content_before_idempotent_skip
+- Resolution: Definition/identity comparisons precede a single append; regression covers partial-batch refusal, duplicate IDs and user toggles.
+
+---
