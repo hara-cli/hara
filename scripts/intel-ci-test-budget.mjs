@@ -21,8 +21,8 @@ export function intelTestBatches(files) {
   assert.equal(new Set(files).size, files.length, "duplicate test file");
   for (const file of INTEL_SLOW_FILES) assert(files.includes(file), `required Intel test missing: ${file}`);
   return [
-    { timeout: 120000, files: files.filter(file => !INTEL_SLOW_FILES.includes(file)), slow: false },
-    { timeout: 300000, files: files.filter(file => INTEL_SLOW_FILES.includes(file)), slow: true },
+    { timeout: 300000, concurrency: 1, files: files.filter(file => INTEL_SLOW_FILES.includes(file)), slow: true },
+    { timeout: 120000, concurrency: 4, files: files.filter(file => !INTEL_SLOW_FILES.includes(file)), slow: false },
   ];
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
@@ -33,16 +33,25 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     if (result.error) throw result.error;
     if (result.status !== 0) process.exit(result.status ?? 1);
   };
-  // Same build, feedback evaluation, isolation, concurrency and assertions as npm test.
+  // Same build, feedback evaluation, isolation and assertions as npm test. Heavy durable migration
+  // fixtures must not contend with each other on Intel's virtual disk. Keep ordinary concurrency4.
   run(["node_modules/typescript/bin/tsc"]);
   run(["scripts/normalize-dist-modes.mjs"]); run(["scripts/check-local-bin-link.mjs"]);
   run(["scripts/evaluate-feedback-traces.mjs"]);
   const files = readdirSync("test").filter(file => file.endsWith(".test.mjs")).sort();
   for (const batch of intelTestBatches(files)) {
-    console.log(`Intel 1.0.1 test batch: ${batch.files.length} files, ${batch.timeout}ms; no skips`);
+    console.log(`Intel 1.0.1 test batch: ${batch.files.length} files, ${batch.timeout}ms, concurrency${batch.concurrency}; no skips`);
     const env = { ...process.env }; delete env.HARA_INTEL_TEST_BUDGET;
     if (batch.slow) env.HARA_INTEL_TEST_BUDGET = "1.0.1";
-    run(["--import", "./test/setup-isolated-home.mjs", "--test", "--test-concurrency=4",
-      `--test-timeout=${batch.timeout}`, ...batch.files.map(file => `test/${file}`)], env);
+    const groups = batch.slow
+      ? ["workspace-production-entry.test.mjs", ...batch.files.filter(file => file !== "workspace-production-entry.test.mjs")].map(file => [file])
+      : [batch.files];
+    for (const group of groups) {
+      const started = Date.now();
+      console.log(`Intel test start: ${group.length === 1 ? group[0] : `${group.length} ordinary files`}`);
+      run(["--import", "./test/setup-isolated-home.mjs", "--test", `--test-concurrency=${batch.concurrency}`,
+        `--test-timeout=${batch.timeout}`, ...group.map(file => `test/${file}`)], env);
+      console.log(`Intel test completed: ${group.length === 1 ? group[0] : `${group.length} ordinary files`}; ${Date.now() - started}ms`);
+    }
   }
 }

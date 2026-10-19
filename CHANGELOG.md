@@ -15,6 +15,9 @@ All notable changes to `@nanhara/hara`.
 - Give measured slow Intel CI test files a bounded 1.0.1-only budget; all other files,
   Linux and arm64 retain their original limits. Confirm the creation approval is consumed exactly
   once and the accepted run completes before delegation; no platform or safety assertion is skipped.
+- Serialize the heavy Intel migration/CLI fixtures, log per-file completion and verify approval first;
+  ordinary files retain concurrency four. Give the required full Intel job room for both batches,
+  without another increase to individual case/file deadlines or weakening production durability.
 
 ## 1.0.0 — 2026-10-19 — Workspace candidate (not published)
 

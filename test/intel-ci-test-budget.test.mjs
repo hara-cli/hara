@@ -13,8 +13,9 @@ test("temporary slow budgets require the exact Intel CI platform, flag and 1.0.1
 });
 test("Intel batching runs every original test exactly once and only measured slow files receive extra time", () => {
   const files = readdirSync(new URL(".", import.meta.url)).filter(file => file.endsWith(".test.mjs")).sort();
-  const [normal, slow] = intelTestBatches(files);
+  const [slow, normal] = intelTestBatches(files);
   assert.equal(normal.timeout, 120000); assert.equal(slow.timeout, 300000);
+  assert.equal(normal.concurrency, 4); assert.equal(slow.concurrency, 1);
   assert.deepEqual([...normal.files, ...slow.files].sort(), files);
   assert.deepEqual([...slow.files].sort(), [...INTEL_SLOW_FILES].sort());
   assert.throws(() => intelTestBatches(files.filter(file => file !== INTEL_SLOW_FILES[0])), /missing/);
@@ -25,4 +26,7 @@ test("Intel batching runs every original test exactly once and only measured slo
     assert.doesNotMatch(workflow, /continue-on-error/);
     assert.match(workflow, /run: npm test/);
   }
+  const runner = readFileSync(new URL("../scripts/intel-ci-test-budget.mjs", import.meta.url), "utf8");
+  assert.match(runner, /\["workspace-production-entry\.test\.mjs",/);
+  assert.match(runner, /batch\.slow[\s\S]*?\.map\(file => \[file\]\)/);
 });

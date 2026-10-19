@@ -132,7 +132,8 @@ jobs:
         run: docker run --rm hara-ci --version
 
   standalone-runtime:
-    timeout-minutes: 20
+    # Intel's full durable-I/O suite is required; heavy fixtures run serially, not skipped.
+    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 35 || 20 }}
     strategy:
       matrix:
         include:
