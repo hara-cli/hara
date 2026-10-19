@@ -1202,3 +1202,24 @@ reproducible full-suite failures; passing two full runs does not guarantee an ar
   organization/project headers determine request audience; never assume API key choice alone clears them.
 
 ---
+
+## [LRN-20261019-LEGACY-SNAPSHOT-SCOPE] Snapshot evidence is not inheritance authority
+
+- Logged: 2026-10-19
+- Status: read-only planner and synthetic regressions implemented; live migration not performed
+- Match launchd applications by exact product-name boundaries. A company namespace containing the
+  product substring is not an application allowlist. Keep explicit known compatibility consumers
+  separate; test unrelated services in that same company namespace as negative fixtures.
+- Bind human-readable dry-run evidence to both the frozen source fingerprint and the compiled
+  planner hash. Changing planner policy must produce new evidence, not overwrite prior results.
+- Keep definition validation, imported state, functional task execution, restart, idempotence,
+  rollback and live scheduler handoff as distinct per-item statuses. Zero provider/script calls
+  during a dry-run cannot prove the imported runtime works.
+- A historical qualified Agent reference is not a persona definition, tool policy or permission
+  to resurrect an absent colleague. Do not substitute a similarly titled colleague or hidden roster.
+- Check field types before reporting counts (a destination string's length is not its recipient
+  count). A conservative credential-syntax redaction is a review signal, not proof of a leaked key.
+- Source files stay read-only. Only owned copies may be narrowed/re-archived; keep the corrected
+  archive hash, exact cleanup receipt and remaining source gaps in the task's private evidence.
+
+---

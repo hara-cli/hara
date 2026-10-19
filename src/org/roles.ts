@@ -427,7 +427,8 @@ export function claudeTools(v: unknown): string[] | undefined {
   return raw.map((t) => CLAUDE_TOOL_MAP[t.toLowerCase().replace(/[^a-z]/g, "")] ?? t);
 }
 
-function parseFrontmatter(text: string): { fm: Record<string, any>; body: string } {
+/** Pure native-role parser shared with the explicit legacy inheritance planner; no discovery or IO. */
+export function parseRoleFrontmatter(text: string): { fm: Record<string, any>; body: string } {
   const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(text);
   if (!m) return { fm: {}, body: text.trim() };
   const fm: Record<string, any> = {};
@@ -975,7 +976,7 @@ function rolesFromDirs(dirs: RoleDir[]): Map<string, Role> {
       if (!f.endsWith(".md") || f === "README.md") continue;
       try {
         const file = join(dir, f);
-        const { fm, body } = parseFrontmatter(readModelContextFileSync(file, MAX_ROLE_BYTES));
+        const { fm, body } = parseRoleFrontmatter(readModelContextFileSync(file, MAX_ROLE_BYTES));
         const id = (fm.name as string) || f.replace(/\.md$/, "");
         if (isTrue(fm.archived)) continue;
         const explicitReadOnly = /^(true|false)$/i.test(String(fm.readOnly ?? ""))
