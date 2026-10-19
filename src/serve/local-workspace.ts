@@ -25,6 +25,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
   const host = new LocalWorkspaceHost(input.root, { mode: input.mode, hostHome: input.hostHome, discoveryHome: input.discoveryHome, legacySourceHome: input.legacySourceHome, credentialVault: input.credentialVault, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, runtimeInstallerOptions: input.runtimeInstallerOptions, onChange(event) {
     for (const [client, state] of clients) if (state.initialized && client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ jsonrpc: "2.0", method: "workspace.changed", params: event }));
   } });
+  await host.initialize();
   const wss = new WebSocketServer({ host: opts.host, port: opts.port, maxPayload: 128 * 1024,
     verifyClient: (info: { origin: string }, done: (allowed: boolean, code?: number, message?: string) => void) => {
       const allowed = !info.origin || origins.has(info.origin); done(allowed, allowed ? undefined : 403, allowed ? undefined : "Forbidden");

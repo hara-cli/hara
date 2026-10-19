@@ -44,6 +44,7 @@ export async function mainLocalWorkspaceCli(args: string[], mode?: "workspace"):
   }
   const host = new LocalWorkspaceHost(root, { mode, ...(mode ? workspaceHostSources() : {}), interactiveApprovals: false, realKeyFile: values.get("--ark-key-file"), realKeySlice: slice });
   try {
+    await host.initialize();
     if (command === "init" || command === "status") { console.log(JSON.stringify(host.list())); return; }
     const workspaceId = values.get("--workspace"), agentId = values.get("--agent"), message = values.get("--message");
     if (!text(workspaceId) || !text(agentId) || !messageBody(message)) throw new Error("run requires explicit --workspace, --agent and --message");

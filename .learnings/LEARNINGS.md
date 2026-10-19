@@ -1392,3 +1392,20 @@ dependency gaps. A candidate-package estimate does not authorize live handoff, i
   markers, and prove partial-write recovery/rollback without optional settings/history effects.
 
 ---
+
+## [LRN-20261019-STARTUP-INHERITANCE-FENCE] best_practice
+
+- Logged: 2026-10-19
+- Status: resolved
+- Area: backend
+- Formal CLI and Serve readiness must await the same Host inheritance operation. Keep the read-only
+  source separate from data Home, use a frozen encrypted backup (wrapping key only in Vault), bind
+  the reviewed required-domain plan, and keep imported schedule execution off until owner handoff.
+- A verified import is not an instruction to re-import later source changes or overwrite user edits
+  at every startup. A rolled-back import stays rolled back on the next automatic boot. Vault denial
+  or tampered backups return an explicit pending state without plaintext fallback or inferred rights.
+- Legacy command/print routing is not a handoff approval. Scheduler may call only explicit scoped
+  execution adapters after its gate; no global CLI/credential fallback is an acceptable shortcut.
+- Related Files: src/workspace/legacy-startup.ts, src/workspace/local-host.ts, test/legacy-startup.test.mjs
+
+---

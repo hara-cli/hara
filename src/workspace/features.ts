@@ -79,7 +79,8 @@ export class WorkspaceFeatures {
     this.state.update(expected, current => { const row = current.skills.find(row => row.id === id) ?? this.inherited.list().find(row => row.id === id); if (!row) throw new Error("Pinned skill unavailable");
       return { ...current, skills: [...current.skills.filter(value => value.id !== id), forkWorkspaceSkill(row, content)] }; });
   }
-  /** Offline migration only, deliberately not exposed to RPC/startup or a scheduler. */
+  /** Trusted owner import only: an audited startup coordinator may call after backup/plan binding.
+   * Never exposed to a model/RPC argument or used as a scheduler execution grant. */
   importLegacy(rows: WorkspaceSchedule[]) {
     const state = this.state.read(), scoped = rows.filter(row => row.workspaceId === this.workspaceId);
     if (new Set(scoped.map(row => row.id)).size !== scoped.length || new Set(scoped.map(row => row.migrationId)).size !== scoped.length) {

@@ -11080,3 +11080,15 @@ explicitly deferred with two alternatives. Earlier historical failures and stres
 - Related Files: /Users/zhujianbo/work/projects/hara/inbox/README.md
 
 ---
+
+## [ERR-20261019-SHARED-CLI-ARG-ORDER] operator_cli
+
+- Logged: 2026-10-19
+- Status: resolved
+- The first shared Feishu doctor invocation placed the global --config argument after its subcommand
+  and was refused before any operation. Moved the global argument before doctor/messages according
+  to the existing parser; no second client, credential store or authorization fallback was created.
+- Also repeated missing-file probes were source filename guesses, not missing product features;
+  subsequent reads use the repository's rg-discovered file inventory.
+
+---

@@ -38,9 +38,13 @@ import { workspaceSkillTool } from "./skills.js";
 import { WorkspaceScheduler } from "./scheduler.js";
 import { legacyPolicyAllowsTool } from "./legacy-role-policy.js";
 import { workspaceMemorySearchTool } from "./memory-tool.js";
+import { WorkspaceLegacyStartup, hasLegacyStartupSource, noLegacyStartup, type LegacyStartupStatus } from "./legacy-startup.js";
+import { WorkspaceLegacyBusiness } from "./legacy-business.js";
+import { WorkspaceLegacyResources } from "./legacy-resources.js";
+import { executeLegacyPrint } from "./legacy-print.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
-interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; features: WorkspaceFeatures; scheduler?: WorkspaceScheduler }
+interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; features: WorkspaceFeatures; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness }
 type WorkspaceConnectionSnapshot = ReturnType<WorkspaceConnectionStoreV2["list"]> & {
   readOnly?: boolean; recovered?: boolean; migrationPending?: boolean; unavailable?: boolean; activeConnectionId?: string | null;
 };
@@ -79,6 +83,10 @@ export class LocalWorkspaceHost {
   private readonly vault: CredentialVault;
   private readonly legacy?: LegacyConnectionCatalog;
   private readonly preferences: WorkspacePreferences;
+  private initialization?: Promise<LegacyStartupStatus>;
+  private inheritance?: WorkspaceLegacyStartup;
+  private inheritanceState?: LegacyStartupStatus;
+  private inheritanceWorkspaceId?: string;
   constructor(root: string, private readonly options: {
     mode?: "workspace";
     hostHome?: string;
@@ -91,6 +99,8 @@ export class LocalWorkspaceHost {
     realKeySlice?: ArkAcceptanceSlice;
     interactiveApprovals?: boolean;
     onChange?: (event: { workspaceId: string; agentId?: string }) => void;
+    /** Trusted native/owner composition only; never supplied by an RPC or imported instructions. */
+    legacyBusinessFactory?: (input: { storage: WorkspaceResourceStorage; features: WorkspaceFeatures; resources: WorkspaceLegacyResources }) => WorkspaceLegacyBusiness;
   } = {}) {
     if (options.mode && (options.realKeyFile || options.realKeySlice)) throw new Error("Workspace mode cannot inherit an acceptance Key lane");
     const opened = openLocalWorkspaceDevRoot(root, options.mode ?? "synthetic"); this.root = opened.root; this.home = opened.home; this.project = opened.project;
@@ -104,6 +114,36 @@ export class LocalWorkspaceHost {
       this.realKey = new WorkspaceRealKeyLane(this.root, options.realKeyFile, undefined, options.realKeySlice);
     }
     else if (options.realKeySlice) throw new Error("A real-key slice requires its explicit file reference");
+  }
+  /** Formal CLI/Serve await this before advertising readiness. Does not activate migrated jobs. */
+  initialize(): Promise<LegacyStartupStatus> {
+    this.initialization ??= this.initializeInheritance(); return this.initialization;
+  }
+  private async initializeInheritance(): Promise<LegacyStartupStatus> {
+    if (this.options.mode !== "workspace") return noLegacyStartup();
+    const sourceHome = this.options.legacySourceHome ?? this.options.hostHome;
+    if (!sourceHome) return noLegacyStartup();
+    this.inheritanceState = { ...noLegacyStartup(), state: "pending", reason: "legacy_inheritance_in_progress" };
+    try {
+      if (!hasLegacyStartupSource(sourceHome)) { this.inheritanceState = noLegacyStartup(); return this.inheritanceState; }
+      if (this.closing) throw new Error();
+      if (!this.catalog.read().workspaces.length) this.createWorkspace("个人空间", this.catalog.read().revision);
+      const record = this.catalog.resolvePersonalWorkspace(); this.inheritanceWorkspaceId = record.scope.workspaceId;
+      const context = this.context(record.scope.workspaceId);
+      this.inheritance = new WorkspaceLegacyStartup({ sourceHome, storage: context.storage, catalog: this.catalog,
+        resources: context.resources, features: context.features, vault: this.vault });
+      this.inheritanceState = await this.inheritance.initialize();
+    } catch {
+      this.inheritanceState = { ...noLegacyStartup(), state: "pending", reason: "legacy_inheritance_requires_review" };
+    }
+    return this.inheritanceState;
+  }
+  /** Owner-only maintenance operation. No RPC: live takeover/rollback still needs a maintenance gate. */
+  async rollbackLegacyInheritance(): Promise<void> {
+    if (this.activity().running || this.schedulerTicking || this.updateLease) throw new Error("Workspace is active; inheritance rollback refused");
+    await this.initialize(); if (!this.inheritance) throw new Error("No owned inheritance operation");
+    await this.inheritance.rollback(); this.inheritanceState = { ...this.inheritanceState!, state: "rolled_back", reason: null };
+    if (this.inheritanceWorkspaceId) this.changed(this.inheritanceWorkspaceId);
   }
   modelMode() { return this.options.mode === "workspace" ? { syntheticOnly: false, executionMode: "workspace" as const }
     : this.realKey ? { syntheticOnly: false, executionMode: "ark-real-key" as const, budget: this.realKey.summary() }
@@ -126,7 +166,7 @@ export class LocalWorkspaceHost {
     const connections = this.options.mode === "workspace" ? new WorkspaceSecureConnections(storage, this.vault, id => {
       if (!this.legacy) throw new Error("Legacy source unavailable"); return this.legacy.resolve(id, source, true);
     }) : new WorkspaceConnectionStoreV2(storage);
-    if (connections instanceof WorkspaceSecureConnections && this.legacy && this.catalog.read().workspaces[0]?.scope.workspaceId === workspaceId) {
+    if (connections instanceof WorkspaceSecureConnections && this.legacy && this.inheritanceState === undefined && this.catalog.read().workspaces[0]?.scope.workspaceId === workspaceId) {
       try { connections.stageLegacyImport(this.legacy.personalSeeds(source)); }
       catch { /* Snapshot isolates unavailable connections; history/roster must remain usable. */ }
     }
@@ -134,6 +174,10 @@ export class LocalWorkspaceHost {
       features: new WorkspaceFeatures(storage, project, workspaceId, this.options.mode === "workspace" ? this.options.hostHome : undefined),
       runtimes: new WorkspaceRuntimeInstaller(storage, { ...((this.options.discoveryHome ?? this.options.hostHome) ? { discovery: { home: (this.options.discoveryHome ?? this.options.hostHome)!, probeHome: this.options.hostHome, shell: process.env.HARA_WORKSPACE_HOST_SHELL } } : {}),
         ...this.options.runtimeInstallerOptions, onChange: () => this.changed(workspaceId) }) };
+    const folders = new WorkspaceLegacyResources(storage);
+    context.legacyBusiness = this.options.legacyBusinessFactory?.({ storage, features: context.features, resources: folders })
+      ?? new WorkspaceLegacyBusiness(storage, context.features, folders, { commands: { authorize: () => undefined,
+        async launch() { throw new Error("Explicit legacy Host authority required"); } }, notifications: { authorize: () => undefined } });
     context.scheduler = new WorkspaceScheduler(storage, context.features, {
       available: agentId => !this.closing && !this.updateLease && Boolean(resources.agents.get(agentId)?.state === "active")
         && ![...this.jobs.values()].some(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId),
@@ -141,6 +185,20 @@ export class LocalWorkspaceHost {
         const accepted = this.start(`schedule:${workspaceId}`, workspaceId, agentId, task, requestId);
         await this.wait(accepted.runId); const result = this.snapshot(workspaceId, agentId);
         this.changed(workspaceId, agentId); return { runId: accepted.runId, completed: result.conversation.taskState === "completed" };
+      },
+      executeLegacy: async (row, requestId) => {
+        if (row.definition.mode === "command") {
+          const result = await context.legacyBusiness!.execute(row.id, requestId);
+          for (const id of result.effects) await context.legacyBusiness!.outcomes.flush(id);
+          const state = result.command.state;
+          return { runId: result.command.runId, completed: state === "completed", unknown: state === "unknown" || state === "running" };
+        }
+        if (row.definition.mode === "print") {
+          const result = await executeLegacyPrint(this, storage, context.features, context.legacyBusiness!.outcomes, row.id, requestId);
+          for (const id of result.effects) await context.legacyBusiness!.outcomes.flush(id);
+          return { runId: result.runId, completed: result.status === "ok" };
+        }
+        throw new Error("Owner project runtime adapter unavailable; no global fallback");
       } });
     this.contexts.set(workspaceId, context); return context;
   }
@@ -152,7 +210,8 @@ export class LocalWorkspaceHost {
   list() {
     const value = this.catalog.read();
     return { revision: value.revision, activeWorkspaceId: value.activeWorkspaceId,
-      workspaces: value.workspaces.map(row => ({ workspaceId: row.scope.workspaceId, label: row.label, role: "owner", active: row.active })), ...this.modelMode() };
+      workspaces: value.workspaces.map(row => ({ workspaceId: row.scope.workspaceId, label: row.label, role: "owner", active: row.active })),
+      inheritance: this.inheritanceState ?? noLegacyStartup(), ...this.modelMode() };
   }
   createWorkspace(label: string, expectedRevision: number) {
     if (this.closing) throw new Error("Workspace Host is closing");
@@ -233,7 +292,8 @@ export class LocalWorkspaceHost {
     const value = store.retryMigration(expected); this.changed(workspaceId); return value;
   }
   selectConnection(workspaceId: string, id: string, expected: number) { this.context(workspaceId).connections.select(id, expected); this.changed(workspaceId); }
-  workspaceFeatures(workspaceId: string) { const context = this.context(workspaceId); return { ...context.features.list(), scheduler: context.scheduler!.list() }; }
+  workspaceFeatures(workspaceId: string) { const context = this.context(workspaceId); return { ...context.features.list(), scheduler: context.scheduler!.list(),
+    inheritance: workspaceId === this.inheritanceWorkspaceId ? this.inheritanceState : noLegacyStartup(), legacyOutcomes: context.legacyBusiness!.outcomes.list() }; }
   workspaceTasks(workspaceId: string) {
     const context = this.context(workspaceId);
     return context.resources.agents.list().agents.flatMap(agent => {
@@ -265,7 +325,8 @@ export class LocalWorkspaceHost {
     if (this.schedulerTicking || this.closing || this.updateLease) return; this.schedulerTicking = true;
     try { for (const row of this.catalog.read().workspaces.filter(row => row.active)) {
       if (this.closing || this.updateLease) break;
-      try { const context = this.context(row.scope.workspaceId); await context.scheduler!.tick(context.resources.agents.list().mainAgentId!, now); }
+      try { if (row.scope.workspaceId === this.inheritanceWorkspaceId && this.inheritanceState?.state === "pending") continue;
+        const context = this.context(row.scope.workspaceId); await context.scheduler!.tick(context.resources.agents.list().mainAgentId!, now); }
       catch { /* Broken scoped state cannot route to another Workspace or old scheduler. */ }
     } } finally { this.schedulerTicking = false; }
   }
@@ -306,6 +367,7 @@ export class LocalWorkspaceHost {
     const live = [...this.jobs.values()].find(job => !job.closed && job.workspaceId === workspaceId && job.agentId === selected);
     const connections = this.connectionSnapshot(context);
     return { workspaceId, resourceGeneration: context.storage.run(() => currentWorkspaceResourceBinding()!.generation),
+      inheritance: workspaceId === this.inheritanceWorkspaceId ? this.inheritanceState : noLegacyStartup(),
       label: row.label, agentRevision: catalog.revision, agents: catalog.agents, selectedAgentId: selected,
       connections, runtimes: context.runtimes.list(), conversation: { revision: value.revision, sessionId: value.sessionId,
         state: live ? live.controller.signal.aborted ? "draining" : "running"

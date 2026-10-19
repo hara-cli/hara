@@ -18,7 +18,7 @@ export class WorkspaceLegacyConnectionImport implements LegacyDomainAdapter {
   readonly id = "connections" as const;
   readonly connections: WorkspaceSecureConnections;
   private readonly undo: LegacyScopedFileUndo;
-  constructor(private readonly storage: WorkspaceResourceStorage, private readonly source: LegacyConnectionCatalog,
+  constructor(private readonly storage: WorkspaceResourceStorage, private readonly source: Pick<LegacyConnectionCatalog, "inheritanceSeeds" | "resolve">,
     private readonly vault: CredentialVault, private readonly sourceFingerprint: string) {
     this.undo = new LegacyScopedFileUndo(storage, this.id, sourceFingerprint);
     this.connections = new WorkspaceSecureConnections(storage, vault, id => source.resolve(id, undefined, true, true));
