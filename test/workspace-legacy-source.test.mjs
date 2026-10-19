@@ -33,6 +33,7 @@ test("keyless legacy copy lists every provider without vault reads, writes, auto
    host.editConnection(a.workspaceId,selected.id,{...selected,apiKey:"fake-user-supplied"},a.connections.revision);
    assert.equal(writes,1);assert.equal(host.snapshot(a.workspaceId).connections.defaultConnectionId,selected.id);
    const b=host.createWorkspace("B",host.list().revision);assert.equal(b.connections.connections.length,0);assert(fs.readFileSync(join(source,".hara/profiles.json")).equals(original));
+   assert.equal(fs.statSync(join(source,".hara/profiles.json")).mode&0o777,0o400,"read-only source permissions are never repaired by a preview/import reader");
  } finally {await host.close();}
 });
 test("config overlays retain their own credentials but never borrow a key across providers",()=>{
@@ -53,4 +54,17 @@ test("Node and the packaged Bun engine agree on source IDs despite fractional fi
  const module=pathToFileURL(join(process.cwd(),"dist/workspace/legacy-connections.js")).href;
  const result=spawnSync("bun",["-e",`import {LegacyConnectionCatalog} from ${JSON.stringify(module)};console.log(JSON.stringify(new LegacyConnectionCatalog(process.argv[1],{get(){throw new Error("No credential reads");}}).personalSeeds().map(row=>row.id)));`,source],{encoding:"utf8",env:{PATH:process.env.PATH,HOME:source},timeout:5000});
  assert.equal(result.status,0,"Bun source-ID probe must succeed");assert.deepEqual(JSON.parse(result.stdout),expected);
+});
+test("a frozen backup retains original source identity without reading or chmodding the original location",()=>{
+ const original=directory(),copy=directory();const value={active:"one",profiles:[{id:"one",provider:"openai",model:"same",apiKey:"fake-only"}]};
+ write(original,"profiles.json",value);write(copy,"profiles.json",value);fs.chmodSync(join(copy,".hara/profiles.json"),0o400);
+ const vault=new MemoryCredentialVault();assert.deepEqual(new LegacyConnectionCatalog(copy,vault,original).personalSeeds().map(r=>r.id),new LegacyConnectionCatalog(original,vault).personalSeeds().map(r=>r.id));
+ assert.equal(fs.statSync(join(copy,".hara/profiles.json")).mode&0o777,0o400);
+});
+test("decision is an explicit owner-only connection source, never the active chat or a borrowed provider key",()=>{
+ const source=directory(),vault=new MemoryCredentialVault();write(source,"config.json",{provider:"openai",model:"chat",apiKey:"fake-chat",decisionBaseURL:"https://decision.example.invalid/v1",decisionModel:"judge",decisionApiKey:"fake-judge"});
+ const catalog=new LegacyConnectionCatalog(source,vault);assert.equal(catalog.personalSeeds().length,1);
+ const rows=catalog.inheritanceSeeds(),decision=rows.find(r=>r.purpose==="decision");assert.equal(rows.length,2);assert.equal(decision.isDefault,false);assert.equal(decision.legacyId,"__decision__");
+ assert.equal(JSON.stringify(rows).includes("fake-"),false);assert.throws(()=>catalog.resolve(decision.id),/changed or is unavailable/);
+ assert.equal(catalog.resolve(decision.id,undefined,true,true).input.apiKey,"fake-judge");
 });

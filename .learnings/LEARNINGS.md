@@ -1,5 +1,25 @@
 # Learnings
 
+## [LRN-20261019-INHERITANCE-WRITE-CHAIN] best_practice
+
+**Logged**: 2026-10-19
+**Priority**: high
+**Status**: implemented on isolated feat; live inheritance not performed
+**Area**: workspace
+
+- Discovery readers must not reuse state readers that repair permissions. Source bytes and modes
+  remain unchanged, including a 0400 copied config. Preview identities use bounded source hashes.
+- An undo postimage comes from the importer's journaled payload chain, not a final directory scan.
+  Journal the next hash before publication and the committed hash after publication. Unknown/newer
+  edits, unplanned outputs, deletion/binary bypass and detached asynchronous writes fail closed.
+- Credential cleanup references must be durable before a denied/unknown vault batch. Restore/revoke
+  metadata first, retain a tamper-checked reference-only cleanup audit, then remove only new owned
+  refs. A denied cleanup is retryable, not permission to remove a user's old credential.
+- Use the real serialized schema in copy rehearsals: old plugins.enabled is a boolean map, not an
+  array. Preserve explicit false states. Passing synthetic fixtures does not establish compatibility.
+
+---
+
 ## [LRN-20261018-CROSS-ENGINE-SOURCE-IDENTITY] native acceptance finding
 
 - Node and Bun expose filesystem timestamps at different precision. Never build persistent

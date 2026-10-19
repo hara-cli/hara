@@ -72,18 +72,27 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
         credentialGeneration: row.credentialGeneration, revision: row.revision, status: row.status, keySaved: !pending && !row.credentialMissing && row.status === "active", keyState: pending || row.credentialMissing ? "pending" : row.credentialInvalid ? "invalid" : "saved", credentialRequired: row.credentialMissing === true, cleanupPending: Boolean(row.retiredKeyRefs?.length), createdAt: row.createdAt, updatedAt: row.updatedAt })) };
   }
   /** Metadata-only prefill, once per personal Workspace. No vault access or secret persistence. */
-  stageLegacyImport(rows: readonly LegacyConnectionSeed[]): void {
+  stageLegacyImport(rows: readonly LegacyConnectionSeed[], extendReviewedOwnerImport = false): void {
     if (!rows.length) return;
-    const state = this.document.read(); if (state.readOnly || state.value.legacyImport) return;
+    const state = this.document.read(); if (state.readOnly || state.value.legacyImport && !extendReviewedOwnerImport) return;
     if (rows.length > 256) throw new Error("Too many legacy connections");
+    const oldPending = state.value.legacyImport?.state === "pending" ? state.value.legacyImport.rows : [];
+    if (oldPending.some(row => !rows.some(source => source.id === row.sourceId))) throw new Error("Legacy source changed after preview; original settings preserved");
     const now = new Date().toISOString(), fresh = rows.filter(row => !state.value.connections.some(old => old.importId === row.id));
     const entries: Metadata[] = fresh.map(row => { const id = `mc_${randomUUID()}`, generation = `gen_${randomUUID()}`;
       return { ...checked(row), id, credentialGeneration: generation, keyRef: `${state.value.resourceBinding.scopeKey}:${id}:${generation}`,
         revision: 1, status: "active", credentialMissing: row.keySaved === false, createdAt: now, updatedAt: now, importId: row.id }; });
-    const authorizations = entries.flatMap((row, index) => row.credentialMissing ? [] : [{ connectionId: row.id, sourceId: fresh[index]!.id }]);
+    const authorizations = [...oldPending, ...entries.flatMap((row, index) => row.credentialMissing ? [] : [{ connectionId: row.id, sourceId: fresh[index]!.id }])];
+    if (!fresh.length && state.value.legacyImport) return;
     this.document.update(state.value.revision, current => ({ ...current, connections: [...current.connections, ...entries],
       activeConnectionId: current.activeConnectionId ?? entries[fresh.findIndex(row => row.isDefault)]?.id ?? entries[0]?.id ?? null,
       legacyImport: { state: authorizations.length ? "pending" : "complete", rows: authorizations } }));
+  }
+  /** Private owner migration receipts only; never renderer/RPC DTOs, never credential values. */
+  inheritanceMetadata() {
+    const state = this.document.read(); if (state.readOnly) throw new Error("Secure settings require recovery before inheritance");
+    return state.value.connections.filter(row => row.status === "active").map(row => ({ id: row.id, importId: row.importId ?? null,
+      keyRef: row.keyRef, keyRequired: row.credentialMissing === true, credentialGeneration: row.credentialGeneration }));
   }
   retryMigration(expected: number): ReturnType<WorkspaceSecureConnections["list"]> {
     const state = this.document.read();

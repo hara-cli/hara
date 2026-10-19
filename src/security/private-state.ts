@@ -18,7 +18,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import type { Stats } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
+import { currentPrivateWriteObserver } from "./private-write-observer.js";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -510,10 +511,10 @@ function removePrivateStateLock(
       || remaining.record?.pid !== current.record?.pid
       || remaining.record?.token !== current.record?.token
     ) throw new Error(`private Hara state lock changed after companion release: '${binding.path}'`);
-    removePrivateStateFile(binding.path, remaining.snapshot, binding.directory);
+    removeVerifiedPrivateStateFile(binding.path, remaining.snapshot, binding.directory);
     return;
   }
-  removePrivateStateFile(binding.path, current.snapshot, binding.directory);
+  removeVerifiedPrivateStateFile(binding.path, current.snapshot, binding.directory);
 }
 
 function releasePrivateStateLock(
@@ -790,6 +791,7 @@ export function writePrivateStateBytesOnceSync(
   bytes: Uint8Array,
 ): void {
   const { directory, path } = binding;
+  if (currentPrivateWriteObserver()) throw new Error("Binary writes are not part of a text inheritance transaction");
   verifyPrivateDirectory(directory);
   if (resolve(path) !== join(directory.path, checkedPrivateComponent(basename(path)))) {
     throw new Error(`private Hara state file is outside '${directory.path}'`);
@@ -874,6 +876,11 @@ export function writePrivateStateFileSync(
   options: PrivateStateWriteOptions = {},
 ): void {
   const { directory, path } = binding;
+  const observer = currentPrivateWriteObserver();
+  const observe = (action: () => unknown): void => {
+    if (action() !== undefined) throw new Error("private write observation must be synchronous and return void");
+  };
+  if (observer) observe(() => observer.checkPath(path));
   const assertCurrent = (): void => {
     const result: unknown = options.assertCurrent?.();
     if (result !== undefined) throw new Error("private state authority fence must be synchronous and return void");
@@ -890,6 +897,8 @@ export function writePrivateStateFileSync(
   if (options.expectedText !== undefined && existing?.text !== options.expectedText) {
     throw new PrivateStateConflictError(`private Hara state file no longer matches the expected version: '${path}'`);
   }
+  const nextHash = observer ? createHash("sha256").update(text).digest("hex") : undefined;
+  if (observer) observe(() => observer.before(path, existing ? createHash("sha256").update(existing.text).digest("hex") : null, nextHash!));
   verifyPrivateDirectory(directory);
 
   const temp = join(directory.path, `.hara-private-${process.pid}-${randomUUID()}.tmp`);
@@ -1006,6 +1015,7 @@ export function writePrivateStateFileSync(
     ) throw new Error(`private Hara state file changed during commit: '${path}'`);
     verifyPrivateDirectory(directory);
     syncPrivateDirectory(directory.path);
+    if (observer) observe(() => observer.committed(path, nextHash!));
   } finally {
     if (fd !== undefined) try { closeSync(fd); } catch { /* preserve original error */ }
     if (staged) {
@@ -1091,6 +1101,17 @@ export async function readPrivateStateFileSnapshot(
 
 /** Remove only the exact single-link inode previously read from the same still-bound private directory. */
 export function removePrivateStateFile(
+  path: string,
+  expected: PrivateStateFileSnapshot,
+  directory: PrivateStateDirectoryIdentity,
+): void {
+  if (currentPrivateWriteObserver()) throw new Error("File deletion is not part of a text inheritance transaction");
+  removeVerifiedPrivateStateFile(path, expected, directory);
+}
+
+// Internal lock ownership cleanup is not a domain data mutation. Keep this bypass private and
+// reachable only after the lock token/inode checks above; exported deletion cannot evade tracing.
+function removeVerifiedPrivateStateFile(
   path: string,
   expected: PrivateStateFileSnapshot,
   directory: PrivateStateDirectoryIdentity,
