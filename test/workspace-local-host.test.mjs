@@ -10,6 +10,7 @@ import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { SYNTHETIC_CONNECTION } from "../dist/workspace/synthetic-provider.js";
 import { WorkspaceTreeBudget } from "../dist/workspace/tree-budget.js";
 import { WorkspaceResourceStorage, workspaceStateHome } from "../dist/workspace/resource-context.js";
+import { intelCaseTimeout } from "../scripts/intel-ci-test-budget.mjs";
 
 const temporary=[];
 after(()=>{for(const path of temporary)fs.rmSync(path,{recursive:true,force:true});});
@@ -19,7 +20,7 @@ function setup(options){
  host.configureSynthetic(workspaceId,0);host.select("client",workspaceId,host.list().revision);
  return{root,host,workspaceId,main:workspace.selectedAgentId};
 }
-async function until(check){const deadline=Date.now()+10000;while(Date.now()<deadline){const value=check();if(value)return value;await new Promise(r=>setTimeout(r,10));}throw new Error("bounded Workspace fixture did not reach expected state");}
+async function until(check){const deadline=Date.now()+intelCaseTimeout(10000,30000);while(Date.now()<deadline){const value=check();if(value)return value;await new Promise(r=>setTimeout(r,100));}throw new Error("bounded Workspace fixture did not reach expected state");}
 test("no-key boot, main chat, explicit creation card, colleague task and same-root restart are a real Host flow",async()=>{
  const a=setup();try{
   const hello=a.host.start("client",a.workspaceId,a.main,"hello",randomUUID());await a.host.wait(hello.runId);

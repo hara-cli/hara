@@ -16,6 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { intelCaseTimeout } from "../scripts/intel-ci-test-budget.mjs";
 import {
   acquireGatewayInstance,
   gatewayRuntimeScope,
@@ -735,7 +736,7 @@ test("gateway CLI recovery locates one opaque marker from the original message i
         HARA_FEISHU_APP_SECRET: "test-secret-never-written",
       },
       encoding: "utf8",
-      timeout: 10_000,
+      timeout: intelCaseTimeout(10_000, 60_000),
     },
   );
   try {
@@ -756,7 +757,7 @@ test("gateway CLI recovery locates one opaque marker from the original message i
     assert.deepEqual(await store.load(messageId), { status: "running" });
 
     const terminalized = run(`terminalize:${messageId}`);
-    assert.equal(terminalized.status, 0, terminalized.stderr || terminalized.stdout);
+    assert.equal(terminalized.status, 0, terminalized.error?.code || terminalized.stderr || terminalized.stdout);
     assert.match(terminalized.stdout, /converted to terminal/);
     assert.deepEqual(await store.load(messageId), { status: "terminal" });
     assert.deepEqual(await store.load(unrelatedId), { status: "running" });

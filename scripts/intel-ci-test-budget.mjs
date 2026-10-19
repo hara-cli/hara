@@ -1,4 +1,4 @@
-// Temporary 1.0.1 test-only budgets for the four measured slow Intel CI files.
+// Temporary 1.0.1 test-only budgets for the measured slow Intel CI files.
 // All files/assertions still run; Linux, arm64 and every other file retain their original budgets.
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
@@ -8,8 +8,9 @@ import { pathToFileURL } from "node:url";
 
 const version = JSON.parse(readFileSync(new URL("../package.json", import.meta.url))).version;
 export const INTEL_SLOW_FILES = Object.freeze([
+  "config-live.test.mjs", "cron-route-binding.test.mjs", "gateway-runtime-state.test.mjs", "home-workspace-cli.test.mjs",
   "legacy-copy-roundtrip.test.mjs", "legacy-startup.test.mjs",
-  "session-profile-cli.test.mjs", "workspace-production-entry.test.mjs",
+  "session-profile-cli.test.mjs", "workspace-local-host.test.mjs", "workspace-model-context.test.mjs", "workspace-production-entry.test.mjs",
 ]);
 export function usesIntelBudget({ platform = process.platform, arch = process.arch, env = process.env, release = version } = {}) {
   return release === "1.0.1" && platform === "darwin" && arch === "x64"

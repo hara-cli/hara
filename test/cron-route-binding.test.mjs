@@ -7,6 +7,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HARA_RUNTIME_VERSION } from "../dist/version.js";
+import { intelCaseTimeout } from "../scripts/intel-ci-test-budget.mjs";
 
 function runCli(args, cwd, home, extraEnv = {}) {
   return new Promise((resolve, reject) => {
@@ -54,7 +55,7 @@ function pendingOccurrence(id, cwd, jobId) {
   };
 }
 
-test("a fresh cron occurrence binds the active profile, Space, provider, and model before its first turn", { timeout: 20_000 }, async () => {
+test("a fresh cron occurrence binds the active profile, Space, provider, and model before its first turn", { timeout: intelCaseTimeout(20_000, 90_000) }, async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-cron-route-"));
   const home = join(root, "home");
   const project = join(root, "project");

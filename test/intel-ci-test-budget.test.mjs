@@ -11,7 +11,7 @@ test("temporary slow budgets require the exact Intel CI platform, flag and 1.0.1
     assert.equal(intelCaseTimeout(5000, 30000, { ...approved, ...changed }), 5000);
   }
 });
-test("Intel batching runs every original test exactly once and only four files receive extra time", () => {
+test("Intel batching runs every original test exactly once and only measured slow files receive extra time", () => {
   const files = readdirSync(new URL(".", import.meta.url)).filter(file => file.endsWith(".test.mjs")).sort();
   const [normal, slow] = intelTestBatches(files);
   assert.equal(normal.timeout, 120000); assert.equal(slow.timeout, 300000);

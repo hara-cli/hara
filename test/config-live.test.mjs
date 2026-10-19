@@ -4,6 +4,7 @@ import { linkSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, sy
 import { spawn, spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { intelCaseTimeout } from "../scripts/intel-ci-test-budget.mjs";
 
 const originalTrustProjectConfig = process.env.HARA_TRUST_PROJECT_CONFIG;
 delete process.env.HARA_TRUST_PROJECT_CONFIG;
@@ -1211,7 +1212,7 @@ test("config get masks every API key and authenticated proxy URL", () => {
     cwd: root,
     env: { ...process.env, HOME: home, USERPROFILE: home, HARA_UPDATE_CHECK: "0" },
     encoding: "utf8",
-    timeout: 10_000,
+    timeout: intelCaseTimeout(10_000, 60_000),
   });
   try {
     for (const key of ["visionApiKey", "embedApiKey", "routeApiKey", "fallbackApiKey", "decisionApiKey"]) {
