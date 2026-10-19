@@ -20,13 +20,14 @@ const reasons: Reason[] = ["host_execution_grant_required", "hara_cli_adapter_pe
 type RunState = "running" | "completed" | "failed" | "blocked" | "timed_out" | "cancelled" | "unknown";
 export interface LegacyCommandReceipt {
   requestId: string; runId: string; scheduleId: string; definitionHash: string; occurredAt: number;
-  state: RunState; code: number | null; reason: Reason | null; output: string; truncated: boolean;
+  state: RunState; code: number | null; reason: Reason | null; output: string; truncated: boolean; hadStdout?: boolean; finishedAt?: number;
 }
 interface State { resourceBinding: WorkspaceResourceBinding; revision: number; runs: LegacyCommandReceipt[] }
 export interface LegacyCommandReview {
   workspaceId: string; resourceBinding: WorkspaceResourceBinding; scheduleId: string; definitionHash: string;
-  sourceHash: string; resourceId: string; originalPath: string;
+  sourceHash: string; resourceId: string; originalPath: string; requestId: string;
 }
+export interface LegacyCliLease { env: Readonly<{ HARA_LEGACY_CLI_SOCKET: string; HARA_LEGACY_CLI_TOKEN: string }>; assertCurrent(): void }
 /** Issued by trusted Host composition only, never from an RPC/model argument or an imported role.
  * The Host owns the actual mount, shell/OS containment and per-task credential lease. Merely changing
  * cwd/HOME is NOT an OS read/network sandbox, and does not make this adapter production-ready. */
@@ -47,11 +48,15 @@ export interface LegacyCommandExit {
   /** True only after the Host launcher has confirmed the owned process tree stopped. */
   terminated: boolean;
 }
-interface Options {
+export interface LegacyCommandOptions {
   // Synchronous, bounded Host permit/vault lookup, not a network authorization wait. An asynchronous
   // installer/approval flow must finish separately before issuing this occurrence-specific permit.
   authorize(review: Readonly<LegacyCommandReview>): LegacyCommandGrant | undefined;
   launch(invocation: LegacyCommandInvocation): Promise<LegacyCommandExit>;
+  /** Host-only, occurrence-bound bridge. Never enables the legacy/global CLI entry. */
+  prepareCli?(review: Readonly<LegacyCommandReview>): LegacyCliLease;
+  /** Preflight the durable scoped outcome adapter; this callback must NOT send a message. */
+  prepareNotifications?(review: Readonly<LegacyCommandReview>): void;
   timeoutMs?: number; terminationGraceMs?: number;
 }
 function absolute(value: unknown): value is string {
@@ -72,7 +77,7 @@ export class WorkspaceLegacyCommands {
   private readonly timeout: number;
   private readonly grace: number;
   constructor(private readonly storage: WorkspaceResourceStorage, private readonly features: WorkspaceFeatures,
-    private readonly resources: WorkspaceLegacyResources, private readonly options: Options) {
+    private readonly resources: WorkspaceLegacyResources, private readonly options: LegacyCommandOptions) {
     this.timeout = options.timeoutMs ?? 30 * 60_000;
     this.grace = options.terminationGraceMs ?? 1500;
     if (!Number.isSafeInteger(this.timeout) || this.timeout < 10 || this.timeout > 24 * 60 * 60_000
@@ -87,7 +92,9 @@ export class WorkspaceLegacyCommands {
           || typeof row.runId !== "string" || !UUID.test(row.runId) || !text(row.scheduleId) || typeof row.definitionHash !== "string" || !/^[a-f0-9]{64}$/.test(row.definitionHash)
           || typeof row.occurredAt !== "number" || !Number.isFinite(row.occurredAt) || !["running", "completed", "failed", "blocked", "timed_out", "cancelled", "unknown"].includes(String(row.state))
           || !(row.code === null || Number.isSafeInteger(row.code)) || !(row.reason === null || reasons.includes(row.reason as Reason))
-          || typeof row.output !== "string" || row.output.length > MAX_OUTPUT || typeof row.truncated !== "boolean") throw new Error("Invalid command occurrence; source preserved");
+          || typeof row.output !== "string" || row.output.length > MAX_OUTPUT || typeof row.truncated !== "boolean"
+          || row.hadStdout !== undefined && typeof row.hadStdout !== "boolean"
+          || row.finishedAt !== undefined && (typeof row.finishedAt !== "number" || !Number.isFinite(row.finishedAt) || row.finishedAt < 0)) throw new Error("Invalid command occurrence; source preserved");
         ids.add(row.requestId);
       }
       return structuredClone(raw) as unknown as State;
@@ -122,7 +129,7 @@ export class WorkspaceLegacyCommands {
     // Never discard dedupe identities to make room. A separate, reviewed archive protocol is needed
     // before production retention can advance; silently forgetting an old request permits replay.
     if (before.runs.length >= MAX_RUNS || before.runs.filter(row => row.state === "running" || row.state === "unknown").length >= 128) return Promise.reject(new Error("Command receipt capacity requires inspection; no new command launched"));
-    const run: LegacyCommandReceipt = { requestId, runId: randomUUID(), scheduleId: id, definitionHash, occurredAt: Date.now(), state: "running", code: null, reason: null, output: "", truncated: false };
+    const run: LegacyCommandReceipt = { requestId, runId: randomUUID(), scheduleId: id, definitionHash, occurredAt: Date.now(), state: "running", code: null, reason: null, output: "", truncated: false, hadStdout: false };
     this.state.update(before.revision, old => ({ ...old, runs: [...old.runs, run] }));
     // Defer the operation so the in-flight map is installed even for a synchronous authorization path.
     const pending = Promise.resolve().then(() => this.run(row, run, signal)); this.active.set(requestId, pending);
@@ -130,7 +137,7 @@ export class WorkspaceLegacyCommands {
     return pending;
   }
   private finish(run: LegacyCommandReceipt, patch: Partial<LegacyCommandReceipt>): LegacyCommandReceipt {
-    const next = { ...run, ...patch }, old = this.state.read();
+    const next = { ...run, ...patch, finishedAt: Date.now() }, old = this.state.read();
     if (!old.runs.some(row => row.requestId === run.requestId && row.runId === run.runId && row.state === "running")) throw new Error("Command receipt changed; outcome requires inspection");
     this.state.update(old.revision, value => ({ ...value, runs: value.runs.map(row => row.runId === run.runId ? next : row) }));
     return next;
@@ -142,13 +149,15 @@ export class WorkspaceLegacyCommands {
     // Do not rewrite shell text or let a PATH lookup fall through to old hara/global HOME/8790.
     // This diagnostic is intentionally conservative, not a shell parser/security sandbox. The Host
     // launcher must still enforce its executable/mount boundary for nested scripts and escaped text.
-    if (/(?:^|[^a-z0-9_-])hara(?:$|[^a-z0-9_-])/i.test(row.definition.task as string)) return this.finish(run, { state: "blocked", reason: "hara_cli_adapter_pending" });
-    if (row.definition.deliver || row.definition.alertAfter) return this.finish(run, { state: "blocked", reason: "notification_adapter_pending" });
+    const needsCli = /(?:^|[^a-z0-9_-])hara(?:$|[^a-z0-9_-])/i.test(row.definition.task as string);
+    if (needsCli && !this.options.prepareCli) return this.finish(run, { state: "blocked", reason: "hara_cli_adapter_pending" });
+    if ((row.definition.deliver || row.definition.alertAfter) && !this.options.prepareNotifications) return this.finish(run, { state: "blocked", reason: "notification_adapter_pending" });
     let grant: LegacyCommandGrant | undefined;
     try {
       const legacy = row.definition.legacy as Record<string, string>;
-      grant = this.options.authorize(Object.freeze({ workspaceId: row.workspaceId, resourceBinding: Object.freeze(this.state.binding()), scheduleId: row.id,
-        definitionHash: run.definitionHash, sourceHash: legacy.sourceHash!, resourceId: legacy.resourceId!, originalPath: row.definition.cwd as string }));
+      const review = Object.freeze({ workspaceId: row.workspaceId, resourceBinding: Object.freeze(this.state.binding()), scheduleId: row.id,
+        definitionHash: run.definitionHash, sourceHash: legacy.sourceHash!, resourceId: legacy.resourceId!, originalPath: row.definition.cwd as string, requestId: run.requestId });
+      grant = this.options.authorize(review);
       if (grant && typeof (grant as unknown as { then?: unknown }).then === "function") {
         void Promise.resolve(grant).catch(() => {}); throw new Error("Asynchronous command authority is not a permit");
       }
@@ -160,8 +169,18 @@ export class WorkspaceLegacyCommands {
       // original fence may revoke its lease, but cannot silently redirect cwd/env after this check.
       grant = Object.freeze({ ...grant, resourceBinding: Object.freeze({ ...grant.resourceBinding }),
         ...(grant.feishu ? { feishu: Object.freeze({ ...grant.feishu }) } : {}), assertCurrent: grant.assertCurrent.bind(grant) });
-      const assertCurrent = () => { this.storage.run(() => {}); if (hash(this.row(row.id)) !== run.definitionHash) throw new Error(); fence(() => grant!.assertCurrent()); };
+      let cli: LegacyCliLease | undefined;
+      if (needsCli) {
+        const lease = this.options.prepareCli!(review);
+        if (lease && typeof (lease as unknown as { then?: unknown }).then === "function") { void Promise.resolve(lease).catch(() => {}); throw new Error(); }
+        if (!lease || !plain(lease.env) || Object.keys(lease.env).length !== 2 || !absolute(lease.env.HARA_LEGACY_CLI_SOCKET)
+          || !/^[a-f0-9]{64}$/.test(lease.env.HARA_LEGACY_CLI_TOKEN) || typeof lease.assertCurrent !== "function") throw new Error();
+        cli = Object.freeze({ env: Object.freeze({ ...lease.env }), assertCurrent: lease.assertCurrent.bind(lease) });
+      }
+      const assertCurrent = () => { this.storage.run(() => {}); if (hash(this.row(row.id)) !== run.definitionHash) throw new Error();
+        fence(() => grant!.assertCurrent()); if (cli) fence(() => cli!.assertCurrent()); };
       assertCurrent();
+      if (row.definition.deliver || row.definition.alertAfter) fence(() => this.options.prepareNotifications!(review));
       if (signal?.aborted) return this.finish(run, { state: "cancelled", reason: "command_cancelled" });
       const env: Record<string, string> = { HOME: grant.isolatedHome, USERPROFILE: grant.isolatedHome, PATH: grant.searchPath, TZ: row.definition.tz as string,
         HARA_CRON: "1", HARA_CRON_ID: row.id, HARA_UPDATE_CHECK: "0", NO_UPDATE_NOTIFIER: "1", npm_config_update_notifier: "false",
@@ -171,6 +190,7 @@ export class WorkspaceLegacyCommands {
           || /[\s\u0000-\u001f\u007f]/.test(grant.feishu.appSecret) || !["feishu", "lark"].includes(grant.feishu.domain)) throw new Error();
         env.HARA_FEISHU_APP_ID = grant.feishu.appId; env.HARA_FEISHU_APP_SECRET = grant.feishu.appSecret; env.HARA_FEISHU_DOMAIN = grant.feishu.domain;
       }
+      if (cli) Object.assign(env, cli.env);
       // Do not catch a started occurrence's persistence/authority failure as a pre-launch refusal.
       // Its durable running intent must remain unknown, never be relabelled "blocked" or replayed.
       return this.launch(row, run, grant, Object.freeze(env), assertCurrent, signal);
@@ -178,10 +198,10 @@ export class WorkspaceLegacyCommands {
   }
   private async launch(row: WorkspaceSchedule, run: LegacyCommandReceipt, grant: LegacyCommandGrant, env: Readonly<Record<string, string>>,
     assertCurrent: () => void, parent?: AbortSignal): Promise<LegacyCommandReceipt> {
-    const abort = new AbortController(); let reason: Reason | null = null, output = "", truncated = false, rawCharacters = 0;
+    const abort = new AbortController(); let reason: Reason | null = null, output = "", truncated = false, rawCharacters = 0, hadStdout = false;
     const stop = (why: Reason) => { if (!reason) { reason = why; abort.abort(); } };
     const capture = (safe: string) => { const left = MAX_OUTPUT - output.length; if (safe.length > left || safe.startsWith("[output line omitted")) truncated = true; if (left > 0) output += safe.slice(0, left); };
-    const stdout = createToolOutputLineRedactor(capture, {}, env, 8192), stderr = createToolOutputLineRedactor(capture, {}, env, 8192);
+    const stdout = createToolOutputLineRedactor(safe => { if (safe.trim()) hadStdout = true; capture(safe); }, {}, env, 8192), stderr = createToolOutputLineRedactor(capture, {}, env, 8192);
     const onOutput = (stream: "stdout" | "stderr", chunk: string) => {
       if (typeof chunk !== "string" || reason) return;
       rawCharacters += chunk.length;
@@ -205,10 +225,10 @@ export class WorkspaceLegacyCommands {
       stdout.flush(); stderr.flush();
       try { assertCurrent(); } catch { reason = "authority_changed"; }
       if (!exit || typeof exit.terminated !== "boolean" || !(exit.code === null || Number.isSafeInteger(exit.code)) || !exit.terminated || reason === "authority_changed") {
-        return this.finish(run, { state: "unknown", reason: reason === "authority_changed" ? reason : "execution_outcome_unconfirmed", output, truncated });
+        return this.finish(run, { state: "unknown", reason: reason === "authority_changed" ? reason : "execution_outcome_unconfirmed", output, truncated, hadStdout });
       }
       const terminal = reason === "command_timed_out" ? "timed_out" : reason === "command_cancelled" ? "cancelled" : reason ? "failed" : exit.code === 0 ? "completed" : "failed";
-      return this.finish(run, { state: terminal, code: exit.code, reason: reason ?? (exit.code === 0 ? null : "command_failed"), output, truncated });
+      return this.finish(run, { state: terminal, code: exit.code, reason: reason ?? (exit.code === 0 ? null : "command_failed"), output, truncated, hadStdout });
     } finally {
       clearTimeout(timeout); clearInterval(guard); if (hardTimer) clearTimeout(hardTimer);
       parent?.removeEventListener("abort", cancel);

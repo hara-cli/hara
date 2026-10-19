@@ -11051,3 +11051,32 @@ explicitly deferred with two alternatives. Earlier historical failures and stres
 - See Also: LRN-20261019-RETAIN-QUALIFIED-PROJECT-AGENT
 
 ---
+
+## [ERR-20261019-BUSINESS-FIXTURE-SYNTAX] test_fixture
+
+- Logged: 2026-10-19
+- Status: resolved
+- Area: tests
+- First focused run: the new business test module failed to parse (`Unexpected token ';'`), while
+  all 17 existing command tests passed. No new test body or copied business command ran.
+- Cause: overly compressed nested fake-transport object missed a method-closing brace. Expanded the
+  object and added an explicit Node syntax check before the next focused run; original assertions and
+  timeouts were not changed. Preserve the first log as evidence rather than rerun an unchanged failure.
+- Related Files: test/legacy-business.test.mjs
+
+---
+
+## [ERR-20261019-WORKTREE-PATH-CONTEXT] verification_paths
+
+- Logged: 2026-10-19
+- Status: resolved
+- Area: tests
+- Several read-only checks used workspace-relative inbox paths while the command cwd was an isolated
+  Core worktree, or a Core source path while cwd was Desktop. Those missing-file results were operator
+  path errors, not evidence that Hara features or handoffs disappeared. No product state changed.
+- Use the canonical absolute workspace inbox path and a repository-specific cwd for each parallel
+  check; discover filenames with rg before opening them. All Node verification uses the explicit
+  approved Node 22 PATH rather than relying on shell initialization.
+- Related Files: /Users/zhujianbo/work/projects/hara/inbox/README.md
+
+---

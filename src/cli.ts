@@ -7,6 +7,11 @@ const runtimeError = unsupportedNodeMessage();
 if (runtimeError) {
   process.stderr.write(`${runtimeError}\n`);
   process.exitCode = 1;
+} else if (process.env.HARA_LEGACY_CLI_SOCKET !== undefined || process.env.HARA_LEGACY_CLI_TOKEN !== undefined) {
+  // A partial/expired bridge must refuse, never fall through to global profiles, cron or providers.
+  void import("./workspace/legacy-cli.js").then(module => module.mainLegacyScopedCli(process.argv.slice(2))).catch(() => {
+    process.stderr.write("Scoped legacy CLI failed; no global fallback\n"); process.exitCode = 2;
+  });
 } else if (process.argv[2] === "--runtime-manifest") {
   void import("./runtime-distribution.js").then(({ runtimeDistribution }) => process.stdout.write(JSON.stringify(runtimeDistribution) + "\n"));
 } else if (process.argv[2] === "workspace-dev" || process.argv[2] === "workspace") {
