@@ -7,6 +7,7 @@ import { sameWorkspaceResourceBinding, workspaceStateHome, type WorkspaceResourc
 import { WorkspaceSkillLibrary, forkWorkspaceSkill, validateWorkspaceSkill, type WorkspaceSkillBundle } from "./skills.js";
 import { parseCron, type Schedule } from "../cron/schedule.js";
 import { redactSensitiveText } from "../security/secrets.js";
+import { WorkspaceInheritedSkills } from "./legacy-skills.js";
 
 export interface WorkspaceSchedule { id: string; name: string; schedule: Schedule; enabled: boolean; workspaceId: string; migrationId: string; source: string; definition: Record<string, unknown> }
 interface FeatureState { resourceBinding: WorkspaceResourceBinding; revision: number; schedules: WorkspaceSchedule[]; disabledSkills: string[]; skills: WorkspaceSkillBundle[] }
@@ -19,8 +20,10 @@ export function validWorkspaceSchedule(value: any): value is Schedule {
 export class WorkspaceFeatures {
   private readonly state: WorkspaceJsonState<FeatureState>;
   private readonly library: WorkspaceSkillLibrary;
+  private readonly inherited: WorkspaceInheritedSkills;
   constructor(private readonly storage: WorkspaceResourceStorage, private readonly project: string, private readonly workspaceId: string, libraryHome?: string) {
     this.library = new WorkspaceSkillLibrary(libraryHome ?? storage.run(() => workspaceStateHome()));
+    this.inherited = new WorkspaceInheritedSkills(storage);
     this.state = new WorkspaceJsonState(storage, "workspace-features-v1.json", raw => {
       if (!plain(raw) || !sameWorkspaceResourceBinding(raw.resourceBinding as WorkspaceResourceBinding, this.state.binding()) || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 1
         || !Array.isArray(raw.schedules) || raw.schedules.length > 4096 || !Array.isArray(raw.disabledSkills) || raw.disabledSkills.some(id => !text(id))) throw new Error("Invalid workspace feature settings");
@@ -33,12 +36,13 @@ export class WorkspaceFeatures {
   }
   list() {
     const value = this.state.read();
-    const candidates = this.library.candidates(this.project), skills = new Map(candidates.map(row => [row.id, row]));
+    const candidates = this.library.candidates(this.project), inherited = this.inherited.list(), skills = new Map(candidates.map(row => [row.id, row]));
+    for (const row of inherited) skills.set(row.id, row);
     for (const row of value.skills) skills.set(row.id, row);
     return { revision: value.revision, workspaceId: this.workspaceId,
       schedules: value.schedules.map(({ definition: _task, ...row }) => ({ ...row, name: safe(row.name) })),
       skills: [...skills.values()].map(row => ({ id: row.id, description: row.description, enabled: row.enabled, version: row.version, source: row.source,
-        locked: value.skills.some(pin => pin.id === row.id), availableVersion: candidates.find(candidate => candidate.id === row.id)?.version ?? row.version })) };
+        locked: value.skills.some(pin => pin.id === row.id) || inherited.some(pin => pin.id === row.id), availableVersion: candidates.find(candidate => candidate.id === row.id)?.version ?? row.version })) };
   }
   setScheduleEnabled(id: string, enabled: boolean, expected: number) {
     this.state.update(expected, current => { const row = current.schedules.find(row => row.id === id); if (!row) throw new Error("Scoped schedule unavailable"); row.enabled = enabled; return current; });
@@ -61,19 +65,19 @@ export class WorkspaceFeatures {
     this.state.update(current.revision, value => ({ ...value, schedules: value.schedules.filter(row => !ids.includes(row.migrationId)) }));
   }
   setSkillEnabled(id: string, enabled: boolean, expected: number, version?: string) {
-    const state = this.state.read(), pinned = state.skills.find(row => row.id === id), candidate = this.library.candidates(this.project).find(row => row.id === id);
+    const state = this.state.read(), pinned = state.skills.find(row => row.id === id) ?? this.inherited.list().find(row => row.id === id), candidate = this.library.candidates(this.project).find(row => row.id === id);
     const selected = version !== undefined ? [pinned, candidate].find(row => row?.version === version) : pinned ?? candidate;
     if (!selected || state.revision !== expected) throw new Error("Scoped skill version unavailable; refresh before changing");
     if (enabled) this.library.preserve(selected);
     this.state.update(expected, current => ({ ...current, skills: [...current.skills.filter(row => row.id !== id), { ...selected, enabled }] }));
   }
-  enabledSkills() { return this.state.read().skills.filter(row => row.enabled); }
+  enabledSkills() { const current = this.state.read(), skills = new Map(this.inherited.list().map(row => [row.id, row])); for (const row of current.skills) skills.set(row.id, row); return [...skills.values()].filter(row => row.enabled && !current.disabledSkills.includes(row.id)); }
   assertSkill(id: string, version: string) { if (!this.enabledSkills().some(row => row.id === id && row.version === version)) throw new Error("Workspace skill lock changed"); }
-  skillContent(id: string) { const row = this.state.read().skills.find(row => row.id === id); if (!row) throw new Error("Pinned skill unavailable"); return { id, version: row.version, content: row.files["SKILL.md"] }; }
+  skillContent(id: string) { const row = this.state.read().skills.find(row => row.id === id) ?? this.inherited.list().find(row => row.id === id); if (!row) throw new Error("Pinned skill unavailable"); return { id, version: row.version, content: row.files["SKILL.md"] }; }
   forkSkill(id: string, content: unknown, expected: number) {
     if (typeof content !== "string" || content.length > 64000) throw new Error("Invalid private skill instructions");
-    this.state.update(expected, current => { const row = current.skills.find(row => row.id === id); if (!row) throw new Error("Pinned skill unavailable");
-      return { ...current, skills: current.skills.map(value => value.id === id ? forkWorkspaceSkill(row, content) : value) }; });
+    this.state.update(expected, current => { const row = current.skills.find(row => row.id === id) ?? this.inherited.list().find(row => row.id === id); if (!row) throw new Error("Pinned skill unavailable");
+      return { ...current, skills: [...current.skills.filter(value => value.id !== id), forkWorkspaceSkill(row, content)] }; });
   }
   /** Offline migration only, deliberately not exposed to RPC/startup or a scheduler. */
   importLegacy(rows: WorkspaceSchedule[]) {
