@@ -12,6 +12,9 @@ All notable changes to `@nanhara/hara`.
   any command. Production Keychain guards, credential storage and all security assertions are unchanged.
 - Carry the verified 1.0.0 Workspace migration fixes forward without changing the fixed v1.0.0 tag.
   The right-hand panel regression is deferred to 1.0.2 and is not included here.
+- Give four measured slow Intel CI test files a bounded 1.0.1-only budget; all other files,
+  Linux and arm64 retain their original limits. Confirm the creation approval is consumed exactly
+  once and the accepted run completes before delegation; no platform or safety assertion is skipped.
 
 ## 1.0.0 — 2026-10-19 — Workspace candidate (not published)
 

@@ -13,10 +13,11 @@ import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { startLocalWorkspaceServe } from "../dist/serve/local-workspace.js";
 import { createWorkspaceSyntheticProvider, SYNTHETIC_CONNECTION } from "../dist/workspace/synthetic-provider.js";
 import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
+import { intelCaseTimeout } from "../scripts/intel-ci-test-budget.mjs";
 const temporary = [];
 function dir() { const path = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-production-entry-"))); temporary.push(path); return path; }
 after(() => { for (const path of temporary) fs.rmSync(path, { recursive: true, force: true }); });
-async function until(check) { const deadline = Date.now() + 5000; while (Date.now() < deadline) { const value = check(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 10)); } throw new Error("Formal fixture did not settle"); }
+async function until(check) { const deadline = Date.now() + intelCaseTimeout(5000, 30000); while (Date.now() < deadline) { const value = check(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 100)); } throw new Error("Formal fixture did not settle"); }
 test("formal six-step Host flow uses an explicit mock Provider; no DEV flags, lab markers or key-lane inheritance", async () => {
   const root = dir(), options = { mode: "workspace", credentialVault: new MemoryCredentialVault(), providerFactory: createWorkspaceSyntheticProvider }, host = new LocalWorkspaceHost(root, options);
   let restored;
@@ -28,7 +29,13 @@ test("formal six-step Host flow uses an explicit mock Provider; no DEV flags, la
     host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
     const hello = host.start("client", id, main, "hello", randomUUID()); await host.wait(hello.runId); assert.equal(host.snapshot(id).conversation.state, "completed");
     const create = host.start("client", id, main, "建立 Pi 同事 Coder", randomUUID()); const card = await until(() => host.snapshot(id, main, "client").approvals[0]);
-    host.answerApproval("client", id, card.id, true); await host.wait(create.runId); assert.equal(host.snapshot(id).agents.length, 2);
+    host.answerApproval("client", id, card.id, true); await host.wait(create.runId);
+    const created = host.snapshot(id, main, "client"); assert.equal(created.agents.length, 2);
+    assert.equal(created.approvals.length, 0); assert.equal(created.conversation.state, "completed");
+    const receipts = created.conversation.history.filter(row => row.role === "tool").flatMap(row => row.results).filter(row => row.name === "agent_create");
+    assert.equal(receipts.length, 1); assert.equal(receipts[0].isError, false);
+    assert.equal(JSON.parse(receipts[0].content).approvalState, "consumed");
+    assert.throws(() => host.answerApproval("client", id, card.id, true), /approval/);
     const task = host.start("client", id, main, "委派 Coder 生成 hello.md 並驗證", randomUUID()); await host.wait(task.runId);
     const before = host.snapshot(id, main, "client"); assert.equal(before.conversation.completion.state, "verified"); assert.equal(fs.readFileSync(join(root, "project", id, "hello.md"), "utf8"), "hello workspace\n");
     assert.equal(fs.existsSync(join(root, ".hara/workspace-dev-fixture.json")), false); assert.equal(JSON.parse(fs.readFileSync(join(root, ".hara/workspace-root-v1.json"))).kind, "hara-workspace");

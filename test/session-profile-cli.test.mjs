@@ -7,6 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { loadRoles } from "../dist/org/roles.js";
 import { latestForCwd } from "../dist/session/store.js";
+import { intelCaseTimeout } from "../scripts/intel-ci-test-budget.mjs";
 
 function runCli(args, cwd, home, extraEnv = {}) {
   return new Promise((resolve, reject) => {
@@ -198,7 +199,7 @@ test("doctor reports the active named Token Plan connection instead of stale Per
   }
 });
 
-test("doctor reports proxy provenance offline and hides credential-bearing model/proxy URLs", { timeout: 30_000 }, async () => {
+test("doctor reports proxy provenance offline and hides credential-bearing model/proxy URLs", { timeout: intelCaseTimeout(30_000, 90_000) }, async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-doctor-private-network-"));
   const home = join(root, "home");
   const project = join(root, "project");
@@ -238,7 +239,7 @@ test("doctor reports proxy provenance offline and hides credential-bearing model
   }
 });
 
-test("doctor uses the SDK-selected endpoint for offline proxy diagnosis without printing it", { timeout: 30_000 }, async () => {
+test("doctor uses the SDK-selected endpoint for offline proxy diagnosis without printing it", { timeout: intelCaseTimeout(30_000, 90_000) }, async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-doctor-sdk-endpoint-"));
   const home = join(root, "home");
   const project = join(root, "project");

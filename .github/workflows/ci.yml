@@ -157,7 +157,13 @@ jobs:
       - run: npm ci
       - name: Run full suite on the release-class Intel runner
         if: ${{ matrix.os == 'macos-15-intel' }}
-        run: npm test
+        shell: bash
+        run: |
+          if [[ "$(node -p 'require("./package.json").version')" == "1.0.1" ]]; then
+            node scripts/intel-ci-test-budget.mjs
+          else
+            npm test
+          fi
       - name: Compile and execute the native standalone binary
         shell: bash
         run: |

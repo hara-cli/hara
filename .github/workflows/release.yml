@@ -91,7 +91,14 @@ jobs:
           [[ "$GITHUB_REF_NAME" == "$expected" ]] || { echo "release tag mismatch: $GITHUB_REF_NAME != $expected" >&2; exit 1; }
           bun --version
       - run: npm ci
-      - run: npm test
+      - name: Run the full native suite
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == "macos-15-intel" && "$(node -p 'require("./package.json").version')" == "1.0.1" ]]; then
+            node scripts/intel-ci-test-budget.mjs
+          else
+            npm test
+          fi
       - name: Build, sign, verify, and execute the native Darwin asset
         shell: bash
         run: |
