@@ -44,6 +44,7 @@ export class WorkspaceLegacyResources {
     }, () => ({ revision: 0, resourceBinding: this.state.binding(), sourceFingerprint: "", resources: [] }));
   }
   list() { return this.state.read().resources.map(({ originalPath: _path, ...row }) => row); }
+  bindingForHost() { return this.state.binding(); }
   /** Host-only lookup is metadata, not a runnable mount or a renderer-selected filesystem path. */
   sourceForHost(id: string) { const row = this.state.read().resources.find(row => row.id === id); if (!row) throw new Error("Resource not registered in this Workspace"); return row; }
   domain(sourceFingerprint: string, rows: readonly LegacyResourceRecord[]) {

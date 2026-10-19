@@ -11037,3 +11037,17 @@ explicitly deferred with two alternatives. Earlier historical failures and stres
   updates, all 691 tests passed. Do not disable assertions or treat an access error as a product fix.
 
 ---
+
+## [ERR-20261019-ASSUMED-FLOW-MODULE-PATH] discovery
+
+- Logged: 2026-10-19
+- Status: resolved
+- Area: docs
+- Read-only searches initially guessed `src/flows.ts` / `src/flows/`, which do not exist. `rg --files`
+  identified the actual module at `src/gateway/flows.ts`; no product state was changed by the failure.
+- Use the discovered path immediately instead of adding guessed paths to later searches. A missing
+  guessed filename is not evidence that the flow feature or a qualified project identity is absent.
+- Related Files: src/gateway/flows.ts, src/workspace/legacy-project-agent.ts
+- See Also: LRN-20261019-RETAIN-QUALIFIED-PROJECT-AGENT
+
+---

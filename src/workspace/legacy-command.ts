@@ -12,10 +12,10 @@ import type { WorkspaceLegacyResources } from "./legacy-resources.js";
 
 const hash = (value: unknown) => createHash("sha256").update(canonical(value)).digest("hex");
 const MAX_OUTPUT = 8000, MAX_RUNS = 256;
-type Reason = "host_execution_grant_required" | "hara_cli_adapter_pending" | "notification_adapter_pending"
+type Reason = "host_execution_grant_required" | "hara_cli_adapter_pending" | "notification_adapter_pending" | "retained_project_runtime_pending"
   | "command_failed" | "command_timed_out" | "command_cancelled" | "command_output_limit"
   | "execution_outcome_unconfirmed" | "authority_changed";
-const reasons: Reason[] = ["host_execution_grant_required", "hara_cli_adapter_pending", "notification_adapter_pending", "command_failed",
+const reasons: Reason[] = ["host_execution_grant_required", "hara_cli_adapter_pending", "notification_adapter_pending", "retained_project_runtime_pending", "command_failed",
   "command_timed_out", "command_cancelled", "command_output_limit", "execution_outcome_unconfirmed", "authority_changed"];
 type RunState = "running" | "completed" | "failed" | "blocked" | "timed_out" | "cancelled" | "unknown";
 export interface LegacyCommandReceipt {
@@ -136,6 +136,9 @@ export class WorkspaceLegacyCommands {
     return next;
   }
   private async run(row: WorkspaceSchedule, run: LegacyCommandReceipt, signal?: AbortSignal): Promise<LegacyCommandReceipt> {
+    // A retained project identity is not a new readonly/Pi colleague or an ordinary shell grant.
+    // Keep the existing owner runtime in charge until its explicit Host bridge is connected.
+    if ((row.definition.legacy as Record<string, unknown>).projectAgent !== undefined) return this.finish(run, { state: "blocked", reason: "retained_project_runtime_pending" });
     // Do not rewrite shell text or let a PATH lookup fall through to old hara/global HOME/8790.
     // This diagnostic is intentionally conservative, not a shell parser/security sandbox. The Host
     // launcher must still enforce its executable/mount boundary for nested scripts and escaped text.

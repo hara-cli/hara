@@ -1295,3 +1295,36 @@ substitute identity or a permission source. Continue independent migration domai
 - Resolution: Bounded read-only preflight retained; no colleague creation, rename or permission import.
 
 ---
+
+## [LRN-20261019-RETAIN-QUALIFIED-PROJECT-AGENT] correction
+
+**Logged**: 2026-10-19
+**Priority**: high
+**Status**: in_progress
+**Area**: backend
+
+### Summary
+
+A missing global/native roster entry does not prove a qualified project Agent is absent. Preserve an
+explicitly owner-confirmed project identity instead of creating a new readonly persona for it.
+
+### Details
+
+The earlier conditional new-colleague proposal was superseded by the owner's explicit clarification.
+Keep the exact qualified alias, original project cwd and existing owner/runtime authority; do not
+silently substitute the main Agent, similarly named sample, Pi colleague or a narrower tool policy.
+This targeted compatibility approval is not permission to import all external roles, open protected
+business files, copy production keys or replay old tasks. Stage exact task/flow source hashes only in
+the approved Workspace/generation, retaining source commands and flags. Flow prompt hints are not
+static dispatch configuration or execution authority. Configuration-copy verification, real runtime
+dispatch, native switching, business execution and post-release owner acceptance remain separate.
+
+### Metadata
+
+- Source: user_feedback
+- Related Files: src/workspace/legacy-project-agent.ts, src/workspace/legacy-schedules.ts
+- Pattern-Key: migration.retain_owner_confirmed_qualified_project_identity
+- See Also: LRN-20261019-PRESERVE-EXISTING-EXAMPLE, LRN-20261019-LEGACY-SNAPSHOT-SCOPE
+- Notes: Explicit compatibility metadata is under test; native Host bridge and live acceptance pending.
+
+---

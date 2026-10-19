@@ -8,16 +8,19 @@ import type { WorkspaceResourceStorage } from "./resource-context.js";
 import type { WorkspaceLegacyResources } from "./legacy-resources.js";
 import { LegacyOwnerFileDomain } from "./legacy-file-domain.js";
 import { redactSensitiveText } from "../security/secrets.js";
+import { retainedProjectTaskRoutes, type RetainedProjectAgentPlan } from "./legacy-project-agent.js";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 /** Stage the reviewed mixed-mode source into the EXISTING feature/scheduler store. Source hashes,
  * clocks and enabled flags are retained; one unsafe row is metadata-only/quarantined, not discarded.
  * Nothing here enables migrated execution or calls a shell, Provider or delivery transport. */
 export function legacyScheduleRows(input: { jobs: unknown; plan: readonly LegacyTaskPlan[]; sourceFingerprint: string; workspaceId: string;
-  mainAgentId: string; resources: WorkspaceLegacyResources; knownCredentials?: readonly string[] }): WorkspaceSchedule[] {
+  mainAgentId: string; resources: WorkspaceLegacyResources; knownCredentials?: readonly string[]; retainedProjectAgents?: readonly RetainedProjectAgentPlan[] }): WorkspaceSchedule[] {
   const rows = Array.isArray(input.jobs) ? input.jobs : plain(input.jobs) ? input.jobs.jobs : null;
   if (!Array.isArray(rows) || rows.length !== input.plan.length || rows.length > 4096 || !isWorkspaceId(input.workspaceId) || !isWorkspaceAgentId(input.mainAgentId)
     || !/^[a-f0-9]{64}$/.test(input.sourceFingerprint) || new Set(input.plan.map(row => row.id)).size !== rows.length) throw new Error("Invalid reviewed legacy schedule source");
+  const projectRoutes = retainedProjectTaskRoutes(input.retainedProjectAgents ?? [], input.jobs, input.sourceFingerprint,
+    input.retainedProjectAgents?.length ? { workspaceId: input.workspaceId, resourceBinding: input.resources.bindingForHost() } : undefined);
   return rows.map(row => {
     if (!plain(row) || typeof row.id !== "string") throw new Error("Invalid legacy task identity");
     const review = input.plan.find(item => item.id === row.id);
@@ -35,7 +38,8 @@ export function legacyScheduleRows(input: { jobs: unknown; plan: readonly Legacy
     if (!quarantined && (redactSensitiveText(row.task).redactions.length || input.knownCredentials?.some(value => value.length >= 4 && row.task!.toString().includes(value)))) throw new Error("Task credential guard disagrees with dry-run; source preserved");
     const definition: Record<string, unknown> = { mode: row.mode, task: quarantined ? "" : row.task, cwd: row.cwd, tz: review.timezone,
       agentId: input.mainAgentId, createdAt: row.createdAt, legacy: { sourceHash: review.definitionHash, resourceId, originalEnabled: review.originalEnabled,
-        quarantined, reason: quarantined ? "source_review_required" : "execution_adapter_and_handoff_pending", oldStatus: ["ok", "error", "running"].includes(String(row.lastStatus)) ? row.lastStatus : null } };
+        quarantined, reason: quarantined ? "source_review_required" : "execution_adapter_and_handoff_pending", oldStatus: ["ok", "error", "running"].includes(String(row.lastStatus)) ? row.lastStatus : null,
+        ...(projectRoutes.has(row.id) ? { projectAgent: projectRoutes.get(row.id) } : {}) } };
     // Keep the scheduler's original occurrence/error generations, not arbitrary old stderr/body fields.
     for (const key of ["lastRunAt", "scheduleRevision", "lastRunScheduleRevision", "scheduleUpdatedAt", "definitionRevision", "alertAfter", "consecutiveErrors", "lastAlertAt"]) {
       if (row[key] === undefined) continue;
