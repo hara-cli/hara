@@ -121,7 +121,9 @@ export class LocalWorkspaceHost {
   }
   private async initializeInheritance(): Promise<LegacyStartupStatus> {
     if (this.options.mode !== "workspace") return noLegacyStartup();
-    const sourceHome = this.options.legacySourceHome ?? this.options.hostHome;
+    // Auto-inheritance needs an explicit trusted source. Data HOME and OS discovery are not consent
+    // to import an unrelated account's legacy data (notably in headless/private-HOME invocations).
+    const sourceHome = this.options.legacySourceHome;
     if (!sourceHome) return noLegacyStartup();
     this.inheritanceState = { ...noLegacyStartup(), state: "pending", reason: "legacy_inheritance_in_progress" };
     try {

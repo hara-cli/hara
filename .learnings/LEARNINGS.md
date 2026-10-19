@@ -1408,4 +1408,10 @@ dependency gaps. A candidate-package estimate does not authorize live handoff, i
   execution adapters after its gate; no global CLI/credential fallback is an acceptable shortcut.
 - Related Files: src/workspace/legacy-startup.ts, src/workspace/local-host.ts, test/legacy-startup.test.mjs
 
+- Follow-up: OS-account discovery is NOT an implicit auto-import grant for a manually invoked CLI.
+  Native composition must pass its source explicitly; without that authority, headless CLI/Host
+  initialization must not inspect old account data or create an automatic migration target.
+  Private-HOME tests must assert both no target creation and not-needed import state, not only an
+  empty caller Home. Earlier logs without this root audit cannot establish fully isolated reads.
+
 ---

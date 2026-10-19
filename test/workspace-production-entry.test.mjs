@@ -57,6 +57,8 @@ test("actual formal CLI routes before legacy startup, never imports caller Home 
   const root = dir(), home = dir(), execute = promisify(execFile), env = { PATH: process.env.PATH, HOME: home, USERPROFILE: home };
   const result = await execute(process.execPath, [resolve("dist/cli.js"), "workspace", "init", "--root", root], { env, cwd: dir() });
   assert.equal(JSON.parse(result.stdout).executionMode, "workspace"); assert.deepEqual(fs.readdirSync(home), []);
+  assert.equal(JSON.parse(result.stdout).inheritance.state, "not_needed", "an implicit OS discovery root is not automatic import authority");
+  assert.equal(JSON.parse(result.stdout).workspaces.length, 0, "no auto-import target is created without an explicit trusted source");
   await assert.rejects(execute(process.execPath, [resolve("dist/cli.js"), "workspace", "status", "--root", root, "--ark-key-file", "/not-read"], { env }));
   assert.deepEqual(fs.readdirSync(home), []);
 });

@@ -101,6 +101,10 @@ test("a fresh formal Host with only its own root marker never mistakes that mark
   const f=fixture(t),host=new LocalWorkspaceHost(f.root,{mode:"workspace",hostHome:f.root,credentialVault:f.vault});
   try{assert.equal((await host.initialize()).state,"not_needed");assert.equal(host.list().workspaces.length,0);}finally{await host.close();}
 });
+test("a data Home containing old files is still not consent to auto-import without an explicit source",async t=>{
+  const f=fixture(t),host=new LocalWorkspaceHost(f.root,{mode:"workspace",hostHome:f.sourceHome,credentialVault:f.vault});
+  try{assert.equal((await host.initialize()).state,"not_needed");assert.equal(host.list().workspaces.length,0);}finally{await host.close();}
+});
 test("Host scheduler routes approved fixture command occurrences into scoped business/outcome handlers only after its gate",async t=>{
   let calls=0;
   const f=fixture(t,{businessFactory:({storage,features,resources})=>new WorkspaceLegacyBusiness(storage,features,resources,{

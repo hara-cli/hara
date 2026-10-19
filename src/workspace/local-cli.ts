@@ -32,17 +32,21 @@ export async function mainLocalWorkspaceCli(args: string[], mode?: "workspace"):
   if (mode && (values.has("--ark-key-file") || values.has("--ark-slice"))) throw new Error("Workspace mode cannot import acceptance credentials");
   const slice = values.get("--ark-slice");
   if (slice !== undefined && (slice !== ARK_CONTEXT_TRIM_SLICE || !values.has("--ark-key-file"))) throw new Error("invalid explicit real-key slice");
+  const discovered = mode ? workspaceHostSources() : undefined;
+  // Native Host always supplies its reviewed source explicitly. A manual CLI with a private HOME
+  // must not silently promote the OS account's discovery root into automatic import authority.
+  const hostSources = discovered ? { ...discovered, legacySourceHome: process.env.HARA_WORKSPACE_LEGACY_SOURCE_HOME ? discovered.legacySourceHome : undefined } : {};
   if (command === "serve") {
     const port = Number(values.get("--port") ?? 0);
     const handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port, cwd: root,
       ...(process.env.HARA_WORKSPACE_DEV_TOKEN ? { token: process.env.HARA_WORKSPACE_DEV_TOKEN } : {}) },
-      { root, mode, ...(mode ? workspaceHostSources() : {}), realKeyFile: values.get("--ark-key-file"), realKeySlice: slice, version: "0.187.1", allowedOrigins: ["http://127.0.0.1:1437", "http://localhost:1437", "http://localhost:1420", "http://127.0.0.1:1420"] });
+      { root, mode, ...hostSources, realKeyFile: values.get("--ark-key-file"), realKeySlice: slice, version: "0.187.1", allowedOrigins: ["http://127.0.0.1:1437", "http://localhost:1437", "http://localhost:1420", "http://127.0.0.1:1420"] });
     console.log(JSON.stringify({ type: mode ? "workspace-ready" : "workspace-dev-ready", protocol: 1, capability: mode ? "workspace.v1" : "workspace.local-dev.v2", port: handle.port, syntheticOnly: !mode && !values.has("--ark-key-file") }));
     let stopping = false;
     const stop = () => { if (stopping) return; stopping = true; void handle.close().catch(() => { process.exitCode = 1; }); };
     process.once("SIGTERM", stop); process.once("SIGINT", stop); return;
   }
-  const host = new LocalWorkspaceHost(root, { mode, ...(mode ? workspaceHostSources() : {}), interactiveApprovals: false, realKeyFile: values.get("--ark-key-file"), realKeySlice: slice });
+  const host = new LocalWorkspaceHost(root, { mode, ...hostSources, interactiveApprovals: false, realKeyFile: values.get("--ark-key-file"), realKeySlice: slice });
   try {
     await host.initialize();
     if (command === "init" || command === "status") { console.log(JSON.stringify(host.list())); return; }
