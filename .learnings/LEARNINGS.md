@@ -1265,3 +1265,33 @@ reproducible full-suite failures; passing two full runs does not guarantee an ar
   archive hash, exact cleanup receipt and remaining source gaps in the task's private evidence.
 
 ---
+
+## [LRN-20261019-PRESERVE-EXISTING-EXAMPLE] correction
+
+**Logged**: 2026-10-19
+**Priority**: high
+**Status**: resolved
+**Area**: backend
+
+### Summary
+
+Conditional permission to create a colleague does not authorize duplicating, renaming or replacing an
+existing system example. Verify identity and storage scope first, preserving existing permissions.
+
+### Details
+
+Check native role identity and current/archived Workspace catalog identity, not only historical
+conversation references or usernames. Absence in a default local root is not absence in an operator-
+selected root or another window. When coverage is incomplete, keep creation pending rather than
+materializing a second example. A similarly titled CFO or an external production persona is not a
+substitute identity or a permission source. Continue independent migration domains while locating it.
+
+### Metadata
+
+- Source: user_feedback
+- Related Files: src/workspace/legacy-agents.ts, src/workspace/agents.ts
+- Pattern-Key: migration.preserve_existing_example_before_conditional_creation
+- See Also: LRN-20261019-LEGACY-SNAPSHOT-SCOPE
+- Resolution: Bounded read-only preflight retained; no colleague creation, rename or permission import.
+
+---
