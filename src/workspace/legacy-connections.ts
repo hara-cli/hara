@@ -13,7 +13,7 @@ interface Source { id: string; label: string; provider: "openai" | "anthropic"; 
   legacyId: string; purpose: "chat" | "decision"; read(): string | undefined }
 function read(path: string): { value: any; revision: string } | null {
   try { const info = lstatSync(path); if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || realpathSync.native(path) !== path || info.size > 4 * 1024 * 1024
-      || process.platform !== "win32" && (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0)) return null;
+      || process.platform !== "win32" && (info.uid !== process.getuid?.() || (info.mode & 0o022) !== 0)) return null;
     const bytes = readLegacyBackupBytes(path, 4 * 1024 * 1024), text = decodeUtf8Strict(bytes, path);
     // Stats timestamps are represented with different precision by Node and Bun. Source identity
     // must survive a CLI/sidecar handoff, while still rejecting any changed credential or metadata.

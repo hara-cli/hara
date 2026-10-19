@@ -53,7 +53,8 @@ test("an inherited Pi colleague performs an actual synthetic file task and remai
   const f=fixture(t),host=f.open();try{
     await host.initialize();const id=host.list().workspaces[0].workspaceId,a=host.snapshot(id).agents.find(row=>row.kind==="colleague"&&row.state==="active");
     const accepted=host.start("test",id,a.agentId,"生成 hello.md 並驗證",randomUUID());await host.wait(accepted.runId);
-    assert.equal(host.snapshot(id,a.agentId).conversation.taskState,"completed");assert.equal(fs.readFileSync(join(f.root,"project",id,"hello.md"),"utf8"),"hello workspace\n");
+    const conversation=host.snapshot(id,a.agentId).conversation;
+    assert.equal(conversation.taskState,"completed",JSON.stringify(conversation));assert.equal(fs.readFileSync(join(f.root,"project",id,"hello.md"),"utf8"),"hello workspace\n");
     const other=host.createWorkspace("Other",host.list().revision);assert.equal(other.agents.length,1);assert.equal(other.connections.connections.length,0);
     assert.equal(host.workspaceFeatures(other.workspaceId).schedules.length,0);assert.equal(host.workspaceFeatures(other.workspaceId).skills.length,0);
   }finally{await host.close();}
@@ -85,11 +86,48 @@ test("a tampered encrypted backup cannot restart import or gain another Workspac
   const raw=JSON.parse(fs.readFileSync(file));raw.tag="0".repeat(32);fs.writeFileSync(file,JSON.stringify(raw)+"\n");const before=fs.readFileSync(file),b=f.open();
   try{assert.equal((await b.initialize()).state,"pending");assert.deepEqual(fs.readFileSync(file),before);assert.equal(b.list().workspaces.length,1);}finally{await b.close();}
 });
-test("readonly source symlinks and public role files are rejected without chmod or target role effects",async t=>{
-  for(const mode of["link","public"]){const f=fixture(t),path=join(f.sourceHome,".hara/roles/legacy00.md");
-    if(mode==="link"){const original=path+".original";fs.renameSync(path,original);fs.symlinkSync(original,path);}else fs.chmodSync(path,0o644);
+test("readonly 0644 legacy sources inherit into an existing personal Workspace without chmod, plaintext keys or duplication",async t=>{
+  const f=fixture(t,{roles:17,jobs:99});
+  const inventory=root=>fs.readdirSync(root,{withFileTypes:true}).sort((a,b)=>a.name.localeCompare(b.name)).flatMap(entry=>{
+    const path=join(root,entry.name);return entry.isDirectory()?inventory(path):[{path,mode:fs.statSync(path).mode&0o777,hash:hash(fs.readFileSync(path))}];
+  });
+  for(const row of inventory(f.sourceHome))fs.chmodSync(row.path,0o644);
+  const before=inventory(f.sourceHome);
+  const seed=new LocalWorkspaceHost(f.root,{mode:"workspace",hostHome:f.root,credentialVault:f.vault,providerFactory:createWorkspaceSyntheticProvider});
+  let personalId;try{await seed.initialize();personalId=seed.createWorkspace("My existing personal Workspace",seed.list().revision).workspaceId;}finally{await seed.close();}
+  let agentIds;
+  const host=f.open();try{
+    const state=await host.initialize();assert.equal(state.state,"verified");assert.equal(state.roles,17);assert.equal(state.schedules,99);
+    assert.equal(host.list().workspaces.length,1);assert.equal(host.catalog.resolvePersonalWorkspace().scope.workspaceId,personalId);
+    const snapshot=host.snapshot(personalId),features=host.workspaceFeatures(personalId);agentIds=snapshot.agents.map(row=>row.agentId);
+    assert.equal(snapshot.agents.length,18);assert.equal(features.schedules.length,99);assert.equal(snapshot.connections.connections.length,1);
+    assert.equal(features.scheduler.migratedEnabled,false);assert.equal(allText(f.root).includes(SYNTHETIC_CONNECTION.apiKey),false);
+    assert.match(allText(f.root),/Use concise Chinese summaries/);
+    assert(inventory(f.root).every(row=>row.mode===0o600),"all copied Workspace files must remain private 0600");
+    assert.deepEqual(inventory(f.sourceHome),before);
+  }finally{await host.close();}
+  const reopened=f.open();try{assert.equal((await reopened.initialize()).state,"verified");assert.equal(reopened.list().workspaces.length,1);
+    assert.deepEqual(reopened.snapshot(personalId).agents.map(row=>row.agentId),agentIds);assert.equal(reopened.workspaceFeatures(personalId).schedules.length,99);
+    assert.equal(reopened.snapshot(personalId).connections.connections.length,1);assert.deepEqual(inventory(f.sourceHome),before);
+  }finally{await reopened.close();}
+});
+test("source symlinks, hardlinks and group/other-writable roles remain rejected without source chmod or partial import",async t=>{
+  for(const mode of["link","hardlink",0o664,0o620,0o602,0o666]){const f=fixture(t),path=join(f.sourceHome,".hara/roles/legacy00.md");
+    if(mode==="link"){const original=path+".original";fs.renameSync(path,original);fs.symlinkSync(original,path);}
+    else if(mode==="hardlink")fs.linkSync(path,path+".other");else fs.chmodSync(path,mode);
+    const before=fs.lstatSync(path);
     const host=f.open();try{assert.equal((await host.initialize()).state,"pending");assert.equal(host.snapshot(host.list().workspaces[0].workspaceId).agents.length,1);
-      assert.equal(mode==="link"?fs.lstatSync(path).isSymbolicLink():fs.statSync(path).mode&0o777,mode==="link"?true:0o644);
+      assert.equal(host.snapshot(host.list().workspaces[0].workspaceId).connections.connections.length,0);
+      assert.equal(fs.lstatSync(path).mode,before.mode);assert.equal(fs.lstatSync(path).nlink,before.nlink);
+    }finally{await host.close();}
+  }
+});
+test("writable legacy config and memory cannot bypass the readonly-source migration boundary",async t=>{
+  for(const relative of[".hara/config.json",".hara/profiles.json",".hara/cron/jobs.json",".hara/memory/global/MEMORY.md"]){
+    const f=fixture(t);if(relative.endsWith("profiles.json"))f.write(relative,"{}");const path=join(f.sourceHome,relative);fs.chmodSync(path,0o664);
+    const before=fs.readFileSync(path),host=f.open();try{assert.equal((await host.initialize()).state,"pending");const id=host.list().workspaces[0].workspaceId;
+      assert.equal(host.snapshot(id).agents.length,1);assert.equal(host.snapshot(id).connections.connections.length,0);assert.equal(host.workspaceFeatures(id).schedules.length,0);
+      assert.equal(fs.statSync(path).mode&0o777,0o664);assert.deepEqual(fs.readFileSync(path),before);
     }finally{await host.close();}
   }
 });

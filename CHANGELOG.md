@@ -13,6 +13,9 @@ All notable changes to `@nanhara/hara`.
 - Await Agent/schedule inheritance at formal Host startup, freeze an encrypted source backup, and
   preserve later edits across restart or owner rollback. A manual CLI requires an explicit legacy
   source; imported schedules remain off until a separately approved live handoff.
+- Accept owned, non-group/other-writable legacy sources (including 0644) during read-only inheritance,
+  without chmodding the source. Keep Workspace copies private at 0600 and continue refusing links,
+  writable/foreign sources and changed input; cover existing personal spaces and repeat startup.
 - Use the shared runtime version in the Workspace Serve handshake, so npm metadata, standalone CLI
   and Desktop's bundled engine no longer retain different version literals.
 - This is a local candidate record only. Developer ID signing, notarization, native upgrade/rollback,

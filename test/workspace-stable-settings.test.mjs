@@ -80,9 +80,10 @@ test("post-commit backup failure never deletes a new credential referenced by du
  try {assert.throws(()=>store.edit(store.list().connections[0].id,{...input(),apiKey:""},store.list().revision),/denied/);}finally{fs.linkSync=original;syncBuiltinESMExports();}
  assert.equal(store.resolve(store.capture()).apiKey,fakeKey);assert.equal(store.list().connections[0].cleanupPending,true);
 });
-test("legacy source preview rejects aliases, public/hard-linked config and excludes the current workspace source",()=>{
+test("legacy source preview accepts readonly public config, rejects writable/hard-linked config and excludes the current workspace source",()=>{
  const home=dir(),path=join(home,".hara/config.json");fs.mkdirSync(dirname(path),{recursive:true,mode:0o700});fs.writeFileSync(path,JSON.stringify(input()),{mode:0o600});const catalog=new LegacyConnectionCatalog(home,new MemoryCredentialVault());
- assert.equal(catalog.list(path).length,0);fs.chmodSync(path,0o644);assert.equal(catalog.list().length,0);fs.chmodSync(path,0o600);
+ assert.equal(catalog.list(path).length,0);fs.chmodSync(path,0o644);assert.equal(catalog.list().length,1);assert.equal(fs.statSync(path).mode&0o777,0o644);
+ fs.chmodSync(path,0o664);assert.equal(catalog.list().length,0);fs.chmodSync(path,0o600);
  fs.linkSync(path,join(home,"retained-hardlink.json"));assert.equal(catalog.list().length,0);
 });
 test("bundle-id-independent theme settings survive upgrade, ordered schema migration and backup recovery",()=>{

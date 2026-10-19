@@ -23,6 +23,19 @@ test("automatic owner import batches fake keys in vault, preserves active select
  for(const file of fs.readdirSync(f.stateRoot()).filter(name=>name.endsWith(".json"))){const text=fs.readFileSync(join(f.stateRoot(),file),"utf8");for(const value of[fakeChat,fakeA,fakeDecision])assert.equal(text.includes(value),false);}
  assert.equal(fs.statSync(join(f.source,".hara/config.json")).mode&0o777,0o400);
 });
+test("readonly 0644 provider sources import into private 0600 Workspace metadata without source edits",async t=>{
+ const f=fixture(t),paths=["config.json","profiles.json"].map(name=>join(f.source,".hara",name));
+ for(const path of paths)fs.chmodSync(path,0o644);const before=paths.map(path=>fs.readFileSync(path));
+ const domain=f.open(),receipt=await domain.apply();assert.equal(receipt.objects,4);assert.equal(await domain.verify(receipt),true);
+ assert.equal(domain.connections.list().connections.length,4);
+ for(let i=0;i<paths.length;i++){assert.equal(fs.statSync(paths[i]).mode&0o777,0o644);assert.deepEqual(fs.readFileSync(paths[i]),before[i]);}
+ for(const name of fs.readdirSync(f.stateRoot()).filter(name=>name.endsWith(".json"))){const file=join(f.stateRoot(),name);
+  assert.equal(fs.statSync(file).mode&0o777,0o600);const value=fs.readFileSync(file,"utf8");for(const key of[fakeChat,fakeA,fakeDecision])assert.equal(value.includes(key),false);}
+});
+test("provider sources writable by group or others are never accepted as inherited credentials",t=>{
+ for(const mode of[0o664,0o620,0o602,0o666]){const f=fixture(t),file=join(f.source,".hara/config.json"),before=fs.readFileSync(file);fs.chmodSync(file,mode);
+  assert.equal(f.catalog.inheritanceSeeds().some(row=>row.source===file),false);assert.equal(fs.statSync(file).mode&0o777,mode);assert.deepEqual(fs.readFileSync(file),before);}
+});
 test("reopen and repeated apply preserve connection IDs and credential generations without another write",async t=>{
  const f=fixture(t),a=f.open(),r=await a.apply(),map=a.connectionMap();const state=a.connections.list();const again=f.open();assert.deepEqual(await again.apply(),r);assert.deepEqual(again.connectionMap(),map);assert.deepEqual(again.connections.list(),state);assert.equal(await again.verify(r),true);
 });

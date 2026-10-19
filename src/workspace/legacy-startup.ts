@@ -58,7 +58,9 @@ function capture(sourceHome: string, vault: CredentialVault): Material | null {
     for (const part of parts.slice(0, -1)) { parent = join(parent, part); if (!directory(parent)) return null; }
     const path = join(sourceHome, relative);
     try { const info = lstatSync(path);
-      if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || process.platform !== "win32" && (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0)) throw new Error("Unsafe legacy source file");
+      // Legacy Markdown/config commonly used 0644. Reading an owned, non-writable source does
+      // not grant execution or publish it: the frozen copy is encrypted and target state is 0600.
+      if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || process.platform !== "win32" && (info.uid !== process.getuid?.() || (info.mode & 0o022) !== 0)) throw new Error("Unsafe legacy source file");
       const bytes = readLegacyBackupBytes(path, max); total += bytes.length;
       if (total > 2 * 1024 * 1024 || captures.length >= 512) throw new Error("Legacy startup source exceeds bounded backup");
       const content = bytes.toString("utf8"); if (!Buffer.from(content).equals(bytes)) throw new Error("Legacy source is not UTF-8");
