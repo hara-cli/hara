@@ -11092,3 +11092,18 @@ explicitly deferred with two alternatives. Earlier historical failures and stres
   subsequent reads use the repository's rg-discovered file inventory.
 
 ---
+
+## [ERR-20261019-VERSION-SEARCH-PATHS] operator_search
+
+- Logged: 2026-10-19
+- Status: resolved
+- A read-only version search passed an unmatched test glob to zsh and guessed nonexistent formal-CLI
+  test filenames. The commands stopped before product execution. Use rg --files to discover the
+  actual workspace-production-entry.test.mjs first, and quote glob filters passed to rg itself.
+- Broad version-property searches also printed dependency-lock versions rather than product fields;
+  use exact old-version literals and bounded root metadata slices instead. No user state changed.
+- Two local-only build-helper patches also failed closed because unnecessary unchanged context had
+  mistyped quote/parenthesis anchors. Neither patch applied. Removed the unrelated context and used
+  minimal exact hunks before syntax-checking; no build, signing or source mutation ran on failure.
+
+---

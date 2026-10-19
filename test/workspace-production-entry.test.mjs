@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { once } from "node:events";
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { createServer } from "node:http";
 import { WebSocket } from "ws";
@@ -61,6 +61,37 @@ test("actual formal CLI routes before legacy startup, never imports caller Home 
   assert.equal(JSON.parse(result.stdout).workspaces.length, 0, "no auto-import target is created without an explicit trusted source");
   await assert.rejects(execute(process.execPath, [resolve("dist/cli.js"), "workspace", "status", "--root", root, "--ark-key-file", "/not-read"], { env }));
   assert.deepEqual(fs.readdirSync(home), []);
+});
+test("actual formal CLI Serve reports the package runtime version without importing any implicit source", async () => {
+  const root = dir(), home = dir(), env = { PATH: process.env.PATH, HOME: home, USERPROFILE: home };
+  const child = spawn(process.execPath, [resolve("dist/cli.js"), "workspace", "serve", "--root", root, "--port", "0"], { env, cwd: dir(), stdio: ["ignore", "pipe", "pipe"] });
+  let socket;
+  const exited = new Promise(resolve => child.once("exit", resolve));
+  try {
+    const ready = await new Promise((resolve, reject) => {
+      let output = "";
+      const timer = setTimeout(() => reject(new Error("bounded formal CLI startup")), 10000);
+      child.once("error", reject); child.once("exit", () => reject(new Error("formal CLI exited before ready")));
+      child.stdout.on("data", bytes => {
+        output += String(bytes);
+        if (output.length > 8192) { clearTimeout(timer); reject(new Error("unexpected CLI startup output")); return; }
+        for (const line of output.split("\n")) {
+          try { const value = JSON.parse(line); if (value.type === "workspace-ready") { clearTimeout(timer); resolve(value); return; } } catch { /* partial line */ }
+        }
+      });
+    });
+    const receipt = JSON.parse(fs.readFileSync(join(root, "home/.hara/workspace-runtime/serve-v2.json")));
+    assert.equal(receipt.pid, child.pid); assert.equal(receipt.port, ready.port);
+    socket = new WebSocket(`ws://127.0.0.1:${ready.port}`); await once(socket, "open");
+    const message = once(socket, "message"); socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { token: receipt.token } }));
+    const response = JSON.parse(String((await message)[0])); assert.equal(response.error, undefined);
+    const expected = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url))).version;
+    assert.equal(response.result.version, expected);
+    assert.equal(response.result.workspace.inheritance.state, "not_needed"); assert.equal(response.result.workspace.workspaces.length, 0);
+    assert.deepEqual(fs.readdirSync(home), []);
+  } finally {
+    socket?.terminate(); child.kill("SIGTERM"); await exited;
+  }
 });
 test("formal default factory sends exactly the scoped fake credential/model to a loopback mock, never ambient keys", async () => {
   let received = [];

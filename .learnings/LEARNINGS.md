@@ -1415,3 +1415,20 @@ dependency gaps. A candidate-package estimate does not authorize live handoff, i
   empty caller Home. Earlier logs without this root audit cannot establish fully isolated reads.
 
 ---
+
+## [LRN-20261019-CANDIDATE-VERSION-PROVENANCE] best_practice
+
+- Logged: 2026-10-19
+- Status: implemented; local candidate gates pending
+- Area: infra
+- A version-only candidate bump must align package/root-lock metadata and every runtime handshake,
+  not just visible labels. Reuse HARA_RUNTIME_VERSION for Workspace Serve; do not keep a separate
+  source literal that can survive a major-version bump. Verify the actual child CLI handshake.
+- Commit Core first, refresh the exact clean SHA with the original sidecar producer, then lock
+  Desktop and build a new candidate directory. Preserve earlier artifacts and mark supersession;
+  version 1.0.0 alone never proves signing, native acceptance, publication or live handoff.
+- Source: user_feedback
+- Pattern-Key: release.candidate_metadata_and_runtime_provenance
+- Related Files: src/version.ts, src/workspace/local-cli.ts, test/workspace-production-entry.test.mjs
+
+---

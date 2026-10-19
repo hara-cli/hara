@@ -5,6 +5,7 @@ import { messageBody, text } from "./local-state.js";
 import { ARK_CONTEXT_TRIM_SLICE } from "./real-key-provider.js";
 import { WorkspaceBudgetAdmissionError } from "./tree-budget.js";
 import { homedir, userInfo } from "node:os";
+import { HARA_RUNTIME_VERSION } from "../version.js";
 
 /** Operator-only paths, never accepted from model/RPC. Writes stay under hostHome; discovery and
  * legacy reads use the OS account Home, not the Workspace/SDK/isolated process HOME. */
@@ -40,7 +41,7 @@ export async function mainLocalWorkspaceCli(args: string[], mode?: "workspace"):
     const port = Number(values.get("--port") ?? 0);
     const handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port, cwd: root,
       ...(process.env.HARA_WORKSPACE_DEV_TOKEN ? { token: process.env.HARA_WORKSPACE_DEV_TOKEN } : {}) },
-      { root, mode, ...hostSources, realKeyFile: values.get("--ark-key-file"), realKeySlice: slice, version: "0.187.1", allowedOrigins: ["http://127.0.0.1:1437", "http://localhost:1437", "http://localhost:1420", "http://127.0.0.1:1420"] });
+      { root, mode, ...hostSources, realKeyFile: values.get("--ark-key-file"), realKeySlice: slice, version: HARA_RUNTIME_VERSION, allowedOrigins: ["http://127.0.0.1:1437", "http://localhost:1437", "http://localhost:1420", "http://127.0.0.1:1420"] });
     console.log(JSON.stringify({ type: mode ? "workspace-ready" : "workspace-dev-ready", protocol: 1, capability: mode ? "workspace.v1" : "workspace.local-dev.v2", port: handle.port, syntheticOnly: !mode && !values.has("--ark-key-file") }));
     let stopping = false;
     const stop = () => { if (stopping) return; stopping = true; void handle.close().catch(() => { process.exitCode = 1; }); };

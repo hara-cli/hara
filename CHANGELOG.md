@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 1.0.0 — 2026-10-19 — Workspace candidate (not published)
+
+- Prepare the Workspace-first entry with isolated Agent identities, conversations, model connections,
+  memory, skills and task state. Pi is the only preinstalled runtime; other coding runtimes require
+  explicit local registration or approved on-demand installation.
+- Await Agent/schedule inheritance at formal Host startup, freeze an encrypted source backup, and
+  preserve later edits across restart or owner rollback. A manual CLI requires an explicit legacy
+  source; imported schedules remain off until a separately approved live handoff.
+- Use the shared runtime version in the Workspace Serve handshake, so npm metadata, standalone CLI
+  and Desktop's bundled engine no longer retain different version literals.
+- This is a local candidate record only. Developer ID signing, notarization, native upgrade/rollback,
+  live business handoff and public distribution remain separate acceptance/release gates.
+
 ## 0.187.1 — 2026-10-13 — retire the local WeChat group scene
 
 - Remove the local visible-WeChat-group Agent controller from the shipped Serve runtime. It no
