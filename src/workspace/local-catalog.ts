@@ -16,6 +16,8 @@ export interface LocalWorkspaceRecord {
   grantId: string;
   grantRevision: number;
   active: boolean;
+  /** Immutable owner-home marker, not an organizational tier or cross-Workspace authority. */
+  personal?: true;
 }
 export interface LocalWorkspaceCatalogState {
   schemaVersion: 2;
@@ -34,13 +36,14 @@ function parse(value: unknown): LocalWorkspaceCatalogState {
     || !text(value.hostId) || !positive(value.hostEpoch) || !Array.isArray(value.workspaces) || value.workspaces.length > 128) return fail();
   const seen = new Set<string>();
   for (const row of value.workspaces) {
-    if (!plain(row) || !exact(row, ["scope", "label", "actorId", "policyRevision", "grantId", "grantRevision", "active"])
+    if (!plain(row) || !exact(row, ["scope", "label", "actorId", "policyRevision", "grantId", "grantRevision", "active", ...(row.personal !== undefined ? ["personal"] : [])])
       || !text(row.label, 80) || !text(row.actorId) || !text(row.grantId) || !positive(row.policyRevision)
-      || !positive(row.grantRevision) || typeof row.active !== "boolean") return fail();
+      || !positive(row.grantRevision) || typeof row.active !== "boolean" || row.personal !== undefined && (row.personal !== true || !row.active)) return fail();
     const scope = parseWorkspaceResourceScope(row.scope);
     if (scope.authority.kind !== "local" || scope.authority.localAuthorityId !== value.localAuthorityId || seen.has(scope.workspaceId)) return fail();
     seen.add(scope.workspaceId);
   }
+  if (value.workspaces.filter(row => row.personal === true).length > 1) return fail();
   if (value.activeWorkspaceId !== null && (!isWorkspaceId(value.activeWorkspaceId)
     || !value.workspaces.some(row => row.scope.workspaceId === value.activeWorkspaceId && row.active))) return fail();
   return structuredClone(value) as unknown as LocalWorkspaceCatalogState;
@@ -107,6 +110,7 @@ export class LocalWorkspaceCatalog {
     this.update(expectedRevision, state => {
       const row = state.workspaces.find(row => row.scope.workspaceId === workspaceId && row.active);
       if (!row || row.grantRevision >= Number.MAX_SAFE_INTEGER) throw new Error("Workspace grant unavailable");
+      if (row.personal) throw new Error("The personal Workspace cannot be revoked or replaced");
       row.active = false; row.grantRevision++;
       if (state.activeWorkspaceId === workspaceId) state.activeWorkspaceId = null;
     });
@@ -115,5 +119,15 @@ export class LocalWorkspaceCatalog {
     const row = this.read().workspaces.find(row => row.scope.workspaceId === workspaceId && row.active);
     if (!row) throw new Error("Workspace is unavailable or revoked");
     return row;
+  }
+  /** Explicit owner operation. Never infer identity from label, foreground selection or Agent input.
+   * Existing v2 catalogs use their stable bootstrap (first) row, not the first currently active row. */
+  resolvePersonalWorkspace(): LocalWorkspaceRecord {
+    const state = this.read(), marked = state.workspaces.filter(row => row.personal);
+    if (marked.length === 1) return marked[0]!;
+    const first = state.workspaces[0];
+    if (!first?.active) throw new Error("Personal Workspace is missing or revoked; legacy data was not imported");
+    const next = this.update(state.revision, current => { current.workspaces[0]!.personal = true; });
+    return next.workspaces[0]!;
   }
 }
