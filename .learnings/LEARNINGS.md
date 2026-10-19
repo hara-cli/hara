@@ -1359,3 +1359,36 @@ guards, live handoff/24-hour observation and native package upgrade as separate 
 - Resolution: Definition/identity comparisons precede a single append; regression covers partial-batch refusal, duplicate IDs and user toggles.
 
 ---
+
+## [LRN-20261019-MIGRATION-REQUIRED-SCOPE] correction
+
+**Logged**: 2026-10-19
+**Priority**: high
+**Status**: resolved
+**Area**: backend
+
+### Summary
+
+An explicitly narrowed migration must have a durable, reviewed required-domain plan. Optional legacy
+surfaces must not remain hidden release blockers, but their receipts must never be fabricated.
+
+### Details
+
+Keep Agent execution dependencies (memory, skills, cwd and connections) and schedules with delivery/
+alerts mandatory. Defer old conversation archives, standalone artifact surfaces and full plugin
+compatibility when the owner narrows scope. Preserve source/backups and already-working unrelated
+features. A required-domain plan cannot shrink during a partial import or rollback; old full-domain
+journals retain their original contract. Unresolved tools actually needed by an Agent remain explicit
+dependency gaps. A candidate-package estimate does not authorize live handoff, install or release.
+
+### Metadata
+
+- Source: user_feedback
+- Related Files: src/workspace/legacy-coordinator.ts
+- Pattern-Key: migration.persist_required_scope_without_fake_receipts
+- See Also: LRN-20261019-LEGACY-SNAPSHOT-SCOPE
+- Resolution: Added an explicit immutable six-domain Agent/schedule profile; old unprofiled journals
+  retain eight domains. Regressions reject omitted dependencies, changed profiles and forged verified
+  markers, and prove partial-write recovery/rollback without optional settings/history effects.
+
+---

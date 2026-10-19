@@ -10,6 +10,9 @@ const INHERITANCE_LEASE_ID = "3539c726-43ba-432d-852d-b19a3e2a63f3";
 
 export const LEGACY_DOMAINS = ["connections", "settings", "roles", "memory", "skills", "resources", "history", "schedules"] as const;
 export type LegacyDomainId = typeof LEGACY_DOMAINS[number];
+// Jeff's v1 cut retains all execution dependencies; optional settings/history are not fake receipts.
+export const LEGACY_AGENT_SCHEDULE_DOMAINS = ["connections", "roles", "memory", "skills", "resources", "schedules"] as const;
+export type LegacyInheritanceProfile = "full-v1" | "agents-and-schedules-v1";
 export interface LegacySourceBinding { sourceFingerprint: string; planHash: string; backupHash: string }
 export interface LegacyDomainReceipt { hash: string; objects: number }
 export interface LegacyDomainAdapter {
@@ -23,7 +26,7 @@ export interface LegacyDomainAdapter {
 }
 type Phase = "empty" | "detected" | "backed_up" | "dry_run" | "applying" | "applied" | "verified" | "rolling_back" | "rolled_back";
 interface Domain { id: LegacyDomainId; state: "applying" | "applied" | "verified" | "rolled_back"; receipt: LegacyDomainReceipt | null }
-interface State { revision: number; schemaVersion: 1; resourceBinding: WorkspaceResourceBinding; source: LegacySourceBinding | null; phase: Phase; round: number; domains: Domain[] }
+interface State { revision: number; schemaVersion: 1; profile?: LegacyInheritanceProfile; resourceBinding: WorkspaceResourceBinding; source: LegacySourceBinding | null; phase: Phase; round: number; domains: Domain[] }
 const digest = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 function source(value: unknown): value is LegacySourceBinding {
   return plain(value) && Object.keys(value).length === 3 && digest(value.sourceFingerprint) && digest(value.planHash) && digest(value.backupHash);
@@ -33,23 +36,35 @@ function receipt(value: unknown): value is LegacyDomainReceipt {
 }
 export class WorkspaceLegacyCoordinator {
   private readonly state: WorkspaceJsonState<State>;
+  private readonly profile: LegacyInheritanceProfile;
+  private readonly requiredDomains: readonly LegacyDomainId[];
   private busy = false;
   private lease?: WorkspaceSessionLease;
   constructor(private readonly storage: WorkspaceResourceStorage, private readonly catalog: LocalWorkspaceCatalog,
-    private readonly currentSource: () => LegacySourceBinding, private readonly adapters: readonly LegacyDomainAdapter[]) {
-    if (adapters.length !== LEGACY_DOMAINS.length || new Set(adapters.map(row => row.id)).size !== LEGACY_DOMAINS.length
-      || adapters.some(row => !LEGACY_DOMAINS.includes(row.id))) throw new Error("Every legacy domain must have one explicit owner adapter");
+    private readonly currentSource: () => LegacySourceBinding, private readonly adapters: readonly LegacyDomainAdapter[],
+    options: { profile?: LegacyInheritanceProfile } = {}) {
+    this.profile = options.profile ?? "full-v1";
+    if (!["full-v1", "agents-and-schedules-v1"].includes(this.profile)) throw new Error("Explicit reviewed inheritance profile required");
+    this.requiredDomains = Object.freeze([...(this.profile === "full-v1" ? LEGACY_DOMAINS : LEGACY_AGENT_SCHEDULE_DOMAINS)]);
+    if (adapters.length !== this.requiredDomains.length || new Set(adapters.map(row => row.id)).size !== this.requiredDomains.length
+      || adapters.some(row => !this.requiredDomains.includes(row.id))) throw new Error("Every required legacy domain must have one explicit owner adapter");
     this.state = new WorkspaceJsonState(storage, "workspace-legacy-inheritance-v1.json", raw => {
+      // Journals written before scope profiles existed remain FULL imports. Neither partial imports
+      // nor completed/rolled-back rounds may silently change their required set on restart.
+      if (plain(raw) && (raw.profile ?? "full-v1") !== this.profile) throw new Error("Legacy inheritance profile changed; preserve the existing journal and reviewed plan");
       if (!plain(raw) || raw.schemaVersion !== 1 || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 1
         || !sameWorkspaceResourceBinding(raw.resourceBinding as WorkspaceResourceBinding, this.state.binding())
         || !["empty", "detected", "backed_up", "dry_run", "applying", "applied", "verified", "rolling_back", "rolled_back"].includes(String(raw.phase))
-        || !Number.isSafeInteger(raw.round) || Number(raw.round) < 1 || !source(raw.source) || !Array.isArray(raw.domains) || raw.domains.length > LEGACY_DOMAINS.length
+        || !Number.isSafeInteger(raw.round) || Number(raw.round) < 1 || !source(raw.source) || !Array.isArray(raw.domains) || raw.domains.length > this.requiredDomains.length
         || new Set(raw.domains.map(row => plain(row) ? row.id : null)).size !== raw.domains.length) throw new Error("Invalid inheritance journal; existing data preserved");
-      for (const row of raw.domains) if (!plain(row) || !LEGACY_DOMAINS.includes(row.id as LegacyDomainId)
+      for (const row of raw.domains) if (!plain(row) || !this.requiredDomains.includes(row.id as LegacyDomainId)
         || !["applying", "applied", "verified", "rolled_back"].includes(String(row.state)) || !(row.receipt === null || receipt(row.receipt))
         || row.receipt === null && ["applied", "verified"].includes(String(row.state))) throw new Error("Invalid inheritance domain receipt");
+      if (["applied", "verified"].includes(String(raw.phase)) && (raw.domains.length !== this.requiredDomains.length
+        || raw.domains.some(row => !plain(row) || !["applied", "verified"].includes(String(row.state))
+          || raw.phase === "verified" && row.state !== "verified"))) throw new Error("Required inheritance domains are incomplete; no handoff allowed");
       return structuredClone(raw) as unknown as State;
-    }, () => ({ schemaVersion: 1, revision: 0, resourceBinding: this.state.binding(), source: null, phase: "empty", round: 0, domains: [] }));
+    }, () => ({ schemaVersion: 1, revision: 0, profile: this.profile, resourceBinding: this.state.binding(), source: null, phase: "empty", round: 0, domains: [] }));
   }
   read() { return this.state.read(); }
   private assertTarget() {
@@ -91,7 +106,7 @@ export class WorkspaceLegacyCoordinator {
     if (!["dry_run", "applying", "applied", "verified"].includes(this.read().phase)) throw new Error("Inheritance is not ready to apply");
     if (this.read().phase === "verified") return this.read();
     this.change(old => ({ ...old, phase: "applying" }));
-    for (const id of LEGACY_DOMAINS) {
+    for (const id of this.requiredDomains) {
       this.assertSource(); if (this.read().domains.some(row => row.id === id && ["applied", "verified"].includes(row.state))) continue;
       this.change(old => ({ ...old, domains: [...old.domains.filter(row => row.id !== id), { id, state: "applying", receipt: null }] }));
       let result: LegacyDomainReceipt;
@@ -103,8 +118,8 @@ export class WorkspaceLegacyCoordinator {
     return this.change(old => ({ ...old, phase: "applied" }));
   }); }
   async verify() { return this.exclusive(async () => {
-    this.assertSource(); if (!["applied", "verified"].includes(this.read().phase) || this.read().domains.length !== LEGACY_DOMAINS.length) throw new Error("Inheritance is incomplete");
-    for (const id of LEGACY_DOMAINS) {
+    this.assertSource(); if (!["applied", "verified"].includes(this.read().phase) || this.read().domains.length !== this.requiredDomains.length) throw new Error("Inheritance is incomplete");
+    for (const id of this.requiredDomains) {
       const row = this.read().domains.find(row => row.id === id)!;
       this.assertSource(); if (!row.receipt || !await this.adapters.find(item => item.id === id)!.verify(row.receipt)) throw new Error(`Legacy ${id} verification failed; no handoff allowed`);
       this.change(old => ({ ...old, domains: old.domains.map(row => row.id === id ? { ...row, state: "verified" } : row) }));
