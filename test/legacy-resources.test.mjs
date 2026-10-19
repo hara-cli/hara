@@ -1,0 +1,13 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { WorkspaceResourceStorage } from "../dist/workspace/resource-context.js";
+import { planLegacyResources,WorkspaceLegacyResources } from "../dist/workspace/legacy-resources.js";
+const plan=()=>planLegacyResources({jobs:[{cwd:"/legacy/project"},{cwd:"/legacy/project"},{cwd:"/legacy/other"}],projects:[{name:"project",path:"/legacy/project"}],legacyWorkspacePath:"/legacy/workspace"});
+function fixture(t){const home=fs.realpathSync(fs.mkdtempSync(join(tmpdir(),"hara-legacy-resources-")));t.after(()=>fs.rmSync(home,{recursive:true,force:true}));const scope={schemaVersion:1,workspaceId:"ws_10000000-0000-4000-8000-000000000001",authority:{kind:"local",localAuthorityId:"20000000-0000-4000-8000-000000000001"}},storage=new WorkspaceResourceStorage(home,scope);storage.initialize();return{home,scope,storage,open:()=>new WorkspaceLegacyResources(storage)};}
+test("task/project/folder identities deduplicate without scanning or granting filesystem rights",()=>{const rows=plan();assert.equal(rows.length,3);assert.deepEqual(rows.find(row=>row.originalPath==="/legacy/project").purposes,["project","schedule-cwd"]);assert(rows.every(row=>row.access==="catalog_only"));});
+test("registered identities survive reopen and guarded rollback/re-upgrade",async t=>{const f=fixture(t),d=f.open().domain("a".repeat(64),plan()),r=await d.apply();assert.equal(await d.verify(r),true);assert.deepEqual(await f.open().domain("a".repeat(64),plan()).apply(),r);assert.equal(f.open().list().length,3);assert.equal(f.open().list()[0].originalPath,undefined);await d.rollback();assert.equal(f.open().list().length,0);await f.open().domain("a".repeat(64),plan()).apply();assert.equal(f.open().list().length,3);});
+test("bad roots, traversal and forged authority are refused rather than mapped to a default cwd",t=>{for(const path of ["/","relative","/legacy/../elsewhere"])assert.throws(()=>planLegacyResources({jobs:[{cwd:path}],projects:[],legacyWorkspacePath:"/legacy/workspace"}),/path review/);const f=fixture(t),rows=plan();assert.throws(()=>f.open().domain("a".repeat(64),[{...rows[0],access:"execute"}]),/identity/);});
+test("another Workspace cannot resolve the imported folder even by a known ID",async t=>{const f=fixture(t),rows=plan();await f.open().domain("a".repeat(64),rows).apply();const other=new WorkspaceResourceStorage(f.home,{...f.scope,workspaceId:"ws_10000000-0000-4000-8000-000000000002"});other.initialize();assert.throws(()=>new WorkspaceLegacyResources(other).sourceForHost(rows[0].id),/not registered/);});

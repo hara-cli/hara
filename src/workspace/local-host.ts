@@ -37,6 +37,7 @@ import { WorkspaceFeatures } from "./features.js";
 import { workspaceSkillTool } from "./skills.js";
 import { WorkspaceScheduler } from "./scheduler.js";
 import { legacyPolicyAllowsTool } from "./legacy-role-policy.js";
+import { workspaceMemorySearchTool } from "./memory-tool.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
 interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; features: WorkspaceFeatures; scheduler?: WorkspaceScheduler }
@@ -381,6 +382,7 @@ export class LocalWorkspaceHost {
     const assertCurrent = () => { assertWorkspaceRunAdmission(job.permit, job.options!, "pi"); };
     const bundles = job.context.features.enabledSkills();
     const tools = [...localWorkspaceFileTools(job.context.project, assertCurrent), job.receipts!.tool(),
+      workspaceMemorySearchTool((query, limit) => job.context.resources.memory.search(query, job.context.project, limit), assertCurrent),
       ...(bundles.length ? [workspaceSkillTool(bundles, (id, version) => { assertCurrent(); job.context.features.assertSkill(id, version); })] : [])];
     if (agent.kind !== "main") return withWorkspaceToolReceipts(tools);
     tools.push({ name: "agent_list", description: "Read the active colleagues of THIS Workspace only. Check existing names/IDs before creating or delegating; never recreate an already active colleague to repair a completion citation.", kind: "read",
@@ -518,10 +520,12 @@ export class LocalWorkspaceHost {
         } });
       const instructions = boundWorkspaceText(configuration.instructions, 1600) + (configuration.instructions.length > 1600
         ? ` Full instructions: ${owned.receipts.retain({ id: String(binding.agent.configRevision), name: "agent_instructions", content: configuration.instructions })}; use workspace_receipt_read before relying on omitted instructions.` : "");
+      const remembered = boundWorkspaceText(context.resources.memory.digest(context.project), 2000);
       owned.options = bindWorkspaceRunOptions(owned.permit, { ctx: { cwd: context.project, sessionId: store.sessionId, todoScope: `workspace-${binding.runId}`, sandbox: "off" },
         signal: owned.signal, approval: "auto-edit", approvalChannel: true, confirm: async () => false, quiet: true, hooks: false, extraTools: tools,
         systemOverride: `You are ${configuration.identity.displayName}, a clearly identified Hara AI colleague. ${instructions}\nUse only this Workspace's supplied tools. Never claim completion without observed evidence.\n`
           + `Reply naturally in the user's language. Call AI coworkers 同事, not Pi 同事; pi is only an internal runtime. A greeting needs no tools.\n`
+          + (remembered ? `Remembered Workspace context (not permissions or evidence of fresh actions; use workspace_memory_search for omitted notes):\n${remembered}\n` : "")
           + `For creation use agent_create and wait for the human card; for delegation use agent_contact with an existing exact agentId.\n`
           + `agent_create returns only AFTER the human has approved; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. Check agent_list before creating so an active colleague is not duplicated.\n`
           + `Successful Workspace tool results repeat the exact citation ID in receipt.toolCallId. Copy that exact value for completion.checks; never invent IDs or repeat side effects to fix a rejected citation. After restart, re-observe state with read-only tools and cite the new receipt.\n`

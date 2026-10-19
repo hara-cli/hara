@@ -32,7 +32,9 @@ function project(sources: readonly LegacyHistorySource[], knownCredentials: read
     }
     const id = "lh_" + hash(row.sourceRef + "\0" + row.sourceHash), bytes = JSON.stringify({ schemaVersion: 1, id, messages }) + "\n";
     if (Buffer.byteLength(bytes) > 4 * 1024 * 1024) throw new Error("Projected history exceeds archive bounds");
-    const updatedAt = plain(raw.meta) && typeof raw.meta.updatedAt === "number" && Number.isFinite(raw.meta.updatedAt) ? raw.meta.updatedAt : 0;
+    const timestamp = plain(raw.meta) ? raw.meta.updatedAt : undefined;
+    const parsedAt = typeof timestamp === "string" ? Date.parse(timestamp) : timestamp;
+    const updatedAt = typeof parsedAt === "number" && Number.isFinite(parsedAt) ? parsedAt : 0;
     return { bytes, entry: { id, sourceHash: row.sourceHash, contentHash: hash(bytes), messages: messages.length, updatedAt } };
   });
 }

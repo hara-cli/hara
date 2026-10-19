@@ -10,7 +10,7 @@ export function validateWorkspaceLegacyToolPolicy(raw: unknown): WorkspaceLegacy
 }
 const aliases: Record<string, string[]> = {
   workspace_read: ["read_file", "read"], workspace_verify: ["read_file", "read"], workspace_write: ["write_file", "edit_file", "apply_patch", "write", "edit"],
-  workspace_list: ["ls", "glob"], workspace_skill: ["skill"],
+  workspace_list: ["ls", "glob"], workspace_skill: ["skill"], workspace_memory_search: ["memory_search"],
 };
 /** Only filters an already scoped base tool set. No unknown tool, shell, app or external transport is
  * invented to satisfy an old allow-list. Deny remains an intersection; readOnly cannot be widened. */

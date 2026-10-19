@@ -1,5 +1,27 @@
 # Learnings
 
+## [LRN-20261019-LEGACY-DATA-AND-EXECUTION] best_practice
+
+**Logged**: 2026-10-19
+**Priority**: high
+**Status**: implemented on isolated feat; native upgrade/live cutover not performed
+**Area**: workspace
+
+- Copy counts are not usable inheritance. Verify a real Pi prompt sees bounded scoped memory and
+  an existing skill tool reads immutable inherited locks; verify another Workspace sees neither.
+  The authorized project cwd already belongs in governed environment context; do not confuse it
+  with a leaked private memory-storage path when writing a regression assertion.
+- Legacy updatedAt is ISO text; normalize it deliberately, not to epoch zero. Hash original relative
+  session paths for archive identity rather than rejecting non-portable names or promoting them
+  to executable UUIDs. Sanitized archives retain no native continuation/tool-call/run authority.
+- Staged 99 jobs and preserved enabled flags are not a live scheduler handoff. Keep command,
+  credentials, scoped CLI, delivery/alerts, freeze/deduplication and a real 24-hour healthy window
+  as independent gates. An eight-domain data rollback/re-upgrade is not a formal .app upgrade.
+- Do not create a persona from an absence in a limited scan. Preserve an existing example, and
+  never merge a similarly named production finance persona's paths/permissions into a new colleague.
+
+---
+
 ## [LRN-20261019-INHERITANCE-WRITE-CHAIN] best_practice
 
 **Logged**: 2026-10-19
