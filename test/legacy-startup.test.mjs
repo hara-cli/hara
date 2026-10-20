@@ -50,9 +50,12 @@ test("cold Host reopen uses frozen encrypted source, does not duplicate, and doe
   }finally{await b.close();}
 });
 test("an inherited Pi colleague performs an actual synthetic file task and remains isolated from another Workspace",async t=>{
-  const f=fixture(t),host=f.open();try{
+  const began=Date.now(),f=fixture(t),host=f.open();try{
     await host.initialize();const id=host.list().workspaces[0].workspaceId,a=host.snapshot(id).agents.find(row=>row.kind==="colleague"&&row.state==="active");
-    const accepted=host.start("test",id,a.agentId,"生成 hello.md 並驗證",randomUUID());await host.wait(accepted.runId);
+    t.diagnostic(`inherited Pi fixture initialized: ${Date.now()-began}ms`);
+    const accepted=host.start("test",id,a.agentId,"生成 hello.md 並驗證",randomUUID());
+    t.diagnostic(`inherited Pi task accepted: ${Date.now()-began}ms`);await host.wait(accepted.runId);
+    t.diagnostic(`inherited Pi task drained: ${Date.now()-began}ms`);
     const conversation=host.snapshot(id,a.agentId).conversation;
     assert.equal(conversation.taskState,"completed",JSON.stringify(conversation));assert.equal(fs.readFileSync(join(f.root,"project",id,"hello.md"),"utf8"),"hello workspace\n");
     const other=host.createWorkspace("Other",host.list().revision);assert.equal(other.agents.length,1);assert.equal(other.connections.connections.length,0);

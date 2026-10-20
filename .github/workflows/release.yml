@@ -93,12 +93,7 @@ jobs:
       - run: npm ci
       - name: Run the full native suite
         shell: bash
-        run: |
-          if [[ "${{ matrix.os }}" == "macos-15-intel" && "$(node -p 'require("./package.json").version')" == "1.0.1" ]]; then
-            node scripts/intel-ci-test-budget.mjs
-          else
-            npm test
-          fi
+        run: node scripts/native-ci-tests.mjs
       - name: Build, sign, verify, and execute the native Darwin asset
         shell: bash
         run: |

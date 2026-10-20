@@ -21,7 +21,13 @@ export function legacyScheduleRows(input: { jobs: unknown; plan: readonly Legacy
     || !/^[a-f0-9]{64}$/.test(input.sourceFingerprint) || new Set(input.plan.map(row => row.id)).size !== rows.length) throw new Error("Invalid reviewed legacy schedule source");
   const projectRoutes = retainedProjectTaskRoutes(input.retainedProjectAgents ?? [], input.jobs, input.sourceFingerprint,
     input.retainedProjectAgents?.length ? { workspaceId: input.workspaceId, resourceBinding: input.resources.bindingForHost() } : undefined);
-  return rows.map(row => {
+  // No async gap in this projection. Validate the private index once, not 99+ complete guarded disk
+  // reads for schedules sharing the same cwd. Every later projection reads a new guarded snapshot.
+  const resources = input.resources.sourcesForHost(rows.map(row => {
+    if (!plain(row) || typeof row.cwd !== "string") throw new Error("Invalid legacy task identity");
+    return "lr_" + hash(row.cwd);
+  }));
+  return rows.map((row, index) => {
     if (!plain(row) || typeof row.id !== "string") throw new Error("Invalid legacy task identity");
     const review = input.plan.find(item => item.id === row.id);
     if (!review || hash(canonical(row)) !== review.definitionHash || !validWorkspaceSchedule(row.schedule) || typeof row.cwd !== "string"
@@ -29,7 +35,7 @@ export function legacyScheduleRows(input: { jobs: unknown; plan: readonly Legacy
       || typeof row.enabled !== "boolean" || review.originalEnabled !== row.enabled || review.importEnabled !== (row.enabled && !review.expiredOnce)
       || review.timezone !== (row.tz === undefined || row.tz === "" ? "Asia/Shanghai" : row.tz)
       || review.expiredOnce && row.schedule.kind !== "once") throw new Error("Legacy task source changed since dry-run");
-    const resourceId = "lr_" + hash(row.cwd), resource = input.resources.sourceForHost(resourceId);
+    const resourceId = "lr_" + hash(row.cwd), resource = resources[index]!;
     if (!resource.purposes.includes("schedule-cwd") || resource.originalPath !== row.cwd) throw new Error("Legacy task cwd mapping changed");
     let quarantined = review.definitionValidation !== "pass";
     if (row.deliver !== undefined && (typeof row.deliver !== "string" || row.deliver.length > 4096 || redactSensitiveText(row.deliver).redactions.length

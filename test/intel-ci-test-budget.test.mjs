@@ -2,11 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { INTEL_SLOW_FILES, usesIntelBudget, intelCaseTimeout, intelTestBatches } from "../scripts/intel-ci-test-budget.mjs";
+import { nativeTestBatches } from "../scripts/native-ci-tests.mjs";
 
-test("temporary slow budgets require the exact Intel CI platform, flag and 1.0.1 release", () => {
-  const approved = { platform: "darwin", arch: "x64", release: "1.0.1", env: { GITHUB_ACTIONS: "true", HARA_INTEL_TEST_BUDGET: "1.0.1" } };
+test("temporary slow budgets require the exact Intel CI platform, matching flag and reviewed release", () => {
+  const approved = { platform: "darwin", arch: "x64", release: "1.0.2", env: { GITHUB_ACTIONS: "true", HARA_INTEL_TEST_BUDGET: "1.0.2" } };
   assert.equal(intelCaseTimeout(5000, 30000, approved), 30000);
-  for (const changed of [{ platform: "linux" }, { arch: "arm64" }, { release: "1.0.2" }, { env: {} }, { env: { ...approved.env, GITHUB_ACTIONS: "false" } }]) {
+  for (const changed of [{ platform: "linux" }, { arch: "arm64" }, { release: "1.0.3" }, { release: "1.0.1" }, { env: {} }, { env: { ...approved.env, GITHUB_ACTIONS: "false" } }]) {
     assert.equal(usesIntelBudget({ ...approved, ...changed }), false);
     assert.equal(intelCaseTimeout(5000, 30000, { ...approved, ...changed }), 5000);
   }
@@ -22,11 +23,26 @@ test("Intel batching runs every original test exactly once and only measured slo
   assert.throws(() => intelTestBatches([...files, files[0]]), /duplicate/);
   for (const name of ["ci.yml", "release.yml"]) {
     const workflow = readFileSync(new URL(`../.github/workflows/${name}`, import.meta.url), "utf8");
-    assert.match(workflow, /intel-ci-test-budget\.mjs/);
+    assert.match(workflow, /run: node scripts\/native-ci-tests\.mjs/);
     assert.doesNotMatch(workflow, /continue-on-error/);
     assert.match(workflow, /run: npm test/);
   }
   const runner = readFileSync(new URL("../scripts/intel-ci-test-budget.mjs", import.meta.url), "utf8");
   assert.match(runner, /\["workspace-production-entry\.test\.mjs",/);
   assert.match(runner, /batch\.slow[\s\S]*?\.map\(file => \[file\]\)/);
+});
+test("real ARM64 full suite precedes tag and keeps original file/case deadlines, isolation and all files", () => {
+  const files = readdirSync(new URL(".", import.meta.url)).filter(file => file.endsWith(".test.mjs")).sort();
+  const batches = nativeTestBatches(files,"arm64");
+  assert.deepEqual(batches.flatMap(batch=>batch.files).sort(),files);
+  assert(batches.every(batch=>batch.timeout===120000));assert.equal(batches[0].concurrency,1);assert.equal(batches[1].concurrency,4);
+  assert(batches[0].files.includes("legacy-startup.test.mjs"));
+  assert.deepEqual(nativeTestBatches(files,"x64"),intelTestBatches(files));
+  assert.throws(()=>nativeTestBatches(files,"ia32"),/architecture/);
+  const workflow=readFileSync(new URL("../.github/workflows/ci.yml",import.meta.url),"utf8");
+  assert.match(workflow,/push:\s*branches: \[main\]/);assert.match(workflow,/if: \$\{\{ startsWith\(matrix.os, 'macos-'\) \}\}/);
+  assert.match(workflow,/os: macos-15\s+target: bun-darwin-arm64/);assert.match(workflow,/os: macos-15-intel\s+target: bun-darwin-x64-baseline/);
+  const runner=readFileSync(new URL("../scripts/native-ci-tests.mjs",import.meta.url),"utf8");
+  assert.match(runner,/delete env\.HARA_INTEL_TEST_BUDGET/);assert.match(runner,/\.\/test\/setup-isolated-home\.mjs/);
+  assert.doesNotMatch(runner,/--test-skip-pattern|--test-name-pattern|continue-on-error|\.retry\(/);
 });

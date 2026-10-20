@@ -1,4 +1,4 @@
-// Temporary 1.0.1 test-only budgets for the measured slow Intel CI files.
+// Test-only budgets retained for the measured slow Intel CI files in 1.0.1/1.0.2.
 // All files/assertions still run; Linux, arm64 and every other file retain their original budgets.
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
@@ -13,8 +13,8 @@ export const INTEL_SLOW_FILES = Object.freeze([
   "session-profile-cli.test.mjs", "workspace-local-host.test.mjs", "workspace-model-context.test.mjs", "workspace-production-entry.test.mjs",
 ]);
 export function usesIntelBudget({ platform = process.platform, arch = process.arch, env = process.env, release = version } = {}) {
-  return release === "1.0.1" && platform === "darwin" && arch === "x64"
-    && env.GITHUB_ACTIONS === "true" && env.HARA_INTEL_TEST_BUDGET === "1.0.1";
+  return ["1.0.1", "1.0.2"].includes(release) && platform === "darwin" && arch === "x64"
+    && env.GITHUB_ACTIONS === "true" && env.HARA_INTEL_TEST_BUDGET === release;
 }
 export function intelCaseTimeout(normal, intel, options) { return usesIntelBudget(options) ? intel : normal; }
 export function intelTestBatches(files) {
@@ -26,7 +26,7 @@ export function intelTestBatches(files) {
   ];
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  assert.equal(version, "1.0.1", "temporary Intel budget is specific to 1.0.1");
+  assert(["1.0.1", "1.0.2"].includes(version), "temporary Intel budget needs an explicitly reviewed release");
   assert(process.platform === "darwin" && process.arch === "x64" && process.env.GITHUB_ACTIONS === "true", "Intel CI only");
   const run = (args, env = process.env) => {
     const result = spawnSync(process.execPath, args, { env, stdio: "inherit" });
@@ -40,9 +40,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   run(["scripts/evaluate-feedback-traces.mjs"]);
   const files = readdirSync("test").filter(file => file.endsWith(".test.mjs")).sort();
   for (const batch of intelTestBatches(files)) {
-    console.log(`Intel 1.0.1 test batch: ${batch.files.length} files, ${batch.timeout}ms, concurrency${batch.concurrency}; no skips`);
+    console.log(`Intel ${version} test batch: ${batch.files.length} files, ${batch.timeout}ms, concurrency${batch.concurrency}; no skips`);
     const env = { ...process.env }; delete env.HARA_INTEL_TEST_BUDGET;
-    if (batch.slow) env.HARA_INTEL_TEST_BUDGET = "1.0.1";
+    if (batch.slow) env.HARA_INTEL_TEST_BUDGET = version;
     const groups = batch.slow
       ? ["workspace-production-entry.test.mjs", ...batch.files.filter(file => file !== "workspace-production-entry.test.mjs")].map(file => [file])
       : [batch.files];

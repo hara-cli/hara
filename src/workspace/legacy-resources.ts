@@ -46,7 +46,13 @@ export class WorkspaceLegacyResources {
   list() { return this.state.read().resources.map(({ originalPath: _path, ...row }) => row); }
   bindingForHost() { return this.state.binding(); }
   /** Host-only lookup is metadata, not a runnable mount or a renderer-selected filesystem path. */
-  sourceForHost(id: string) { const row = this.state.read().resources.find(row => row.id === id); if (!row) throw new Error("Resource not registered in this Workspace"); return row; }
+  sourceForHost(id: string) { return this.sourcesForHost([id])[0]!; }
+  /** One synchronous projection uses one freshly validated index. Never retain this snapshot across
+   * operations/awaits: the next apply/verify/rollback must observe current scope and file identities. */
+  sourcesForHost(ids: readonly string[]) {
+    const index = new Map(this.state.read().resources.map(row => [row.id, row]));
+    return ids.map(id => { const row = index.get(id); if (!row) throw new Error("Resource not registered in this Workspace"); return structuredClone(row); });
+  }
   domain(sourceFingerprint: string, rows: readonly LegacyResourceRecord[]) {
     if (!/^[a-f0-9]{64}$/.test(sourceFingerprint) || rows.length > 4353) throw new Error("Invalid resource import source");
     const resources = rows.map(checked); if (new Set(resources.map(row => row.id)).size !== resources.length) throw new Error("Duplicate resource identity");

@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 1.0.2 — 2026-10-20 — Required ARM64 and Intel pre-tag acceptance
+
+- Resolve a legacy schedule batch from one fresh, guarded resource index rather than reopening the
+  same private index for each of 99 tasks. Later apply/verify/rollback operations revalidate current
+  state; source checks, scope generations, private writes and credential protections remain intact.
+- Run all tests on real ARM64 and Intel main CI before tagging, as well as during release. Schedule
+  durable migration fixtures without competing I/O-heavy files; ARM64 retains every original
+  120-second file deadline and all assertions. Preserve the already-reviewed Intel-only limits.
+- Retain the fixed Core v1.0.0/v1.0.1 tags and the cross-platform simulated Keychain test repair.
+  The right-hand panel regression is deferred to 1.0.3 and is not included in this patch.
+
 ## 1.0.1 — 2026-10-20 — Cross-platform Keychain test fixtures
 
 - Explicitly model macOS in the two simulated Keychain security tests and restore the real platform

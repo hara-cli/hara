@@ -11,3 +11,14 @@ test("task/project/folder identities deduplicate without scanning or granting fi
 test("registered identities survive reopen and guarded rollback/re-upgrade",async t=>{const f=fixture(t),d=f.open().domain("a".repeat(64),plan()),r=await d.apply();assert.equal(await d.verify(r),true);assert.deepEqual(await f.open().domain("a".repeat(64),plan()).apply(),r);assert.equal(f.open().list().length,3);assert.equal(f.open().list()[0].originalPath,undefined);await d.rollback();assert.equal(f.open().list().length,0);await f.open().domain("a".repeat(64),plan()).apply();assert.equal(f.open().list().length,3);});
 test("bad roots, traversal and forged authority are refused rather than mapped to a default cwd",t=>{for(const path of ["/","relative","/legacy/../elsewhere"])assert.throws(()=>planLegacyResources({jobs:[{cwd:path}],projects:[],legacyWorkspacePath:"/legacy/workspace"}),/path review/);const f=fixture(t),rows=plan();assert.throws(()=>f.open().domain("a".repeat(64),[{...rows[0],access:"execute"}]),/identity/);});
 test("another Workspace cannot resolve the imported folder even by a known ID",async t=>{const f=fixture(t),rows=plan();await f.open().domain("a".repeat(64),rows).apply();const other=new WorkspaceResourceStorage(f.home,{...f.scope,workspaceId:"ws_10000000-0000-4000-8000-000000000002"});other.initialize();assert.throws(()=>new WorkspaceLegacyResources(other).sourceForHost(rows[0].id),/not registered/);});
+test("one synchronous batch reads one fresh guarded resource index, not once per task or a cached generation",async t=>{
+  const f=fixture(t),store=f.open(),rows=plan(),domain=store.domain("a".repeat(64),rows);await domain.apply();
+  let reads=0;const original=store.state.read.bind(store.state);store.state.read=()=>{reads++;return original();};
+  const ids=Array.from({length:99},()=>rows[0].id),resolved=store.sourcesForHost(ids);
+  assert.equal(reads,1);assert.equal(resolved.length,99);assert(resolved.every(row=>row.id===ids[0]));
+  resolved[0].purposes.push("execute");assert.equal(store.sourceForHost(ids[0]).purposes.includes("execute"),false);
+  assert.equal(reads,2,"a later lookup must revalidate the live index");
+  await domain.rollback();assert.throws(()=>store.sourcesForHost(ids),/not registered/);
+  const other=new WorkspaceResourceStorage(f.home,{...f.scope,workspaceId:"ws_10000000-0000-4000-8000-000000000002"});other.initialize();
+  assert.throws(()=>new WorkspaceLegacyResources(other).sourcesForHost(ids),/not registered/);
+});
