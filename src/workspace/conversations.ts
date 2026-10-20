@@ -5,6 +5,7 @@ import { isWorkspaceAgentId } from "./agent-binding.js";
 import { workspaceRunMatchesTask } from "./run-binding.js";
 import { sameWorkspaceResourceBinding, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { canonical, exact, plain, positive, UUID, WorkspaceJsonState } from "./local-state.js";
+import { channelSessionId } from "./channel-session.js";
 
 export type WorkspaceAttemptState = "running" | "draining" | "completed" | "cancelled" | "interrupted" | "blocked";
 export interface WorkspaceAttempt {
@@ -67,9 +68,9 @@ export function closedWorkspaceHistory(history: NeutralMsg[]): NeutralMsg[] {
 export class WorkspaceConversationStore {
   private readonly state: WorkspaceJsonState<WorkspaceConversation>;
   readonly sessionId: string;
-  constructor(storage: WorkspaceResourceStorage, readonly agentId: string) {
+  constructor(storage: WorkspaceResourceStorage, readonly agentId: string, channelId?: string) {
     if (!isWorkspaceAgentId(agentId)) throw new Error("invalid scoped conversation Agent");
-    this.sessionId = agentId.slice(3); // one durable chat per stable Agent, independent of task/run IDs
+    this.sessionId = channelId ? channelSessionId(channelId, agentId) : agentId.slice(3);
     const binding = () => this.state.binding();
     this.state = new WorkspaceJsonState(storage, `conversation-${this.sessionId}.json`, value => {
       const fail = (): never => { throw new Error("invalid scoped conversation; history preserved and execution refused"); };

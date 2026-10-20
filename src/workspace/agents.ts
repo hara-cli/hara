@@ -25,7 +25,6 @@ import {
 const FILE = "workspace-agents.json";
 const OWNER = "workspace-agents-owner.json";
 const MAX_BYTES = 2 * 1024 * 1024;
-const MAX_AGENTS = 256;
 const MAX_CONFIGS = 64;
 const USERNAME = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const PROFILE_FIELDS = ["displayName", "title", "bio", "traits", "emoji", "avatar", "theme", "accent", "character"];
@@ -165,7 +164,7 @@ export class WorkspaceAgentStore {
     try { raw = JSON.parse(file.snapshot.text); rawOwner = JSON.parse(ownerFile.snapshot.text); } catch { return invalid(); }
     const owner = this.parseOwner(rawOwner);
     if (!object(raw) || !keys(raw, ["schemaVersion", "resourceBinding", "workspaceId", "mainAgentId", "revision", "agents"])
-      || !positive(raw.revision) || !Array.isArray(raw.agents) || raw.agents.length < 1 || raw.agents.length > MAX_AGENTS) return invalid();
+      || !positive(raw.revision) || !Array.isArray(raw.agents) || raw.agents.length < 1) return invalid();
     const { revision, agents, ...rawManifestOwner } = raw;
     if (canonical(this.parseOwner(rawManifestOwner)) !== canonical(owner)) return invalid();
     const ids = new Set<string>(), usernames = new Set<string>();
@@ -192,7 +191,7 @@ export class WorkspaceAgentStore {
   }
   private persist(loaded: ReturnType<WorkspaceAgentStore["load"]>, value: Manifest): void {
     const text = JSON.stringify(value) + "\n";
-    if (Buffer.byteLength(text) > MAX_BYTES || value.agents.length > MAX_AGENTS) throw new Error("Workspace Agent catalog is full; existing data was preserved");
+    if (Buffer.byteLength(text) > MAX_BYTES) throw new Error("Workspace Agent catalog is full; existing data was preserved");
     loaded.file.assertCurrent(); loaded.ownerFile.assertCurrent();
     const assertResourceCurrent = workspaceResourceCommitGuard();
     const { revision: _revision, agents: _agents, ...expectedOwner } = value;
@@ -257,7 +256,6 @@ export class WorkspaceAgentStore {
       const loaded = this.load(), value = loaded.value;
       if (!value || value.revision !== expectedCatalogRevision) throw new Error("Workspace Agent catalog changed; reload before creating");
       if (value.agents.some(row => row.username === username)) throw new Error("Workspace Agent username is retained; restore the exact archived colleague or choose another");
-      if (value.agents.filter(row => row.kind === "colleague" && row.state === "active").length >= 10) throw new Error("Ten active colleague slots are full; archive one before creating another");
       const row: AgentRecord = { agentId: `ag_${randomUUID()}`, username, kind: "colleague", state: "active", epoch: 1,
         currentConfigRevision: 1, configurations: [configuration(normalized, 1, runtimeId)] };
       value.agents.push(row); this.advance(value); this.persist(loaded, value);
@@ -305,7 +303,6 @@ export class WorkspaceAgentStore {
       if (row.kind === "main") throw new Error("the Workspace main Hara cannot be archived or replaced");
       if ((row.state === "archived") === archived) throw new Error("Workspace Agent lifecycle already changed; refresh before editing");
       if (row.epoch >= Number.MAX_SAFE_INTEGER) throw new Error("Workspace Agent lifecycle epoch exhausted");
-      if (!archived && value.agents.filter(row => row.kind === "colleague" && row.state === "active").length >= 10) throw new Error("Ten active colleague slots are full; archive one before restoring another");
       row.state = archived ? "archived" : "active"; row.epoch++;
     });
   }
@@ -339,7 +336,6 @@ export class WorkspaceAgentStore {
         if (value.agents.some(agent => agent.username === row.username)) throw new Error("Legacy Agent conflicts with an existing colleague; neither was replaced");
         return true;
       });
-      if (value.agents.filter(row => row.kind === "colleague" && row.state === "active").length + fresh.filter(row => row.state === "active").length > 10) throw new Error("Legacy active selection exceeds ten colleague slots");
       if (fresh.length) {
         value.agents.push(...fresh.map(row => ({ agentId: `ag_${randomUUID()}`, username: row.username, kind: "colleague" as const, state: row.state, epoch: 1,
           currentConfigRevision: 1, configurations: [row.config], legacy: { importId: row.importId, sourceHash: row.sourceHash } })));
