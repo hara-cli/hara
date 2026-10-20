@@ -246,7 +246,7 @@ test("saved mailbox passwords are reused only for the same enrolled host and ver
 test("an empty-inbox body check becomes verified only after a matching body is received", async () => {
   const s = { profileId: "first-body", spaceId: "org-first-body", identityKey: "first-body" };
   const email = "first-body@example.test";
-  let binding, available = false;
+  let binding, receivedAt, bodyReads=0, available = false;
   const engine = new MailEngine(async (_scope, method, path, body) => {
     if (path === "/mail-bindings" && method === "GET") return { bindings: binding ? [binding] : [] };
     if (path === "/mail-bindings") return { binding: binding = { ...body, revision: (binding?.revision || 0) + 1 } };
@@ -256,17 +256,26 @@ test("an empty-inbox body check becomes verified only after a matching body is r
     throw new Error("unexpected first-body route");
   }, () => s, async (_provider, args) => {
     if (args[0] === "mail-doctor") return { ok: true, source_mailbox: email };
-    if (args[0] === "mail-messages") return { messages: available ? [{ message_id: "first-body-message", received_at: new Date().toISOString() }] : [], has_more: false };
-    if (args[0] === "mail-get-message") return { message: { message_id: "first-body-message", body: "A real body fixture" } };
+    if (args[0] === "mail-messages") {
+      // A received message has a stable timestamp. Fabricating Date.now() AFTER the receiver froze
+      // its upper bound made this fixture race by 1ms and correctly exclude its supposedly old mail.
+      await new Promise(resolve=>setTimeout(resolve,2));
+      return { messages: available ? [{ message_id: "first-body-message", received_at: receivedAt },
+        { message_id: "outside-window", received_at: new Date(Date.parse(receivedAt)+3600000).toISOString() }] : [], has_more: false };
+    }
+    if (args[0] === "mail-get-message") { assert.equal(args[args.indexOf("--message-id")+1],"first-body-message");bodyReads++;
+      return { message: { message_id: "first-body-message", body: "A real body fixture" } }; }
     throw new Error("unexpected first-body provider call");
   });
   try {
     const c = (await engine.request(s, "bind", { provider: "feishu", mailbox: email, projectId: "p", mainBotId: "bot" })).connection;
     assert.equal(c.checks.body, "empty-inbox");
+    receivedAt=c.after;
     available = true;
     await engine.request(s, "start", { id: c.id, expectedRevision: 1 });
     const state = await waitFor(() => engine.request(s, "list"), x => x.connections[0].phase === "connected");
     assert.equal(state.connections[0].checks.body, "verified");
+    assert.equal(bodyReads,1,"only the matching in-window body was fetched");
   } finally { engine.close(); }
 });
 
