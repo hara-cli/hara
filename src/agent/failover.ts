@@ -16,6 +16,18 @@ export type ErrKind =
   | "interrupted"
   | "unknown";
 
+function requestWindowQuota(message: string): boolean {
+  return /\b(?:requests?|tokens?).{0,50}\b(?:per|minute|hour|day|second|quota|limit)\b|\b(?:rpm|tpm|rpd|tpd)\b|(?:每.{0,8}(?:秒|分钟|分鐘|小时|小時|天)|请求速率|請求速率)/.test(message);
+}
+
+function explicitQuotaExhaustion(message: string): boolean {
+  const balance = /(?:insufficient|exhausted|depleted|not enough).{0,20}(?:credits?|balance|funds)|(?:credits?|balance|funds).{0,30}(?:exhausted|depleted|insufficient|used up|run out)|(?:积分|積分|余额|餘額|余額).{0,12}(?:不足|耗尽|耗盡|用尽|用盡)/.test(message);
+  if (balance) return true;
+  // Request/token quotas are rate windows, not evidence of an exhausted account balance.
+  if (requestWindowQuota(message)) return false;
+  return /insufficient\s+(?:account\s+)?(?:quota|allowance)|(?:quota|allowance).{0,20}(?:exhausted|depleted|used up|run out)|(?:exhausted|depleted).{0,20}(?:quota|allowance)|(?:额度|額度|配额|配額).{0,12}(?:不足|耗尽|耗盡|用尽|用盡)/.test(message);
+}
+
 /** Classify a provider error from its message (+ HTTP status if known). Message patterns include the
  *  Chinese strings DashScope/GLM/Qwen return, since hara targets those endpoints. */
 export function classifyError(msg: string, status?: number, code?: string): ErrKind {
@@ -23,6 +35,11 @@ export function classifyError(msg: string, status?: number, code?: string): ErrK
   const normalizedCode = (code || "").toUpperCase();
   if (m === "interrupted") return "interrupted";
   if (normalizedCode === "HARA_CIRCUIT_OPEN" || /connection circuit open/.test(m)) return "circuit_open";
+  if (status === 429 || (status === undefined && requestWindowQuota(m))) {
+    return normalizedCode === "INSUFFICIENT_QUOTA" || explicitQuotaExhaustion(m.replace(/\s+/g, " "))
+      ? "quota_exhausted"
+      : "rate_limit";
+  }
   if (
     status === 402
     || /(?:insufficient|exhausted|exceeded).{0,20}(?:quota|credit|balance|allowance)/.test(m)

@@ -79,7 +79,8 @@ export function providerErrorMetadata(error: unknown, at = Date.now()): Provider
     ? rawStatus
     : undefined;
   const rawCode = errorMember(error, "code");
-  const code = typeof rawCode === "string" && /^[A-Z][A-Z0-9_]{1,39}$/u.test(rawCode)
+  const code = rawCode === "insufficient_quota" ? "INSUFFICIENT_QUOTA"
+    : typeof rawCode === "string" && /^[A-Z][A-Z0-9_]{1,39}$/u.test(rawCode)
     ? rawCode
     : undefined;
   const retryAfter = parseRetryAfterMs(retryAfterHeader(errorMember(error, "headers")), at);
@@ -174,7 +175,7 @@ export function withProviderRetry(
             args.onReasoning?.(delta);
           },
         });
-        const kind = classifyError(result.errorMsg ?? "", result.errorMetadata?.status);
+        const kind = classifyError(result.errorMsg ?? "", result.errorMetadata?.status, result.errorMetadata?.code);
         if (
           attempt >= policy.maxAttempts
           || args.signal?.aborted
