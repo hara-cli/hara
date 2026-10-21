@@ -169,3 +169,25 @@ test("providerErrorMetadata extracts only status, safe code, and Retry-After", (
   assert.deepEqual(metadata, { status: 429, code: "RATE_LIMITED", retryAfterMs: 3_000 });
   assert.equal(JSON.stringify(metadata).includes("secret"), false);
 });
+
+test("a structured insufficient_quota 429 survives SDK metadata extraction and is never transport-retried", async () => {
+  const metadata = providerErrorMetadata({ cause: { status: 429, code: "insufficient_quota" } });
+  assert.deepEqual(metadata, { status: 429, code: "INSUFFICIENT_QUOTA" });
+  assert.deepEqual(providerErrorMetadata({ status: 429, code: "private-arbitrary-value" }), { status: 429 });
+  let calls = 0;
+  const provider = { id: "fixture", model: "fixture", async turn() {
+    calls++;return { text: "", toolUses: [], stop: "error", errorMsg: "429", errorMetadata: metadata };
+  } };
+  await withProviderRetry(provider, { maxAttempts: 3, baseDelayMs: 0 }, { sleep: async () => true }).turn(args());
+  assert.equal(calls, 1);
+});
+
+test("a request-window quota 429 retains bounded transport retry", async () => {
+  let calls = 0;
+  const events = [];
+  const provider = { id: "fixture", model: "fixture", async turn() {
+    calls++;return { text: "", toolUses: [], stop: "error", errorMsg: "exceeded your requests per minute quota", errorMetadata: { status: 429 } };
+  } };
+  await withProviderRetry(provider, { maxAttempts: 2, baseDelayMs: 0 }, { sleep: async () => true }).turn(args({ onRetry: event => events.push(event) }));
+  assert.equal(calls, 2);assert.deepEqual(events.map(event => event.kind), ["rate_limit"]);
+});

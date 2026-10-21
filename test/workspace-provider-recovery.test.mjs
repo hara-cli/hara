@@ -27,7 +27,44 @@ test("configuration, authentication and allowance failures stay distinct from tr
     ["temporary failure", { status: 503 }, null], ["rate limit", { status: 429 }, null], ["network timeout", {}, null],
   ]) assert.equal(workspaceProviderFailure(message, metadata), reason);
   assert.equal(legacyWorkspaceProviderFailure("[openai error] 404 model unavailable"), "connection_model_unavailable");
+  assert.equal(workspaceProviderFailure("exceeded your requests per minute quota", { status: 429 }), null);
+  assert.equal(workspaceProviderFailure("429", { status: 429, code: "insufficient_quota" }), "connection_quota_exhausted");
+  assert.equal(legacyWorkspaceProviderFailure("[openai error] 429 exceeded your requests per minute quota — the provider reported this account allowance or balance is exhausted; select another authorized connection or wait for its reset"), null);
   for (const text of ["404", "User asked about model not found", "Tool failed: [openai error] 404", "[openai error] network timeout"]) assert.equal(legacyWorkspaceProviderFailure(text), null);
+});
+
+for (const refusal of [
+  { message: "exceeded your requests per minute quota", code: "rate_limit_exceeded", terminal: false },
+  { message: "quota exceeded", code: "insufficient_quota", terminal: true },
+  { message: "account balance is exhausted", terminal: true },
+]) test(`a real loopback 429 ${refusal.terminal ? "refuses exhausted allowance" : "allows manual continuation after a rate window"} across restart: ${refusal.message}`, async () => {
+  const root = temporary(), requests = [], server = createServer(async (request, response) => {
+    let raw = "";for await (const chunk of request) raw += chunk;
+    requests.push({ path: request.url, model: JSON.parse(raw).model });
+    response.writeHead(429, { "content-type": "application/json" });response.end(JSON.stringify({ error: { message: refusal.message, ...(refusal.code ? { code: refusal.code } : {}) } }));
+  });
+  await new Promise(done => server.listen(0, "127.0.0.1", done));
+  const options = { mode: "workspace", credentialVault: new MemoryCredentialVault(), legacySourceHome: root, hostHome: root };
+  let host = new LocalWorkspaceHost(root, options);
+  try {
+    const w = host.createWorkspace("HTTP quota fixture", host.list().revision);
+    host.configureConnection(w.workspaceId, { label: "Loopback fixture", provider: "openai", baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: "local-fixture-credential", defaultModel: "fixture-model" }, 0);
+    const first = host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
+    assert.equal(requests.length, 1, "no automatic Workspace resend");
+    const paths = files(host, w), bytes = fs.readFileSync(paths.conversation);
+    await host.close();host = new LocalWorkspaceHost(root, options);
+    assert.equal(host.snapshot(w.workspaceId).conversation.resumeAdmission.allowed, !refusal.terminal);
+    assert.equal(fs.readFileSync(paths.conversation).equals(bytes), true);
+    if (refusal.terminal) {
+      assert.equal(host.snapshot(w.workspaceId).conversation.resumeAdmission.reason, "connection_quota_exhausted");
+      assert.throws(() => host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true), /no new model call/);
+      assert.equal(requests.length, 1);
+    } else {
+      assert.equal(fs.existsSync(paths.failure), false);
+      const resumed = host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true);await host.wait(resumed.runId);
+      assert.equal(resumed.runId, first.runId);assert.equal(requests.length, 2);
+    }
+  } finally { await host.close();server.closeAllConnections();await new Promise(done => server.close(done));fs.rmSync(root, { recursive: true, force: true }); }
 });
 test("recovery observation preserves provider capabilities, preparation and health methods with their original receiver", async () => {
   const root = temporary(), host = new LocalWorkspaceHost(root);

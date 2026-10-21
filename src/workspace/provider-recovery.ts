@@ -21,8 +21,10 @@ export function workspaceProviderFailure(message: string, metadata?: ProviderErr
 export function legacyWorkspaceProviderFailure(reason: string | undefined): WorkspaceProviderFailure | null {
   const match = /^\[[^\]\r\n]{1,40} error\]\s+(.*)$/s.exec(reason ?? "");
   if (!match) return null;
-  const status = /^(\d{3})\b/.exec(match[1]!);
-  return workspaceProviderFailure(match[1]!, status ? { status: Number(status[1]) } : undefined);
+  // Older checkpoints append Hara recovery hints; only the provider's part is evidence.
+  const message = match[1]!.split(" — ", 1)[0]!;
+  const status = /^(\d{3})\b/.exec(message);
+  return workspaceProviderFailure(message, status ? { status: Number(status[1]) } : undefined);
 }
 export class WorkspaceProviderAdmissionError extends Error {
   constructor(readonly reason: WorkspaceProviderFailure | "connection_recovery_unavailable") {
