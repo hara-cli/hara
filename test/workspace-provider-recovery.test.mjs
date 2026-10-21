@@ -167,6 +167,26 @@ test("repairing the selected connection does not rebind or replay the old run; a
     assert.equal(saved.pastTasks.at(-1).usage.modelCalls, old.conversation.runUsage.modelCalls);
   } finally { await host.close();fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test("429 metadata without a numeric message prefix stays resumable through the legacy checkpoint and restart", async () => {
+  for (const message of ["requests per minute quota exhausted", "每分钟请求额度用尽"]) {
+    const root = temporary();let calls = 0;
+    const options = { providerFactory(_connection, binding) { return { id: "openai", model: binding.model, async turn() {
+      calls++;return { text: "", toolUses: [], stop: "error", errorMsg: message, errorMetadata: { status: 429 } };
+    } }; } };
+    let host = new LocalWorkspaceHost(root, options);
+    try {
+      const w = host.createWorkspace("Rate-window checkpoint", host.list().revision);host.configureSynthetic(w.workspaceId, 0);
+      const first = host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
+      assert.equal(host.snapshot(w.workspaceId).conversation.resumeAdmission.allowed, true);assert.equal(calls, 1);
+      assert.equal(legacyWorkspaceProviderFailure(`[openai error] ${message}`), null);
+      await host.close();host = new LocalWorkspaceHost(root, options);
+      assert.equal(host.snapshot(w.workspaceId).conversation.resumeAdmission.allowed, true);
+      const resumed = host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true);await host.wait(resumed.runId);
+      assert.equal(resumed.runId, first.runId);assert.equal(calls, 2);
+    } finally { await host.close();fs.rmSync(root, { recursive: true, force: true }); }
+  }
+});
 test("a real loopback provider 404 makes one request; continuation refuses without a second HTTP call or credential fallback", async () => {
   const root = temporary(), requests = [], server = createServer(async (request, response) => {
     let raw = "";for await (const chunk of request) raw += chunk;

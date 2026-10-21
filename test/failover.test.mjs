@@ -26,6 +26,7 @@ test("classifyError: maps message/status to a kind (incl. DashScope/GLM Chinese 
 test("429 is rate-limited unless its code or message explicitly identifies exhausted account allowance", () => {
   for (const message of ["exceeded your requests per minute quota", "requests per minute quota exhausted", "token quota exhausted per minute", "insufficient requests per hour quota", "TPM quota exhausted", "每分钟请求额度用尽", "每分鐘請求配額耗盡", "quota exceeded", "You exceeded your current quota", "Too many requests"]) {
     assert.equal(classifyError(message, 429), "rate_limit", message);
+    if (/per|TPM|每/.test(message)) assert.equal(classifyError(message), "rate_limit", "a legacy message may omit HTTP status");
     assert.match(errorHint(classifyError(message, 429)), /rate-limited/);
   }
   for (const message of ["insufficient quota", "account allowance exhausted", "your quota has been depleted", "not enough credits", "account balance is exhausted", "余额不足", "账户额度已用尽", "帳戶配額已耗盡"]) {
