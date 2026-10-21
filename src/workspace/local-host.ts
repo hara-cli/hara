@@ -459,9 +459,9 @@ export class LocalWorkspaceHost {
     try { new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget).assertResumeAdmission(value.runUsage); return { allowed: true, reason: null }; }
     catch (error) { return { allowed: false, reason: error instanceof WorkspaceBudgetAdmissionError ? error.reason : "budget_unavailable" }; }
   }
-  private resumeProviderFailure(context: WorkspaceHostContext, value: WorkspaceConversation) {
+  private resumeProviderFailure(context: WorkspaceHostContext, value: WorkspaceConversation, channelId?: string) {
     const binding = value.task?.workspaceRunBinding; if (!binding) return null;
-    try { return new WorkspaceProviderRecovery(context.storage, value.agentId).reason(binding.runId)
+    try { return new WorkspaceProviderRecovery(context.storage, value.agentId, channelId).reason(binding.runId)
       ?? legacyWorkspaceProviderFailure(value.task?.checkpoint?.blockReason); }
     catch { return "connection_recovery_unavailable" as const; }
   }
@@ -593,7 +593,7 @@ export class LocalWorkspaceHost {
       lease = WorkspaceSessionLease.acquire(context.storage, store.sessionId);
       let value = store.read(); // lock BEFORE loading the resumable state
       if (resume && value.task?.workspaceRunBinding) {
-        const failure = this.resumeProviderFailure(context, value);
+        const failure = this.resumeProviderFailure(context, value, channel?.id);
         if (failure) throw new WorkspaceProviderAdmissionError(failure);
         const binding = value.task.workspaceRunBinding;
         new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget).assertResumeAdmission(value.runUsage);
@@ -629,7 +629,7 @@ export class LocalWorkspaceHost {
       const selectedProvider = this.realKey ? this.realKey.createProvider(connection, binding.connection)
         : (this.options.providerFactory ?? (this.options.mode === "workspace" ? createWorkspaceProvider : createWorkspaceSyntheticProvider))(connection, binding.connection,
           { agent, objective: task.objective, colleagues: () => context.resources.agents.list().agents });
-      const provider = new WorkspaceProviderRecovery(context.storage, agentId).observe(selectedProvider, binding.runId);
+      const provider = new WorkspaceProviderRecovery(context.storage, agentId, channel?.id).observe(selectedProvider, binding.runId);
       const modelHistoryStart = value.history.length;
       value.history.push({ role: "user", content: message }); value.task = task;
       value.attempt = { attemptId: lease.attemptId, fence: (value.attempt?.fence ?? 0) + 1, runId: binding.runId, state: "running", startedAt: new Date().toISOString(), endedAt: null };

@@ -2,6 +2,7 @@ import { classifyError } from "../agent/failover.js";
 import { providerErrorMetadata } from "../providers/retry.js";
 import type { Provider, ProviderErrorMetadata } from "../providers/types.js";
 import { isWorkspaceAgentId } from "./agent-binding.js";
+import { channelSessionId } from "./channel-session.js";
 import { sameWorkspaceResourceBinding, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { exact, plain, positive, UUID, WorkspaceJsonState } from "./local-state.js";
 
@@ -32,23 +33,27 @@ export class WorkspaceProviderAdmissionError extends Error {
   }
 }
 interface FailureState {
-  schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; agentId: string;
+  schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; agentId: string; channelId?: string;
   runId: string | null; reason: WorkspaceProviderFailure | null;
 }
-/** Separate, scoped recovery evidence leaves the existing conversation/RunBinding schema unchanged. */
+/** Separate, scoped recovery evidence leaves the existing conversation/RunBinding schema unchanged.
+ * Each session (private chat, or one channel per Agent) keeps its own evidence, so a later failure in
+ * another session never overwrites it. Private-chat files keep their original name and fields. */
 export class WorkspaceProviderRecovery {
   private readonly state: WorkspaceJsonState<FailureState>;
-  constructor(storage: WorkspaceResourceStorage, agentId: string) {
+  constructor(storage: WorkspaceResourceStorage, agentId: string, channelId?: string) {
     if (!isWorkspaceAgentId(agentId)) throw new Error("Invalid provider recovery owner");
-    this.state = new WorkspaceJsonState(storage, `provider-recovery-${agentId.slice(3)}.json`, value => {
-      if (!plain(value) || !exact(value, ["schemaVersion", "revision", "resourceBinding", "agentId", "runId", "reason"])
-        || value.schemaVersion !== 1 || !positive(value.revision) || value.agentId !== agentId
+    const sessionId = channelId ? channelSessionId(channelId, agentId) : agentId.slice(3);
+    const fields = ["schemaVersion", "revision", "resourceBinding", "agentId", ...(channelId ? ["channelId"] : []), "runId", "reason"];
+    this.state = new WorkspaceJsonState(storage, `provider-recovery-${sessionId}.json`, value => {
+      if (!plain(value) || !exact(value, fields)
+        || value.schemaVersion !== 1 || !positive(value.revision) || value.agentId !== agentId || (channelId && value.channelId !== channelId)
         || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, this.state.binding())
         || typeof value.runId !== "string" || !UUID.test(value.runId) || !WORKSPACE_PROVIDER_FAILURES.includes(value.reason as WorkspaceProviderFailure)) {
         throw new WorkspaceProviderAdmissionError("connection_recovery_unavailable");
       }
       return structuredClone(value) as unknown as FailureState;
-    }, () => ({ schemaVersion: 1, revision: 0, resourceBinding: this.state.binding(), agentId, runId: null, reason: null }));
+    }, () => ({ schemaVersion: 1, revision: 0, resourceBinding: this.state.binding(), agentId, ...(channelId ? { channelId } : {}), runId: null, reason: null }));
   }
   reason(runId: string): WorkspaceProviderFailure | null {
     const value = this.state.read(); return value.runId === runId ? value.reason : null;

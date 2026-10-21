@@ -11,6 +11,7 @@ import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
 import { SYNTHETIC_CONNECTION, createWorkspaceSyntheticProvider } from "../dist/workspace/synthetic-provider.js";
 import { channelSessionId } from "../dist/workspace/channel-session.js";
 import { WorkspaceRequestJournal } from "../dist/workspace/request-journal.js";
+import { WorkspaceConversationStore } from "../dist/workspace/conversations.js";
 
 const temporary = [];
 after(() => { for (const p of temporary) fs.rmSync(p, { recursive: true, force: true }); });
@@ -171,4 +172,46 @@ test("a room-receipt write failure after acceptance cancels its exact run before
     assert.ok(view.turns[0].replies.slice(1).every(row => row.state === "cancelled")); assert.equal(f.host.activity().running, 0);
     assert.ok(f.calls.every(row => row.agentId === f.members[0])); assert.ok(f.calls.length <= 1);
   } finally { await f.host.close(); }
+});
+
+test("terminal provider recovery stays isolated between two channels and a DM, including restart and foreign evidence", async () => {
+  let factories = 0, calls = 0, restored;
+  const f = await setup(1, (_connection, binding, context) => {
+    factories++;
+    return { id: "openai", model: binding.model, async turn() {
+      calls++;
+      if (context.objective.startsWith("channel-")) return { text: "", toolUses: [], stop: "error",
+        errorMsg: "synthetic refusal", errorMetadata: { status: context.objective === "channel-a" ? 404 : 401 } };
+      return { text: "private task complete", toolUses: [], stop: "end" };
+    } };
+  });
+  try {
+    const a = f.create("A"), nonce = randomUUID();
+    f.host.sendChannel("client", f.id, a, "channel-a", nonce, f.members); await f.host.waitChannel(f.id, a);
+    const b = f.create("B");
+    f.host.sendChannel("client", f.id, b, "channel-b", randomUUID(), f.members); await f.host.waitChannel(f.id, b);
+    const storage = new WorkspaceResourceStorage(f.host.home, f.host.catalog.resolve(f.id).scope); storage.initialize();
+    const read = channel => new WorkspaceConversationStore(storage, f.members[0], channel).read();
+    const beforeA = read(a), beforeB = read(b);
+    const resume = (host, channel) => host.start("client", f.id, f.members[0], "/continue", randomUUID(), false,
+      undefined, undefined, { source: "ui", channel: "rpc", clientId: "client" }, { id: channel, context: "same local channel" });
+    assert.throws(() => resume(f.host, a), /connection_model_unavailable/);
+    assert.throws(() => resume(f.host, b), /connection_auth_required/);
+    f.host.selectChannel("client", f.id, a); f.host.sendChannel("client", f.id, a, "channel-a", nonce, f.members);
+    assert.equal(calls, 2, "denied continuations and duplicate channel delivery never call a model");
+    const dm = f.host.start("client", f.id, f.members[0], "private task", randomUUID()); await f.host.wait(dm.runId);
+    assert.equal(f.host.snapshot(f.id, f.members[0]).conversation.state, "completed");
+    assert.deepEqual(read(a), beforeA); assert.deepEqual(read(b), beforeB);
+    await f.host.close(); restored = new LocalWorkspaceHost(f.root, f.options); await restored.initialize();
+    assert.throws(() => resume(restored, a), /connection_model_unavailable/);
+    assert.throws(() => resume(restored, b), /connection_auth_required/);
+    assert.deepEqual(read(a), beforeA); assert.deepEqual(read(b), beforeB);
+    const folder = storage.run(() => join(workspaceStateHome(), ".hara"));
+    const source = join(folder, `provider-recovery-${channelSessionId(a, f.members[0])}.json`);
+    const destination = join(folder, `provider-recovery-${channelSessionId(b, f.members[0])}.json`);
+    fs.copyFileSync(source, destination); const foreign = fs.readFileSync(destination);
+    assert.throws(() => resume(restored, b), /connection_recovery_unavailable/);
+    assert.equal(fs.readFileSync(destination).equals(foreign), true, "foreign evidence is retained, never silently repaired");
+    assert.equal(factories, 3); assert.equal(calls, 3);
+  } finally { await restored?.close(); await f.host.close(); }
 });
