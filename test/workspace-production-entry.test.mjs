@@ -52,7 +52,7 @@ test("formal protocol advertises only workspace.v1 and rejects Lab configuration
     const message = raw => { const value = JSON.parse(String(raw)); if (value.id === id) { clearTimeout(timer); socket.off("message", message); value.error ? reject(new Error(value.error.message)) : resolve(value.result); } };
     socket.on("message", message); socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params })); });
   try {
-    const init = await request("initialize", { token: handle.token }); assert.deepEqual(init.capabilities, ["workspace.v1"]); assert.equal(init.executionMode, "workspace");
+    const init = await request("initialize", { token: handle.token }); assert.deepEqual(init.capabilities, ["workspace.v1", "workspace.local-channels.v1"]); assert.equal(init.executionMode, "workspace");
     const workspace = await request("workspace.create", { label: "P", expectedRevision: init.workspace.revision }), scope = { workspaceId: workspace.workspaceId, expectedGeneration: workspace.resourceGeneration };
     await assert.rejects(request("workspace.connection.synthetic", { ...scope, expectedRevision: 0 }), /Lab/);
     await assert.rejects(request("workspace.runtime.propose", { ...scope, runtimeId: "codex", url: "http://127.0.0.1:9/tool" }), /unsupported/);

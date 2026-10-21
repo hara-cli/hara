@@ -26,7 +26,7 @@ test("formal startServe local branch boots without provider/global config and en
   await assert.rejects(client.request("workspace.list"),/unauthorized/);
   await assert.rejects(client.request("initialize",{token:"x".repeat(64)}),/unauthorized/);
   await assert.rejects(client.request("initialize",{token:"中".repeat(64)}),/unauthorized/);
-  const init=await client.request("initialize",{token:handle.token});assert.deepEqual(init.capabilities,["workspace.local-dev.v2"]);assert.equal(init.workspace.workspaces.length,0);
+  const init=await client.request("initialize",{token:handle.token});assert.deepEqual(init.capabilities,["workspace.local-dev.v2","workspace.local-channels.v1"]);assert.equal(init.workspace.workspaces.length,0);
   await assert.rejects(client.request("session.create",{}),/Workspace must be explicit|legacy/);
   const created=await client.request("workspace.create",{label:"Personal",expectedRevision:init.workspace.revision});
   await client.request("workspace.connection.synthetic",{workspaceId:created.workspaceId,expectedGeneration:created.resourceGeneration,expectedRevision:0});

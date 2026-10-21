@@ -56,7 +56,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, capabilities: [capability, ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, capabilities: [capability, "workspace.local-channels.v1", ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
@@ -72,6 +72,30 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (method === "workspace.select" || method === "workspace.settings.select") { fields(["workspaceId", "expectedRevision"]); if (!positive(params.expectedRevision)) throw new Error("invalid Workspace selection"); host.select(client.id, workspaceId, params.expectedRevision, method === "workspace.settings.select"); return host.snapshot(workspaceId, undefined, client.id); }
     if (method === "workspace.snapshot") { fields(["workspaceId", "agentId"]); if (params.agentId !== null && !text(params.agentId)) throw new Error("invalid Agent selection"); return host.snapshot(workspaceId, typeof params.agentId === "string" ? params.agentId : undefined, client.id); }
     host.assertGeneration(workspaceId, params.expectedGeneration);
+    if (method === "workspace.channels.list") { fields(["workspaceId", "expectedGeneration"]); return host.listChannels(workspaceId); }
+    if (method === "workspace.channels.create" || method === "workspace.channels.update") {
+      fields(["workspaceId", "expectedGeneration", "channelId", "name", "memberIds", "expectedRevision"]);
+      if (typeof params.channelId !== "string" || !UUID.test(params.channelId) || !text(params.name, 80)) throw new Error("invalid local channel");
+      return method.endsWith(".create") ? host.createChannel(client.id, workspaceId, params.channelId, params.name, params.memberIds, params.expectedRevision as number)
+        : host.updateChannel(client.id, workspaceId, params.channelId, params.name, params.memberIds, params.expectedRevision as number);
+    }
+    if (["workspace.channels.select", "workspace.channels.snapshot", "workspace.channels.cancel"].includes(method)) {
+      fields(["workspaceId", "expectedGeneration", "channelId"]);
+      if (typeof params.channelId !== "string" || !UUID.test(params.channelId)) throw new Error("invalid local channel");
+      if (method.endsWith(".select")) return host.selectChannel(client.id, workspaceId, params.channelId);
+      if (method.endsWith(".cancel")) { host.cancelChannel(client.id, workspaceId, params.channelId); return { state: "draining" }; }
+      return host.channelSnapshot(workspaceId, params.channelId, client.id);
+    }
+    if (method === "workspace.channels.send") {
+      fields(["workspaceId", "expectedGeneration", "channelId", "message", "requestId", "recipientIds"]);
+      if (typeof params.channelId !== "string" || !UUID.test(params.channelId) || !messageBody(params.message) || typeof params.requestId !== "string" || !UUID.test(params.requestId)) throw new Error("invalid local channel message");
+      return host.sendChannel(client.id, workspaceId, params.channelId, params.message, params.requestId, params.recipientIds);
+    }
+    if (method === "workspace.channels.receipt") {
+      fields(["workspaceId", "expectedGeneration", "channelId", "requestId"]);
+      if (typeof params.channelId !== "string" || !UUID.test(params.channelId) || typeof params.requestId !== "string" || !UUID.test(params.requestId)) throw new Error("invalid local channel receipt");
+      return host.channelReceipt(workspaceId, params.channelId, params.requestId);
+    }
     if (method === "workspace.features.list") { fields(["workspaceId", "expectedGeneration"]); return host.workspaceFeatures(workspaceId); }
     if (method === "workspace.tasks") { fields(["workspaceId", "expectedGeneration"]); return host.workspaceTasks(workspaceId); }
     if (method === "workspace.schedule.save") { fields(["workspaceId", "expectedGeneration", "input", "expectedRevision", "approved"]); return host.saveSchedule(workspaceId, params.input, params.expectedRevision as number, params.approved === true); }

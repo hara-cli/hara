@@ -1,6 +1,7 @@
 import { isWorkspaceAgentId } from "./agent-binding.js";
 import { sameWorkspaceResourceBinding, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { exact, plain, positive, text, UUID, WorkspaceJsonState } from "./local-state.js";
+import { channelSessionId } from "./channel-session.js";
 
 export type WorkspaceRequestSource = "ui" | "cli" | "automatic_retry" | "delegation" | "host" | "legacy_rpc";
 export interface WorkspaceRequestOrigin { source: WorkspaceRequestSource; channel: "rpc" | "cli" | "internal"; clientId: string; rpcIdHash?: string }
@@ -9,7 +10,7 @@ interface RequestEntry extends WorkspaceRequestOrigin {
   receivedAt: string; settledAt: string | null; state: "received" | "accepted" | "rejected";
   taskId: string | null; runId: string | null; reason: string | null;
 }
-interface Journal { schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; agentId: string; entries: RequestEntry[] }
+interface Journal { schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; agentId: string; sessionId?: string; entries: RequestEntry[] }
 const SOURCES = ["ui", "cli", "automatic_retry", "delegation", "host", "legacy_rpc"];
 export function workspaceRequestSource(value: unknown): value is WorkspaceRequestSource { return typeof value === "string" && SOURCES.includes(value); }
 function validOrigin(value: WorkspaceRequestOrigin): boolean {
@@ -20,11 +21,13 @@ function validOrigin(value: WorkspaceRequestOrigin): boolean {
  * RPC source is client-declared diagnostic metadata, never an identity or authority grant. */
 export class WorkspaceRequestJournal {
   private readonly state: WorkspaceJsonState<Journal>;
-  constructor(storage: WorkspaceResourceStorage, agentId: string) {
+  constructor(storage: WorkspaceResourceStorage, agentId: string, channelId?: string) {
     if (!isWorkspaceAgentId(agentId)) throw new Error("invalid request journal Agent");
-    this.state = new WorkspaceJsonState(storage, `requests-${agentId.slice(3)}.json`, value => {
-      if (!plain(value) || !exact(value, ["schemaVersion", "revision", "resourceBinding", "agentId", "entries"])
+    const sessionId = channelId ? channelSessionId(channelId, agentId) : undefined;
+    this.state = new WorkspaceJsonState(storage, `requests-${sessionId ?? agentId.slice(3)}.json`, value => {
+      if (!plain(value) || !exact(value, ["schemaVersion", "revision", "resourceBinding", "agentId", "entries", ...(sessionId ? ["sessionId"] : [])])
         || value.schemaVersion !== 1 || !positive(value.revision) || value.agentId !== agentId
+        || (sessionId && value.sessionId !== sessionId)
         || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, this.state.binding())
         || !Array.isArray(value.entries) || value.entries.length > 512) throw new Error("invalid Workspace request journal; retained");
       const ids = new Set<string>();
@@ -42,7 +45,7 @@ export class WorkspaceRequestJournal {
         ids.add(entry.requestId);
       }
       return structuredClone(value) as unknown as Journal;
-    }, () => ({ schemaVersion: 1, revision: 0, resourceBinding: this.state.binding(), agentId, entries: [] }));
+    }, () => ({ schemaVersion: 1, revision: 0, resourceBinding: this.state.binding(), agentId, ...(sessionId ? { sessionId } : {}), entries: [] }));
   }
   find(requestId: string): Readonly<RequestEntry> | undefined { return this.state.read().entries.find(entry => entry.requestId === requestId); }
   receive(input: Pick<RequestEntry, "requestId" | "digest" | "operation">, origin: WorkspaceRequestOrigin): void {
