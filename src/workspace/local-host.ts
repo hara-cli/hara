@@ -14,7 +14,7 @@ import { currentWorkspaceResourceBinding, workspaceStateHome, WorkspaceResourceS
 import { WorkspaceConnectionStoreV2, type ScopedConnection, type ScopedRunConnection } from "./scoped-connections.js";
 import { closedWorkspaceHistory, WorkspaceConversationStore, type WorkspaceConversation, type WorkspaceUsage } from "./conversations.js";
 import { WorkspaceSessionLease } from "./session-lease.js";
-import { freezeWorkspaceRunBinding, workspaceAgentBindingHash, type WorkspaceRunBinding } from "./run-binding.js";
+import { DEFAULT_WORKSPACE_RUN_BUDGET, freezeWorkspaceRunBinding, workspaceAgentBindingHash, type WorkspaceRunBinding } from "./run-binding.js";
 import { createWorkspaceRunPermit, bindWorkspaceRunOptions, assertWorkspaceRunAdmission, assertWorkspaceRunContextCurrent, closeWorkspaceRunPermit, type WorkspaceRunPermit } from "./execution.js";
 import { WorkspaceBudgetAdmissionError, WorkspaceTreeBudget } from "./tree-budget.js";
 import { WorkspaceRequestJournal, type WorkspaceRequestOrigin } from "./request-journal.js";
@@ -620,7 +620,8 @@ export class LocalWorkspaceHost {
           project: { root: context.project, dev: project.dev, ino: project.ino }, sessionId: store.sessionId, runId: randomUUID(),
           lineage: parent ? { rootRunId: parent.binding.lineage.rootRunId ?? parent.id, parentRunId: parent.id, depth: 1 } : { rootRunId: null, parentRunId: null, depth: 0 },
           createdAt: new Date().toISOString(), host: { hostId: host.hostId, hostEpoch: host.hostEpoch, grantId: row.grantId, grantRevision: row.grantRevision, actorId: row.actorId, policyRevision: row.policyRevision },
-          budget: parent ? { ...parent.binding.budget } : { maxRounds: 12, maxToolCalls: 32, maxTokens: this.realKey ? 80000 : 32000, timeoutMs: this.realKey ? 300000 : 120000 } });
+          budget: parent ? { ...parent.binding.budget } : { ...DEFAULT_WORKSPACE_RUN_BUDGET,
+            ...(this.realKey ? { maxTokens: 80000, timeoutMs: 300000 } : {}) } });
         value.runUsage = ZERO_USAGE();
       }
       const binding = task.workspaceRunBinding!, controller = new AbortController();
@@ -643,7 +644,7 @@ export class LocalWorkspaceHost {
       const configuration = context.resources.agents.resolveTask(binding.agent);
       const tools = this.jobTools(owned, agent).filter(tool => legacyPolicyAllowsTool(configuration.toolPolicy, tool.name, tool.kind));
       owned.permit = createWorkspaceRunPermit({ binding, catalog: this.catalog, resources: context.resources, storage: context.storage, connections: context.connections,
-        lease, provider, cwd: context.project, signal: owned.signal, toolNames: ["task_intake", "task_checkpoint", "todo_write", ...tools.map(tool => tool.name)], usage: value.runUsage,
+        lease, provider, cwd: context.project, signal: owned.signal, toolNames: ["task_intake", "task_checkpoint", "todo_write", "ask_user", ...tools.map(tool => tool.name)], usage: value.runUsage,
         modelHistory: { history: value.history, start: modelHistoryStart, retain: result => owned.receipts!.retain(result),
           usedTokens: () => { const usage = tree.read().usage; return usage.inputTokens + usage.outputTokens; } },
         observeContext: observation => { owned.lease.assertCurrent(); audit.append(observation); },

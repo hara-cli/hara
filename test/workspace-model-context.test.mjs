@@ -10,6 +10,7 @@ import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { createWorkspaceSyntheticProvider } from "../dist/workspace/synthetic-provider.js";
 import { WorkspaceContextReceipts } from "../dist/workspace/context-receipts.js";
 import { WorkspaceResourceStorage, workspaceStateHome } from "../dist/workspace/resource-context.js";
+import { DEFAULT_WORKSPACE_RUN_BUDGET } from "../dist/workspace/run-binding.js";
 
 const temporary = [];
 after(() => { for (const path of temporary) fs.rmSync(path, { recursive: true, force: true }); });
@@ -171,7 +172,7 @@ test("a verbose colleague completion returns at most2k characters with its full 
 });
 
 test("actual governed Host compacts at72% without an extra Provider or a usage reset, then closes with fresh verification", async () => {
-  const path = root(); let calls = 0;
+  const path = root(), burstInput = Math.ceil(DEFAULT_WORKSPACE_RUN_BUDGET.maxTokens * WORKSPACE_CONTEXT_LIMITS.compactAt / 2); let calls = 0;
   const host = new LocalWorkspaceHost(path, { providerFactory(_connection, binding) {
     return { id: "openai", model: binding.model, trailingTurnContext: true, async turn() {
       const index = calls++, steps = [
@@ -180,14 +181,14 @@ test("actual governed Host compacts at72% without an extra Provider or a usage r
         [{ id: "verify", name: "workspace_verify", input: { path: "hello.md", expectedContent: "hello workspace\n" } }],
         [{ id: "complete", name: "task_checkpoint", input: { completion: { state: "verified", checks: [{ acceptance_index: 0, evidence: "exact file bytes verified", tool_call_ids: ["verify"] }], final_answer: "verified" } } }],
       ];
-      assert.ok(index < 4); return { text: "", toolUses: steps[index], stop: "tool_use", usage: { input: index < 2 ? 11520 : 10, output: 1 } };
+      assert.ok(index < 4); return { text: "", toolUses: steps[index], stop: "tool_use", usage: { input: index < 2 ? burstInput : 10, output: 1 } };
     } };
   } });
   try {
     const ws = host.createWorkspace("Compaction", host.list().revision); host.configureSynthetic(ws.workspaceId, 0);
     const run = host.start("test", ws.workspaceId, ws.selectedAgentId, "write hello.md and verify", randomUUID()); await host.wait(run.runId);
     const view = host.snapshot(ws.workspaceId); assert.equal(view.conversation.taskState, "completed"); assert.equal(view.conversation.completion.state, "verified");
-    assert.equal(calls, 4); assert.equal(view.conversation.runUsage.modelCalls, 4); assert.equal(view.conversation.runUsage.inputTokens + view.conversation.runUsage.outputTokens, 23064);
+    assert.equal(calls, 4); assert.equal(view.conversation.runUsage.modelCalls, 4); assert.equal(view.conversation.runUsage.inputTokens + view.conversation.runUsage.outputTokens, 2 * burstInput + 24);
     const storage = new WorkspaceResourceStorage(host.home, host.catalog.resolve(ws.workspaceId).scope); storage.initialize();
     const audit = JSON.parse(fs.readFileSync(storage.run(() => join(workspaceStateHome(), ".hara", `context-${run.runId}.json`)), "utf8"));
     assert.equal(audit.observations.length, 4); assert.equal(audit.observations[1].compacted, false); assert.equal(audit.observations[2].compacted, true);

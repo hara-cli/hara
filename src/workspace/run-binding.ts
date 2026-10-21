@@ -20,6 +20,12 @@ export interface WorkspaceRunBinding {
   host: { hostId: string; hostEpoch: number; grantId: string; grantRevision: number; actorId: string; policyRevision: number };
   budget: { maxRounds: number; maxToolCalls: number; maxTokens: number; timeoutMs: number };
 }
+/** Transport input includes the fixed prompt/tool schema on EVERY round. Allow twelve ordinary
+ * rounds (about 96k at 8k/round) plus headroom; retain raw telemetry and the bounded tree governor.
+ * Only new ordinary tasks use this default. Existing bindings and acceptance slices stay frozen. */
+export const DEFAULT_WORKSPACE_RUN_BUDGET: Readonly<WorkspaceRunBinding["budget"]> = Object.freeze({
+  maxRounds: 12, maxToolCalls: 32, maxTokens: 128_000, timeoutMs: 120_000,
+});
 export function workspaceAgentBindingHash(binding: WorkspaceAgentTaskBinding): string {
   return createHash("sha256").update("hara-workspace-run-agent-v1\0").update(canonical(binding)).digest("hex");
 }
