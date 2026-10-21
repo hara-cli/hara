@@ -29,7 +29,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     const files = readdirSync("test").filter(file => file.endsWith(".test.mjs")).sort();
     const env = { ...process.env }; delete env.HARA_INTEL_TEST_BUDGET;
     for (const batch of nativeTestBatches(files, process.arch)) {
-      const groups = batch.slow ? batch.files.map(file => [file]) : [batch.files];
+      const groups = batch.slow || batch.isolated ? batch.files.map(file => [file]) : [batch.files];
       for (const group of groups) {
         const label = group.length === 1 ? group[0] : `${group.length} ordinary files`, started = Date.now();
         console.log(`ARM64 full-suite start: ${label}; original ${batch.timeout}ms deadline; concurrency${batch.concurrency}`);

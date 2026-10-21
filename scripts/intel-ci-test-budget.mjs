@@ -12,6 +12,13 @@ export const INTEL_SLOW_FILES = Object.freeze([
   "legacy-copy-roundtrip.test.mjs", "legacy-startup.test.mjs",
   "session-profile-cli.test.mjs", "workspace-local-host.test.mjs", "workspace-model-context.test.mjs", "workspace-production-entry.test.mjs",
 ]);
+// These fixtures compete for the hosted Mac's durable disk, browser or process-start capacity.
+// Isolate them without increasing their original 120s file deadline or any product/case deadline.
+export const NATIVE_CONTENTION_FILES = Object.freeze([
+  "jobs.test.mjs", "presentations.test.mjs", "provider-connections-cli.test.mjs",
+  "workspace-local-channels.test.mjs", "workspace-local-channels-sessions.test.mjs",
+  "workspace-local-channels-recovery.test.mjs", "workspace-provider-recovery.test.mjs",
+]);
 export function usesIntelBudget({ platform = process.platform, arch = process.arch, env = process.env, release = version } = {}) {
   return ["1.0.1", "1.0.2"].includes(release) && platform === "darwin" && arch === "x64"
     && env.GITHUB_ACTIONS === "true" && env.HARA_INTEL_TEST_BUDGET === release;
@@ -20,10 +27,17 @@ export function intelCaseTimeout(normal, intel, options) { return usesIntelBudge
 export function intelTestBatches(files) {
   assert.equal(new Set(files).size, files.length, "duplicate test file");
   for (const file of INTEL_SLOW_FILES) assert(files.includes(file), `required Intel test missing: ${file}`);
+  for (const file of NATIVE_CONTENTION_FILES) assert(files.includes(file), `required native contention test missing: ${file}`);
   return [
     { timeout: 300000, concurrency: 1, files: files.filter(file => INTEL_SLOW_FILES.includes(file)), slow: true },
-    { timeout: 120000, concurrency: 4, files: files.filter(file => !INTEL_SLOW_FILES.includes(file)), slow: false },
+    { timeout: 120000, concurrency: 4, files: files.filter(file => !INTEL_SLOW_FILES.includes(file) && !NATIVE_CONTENTION_FILES.includes(file)), slow: false },
+    { timeout: 120000, concurrency: 1, files: files.filter(file => NATIVE_CONTENTION_FILES.includes(file)), slow: false, isolated: true },
   ];
+}
+export function intelTestGroups(batch) {
+  if (batch.slow)
+    return ["workspace-production-entry.test.mjs", ...batch.files.filter(file => file !== "workspace-production-entry.test.mjs")].map(file => [file]);
+  return batch.isolated ? batch.files.map(file => [file]) : [batch.files];
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   assert(["1.0.1", "1.0.2"].includes(version), "temporary Intel budget needs an explicitly reviewed release");
@@ -43,9 +57,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     console.log(`Intel ${version} test batch: ${batch.files.length} files, ${batch.timeout}ms, concurrency${batch.concurrency}; no skips`);
     const env = { ...process.env }; delete env.HARA_INTEL_TEST_BUDGET;
     if (batch.slow) env.HARA_INTEL_TEST_BUDGET = version;
-    const groups = batch.slow
-      ? ["workspace-production-entry.test.mjs", ...batch.files.filter(file => file !== "workspace-production-entry.test.mjs")].map(file => [file])
-      : [batch.files];
+    const groups = intelTestGroups(batch);
     for (const group of groups) {
       const started = Date.now();
       console.log(`Intel test start: ${group.length === 1 ? group[0] : `${group.length} ordinary files`}`);
