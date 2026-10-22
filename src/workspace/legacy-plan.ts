@@ -4,7 +4,7 @@ import { isAbsolute } from "node:path";
 import { parseRoleFrontmatter } from "../org/roles.js";
 import { scanMemory } from "../memory/guard.js";
 import { redactSensitiveText } from "../security/secrets.js";
-import { nextRun, validTz } from "../cron/schedule.js";
+import { nextRunPreview, validTz, type NextRunPreview, type Schedule } from "../cron/schedule.js";
 import { validWorkspaceSchedule } from "./features.js";
 import { canonical, plain } from "./local-state.js";
 
@@ -19,7 +19,7 @@ export interface LegacyTaskPlan {
   schedule: unknown; timezone: string; timezoneDefaulted: boolean; originalEnabled: boolean; importEnabled: boolean;
   expiredOnce: boolean; cwdRef: string; haraCli: boolean; externalTargetHints: number; structuredDeliver: boolean;
   alertAfter: number | null; consecutiveErrors: number; relatedRoles: string[];
-  classification: "needs_adapters" | "safe_disabled" | "rejected"; reasons: string[]; nextRunAt: number | null;
+  classification: "needs_adapters" | "safe_disabled" | "rejected"; reasons: string[];
   definitionValidation: "pass" | "reject"; execution: "not_run"; idempotency: "not_run"; rollback: "not_run";
 }
 export interface LegacyRolePlan {
@@ -111,9 +111,6 @@ export function buildLegacyInheritancePlan(input: LegacyPlanInput) {
       if (expiredOnce) reasons.push("expired_once_disabled");
       if (enabled) reasons.push("cutover_and_24h_observation_pending");
     }
-    let nextRunAt: number | null = null;
-    if (!rejected && enabled) nextRunAt = nextRun({ schedule: row.schedule as any, createdAt: typeof row.createdAt === "number" ? row.createdAt : input.now,
-      tz: timezone, ...(typeof row.lastRunAt === "number" ? { lastRunAt: row.lastRunAt } : {}) }, input.now, { deadlineMs: Date.now() + 40 });
     const schedule = validWorkspaceSchedule(row.schedule) ? row.schedule.kind === "cron" ? { kind: "cron", expr: row.schedule.expr }
       : row.schedule.kind === "once" ? { kind: "once", runAt: row.schedule.runAt } : { kind: "every", everyMs: row.schedule.everyMs } : null;
     return { id: row.id as string, name: safe(row.name, 128), definitionHash: hash(canonical(row)), taskHash: hash(task), mode: ["print", "command", "org"].includes(mode) ? mode : "unknown",
@@ -121,7 +118,7 @@ export function buildLegacyInheritancePlan(input: LegacyPlanInput) {
       expiredOnce, cwdRef: `R${String(roots.indexOf(typeof row.cwd === "string" ? row.cwd : "") + 1).padStart(2, "0")}`, haraCli: cli,
       externalTargetHints: new Set(task.match(/(?:feishu|telegram|weixin|webhook):[^\s"'`<>]+/g) ?? []).size, structuredDeliver: Boolean(row.deliver),
       alertAfter: Number.isSafeInteger(row.alertAfter) ? Number(row.alertAfter) : null, consecutiveErrors: Number.isSafeInteger(row.consecutiveErrors) ? Number(row.consecutiveErrors) : 0,
-      relatedRoles: related, classification: rejected ? "rejected" : !enabled ? "safe_disabled" : "needs_adapters", reasons, nextRunAt,
+      relatedRoles: related, classification: rejected ? "rejected" : !enabled ? "safe_disabled" : "needs_adapters", reasons,
       definitionValidation: rejected ? "reject" : "pass", execution: "not_run", idempotency: "not_run", rollback: "not_run" };
   });
   const plan = { schemaVersion: 1, kind: "read_only_dry_run", sourceFingerprint: input.sourceFingerprint, at: input.now,
@@ -134,4 +131,24 @@ export function buildLegacyInheritancePlan(input: LegacyPlanInput) {
   const serialized = JSON.stringify(plan);
   if (needles.some(value => serialized.includes(value))) throw new Error("Legacy output failed secret boundary; nothing published");
   return plan;
+}
+
+/** Optional, volatile display data. Never stored in the migration plan/hash or used to decide whether
+ * a task is imported/enabled. All rows share the original 40ms bound instead of multiplying it per row. */
+export function previewLegacyInheritanceSchedules(input: LegacyPlanInput, options: { budgetMs?: number; now?: () => number } = {}) {
+  const plan = buildLegacyInheritancePlan(input), budgetMs = options.budgetMs ?? 40;
+  if (!Number.isSafeInteger(budgetMs) || budgetMs < 1 || budgetMs > 40) throw new Error("Invalid legacy preview budget");
+  const now = options.now ?? Date.now, deadlineMs = now() + budgetMs;
+  const jobs = (Array.isArray(input.jobs) ? input.jobs : (input.jobs as { jobs: unknown[] }).jobs) as Record<string, unknown>[];
+  const tasks = plan.tasks.map((task, index) => {
+    const row = jobs[index];
+    let preview: NextRunPreview | { state: "disabled" | "rejected"; nextRunAt: null };
+    if (task.classification === "rejected") preview = { state: "rejected", nextRunAt: null };
+    else if (!task.importEnabled) preview = { state: "disabled", nextRunAt: null };
+    else preview = nextRunPreview({ schedule: row.schedule as Schedule,
+      createdAt: typeof row.createdAt === "number" ? row.createdAt : input.now, tz: task.timezone,
+      ...(typeof row.lastRunAt === "number" ? { lastRunAt: row.lastRunAt } : {}) }, input.now, { deadlineMs, now });
+    return { id: task.id, definitionHash: task.definitionHash, ...preview };
+  });
+  return { sourceFingerprint: plan.sourceFingerprint, at: plan.at, tasks };
 }
