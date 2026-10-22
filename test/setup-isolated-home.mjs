@@ -5,8 +5,12 @@ import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// macOS exposes /var as a symlink to /private/var. Store the canonical spelling so security checks that
-// compare verified symlink targets do not mistake the OS alias for a foreign path.
+// macOS /var aliases and Windows 8.3 TEMP spellings must not become fixture authority aliases.
+// Candidate callers already canonicalize their temp root; keep ordinary CI fixtures equivalent.
+const canonicalTemp = realpathSync.native(tmpdir());
+process.env.TMPDIR = canonicalTemp;
+process.env.TMP = canonicalTemp;
+process.env.TEMP = canonicalTemp;
 const isolatedHome = realpathSync.native(mkdtempSync(join(tmpdir(), "hara-test-home-")));
 process.env.HOME = isolatedHome;
 process.env.USERPROFILE = isolatedHome;

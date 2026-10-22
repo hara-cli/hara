@@ -110,7 +110,7 @@ jobs:
           node scripts/standalone-pi-runtime-smoke.mjs dist/bin/hara.exe "$expected"
 
   complete-default-suite:
-    # Keep the candidate's unmodified npm-test entry covered on both affected native platforms.
+    # Candidate-equivalent full coverage, including the strict original-deadline native batches.
     # Full output must survive a failure; a tail alone cannot identify the first failed fixture.
     strategy:
       fail-fast: false
@@ -118,6 +118,12 @@ jobs:
         os: [windows-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: 'false'
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -133,12 +139,18 @@ jobs:
         shell: bash
         run: |
           node --input-type=module -e 'import fs from "node:fs";import os from "node:os";const n=fs.lstatSync(os.tmpdir()),b=fs.lstatSync(os.tmpdir(),{bigint:true});console.log(JSON.stringify({platform:process.platform,arch:process.arch,dev:String(b.dev),ino:String(b.ino),safeNumberDev:Number.isSafeInteger(n.dev),safeNumberIno:Number.isSafeInteger(n.ino)}));'
-      - name: Complete original default suite with failure diagnostics
+      - name: Complete platform full suite with failure diagnostics
         shell: bash
         run: |
           set +e
-          npm test 2>&1 | tee "$RUNNER_TEMP/core-default-tests.log"
-          exit "${PIPESTATUS[0]}"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            node scripts/native-ci-tests.mjs --original-deadlines 2>&1 | tee "$RUNNER_TEMP/core-default-tests.log"
+            test_code=${PIPESTATUS[0]}
+          else
+            npm test 2>&1 | tee "$RUNNER_TEMP/core-default-tests.log"
+            test_code=${PIPESTATUS[0]}
+          fi
+          exit "$test_code"
       - name: Retain complete test diagnostics on success or failure
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
