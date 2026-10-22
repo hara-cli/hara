@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildLegacyInheritancePlan } from "../dist/workspace/legacy-plan.js";
+import { buildLegacyInheritancePlan, previewLegacyInheritanceSchedules } from "../dist/workspace/legacy-plan.js";
 const at=Date.parse("2026-10-19T03:00:00Z");
 const job=(extra={})=>({id:"job-1",name:"Daily report",mode:"command",task:"python3 report.py",cwd:"/private/work",enabled:true,createdAt:at-86400000,schedule:{kind:"cron",expr:"0 8 * * *"},...extra});
 const role=(id,extra="")=>({file:id+".md",content:`---\nname: ${id}\ndisplayName: ${id}\nallowTools: ["read", "bash"]\nowns: ["reports"]\n${extra}---\nWork carefully.\n`});
@@ -9,6 +9,36 @@ test("dry-run keeps exact task IDs/hashes and preserves shell lane as pending, n
  const a=buildLegacyInheritancePlan(input()),b=buildLegacyInheritancePlan(input());assert.deepEqual(a,b);
  assert.equal(a.tasks[0].id,"job-1");assert.equal(a.tasks[0].classification,"needs_adapters");assert.equal(a.tasks[0].execution,"not_run");assert.equal(a.tasks[0].timezone,"Asia/Shanghai");
  assert.equal(a.summary.modelCalls,0);assert.equal(a.summary.scriptsExecuted,0);assert.equal(JSON.stringify(a).includes("python3 report.py"),false);
+});
+test("inheritance plan is identical even when a preview wall-clock budget would expire",()=>{
+ const original=Date.now;
+ try {
+  Date.now=()=>1000;const before=buildLegacyInheritancePlan(input());
+  let reads=0;Date.now=()=>reads++===0?1000:1041;
+  const delayed=buildLegacyInheritancePlan(input());
+  assert.deepEqual(delayed,before);
+  assert.equal(reads,0,"classification must not consult the preview clock");
+ } finally {Date.now=original;}
+});
+test("bounded schedule preview distinguishes budget exhaustion from no next run, outside the plan",()=>{
+ const source=input();const plan=buildLegacyInheritancePlan(source);
+ const ready=previewLegacyInheritanceSchedules(source,{now:()=>1000});
+ assert.deepEqual(ready.tasks[0],{id:plan.tasks[0].id,definitionHash:plan.tasks[0].definitionHash,state:"scheduled",nextRunAt:Date.parse("2026-10-20T00:00:00Z")});
+ let reads=0;const exhausted=previewLegacyInheritanceSchedules(source,{now:()=>reads++===0?1000:1041});
+ assert.equal(exhausted.tasks[0].state,"budget_exhausted");assert.equal(exhausted.tasks[0].nextRunAt,null);
+ assert.deepEqual(buildLegacyInheritancePlan(source),plan);
+ assert.equal(Object.hasOwn(plan.tasks[0],"nextRunAt"),false);
+ assert.equal(plan.tasks[0].importEnabled,true);
+ assert.deepEqual(previewLegacyInheritanceSchedules(source,{now:()=>1000}),ready);
+});
+test("all sparse previews share one bounded budget; disabled/rejected/completed rows stay distinct",()=>{
+ const source=input({jobs:[job(),job({id:"sparse-2"}),job({id:"disabled",enabled:false}),job({id:"invalid",schedule:{kind:"cron",expr:"bad"}}),
+  job({id:"completed",schedule:{kind:"once",runAt:at+60000,display:"later"},lastRunAt:at+60000}),job({id:"every",schedule:{kind:"every",everyMs:60000,display:"every minute"}})]});
+ let reads=0;const result=previewLegacyInheritanceSchedules(source,{now:()=>reads++===0?1000:1041});
+ assert.deepEqual(result.tasks.map(t=>t.state),["budget_exhausted","budget_exhausted","disabled","rejected","none","scheduled"]);
+ assert.equal(reads,3,"one shared deadline plus one bounded check per sparse row");
+ assert.equal(result.tasks.at(-1).nextRunAt,at+60000);
+ for(const budgetMs of [0,41,NaN,1.5])assert.throws(()=>previewLegacyInheritanceSchedules(source,{budgetMs}),/budget/);
 });
 test("expired enabled once is disabled without deleting its schedule, original state, or evidence",()=>{
  const p=buildLegacyInheritancePlan(input({jobs:[job({schedule:{kind:"once",runAt:at-1,display:"yesterday"}})]}));const j=p.tasks[0];

@@ -292,33 +292,47 @@ export function isDue(job: JobTiming, nowMs: number): boolean {
 export interface NextRunOptions {
   /** Optional shared wall-clock budget for renderer-facing bulk queries. Core scheduler calls omit it. */
   deadlineMs?: number;
+  /** Injectable preview clock. Business schedule time is always the explicit fromMs argument. */
+  now?: () => number;
 }
 
-export function nextRun(job: JobTiming, fromMs: number, options: NextRunOptions = {}): number | null {
+export type NextRunPreview =
+  | { state: "scheduled"; nextRunAt: number }
+  | { state: "none" | "budget_exhausted"; nextRunAt: null };
+
+/** Display-only result: exhausting a response budget is not evidence that no next run exists. */
+export function nextRunPreview(job: JobTiming, fromMs: number, options: NextRunOptions = {}): NextRunPreview {
+  const scheduled = (nextRunAt: number): NextRunPreview => ({ state: "scheduled", nextRunAt });
+  const none: NextRunPreview = { state: "none", nextRunAt: null };
   const s = job.schedule;
-  if (s.kind === "every") return (Math.floor(fromMs / s.everyMs) + 1) * s.everyMs; // next grid boundary (always > fromMs)
+  if (s.kind === "every") return scheduled((Math.floor(fromMs / s.everyMs) + 1) * s.everyMs); // next grid boundary (always > fromMs)
   if (s.kind === "once") {
     const completed = lastRunBelongsToCurrentSchedule(job);
-    if (completed) return null;
-    return s.runAt <= fromMs ? fromMs : s.runAt;
+    if (completed) return none;
+    return scheduled(s.runAt <= fromMs ? fromMs : s.runAt);
   }
   const p = parseCron(s.expr);
-  if (!p) return null;
-  if (isDue(job, fromMs)) return fromMs;
+  if (!p) return none;
+  if (isDue(job, fromMs)) return scheduled(fromMs);
   const start = Math.floor(fromMs / 60_000) * 60_000 + 60_000; // next minute boundary
   for (let t = start, i = 0; i < 366 * 24 * 60; t += 60_000, i++) {
     // Inspect the candidate before enforcing the shared UI deadline. A caller can be descheduled after
     // creating a tiny budget; dense schedules must still return their immediately-computable next minute
     // instead of becoming an empty preview solely because the process resumed a few milliseconds late.
-    if (cronFieldsMatch(p, new Date(t), job.tz)) return t;
+    if (cronFieldsMatch(p, new Date(t), job.tz)) return scheduled(t);
     // A Desktop list can contain thousands of independently valid but extremely sparse schedules. Share
     // one small response budget so an authenticated local query cannot monopolize Serve's event loop. At
     // most one candidate is evaluated after an already-expired deadline, which keeps the bound intact.
     if (
       options.deadlineMs !== undefined
       && (i & 255) === 0
-      && Date.now() >= options.deadlineMs
-    ) return null;
+      && (options.now ?? Date.now)() >= options.deadlineMs
+    ) return { state: "budget_exhausted", nextRunAt: null };
   }
-  return null;
+  return none;
+}
+
+/** Compatibility projection for existing callers. Use nextRunPreview to distinguish budget exhaustion. */
+export function nextRun(job: JobTiming, fromMs: number, options: NextRunOptions = {}): number | null {
+  return nextRunPreview(job, fromMs, options).nextRunAt;
 }
