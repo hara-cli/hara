@@ -25,6 +25,43 @@ test("context preflight is required and unresolved lookup counts survive reopeni
   assert.equal(reopened.question(), null, "an accepted answer starts a new bounded lookup window");
 });
 
+for (const reason of ["lookup_missing", "lookup_ambiguous", "tool_problem", "budget_warning", "explicit"]) {
+  test(`answering ${reason} resets only the corresponding failure window`, t => {
+    const create = () => {
+      const a = gate(t); a.interaction.prepared();
+      a.interaction.observe("workspace_context_lookup", JSON.stringify({ status: "missing" }), false);
+      a.interaction.observe("workspace_read", undefined, true);
+      const question = a.interaction.request(reason);
+      a.interaction.answer(question.id);
+      return a.open();
+    };
+    const lookupGate = create();
+    lookupGate.observe("workspace_context_lookup", JSON.stringify({ status: "missing" }), false);
+    assert.equal(lookupGate.question()?.reason ?? null,
+      ["lookup_missing", "lookup_ambiguous"].includes(reason) ? null : "lookup_missing");
+    const failureGate = create();
+    failureGate.observe("workspace_read", undefined, true);
+    assert.equal(failureGate.question()?.reason ?? null, reason === "tool_problem" ? null : "tool_problem");
+  });
+}
+
+test("roster enumeration neither counts nor resolves missing references; failed listings still require help", t => {
+  const a = gate(t); a.interaction.prepared();
+  a.interaction.beginBatch(["agent_list", "workspace_write"]);
+  a.interaction.admit("agent_list");
+  assert.throws(() => a.interaction.admit("workspace_write"), /separate lookup batch/);
+  a.interaction.observe("workspace_context_lookup", JSON.stringify({ status: "missing" }), false);
+  for (let n = 0; n < 2; n++) a.interaction.observe("agent_list", JSON.stringify([]), false);
+  assert.equal(a.interaction.question(), null, "an empty roster is not a query-specific lookup failure");
+  a.open().observe("workspace_context_lookup", JSON.stringify({ status: "missing" }), false);
+  assert.equal(a.interaction.question().reason, "lookup_missing", "enumeration cannot clear an unresolved lookup");
+  const failed = gate(t); failed.interaction.prepared();
+  failed.interaction.observe("agent_list", undefined, true);
+  assert.equal(failed.interaction.question(), null);
+  failed.open().observe("agent_list", undefined, true);
+  assert.equal(failed.interaction.question().reason, "tool_problem");
+});
+
 test("one evidenced ambiguity asks once; a model default cannot replace an answer", t => {
   const a = gate(t); a.interaction.prepared();
   a.interaction.observe("workspace_context_lookup", JSON.stringify({ status: "ambiguous", candidates: [{ name: "Alpha" }, { name: "Beta" }] }), false);

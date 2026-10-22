@@ -569,6 +569,9 @@ export class LocalWorkspaceHost {
         const { completion: _completion, ...checkpoint } = value.task.checkpoint ?? { artifacts: [], facts: {}, capabilities: {}, updatedAt: now };
         value.task = { ...value.task, status: "paused", lastOutcome: "interrupted", endedAt: now, updatedAt: now, checkpoint: { ...checkpoint, updatedAt: now } };
         if (value.attempt) value.attempt = { ...value.attempt, state: "cancelled", endedAt: now };
+        // These separate JSON stores are not atomic. The lease serializes writers; a crash
+        // between writes leaves the retained question blocking dispatch. Retrying pause can
+        // finish dismissal without losing the saved checkpoint or treating it as an answer.
         store.save(value.revision, value); interaction.dismiss();
       }
       this.changed(workspaceId, agentId); return { state: "paused" as const };
