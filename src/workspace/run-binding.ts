@@ -34,7 +34,8 @@ export function workspaceAgentBindingHash(binding: WorkspaceAgentTaskBinding): s
 }
 const safeId = (value: unknown) => text(value, 220) && !/[\\/]/.test(value);
 // Native file IDs can use all 64 bits (notably on NTFS). Keep old exact JSON numbers readable,
-// but never round an unsafe number back into authority. New bindings use decimal strings.
+// but never round an unsafe number back into authority. Preserve numeric rollback compatibility
+// whenever the native value is safe; only wider IDs require decimal strings.
 function fileId(value: unknown): value is string | number {
   return typeof value === "number" ? Number.isSafeInteger(value) && value >= 0
     : typeof value === "string" && /^(?:0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 0xffffffffffffffffn;
@@ -42,12 +43,18 @@ function fileId(value: unknown): value is string | number {
 export function workspaceFileIdMatches(frozen: unknown, native: bigint): boolean {
   return fileId(frozen) && BigInt(frozen) === native;
 }
+export function serializeWorkspaceFileId(native: bigint): string | number {
+  if (typeof native !== "bigint" || native < 0n || native > 0xffffffffffffffffn) {
+    throw new Error("unsupported native Workspace file identity");
+  }
+  return native <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(native) : String(native);
+}
 export function captureWorkspaceProjectIdentity(root: string): WorkspaceRunBinding["project"] {
   const info = lstatSync(root, { bigint: true });
   if (!isAbsolute(root) || !info.isDirectory() || info.isSymbolicLink() || realpathSync.native(root) !== root) {
     throw new Error("Workspace project grant identity changed");
   }
-  return { root, dev: String(info.dev), ino: String(info.ino) };
+  return { root, dev: serializeWorkspaceFileId(info.dev), ino: serializeWorkspaceFileId(info.ino) };
 }
 function parse(value: unknown): WorkspaceRunBinding {
   const fail = (): never => { throw new Error("invalid or unsupported Workspace RunBinding; execution refused"); };

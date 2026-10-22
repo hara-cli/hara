@@ -5,7 +5,7 @@ import fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { workspaceResourceScopeKey } from "../dist/workspace/resource-context.js";
-import { captureWorkspaceProjectIdentity, freezeWorkspaceRunBinding, isWorkspaceRunBinding, workspaceAgentBindingHash, workspaceFileIdMatches } from "../dist/workspace/run-binding.js";
+import { captureWorkspaceProjectIdentity, serializeWorkspaceFileId, freezeWorkspaceRunBinding, isWorkspaceRunBinding, workspaceAgentBindingHash, workspaceFileIdMatches } from "../dist/workspace/run-binding.js";
 
 function binding(project = { root: resolve("."), dev: 1, ino: 2 }) {
   const scope = { schemaVersion: 1, workspaceId: `ws_${randomUUID()}`, authority: { kind: "local", localAuthorityId: randomUUID() } };
@@ -24,6 +24,16 @@ test("RunBinding preserves full-width native directory identities through JSON i
   assert.equal(frozen.project.ino, "9007199254740993");
   assert.deepEqual(freezeWorkspaceRunBinding(JSON.parse(JSON.stringify(frozen))), frozen);
   assert.equal(Object.isFrozen(frozen.project), true);
+});
+
+test("new IDs remain JSON numbers through MAX_SAFE_INTEGER and only wider IDs become strings", () => {
+  for (const native of [0n, 123n, 9007199254740991n, 9007199254740992n, 9007199254740993n, 0xffffffffffffffffn]) {
+    const stored = serializeWorkspaceFileId(native);
+    assert.equal(typeof stored, native <= 9007199254740991n ? "number" : "string");
+    assert.equal(workspaceFileIdMatches(JSON.parse(JSON.stringify(stored)), native), true);
+    if (typeof stored === "number") assert.equal(isWorkspaceRunBinding(binding({ root: resolve("."), dev: stored, ino: stored })), true);
+  }
+  for (const bad of [-1n, 0x10000000000000000n, 1, "1", null]) assert.throws(() => serializeWorkspaceFileId(bad), /unsupported native/);
 });
 
 test("RunBinding retains exact legacy safe integers but rejects rounded, malformed or oversized file ids", () => {
@@ -53,7 +63,7 @@ test("native directory capture freezes exact IDs and still rejects replacement a
   const info = fs.lstatSync(directory, { bigint: true }), identity = captureWorkspaceProjectIdentity(directory);
   t.diagnostic(JSON.stringify({ platform: process.platform, arch: process.arch, nativeDev: String(info.dev), nativeIno: String(info.ino),
     numberDevSafe: Number.isSafeInteger(Number(info.dev)), numberInoSafe: Number.isSafeInteger(Number(info.ino)) }));
-  assert.equal(identity.dev, String(info.dev)); assert.equal(identity.ino, String(info.ino));
+  assert.equal(identity.dev, serializeWorkspaceFileId(info.dev)); assert.equal(identity.ino, serializeWorkspaceFileId(info.ino));
   assert.equal(isWorkspaceRunBinding(binding(identity)), true);
   fs.renameSync(directory, retained); fs.mkdirSync(directory);
   assert.equal(workspaceFileIdMatches(identity.ino, fs.lstatSync(directory, { bigint: true }).ino), false,

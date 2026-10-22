@@ -17,16 +17,33 @@ export function nativeTestBatches(files, arch) {
 export function strictNativeTestBatches(files, arch) {
   return nativeTestBatches(files, arch).map(batch => ({ ...batch, timeout: 120000 }));
 }
+export function runNativeTestGroups(batches, arch, { run, env, log = console.log, now = Date.now }) {
+  let failures = 0;
+  for (const batch of batches) {
+    const groups = batch.slow || batch.isolated ? batch.files.map(file => [file]) : [batch.files];
+    for (const group of groups) {
+      const label = group.length === 1 ? group[0] : `${group.length} ordinary files`, started = now();
+      log(`Native ${arch} full-suite start: ${label}; original ${batch.timeout}ms deadline; concurrency${batch.concurrency}`);
+      const code = run(["--import", "./test/setup-isolated-home.mjs", "--test", `--test-concurrency=${batch.concurrency}`,
+        `--test-timeout=${batch.timeout}`, ...group.map(file => `test/${file}`)], env);
+      if (code !== 0) failures++;
+      log(`Native ${arch} full-suite completed: ${label}; ${now() - started}ms; exit ${code}`);
+    }
+  }
+  log(`Native ${arch} full-suite finished: ${failures} failed groups`);
+  return failures === 0 ? 0 : 1;
+}
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   assert.equal(process.platform, "darwin", "native Mac full-suite runner only");
   const args = process.argv.slice(2);
   assert(args.length === 0 || (args.length === 1 && args[0] === "--original-deadlines"), "unsupported native test mode");
   const strict = args[0] === "--original-deadlines";
-  const run = (args, env = process.env) => {
+  const execute = (args, env = process.env) => {
     const result = spawnSync(process.execPath, args, { env, stdio: "inherit" });
     if (result.error) throw result.error;
-    if (result.status !== 0) process.exit(result.status ?? 1);
+    return result.status ?? 1;
   };
+  const run = args => { const code = execute(args); if (code !== 0) process.exit(code); };
   if (process.arch === "x64" && !strict) {
     run(["scripts/intel-ci-test-budget.mjs"]);
   } else {
@@ -37,15 +54,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     const files = readdirSync("test").filter(file => file.endsWith(".test.mjs")).sort();
     const env = { ...process.env }; delete env.HARA_INTEL_TEST_BUDGET;
     const batches = strict ? strictNativeTestBatches(files, process.arch) : nativeTestBatches(files, process.arch);
-    for (const batch of batches) {
-      const groups = batch.slow || batch.isolated ? batch.files.map(file => [file]) : [batch.files];
-      for (const group of groups) {
-        const label = group.length === 1 ? group[0] : `${group.length} ordinary files`, started = Date.now();
-        console.log(`Native ${process.arch} full-suite start: ${label}; original ${batch.timeout}ms deadline; concurrency${batch.concurrency}`);
-        run(["--import", "./test/setup-isolated-home.mjs", "--test", `--test-concurrency=${batch.concurrency}`,
-          `--test-timeout=${batch.timeout}`, ...group.map(file => `test/${file}`)], env);
-        console.log(`Native ${process.arch} full-suite completed: ${label}; ${Date.now() - started}ms`);
-      }
-    }
+    process.exitCode = runNativeTestGroups(batches, process.arch, { run: execute, env });
   }
 }
