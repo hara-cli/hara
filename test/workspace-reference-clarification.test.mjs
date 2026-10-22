@@ -44,7 +44,7 @@ for(const lookups of [1,2]) test(`unknown reference pauses after ${lookups} look
   });
   try{
     writeFileSync(join(a.root,"project",a.workspaceId,"DO-NOT-READ.txt"),"SYNTHETIC_FILE_MUST_NOT_BE_READ");
-    const run=a.host.start("client",a.workspaceId,a.main,"Mori 同事去哪了？",randomUUID());await a.host.wait(run.runId);
+    const run=a.host.start("client",a.workspaceId,a.main,"Resolve the colleague reference in the current request",randomUUID());await a.host.wait(run.runId);
     const snapshot=a.host.snapshot(a.workspaceId,a.main,"client"),conversation=snapshot.conversation;
     assert.equal(requests,lookups+1);assert.equal(conversation.taskState,"paused");assert.equal(conversation.completion.state,"awaiting_user");assert.equal(conversation.blockReason,question);
     const results=conversation.history.flatMap(row=>row.role==="tool"?row.results:[]);
@@ -70,21 +70,18 @@ test("a model-provided default cannot answer its own Workspace clarification or 
     assert.equal(result.content.includes("INVENTED_ANSWER_MUST_NOT_BE_USED"),false);
   }finally{await a.close();}
 });
-test("two evidenced colleagues sharing a display name cause immediate clarification after the roster lookup",async()=>{
-  let requests=0;const question="你指的是哪位 Mori 同事？请确认具体名称或职责。";
-  const a=fixture(async args=>{
-    if(++requests===1)return call("agent_list");
-    assert.equal(requests,2);const result=args.history.flatMap(row=>row.role==="tool"?row.results:[]).find(row=>row.name==="agent_list");
-    assert.equal(JSON.parse(result.content).agents.filter(row=>row.identity.displayName==="Mori").length,2);
-    return call("ask_user",{question});
-  });
+test("two evidenced colleagues sharing a display name cause startup clarification before any model request",async()=>{
+  let requests=0;
+  const a=fixture(async()=>{requests++;throw new Error("startup ambiguity must stop before model dispatch");});
   try{
     const resources=new WorkspaceResources(a.host.home,a.scope);resources.initialize();const agents=resources.agents;
-    for(const username of ["synthetic-a","synthetic-b"])agents.create({username,profile:{displayName:"Mori",title:username},instructions:"Synthetic colleague",runtimeId:"pi"},agents.list().revision);
-    const run=a.host.start("client",a.workspaceId,a.main,"Mori 同事是哪位？",randomUUID());await a.host.wait(run.runId);
+    for(const username of ["synthetic-a","synthetic-b"])agents.create({username,profile:{displayName:"Alpha",title:username},instructions:"Synthetic colleague",runtimeId:"pi"},agents.list().revision);
+    const run=a.host.start("client",a.workspaceId,a.main,"Alpha 同事是哪位？",randomUUID());await a.host.wait(run.runId);
     const conversation=a.host.snapshot(a.workspaceId,a.main).conversation;
-    assert.equal(requests,2);assert.equal(conversation.completion.state,"awaiting_user");assert.equal(conversation.blockReason,question);
-    assert.equal(conversation.history.flatMap(row=>row.role==="tool"?row.results:[]).some(row=>row.name==="workspace_memory_search"||row.name==="workspace_read"),false);
+    assert.equal(requests,0);assert.equal(conversation.completion.state,"awaiting_user");assert.equal(conversation.pendingQuestion.reason,"lookup_ambiguous");
+    assert.deepEqual(conversation.pendingQuestion.options,["Alpha (synthetic-a)","Alpha (synthetic-b)"]);
+    assert.equal(conversation.runUsage.modelCalls,0);assert.equal(conversation.runUsage.toolCalls,0);
+    assert.equal(conversation.history.flatMap(row=>row.role==="tool"?row.results:[]).length,0);
   }finally{await a.close();}
 });
 test("new ordinary tasks can finish five bounded model rounds above the old 32k limit, retaining exact raw usage",async()=>{

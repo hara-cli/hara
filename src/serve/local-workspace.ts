@@ -56,7 +56,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, capabilities: [capability, "workspace.local-channels.v1", ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, capabilities: [capability, "workspace.user-interaction.v1", "workspace.local-channels.v1", ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
@@ -85,6 +85,20 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       if (method.endsWith(".select")) return host.selectChannel(client.id, workspaceId, params.channelId);
       if (method.endsWith(".cancel")) { host.cancelChannel(client.id, workspaceId, params.channelId); return { state: "draining" }; }
       return host.channelSnapshot(workspaceId, params.channelId, client.id);
+    }
+    if (method === "workspace.session.pause-question" || method === "workspace.channels.pause-question") {
+      const channel = method.startsWith("workspace.channels.");
+      fields(["workspaceId", "expectedGeneration", "agentId", "questionId", ...(channel ? ["channelId"] : [])]);
+      if (!text(params.agentId) || typeof params.questionId !== "string" || !UUID.test(params.questionId)
+        || (channel && (typeof params.channelId !== "string" || !UUID.test(params.channelId)))) throw new Error("invalid pending question pause");
+      return host.pauseUserQuestion(client.id, workspaceId, params.agentId, params.questionId, channel ? params.channelId as string : undefined);
+    }
+    if (method === "workspace.channels.answer") {
+      fields(["workspaceId", "expectedGeneration", "channelId", "agentId", "questionId", "message", "requestId"]);
+      if (typeof params.channelId !== "string" || !UUID.test(params.channelId) || !text(params.agentId)
+        || typeof params.questionId !== "string" || !UUID.test(params.questionId) || !messageBody(params.message)
+        || typeof params.requestId !== "string" || !UUID.test(params.requestId)) throw new Error("invalid channel user answer");
+      return host.answerChannel(client.id, workspaceId, params.channelId, params.agentId, params.questionId, params.message, params.requestId);
     }
     if (method === "workspace.channels.send") {
       fields(["workspaceId", "expectedGeneration", "channelId", "message", "requestId", "recipientIds"]);
@@ -127,6 +141,13 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (method === "workspace.connection.migration.retry") { fields(["workspaceId", "expectedGeneration", "expectedRevision", "approved"]); if (params.approved !== true) throw new Error("Explicit migration retry approval required"); return host.retryConnectionMigration(workspaceId, params.expectedRevision as number, true); }
     if (method === "workspace.connection.revoke") { fields(["workspaceId", "expectedGeneration", "connectionId", "expectedRevision"]); if (!text(params.connectionId)) throw new Error("invalid connection"); host.revokeConnection(workspaceId, params.connectionId, params.expectedRevision as number); return { revoked: true }; }
     if (method === "workspace.approval.respond") { fields(["workspaceId", "expectedGeneration", "approvalId", "approved"]); if (!text(params.approvalId) || typeof params.approved !== "boolean") throw new Error("invalid approval"); host.answerApproval(client.id, workspaceId, params.approvalId, params.approved); return { accepted: true }; }
+    if (method === "workspace.session.answer") {
+      fields(["workspaceId", "expectedGeneration", "agentId", "message", "requestId", "questionId"]);
+      if (!text(params.agentId) || !messageBody(params.message) || typeof params.requestId !== "string" || !UUID.test(params.requestId)
+        || typeof params.questionId !== "string" || !UUID.test(params.questionId)) throw new Error("invalid Workspace user answer");
+      return host.start(client.id, workspaceId, params.agentId, params.message, params.requestId, true, undefined, undefined,
+        { source: "ui", channel: "rpc", clientId: client.id, rpcIdHash: createHash("sha256").update(JSON.stringify(rpcId)).digest("hex") }, undefined, params.questionId);
+    }
     if (method === "workspace.session.send" || method === "workspace.session.resume") {
       fields(["workspaceId", "expectedGeneration", "agentId", "message", "requestId", ...(Object.hasOwn(params, "source") ? ["source"] : [])]);
       if (!text(params.agentId) || !messageBody(params.message) || typeof params.requestId !== "string" || !UUID.test(params.requestId)) throw new Error("invalid Workspace message");

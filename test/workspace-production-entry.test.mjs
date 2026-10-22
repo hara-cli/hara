@@ -45,14 +45,14 @@ test("formal six-step Host flow uses an explicit mock Provider; no DEV flags, la
     assert.throws(() => new LocalWorkspaceHost(dir(), { mode: "workspace", realKeyFile: "/not-read" }), /cannot inherit/);
   } finally { await restored?.close(); await host.close(); }
 });
-test("formal protocol advertises only workspace.v1 and rejects Lab configuration and renderer-selected sources", async () => {
+test("formal protocol advertises Workspace capabilities and rejects Lab configuration and renderer-selected sources", async () => {
   const root = dir(), handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port: 0 }, { root, mode: "workspace", version: "test" });
   const socket = new WebSocket(`ws://127.0.0.1:${handle.port}`); await once(socket, "open"); let serial = 0;
   const request = (method, params) => new Promise((resolve, reject) => { const id = ++serial, timer = setTimeout(() => { socket.off("message", message); reject(new Error("bounded formal RPC wait")); }, 3000);
     const message = raw => { const value = JSON.parse(String(raw)); if (value.id === id) { clearTimeout(timer); socket.off("message", message); value.error ? reject(new Error(value.error.message)) : resolve(value.result); } };
     socket.on("message", message); socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params })); });
   try {
-    const init = await request("initialize", { token: handle.token }); assert.deepEqual(init.capabilities, ["workspace.v1", "workspace.local-channels.v1"]); assert.equal(init.executionMode, "workspace");
+    const init = await request("initialize", { token: handle.token }); assert.deepEqual(init.capabilities, ["workspace.v1", "workspace.user-interaction.v1", "workspace.local-channels.v1"]); assert.equal(init.executionMode, "workspace");
     const workspace = await request("workspace.create", { label: "P", expectedRevision: init.workspace.revision }), scope = { workspaceId: workspace.workspaceId, expectedGeneration: workspace.resourceGeneration };
     await assert.rejects(request("workspace.connection.synthetic", { ...scope, expectedRevision: 0 }), /Lab/);
     await assert.rejects(request("workspace.runtime.propose", { ...scope, runtimeId: "codex", url: "http://127.0.0.1:9/tool" }), /unsupported/);

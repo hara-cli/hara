@@ -1,7 +1,7 @@
 import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment, TurnArgs, TurnResult } from "../providers/types.js";
 import { isTaskRuntimeBinding } from "../agent-runtime/bindings.js";
 import { WORKSPACE_AGENT_EXECUTION_PENDING } from "../workspace/agent-binding.js";
-import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, type WorkspaceRunPermit } from "../workspace/execution.js";
+import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, workspaceRunQuestion, workspaceRunBeginToolBatch, type WorkspaceRunPermit } from "../workspace/execution.js";
 import { createToolImageStore, redactOwnedToolImageText } from "../tools/tool-images.js";
 import { redactOwnedToolImageValue } from "../security/tool-media-redaction.js";
 import { createComputerRunScope, closeComputerRunScope } from "../tools/computer-run.js";
@@ -1809,6 +1809,12 @@ async function runAgentInner(
   // wait for its own task-state round to close. They run as the next round without another provider request.
   let carriedToolRound: Pick<Awaited<ReturnType<Provider["turn"]>>, "toolUses" | "continuation"> | undefined;
   for (;;) {
+    if (opts.workspaceRun && !runSignal.aborted) {
+      try {
+        const question = workspaceRunQuestion(opts.workspaceRun);
+        if (question) return { status: "completed" };
+      } catch (error) { return interactionFailure("Workspace user-question checkpoint", error); }
+    }
     let userIntervenedThisRound = false;
     // A cancellation that already happened is authoritative: do not start pending-input work, a provider
     // request, or any later tool round merely to give it an already-aborted signal.
@@ -2617,6 +2623,7 @@ async function runAgentInner(
     // while planning, approving, or executing, so finalize the round with real results for work that already
     // completed and explicit interruption errors for everything else before persisting the session.
     const results: ToolResult[] = new Array(r.toolUses.length);
+    if (opts.workspaceRun) workspaceRunBeginToolBatch(opts.workspaceRun, r.toolUses.map(tool => tool.name));
     const toolRuntimeItems = r.toolUses.map((toolUse) => ({
       itemId: randomUUID(),
       kind: "tool" as const,
@@ -2726,9 +2733,9 @@ async function runAgentInner(
           finishToolRuntimeItem(index, r.toolUses[index].id === pendingAsk.id ? "completed" : "denied");
         }
         const waiting = applyTaskCheckpoint(questionTask, {
-          blocked_step: questionCopy.blockedStep,
+          blocked_step: questionTask.checkpoint?.currentStep ?? questionCopy.blockedStep,
           block_reason: safeQuestion,
-          next_step: questionCopy.nextStep,
+          next_step: questionTask.checkpoint?.nextStep ?? questionCopy.nextStep,
           completion: {
             state: "awaiting_user",
             evidence: [questionCopy.waitingEvidence],

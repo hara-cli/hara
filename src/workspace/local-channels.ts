@@ -12,7 +12,7 @@ import { redactSensitiveText } from "../security/secrets.js";
 export interface LocalChannel { id: string; name: string; memberIds: string[]; createdAt: string }
 interface Catalog { schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; channels: LocalChannel[] }
 type ReplyState = "queued" | "running" | "completed" | "cancelled" | "failed" | "interrupted";
-interface Reply { agentId: string; displayName: string; requestId: string; runId: string | null; startIndex: number; endIndex: number | null; state: ReplyState }
+interface Reply { agentId: string; displayName: string; requestId: string; runId: string | null; startIndex: number; endIndex: number | null; state: ReplyState; questionId?: string }
 interface ChannelTurn { id: string; digest: string; body: string; createdAt: string; state: "running" | "completed" | "cancelled" | "interrupted"; replies: Reply[] }
 interface ChannelHistory { schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; channelId: string; turns: ChannelTurn[] }
 export interface LocalChannelMessage { id: string; turnId: string; agentId: string | null; displayName: string; createdAt: string;
@@ -20,7 +20,7 @@ export interface LocalChannelMessage { id: string; turnId: string; agentId: stri
 interface ActiveTurn { cancelled: boolean; runId: string | null; agentId: string | null; promise: Promise<void>; lease: WorkspaceSessionLease }
 interface ChannelHost {
   agents(): WorkspaceAgentView[];
-  start(agentId: string, body: string, requestId: string, channelId: string, context: string, clientId: string): { runId: string };
+  start(agentId: string, body: string, requestId: string, channelId: string, context: string, clientId: string, questionId?: string): { runId: string };
   wait(runId: string): Promise<void>;
   cancel(agentId: string, runId: string): void;
   changed(): void;
@@ -89,8 +89,9 @@ export class WorkspaceLocalChannels {
           || !["running", "completed", "cancelled", "interrupted"].includes(String(turn.state)) || !Array.isArray(turn.replies)) throw new Error("invalid channel turn; retained");
         const members = new Set<string>();
         for (const reply of turn.replies) {
-          if (!plain(reply) || !exact(reply, ["agentId", "displayName", "requestId", "runId", "startIndex", "endIndex", "state"]) || !isWorkspaceAgentId(reply.agentId) || members.has(reply.agentId)
+          if (!plain(reply) || !exact(reply, ["agentId", "displayName", "requestId", "runId", "startIndex", "endIndex", "state", ...(Object.hasOwn(reply, "questionId") ? ["questionId"] : [])]) || !isWorkspaceAgentId(reply.agentId) || members.has(reply.agentId)
             || !text(reply.displayName, 200) || typeof reply.requestId !== "string" || !UUID.test(reply.requestId) || (reply.runId !== null && (typeof reply.runId !== "string" || !UUID.test(reply.runId)))
+            || (reply.questionId !== undefined && (typeof reply.questionId !== "string" || !UUID.test(reply.questionId)))
             || !nonnegative(reply.startIndex) || (reply.endIndex !== null && (!nonnegative(reply.endIndex) || reply.endIndex < reply.startIndex))
             || !["queued", "running", "completed", "cancelled", "failed", "interrupted"].includes(String(reply.state))) throw new Error("invalid channel reply; retained");
           members.add(reply.agentId);
@@ -132,11 +133,11 @@ export class WorkspaceLocalChannels {
     return JSON.stringify({ channel: snapshot.channel.name, members: snapshot.channel.memberIds.map(id => ({ agentId: id, name: this.host.agents().find(row => row.agentId === id)?.identity.displayName ?? id })),
       messages: snapshot.messages.map(row => ({ sender: row.agentId ? row.displayName : "User", message: row.message })) });
   }
-  send(clientId: string, channelId: string, body: string, requestId: string, recipientIds: unknown) {
+  send(clientId: string, channelId: string, body: string, requestId: string, recipientIds: unknown, questionId?: string) {
     const channel = this.get(channelId);
     if (!this.host.accepting() || !messageBody(body) || !UUID.test(requestId) || !ids(recipientIds) || recipientIds.some(id => !channel.memberIds.includes(id))) throw new Error("invalid local channel message or recipients");
     this.members(recipientIds);
-    const state = this.history(channelId), before = state.read(), digest = createHash("sha256").update(canonical([body, recipientIds])).digest("hex");
+    const state = this.history(channelId), before = state.read(), digest = createHash("sha256").update(canonical(questionId ? [body, recipientIds, questionId] : [body, recipientIds])).digest("hex");
     const duplicate = before.turns.find(row => row.id === requestId);
     if (duplicate) { if (duplicate.digest !== digest) throw new Error("channel message identity already used"); return { channelId, requestId, accepted: true }; }
     if (this.active.has(channelId)) throw new Error("channel colleagues are still working");
@@ -154,7 +155,7 @@ export class WorkspaceLocalChannels {
           }
         }
         value.turns.push({ id: requestId, digest, body: redactSensitiveText(body).text, createdAt: new Date().toISOString(), state: "running", replies: recipientIds.map(agentId => ({ agentId,
-          displayName: this.host.agents().find(row => row.agentId === agentId)!.identity.displayName, requestId: randomUUID(), runId: null, startIndex: 0, endIndex: null, state: "queued" })) }); return value;
+          displayName: this.host.agents().find(row => row.agentId === agentId)!.identity.displayName, requestId: randomUUID(), runId: null, startIndex: 0, endIndex: null, state: "queued", ...(questionId ? { questionId } : {}) })) }); return value;
       });
     } catch (error) { lease.release(); throw error; }
     const active: ActiveTurn = { cancelled: false, runId: null, agentId: null, promise: Promise.resolve(), lease }; this.active.set(channelId, active);
@@ -176,7 +177,7 @@ export class WorkspaceLocalChannels {
         try {
           const store = new WorkspaceConversationStore(this.storage, reply.agentId, channelId), startIndex = store.read().history.length;
           this.changeReply(channelId, turnId, index, row => { row.startIndex = startIndex; row.state = "running"; });
-          const accepted = this.host.start(reply.agentId, turn.body, reply.requestId, channelId, this.context(channelId), clientId);
+          const accepted = this.host.start(reply.agentId, turn.body, reply.requestId, channelId, this.context(channelId), clientId, reply.questionId);
           active.runId = accepted.runId; active.agentId = reply.agentId;
           this.changeReply(channelId, turnId, index, row => { row.runId = accepted.runId; });
           admitted = true;
