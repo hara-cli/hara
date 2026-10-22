@@ -26,6 +26,7 @@ import type { WorkspaceAgentView } from "./agents.js";
 import { WorkspaceRealKeyLane, type ArkAcceptanceSlice } from "./real-key-provider.js";
 import { WorkspaceContextReceipts } from "./context-receipts.js";
 import { WorkspaceContextAudit } from "./context-audit.js";
+import { pruneWorkspaceExecutionAudits } from "./execution-audit.js";
 import { boundWorkspaceText } from "./model-context.js";
 import { createWorkspaceProvider } from "./provider.js";
 import { legacyWorkspaceProviderFailure, WorkspaceProviderAdmissionError, WorkspaceProviderRecovery } from "./provider-recovery.js";
@@ -46,7 +47,7 @@ import { WorkspaceLegacyResources } from "./legacy-resources.js";
 import { executeLegacyPrint } from "./legacy-print.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
-interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; features: WorkspaceFeatures; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness }
+interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; features: WorkspaceFeatures; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
 type WorkspaceConnectionSnapshot = ReturnType<WorkspaceConnectionStoreV2["list"]> & {
   readOnly?: boolean; recovered?: boolean; migrationPending?: boolean; unavailable?: boolean; activeConnectionId?: string | null;
 };
@@ -158,7 +159,7 @@ export class LocalWorkspaceHost {
   private context(workspaceId: string): WorkspaceHostContext {
     const row = this.catalog.resolve(workspaceId);
     const found = this.contexts.get(workspaceId);
-    if (found) { found.storage.run(() => {}); return found; }
+    if (found) { found.storage.run(() => {}); this.pruneExecutionAudits(workspaceId, found); return found; }
     const expected = canonical([row.scope, row.actorId, row.policyRevision, row.grantId, row.grantRevision]);
     const assertAuthority = () => {
       const current = this.catalog.resolve(workspaceId);
@@ -207,7 +208,21 @@ export class LocalWorkspaceHost {
         }
         throw new Error("Owner project runtime adapter unavailable; no global fallback");
       } });
-    this.contexts.set(workspaceId, context); return context;
+    this.contexts.set(workspaceId, context); this.pruneExecutionAudits(workspaceId, context); return context;
+  }
+  private pruneExecutionAudits(workspaceId: string, context: WorkspaceHostContext): void {
+    const now = Date.now();
+    // This throttle is not authority. Writers/cleanup still share the private per-file lock, and an
+    // unfinished persisted call is retained even when no job survives a Host restart.
+    if ((context.nextAuditCleanupAt !== undefined && now < context.nextAuditCleanupAt)
+      || [...this.jobs.values()].some(job => job.workspaceId === workspaceId)) return;
+    context.nextAuditCleanupAt = now + 60_000;
+    try { pruneWorkspaceExecutionAudits(context.storage, now); }
+    catch {
+      // Diagnostics are best effort; neither cleanup nor its log sink may block Workspace access.
+      try { process.stderr.write("hara: Workspace execution audit cleanup failed; retrying later.\n"); }
+      catch { /* Keep Workspace access available when diagnostic logging is unavailable too. */ }
+    }
   }
   private changed(workspaceId: string, agentId?: string): void { this.options.onChange?.({ workspaceId, ...(agentId ? { agentId } : {}) }); }
   assertGeneration(workspaceId: string, generation: unknown): void {
@@ -621,6 +636,8 @@ export class LocalWorkspaceHost {
           lineage: parent ? { rootRunId: parent.binding.lineage.rootRunId ?? parent.id, parentRunId: parent.id, depth: 1 } : { rootRunId: null, parentRunId: null, depth: 0 },
           createdAt: new Date().toISOString(), host: { hostId: host.hostId, hostEpoch: host.hostEpoch, grantId: row.grantId, grantRevision: row.grantRevision, actorId: row.actorId, policyRevision: row.policyRevision },
           budget: parent ? { ...parent.binding.budget } : { ...DEFAULT_WORKSPACE_RUN_BUDGET,
+            // Live-provider acceptance deliberately keeps its independent 80k/5-minute envelope.
+            // The ordinary 128k default must not expand that explicit test-spend boundary.
             ...(this.realKey ? { maxTokens: 80000, timeoutMs: 300000 } : {}) } });
         value.runUsage = ZERO_USAGE();
       }
