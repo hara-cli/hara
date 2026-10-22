@@ -12,7 +12,7 @@ import type { WorkspaceConnectionStoreV2 } from "./scoped-connections.js";
 import type { WorkspaceSessionLease } from "./session-lease.js";
 import { canonical } from "./local-state.js";
 import { workspaceStateHome, type WorkspaceResourceStorage } from "./resource-context.js";
-import { freezeWorkspaceRunBinding, workspaceRunBindingsEqual, workspaceRunMatchesTask, type WorkspaceRunBinding } from "./run-binding.js";
+import { freezeWorkspaceRunBinding, workspaceFileIdMatches, workspaceRunBindingsEqual, workspaceRunMatchesTask, type WorkspaceRunBinding } from "./run-binding.js";
 import type { WorkspaceUsage } from "./conversations.js";
 import { workspaceTaskHistory, workspaceTaskProjection, workspaceWakeBrief, type WorkspaceContextStats } from "./model-context.js";
 import { historyChars } from "../agent/context-budget.js";
@@ -103,9 +103,9 @@ export function createWorkspaceRunPermit(input: {
   const assertLive = (): void => {
     if (state?.retired || input.signal.aborted || Date.now() - started >= binding.budget.timeoutMs) throw new Error("Workspace attempt cancelled or expired");
     input.lease.assertCurrent();
-    const project = lstatSync(cwd);
+    const project = lstatSync(cwd, { bigint: true });
     if (!project.isDirectory() || project.isSymbolicLink() || realpathSync.native(cwd) !== cwd
-      || project.dev !== binding.project.dev || project.ino !== binding.project.ino) throw new Error("Workspace project grant identity changed");
+      || !workspaceFileIdMatches(binding.project.dev, project.dev) || !workspaceFileIdMatches(binding.project.ino, project.ino)) throw new Error("Workspace project grant identity changed");
     input.storage.run(() => {});
     const catalog = input.catalog.read(), row = input.catalog.resolve(binding.scope.workspaceId);
     if (canonical(row.scope) !== canonical(binding.scope) || catalog.hostId !== binding.host.hostId || catalog.hostEpoch !== binding.host.hostEpoch

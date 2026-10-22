@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { lstatSync, realpathSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { isWorkspaceAgentTaskBinding, type WorkspaceAgentTaskBinding } from "./agent-binding.js";
 import { isScopedRunConnection, type ScopedRunConnection } from "./scoped-connections.js";
@@ -12,7 +13,7 @@ export interface WorkspaceRunBinding {
   agentBindingHash: string;
   connection: Readonly<ScopedRunConnection>;
   runtimeContract: "hara-governed-pi-v1";
-  project: { root: string; dev: number; ino: number };
+  project: { root: string; dev: string | number; ino: string | number };
   sessionId: string;
   runId: string;
   lineage: { rootRunId: string | null; parentRunId: string | null; depth: number };
@@ -32,6 +33,22 @@ export function workspaceAgentBindingHash(binding: WorkspaceAgentTaskBinding): s
   return createHash("sha256").update("hara-workspace-run-agent-v1\0").update(canonical(binding)).digest("hex");
 }
 const safeId = (value: unknown) => text(value, 220) && !/[\\/]/.test(value);
+// Native file IDs can use all 64 bits (notably on NTFS). Keep old exact JSON numbers readable,
+// but never round an unsafe number back into authority. New bindings use decimal strings.
+function fileId(value: unknown): value is string | number {
+  return typeof value === "number" ? Number.isSafeInteger(value) && value >= 0
+    : typeof value === "string" && /^(?:0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 0xffffffffffffffffn;
+}
+export function workspaceFileIdMatches(frozen: unknown, native: bigint): boolean {
+  return fileId(frozen) && BigInt(frozen) === native;
+}
+export function captureWorkspaceProjectIdentity(root: string): WorkspaceRunBinding["project"] {
+  const info = lstatSync(root, { bigint: true });
+  if (!isAbsolute(root) || !info.isDirectory() || info.isSymbolicLink() || realpathSync.native(root) !== root) {
+    throw new Error("Workspace project grant identity changed");
+  }
+  return { root, dev: String(info.dev), ino: String(info.ino) };
+}
 function parse(value: unknown): WorkspaceRunBinding {
   const fail = (): never => { throw new Error("invalid or unsupported Workspace RunBinding; execution refused"); };
   if (!plain(value) || !exact(value, ["schemaVersion", "scope", "agent", "agentBindingHash", "connection", "runtimeContract", "project", "sessionId", "runId", "lineage", "createdAt", "host", "budget"])
@@ -43,7 +60,7 @@ function parse(value: unknown): WorkspaceRunBinding {
       : value.lineage.depth === 1 && safeId(value.lineage.rootRunId) && safeId(value.lineage.parentRunId)
         && value.lineage.rootRunId !== value.runId && value.lineage.parentRunId !== value.runId)
     || !plain(value.project) || !exact(value.project, ["root", "dev", "ino"]) || !text(value.project.root, 4096) || !isAbsolute(value.project.root)
-    || ![value.project.dev, value.project.ino].every(v => Number.isSafeInteger(v) && Number(v) >= 0)
+    || ![value.project.dev, value.project.ino].every(fileId)
     || typeof value.createdAt !== "string" || !Number.isFinite(Date.parse(value.createdAt))
     || !plain(value.host) || !exact(value.host, ["hostId", "hostEpoch", "grantId", "grantRevision", "actorId", "policyRevision"])
     || !text(value.host.hostId) || !text(value.host.grantId) || !text(value.host.actorId)

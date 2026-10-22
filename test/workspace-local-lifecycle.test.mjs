@@ -11,7 +11,7 @@ import { LocalWorkspaceCatalog } from "../dist/workspace/local-catalog.js";
 import { WorkspaceResourceStorage } from "../dist/workspace/resource-context.js";
 import { WorkspaceResources } from "../dist/workspace/resources.js";
 import { WorkspaceConnectionStoreV2 } from "../dist/workspace/connections.js";
-import { freezeWorkspaceRunBinding, workspaceAgentBindingHash } from "../dist/workspace/run-binding.js";
+import { captureWorkspaceProjectIdentity, freezeWorkspaceRunBinding, workspaceAgentBindingHash } from "../dist/workspace/run-binding.js";
 import { WorkspaceSessionLease } from "../dist/workspace/session-lease.js";
 import { WorkspaceConversationStore } from "../dist/workspace/conversations.js";
 import { createTaskExecution, isTaskExecution } from "../dist/session/task.js";
@@ -29,7 +29,7 @@ function setup(assertCurrent){
   const t=resources.agents.bindTask(createTaskExecution("synthetic","turn"),main.agentId,main.configRevision,main.agentEpoch);
   t.workspaceRunBinding=freezeWorkspaceRunBinding({schemaVersion:1,scope:row.scope,agent:t.workspaceAgentBinding,
    agentBindingHash:workspaceAgentBindingHash(t.workspaceAgentBinding),connection:connections.capture(),runtimeContract:"hara-governed-pi-v1",
-   project:{root:home,dev:fs.statSync(home).dev,ino:fs.statSync(home).ino},sessionId:conversation.sessionId,runId:randomUUID(),lineage:{rootRunId:null,parentRunId:null,depth:0},createdAt:new Date().toISOString(),
+   project:captureWorkspaceProjectIdentity(home),sessionId:conversation.sessionId,runId:randomUUID(),lineage:{rootRunId:null,parentRunId:null,depth:0},createdAt:new Date().toISOString(),
    host:{hostId:catalog.read().hostId,hostEpoch:1,grantId:row.grantId,grantRevision:1,actorId:row.actorId,policyRevision:1},
    budget:{maxRounds:16,maxToolCalls:32,maxTokens:32000,timeoutMs:60000}});return t;
  }

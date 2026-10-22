@@ -9,7 +9,7 @@ import { LocalWorkspaceCatalog } from "../dist/workspace/local-catalog.js";
 import { WorkspaceResourceStorage } from "../dist/workspace/resource-context.js";
 import { WorkspaceResources } from "../dist/workspace/resources.js";
 import { WorkspaceConnectionStoreV2 } from "../dist/workspace/connections.js";
-import { freezeWorkspaceRunBinding, workspaceAgentBindingHash } from "../dist/workspace/run-binding.js";
+import { captureWorkspaceProjectIdentity, freezeWorkspaceRunBinding, workspaceAgentBindingHash } from "../dist/workspace/run-binding.js";
 import { WorkspaceSessionLease } from "../dist/workspace/session-lease.js";
 import { createWorkspaceRunPermit, bindWorkspaceRunOptions, beginWorkspaceGovernedRun, closeWorkspaceRunPermit, executeWorkspaceTool, prepareWorkspaceRunHistory } from "../dist/workspace/execution.js";
 import { WorkspaceExecutionAudit } from "../dist/workspace/execution-audit.js";
@@ -30,7 +30,7 @@ function fixture(turn,extraTools=[],modelHistory){
  let task=resources.agents.bindTask(createTaskExecution("synthetic task","fixture-turn"),main.agentId,main.configRevision,main.agentEpoch);
  const sessionId=main.agentId.slice(3),binding=freezeWorkspaceRunBinding({schemaVersion:1,scope:row.scope,agent:task.workspaceAgentBinding,
   agentBindingHash:workspaceAgentBindingHash(task.workspaceAgentBinding),connection:connections.capture(),runtimeContract:"hara-governed-pi-v1",
-  project:{root:project,dev:fs.statSync(project).dev,ino:fs.statSync(project).ino},sessionId,runId:randomUUID(),lineage:{rootRunId:null,parentRunId:null,depth:0},createdAt:new Date().toISOString(),
+  project:captureWorkspaceProjectIdentity(project),sessionId,runId:randomUUID(),lineage:{rootRunId:null,parentRunId:null,depth:0},createdAt:new Date().toISOString(),
   host:{hostId:catalog.read().hostId,hostEpoch:1,grantId:row.grantId,grantRevision:1,actorId:row.actorId,policyRevision:1},
   budget:{maxRounds:12,maxToolCalls:32,maxTokens:32000,timeoutMs:60000}});
  task.workspaceRunBinding=binding;const lease=WorkspaceSessionLease.acquire(storage,sessionId),controller=new AbortController();
