@@ -216,8 +216,13 @@ export class LocalWorkspaceHost {
     // unfinished persisted call is retained even when no job survives a Host restart.
     if ((context.nextAuditCleanupAt !== undefined && now < context.nextAuditCleanupAt)
       || [...this.jobs.values()].some(job => job.workspaceId === workspaceId)) return;
-    pruneWorkspaceExecutionAudits(context.storage, now);
     context.nextAuditCleanupAt = now + 60_000;
+    try { pruneWorkspaceExecutionAudits(context.storage, now); }
+    catch {
+      // Diagnostics are best effort; neither cleanup nor its log sink may block Workspace access.
+      try { process.stderr.write("hara: Workspace execution audit cleanup failed; retrying later.\n"); }
+      catch { /* Keep Workspace access available when diagnostic logging is unavailable too. */ }
+    }
   }
   private changed(workspaceId: string, agentId?: string): void { this.options.onChange?.({ workspaceId, ...(agentId ? { agentId } : {}) }); }
   assertGeneration(workspaceId: string, generation: unknown): void {

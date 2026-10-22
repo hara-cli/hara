@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join, basename } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -130,4 +131,49 @@ test("Host keeps expired diagnostics while an accepted job owns the Workspace, t
   const reopened = new LocalWorkspaceHost(root);
   try { reopened.snapshot(workspace.workspaceId, workspace.selectedAgentId); assert.equal(fs.existsSync(file), false); }
   finally { await reopened.close(); }
+});
+
+
+test("Host opens despite cleanup failure, logs no raw error and retries after the cooldown", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
+  const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-host-audit-failure-")));
+  const host = new LocalWorkspaceHost(root);
+  let reopened;
+  t.after(async () => { await reopened?.close(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const workspace = host.createWorkspace("Synthetic", host.list().revision);
+  const storage = new WorkspaceResourceStorage(host.home, host.catalog.resolve(workspace.workspaceId).scope); storage.initialize();
+  const runId = randomUUID(), audit = new WorkspaceExecutionAudit(storage, runId, workspace.selectedAgentId);
+  audit.finish(audit.start("tool", 1, "workspace_read"), 0, "completed", null);
+  const file = storage.run(() => join(workspaceStateHome(), ".hara", `execution-${runId}.json`));
+  await host.close();
+  t.mock.timers.setTime(Date.now() + TTL);
+  const originalRead = fs.readdirSync, warnings = [];
+  let fail = true, scans = 0;
+  t.mock.method(fs, "readdirSync", (directory, ...args) => {
+    if (directory === join(file, "..")) {
+      scans++;
+      if (fail) throw new Error("synthetic-private-error: do not log this path or credential");
+    }
+    return originalRead(directory, ...args);
+  });
+  t.mock.method(process.stderr, "write", line => {
+    warnings.push(String(line));
+    throw new Error("synthetic log sink failure");
+  });
+  syncBuiltinESMExports();
+  try {
+    reopened = new LocalWorkspaceHost(root);
+    assert.equal(reopened.snapshot(workspace.workspaceId, workspace.selectedAgentId).workspaceId, workspace.workspaceId);
+    assert.equal(scans, 1);
+    assert.deepEqual(warnings, ["hara: Workspace execution audit cleanup failed; retrying later.\n"]);
+    assert.ok(fs.existsSync(file), "failed cleanup preserves the diagnostic");
+    fail = false;
+    reopened.snapshot(workspace.workspaceId, workspace.selectedAgentId);
+    assert.equal(scans, 1, "failed cleanup is throttled too");
+    t.mock.timers.setTime(Date.now() + 60_000);
+    reopened.snapshot(workspace.workspaceId, workspace.selectedAgentId);
+    assert.equal(scans, 2);
+    assert.equal(fs.existsSync(file), false, "cleanup can recover on a later access");
+    assert.equal(warnings.length, 1);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
 });
