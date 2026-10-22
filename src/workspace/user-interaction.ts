@@ -16,6 +16,9 @@ interface State {
   prepared: boolean; answeredQuestionIds: string[]; dismissed: boolean; referenceAcknowledged: boolean; misses: number; failures: number; budgetAcknowledged: boolean;
   question: WorkspaceUserQuestion | null;
 }
+// Batch admission treats roster enumeration as context work. Successful agent_list results do not
+// count as missing references: enumeration has no query-specific resolved/missing evidence.
+// Failed listings still enter observe()'s ordinary consecutive tool-failure counter.
 const LOOKUPS = new Set(["workspace_context_lookup", "workspace_memory_search", "agent_list"]);
 const REASONS = ["lookup_missing", "lookup_ambiguous", "tool_problem", "budget_warning", "explicit"];
 function safe(value: string, cap: number): string {
@@ -82,13 +85,18 @@ export class WorkspaceUserInteraction {
     const s = this.state.read();
     if (s.answeredQuestionIds.includes(questionId)) return;
     if (!s.question || s.question.id !== questionId) throw new Error("Workspace question changed; refresh before answering");
-    this.state.update(s.revision, value => ({ ...value, question: null, answeredQuestionIds: [...value.answeredQuestionIds, questionId].slice(-64), dismissed: false, misses: 0, failures: 0,
-      referenceAcknowledged: value.referenceAcknowledged || ["lookup_missing", "lookup_ambiguous"].includes(s.question!.reason),
-      budgetAcknowledged: value.budgetAcknowledged || s.question!.reason === "budget_warning" }));
+    const referenceAnswer = ["lookup_missing", "lookup_ambiguous"].includes(s.question.reason);
+    const reason = s.question.reason;
+    this.state.update(s.revision, value => ({ ...value, question: null, answeredQuestionIds: [...value.answeredQuestionIds, questionId].slice(-64), dismissed: false,
+      misses: referenceAnswer ? 0 : value.misses, failures: reason === "tool_problem" ? 0 : value.failures,
+      referenceAcknowledged: value.referenceAcknowledged || referenceAnswer,
+      budgetAcknowledged: value.budgetAcknowledged || reason === "budget_warning" }));
   }
   check(usage: Readonly<WorkspaceUsage>, elapsedMs: number): WorkspaceUserQuestion | null {
     const s = this.state.read();
     if (s.question) {
+      // A continuation may revisit a deliberately paused question. Reopen its display so the
+      // retained question gates dispatch again; this is not an answer or a counter reset.
       if (s.dismissed) this.state.update(s.revision, value => ({ ...value, dismissed: false }));
       return s.question;
     }
