@@ -19,6 +19,7 @@ import { historyChars } from "../agent/context-budget.js";
 import type { ToolResult } from "../providers/types.js";
 import type { WorkspaceContextObservation } from "./context-audit.js";
 import { WorkspaceExecutionAudit, type WorkspaceExecutionError } from "./execution-audit.js";
+import type { WorkspaceUserInteraction, WorkspaceUserQuestion } from "./user-interaction.js";
 
 export interface WorkspaceRunPermit { readonly binding: Readonly<WorkspaceRunBinding> }
 interface PermitState {
@@ -39,6 +40,11 @@ interface PermitState {
   contextStats?: WorkspaceContextStats;
   wakeChars: number;
   audit: WorkspaceExecutionAudit;
+  interaction?: WorkspaceUserInteraction;
+  onQuestion?: (question: WorkspaceUserQuestion) => void;
+  interactionUsage?: () => Readonly<WorkspaceUsage>;
+  startedAt: number;
+  toolTail: Promise<unknown>;
 }
 const permits = new WeakMap<object, PermitState>();
 function stateOf(permit: unknown): PermitState {
@@ -78,6 +84,9 @@ export function createWorkspaceRunPermit(input: {
   /** Trusted Host-only attempt boundary. Persisted history stays complete and append-only. */
   modelHistory?: { history: NeutralMsg[]; start: number; retain?: (result: ToolResult) => string; usedTokens?: () => number };
   observeContext?(value: WorkspaceContextObservation): void;
+  interaction?: WorkspaceUserInteraction;
+  onQuestion?(question: WorkspaceUserQuestion): void;
+  interactionUsage?(): Readonly<WorkspaceUsage>;
   updateUsage(value: Readonly<WorkspaceUsage>): void;
 }): WorkspaceRunPermit {
   const binding = freezeWorkspaceRunBinding(input.binding), cwd = realpathSync.native(input.cwd);
@@ -129,6 +138,7 @@ export function createWorkspaceRunPermit(input: {
       if (!state.started) throw new Error("Workspace model requires the governed entry");
       if (args.signal?.aborted || state.usage.modelCalls >= binding.budget.maxRounds
         || state.usage.inputTokens + state.usage.outputTokens >= binding.budget.maxTokens) throw new Error("Workspace model budget exhausted or cancelled");
+      if (state.interaction?.check(state.interactionUsage?.() ?? state.usage, Date.now() - started)) throw new Error("Workspace is waiting for user input; model not dispatched");
       publishUsage(state, { modelCalls: 1 });
       const auditIndex = state.audit.start("model", state.usage.modelCalls, "provider"), callStarted = performance.now();
       let outcome: "completed" | "error" | "cancelled" = "error", errorKind: WorkspaceExecutionError = "thrown", status: number | null = null;
@@ -167,6 +177,7 @@ export function createWorkspaceRunPermit(input: {
   };
   state = { assertLive, provider, cwd, stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
     updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false, wakeChars: 0,
+    interaction: input.interaction, onQuestion: input.onQuestion, interactionUsage: input.interactionUsage, startedAt: started, toolTail: Promise.resolve(),
     audit: new WorkspaceExecutionAudit(input.storage, binding.runId, binding.agent.agentId),
     ...(input.modelHistory ? { modelHistory: { ...input.modelHistory,
       prefixDigest: createHash("sha256").update(canonical(input.modelHistory.history.slice(0, input.modelHistory.start))).digest("hex") } } : {}) };
@@ -243,22 +254,43 @@ export function prepareWorkspaceRunWakeBrief(permit: WorkspaceRunPermit): string
   if (!state.started || !task) throw new Error("Workspace wake context requires the governed task");
   const brief = workspaceWakeBrief(task, state.modelHistory?.retain); state.wakeChars = brief.length; return brief;
 }
+/** Called at a closed-history boundary, before another model request or tool batch. */
+export function workspaceRunQuestion(permit: WorkspaceRunPermit): WorkspaceUserQuestion | null {
+  const state = stateOf(permit);
+  if (state.retired || state.signal.aborted) return null;
+  const question = state.interaction?.check(state.interactionUsage?.() ?? state.usage, Date.now() - state.startedAt) ?? null;
+  if (question) state.onQuestion?.(question);
+  return question;
+}
+export function workspaceRunBeginToolBatch(permit: WorkspaceRunPermit, names: readonly string[]): void {
+  stateOf(permit).interaction?.beginBatch(names);
+}
 export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string, execute: () => Promise<T>, toolFailed?: (result: T) => boolean): Promise<T> {
   const state = stateOf(permit); state.assertLive();
-  if (!state.started || !state.tools.has(name) || state.usage.toolCalls >= permit.binding.budget.maxToolCalls) throw new Error("Workspace tool unavailable or budget exhausted");
-  publishUsage(state, { toolCalls: 1 });
-  const auditIndex = state.audit.start("tool", state.usage.toolCalls, name), callStarted = performance.now();
-  return track(state, Promise.resolve().then(async () => {
+  // Serialize the governed dispatch boundary, including read lookups. A third queued search or a
+  // sibling write cannot run past the second result that required a real user's answer.
+  const operation = state.toolTail.then(async () => {
+    state.assertLive();
+    if (!state.started || !state.tools.has(name) || state.usage.toolCalls >= permit.binding.budget.maxToolCalls) throw new Error("Workspace tool unavailable or budget exhausted");
+    if (name !== "ask_user" && state.interaction?.check(state.interactionUsage?.() ?? state.usage, Date.now() - state.startedAt)) throw new Error("Workspace is waiting for user input; tool not dispatched");
+    state.interaction?.admit(name);
+    publishUsage(state, { toolCalls: 1 });
+    const auditIndex = state.audit.start("tool", state.usage.toolCalls, name), callStarted = performance.now();
     let outcome: "completed" | "error" | "cancelled" = "error", errorKind: WorkspaceExecutionError = "thrown";
     try {
       state.assertLive(); const result = await execute();
-      const failed = toolFailed?.(result) || (typeof result === "string" && /^Error:/i.test(result));
+      const failed = Boolean(toolFailed?.(result) || (typeof result === "string" && /^Error:/i.test(result)));
+      state.interaction?.observe(name, result, failed);
       outcome = failed ? "error" : "completed"; errorKind = failed ? "tool_error" : null; return result;
+    } catch (error) {
+      state.interaction?.observe(name, undefined, true); throw error;
     } finally {
       if (state.signal.aborted) { outcome = "cancelled"; errorKind = "cancelled"; }
       state.audit.finish(auditIndex, performance.now() - callStarted, outcome, errorKind);
     }
-  }));
+  });
+  state.toolTail = operation.then(() => undefined, () => undefined);
+  return track(state, operation);
 }
 export async function closeWorkspaceRunPermit(permit: WorkspaceRunPermit): Promise<void> {
   const state = stateOf(permit); state.retired = true;

@@ -26,7 +26,7 @@ test("formal startServe local branch boots without provider/global config and en
   await assert.rejects(client.request("workspace.list"),/unauthorized/);
   await assert.rejects(client.request("initialize",{token:"x".repeat(64)}),/unauthorized/);
   await assert.rejects(client.request("initialize",{token:"中".repeat(64)}),/unauthorized/);
-  const init=await client.request("initialize",{token:handle.token});assert.deepEqual(init.capabilities,["workspace.local-dev.v2","workspace.local-channels.v1"]);assert.equal(init.workspace.workspaces.length,0);
+  const init=await client.request("initialize",{token:handle.token});assert.deepEqual(init.capabilities,["workspace.local-dev.v2","workspace.user-interaction.v1","workspace.local-channels.v1"]);assert.equal(init.workspace.workspaces.length,0);
   await assert.rejects(client.request("session.create",{}),/Workspace must be explicit|legacy/);
   const created=await client.request("workspace.create",{label:"Personal",expectedRevision:init.workspace.revision});
   await client.request("workspace.connection.synthetic",{workspaceId:created.workspaceId,expectedGeneration:created.resourceGeneration,expectedRevision:0});
@@ -76,4 +76,38 @@ test("RPC acknowledges a slow mock task, records its source, and receipt lookup 
   await assert.rejects(c.request("workspace.session.receipt",{...receiptParams,expectedGeneration:randomUUID()}),/generation/);
   release();await until(async()=>{const view=await c.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId});return view.conversation.state==="completed";});assert.equal(calls,1);
  }finally{release();await c.close();await handle.close();}
+});
+
+
+test("two answer connections compete for one durable question; stale/cross-scope answers never restart work", async () => {
+ const root=dir();let calls=0;
+ const handle=await startLocalWorkspaceServe({host:"127.0.0.1",port:0,cwd:root},{root,version:"synthetic",providerFactory(_connection,binding){return{id:"openai",model:binding.model,async turn(){
+  calls++;return calls===1?{text:"",toolUses:[{id:randomUUID(),name:"ask_user",input:{question:"Which synthetic target?",options:["Alpha","Beta"]}}],stop:"tool_use",usage:{input:1,output:1}}:{text:"Answer retained",toolUses:[],stop:"end",usage:{input:1,output:1}};
+ }};}});
+ const a=await connect(handle),b=await connect(handle);
+ try {
+  const init=await a.request("initialize",{token:handle.token});await b.request("initialize",{token:handle.token});
+  assert(init.capabilities.includes("workspace.user-interaction.v1"));
+  const w=await a.request("workspace.create",{label:"Question",expectedRevision:init.workspace.revision});
+  await a.request("workspace.connection.synthetic",{workspaceId:w.workspaceId,expectedGeneration:w.resourceGeneration,expectedRevision:0});
+  const base={workspaceId:w.workspaceId,expectedGeneration:w.resourceGeneration,agentId:w.selectedAgentId};
+  const first=await a.request("workspace.session.send",{...base,message:"Clarify this target",requestId:randomUUID()});
+  const pending=await until(async()=>{const view=await a.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId});return view.conversation.state==="awaiting_user"?view.conversation.pendingQuestion:null;});
+  await assert.rejects(a.request("workspace.session.send",{...base,message:"Guess instead",requestId:randomUUID()}),/specific answer/);
+  await assert.rejects(a.request("workspace.session.answer",{...base,questionId:randomUUID(),message:"Alpha",requestId:randomUUID()}),/specific answer|changed/);
+  await assert.rejects(a.request("workspace.session.answer",{...base,expectedGeneration:randomUUID(),questionId:pending.id,message:"Alpha",requestId:randomUUID()}),/generation/);
+  const requests=[{...base,questionId:pending.id,message:"Alpha",requestId:randomUUID()},{...base,questionId:pending.id,message:"Beta",requestId:randomUUID()}];
+  const results=await Promise.allSettled([a.request("workspace.session.answer",requests[0]),b.request("workspace.session.answer",requests[1])]);
+  assert.equal(results.filter(row=>row.status==="fulfilled").length,1);assert.equal(results.filter(row=>row.status==="rejected").length,1);
+  const index=results.findIndex(row=>row.status==="fulfilled"),accepted=results[index].value;
+  assert.equal(accepted.runId,first.runId);
+  await until(async()=>{const view=await a.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId});return view.conversation.state==="completed";});
+  assert.equal(calls,2);
+  const replay=await a.request("workspace.session.answer",requests[index]);assert.equal(replay.duplicate,true);assert.equal(calls,2);
+  await assert.rejects(a.request("workspace.session.answer",{...requests[index],message:"Other answer"}),/another request/);
+  const receipt=await a.request("workspace.session.receipt",{...base,requestId:requests[index].requestId});assert.equal(receipt.state,"accepted");assert.equal(receipt.runId,first.runId);
+  const other=await a.request("workspace.create",{label:"Other",expectedRevision:(await a.request("workspace.list")).revision});
+  await assert.rejects(a.request("workspace.session.answer",{workspaceId:other.workspaceId,expectedGeneration:other.resourceGeneration,agentId:other.selectedAgentId,questionId:pending.id,message:"Alpha",requestId:randomUUID()}),/changed|no answer/);
+  assert.equal(calls,2);
+ } finally {await a.close();await b.close();await handle.close();}
 });

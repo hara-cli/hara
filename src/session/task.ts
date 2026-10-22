@@ -1054,6 +1054,7 @@ export function recordAwaitingTaskDecision(
   task: TaskExecution | undefined,
   answer: string,
   at: Date | string = new Date(),
+  retainedCallId?: string,
 ): { ok: true; task: TaskExecution; decision: TaskDecision } | { ok: false; reason: string } {
   if (!task) return { ok: false, reason: "there is no task waiting for a decision" };
   const completion = freshTaskCompletion(task);
@@ -1081,7 +1082,7 @@ export function recordAwaitingTaskDecision(
     .slice(0, 32)}`;
   const retained = retainTaskDecision(task, {
     turnId: task.turnId,
-    callId,
+    callId: retainedCallId ?? callId,
     question,
     answer: normalizedAnswer,
     source: "interactive",
@@ -1089,8 +1090,8 @@ export function recordAwaitingTaskDecision(
   if (!retained.ok || !retained.task.checkpoint) return retained;
   const checkpoint = {
     ...retained.task.checkpoint,
-    currentStep: "apply the retained user decision",
-    nextStep: "continue the original task with the retained answer",
+    currentStep: retained.task.checkpoint.currentStep ?? "apply the retained user decision",
+    nextStep: retained.task.checkpoint.nextStep ?? "continue the original task with the retained answer",
     updatedAt: retained.decision.createdAt,
   };
   delete checkpoint.blockedStep;

@@ -141,9 +141,9 @@ test("each physical tool has a start/end and its own attempt number, including r
  const a=fixture(async()=>reply("unused"),[tool]),marker="SYNTHETIC_PRIVATE_TOOL_BODY";
  try{
   beginWorkspaceGovernedRun(a.permit,a.options,"pi");const audit=new WorkspaceExecutionAudit(a.storage,a.binding.runId,a.binding.agent.agentId);
-  let release;const wait=new Promise(r=>release=r);
-  const first=executeWorkspaceTool(a.permit,tool.name,async()=>{await wait;return marker;});
-  assert.equal(audit.read().operations[0].outcome,"running");release();assert.equal(await first,marker);
+  let release,enter;const wait=new Promise(r=>release=r),entered=new Promise(r=>enter=r);
+  const first=executeWorkspaceTool(a.permit,tool.name,async()=>{enter();await wait;return marker;});
+  await entered;assert.equal(audit.read().operations[0].outcome,"running");release();assert.equal(await first,marker);
   assert.equal(await executeWorkspaceTool(a.permit,tool.name,async()=>`Error: ${marker}`),`Error: ${marker}`);
   await assert.rejects(executeWorkspaceTool(a.permit,tool.name,async()=>{throw new Error(marker);}),new RegExp(marker));
   assert.equal(await executeWorkspaceTool(a.permit,tool.name,async()=>marker,()=>true),marker);

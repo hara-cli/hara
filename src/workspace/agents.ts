@@ -220,6 +220,11 @@ export class WorkspaceAgentStore {
     return { revision: value?.revision ?? 0, mainAgentId: value?.mainAgentId ?? null,
       agents: value?.agents.map(row => this.view(row)) ?? [] };
   }
+  references() {
+    return (this.load().value?.agents ?? []).map(row => ({ agentId: row.agentId,
+      name: row.configurations[row.currentConfigRevision - 1]!.identity.displayName, state: row.state,
+      aliases: [...new Set([row.username, ...row.configurations.map(config => config.identity.displayName)])] }));
+  }
   get(agentId: string): WorkspaceAgentView | null {
     if (!isWorkspaceAgentId(agentId)) throw new Error("invalid Workspace Agent id");
     const row = this.load().value?.agents.find(entry => entry.agentId === agentId);
