@@ -8,6 +8,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { WorkspaceResourceStorage, workspaceStateHome } from "../dist/workspace/resource-context.js";
+import { DEFAULT_WORKSPACE_RUN_BUDGET } from "../dist/workspace/run-binding.js";
 
 const temporary = [];
 after(() => { for (const path of temporary) fs.rmSync(path, { recursive: true, force: true }); });
@@ -17,7 +18,7 @@ function setup() {
   const host = new LocalWorkspaceHost(root, { providerFactory(_connection, binding) {
     factories++;
     return { id: "openai", model: binding.model, async turn() {
-      calls++; return { text: "synthetic exhausted task", toolUses: [], stop: "end", usage: { input: 32000, output: 1 } };
+      calls++; return { text: "synthetic exhausted task", toolUses: [], stop: "end", usage: { input: DEFAULT_WORKSPACE_RUN_BUDGET.maxTokens, output: 1 } };
     } };
   } });
   const workspace = host.createWorkspace("Synthetic resume", host.list().revision);
@@ -93,6 +94,24 @@ test("stale running exhausted attempts are refused without writing an interrupte
       assert.equal(fs.readFileSync(f.file).equals(bytes), true); assert.equal(restored.snapshot(w.workspaceId).conversation.state, "needs_recovery");
     } finally { await restored.close(); }
   } finally { await f.host.close(); }
+});
+test("a persisted legacy 32k run/tree stays frozen after the ordinary default increases", async () => {
+  const f=setup(),w=f.workspace;
+  try {
+    const run=f.host.start("initial",w.workspaceId,w.selectedAgentId,"hello",randomUUID());await f.host.wait(run.runId);await f.host.close();
+    const raw=JSON.parse(fs.readFileSync(f.file,"utf8")),treeFile=join(f.file,"..",`tree-budget-${run.runId}.json`),tree=JSON.parse(fs.readFileSync(treeFile,"utf8"));
+    // Seed only this synthetic old-schema fixture. Never rewrite a user's frozen budget.
+    raw.task.workspaceRunBinding.budget.maxTokens=32000;tree.limits.maxTokens=32000;
+    raw.runUsage={modelCalls:1,toolCalls:0,inputTokens:32000,outputTokens:1};raw.usage={...raw.runUsage};tree.usage={...raw.runUsage};
+    fs.writeFileSync(f.file,JSON.stringify(raw)+"\n");fs.writeFileSync(treeFile,JSON.stringify(tree)+"\n");
+    const bytes=fs.readFileSync(f.file),treeBytes=fs.readFileSync(treeFile);let constructed=0;
+    const reopened=new LocalWorkspaceHost(f.root,{providerFactory(){constructed++;throw new Error("must not construct");}});
+    try {
+      assert.equal(reopened.snapshot(w.workspaceId).conversation.resumeAdmission.reason,"run_tokens");
+      assert.throws(()=>reopened.start("client",w.workspaceId,w.selectedAgentId,"/continue",randomUUID(),true),/run_tokens/);
+      assert.equal(constructed,0);assert.equal(fs.readFileSync(f.file).equals(bytes),true);assert.equal(fs.readFileSync(treeFile).equals(treeBytes),true);
+    } finally {await reopened.close();}
+  } finally {await f.host.close();}
 });
 test("receipt lookup is read-only, scope-bound, and does not invent provenance for legacy accepted requests", async () => {
   const f = setup(), w = f.workspace, id = randomUUID();

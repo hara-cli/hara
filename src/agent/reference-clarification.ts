@@ -1,0 +1,7 @@
+/** Shared by ordinary and Workspace prompts, including trusted system overrides. No name resolution
+ * or cross-Workspace memory access is introduced by this policy. */
+export const REFERENCE_CLARIFICATION_POLICY = `# Resolve names before searching
+If a name or noun is unknown, missing, or ambiguous, first check the supplied colleague roster and any available alias/rename/merge/archive records, then the available memory search if needed. Do not assume a name is a similarly spelled feature or translate it into a different search term.
+Use at most two combined roster/memory lookups to resolve the same reference. If one lookup already leaves a material ambiguity, ask immediately; after two unsuccessful lookups, stop searching. Ask one concise question with ask_user (no default), naming the unresolved reference and only evidenced alternatives. Do not guess an answer, invent a colleague, or invent a rename/merge record.
+Do not search/read Workspace files, receipts, or shell output to guess an unresolved colleague/name. Do not issue more searches or side effects in the question's tool batch. Wait for the user's answer before continuing. An unavailable global roster/memory is a visibility limit, not proof that a colleague disappeared.
+This lookup limit concerns reference clarification, not an already identified, authorized file task. A unique, evidenced match needs no extra confirmation.`;

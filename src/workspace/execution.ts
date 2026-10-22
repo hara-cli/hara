@@ -2,7 +2,7 @@
 // calls this factory; renderer/Agent arguments cannot populate the private WeakMap below.
 import { createHash } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
-import type { NeutralMsg, Provider, TurnResult } from "../providers/types.js";
+import type { NeutralMsg, Provider, ProviderRetryEvent, TurnResult } from "../providers/types.js";
 import type { RunOpts } from "../agent/loop.js";
 import type { TaskExecution } from "../session/task.js";
 import type { Tool } from "../tools/registry.js";
@@ -18,6 +18,7 @@ import { workspaceTaskHistory, workspaceTaskProjection, workspaceWakeBrief, type
 import { historyChars } from "../agent/context-budget.js";
 import type { ToolResult } from "../providers/types.js";
 import type { WorkspaceContextObservation } from "./context-audit.js";
+import { WorkspaceExecutionAudit, type WorkspaceExecutionError } from "./execution-audit.js";
 
 export interface WorkspaceRunPermit { readonly binding: Readonly<WorkspaceRunBinding> }
 interface PermitState {
@@ -37,6 +38,7 @@ interface PermitState {
   modelHistory?: { history: NeutralMsg[]; start: number; prefixDigest: string; retain?: (result: ToolResult) => string; usedTokens?: () => number };
   contextStats?: WorkspaceContextStats;
   wakeChars: number;
+  audit: WorkspaceExecutionAudit;
 }
 const permits = new WeakMap<object, PermitState>();
 function stateOf(permit: unknown): PermitState {
@@ -128,6 +130,8 @@ export function createWorkspaceRunPermit(input: {
       if (args.signal?.aborted || state.usage.modelCalls >= binding.budget.maxRounds
         || state.usage.inputTokens + state.usage.outputTokens >= binding.budget.maxTokens) throw new Error("Workspace model budget exhausted or cancelled");
       publishUsage(state, { modelCalls: 1 });
+      const auditIndex = state.audit.start("model", state.usage.modelCalls, "provider"), callStarted = performance.now();
+      let outcome: "completed" | "error" | "cancelled" = "error", errorKind: WorkspaceExecutionError = "thrown", status: number | null = null;
       const observation = { modelCall: state.usage.modelCalls, systemChars: args.system.length, toolSchemaChars: JSON.stringify(args.tools).length,
         systemAndToolsUtf8Bytes: Buffer.byteLength(args.system + JSON.stringify(args.tools)), modelHistoryChars: historyChars(args.history), wakeChars: state.wakeChars,
         ...(state.contextStats ?? { compacted: false, originalChars: historyChars(args.history), recentChars: historyChars(args.history), summaryChars: 0, toolMaxChars: 0, agedToolMaxChars: 0 }) };
@@ -138,20 +142,32 @@ export function createWorkspaceRunPermit(input: {
         try { assertLive(); fn(...values); } catch { revoked.abort(); }
       };
       const guardedArgs = { ...args, signal: AbortSignal.any(signals), onText: forward(args.onText),
-        onReasoning: forward(args.onReasoning), onActivity: forward(args.onActivity), onRetry: forward(args.onRetry) };
+        onReasoning: forward(args.onReasoning), onActivity: forward(args.onActivity), onRetry: forward((event: ProviderRetryEvent) => {
+          state.audit.retry(auditIndex, event); args.onRetry?.(event);
+        }) };
       const operation = Promise.resolve().then(() => { assertLive(); if (guardedArgs.signal.aborted) throw new Error("Workspace model cancelled"); return input.provider.turn(guardedArgs); });
-      const result: TurnResult = await track(state, operation);
-      // Even a cancelled/late request consumes its recorded telemetry, but never releases more tools.
-      try { if (result.usage) publishUsage(state, { inputTokens: result.usage.input, outputTokens: result.usage.output }); }
-      finally { input.observeContext?.({ ...observation, input: result.usage?.input ?? null, output: result.usage?.output ?? null,
-        inputWarning: (result.usage?.input ?? 0) > 12000 }); }
-      assertLive();
-      if (state.usage.inputTokens + state.usage.outputTokens > binding.budget.maxTokens) throw new Error("Workspace token telemetry safety ceiling reached");
-      return result;
+      try {
+        const result: TurnResult = await track(state, operation);
+        // Even a cancelled/late request consumes its recorded telemetry, but never releases more tools.
+        try { if (result.usage) publishUsage(state, { inputTokens: result.usage.input, outputTokens: result.usage.output }); }
+        finally { input.observeContext?.({ ...observation, input: result.usage?.input ?? null, output: result.usage?.output ?? null,
+          inputWarning: (result.usage?.input ?? 0) > 12000 }); }
+        assertLive();
+        if (state.usage.inputTokens + state.usage.outputTokens > binding.budget.maxTokens) {
+          errorKind = "budget_exhausted"; throw new Error("Workspace token telemetry safety ceiling reached");
+        }
+        outcome = result.stop === "error" ? "error" : "completed"; errorKind = result.stop === "error" ? "provider_error" : null;
+        status = result.errorMetadata?.status ?? null;
+        return result;
+      } finally {
+        if (input.signal.aborted || args.signal?.aborted || revoked.signal.aborted) { outcome = "cancelled"; errorKind = "cancelled"; }
+        state.audit.finish(auditIndex, performance.now() - callStarted, outcome, errorKind, status);
+      }
     },
   };
   state = { assertLive, provider, cwd, stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
     updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false, wakeChars: 0,
+    audit: new WorkspaceExecutionAudit(input.storage, binding.runId, binding.agent.agentId),
     ...(input.modelHistory ? { modelHistory: { ...input.modelHistory,
       prefixDigest: createHash("sha256").update(canonical(input.modelHistory.history.slice(0, input.modelHistory.start))).digest("hex") } } : {}) };
   for (const value of Object.values(state.usage)) if (!Number.isSafeInteger(value) || value < 0) throw new Error("invalid Workspace persisted usage");
@@ -227,11 +243,22 @@ export function prepareWorkspaceRunWakeBrief(permit: WorkspaceRunPermit): string
   if (!state.started || !task) throw new Error("Workspace wake context requires the governed task");
   const brief = workspaceWakeBrief(task, state.modelHistory?.retain); state.wakeChars = brief.length; return brief;
 }
-export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string, execute: () => Promise<T>): Promise<T> {
+export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string, execute: () => Promise<T>, toolFailed?: (result: T) => boolean): Promise<T> {
   const state = stateOf(permit); state.assertLive();
   if (!state.started || !state.tools.has(name) || state.usage.toolCalls >= permit.binding.budget.maxToolCalls) throw new Error("Workspace tool unavailable or budget exhausted");
   publishUsage(state, { toolCalls: 1 });
-  return track(state, Promise.resolve().then(() => { state.assertLive(); return execute(); }));
+  const auditIndex = state.audit.start("tool", state.usage.toolCalls, name), callStarted = performance.now();
+  return track(state, Promise.resolve().then(async () => {
+    let outcome: "completed" | "error" | "cancelled" = "error", errorKind: WorkspaceExecutionError = "thrown";
+    try {
+      state.assertLive(); const result = await execute();
+      const failed = toolFailed?.(result) || (typeof result === "string" && /^Error:/i.test(result));
+      outcome = failed ? "error" : "completed"; errorKind = failed ? "tool_error" : null; return result;
+    } finally {
+      if (state.signal.aborted) { outcome = "cancelled"; errorKind = "cancelled"; }
+      state.audit.finish(auditIndex, performance.now() - callStarted, outcome, errorKind);
+    }
+  }));
 }
 export async function closeWorkspaceRunPermit(permit: WorkspaceRunPermit): Promise<void> {
   const state = stateOf(permit); state.retired = true;

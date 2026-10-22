@@ -118,6 +118,7 @@ import {
   NO_INTERACTIVE_USER,
 } from "../tools/ask_user.js";
 import { PromptAssembler, type AssembledSystemPrompt } from "./prompt.js";
+import { REFERENCE_CLARIFICATION_POLICY } from "./reference-clarification.js";
 import { runtimeTimePrompt, type RuntimeTimePromptOptions } from "../runtime-time.js";
 import {
   assertOrganizationModelAllowed,
@@ -557,6 +558,7 @@ export function composeSystem(
 ): AssembledSystemPrompt {
   const assembler = new PromptAssembler();
   assembler.add("core", "static", "core", override || HARA_SYSTEM());
+  assembler.add("reference-clarification", "static", "core", REFERENCE_CLARIFICATION_POLICY);
   const skills = scopedWorkspace ? "" : skillsDigest(cwd);
   const roles = scopedWorkspace || override ? "" : rolesDigest(cwd, profileId);
   const checkpointContext = scopedWorkspace ? "" : taskCheckpointContext(intake?.checkpoint, intake?.decisions);
@@ -2669,7 +2671,9 @@ async function runAgentInner(
       const explicitDefault = (toolUse.input as { default?: unknown } | null)?.default;
       return typeof question === "string"
         && question.trim().length > 0
-        && !(typeof explicitDefault === "string" && explicitDefault.trim().length > 0);
+        // A scoped Workspace has no interactive answer in this process. A model-supplied default
+        // cannot stand in for the human's clarification; retain the question instead.
+        && (Boolean(opts.workspaceRun) || !(typeof explicitDefault === "string" && explicitDefault.trim().length > 0));
     };
     const headlessQuestionWithoutDefault = !ctx.ask && r.toolUses.some(isPendingHeadlessQuestion);
     if (headlessQuestionWithoutDefault) {
@@ -2703,54 +2707,60 @@ async function runAgentInner(
           .filter(Boolean)
           .slice(0, 8)
         : [];
-      history.push({
-        role: "tool",
-        results: r.toolUses.map((toolUse) => ({
-          id: toolUse.id,
-          name: toolUse.name,
-          content: toolUse.id === pendingAsk.id
-            ? "The question was retained for the next reply in this persisted conversation; no answer was inferred."
-            : toolUse.name === "ask_user"
-              ? "Not asked: a persisted headless turn presents one material question at a time. Ask this question again after the retained answer arrives."
-            : "Not executed because the persisted conversation paused for a user answer.",
-          isError: toolUse.id !== pendingAsk.id,
-        })),
-      });
-      for (let index = 0; index < r.toolUses.length; index++) {
-        finishToolRuntimeItem(index, r.toolUses[index].id === pendingAsk.id ? "completed" : "denied");
-      }
-      const waiting = applyTaskCheckpoint(intakeTask, {
-        blocked_step: questionCopy.blockedStep,
-        block_reason: safeQuestion,
-        next_step: questionCopy.nextStep,
-        completion: {
-          state: "awaiting_user",
-          evidence: [questionCopy.waitingEvidence],
-          dependency: {
-            kind: "material_choice",
-            detail: safeQuestion,
-            evidence: [questionCopy.dependencyEvidence],
-            ...(safeOptions.length ? { options: safeOptions } : {}),
+      const questionTask = intakeTask, questionIntake = opts.taskIntake;
+      const retainQuestion = async (): Promise<RunOutcome> => {
+        history.push({
+          role: "tool",
+          results: r.toolUses.map((toolUse) => ({
+            id: toolUse.id,
+            name: toolUse.name,
+            content: toolUse.id === pendingAsk.id
+              ? "The question was retained for the next reply in this persisted conversation; no answer was inferred."
+              : toolUse.name === "ask_user"
+                ? "Not asked: a persisted headless turn presents one material question at a time. Ask this question again after the retained answer arrives."
+              : "Not executed because the persisted conversation paused for a user answer.",
+            isError: toolUse.id !== pendingAsk.id,
+          })),
+        });
+        for (let index = 0; index < r.toolUses.length; index++) {
+          finishToolRuntimeItem(index, r.toolUses[index].id === pendingAsk.id ? "completed" : "denied");
+        }
+        const waiting = applyTaskCheckpoint(questionTask, {
+          blocked_step: questionCopy.blockedStep,
+          block_reason: safeQuestion,
+          next_step: questionCopy.nextStep,
+          completion: {
+            state: "awaiting_user",
+            evidence: [questionCopy.waitingEvidence],
+            dependency: {
+              kind: "material_choice",
+              detail: safeQuestion,
+              evidence: [questionCopy.dependencyEvidence],
+              ...(safeOptions.length ? { options: safeOptions } : {}),
+            },
           },
-        },
-      });
-      if (!waiting.ok) return interactionFailure("pending user-question checkpoint", waiting.reason);
-      intakeTask = waiting.task;
-      try {
-        opts.taskIntake.onUpdate?.(intakeTask);
-        opts.taskIntake.onCheckpoint?.(intakeTask);
-      } catch (error) {
-        return interactionFailure("pending user-question checkpoint", error);
-      }
-      const renderedQuestion = [
-        safeHeader ? `[${safeHeader}]` : questionCopy.defaultHeader,
-        safeContext,
-        safeQuestion,
-        ...(safeOptions.length ? safeOptions.map((option, index) => `${index + 1}. ${option}`) : []),
-        questionCopy.footer,
-      ].filter(Boolean).join("\n");
-      emitVisibleText(`${renderedQuestion}\n`);
-      return { status: "completed" };
+        });
+        if (!waiting.ok) return interactionFailure("pending user-question checkpoint", waiting.reason);
+        intakeTask = waiting.task;
+        try {
+          questionIntake.onUpdate?.(intakeTask);
+          questionIntake.onCheckpoint?.(intakeTask);
+        } catch (error) {
+          return interactionFailure("pending user-question checkpoint", error);
+        }
+        const renderedQuestion = [
+          safeHeader ? `[${safeHeader}]` : questionCopy.defaultHeader,
+          safeContext,
+          safeQuestion,
+          ...(safeOptions.length ? safeOptions.map((option, index) => `${index + 1}. ${option}`) : []),
+          questionCopy.footer,
+        ].filter(Boolean).join("\n");
+        emitVisibleText(`${renderedQuestion}\n`);
+        return { status: "completed" };
+      };
+      return opts.workspaceRun
+        ? executeWorkspaceTool(opts.workspaceRun, "ask_user", retainQuestion, result => result.status === "error")
+        : retainQuestion();
     }
     const finalizeStoppedToolRound = (): RunOutcome => {
       const pendingMessage = life.timedOut
@@ -3525,7 +3535,7 @@ async function runAgentInner(
         }
         if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return;
         const physicalTool = opts.workspaceRun
-          ? executeWorkspaceTool(opts.workspaceRun, p.tool!.name, () => p.tool!.run(p.tu.input, executionToolCtx))
+          ? executeWorkspaceTool(opts.workspaceRun, p.tool!.name, () => p.tool!.run(p.tu.input, executionToolCtx), () => structuredToolError)
           : p.tool!.run(p.tu.input, executionToolCtx);
         const observedTool = physicalTool.then(
           (value) => { settled = { ok: true, value }; return value; },

@@ -11,7 +11,8 @@ import { WorkspaceResources } from "../dist/workspace/resources.js";
 import { WorkspaceConnectionStoreV2 } from "../dist/workspace/connections.js";
 import { freezeWorkspaceRunBinding, workspaceAgentBindingHash } from "../dist/workspace/run-binding.js";
 import { WorkspaceSessionLease } from "../dist/workspace/session-lease.js";
-import { createWorkspaceRunPermit, bindWorkspaceRunOptions, beginWorkspaceGovernedRun, closeWorkspaceRunPermit, prepareWorkspaceRunHistory } from "../dist/workspace/execution.js";
+import { createWorkspaceRunPermit, bindWorkspaceRunOptions, beginWorkspaceGovernedRun, closeWorkspaceRunPermit, executeWorkspaceTool, prepareWorkspaceRunHistory } from "../dist/workspace/execution.js";
+import { WorkspaceExecutionAudit } from "../dist/workspace/execution-audit.js";
 import { createTaskExecution, finishTaskExecution } from "../dist/session/task.js";
 import { runConfiguredAgent, bindNewAgentTask } from "../dist/agent-runtime/dispatch.js";
 import { runAgent } from "../dist/agent/loop.js";
@@ -51,7 +52,7 @@ test("actual Pi execution reaches the frozen scoped provider once, without legac
  const history=[{role:"user",content:"hello"}];try{
   assert.equal(bindNewAgentTask(a.options.taskIntake.task,"unused","unused",undefined,a.options),a.options.taskIntake.task);
   const result=await runConfiguredAgent(history,a.options);
-  assert.equal(result.status,"completed");assert.equal(a.requests,1);assert.equal(history.at(-1).text,"Hello from scoped Pi");
+  assert.equal(result.status,"completed",result.error);assert.equal(a.requests,1);assert.equal(history.at(-1).text,"Hello from scoped Pi");
   assert.equal(a.usage.modelCalls,1);assert.equal(a.usage.inputTokens,7);
   assert.equal(fs.existsSync(join(a.home,".hara","profiles.json")),false);
  }finally{await a.close();}
@@ -112,10 +113,53 @@ test("cancellation cannot free a lease while a real pending model promise ignore
  const a=fixture(async()=>{enter();await waiting;return reply("late");});
  const run=runConfiguredAgent([{role:"user",content:"hello"}],a.options);await entered;a.controller.abort();
  let closed=false;const close=a.close().then(()=>closed=true);
- await new Promise(r=>setTimeout(r,20));assert.equal(closed,false);
+ const audit=new WorkspaceExecutionAudit(a.storage,a.binding.runId,a.binding.agent.agentId);
+ await new Promise(r=>setTimeout(r,20));assert.equal(closed,false);assert.equal(audit.read().operations[0].outcome,"running");
  assert.throws(()=>WorkspaceSessionLease.acquire(a.storage,a.binding.sessionId),/busy/);
- release();await run;await close;assert.equal(closed,true);
+ release();await run;await close;assert.equal(closed,true);assert.equal(audit.read().operations[0].outcome,"cancelled");
  const next=WorkspaceSessionLease.acquire(a.storage,a.binding.sessionId);next.release();
+});
+test("physical model timing includes retry metadata and provider errors, without retaining raw provider data",async()=>{
+ let enter,release;const entered=new Promise(r=>enter=r),waiting=new Promise(r=>release=r);
+ const marker="SYNTHETIC_PRIVATE_ERROR_MUST_NOT_BE_RETAINED";
+ const a=fixture(async args=>{
+  args.onRetry({provider:marker,model:marker,attempt:1,nextAttempt:2,kind:"overloaded",delayMs:7,elapsedMs:12,status:503});
+  enter();await waiting;return{text:"",toolUses:[],stop:"error",errorMsg:marker,errorMetadata:{status:503},usage:{input:9,output:2}};
+ });
+ try{
+  const audit=new WorkspaceExecutionAudit(a.storage,a.binding.runId,a.binding.agent.agentId);
+  const run=runConfiguredAgent([{role:"user",content:"hello"}],a.options);await entered;
+  const pending=audit.read().operations[0];assert.equal(pending.kind,"model");assert.equal(pending.outcome,"running");assert.equal(pending.endedAt,null);assert.equal(pending.retryCount,1);
+  release();assert.equal((await run).status,"error");
+  const row=audit.read().operations[0];assert.equal(row.outcome,"error");assert.equal(row.error,"provider_error");assert.equal(row.status,503);
+  assert.ok(row.endedAt>=row.startedAt);assert.ok(row.durationMs>=0);assert.equal(row.retries[0].delayMs,7);
+  assert.equal(JSON.stringify(audit.read()).includes(marker),false);assert.equal(a.usage.inputTokens,9);assert.equal(a.usage.outputTokens,2);
+ }finally{release();await a.close();}
+});
+test("each physical tool has a start/end and its own attempt number, including returned and thrown errors",async()=>{
+ const tool={name:"fixture_read",description:"Synthetic read",kind:"read",input_schema:{type:"object"},async run(){return"unused";}};
+ const a=fixture(async()=>reply("unused"),[tool]),marker="SYNTHETIC_PRIVATE_TOOL_BODY";
+ try{
+  beginWorkspaceGovernedRun(a.permit,a.options,"pi");const audit=new WorkspaceExecutionAudit(a.storage,a.binding.runId,a.binding.agent.agentId);
+  let release;const wait=new Promise(r=>release=r);
+  const first=executeWorkspaceTool(a.permit,tool.name,async()=>{await wait;return marker;});
+  assert.equal(audit.read().operations[0].outcome,"running");release();assert.equal(await first,marker);
+  assert.equal(await executeWorkspaceTool(a.permit,tool.name,async()=>`Error: ${marker}`),`Error: ${marker}`);
+  await assert.rejects(executeWorkspaceTool(a.permit,tool.name,async()=>{throw new Error(marker);}),new RegExp(marker));
+  assert.equal(await executeWorkspaceTool(a.permit,tool.name,async()=>marker,()=>true),marker);
+  const rows=audit.read().operations;
+  assert.deepEqual(rows.map(row=>[row.kind,row.call,row.outcome,row.error,row.retryCount]),[["tool",1,"completed",null,0],["tool",2,"error","tool_error",0],["tool",3,"error","thrown",0],["tool",4,"error","tool_error",0]]);
+  assert.ok(rows.every(row=>row.endedAt>=row.startedAt&&row.durationMs>=0));assert.equal(JSON.stringify(audit.read()).includes(marker),false);
+ }finally{await a.close();}
+});
+test("an existing frozen 32k run still stops at its original ceiling and records the failed call",async()=>{
+ const a=fixture(async()=>({...reply("over budget"),usage:{input:32000,output:1}}));
+ try{
+  assert.equal((await runConfiguredAgent([{role:"user",content:"hello"}],a.options)).status,"error");
+  assert.equal(a.binding.budget.maxTokens,32000);assert.equal(a.requests,1);assert.equal(a.usage.inputTokens+a.usage.outputTokens,32001);
+  const row=new WorkspaceExecutionAudit(a.storage,a.binding.runId,a.binding.agent.agentId).read().operations[0];
+  assert.equal(row.outcome,"error");assert.equal(row.error,"budget_exhausted");
+ }finally{await a.close();}
 });
 test("a syntactically valid permit cannot be attached to ambient hooks, fallback or plugin execution",async()=>{
  const a=fixture(async()=>reply("no"));try{
