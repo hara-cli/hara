@@ -14,7 +14,7 @@ import { currentWorkspaceResourceBinding, workspaceStateHome, WorkspaceResourceS
 import { WorkspaceConnectionStoreV2, type ScopedConnection, type ScopedRunConnection } from "./scoped-connections.js";
 import { closedWorkspaceHistory, WorkspaceConversationStore, type WorkspaceConversation, type WorkspaceUsage } from "./conversations.js";
 import { WorkspaceSessionLease } from "./session-lease.js";
-import { DEFAULT_WORKSPACE_RUN_BUDGET, freezeWorkspaceRunBinding, workspaceAgentBindingHash, type WorkspaceRunBinding } from "./run-binding.js";
+import { DEFAULT_WORKSPACE_RUN_BUDGET, captureWorkspaceProjectIdentity, freezeWorkspaceRunBinding, workspaceAgentBindingHash, type WorkspaceRunBinding } from "./run-binding.js";
 import { createWorkspaceRunPermit, bindWorkspaceRunOptions, assertWorkspaceRunAdmission, assertWorkspaceRunContextCurrent, closeWorkspaceRunPermit, type WorkspaceRunPermit } from "./execution.js";
 import { WorkspaceBudgetAdmissionError, WorkspaceTreeBudget } from "./tree-budget.js";
 import { WorkspaceRequestJournal, type WorkspaceRequestOrigin } from "./request-journal.js";
@@ -724,10 +724,9 @@ export class LocalWorkspaceHost {
       } else {
         if (value.task) value.pastTasks.push({ task: value.task, usage: value.runUsage, endedAt: new Date().toISOString() });
         task = context.resources.agents.bindTask(createTaskExecution(message, randomUUID()), agentId, agent.configRevision, agent.agentEpoch);
-        const project = lstatSync(context.project);
         task.workspaceRunBinding = freezeWorkspaceRunBinding({ schemaVersion: 1, scope: row.scope, agent: task.workspaceAgentBinding!,
           agentBindingHash: workspaceAgentBindingHash(task.workspaceAgentBinding!), connection: context.connections.capture(), runtimeContract: "hara-governed-pi-v1",
-          project: { root: context.project, dev: project.dev, ino: project.ino }, sessionId: store.sessionId, runId: randomUUID(),
+          project: captureWorkspaceProjectIdentity(context.project), sessionId: store.sessionId, runId: randomUUID(),
           lineage: parent ? { rootRunId: parent.binding.lineage.rootRunId ?? parent.id, parentRunId: parent.id, depth: 1 } : { rootRunId: null, parentRunId: null, depth: 0 },
           createdAt: new Date().toISOString(), host: { hostId: host.hostId, hostEpoch: host.hostEpoch, grantId: row.grantId, grantRevision: row.grantRevision, actorId: row.actorId, policyRevision: row.policyRevision },
           budget: parent ? { ...parent.binding.budget } : { ...DEFAULT_WORKSPACE_RUN_BUDGET,

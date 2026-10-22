@@ -78,8 +78,10 @@ test("Trusted Publishing stays in publish-npm while reusable verification gets n
 
 test("Windows verification exercises package isolation and native worktree path contracts", () => {
   const windows = workflowJob(ci, "windows-runtime");
-  assert.match(windows, /node --test[^\n]*test\/npm-package-smoke\.test\.mjs/);
-  assert.match(windows, /node --test[^\n]*test\/agent-worktree-registration\.test\.mjs/);
+  assert.match(windows, /node scripts\/windows-ci-tests\.mjs/);
+  const contracts = readFileSync(new URL("../scripts/windows-ci-tests.mjs", import.meta.url), "utf8");
+  assert.match(contracts, /"test\/npm-package-smoke\.test\.mjs"/);
+  assert.match(contracts, /"test\/agent-worktree-registration\.test\.mjs"/);
   assert.match(windows, /node scripts\/npm-package-smoke\.mjs/);
   assert.match(windows, /node scripts\/standalone-pi-runtime-smoke\.mjs dist\/bin\/hara\.exe/);
   assert.doesNotMatch(windows, /continue-on-error:\s*true/);

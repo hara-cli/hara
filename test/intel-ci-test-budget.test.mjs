@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { INTEL_SLOW_FILES, NATIVE_CONTENTION_FILES, usesIntelBudget, intelCaseTimeout, intelTestBatches, intelTestGroups } from "../scripts/intel-ci-test-budget.mjs";
-import { nativeTestBatches } from "../scripts/native-ci-tests.mjs";
+import { nativeTestBatches, strictNativeTestBatches, runNativeTestGroups } from "../scripts/native-ci-tests.mjs";
 
 test("temporary slow budgets require the exact Intel CI platform, matching flag and reviewed release", () => {
   const approved = { platform: "darwin", arch: "x64", release: "1.0.2", env: { GITHUB_ACTIONS: "true", HARA_INTEL_TEST_BUDGET: "1.0.2" } };
@@ -54,4 +54,36 @@ test("real ARM64 full suite precedes tag and keeps original file/case deadlines,
   const runner=readFileSync(new URL("../scripts/native-ci-tests.mjs",import.meta.url),"utf8");
   assert.match(runner,/delete env\.HARA_INTEL_TEST_BUDGET/);assert.match(runner,/\.\/test\/setup-isolated-home\.mjs/);
   assert.doesNotMatch(runner,/--test-skip-pattern|--test-name-pattern|continue-on-error|\.retry\(/);
+});
+test("strict native candidate mode isolates every durable fixture with the original 120s deadlines on both Macs", () => {
+  const files = readdirSync(new URL(".", import.meta.url)).filter(file => file.endsWith(".test.mjs")).sort();
+  for (const arch of ["arm64", "x64"]) {
+    const batches = strictNativeTestBatches(files, arch);
+    assert.deepEqual(batches.flatMap(batch => batch.files).sort(), files);
+    assert(batches.every(batch => batch.timeout === 120000));
+    assert.equal(batches[0].concurrency, 1); assert.equal(batches[2].concurrency, 1);
+    for (const file of [...INTEL_SLOW_FILES, ...NATIVE_CONTENTION_FILES]) {
+      const batch = batches.find(batch => batch.files.includes(file));
+      assert(batch.slow || batch.isolated, `durable fixture must not compete: ${file}`);
+    }
+  }
+  const runner = readFileSync(new URL("../scripts/native-ci-tests.mjs", import.meta.url), "utf8");
+  assert.match(runner, /process\.arch === "x64" && !strict/);
+  assert.match(runner, /delete env\.HARA_INTEL_TEST_BUDGET/);
+  assert.throws(() => strictNativeTestBatches(files, "ia32"), /architecture/);
+});
+test("a failed native group preserves all later groups and the final exit remains nonzero", () => {
+  const batches = [{ slow: true, files: ["a.test.mjs", "b.test.mjs"], timeout: 120000, concurrency: 1 },
+    { files: ["c.test.mjs", "d.test.mjs"], timeout: 120000, concurrency: 4 },
+    { isolated: true, files: ["e.test.mjs"], timeout: 120000, concurrency: 1 }];
+  for (const failure of [1, null]) {
+    const seen = [], messages = [], env = { SYNTHETIC: "only" };
+    const code = runNativeTestGroups(batches, "x64", { env, log: text => messages.push(text),
+      run: (args, passedEnv) => { assert.equal(passedEnv, env); seen.push(args); return seen.length === 1 ? failure : 0; } });
+    assert.equal(code, 1); assert.equal(seen.length, 4);
+    assert.deepEqual(seen.flatMap(args => args.filter(arg => arg.startsWith("test/"))), batches.flatMap(batch => batch.files.map(file => `test/${file}`)));
+    assert(seen.every(args => args.includes("--test-timeout=120000")));
+    assert.match(messages.at(-1), /1 failed groups/);
+  }
+  assert.equal(runNativeTestGroups(batches, "arm64", { run: () => 0, log: () => {} }), 0);
 });

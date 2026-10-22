@@ -11,6 +11,7 @@ import { SYNTHETIC_CONNECTION } from "../dist/workspace/synthetic-provider.js";
 import { WorkspaceTreeBudget } from "../dist/workspace/tree-budget.js";
 import { WorkspaceResourceStorage, workspaceStateHome } from "../dist/workspace/resource-context.js";
 import { intelCaseTimeout } from "../scripts/intel-ci-test-budget.mjs";
+import { captureWorkspaceProjectIdentity } from "../dist/workspace/run-binding.js";
 
 const temporary=[];
 after(()=>{for(const path of temporary)fs.rmSync(path,{recursive:true,force:true});});
@@ -68,9 +69,9 @@ test("old shared-project run remains readable but cannot resume or construct a P
   const run=a.host.start("client",a.workspaceId,a.main,"hello",randomUUID());await ready;a.host.cancel(a.workspaceId,a.main,run.runId);release();await a.host.wait(run.runId);
   const row=a.host.catalog.resolve(a.workspaceId),storage=new WorkspaceResourceStorage(a.host.home,row.scope);storage.initialize();
   const path=storage.run(()=>join(workspaceStateHome(),".hara",`conversation-${a.main.slice(3)}.json`));
-  await a.host.close();const raw=JSON.parse(fs.readFileSync(path,"utf8")),base=fs.statSync(join(a.root,"project"));
+  await a.host.close();const raw=JSON.parse(fs.readFileSync(path,"utf8"));
   // Seed an earlier candidate's valid on-disk snapshot, not an authorized live mutation.
-  raw.task.workspaceRunBinding.project={root:join(a.root,"project"),dev:base.dev,ino:base.ino};fs.writeFileSync(path,JSON.stringify(raw)+"\n",{mode:0o600});
+  raw.task.workspaceRunBinding.project=captureWorkspaceProjectIdentity(join(a.root,"project"));fs.writeFileSync(path,JSON.stringify(raw)+"\n",{mode:0o600});
   let constructed=0;const restored=new LocalWorkspaceHost(a.root,{providerFactory(){constructed++;throw new Error("must not construct");}});
   try{const history=restored.snapshot(a.workspaceId).conversation.history;
    assert.throws(()=>restored.start("client",a.workspaceId,a.main,"/continue",randomUUID(),true),/project root changed/);

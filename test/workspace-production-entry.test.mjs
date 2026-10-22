@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { once } from "node:events";
+import { once, EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
@@ -13,13 +13,14 @@ import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { startLocalWorkspaceServe } from "../dist/serve/local-workspace.js";
 import { createWorkspaceSyntheticProvider, SYNTHETIC_CONNECTION } from "../dist/workspace/synthetic-provider.js";
 import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
-import { intelCaseTimeout } from "../scripts/intel-ci-test-budget.mjs";
+import { waitForHostApproval } from "./fixtures/host-approval.mjs";
 const temporary = [];
 function dir() { const path = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-production-entry-"))); temporary.push(path); return path; }
 after(() => { for (const path of temporary) fs.rmSync(path, { recursive: true, force: true }); });
-async function until(check) { const deadline = Date.now() + intelCaseTimeout(5000, 30000); while (Date.now() < deadline) { const value = check(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 100)); } throw new Error("Formal fixture did not settle"); }
-test("formal six-step Host flow uses an explicit mock Provider; no DEV flags, lab markers or key-lane inheritance", async () => {
-  const root = dir(), options = { mode: "workspace", credentialVault: new MemoryCredentialVault(), providerFactory: createWorkspaceSyntheticProvider }, host = new LocalWorkspaceHost(root, options);
+test("formal six-step Host flow uses an explicit mock Provider; no DEV flags, lab markers or key-lane inheritance", async t => {
+  const events = new EventEmitter();
+  const root = dir(), options = { mode: "workspace", credentialVault: new MemoryCredentialVault(), providerFactory: createWorkspaceSyntheticProvider,
+    onChange: event => events.emit("change", event) }, host = new LocalWorkspaceHost(root, options);
   let restored;
   try {
     assert.equal(host.list().executionMode, "workspace"); assert.equal(host.list().syntheticOnly, false);
@@ -28,7 +29,11 @@ test("formal six-step Host flow uses an explicit mock Provider; no DEV flags, la
     assert.throws(() => host.start("client", id, main, "hello", randomUUID()), /connection/); assert.equal(host.snapshot(id).conversation.usage.modelCalls, 0);
     host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
     const hello = host.start("client", id, main, "hello", randomUUID()); await host.wait(hello.runId); assert.equal(host.snapshot(id).conversation.state, "completed");
-    const create = host.start("client", id, main, "建立 Pi 同事 Coder", randomUUID()); const card = await until(() => host.snapshot(id, main, "client").approvals[0]);
+    const approvalStarted = Date.now();
+    const { job: create, card } = await waitForHostApproval({ events, signal: t.signal,
+      start: () => host.start("client", id, main, "建立 Pi 同事 Coder", randomUUID()),
+      read: () => host.snapshot(id, main, "client").approvals[0], wait: runId => host.wait(runId) });
+    t.diagnostic(`Host approval event observed after ${Date.now() - approvalStarted}ms on ${process.platform}/${process.arch}`);
     host.answerApproval("client", id, card.id, true); await host.wait(create.runId);
     const created = host.snapshot(id, main, "client"); assert.equal(created.agents.length, 2);
     assert.equal(created.approvals.length, 0); assert.equal(created.conversation.state, "completed");
