@@ -1,11 +1,58 @@
 // A local, per-occurrence READ-ONLY compatibility bridge. No global CLI/8790/Home fallback.
 import net from "node:net";
-import { chmodSync, lstatSync, realpathSync, unlinkSync } from "node:fs";
+import { chmodSync, lstatSync, mkdtempSync, realpathSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { canonical, deepFreeze, exact, plain } from "./local-state.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import type { LegacyCliLease, LegacyCommandReview } from "./legacy-command.js";
+
+
+/** AF_UNIX endpoint budget kept by LegacyScopedCli (≤100 bytes including "legacy-cli.sock"). */
+export const LEGACY_CLI_SOCKET_ENDPOINT_MAX_BYTES = 100;
+const LEGACY_CLI_SOCKET_NAME = "legacy-cli.sock";
+
+/**
+ * Host prepareCli / test harness contract: allocate an owner-only socket directory whose
+ * `legacy-cli.sock` endpoint stays ≤ {@link LEGACY_CLI_SOCKET_ENDPOINT_MAX_BYTES}.
+ * Never place sockets under evidence `HOME` / `TMPDIR` / `TEMP` / `HARA_HOME` — those paths
+ * are intentionally long for isolation and blow the AF_UNIX budget.
+ * Prefer `HARA_PRIVATE_SOCKET_DIR` when set (must already be a short, owned, mode-0700 dir);
+ * otherwise use a short sticky parent under `/tmp` (realpath on Darwin → `/private/tmp`).
+ */
+export function allocatePrivateSocketRoot(env: NodeJS.ProcessEnv = process.env): string {
+  const parent = resolvePrivateSocketParent(env);
+  const root = realpathSync(mkdtempSync(join(parent, "h")));
+  chmodSync(root, 0o700);
+  const info = lstatSync(root);
+  if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0)
+    throw new Error("Private owner socket directory required");
+  const endpoint = join(root, LEGACY_CLI_SOCKET_NAME);
+  if (Buffer.byteLength(endpoint) > LEGACY_CLI_SOCKET_ENDPOINT_MAX_BYTES)
+    throw new Error("Explicit shorter private socket directory required");
+  return root;
+}
+
+function resolvePrivateSocketParent(env: NodeJS.ProcessEnv): string {
+  const configured = env.HARA_PRIVATE_SOCKET_DIR?.trim();
+  if (configured) {
+    const parent = realpathSync(configured);
+    const info = lstatSync(parent);
+    if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0)
+      throw new Error("Private owner socket directory required");
+    // parent + /hXXXXXX + /legacy-cli.sock must stay ≤100 (mkdtemp suffix length 6).
+    const probe = join(parent, "hXXXXXX", LEGACY_CLI_SOCKET_NAME);
+    if (Buffer.byteLength(probe) > LEGACY_CLI_SOCKET_ENDPOINT_MAX_BYTES)
+      throw new Error("Explicit shorter private socket directory required");
+    return parent;
+  }
+  // Short sticky tmp — independent of evidence TMPDIR / os.tmpdir().
+  const sticky = realpathSync("/tmp");
+  const probe = join(sticky, "hXXXXXX", LEGACY_CLI_SOCKET_NAME);
+  if (Buffer.byteLength(probe) > LEGACY_CLI_SOCKET_ENDPOINT_MAX_BYTES)
+    throw new Error("Explicit shorter private socket directory required");
+  return sticky;
+}
 
 export class LegacyScopedCli {
   private readonly token = randomBytes(32).toString("hex");
@@ -22,7 +69,7 @@ export class LegacyScopedCli {
     if (realpathSync(options.socketRoot) !== options.socketRoot || !info.isDirectory() || info.uid !== process.getuid?.()
       || (info.mode & 0o077) !== 0) throw new Error("Private owner socket directory required");
     this.endpoint = join(options.socketRoot, "legacy-cli.sock");
-    if (Buffer.byteLength(this.endpoint) > 100) throw new Error("Explicit shorter private socket directory required");
+    if (Buffer.byteLength(this.endpoint) > LEGACY_CLI_SOCKET_ENDPOINT_MAX_BYTES) throw new Error("Explicit shorter private socket directory required");
     try { lstatSync(this.endpoint); throw new Error("CLI socket path already exists"); } catch (error: any) { if (error.code !== "ENOENT") throw error; }
     this.server = net.createServer(socket => {
       this.sockets.add(socket); socket.once("close", () => this.sockets.delete(socket)); socket.on("error", () => {});
