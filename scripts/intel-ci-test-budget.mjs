@@ -9,7 +9,7 @@ import { pathToFileURL } from "node:url";
 const version = JSON.parse(readFileSync(new URL("../package.json", import.meta.url))).version;
 export const INTEL_SLOW_FILES = Object.freeze([
   "config-live.test.mjs", "cron-route-binding.test.mjs", "gateway-runtime-state.test.mjs", "home-workspace-cli.test.mjs",
-  "legacy-copy-roundtrip.test.mjs", "legacy-startup.test.mjs",
+  "legacy-copy-roundtrip.test.mjs", "legacy-startup.test.mjs", "legacy-startup-pi.test.mjs", "legacy-startup-rollback.test.mjs",
   "session-profile-cli.test.mjs", "workspace-local-host.test.mjs", "workspace-model-context.test.mjs", "workspace-production-entry.test.mjs",
 ]);
 // These fixtures compete for the hosted Mac's durable disk, browser or process-start capacity.

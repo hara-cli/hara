@@ -45,7 +45,8 @@ test("real ARM64 full suite precedes tag and keeps original file/case deadlines,
   assert.deepEqual(batches.flatMap(batch=>batch.files).sort(),files);
   assert(batches.every(batch=>batch.timeout===120000));assert.equal(batches[0].concurrency,1);assert.equal(batches[1].concurrency,4);
   assert.equal(batches[2].concurrency, 1);assert.equal(batches[2].isolated, true);
-  assert(batches[0].files.includes("legacy-startup.test.mjs"));
+  for (const file of ["legacy-startup.test.mjs", "legacy-startup-pi.test.mjs", "legacy-startup-rollback.test.mjs"])
+    assert(batches[0].files.includes(file), `legacy-startup scenarios stay serialized as durable fixtures: ${file}`);
   assert.deepEqual(nativeTestBatches(files,"x64"),intelTestBatches(files));
   assert.throws(()=>nativeTestBatches(files,"ia32"),/architecture/);
   const workflow=readFileSync(new URL("../.github/workflows/ci.yml",import.meta.url),"utf8");
