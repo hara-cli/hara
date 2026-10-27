@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, posix, win32 } from "node:path";
+import { dirname, join, posix, win32 } from "node:path";
 
 import {
   AGENT_WORKTREE_GIT_DIR_MAX_BYTES,
@@ -194,7 +194,13 @@ test("native registration matching does not allow a linked managed worktree", t 
   const state = fixture(t);
   const manager = new AgentWorktreeManager(state.repo, state.home, "registration-link");
   const binding = manager.prepare(AGENT_ID);
-  const moved = join(state.root, "moved-worktree");
+  // Move the worktree aside inside its own managed root, never into the fixture root: on Windows a
+  // long evidence home puts managed worktrees under %SystemRoot%\Temp (C:) while TEMP may live on
+  // another volume (D:), and renameSync cannot cross volumes (EXDEV). A same-directory rename is also
+  // the realistic swap an attacker with write access to the managed root would perform.
+  const managedRoot = dirname(binding.path);
+  t.after(() => rmSync(managedRoot, { force: true, recursive: true }));
+  const moved = join(managedRoot, "moved-worktree");
   renameSync(binding.path, moved);
   symlinkSync(moved, binding.path, process.platform === "win32" ? "junction" : "dir");
   assert.throws(() => manager.prepare(AGENT_ID), /replaced or linked/i);
