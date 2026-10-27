@@ -3,6 +3,7 @@ import {
   accessSync,
   constants,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   openSync,
   closeSync,
@@ -15,11 +16,37 @@ import {
 import { platform, tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { terminateSubprocessTree, toolSubprocessEnv } from "../security/subprocess-env.js";
+import { redactToolSubprocessOutput, terminateSubprocessTree, toolSubprocessEnv } from "../security/subprocess-env.js";
 import { findHeadlessBrowser } from "../tools/headless-web.js";
 
 const PDF_RENDER_TIMEOUT_MS = 60_000;
 const MAX_PRESENTATION_PDF_BYTES = 256 * 1024 * 1024;
+const BROWSER_DIAGNOSTIC_MAX_BYTES = 8 * 1024;
+/** POSIX Chromium binds `$TMPDIR/org.chromium.Chromium.XXXXXX/SingletonSocket` (Linux aborts with
+ * "Socket path too long"); 104 is the smallest AF_UNIX `sun_path` budget across macOS and Linux. */
+export const PRESENTATION_PDF_SOCKET_PATH_MAX_BYTES = 104;
+const CHROMIUM_SINGLETON_PROBE = join("org.chromium.Chromium.XXXXXX", "SingletonSocket");
+
+export interface PresentationPdfTemporary {
+  root: string;
+  /** Short private TMPDIR handed to the browser so its process-singleton socket stays bindable. */
+  browserTmp: string;
+}
+
+/** Allocate the owner-only render directory. Evidence/isolated `TMPDIR` values are intentionally long and
+ * blow Chromium's AF_UNIX singleton socket budget, so POSIX hosts use a fresh mkdtemp (0700) directly
+ * under the short sticky `/tmp`, mirroring the LegacyScopedCli socket root. Windows has no such socket. */
+export function allocatePresentationPdfTemporary(plat = platform()): PresentationPdfTemporary {
+  const parent = plat === "win32" ? tmpdir() : realpathSync("/tmp");
+  const root = realpathSync(mkdtempSync(join(parent, "hara-pdf-")));
+  const browserTmp = join(root, "t");
+  mkdirSync(browserTmp, { mode: 0o700 });
+  if (plat !== "win32" && Buffer.byteLength(join(browserTmp, CHROMIUM_SINGLETON_PROBE)) > PRESENTATION_PDF_SOCKET_PATH_MAX_BYTES) {
+    rmSync(root, { recursive: true, force: true });
+    throw new Error("Presentation PDF temporary directory is too long for the browser socket.");
+  }
+  return { root, browserTmp };
+}
 
 export interface PresentationPdfResult {
   bytes: Uint8Array;
@@ -79,6 +106,7 @@ function renderWithBrowser(
   htmlPath: string,
   pdfPath: string,
   profilePath: string,
+  browserTmp: string,
 ): Promise<void> {
   const args = [
     "--headless=new",
@@ -117,11 +145,22 @@ function renderWithBrowser(
       HTTP_PROXY: undefined,
       https_proxy: undefined,
       http_proxy: undefined,
+      ...(processGroup ? { TMPDIR: browserTmp, TMP: browserTmp, TEMP: browserTmp } : {}),
     }),
   });
-  // Browser diagnostics can contain machine-specific paths. Drain them, but never include them in a
-  // renderer error or model-visible receipt.
-  child.stderr?.resume();
+  // Browser diagnostics can contain machine-specific paths. Keep a bounded, redacted tail only as an
+  // operator `diagnostic` property on a failure; it never enters the error message or a receipt.
+  let stderrTail = "";
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk: string) => {
+    stderrTail = (stderrTail + chunk).slice(-BROWSER_DIAGNOSTIC_MAX_BYTES);
+  });
+  const failure = (message: string): Error => {
+    const error = new Error(message);
+    const diagnostic = redactToolSubprocessOutput(stderrTail).trim();
+    if (diagnostic) Object.defineProperty(error, "diagnostic", { value: diagnostic, enumerable: false });
+    return error;
+  };
   return new Promise((resolve, reject) => {
     let settled = false;
     let lastSize = -1;
@@ -173,8 +212,8 @@ function renderWithBrowser(
       // A browser that exits normally has already closed the output descriptor; the EOF marker is then
       // sufficient. Long-lived Chromium builds use the stricter two-stable-poll success path above.
       if (outputLooksComplete(false)) return finish();
-      if (code !== 0) return finish(new Error("Presentation PDF browser exited before producing a verified file."));
-      finish(new Error("Presentation PDF browser exited without a complete output file."));
+      if (code !== 0) return finish(failure("Presentation PDF browser exited before producing a verified file."));
+      finish(failure("Presentation PDF browser exited without a complete output file."));
     });
   });
 }
@@ -208,13 +247,13 @@ export async function renderPresentationPdf(
     throw new Error("Presentation HTML for PDF rendering is outside the supported range.");
   }
   const browser = checkedBrowserPath(options.browserPath ?? findHeadlessBrowser());
-  const temporary = mkdtempSync(join(tmpdir(), "hara-presentation-pdf-"));
+  const { root: temporary, browserTmp } = allocatePresentationPdfTemporary();
   const htmlPath = join(temporary, "presentation.html");
   const pdfPath = join(temporary, "presentation.pdf");
   const profilePath = join(temporary, "browser-profile");
   try {
     writeFileSync(htmlPath, html, { encoding: "utf8", flag: "wx", mode: 0o600 });
-    await renderWithBrowser(browser, htmlPath, pdfPath, profilePath);
+    await renderWithBrowser(browser, htmlPath, pdfPath, profilePath, browserTmp);
     const info = lstatSync(pdfPath);
     if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) {
       throw new Error("Presentation PDF renderer produced an unsafe output file.");

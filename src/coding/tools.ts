@@ -40,7 +40,8 @@ function inside(root: string, target: string): boolean {
 }
 function sameIdentity(a: Stats, b: Stats): boolean { return a.dev === b.dev && a.ino === b.ino && a.isDirectory() === b.isDirectory(); }
 function protectedPath(root: string, path: string): boolean {
-  // The trusted managed root itself lives in ~/.hara/workspace/agent-worktrees. Only descendant
+  // The trusted managed root lives in ~/.hara/workspace/agent-worktrees (or, for an over-long Windows
+  // home, a hashed %SystemRoot%\Temp\hara-aw-* directory). Only descendant
   // control-plane names are prohibited here; the central secret policy still sees the absolute path.
   const parts = relative(root,path).split(/[\\/]/u).map(part => part.toLowerCase().replace(/[. ]+$/u, ""));
   return parts.some(part => [".git", ".hara", ".gitattributes", ".gitmodules"].includes(part)) || sensitiveFileReason(path) !== null;

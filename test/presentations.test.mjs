@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstatSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import "../dist/tools/presentation.js";
@@ -16,7 +17,12 @@ import {
   validatePresentationArtifact,
 } from "../dist/presentations/runtime.js";
 import { findHeadlessBrowser } from "../dist/tools/headless-web.js";
-import { inspectPresentationPdf, renderPresentationPdf } from "../dist/presentations/pdf.js";
+import {
+  PRESENTATION_PDF_SOCKET_PATH_MAX_BYTES,
+  allocatePresentationPdfTemporary,
+  inspectPresentationPdf,
+  renderPresentationPdf,
+} from "../dist/presentations/pdf.js";
 import { analyzePresentationNarrative } from "../dist/presentations/quality.js";
 import { renderPresentationHtml } from "@nanhara/hara-presentation";
 
@@ -29,7 +35,7 @@ async function withTempHome(fn) {
   }
 }
 
-test("native Presentation Artifact previews and exports one validated revision", async () => {
+test("native Presentation Artifact previews and exports one validated revision", async (t) => {
   await withTempHome(async (home) => {
     const created = createPresentationArtifact(home, {
       title: "经营复盘",
@@ -103,13 +109,13 @@ test("native Presentation Artifact previews and exports one validated revision",
     const formats = findHeadlessBrowser() ? ["json", "html", "pdf", "pptx"] : ["json", "html", "pptx"];
     for (const format of formats) {
       const destinationPath = join(home, `经营复盘.${format}`);
-      const receipt = await exportPresentationArtifact(home, {
+      const receipt = await withBrowserDiagnostic(t, () => exportPresentationArtifact(home, {
         artifactId: created.artifact.artifactId,
         revisionId: created.currentRevision.revisionId,
         validationReportId: report.reportId,
         destinationPath,
         format,
-      });
+      }));
       assert.equal(receipt.format, format);
       assert.ok(receipt.output.byteSize > 0);
       const bytes = await readFile(destinationPath);
@@ -128,7 +134,44 @@ test("native Presentation Artifact previews and exports one validated revision",
   });
 });
 
-test("direct PDF rendering verifies the exact slide count", { skip: !findHeadlessBrowser() }, async () => {
+/** Surface the redacted browser stderr tail in TAP so a CI-only browser exit is diagnosable. */
+async function withBrowserDiagnostic(t, operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    for (let current = error; current; current = current.cause) {
+      if (current.diagnostic) t.diagnostic(`browser stderr tail:\n${current.diagnostic}`);
+    }
+    throw error;
+  }
+}
+
+test("PDF render root keeps Chromium's singleton socket bindable under a long evidence TMPDIR", { skip: process.platform === "win32" }, () => {
+  const previous = process.env.TMPDIR;
+  const longTmp = join(tmpdir(), "candidate-evidence-40506201909", "1", "candidate-build", "x86_64-unknown-linux-gnu", "tmp");
+  mkdirSync(longTmp, { recursive: true, mode: 0o700 });
+  process.env.TMPDIR = longTmp;
+  let allocated;
+  try {
+    allocated = allocatePresentationPdfTemporary();
+    const socket = join(allocated.browserTmp, "org.chromium.Chromium.XXXXXX", "SingletonSocket");
+    assert.ok(Buffer.byteLength(socket) <= PRESENTATION_PDF_SOCKET_PATH_MAX_BYTES, socket);
+    assert.ok(!allocated.root.startsWith(realpathSync(longTmp)), "render root must not inherit the evidence TMPDIR");
+    assert.equal(allocated.root, realpathSync(allocated.root));
+    for (const directory of [allocated.root, allocated.browserTmp]) {
+      const info = lstatSync(directory);
+      assert.ok(info.isDirectory() && !info.isSymbolicLink());
+      assert.equal(info.uid, process.getuid());
+      assert.equal(info.mode & 0o077, 0);
+    }
+  } finally {
+    if (allocated) rmSync(allocated.root, { recursive: true, force: true });
+    if (previous === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previous;
+  }
+});
+
+test("direct PDF rendering verifies the exact slide count", { skip: !findHeadlessBrowser() }, async (t) => {
   const project = {
     schemaVersion: "hara.presentation/1",
     title: "PDF proof",
@@ -150,7 +193,7 @@ test("direct PDF rendering verifies the exact slide count", { skip: !findHeadles
       },
     ],
   };
-  const result = await renderPresentationPdf(renderPresentationHtml(project), 2);
+  const result = await withBrowserDiagnostic(t, () => renderPresentationPdf(renderPresentationHtml(project), 2));
   assert.equal(result.mediaType, "application/pdf");
   assert.equal(result.fidelity, "visual-fidelity");
   assert.equal(result.pageCount, 2);
