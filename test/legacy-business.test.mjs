@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import { businessFixture, hash } from "./helpers/legacy-business-fixture.mjs";
 import { WorkspaceLegacyBusiness } from "../dist/workspace/legacy-business.js";
 import { WorkspaceLegacyOutcomes } from "../dist/workspace/legacy-outcomes.js";
-import { LegacyScopedCli } from "../dist/workspace/legacy-cli.js";
+import { LegacyScopedCli, allocatePrivateSocketRoot, LEGACY_CLI_SOCKET_ENDPOINT_MAX_BYTES } from "../dist/workspace/legacy-cli.js";
 import { legacyProcessLauncher } from "../dist/workspace/legacy-process.js";
 import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { executeLegacyPrint } from "../dist/workspace/legacy-print.js";
@@ -101,7 +101,7 @@ test("an asynchronous process grant is refused before starting even when its rej
   assert.equal(r.command.state,"unknown");assert.equal(r.command.output,"");
 });
 test("scoped CLI runs through the actual early entry and owned process; token/scope revocation fail closed",{skip:process.platform==="win32"},async t=>{
-  const f=await fixture(t,{task:"hara cron logs one -n 5; printf 'done\\n'",deliver:"feishu:fixture"}),id=randomUUID(),socketRoot=fs.realpathSync(fs.mkdtempSync(join(tmpdir(),"hara-lcli-")));
+  const f=await fixture(t,{task:"hara cron logs one -n 5; printf 'done\\n'",deliver:"feishu:fixture"}),id=randomUUID(),socketRoot=allocatePrivateSocketRoot();
   t.after(()=>fs.rmSync(socketRoot,{recursive:true,force:true}));let current=true,reads=0;
   const bridge=new LegacyScopedCli({socketRoot,review:f.review("one",id),assertCurrent(){if(!current)throw Error();},readLogs(jobId,lines){reads++;assert.equal(jobId,"one");assert.equal(lines,5);return"scoped fixture log\n";}});
   await bridge.start();t.after(()=>bridge.close());
@@ -114,6 +114,39 @@ test("scoped CLI runs through the actual early entry and owned process; token/sc
   await assert.rejects(exec(process.execPath,[cli,"cron","logs","foreign"],{env}),e=>e.code===2);
   await assert.rejects(exec(process.execPath,[cli,"cron","logs","one"],{env:{...env,HARA_LEGACY_CLI_TOKEN:"0".repeat(64)}}),e=>e.code===2);
   current=false;await assert.rejects(exec(process.execPath,[cli,"cron","logs","one"],{env}),e=>e.code===2);assert.equal(reads,1);await bridge.close();
+});
+test("allocatePrivateSocketRoot stays ≤100B and ignores long evidence TMPDIR",{skip:process.platform==="win32"},async t=>{
+  const longTmp=fs.realpathSync(fs.mkdtempSync(join(tmpdir(),"candidate-evidence-40488820744-1-native_build-aarch64-apple-darwin-tmp-")));
+  t.after(()=>fs.rmSync(longTmp,{recursive:true,force:true}));
+  const prev={TMPDIR:process.env.TMPDIR,TMP:process.env.TMP,TEMP:process.env.TEMP,HARA_PRIVATE_SOCKET_DIR:process.env.HARA_PRIVATE_SOCKET_DIR};
+  process.env.TMPDIR=longTmp;process.env.TMP=longTmp;process.env.TEMP=longTmp;delete process.env.HARA_PRIVATE_SOCKET_DIR;
+  t.after(()=>{for(const [k,v] of Object.entries(prev)){if(v===undefined)delete process.env[k];else process.env[k]=v;}});
+  const root=allocatePrivateSocketRoot();
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const endpoint=join(root,"legacy-cli.sock");
+  assert.ok(Buffer.byteLength(endpoint)<=LEGACY_CLI_SOCKET_ENDPOINT_MAX_BYTES);
+  assert.equal(LEGACY_CLI_SOCKET_ENDPOINT_MAX_BYTES,100);
+  assert.ok(!root.startsWith(longTmp));
+  assert.ok(!endpoint.startsWith(longTmp));
+});
+test("LegacyScopedCli still refuses an over-budget socketRoot (≤100B gate retained)",{skip:process.platform==="win32"},async t=>{
+  const longRoot=fs.realpathSync(fs.mkdtempSync(join(tmpdir(),"hara-lcli-overbudget-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-")));
+  t.after(()=>fs.rmSync(longRoot,{recursive:true,force:true}));
+  fs.chmodSync(longRoot,0o700);
+  assert.ok(Buffer.byteLength(join(longRoot,"legacy-cli.sock"))>LEGACY_CLI_SOCKET_ENDPOINT_MAX_BYTES);
+  assert.throws(()=>new LegacyScopedCli({socketRoot:longRoot,review:{scheduleId:"one",occurrenceId:"x",command:"echo",cwd:"/tmp",env:{}},assertCurrent(){},readLogs(){return"";}}),/Explicit shorter private socket directory required/);
+});
+test("HARA_PRIVATE_SOCKET_DIR parent is honored when short, owned, and mode 0700",{skip:process.platform==="win32"},async t=>{
+  const parent=fs.realpathSync(fs.mkdtempSync(join("/tmp","hp")));
+  t.after(()=>fs.rmSync(parent,{recursive:true,force:true}));
+  fs.chmodSync(parent,0o700);
+  const prev=process.env.HARA_PRIVATE_SOCKET_DIR;
+  process.env.HARA_PRIVATE_SOCKET_DIR=parent;
+  t.after(()=>{if(prev===undefined)delete process.env.HARA_PRIVATE_SOCKET_DIR;else process.env.HARA_PRIVATE_SOCKET_DIR=prev;});
+  const root=allocatePrivateSocketRoot();
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  assert.ok(root.startsWith(parent+"/"));
+  assert.ok(Buffer.byteLength(join(root,"legacy-cli.sock"))<=LEGACY_CLI_SOCKET_ENDPOINT_MAX_BYTES);
 });
 test("a partial scoped CLI env cannot enter global workspace/profile/cron startup",async t=>{
   const f=await fixture(t);for(const args of[["workspace","--help"],["--runtime-manifest"]])await assert.rejects(exec(process.execPath,[cli,...args],{env:{HOME:f.isolatedHome,PATH:"/usr/bin:/bin",HARA_LEGACY_CLI_TOKEN:"invalid"}}),e=>e.code===2&&/no global fallback/.test(e.stderr));
