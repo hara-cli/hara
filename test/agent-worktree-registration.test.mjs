@@ -16,7 +16,9 @@ import { tmpdir } from "node:os";
 import { join, posix, win32 } from "node:path";
 
 import {
+  AGENT_WORKTREE_GIT_DIR_MAX_BYTES,
   AgentWorktreeManager,
+  agentWorktreeManagedLocation,
   agentWorktreeRegistrationMatches,
 } from "../dist/subagent/worktree.js";
 
@@ -211,4 +213,66 @@ test("native registration matching rejects another repository's worktree at the 
   assert.throws(() => manager.prepare(AGENT_ID), /not registered to the source repository/i);
   assert.throws(() => manager.capture(AGENT_ID), /not registered to the source repository/i);
   assert.equal(readFileSync(join(binding.path, "source.txt"), "utf8"), "synthetic worktree source\n");
+});
+
+const LIVE26_WINDOWS_EVIDENCE_HOME = win32.join(
+  "D:\\a\\hara-desktop\\hara-desktop\\candidate-evidence\\40506201909\\1\\candidate-build",
+  "x86_64-pc-windows-msvc\\tmp\\hara-worktree-registration-AbCdEf\\home",
+);
+
+function windowsGitDir(location) {
+  return win32.join(location.base, ...location.components, AGENT_ID, ".git");
+}
+
+test("managed worktree location keeps the private Hara home layout on POSIX and short Windows homes", () => {
+  const posixHome = "/" + "evidence/".repeat(40) + "home";
+  assert.deepEqual(agentWorktreeManagedLocation(posixHome, "/repo", "session", "linux"), {
+    base: posixHome,
+    components: [".hara", "workspace", "agent-worktrees", agentWorktreeManagedLocation(posixHome, "/repo", "session", "darwin").components[3]],
+  });
+  const windowsHome = "C:\\Users\\runneradmin";
+  const location = agentWorktreeManagedLocation(windowsHome, "C:\\repo", "session", "win32", { SystemRoot: "C:\\Windows" });
+  assert.equal(location.base, windowsHome);
+  assert.deepEqual(location.components.slice(0, 3), [".hara", "workspace", "agent-worktrees"]);
+  assert.ok(Buffer.byteLength(windowsGitDir(location)) <= AGENT_WORKTREE_GIT_DIR_MAX_BYTES);
+});
+
+test("a long Windows evidence home moves managed worktrees under a short owner-created SystemRoot Temp root", () => {
+  const env = { SystemRoot: "C:\\Windows" };
+  const preferred = win32.join(LIVE26_WINDOWS_EVIDENCE_HOME, ".hara", "workspace", "agent-worktrees", "s_" + "0".repeat(32), AGENT_ID, ".git");
+  assert.ok(Buffer.byteLength(preferred) > AGENT_WORKTREE_GIT_DIR_MAX_BYTES, "fixture must reproduce live26's '$GIT_DIR' too big");
+  const location = agentWorktreeManagedLocation(LIVE26_WINDOWS_EVIDENCE_HOME, "D:\\repo", "session", "win32", env);
+  assert.equal(location.base, "C:\\Windows\\Temp");
+  assert.equal(location.components.length, 1);
+  assert.match(location.components[0], /^hara-aw-[0-9a-f]{32}$/u);
+  assert.ok(Buffer.byteLength(windowsGitDir(location)) <= AGENT_WORKTREE_GIT_DIR_MAX_BYTES);
+  // Distinct homes, repositories and sessions never share one managed root.
+  const others = [
+    agentWorktreeManagedLocation(LIVE26_WINDOWS_EVIDENCE_HOME + "2", "D:\\repo", "session", "win32", env),
+    agentWorktreeManagedLocation(LIVE26_WINDOWS_EVIDENCE_HOME, "D:\\repo2", "session", "win32", env),
+    agentWorktreeManagedLocation(LIVE26_WINDOWS_EVIDENCE_HOME, "D:\\repo", "session2", "win32", env),
+  ];
+  assert.equal(new Set([location, ...others].map(value => value.components[0])).size, 4);
+  // A relative or NUL-bearing SystemRoot is not trusted.
+  for (const SystemRoot of ["Windows", "C:\\Win\0dows"]) {
+    assert.equal(agentWorktreeManagedLocation(LIVE26_WINDOWS_EVIDENCE_HOME, "D:\\repo", "session", "win32", { SystemRoot }).base, "C:\\Windows\\Temp");
+  }
+  const tooLong = { SystemRoot: "C:\\" + "x".repeat(200) };
+  assert.throws(() => agentWorktreeManagedLocation(LIVE26_WINDOWS_EVIDENCE_HOME, "D:\\repo", "session", "win32", tooLong), /GIT_DIR limit/);
+});
+
+test("Windows prepare succeeds under a deliberately long home and stays outside the repository", { skip: process.platform !== "win32" }, t => {
+  const state = fixture(t);
+  const longHome = join(state.home, "e".repeat(48), "f".repeat(48));
+  mkdirSync(longHome, { recursive: true });
+  const manager = new AgentWorktreeManager(state.repo, longHome, "registration-long-home");
+  const binding = manager.prepare(AGENT_ID);
+  try {
+    assert.ok(Buffer.byteLength(join(binding.path, ".git")) <= AGENT_WORKTREE_GIT_DIR_MAX_BYTES, binding.path);
+    assert.equal(binding.path, realpathSync.native(binding.path));
+    assert.equal(readFileSync(join(binding.path, "source.txt"), "utf8"), "synthetic worktree source\n");
+    assert.equal(agentWorktreeRegistrationMatches(state.git("worktree", "list", "--porcelain", "-z"), binding.path), true);
+  } finally {
+    manager.remove(AGENT_ID);
+  }
 });

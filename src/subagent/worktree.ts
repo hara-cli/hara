@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { chmodSync, lstatSync, readdirSync, readFileSync, realpathSync, rmdirSync } from "node:fs";
-import { basename, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, isAbsolute, relative, resolve, sep, win32 } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { ensurePrivateStateSubdirectory } from "../security/private-state.js";
@@ -14,6 +14,59 @@ const COMMIT = /^[0-9a-f]{40,64}$/u;
 const WORKSPACE_ID = /^aw_[a-f0-9]{40}$/u;
 const MAX_ATTRIBUTE_DIRECTORIES = 100_000;
 const MAX_ATTRIBUTE_FILES = 1_024;
+/** Git dies with "'$GIT_DIR' too big" when the `GIT_DIR` it exports to `worktree add` children
+ * (`<target>/.git`) exceeds PATH_MAX - 40; Git for Windows compiles PATH_MAX as 260. */
+export const AGENT_WORKTREE_GIT_DIR_MAX_BYTES = 220;
+const AGENT_WORKTREE_LEAF_PROBE = "00000000-0000-4000-8000-000000000000";
+
+export interface AgentWorktreeManagedLocation {
+  base: string;
+  components: string[];
+}
+
+/** Choose where one session's managed worktrees live. The default is private Hara state under `home`.
+ * On Windows, an intentionally long (evidence/isolated) home would put `<target>/.git` past Git's
+ * `GIT_DIR` ceiling, so that case alone moves to one hashed directory under `%SystemRoot%\Temp` — the
+ * Windows analog of sticky `/tmp`: Users may create folders there and CREATOR OWNER keeps them private.
+ * The hash binds home, repository and session, so distinct homes never share a managed root. */
+export function agentWorktreeManagedLocation(
+  home: string,
+  repositoryRoot: string,
+  sessionId: string,
+  plat: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): AgentWorktreeManagedLocation {
+  const sessionScope = "s_" + createHash("sha256")
+    .update(repositoryRoot, "utf8")
+    .update("\0", "utf8")
+    .update(sessionId, "utf8")
+    .digest("hex")
+    .slice(0, 32);
+  const preferred = { base: home, components: [".hara", "workspace", "agent-worktrees", sessionScope] };
+  if (plat !== "win32") return preferred;
+  const gitDir = (location: AgentWorktreeManagedLocation) =>
+    win32.join(location.base, ...location.components, AGENT_WORKTREE_LEAF_PROBE, ".git");
+  if (Buffer.byteLength(gitDir(preferred)) <= AGENT_WORKTREE_GIT_DIR_MAX_BYTES) return preferred;
+  const configuredRoot = String(env.SystemRoot ?? env.WINDIR ?? "").trim();
+  const systemRoot = configuredRoot && win32.isAbsolute(configuredRoot) && !configuredRoot.includes("\0")
+    ? configuredRoot
+    : "C:\\Windows";
+  const short = {
+    base: win32.join(systemRoot, "Temp"),
+    components: ["hara-aw-" + createHash("sha256")
+      .update(resolve(home), "utf8")
+      .update("\0", "utf8")
+      .update(repositoryRoot, "utf8")
+      .update("\0", "utf8")
+      .update(sessionId, "utf8")
+      .digest("hex")
+      .slice(0, 32)],
+  };
+  if (Buffer.byteLength(gitDir(short)) > AGENT_WORKTREE_GIT_DIR_MAX_BYTES) {
+    throw new Error("Agent worktree storage path exceeds Git's GIT_DIR limit on Windows");
+  }
+  return short;
+}
 
 export interface AgentWorktreeBinding {
   baseCommit: string;
@@ -175,16 +228,8 @@ export class AgentWorktreeManager {
       throw new Error("Agent source cwd is outside its Git repository");
     }
     this.sourceRelativeCwd = relative(this.repositoryRoot, this.sourceCwd);
-    const sessionScope = "s_" + createHash("sha256")
-      .update(this.repositoryRoot, "utf8")
-      .update("\0", "utf8")
-      .update(sessionId, "utf8")
-      .digest("hex")
-      .slice(0, 32);
-    this.managedRoot = ensurePrivateStateSubdirectory(
-      home,
-      [".hara", "workspace", "agent-worktrees", sessionScope],
-    ).path;
+    const location = agentWorktreeManagedLocation(home, this.repositoryRoot, sessionId);
+    this.managedRoot = ensurePrivateStateSubdirectory(location.base, location.components).path;
     if (pathWithin(this.repositoryRoot, this.managedRoot) || pathWithin(this.managedRoot, this.repositoryRoot)) {
       throw new Error("Agent worktree storage must be outside the source repository");
     }
