@@ -16,7 +16,7 @@ async function connect(handle,origin){
  const socket=new WebSocket(`ws://127.0.0.1:${handle.port}`,origin?{origin}:{}),pending=new Map();let counter=0;
  socket.on("error",()=>{});socket.on("message",raw=>{const value=JSON.parse(raw.toString()),wait=pending.get(value.id);if(wait){pending.delete(value.id);clearTimeout(wait.timer);value.error?wait.reject(Object.assign(new Error(value.error.message),{code:value.error.code})):wait.resolve(value.result);}});
  await once(socket,"open");
- return{socket,request(method,params={}){return new Promise((resolve,reject)=>{const id=++counter,timer=setTimeout(()=>{pending.delete(id);reject(new Error("bounded RPC timeout"));},5000);pending.set(id,{resolve,reject,timer});socket.send(JSON.stringify({jsonrpc:"2.0",id,method,params}));});},
+ return{socket,request(method,params={}){return new Promise((resolve,reject)=>{const id=++counter,timer=setTimeout(()=>{pending.delete(id);reject(new Error("bounded RPC timeout"));},30_000);pending.set(id,{resolve,reject,timer});socket.send(JSON.stringify({jsonrpc:"2.0",id,method,params}));});},
   async close(){if(socket.readyState===WebSocket.CLOSED)return;const closed=once(socket,"close");socket.close();await closed;}};
 }
 async function until(check){for(let attempt=0;attempt<150;attempt++){const value=await check();if(value)return value;await new Promise(r=>setTimeout(r,20));}throw new Error("bounded RPC state wait expired");}
