@@ -7,6 +7,7 @@ import { redactSensitiveText } from "../security/secrets.js";
 import { readWorkspaceResourceText, type WorkspaceResourceStorage } from "./resource-context.js";
 import type { Tool } from "../tools/registry.js";
 import { exact, plain, text } from "./local-state.js";
+import { workspaceRenameTargetQuestion } from "./user-interaction.js";
 
 export interface WorkspaceColleagueReference { agentId: string; name: string; aliases: string[]; state: string; title?: string; mergedInto?: string }
 interface Note { source: "personal_global" | "workspace"; ref: string; snippet: string }
@@ -122,7 +123,9 @@ export function prepareWorkspaceStartContext(input: {
     const exactIdentity = visible.some(row => normalize(row.agentId) === needle && !row.mergedInto);
     const status = ids.size > 1 ? "ambiguous" : missingTarget || (rosterTruncated && !exactIdentity) ? "unavailable"
       : ids.size === 1 || hits.length ? "resolved" : unavailable || truncated || !personal.available ? "unavailable" : "missing";
-    return { status, historicalContextOnly: true, candidates, hits, personalGlobalAvailable: personal.available, truncated };
+    // During a rename request an ambiguous current colleague becomes a rename-target choice card.
+    return { status, historicalContextOnly: true, candidates, hits, personalGlobalAvailable: personal.available, truncated,
+      ...(rename && status === "ambiguous" ? { renameTo: clean(rename.newName, 120) } : {}) };
   };
   const objective = normalize(input.objective);
   const names = [...new Set(references.flatMap(row => [row.name, ...row.aliases]).filter(name => normalize(name).length >= 2))];
@@ -132,12 +135,15 @@ export function prepareWorkspaceStartContext(input: {
   const explicitFile = /(?:\b(?:file|folder|directory|path)\b|[a-z0-9_-]+\.[a-z0-9]{1,8}\b|文件|目录|路徑|路径)/i.test(input.objective);
   const reference = mentionedAmbiguity ?? (explicitFile ? undefined : explicitMatch);
   const initial = reference ? lookup(reference) : null;
+  const renameTarget = initial?.status === "ambiguous" && rename ? rename.newName : "";
   const initialQuestion = initial && initial.status !== "resolved" ? {
     reason: initial.status === "ambiguous" ? "lookup_ambiguous" as const : "lookup_missing" as const,
-    question: /[\u3400-\u9fff]/u.test(input.objective)
+    question: renameTarget ? workspaceRenameTargetQuestion(renameTarget, /[\u3400-\u9fff]/u.test(input.objective))
+      : /[\u3400-\u9fff]/u.test(input.objective)
       ? `开工前的同事名册、索引和可见记忆仍未唯一确认「${clean(reference!, 200)}」。你指的是哪位同事或哪项内容？`
       : `The startup roster, index and visible memory did not uniquely identify "${clean(reference!, 200)}". Which colleague or item do you mean?`,
     options: initial.candidates.map(row => row.label),
+    ...(renameTarget ? { intent: "rename_target" as const } : {}),
   } : null;
   // Rank the startup packet using the actual objective, not only each file's first lines. This is
   // lexical context selection, not semantic identity resolution or permission to act on a note.

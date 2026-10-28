@@ -1,7 +1,7 @@
 import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment, TurnArgs, TurnResult } from "../providers/types.js";
 import { isTaskRuntimeBinding } from "../agent-runtime/bindings.js";
 import { WORKSPACE_AGENT_EXECUTION_PENDING } from "../workspace/agent-binding.js";
-import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, workspaceRunQuestion, workspaceRunBeginToolBatch, type WorkspaceRunPermit } from "../workspace/execution.js";
+import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, workspaceRunQuestion, workspaceRunBeginToolBatch, workspaceRunAsk, workspaceRunAsyncAnswers, type WorkspaceRunPermit } from "../workspace/execution.js";
 import { createToolImageStore, redactOwnedToolImageText } from "../tools/tool-images.js";
 import { redactOwnedToolImageValue } from "../security/tool-media-redaction.js";
 import { createComputerRunScope, closeComputerRunScope } from "../tools/computer-run.js";
@@ -262,6 +262,20 @@ const RETAINED_QUESTION_COPY = Object.freeze({
     dependencyEvidence: "模型调用 ask_user 时没有提供明确且确定的默认值。",
   }),
 });
+
+/** Post a Workspace delivery:"async" ask_user card and return its pending receipt immediately. */
+function postAsyncWorkspaceAsk(permit: WorkspaceRunPermit, input: unknown): string {
+  const value = (input && typeof input === "object" ? input : {}) as { question?: unknown; header?: unknown; options?: unknown };
+  const clean = (raw: unknown, cap: number) => typeof raw === "string" ? redactSensitiveText(raw).text.trim().slice(0, cap) : "";
+  const question = clean(value.question, 800);
+  if (!question) return "Error: ask_user needs a non-empty `question`.";
+  const header = clean(value.header, 120);
+  const options = Array.isArray(value.options) ? value.options.map((option) => clean(option, 300)).filter(Boolean).slice(0, 8) : [];
+  const posted = workspaceRunAsk(permit, { question, ...(header ? { header } : {}), options }, "async");
+  if (!posted) return "Error: this run has no Workspace user channel; ask synchronously instead.";
+  return JSON.stringify({ status: "pending", delivery: "async", questionId: posted.id,
+    note: "The question card is shown to the user. Continue only with work that does not depend on the answer; the answer arrives later as a user message. An unanswered async question is dismissed when this run ends — never assume an answer." });
+}
 
 export function runtimeCopyLanguage(
   history: NeutralMsg[],
@@ -1813,6 +1827,8 @@ async function runAgentInner(
       try {
         const question = workspaceRunQuestion(opts.workspaceRun);
         if (question) return { status: "completed" };
+        // Async answers join as user turns at a closed boundary; never between a carried tool_use and its results.
+        if (!carriedToolRound) for (const message of workspaceRunAsyncAnswers(opts.workspaceRun)) history.push(message);
       } catch (error) { return interactionFailure("Workspace user-question checkpoint", error); }
     }
     let userIntervenedThisRound = false;
@@ -2671,9 +2687,13 @@ async function runAgentInner(
         );
       }
     };
+    // delivery:"async" is a Workspace-only ask; elsewhere the field is ignored and the ask stays sync.
+    const isAsyncWorkspaceAsk = (input: unknown): boolean =>
+      Boolean(opts.workspaceRun) && !!input && typeof input === "object" && (input as { delivery?: unknown }).delivery === "async";
     const isPendingHeadlessQuestion = (toolUse: (typeof r.toolUses)[number]): boolean => {
       if (toolUse.name !== "ask_user") return false;
       if (askUserRequestsCredential(toolUse.input)) return false;
+      if (isAsyncWorkspaceAsk(toolUse.input)) return false; // dispatched as a non-blocking card below
       const question = (toolUse.input as { question?: unknown } | null)?.question;
       const explicitDefault = (toolUse.input as { default?: unknown } | null)?.default;
       return typeof question === "string"
@@ -2716,6 +2736,12 @@ async function runAgentInner(
         : [];
       const questionTask = intakeTask, questionIntake = opts.taskIntake;
       const retainQuestion = async (): Promise<RunOutcome> => {
+        // Workspace: the model's ask enters the same run-bound channel as the observation gates.
+        if (opts.workspaceRun) {
+          try {
+            workspaceRunAsk(opts.workspaceRun, { question: safeQuestion, ...(safeHeader ? { header: safeHeader } : {}), options: safeOptions }, "sync");
+          } catch (error) { return interactionFailure("Workspace user question", error); }
+        }
         history.push({
           role: "tool",
           results: r.toolUses.map((toolUse) => ({
@@ -3541,8 +3567,10 @@ async function runAgentInner(
           return;
         }
         if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return;
+        const asyncAsk = opts.workspaceRun && p.tool === askUserTool && isAsyncWorkspaceAsk(p.tu.input) && !askUserRequestsCredential(p.tu.input);
         const physicalTool = opts.workspaceRun
-          ? executeWorkspaceTool(opts.workspaceRun, p.tool!.name, () => p.tool!.run(p.tu.input, executionToolCtx), () => structuredToolError)
+          ? executeWorkspaceTool(opts.workspaceRun, p.tool!.name, asyncAsk ? async () => postAsyncWorkspaceAsk(opts.workspaceRun!, p.tu.input)
+            : () => p.tool!.run(p.tu.input, executionToolCtx), () => structuredToolError)
           : p.tool!.run(p.tu.input, executionToolCtx);
         const observedTool = physicalTool.then(
           (value) => { settled = { ok: true, value }; return value; },

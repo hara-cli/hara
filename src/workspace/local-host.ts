@@ -29,7 +29,7 @@ import { WorkspaceContextAudit } from "./context-audit.js";
 import { pruneWorkspaceExecutionAudits } from "./execution-audit.js";
 import { prepareWorkspaceStartContext } from "./start-context.js";
 import { WorkspaceColleagueReferences } from "./colleague-references.js";
-import { WorkspaceUserInteraction, type WorkspaceUserQuestion } from "./user-interaction.js";
+import { WorkspaceUserInteraction, workspacePermissionInteraction, type WorkspaceInteractionRequest, type WorkspaceUserQuestion } from "./user-interaction.js";
 import { boundWorkspaceText } from "./model-context.js";
 import { createWorkspaceProvider } from "./provider.js";
 import { legacyWorkspaceProviderFailure, WorkspaceProviderAdmissionError, WorkspaceProviderRecovery } from "./provider-recovery.js";
@@ -300,10 +300,11 @@ export class LocalWorkspaceHost {
     const participants = new Set(snapshot.turns.flatMap(turn => turn.replies.map(reply => reply.agentId)));
     const questions = channel.memberIds.filter(agentId => participants.has(agentId)).flatMap(agentId => {
       const value = new WorkspaceConversationStore(context.storage, agentId, channelId).read(), pendingQuestion = this.pendingUserQuestion(context, value);
-      if (!pendingQuestion) return [];
-      const live = this.jobs.get(pendingQuestion.runId);
+      const pendingInteractions = this.pendingInteractions(context, value, []);
+      if (!pendingQuestion && !pendingInteractions.length) return [];
+      const live = value.task?.workspaceRunBinding ? this.jobs.get(value.task.workspaceRunBinding.runId) : undefined;
       return [{ agentId, displayName: context.resources.agents.get(agentId)?.identity.displayName ?? agentId,
-        conversation: { pendingQuestion, taskState: value.task?.status ?? null, state: live ? "draining" : "awaiting_user",
+        conversation: { pendingQuestion, pendingInteractions, taskState: value.task?.status ?? null, state: !pendingQuestion ? "running" : live ? "draining" : "awaiting_user",
           blockReason: value.task?.checkpoint?.blockReason ?? null, resumeAdmission: this.resumeAdmission(context, value, channelId) } }];
     });
     return { workspaceId, resourceGeneration: this.snapshotGeneration(workspaceId), ...snapshot, questions,
@@ -476,6 +477,9 @@ export class LocalWorkspaceHost {
         runId: value.task?.workspaceRunBinding?.runId ?? null,
         completion: value.task?.checkpoint?.completion ?? null, blockReason: value.task?.checkpoint?.blockReason ?? null,
         pendingQuestion: this.pendingUserQuestion(context, value),
+        // Unified interaction view (permission + sync/async ask). pendingQuestion stays the legacy sync shape.
+        pendingInteractions: this.pendingInteractions(context, value, [...this.pending.values()].filter(pending => pending.card.workspaceId === workspaceId
+          && pending.card.agentId === selected && !pending.card.channelId && pending.clientId === clientId).map(pending => pending.card)),
         usage: value.usage, runUsage: value.runUsage, pastTaskCount: value.pastTasks.length,
         resumeAdmission: this.resumeAdmission(context, value),
         history: value.history.map(message => message.role === "assistant" ? { role: message.role, text: message.text, tools: message.toolUses.map(tool => tool.name) }
@@ -576,6 +580,26 @@ export class LocalWorkspaceHost {
       }
       this.changed(workspaceId, agentId); return { state: "paused" as const };
     } finally { lease.release(); }
+  }
+  /** Answer a still-open async card of the live run. The answer reaches the model at its next boundary. */
+  answerAsyncQuestion(clientId: string, workspaceId: string, agentId: string, questionId: string, answer: string, channelId?: string) {
+    if (channelId) this.channelView(clientId, workspaceId, channelId);
+    const job = [...this.jobs.values()].find(row => !row.closed && row.workspaceId === workspaceId && row.agentId === agentId && (row.channelId ?? undefined) === channelId);
+    if (!job?.interaction || job.signal.aborted) throw new Error("Workspace async question expired with its run; ask again if still needed");
+    job.lease.assertCurrent(); job.interaction.answerAsync(questionId, answer);
+    this.changed(workspaceId, agentId); return { accepted: true as const };
+  }
+  /** Run end closes the run-bound cards: unanswered async asks are dismissed (never a user skip), and an
+   * abort/Host close hides the sync card as dismissed while retaining it for an explicit continuation. */
+  private closeRunInteractions(job: LocalJob): void {
+    const interaction = job.interaction; if (!interaction) return;
+    interaction.closeAsync(job.signal.aborted ? "aborted" : "run_ended");
+    if (job.signal.aborted && interaction.question()) interaction.dismiss("aborted");
+  }
+  private pendingInteractions(context: WorkspaceHostContext, value: WorkspaceConversation, cards: readonly LocalWorkspaceApproval[]): WorkspaceInteractionRequest[] {
+    this.pendingUserQuestion(context, value); // reconcile/materialize the retained sync ask first
+    const asks = this.interactionFor(context, value)?.pendingInteractions() ?? [];
+    return [...cards.map(workspacePermissionInteraction), ...asks];
   }
   private questionCheckpoint(task: TaskExecution, question: WorkspaceUserQuestion): TaskExecution {
     if (task.status === "paused" && freshTaskCompletion(task)?.state === "awaiting_user"
@@ -762,7 +786,7 @@ export class LocalWorkspaceHost {
         references: new WorkspaceColleagueReferences(context.storage, () => context.resources.agents.references()).read(), objective: task.objective });
       interaction.prepared();
       if (startContext.initialQuestion && !interaction.hasReferenceAnswer()) {
-        const q = startContext.initialQuestion; interaction.request(q.reason, q.question, q.options);
+        const q = startContext.initialQuestion; interaction.request(q.reason, q.question, q.options, q.intent ? { intent: q.intent } : {});
       }
       const modelHistoryStart = value.history.length;
       value.history.push({ role: "user", content: message }); value.task = task;
@@ -785,6 +809,7 @@ export class LocalWorkspaceHost {
         observeContext: observation => { owned.lease.assertCurrent(); audit.append(observation); },
         interaction: owned.interaction, interactionUsage: () => tree.read().usage,
         onQuestion: question => { this.commit(owned, this.questionCheckpoint(owned.value.task!, question)); },
+        onInteractionChanged: () => { this.changed(owned.workspaceId, owned.agentId); },
         updateUsage: next => {
           const delta = ZERO_USAGE(); for (const key of Object.keys(delta) as (keyof WorkspaceUsage)[]) delta[key] = next[key] - owned.value.runUsage[key];
           owned.lease.assertCurrent(); tree.consume(delta);
@@ -824,6 +849,7 @@ export class LocalWorkspaceHost {
   private async run(job: LocalJob): Promise<void> {
     try {
       job.outcome = await job.context.storage.run(() => runConfiguredAgent(job.value.history, job.options!));
+      this.closeRunInteractions(job);
       if (!job.signal.aborted && job.interaction?.question()) {
         job.value.task = this.questionCheckpoint(job.value.task!, job.interaction.question()!);
         job.outcome = { status: "completed" };
@@ -833,6 +859,7 @@ export class LocalWorkspaceHost {
       job.value.attempt = { ...job.value.attempt!, state: job.signal.aborted ? "cancelled" : job.outcome.status === "completed" ? "completed" : "blocked", endedAt: new Date().toISOString() };
       this.commit(job);
     } catch (error) {
+      try { this.closeRunInteractions(job); } catch { /* retained state is validated again on the next read */ }
       this.noteCredentialFailure(job, error);
       job.error = redactSensitiveText(error instanceof Error ? error.message : "Workspace execution failed").text.replaceAll(this.root, "[Dev state]");
       job.outcome = { status: "error", error: job.error };
