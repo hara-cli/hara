@@ -130,9 +130,11 @@ test("allocatePrivateSocketRoot stays ≤100B and ignores long evidence TMPDIR",
   assert.ok(!endpoint.startsWith(longTmp));
 });
 test("LegacyScopedCli still refuses an over-budget socketRoot (≤100B gate retained)",{skip:process.platform==="win32"},async t=>{
-  const longRoot=fs.realpathSync(fs.mkdtempSync(join(tmpdir(),"hara-lcli-overbudget-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-")));
-  t.after(()=>fs.rmSync(longRoot,{recursive:true,force:true}));
-  fs.chmodSync(longRoot,0o700);
+  // A fixed 120-byte child component guarantees > 100B on a short Linux /tmp as well as a long macOS TMPDIR.
+  const base=fs.realpathSync(fs.mkdtempSync(join(tmpdir(),"hara-lcli-overbudget-")));
+  t.after(()=>fs.rmSync(base,{recursive:true,force:true}));
+  const longRoot=join(base,"o".repeat(120));
+  fs.mkdirSync(longRoot,{mode:0o700});fs.chmodSync(longRoot,0o700);
   assert.ok(Buffer.byteLength(join(longRoot,"legacy-cli.sock"))>LEGACY_CLI_SOCKET_ENDPOINT_MAX_BYTES);
   assert.throws(()=>new LegacyScopedCli({socketRoot:longRoot,review:{scheduleId:"one",occurrenceId:"x",command:"echo",cwd:"/tmp",env:{}},assertCurrent(){},readLogs(){return"";}}),/Explicit shorter private socket directory required/);
 });
