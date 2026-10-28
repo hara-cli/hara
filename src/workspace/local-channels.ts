@@ -12,7 +12,9 @@ import { redactSensitiveText } from "../security/secrets.js";
 export interface LocalChannel { id: string; name: string; memberIds: string[]; createdAt: string }
 interface Catalog { schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; channels: LocalChannel[] }
 type ReplyState = "queued" | "running" | "completed" | "cancelled" | "failed" | "interrupted";
-interface Reply { agentId: string; displayName: string; requestId: string; runId: string | null; startIndex: number; endIndex: number | null; state: ReplyState; questionId?: string }
+interface Reply { agentId: string; displayName: string; requestId: string; runId: string | null; startIndex: number; endIndex: number | null; state: ReplyState; questionId?: string;
+  /** Peer wake (Raft-learned): the member whose reply queued this one, and its optional untrusted note. */
+  wokenBy?: string; wakeNote?: string }
 interface ChannelTurn { id: string; digest: string; body: string; createdAt: string; state: "running" | "completed" | "cancelled" | "interrupted"; replies: Reply[] }
 interface ChannelHistory { schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; channelId: string; turns: ChannelTurn[] }
 export interface LocalChannelMessage { id: string; turnId: string; agentId: string | null; displayName: string; createdAt: string;
@@ -29,6 +31,25 @@ interface ChannelHost {
 const time = (v: unknown) => typeof v === "string" && Number.isFinite(Date.parse(v));
 const ids = (v: unknown): v is string[] => Array.isArray(v) && v.every(isWorkspaceAgentId) && new Set(v).size === v.length;
 const nonnegative = (v: unknown): v is number => Number.isSafeInteger(v) && Number(v) >= 0;
+const WAKE_NOTE_MAX = 500;
+const optionalReplyKeys = ["questionId", "wokenBy", "wakeNote"];
+/** ASCII word chars only — so `@Bob` never matches inside `@Bobby`, while `@小明你好` still resolves `小明`. */
+const asciiWordEnd = /[A-Za-z0-9_]$/, asciiWordStart = /^[A-Za-z0-9_]/;
+
+/** `@displayName` / `@agentId` mentions of channel members, in body order. The longest name wins at each `@`; an ASCII name
+ * ending in a letter/digit must not run into another ASCII word char. CJK names need no trailing separator. */
+export function channelMentions(body: string, members: { agentId: string; displayName: string }[]): string[] {
+  const names = members.flatMap(row => [{ agentId: row.agentId, name: row.displayName.toLowerCase() }, { agentId: row.agentId, name: row.agentId.toLowerCase() }])
+    .filter(row => row.name.length > 0).sort((a, b) => b.name.length - a.name.length);
+  const found: string[] = [];
+  for (let at = body.indexOf("@"); at >= 0; at = body.indexOf("@", at + 1)) {
+    if (at > 0 && /[\p{L}\p{N}_.]/u.test(body[at - 1]!)) continue; // an e-mail address, not a mention
+    const rest = body.slice(at + 1), lower = rest.toLowerCase();
+    const hit = names.find(row => lower.startsWith(row.name) && !(asciiWordEnd.test(row.name) && asciiWordStart.test(rest.slice(row.name.length))));
+    if (hit && !found.includes(hit.agentId)) found.push(hit.agentId);
+  }
+  return found;
+}
 
 /** Local room metadata, transcript references and execution queue. No Account or collab dependency. */
 export class WorkspaceLocalChannels {
@@ -89,9 +110,11 @@ export class WorkspaceLocalChannels {
           || !["running", "completed", "cancelled", "interrupted"].includes(String(turn.state)) || !Array.isArray(turn.replies)) throw new Error("invalid channel turn; retained");
         const members = new Set<string>();
         for (const reply of turn.replies) {
-          if (!plain(reply) || !exact(reply, ["agentId", "displayName", "requestId", "runId", "startIndex", "endIndex", "state", ...(Object.hasOwn(reply, "questionId") ? ["questionId"] : [])]) || !isWorkspaceAgentId(reply.agentId) || members.has(reply.agentId)
+          if (!plain(reply) || !exact(reply, ["agentId", "displayName", "requestId", "runId", "startIndex", "endIndex", "state", ...optionalReplyKeys.filter(key => Object.hasOwn(reply, key))]) || !isWorkspaceAgentId(reply.agentId) || members.has(reply.agentId)
             || !text(reply.displayName, 200) || typeof reply.requestId !== "string" || !UUID.test(reply.requestId) || (reply.runId !== null && (typeof reply.runId !== "string" || !UUID.test(reply.runId)))
             || (reply.questionId !== undefined && (typeof reply.questionId !== "string" || !UUID.test(reply.questionId)))
+            || (reply.wokenBy !== undefined && (!isWorkspaceAgentId(reply.wokenBy) || reply.wokenBy === reply.agentId))
+            || (reply.wakeNote !== undefined && (reply.wokenBy === undefined || !messageBody(reply.wakeNote, WAKE_NOTE_MAX)))
             || !nonnegative(reply.startIndex) || (reply.endIndex !== null && (!nonnegative(reply.endIndex) || reply.endIndex < reply.startIndex))
             || !["queued", "running", "completed", "cancelled", "failed", "interrupted"].includes(String(reply.state))) throw new Error("invalid channel reply; retained");
           members.add(reply.agentId);
@@ -122,21 +145,56 @@ export class WorkspaceLocalChannels {
     const last = value.turns.at(-1);
     return { channel, revision: value.revision, state: active ? active.cancelled ? "draining" : "running" : this.cleanupFailed.has(channelId) || last?.state === "running" ? "interrupted" : last?.state ?? "idle",
       turns: value.turns.map(turn => ({ id: turn.id, state: !active && turn.state === "running" ? "interrupted" : turn.state,
-        replies: turn.replies.map(reply => ({ agentId: reply.agentId, displayName: reply.displayName, state: !active && ["queued", "running"].includes(reply.state) ? "interrupted" : reply.state })) })), messages };
+        replies: turn.replies.map(reply => ({ agentId: reply.agentId, displayName: reply.displayName, state: !active && ["queued", "running"].includes(reply.state) ? "interrupted" : reply.state,
+          ...(reply.wokenBy ? { wokenBy: reply.wokenBy } : {}) })) })), messages };
   }
   receipt(channelId: string, requestId: string) {
     this.get(channelId); if (!UUID.test(requestId)) throw new Error("invalid channel receipt");
     return { channelId, requestId, state: this.history(channelId).read().turns.some(row => row.id === requestId) ? "accepted" : "unknown" };
   }
-  private context(channelId: string) {
+  private name(agentId: string) { return this.host.agents().find(row => row.agentId === agentId)?.identity.displayName ?? agentId; }
+  private context(channelId: string, wake?: { by: string; note?: string }) {
     const snapshot = this.snapshot(channelId);
-    return JSON.stringify({ channel: snapshot.channel.name, members: snapshot.channel.memberIds.map(id => ({ agentId: id, name: this.host.agents().find(row => row.agentId === id)?.identity.displayName ?? id })),
-      messages: snapshot.messages.map(row => ({ sender: row.agentId ? row.displayName : "User", message: row.message })) });
+    return JSON.stringify({ channel: snapshot.channel.name, members: snapshot.channel.memberIds.map(id => ({ agentId: id, name: this.name(id) })),
+      messages: snapshot.messages.map(row => ({ sender: row.agentId ? row.displayName : "User", message: row.message })),
+      // A peer's wake note is conversation data from another participant, never user authority.
+      ...(wake ? { wokenBy: { agentId: wake.by, name: this.name(wake.by), ...(wake.note ? { note: wake.note } : {}) } } : {}) });
+  }
+  /** channel_sync: the same JSON a reply receives at start, re-read now so replies written mid-turn are visible. Read-only. */
+  sync(channelId: string) { return this.context(channelId); }
+  /** channel_peer_wake: the reply running right now queues another member into the same turn. Still serial; no re-entry. */
+  peerWake(channelId: string, runId: string, agentId: string, target: string, note?: string) {
+    const channel = this.get(channelId), active = this.active.get(channelId);
+    // Outside an active reply is a host misuse; expected wake refusals return structured {ok:false} so the
+    // colleague can keep working (throw would mark the tool isError and can end the channel run early).
+    if (!active || active.cancelled || active.runId !== runId || active.agentId !== agentId) throw new Error("peer wake is only available to the colleague currently replying in this channel turn");
+    if (note !== undefined && !messageBody(note, WAKE_NOTE_MAX)) return { ok: false as const, error: `wake note must be 1-${WAKE_NOTE_MAX} plain characters` };
+    const wanted = target.replace(/^@/, "").trim().toLowerCase();
+    const matches = channel.memberIds.filter(id => id.toLowerCase() === wanted || this.name(id).toLowerCase() === wanted);
+    if (matches.length !== 1) {
+      return { ok: false as const, error: matches.length ? "more than one channel member has that name; wake by exact agentId" : "peer wake target is not a member of this channel" };
+    }
+    const targetId = matches[0]!;
+    if (targetId === agentId) return { ok: false as const, error: "a colleague cannot wake itself" };
+    this.members([targetId]); active.lease.assertCurrent();
+    const state = this.history(channelId), value = state.read(), prior = value.turns.at(-1)!.replies.find(row => row.agentId === targetId);
+    if (prior && prior.state !== "queued") return { ok: false as const, error: "that colleague already replied in this turn; no re-entry" };
+    if (!prior) {
+      state.update(value.revision, next => { active.lease.assertCurrent();
+        next.turns.at(-1)!.replies.push({ agentId: targetId, displayName: this.name(targetId), requestId: randomUUID(), runId: null, startIndex: 0, endIndex: null, state: "queued",
+          wokenBy: agentId, ...(note ? { wakeNote: redactSensitiveText(note).text } : {}) }); return next; });
+      this.host.changed();
+    }
+    return { ok: true as const, queued: true, alreadyQueued: Boolean(prior), agentId: targetId, displayName: this.name(targetId) };
   }
   send(clientId: string, channelId: string, body: string, requestId: string, recipientIds: unknown, questionId?: string) {
     const channel = this.get(channelId);
     if (!this.host.accepting() || !messageBody(body) || !UUID.test(requestId) || !ids(recipientIds) || recipientIds.some(id => !channel.memberIds.includes(id))) throw new Error("invalid local channel message or recipients");
     this.members(recipientIds);
+    // Mentions widen a non-empty recipient list only; with no recipients the message is a note to the room and starts nobody.
+    const available = channel.memberIds.filter(id => this.host.agents().some(row => row.agentId === id && row.kind === "colleague" && row.state === "active"));
+    const recipients = recipientIds.length ? [...recipientIds, ...channelMentions(body, available.map(id => ({ agentId: id, displayName: this.name(id) })))
+      .filter(id => !recipientIds.includes(id))] : recipientIds;
     const state = this.history(channelId), before = state.read(), digest = createHash("sha256").update(canonical(questionId ? [body, recipientIds, questionId] : [body, recipientIds])).digest("hex");
     const duplicate = before.turns.find(row => row.id === requestId);
     if (duplicate) { if (duplicate.digest !== digest) throw new Error("channel message identity already used"); return { channelId, requestId, accepted: true }; }
@@ -154,7 +212,7 @@ export class WorkspaceLocalChannels {
             if (row.runId) row.endIndex = conversation.history.length;
           }
         }
-        value.turns.push({ id: requestId, digest, body: redactSensitiveText(body).text, createdAt: new Date().toISOString(), state: "running", replies: recipientIds.map(agentId => ({ agentId,
+        value.turns.push({ id: requestId, digest, body: redactSensitiveText(body).text, createdAt: new Date().toISOString(), state: "running", replies: recipients.map(agentId => ({ agentId,
           displayName: this.host.agents().find(row => row.agentId === agentId)!.identity.displayName, requestId: randomUUID(), runId: null, startIndex: 0, endIndex: null, state: "queued", ...(questionId ? { questionId } : {}) })) }); return value;
       });
     } catch (error) { lease.release(); throw error; }
@@ -169,15 +227,17 @@ export class WorkspaceLocalChannels {
   }
   private async run(clientId: string, channelId: string, turnId: string, active: ActiveTurn) {
     try {
-      const turn = this.history(channelId).read().turns.find(row => row.id === turnId)!;
-      for (const [index, reply] of turn.replies.entries()) {
+      // Re-read every step: channel_peer_wake may append replies while an earlier one is running.
+      for (let index = 0; ; index++) {
+        const turn = this.history(channelId).read().turns.find(row => row.id === turnId)!, reply = turn.replies[index];
+        if (!reply) break;
         active.lease.assertCurrent();
         if (active.cancelled || !this.host.accepting()) break;
         let admitted = false;
         try {
           const store = new WorkspaceConversationStore(this.storage, reply.agentId, channelId), startIndex = store.read().history.length;
           this.changeReply(channelId, turnId, index, row => { row.startIndex = startIndex; row.state = "running"; });
-          const accepted = this.host.start(reply.agentId, turn.body, reply.requestId, channelId, this.context(channelId), clientId, reply.questionId);
+          const accepted = this.host.start(reply.agentId, turn.body, reply.requestId, channelId, this.context(channelId, reply.wokenBy ? { by: reply.wokenBy, note: reply.wakeNote } : undefined), clientId, reply.questionId);
           active.runId = accepted.runId; active.agentId = reply.agentId;
           this.changeReply(channelId, turnId, index, row => { row.runId = accepted.runId; });
           admitted = true;
