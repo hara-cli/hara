@@ -51,9 +51,10 @@ test("a changed namespace during an absent read falls back to the writer fence",
   fs.lstatSync = function (path, ...options) {
     if (String(path) === f.config && !changed) {
       changed = true;
-      const marker = join(f.state, "synthetic-namespace-change");
-      fs.writeFileSync(marker, "created and removed during lookup\n");
-      fs.unlinkSync(marker);
+      // Permission-repair is in the absence-proof threat model and updates mode synchronously.
+      // create+unlink only bumps mtime/ctime; overlayfs/lazytime Linux CI often keeps those equal
+      // within the same second, so the reader would wrongly take the uncontended empty path (live35/36).
+      fs.chmodSync(f.state, 0o701);
     }
     return original(path, ...options);
   };
@@ -64,6 +65,7 @@ test("a changed namespace during an absent read falls back to the writer fence",
   assert.equal(changed, true);
   // Lock-file fsync is mandatory; directory fsync is best-effort and may be 0 on some Linux CI FS.
   assert.ok(count >= 1, "uncertain namespace absence must acquire/release the original durable writer lock");
+  // Fence may tighten mode back to 0o700; no durable lock/config residue may remain.
   assert.deepEqual(fs.readdirSync(f.state), []);
 });
 
