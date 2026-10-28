@@ -627,6 +627,17 @@ export class LocalWorkspaceHost {
         const created = job.context.resources.agents.create({ username: input.username, profile: { displayName: input.displayName, title: input.title }, instructions: input.instructions, runtimeId: "pi" }, job.context.resources.agents.list().revision);
         host.changed(job.workspaceId, job.agentId); return JSON.stringify({ created: true, humanConfirmed: true, approvalState: "consumed", agent: created });
       } });
+    tools.push({ name: "agent_rename", description: "Change an existing colleague's display name when the human asked for it and supplied the new name. Resolve the current colleague first (exact name, alias or roster title); never look up the new name. The former name stays a resolvable alias. Use ask_user instead if more than one colleague matches.", kind: "edit",
+      input_schema: { type: "object", properties: { agentId: { type: "string" }, displayName: { type: "string" } }, required: ["agentId", "displayName"] },
+      async run(input) {
+        if (!plain(input) || !exact(input, ["agentId", "displayName"]) || !text(input.agentId) || !text(input.displayName, 64)) throw new Error("invalid colleague rename");
+        assertCurrent();
+        const current = job.context.resources.agents.get(input.agentId);
+        if (!current || current.kind !== "colleague" || current.state !== "active") throw new Error("rename needs an active colleague of THIS Workspace by exact agentId");
+        const renamed = job.context.resources.agents.rename(current.agentId, input.displayName, current.configRevision, current.agentEpoch);
+        host.changed(job.workspaceId, job.agentId);
+        return JSON.stringify({ renamed: true, agentId: renamed.agentId, previousName: current.identity.displayName, displayName: renamed.identity.displayName });
+      } });
     const host = this;
     const handoff = (value: { completed: boolean; agentId: string; taskId: string; runId: string; completion: unknown; retainedReceipt?: boolean }) => {
       const raw = JSON.stringify(value);
@@ -791,6 +802,7 @@ export class LocalWorkspaceHost {
           + `${owned.startContext.prompt}\n`
           + `Use workspace_context_lookup to resolve missing names and aliases. Core pauses after two unresolved lookups or a budget warning. Use ask_user for a real problem or material ambiguity; never guess a user answer.\n`
           + `For creation use agent_create and wait for the human card; for delegation use agent_contact with an existing exact agentId.\n`
+          + `For a requested rename use agent_rename on the resolved existing colleague; the new name is not a reference to look up.\n`
           + `agent_create returns only AFTER the human has approved; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. Check agent_list before creating so an active colleague is not duplicated.\n`
           + `Successful Workspace tool results repeat the exact citation ID in receipt.toolCallId. Copy that exact value for completion.checks; never invent IDs or repeat side effects to fix a rejected citation. After restart, re-observe state with read-only tools and cite the new receipt.\n`
           + `Enabled version-locked Workspace skills (load every page of instructions via workspace_skill before acting; no extra permissions): ${boundWorkspaceText(JSON.stringify(context.features.enabledSkills().map(item => ({ id: item.id, description: item.description, version: item.version }))), 1200)}.\n`

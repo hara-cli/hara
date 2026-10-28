@@ -52,7 +52,7 @@ export class WorkspaceResources {
     this.agents = Object.freeze({
       list: bind(agents.list.bind(agents)), references: bind(agents.references.bind(agents)), get: bind(agents.get.bind(agents)),
       initializeMain: bind(agents.initializeMain.bind(agents), "configure"), create: bind(agents.create.bind(agents), "configure"),
-      updatePersona: bind(agents.updatePersona.bind(agents), "configure"), setRuntime: bind(agents.setRuntime.bind(agents), "configure"),
+      updatePersona: bind(agents.updatePersona.bind(agents), "configure"), rename: bind(agents.rename.bind(agents), "configure"), setRuntime: bind(agents.setRuntime.bind(agents), "configure"),
       setArchived: bind(agents.setArchived.bind(agents), "configure"), runtimeOptions: bind(agents.runtimeOptions.bind(agents)),
       importLegacy: bind(agents.importLegacy.bind(agents), "configure"), // Trusted composition only; no RPC route.
       resolveTask: bind(agents.resolveTask.bind(agents)),
