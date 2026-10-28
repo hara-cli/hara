@@ -65,6 +65,11 @@ const definition: Tool = {
         type: "string",
         description: "optional explicit fallback used only when no interactive user can answer; omit to skip rather than guess",
       },
+      delivery: {
+        type: "string",
+        enum: ["sync", "async"],
+        description: "Workspace runs only (ignored elsewhere). sync (default) stops until the answer arrives. async shows the card and returns a pending receipt at once: continue only with work that does not depend on the answer; the answer arrives later as a user message, and an unanswered async question is dismissed when the run ends. Never use async for approvals.",
+      },
     },
     required: ["question"],
   },

@@ -42,6 +42,7 @@ interface PermitState {
   audit: WorkspaceExecutionAudit;
   interaction?: WorkspaceUserInteraction;
   onQuestion?: (question: WorkspaceUserQuestion) => void;
+  onInteractionChanged?: () => void;
   interactionUsage?: () => Readonly<WorkspaceUsage>;
   startedAt: number;
   toolTail: Promise<unknown>;
@@ -86,6 +87,8 @@ export function createWorkspaceRunPermit(input: {
   observeContext?(value: WorkspaceContextObservation): void;
   interaction?: WorkspaceUserInteraction;
   onQuestion?(question: WorkspaceUserQuestion): void;
+  /** Host view refresh after an ask card is posted (async cards do not pass through a checkpoint). */
+  onInteractionChanged?(): void;
   interactionUsage?(): Readonly<WorkspaceUsage>;
   updateUsage(value: Readonly<WorkspaceUsage>): void;
 }): WorkspaceRunPermit {
@@ -177,7 +180,7 @@ export function createWorkspaceRunPermit(input: {
   };
   state = { assertLive, provider, cwd, stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
     updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false, wakeChars: 0,
-    interaction: input.interaction, onQuestion: input.onQuestion, interactionUsage: input.interactionUsage, startedAt: started, toolTail: Promise.resolve(),
+    interaction: input.interaction, onQuestion: input.onQuestion, onInteractionChanged: input.onInteractionChanged, interactionUsage: input.interactionUsage, startedAt: started, toolTail: Promise.resolve(),
     audit: new WorkspaceExecutionAudit(input.storage, binding.runId, binding.agent.agentId),
     ...(input.modelHistory ? { modelHistory: { ...input.modelHistory,
       prefixDigest: createHash("sha256").update(canonical(input.modelHistory.history.slice(0, input.modelHistory.start))).digest("hex") } } : {}) };
@@ -261,6 +264,24 @@ export function workspaceRunQuestion(permit: WorkspaceRunPermit): WorkspaceUserQ
   const question = state.interaction?.check(state.interactionUsage?.() ?? state.usage, Date.now() - state.startedAt) ?? null;
   if (question) state.onQuestion?.(question);
   return question;
+}
+/** ask_user enters the same run-bound ask channel as the observation gates. sync retains the one
+ * blocking question; async posts a card and lets non-interactive work continue. */
+export function workspaceRunAsk(permit: WorkspaceRunPermit, input: { question: string; header?: string; options: string[] },
+  delivery: "sync" | "async"): WorkspaceUserQuestion | null {
+  const state = stateOf(permit); state.assertLive();
+  if (!state.interaction) return null;
+  const question = delivery === "async"
+    ? state.interaction.requestAsync(input.question, input.options, input.header)
+    : state.interaction.request("explicit", input.question, input.options, input.header ? { header: input.header } : {});
+  state.onInteractionChanged?.(); return question;
+}
+/** Answers to async questions that arrived since the last boundary, as user turns for the model. */
+export function workspaceRunAsyncAnswers(permit: WorkspaceRunPermit): NeutralMsg[] {
+  const state = stateOf(permit);
+  if (state.retired || state.signal.aborted || !state.interaction) return [];
+  return state.interaction.drainAsyncAnswers().map(row => ({ role: "user" as const,
+    content: `Answer to your earlier async question "${row.question}" (question id ${row.id}):\n${row.answer}` }));
 }
 export function workspaceRunBeginToolBatch(permit: WorkspaceRunPermit, names: readonly string[]): void {
   stateOf(permit).interaction?.beginBatch(names);
