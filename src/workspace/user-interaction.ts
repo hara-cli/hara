@@ -124,7 +124,8 @@ export class WorkspaceUserInteraction {
         this.request("lookup_ambiguous", undefined, candidates); return;
       }
       lookupMissing = name === "workspace_read" ? parsed.exists === false
-        : failed || (name === "workspace_context_lookup" ? parsed.status !== "resolved"
+        // rename_new_name: the user-supplied new display name is not an unresolved reference.
+        : failed || (name === "workspace_context_lookup" ? parsed.status !== "resolved" && parsed.status !== "rename_new_name"
           : !Array.isArray(parsed.hits) || parsed.hits.length === 0);
     }
     if (!failed && !lookupMissing) {

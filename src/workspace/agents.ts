@@ -223,6 +223,7 @@ export class WorkspaceAgentStore {
   references() {
     return (this.load().value?.agents ?? []).map(row => ({ agentId: row.agentId,
       name: row.configurations[row.currentConfigRevision - 1]!.identity.displayName, state: row.state,
+      ...(row.configurations[row.currentConfigRevision - 1]!.identity.title ? { title: row.configurations[row.currentConfigRevision - 1]!.identity.title } : {}),
       aliases: [...new Set([row.username, ...row.configurations.map(config => config.identity.displayName)])] }));
   }
   get(agentId: string): WorkspaceAgentView | null {
@@ -292,6 +293,19 @@ export class WorkspaceAgentStore {
     const normalized = persona(input, "agent");
     return this.update(agentId, configRevision, agentEpoch, row => {
       this.appendConfiguration(row, normalized, row.configurations[row.currentConfigRevision - 1]!.runtimeId);
+    });
+  }
+  /** A display-name change only: a new configuration snapshot keeps every other persona field, so the
+   * former name stays in configuration history and therefore remains a resolvable alias. */
+  rename(agentId: string, displayName: string, configRevision: number, agentEpoch: number): WorkspaceAgentView {
+    if (typeof displayName !== "string" || !displayName.trim()) throw new Error("invalid Workspace Agent display name");
+    return this.update(agentId, configRevision, agentEpoch, row => {
+      if (row.kind !== "colleague") throw new Error("only a Workspace colleague can be renamed");
+      const current = row.configurations[row.currentConfigRevision - 1]!;
+      const { version: _version, source: _source, ...profile } = current.identity;
+      const normalized = persona({ profile: { ...profile, displayName }, description: current.description, instructions: current.instructions }, row.username);
+      if (normalized.identity.displayName === current.identity.displayName) throw new Error("the colleague already has this display name");
+      this.appendConfiguration(row, normalized, current.runtimeId);
     });
   }
   setRuntime(agentId: string, runtimeId: AgentRuntimeId, configRevision: number, agentEpoch: number): WorkspaceAgentView {
