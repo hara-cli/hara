@@ -1,0 +1,34 @@
+【Soft Dark 确认卡过期／拒绝结算态 · Antigravity Opus 4.6 · Jeff t1060u】
+
+立刻执行。先 shasum -a 256 本 kick 与 brief，写入旁 .sha256 后再动手。
+**本刀用 Antigravity（hara:2）Claude Opus 4.6；禁止 CloudAgent；复杂实现若卡住可停并写明，勿改合／装。**
+
+## Brief（必读）
+- Path: /Users/zhujianbo/work/projects/hara/inbox/2026-10-30-soft-dark-approval-settled-brief.md
+- 复制到两 worktree 的 inbox/。
+
+## Worktrees（必须用）
+Core:
+- Path: /Users/zhujianbo/work/projects/hara/.worktrees/core-agent-create-approval-settled-20261030
+- Branch: feat/core-agent-create-approval-settled-20261030
+- Base: 29c567f (= origin/main)
+- Repo: git@github.com:hara-cli/hara.git
+
+Desktop:
+- Path: /Users/zhujianbo/work/projects/hara/.worktrees/desktop-soft-dark-approval-settled-20261030
+- Branch: feat/soft-dark-approval-settled-20261030
+- Base: 8f31198 (= origin/main)
+- Repo: git@github.com:hara-cli/hara-desktop.git
+
+Do NOT 用脏 checkout；Do NOT merge；合／装另批。
+
+## Goal
+1. Core：agent_create 在 declined／expired／aborted 时 return 结构化 JSON（created:false + approvalState），勿 throw 当 UX。
+2. Desk：Soft Dark 流内只读结算卡（过期／拒绝／中止），提示可请同事重新提；不延长授权、不自动重提。
+3. 测绿；各开 PR→main（只求审）；inbox impl＋sha256。
+
+## 硬禁
+PEM／tag／candidate／live／合 PR／改 ~/.hara／CloudAgent／侧栏＋／用量读取器／正式闸。
+
+读 brief 后在上述 worktree 实现、测、commit、push、开 PR。结案写：
+- inbox/2026-10-30-soft-dark-approval-settled-impl.md＋sha256
