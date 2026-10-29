@@ -8,7 +8,7 @@ export interface DetectedRuntime { runtimeId: OptionalRuntimeId; path: string; r
 export interface DetectionOptions { home: string; probeHome?: string; shell?: string; path?: string; timeoutMs?: number;
   run?: (command: string, args: string[], env: NodeJS.ProcessEnv, timeout: number) => Promise<string | null>;
   systemBins?: string[] }
-const ids: OptionalRuntimeId[] = ["opencode", "codex", "claude"];
+const ids: OptionalRuntimeId[] = ["opencode", "codex", "claude", "agy"];
 export const LOGIN_RUNTIME_PATH_COMMAND = 'printf "__HARA_RUNTIME_PATH__%s\\n" "$PATH"';
 const fingerprints = new Map<string, { identity: string; value: { realPath: string; fingerprint: string } }>();
 const safePath = (value: string) => isAbsolute(value) && value.length < 4096 && !/[\u0000-\u001f\u007f]/.test(value);

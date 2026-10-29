@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
 
+import { AgyExternalSessionAdapter } from "../dist/external-sessions/agy.js";
 import { ClaudeAgentSdkAdapter } from "../dist/external-sessions/claude.js";
 import { CodexAppServerAdapter } from "../dist/external-sessions/codex.js";
 import { HaraRuntimeAdapter } from "../dist/external-sessions/runtime.js";
@@ -935,7 +936,7 @@ test("Codex App Server metadata is normalized and provider cursors remain server
       opencode: { command: "definitely-missing-opencode-test-command", timeoutMs: 500 },
     });
     const first = await registry.listSessions({ sourceId: "codex", limit: 1 });
-    assert.deepEqual(first.sources.map((source) => source.id), ["runtime", "codex", "claude", "opencode"]);
+    assert.deepEqual(first.sources.map((source) => source.id), ["runtime", "codex", "claude", "opencode", "agy"]);
     assert.equal(first.sessions.length, 1);
     assert.equal(first.sessions[0].title, "Release audit");
     assert.equal(first.sessions[0].workspaceName, "secret-project");
@@ -1533,4 +1534,25 @@ test("Claude authentication trusts structured loggedIn:false on exit 1 but not a
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Antigravity source distinguishes missing CLI from installed adapter requirement", async () => {
+ const missing=new AgyExternalSessionAdapter({command:"definitely-missing-agy-test-command"});
+ assert.equal((await missing.inspect()).state,"not_installed");
+ assert.equal((await missing.inspect()).reason,"command_not_found");
+ const root=mkdtempSync(join(tmpdir(),"hara-agy-probe-"));
+ try {
+   const command=join(root,"agy");writeFileSync(command,"#!/bin/sh\necho 'agy 1.4.10'\n",{mode:0o755});
+   const adapter=new AgyExternalSessionAdapter({command});
+   const source=await adapter.inspect();
+   assert.equal(source.state,"adapter_required");assert.equal(source.reason,"official_adapter_not_bundled");
+   assert.equal(source.version,"agy 1.4.10");assert(Object.values(source.capabilities).every(value=>value===false));
+   await assert.rejects(adapter.list({limit:1}),/official adapter/);
+   await assert.rejects(adapter.read("ext_agy_"+"a".repeat(24)),/official adapter/);
+ } finally {rmSync(root,{recursive:true,force:true});}
+});
+
+test("Antigravity opaque session IDs route to the unavailable adapter", async () => {
+  const registry=new ExternalSessionRegistry({haraVersion:"0.0.0-test",adapters:[new AgyExternalSessionAdapter({command:"definitely-missing-agy-test-command"})]});
+  await assert.rejects(registry.readSession(`ext_agy_${"a".repeat(24)}`),/official adapter/);
 });

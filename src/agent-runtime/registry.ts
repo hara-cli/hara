@@ -22,7 +22,7 @@ export interface AgentRuntimeOption {
 }
 
 const LABELS: Record<AgentRuntimeId, string> = {
-  hara: "Hara（現有相容引擎）", pi: "Pi（內建）", opencode: "OpenCode", codex: "Codex", claude: "Claude Code",
+  hara: "Hara（現有相容引擎）", pi: "Pi（內建）", opencode: "OpenCode", codex: "Codex", claude: "Claude Code", agy: "Antigravity",
 };
 
 export class AgentRuntimeRegistry {

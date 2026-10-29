@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
+import { AgyExternalSessionAdapter } from "./agy.js";
 import { CodexAppServerAdapter } from "./codex.js";
 import { ClaudeAgentSdkAdapter } from "./claude.js";
 import { HaraRuntimeAdapter } from "./runtime.js";
@@ -39,7 +40,7 @@ import {
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
 const CURSOR_TTL_MS = 10 * 60 * 1_000;
-const SOURCE_ORDER: ExternalSessionSourceId[] = ["runtime", "codex", "claude", "opencode"];
+const SOURCE_ORDER: ExternalSessionSourceId[] = ["runtime", "codex", "claude", "opencode", "agy"];
 
 interface CursorRecord {
   sourceId: ExternalSessionSourceId;
@@ -56,6 +57,7 @@ export interface ExternalSessionRegistryOptions {
   codex?: Partial<ExternalCommandOptions> & { managedDaemon?: boolean };
   claude?: Partial<ExternalCommandOptions>;
   opencode?: Partial<ExternalCommandOptions>;
+  agy?: Partial<ExternalCommandOptions>;
   runtime?: Partial<ExternalCommandOptions> & { sessionName?: string; runtimeRoot?: string };
 }
 
@@ -91,6 +93,13 @@ export class ExternalSessionRegistry implements ExternalSessionService {
         ? { available: true as const, command: options.opencode.command }
         : resolveHaraCodeRuntime(options.opencode?.env ?? process.env);
       return [
+        new AgyExternalSessionAdapter({
+          command: options.agy?.command ?? "agy",
+          argsPrefix: options.agy?.argsPrefix,
+          spawnProcess: options.agy?.spawnProcess,
+          timeoutMs: options.agy?.timeoutMs,
+          env: options.agy?.env,
+        }),
         new HaraRuntimeAdapter({
           command: options.runtime?.command ?? process.env.HARA_HERDR_PATH ?? "herdr",
           argsPrefix: options.runtime?.argsPrefix,
@@ -346,14 +355,14 @@ export class ExternalSessionRegistry implements ExternalSessionService {
   }
 
   private adapterForSession(sessionId: string): ExternalSessionAdapter {
-    if (typeof sessionId !== "string" || !/^ext_(?:codex|claude|opencode|runtime)_[a-f0-9]{24}$/.test(sessionId)) {
+    if (typeof sessionId !== "string" || !/^ext_(?:codex|claude|opencode|agy|runtime)_[a-f0-9]{24}$/.test(sessionId)) {
       throw new ExternalSessionInputError("external session id is invalid");
     }
     const sourceId: ExternalSessionSourceId = sessionId.startsWith("ext_codex_")
       ? "codex"
       : sessionId.startsWith("ext_claude_")
         ? "claude"
-        : sessionId.startsWith("ext_opencode_") ? "opencode" : "runtime";
+        : sessionId.startsWith("ext_opencode_") ? "opencode" : sessionId.startsWith("ext_agy_") ? "agy" : "runtime";
     const adapter = this.adapters.get(sourceId);
     if (!adapter) throw new ExternalSessionInputError("external session source is unavailable");
     return adapter;

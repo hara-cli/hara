@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { userInfo } from "node:os";
 import { WorkspaceJsonState, exact, plain, UUID } from "./local-state.js";
 import { sameWorkspaceResourceBinding, workspaceResourceDirectory, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { OPTIONAL_RUNTIMES, RUNTIME_DOWNLOAD_HOSTS, RUNTIME_LABELS, resolveOfficialRuntimeArtifact } from "./runtime-catalog.js";
@@ -8,7 +9,7 @@ import { runtimeArchiveMember } from "./runtime-archive.js";
 import { validOpenCodeNativeHeader } from "../coding/bundled-opencode.js";
 import { detectInstalledRuntimes, inspectLocalRuntime, type DetectionOptions, type DetectedRuntime } from "./runtime-detect.js";
 
-export type OptionalRuntimeId = "opencode" | "codex" | "claude";
+export type OptionalRuntimeId = "opencode" | "codex" | "claude" | "agy";
 export interface RuntimeTarget { platform: NodeJS.Platform; arch: string }
 export interface RuntimeArtifact { runtimeId: OptionalRuntimeId; version: string; target: RuntimeTarget; url: string;
   sha256: string; format: "raw" | "tar.gz" | "zip"; member: string | null; maxBytes: number }
@@ -61,7 +62,7 @@ export class WorkspaceRuntimeInstaller {
     }, () => ({ resourceBinding: binding(), revision: 0, entries: [] }));
     this.locals = new WorkspaceJsonState(storage, "runtime-local-v1.json", value => {
       if (!plain(value) || !exact(value, ["resourceBinding", "revision", "entries"]) || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, this.state.binding())
-        || !Number.isSafeInteger(value.revision) || Number(value.revision) < 1 || !Array.isArray(value.entries) || value.entries.length > 3) return fail();
+        || !Number.isSafeInteger(value.revision) || Number(value.revision) < 1 || !Array.isArray(value.entries) || value.entries.length > 4) return fail();
       const seen = new Set<string>();
       for (const row of value.entries) {
         if (!plain(row) || !optionalRuntimeId(row.runtimeId) || seen.has(row.runtimeId) || !exact(row, ["runtimeId", "path", "realPath", "version", "fingerprint", "source"])
@@ -92,6 +93,9 @@ export class WorkspaceRuntimeInstaller {
   resolveLocal(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv } {
     const row = this.locals.read().entries.find(row => row.runtimeId === runtimeId), checked = row && inspectLocalRuntime(row.path, true);
     if (!row || !checked || checked.realPath !== row.realPath || checked.fingerprint !== row.fingerprint) return fail();
+    if (runtimeId === "agy") return { command: row.path, env: { HOME: this.options.discovery?.home ?? userInfo().homedir,
+      USERPROFILE: this.options.discovery?.home ?? userInfo().homedir, PATH: `${dirname(row.path)}:${this.options.discovery?.path ?? process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin"}`,
+      DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" } };
     const privateHome = this.storage.run(() => workspaceResourceDirectory(["runtime-homes", runtimeId]));
     return { command: row.path, env: { HOME: privateHome, USERPROFILE: privateHome, CODEX_HOME: join(privateHome, ".codex"),
       CLAUDE_CONFIG_DIR: join(privateHome, ".claude"), PATH: `${dirname(row.path)}:${this.options.discovery?.path ?? "/usr/bin:/bin:/usr/sbin:/sbin"}`,
@@ -106,7 +110,7 @@ export class WorkspaceRuntimeInstaller {
   }
   private validateArtifact(value: unknown): RuntimeArtifact {
     if (!plain(value) || !exact(value, ["runtimeId", "version", "target", "url", "sha256", "format", "member", "maxBytes"])
-      || !optionalRuntimeId(value.runtimeId) || typeof value.version !== "string" || !/^\d+\.\d+\.\d+$/.test(value.version)
+      || !optionalRuntimeId(value.runtimeId) || value.runtimeId === "agy" || typeof value.version !== "string" || !/^\d+\.\d+\.\d+$/.test(value.version)
       || !plain(value.target) || !exact(value.target, ["platform", "arch"]) || value.target.platform !== this.target.platform || value.target.arch !== this.target.arch
       || typeof value.url !== "string" || typeof value.sha256 !== "string" || !HASH.test(value.sha256)
       || !["raw", "tar.gz", "zip"].includes(String(value.format)) || (value.member !== null && (typeof value.member !== "string" || !/^[A-Za-z0-9_.+/-]{1,200}$/.test(value.member)))
@@ -139,6 +143,7 @@ export class WorkspaceRuntimeInstaller {
     return fail();
   }
   async propose(runtimeId: OptionalRuntimeId, controllerId: string, assertCurrent: () => void, assertInstallCurrent = () => this.storage.run(() => {})): Promise<RuntimeInstallCard> {
+    if (runtimeId === "agy") throw new Error("Antigravity is local registration only; no official download is configured");
     await this.discover();
     if (this.detected.some(row => row.runtimeId === runtimeId && inspectLocalRuntime(row.path))) throw new Error("A local installation is already available; confirm registration instead of downloading");
     for (const [id, proposal] of this.proposals) if (Date.parse(proposal.card.expiresAt) <= Date.now()) this.proposals.delete(id);
@@ -246,6 +251,7 @@ export class WorkspaceRuntimeInstaller {
     }), operations: [...this.operations.values()].slice(-64).map(({ controller: _c, ...row }) => row) };
   }
   resolve(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string): { command: string; env: NodeJS.ProcessEnv } {
+    if (runtimeId === "agy") return fail();
     const row = this.state.read().entries.find(row => row.artifact.runtimeId === runtimeId && row.artifact.version === version && row.artifact.sha256 === artifactSha256);
     if (!row) return fail(); const checked = this.inspect(row.artifact, row); if (!checked) return fail();
     const privateHome = this.storage.run(() => workspaceResourceDirectory(["runtime-homes", runtimeId]));

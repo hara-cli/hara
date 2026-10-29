@@ -8,7 +8,7 @@ test("Pi is the only preinstalled Agent runtime in both dependency manifests", (
   assert.equal(pkg.dependencies["@earendil-works/pi-coding-agent"], "1.1.0");
   for (const name of Object.keys({ ...pkg.dependencies, ...pkg.optionalDependencies })) assert.ok(!/^opencode-/.test(name) && name !== "@anthropic-ai/claude-agent-sdk", name);
   for (const name of Object.keys(lock.packages)) assert.ok(!/node_modules\/(?:opencode-(?:darwin|linux|windows)-|@anthropic-ai\/claude-agent-sdk(?:\/|$))/.test(name), name);
-  assert.deepEqual(runtimeDistribution.preinstalled, ["pi"]); assert.deepEqual(runtimeDistribution.optional, ["opencode", "codex", "claude"]);
+  assert.deepEqual(runtimeDistribution.preinstalled, ["pi"]); assert.deepEqual(runtimeDistribution.optional, ["opencode", "codex", "claude", "agy"]);
 });
 test("standalone and Desktop sidecar compile only Pi, preserve CPU baseline and disable ambient loaders", () => {
   const source = read("scripts/build-binary.ts");

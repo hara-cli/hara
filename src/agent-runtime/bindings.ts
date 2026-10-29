@@ -7,7 +7,7 @@ import {
   writePrivateStateFileSync,
 } from "../security/private-state.js";
 
-export const AGENT_RUNTIME_IDS = ["hara", "pi", "opencode", "codex", "claude"] as const;
+export const AGENT_RUNTIME_IDS = ["hara", "pi", "opencode", "codex", "claude", "agy"] as const;
 export type AgentRuntimeId = typeof AGENT_RUNTIME_IDS[number];
 const REF = /^(?:main|(?:global|[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?):[A-Za-z0-9][A-Za-z0-9._-]{0,79})$/;
 const FILE = "agent-runtime-bindings.json";

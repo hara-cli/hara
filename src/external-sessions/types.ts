@@ -7,7 +7,7 @@ import type { OpenCodeWorkerTurnBridge } from "./opencode-worker.js";
  * objects must stay behind the Serve boundary. Desktop and future mobile clients receive only this
  * deliberately small projection.
  */
-export type ExternalSessionSourceId = "codex" | "claude" | "opencode" | "runtime";
+export type ExternalSessionSourceId = "codex" | "claude" | "opencode" | "agy" | "runtime";
 
 export type ExternalRuntimeAgentKind = "codex" | "claude";
 

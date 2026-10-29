@@ -1,7 +1,7 @@
 import type { RuntimeArtifact, OptionalRuntimeId, RuntimeTarget } from "./runtime-install.js";
 
-export const OPTIONAL_RUNTIMES = ["opencode", "codex", "claude"] as const;
-export const RUNTIME_LABELS = { opencode: "OpenCode", codex: "Codex", claude: "Claude Code" } as const;
+export const OPTIONAL_RUNTIMES = ["opencode", "codex", "claude", "agy"] as const;
+export const RUNTIME_LABELS = { opencode: "OpenCode", codex: "Codex", claude: "Claude Code", agy: "Antigravity" } as const;
 const CLAUDE_DIST = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819";
 export const RUNTIME_DOWNLOAD_HOSTS = ["api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com", "storage.googleapis.com"] as const;
 const version = (value: unknown): value is string => typeof value === "string" && /^\d+\.\d+\.\d+$/.test(value);
@@ -10,6 +10,7 @@ const version = (value: unknown): value is string => typeof value === "string" &
  * No vendor installer, package script, global tool config, model endpoint or credential is consulted. */
 export async function resolveOfficialRuntimeArtifact(id: OptionalRuntimeId, target: RuntimeTarget,
   read: (url: string, maxBytes: number, signal?: AbortSignal) => Promise<Buffer>, signal?: AbortSignal): Promise<RuntimeArtifact> {
+  if (id === "agy") throw new Error("Antigravity is available only through local detection and registration; no official download is configured");
   if (!["darwin", "linux", "win32"].includes(target.platform) || !["arm64", "x64"].includes(target.arch)) throw new Error("Unsupported runtime platform");
   if (target.platform === "win32" && target.arch !== "x64") throw new Error("Windows ARM64 runtime acquisition is not supported");
   const parse = async (url: string) => JSON.parse((await read(url, 2 * 1024 * 1024, signal)).toString("utf8"));

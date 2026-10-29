@@ -6822,8 +6822,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps | LocalWorkspa
             if (externalSessionSpaceId() !== "personal") {
               return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
             }
-            if (p.sourceId !== undefined && p.sourceId !== "codex" && p.sourceId !== "claude" && p.sourceId !== "opencode" && p.sourceId !== "runtime") {
-              return reply(rpcError(id, ERR.PARAMS, "sourceId must be codex, claude, opencode, or runtime"));
+            if (p.sourceId !== undefined && p.sourceId !== "codex" && p.sourceId !== "claude" && p.sourceId !== "opencode" && p.sourceId !== "agy" && p.sourceId !== "runtime") {
+              return reply(rpcError(id, ERR.PARAMS, "sourceId must be codex, claude, opencode, agy, or runtime"));
             }
             if (p.cursor !== undefined && (typeof p.cursor !== "string" || !p.cursor || p.cursor.length > 160)) {
               return reply(rpcError(id, ERR.PARAMS, "cursor must be a bounded non-empty opaque cursor"));
