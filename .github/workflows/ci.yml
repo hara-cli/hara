@@ -113,12 +113,14 @@ jobs:
     # Native Intel candidate-equivalent full coverage at the original deadlines.
     # Windows candidate coverage explicitly uses windows-runtime's shared contract subset.
     # Full output must survive a failure; a tail alone cannot identify the first failed fixture.
+    # Job wall-clock aligned to standalone-runtime Intel (35m): suite itself was ~23.7m and
+    # hit the former 25m job cap on main 8357c14 (run 40898728754), not a test failure.
     strategy:
       fail-fast: false
       matrix:
         os: [macos-15-intel]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 35
     permissions:
       contents: read
     env:
