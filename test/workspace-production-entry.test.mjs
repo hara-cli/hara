@@ -82,6 +82,50 @@ test("one LocalJob offers only one agent_create confirmation and softly refuses 
     assert.equal(refusal.humanConfirmed, false); assert.equal(refusal.limit, 1);
   } finally { await host.close(); }
 });
+
+test("agent_create soft-returns declined when the human declines the confirmation card", async t => {
+  const events = new EventEmitter(), root = dir();
+  const host = new LocalWorkspaceHost(root, { mode: "workspace", credentialVault: new MemoryCredentialVault(),
+    providerFactory: createWorkspaceSyntheticProvider, onChange: event => events.emit("change", event) });
+  try {
+    const workspace = host.createWorkspace("Personal", host.list().revision), id = workspace.workspaceId, main = workspace.selectedAgentId;
+    host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
+    const { job, card } = await waitForHostApproval({ events, signal: t.signal,
+      start: () => host.start("client", id, main, "建立同事 Declined", randomUUID()),
+      read: () => host.snapshot(id, main, "client").approvals[0], wait: runId => host.wait(runId) });
+    assert.equal(host.snapshot(id, main, "client").approvals.length, 1);
+    host.answerApproval("client", id, card.id, false); await host.wait(job.runId);
+    const view = host.snapshot(id, main, "client");
+    const receipts = view.conversation.history.filter(row => row.role === "tool").flatMap(row => row.results).filter(row => row.name === "agent_create");
+    assert.equal(view.approvals.length, 0); assert.equal(view.agents.length, 1);
+    assert.equal(receipts.length, 1); assert.equal(receipts[0].isError, false);
+    const declined = JSON.parse(receipts[0].content);
+    assert.equal(declined.created, false); assert.equal(declined.humanConfirmed, false); assert.equal(declined.approvalState, "declined"); assert.equal(declined.displayName, "Coder");
+  } finally { await host.close(); }
+});
+
+test("agent_create soft-returns expired when the confirmation card times out", async t => {
+  const events = new EventEmitter(), root = dir();
+  const host = new LocalWorkspaceHost(root, { mode: "workspace", credentialVault: new MemoryCredentialVault(),
+    approvalTimeoutMs: 40, providerFactory: createWorkspaceSyntheticProvider, onChange: event => events.emit("change", event) });
+  try {
+    const workspace = host.createWorkspace("Personal", host.list().revision), id = workspace.workspaceId, main = workspace.selectedAgentId;
+    host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
+    const { job, card } = await waitForHostApproval({ events, signal: t.signal,
+      start: () => host.start("client", id, main, "建立同事 Expired", randomUUID()),
+      read: () => host.snapshot(id, main, "client").approvals[0], wait: runId => host.wait(runId) });
+    assert.equal(host.snapshot(id, main, "client").approvals.length, 1);
+    const remaining = Math.max(5, Date.parse(card.expiresAt) - Date.now() + 30);
+    await new Promise(resolve => setTimeout(resolve, remaining));
+    await host.wait(job.runId);
+    const view = host.snapshot(id, main, "client");
+    const receipts = view.conversation.history.filter(row => row.role === "tool").flatMap(row => row.results).filter(row => row.name === "agent_create");
+    assert.equal(view.approvals.length, 0); assert.equal(view.agents.length, 1);
+    assert.equal(receipts.length, 1); assert.equal(receipts[0].isError, false);
+    const expired = JSON.parse(receipts[0].content);
+    assert.equal(expired.created, false); assert.equal(expired.humanConfirmed, false); assert.equal(expired.approvalState, "expired"); assert.equal(typeof expired.displayName, "string"); assert.ok(expired.displayName.length > 0);
+  } finally { await host.close(); }
+});
 test("formal protocol advertises Workspace capabilities and rejects Lab configuration and renderer-selected sources", async () => {
   const root = dir(), handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port: 0 }, { root, mode: "workspace", version: "test" });
   const socket = new WebSocket(`ws://127.0.0.1:${handle.port}`); await once(socket, "open"); let serial = 0;
