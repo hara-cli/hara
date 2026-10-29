@@ -16,6 +16,8 @@ import { WorkspaceScheduler } from "../../dist/workspace/scheduler.js";
 import { LegacyOwnerFileDomain } from "../../dist/workspace/legacy-file-domain.js";
 import { WorkspaceLegacyResources, planLegacyResources } from "../../dist/workspace/legacy-resources.js";
 import { legacyScheduleRows, legacySchedulesDomain } from "../../dist/workspace/legacy-schedules.js";
+import { buildLegacyInheritancePlan } from "../../dist/workspace/legacy-plan.js";
+import { legacyAgentInputs } from "../../dist/workspace/legacy-agents.js";
 
 const hash = value => createHash("sha256").update(typeof value === "string" || Buffer.isBuffer(value) ? value : canonical(value)).digest("hex");
 const roleFiles = [".hara/workspace-agents.json", ".hara/workspace-agents-owner.json"];
@@ -92,8 +94,24 @@ function inspectSchedule(f, old, review) {
     resourceAccess: "catalog_only", businessExecution: "not_run", liveHandoff: "pending", live24h: "not_observed", nativeUpgrade: "not_run" };
 }
 
+/** The shared 95-task/17-persona inert fixture; every legacy-copy-roundtrip*.test.mjs file rehearses the same inputs. */
+export function legacyCopyFixture() {
+  const jobs = Array.from({ length: 95 }, (_, i) => ({ id: `copy-${i}`, name: `Copy fixture ${i}`, mode: i < 91 ? "command" : "print",
+    task: i === 94 ? "command --api-key fake-do-not-copy" : i < 91 ? "DO_NOT_EXECUTE copied command fixture" : "Do not execute original instructions",
+    cwd: `/copy/source/project-${i % 8}`, createdAt: 0, enabled: i < 62, schedule: i < 2 ? { kind: "once", runAt: 10, display: "expired once" } : { kind: "cron", expr: "* * * * *" },
+    tz: i % 7 ? "Asia/Taipei" : "", consecutiveErrors: i % 3, alertAfter: 4 }));
+  const sourceRoles = Array.from({ length: 17 }, (_, i) => ({ file: `copy-role-${i}.md`, content: `---\nname: copy-role-${i}\ndisplayName: Copy colleague ${i}\nallowTools: [read_file]\n---\nThese are inert fixture instructions ${i}.\n` }));
+  const sourceFingerprint = "b".repeat(64), plan = buildLegacyInheritancePlan({ sourceFingerprint, now: 120000, jobs, roles: sourceRoles, config: {}, profiles: {}, flows: [], sessions: [] });
+  return { jobs, sourceFingerprint, taskPlan: plan.tasks, roles: legacyAgentInputs(sourceRoles, plan.roles), legacyWorkspacePath: "/copy/source/workspace" };
+}
+/** Phase marks go to TAP and stderr at once: TAP diagnostics are dropped when a file hits its deadline. */
+export function phaseMarks(t, name) {
+  const began = Date.now();
+  return label => { const line = `${name} ${label}: ${Date.now() - began}ms`; t.diagnostic(line); process.stderr.write(`${line}\n`); };
+}
+
 /** Caller makes root with mkdtemp inside its authorized copy area. No filesystem source discovery. */
-export async function rehearseLegacyCopies({ root, jobs, taskPlan, roles, sourceFingerprint, legacyWorkspacePath, assertSource = () => {} }) {
+async function seedAndApply({ root, jobs, taskPlan, roles, sourceFingerprint, legacyWorkspacePath, assertSource, phase }) {
   const info = fs.lstatSync(root);
   assert.equal(fs.realpathSync(root), root); assert(info.isDirectory()); assert.equal(info.mode & 0o077, 0); assert.equal(info.uid, process.getuid());
   const home = join(root, "home"); fs.mkdirSync(home, { mode: 0o700 });
@@ -104,6 +122,7 @@ export async function rehearseLegacyCopies({ root, jobs, taskPlan, roles, source
   f.resources.agents.setArchived(kept.agentId, true, kept.configRevision, kept.agentEpoch);
   f.features.saveSchedule({ id: "copy-existing", name: "Existing destination fixture", schedule: { kind: "cron", expr: "* * * * *" },
     enabled: false, task: "Fixture only, never execute", agentId: main.agentId }, 0);
+  phase("destination fixture seeded");
   const paths = [...roleFiles, featureFile, ".hara/workspace-legacy-resources-v1.json"], beforeFiles = fileHashes(f, paths), before = projection(f);
   const rolesDomain = () => new LegacyOwnerFileDomain(f.storage, "roles", sourceFingerprint, roleFiles, roles.length,
     () => { f.resources.agents.importLegacy(roles, f.resources.agents.list().revision); });
@@ -115,14 +134,31 @@ export async function rehearseLegacyCopies({ root, jobs, taskPlan, roles, source
   const scheduleDomain = () => legacySchedulesDomain(f.storage, f.features, sourceFingerprint, rows);
   const domains = () => [rolesDomain(), foldersDomain(), scheduleDomain()];
   const receipt = await scheduleDomain().apply(); assert.equal(await scheduleDomain().verify(receipt), true);
+  phase("applied");
+  return { home, catalog, personal, f, main, paths, beforeFiles, before, rows, domains };
+}
+function inertScheduler(f) {
+  const counter = { executions: 0 };
+  const executor = { available: () => true, async execute() { counter.executions++; assert.fail("Copied business work must remain inert"); } };
+  return { counter, scheduler: () => new WorkspaceScheduler(f.storage, f.features, executor) };
+}
+function assertInertGate(f, scheduler, counter) {
+  const gate = scheduler().list(); assert.equal(gate.migratedEnabled, false); assert.equal(gate.runs.length, 0); assert.equal(counter.executions, 0);
+  assert(gate.schedules.filter(row => row.id !== "copy-existing").every(row => row.awaitingHandoff));
+}
+
+export async function rehearseLegacyCopies({ root, jobs, taskPlan, roles, sourceFingerprint, legacyWorkspacePath, assertSource = () => {}, phase = () => {} }) {
+  const { home, catalog, f, main, paths, beforeFiles, before, rows, domains } = await seedAndApply({ root, jobs, taskPlan, roles, sourceFingerprint, legacyWorkspacePath, assertSource, phase });
   const tasks = jobs.map(old => inspectSchedule(f, old, taskPlan.find(row => row.id === old.id)));
   const roleResults = roles.map(input => inspectRole(f, input)), applied = projection(f);
+  phase("applied copies inspected");
   for (let round = 0; round < 3; round++) {
     assertSource(); assert.equal(f.features.importLegacy(rows), 0);
     assert.equal(f.resources.agents.importLegacy(roles, f.resources.agents.list().revision).imported, 0);
     for (const domain of domains()) await domain.apply();
     assert.deepEqual(projection(f), applied);
   }
+  phase("repeat rounds");
   const restarted = childProbe(home); assert.deepEqual(restarted.state, applied);
   for (const row of rows) {
     const changed = { ...row, definition: { ...row.definition, task: "changed-copy-only-definition" } };
@@ -132,19 +168,19 @@ export async function rehearseLegacyCopies({ root, jobs, taskPlan, roles, source
     assert.throws(() => f.resources.agents.importLegacy([{ ...role, sourceHash: hash("changed-source:" + role.sourceHash) }], f.resources.agents.list().revision), /source changed/);
   }
   assert.deepEqual(projection(f), applied); assertSource();
-  let executions = 0;
-  const executor = { available: () => true, async execute() { executions++; assert.fail("Copied business work must remain inert"); } };
-  const scheduler = () => new WorkspaceScheduler(f.storage, f.features, executor);
+  phase("restart probe and source mutations rejected");
+  const { counter, scheduler } = inertScheduler(f);
   await scheduler().tick(main.agentId); await scheduler().tick(main.agentId, Date.now() + 24 * 60 * 60 * 1000);
   // Synthetic clock is ONLY a default-off test, never evidence of a real 24-hour soak or cutover.
-  for (const row of rows) await scheduler().tick(main.agentId, Date.now(), row.id);
-  const gate = scheduler().list(); assert.equal(gate.migratedEnabled, false); assert.equal(gate.runs.length, 0); assert.equal(executions, 0);
-  assert(gate.schedules.filter(row => row.id !== "copy-existing").every(row => row.awaitingHandoff));
+  // Per-row manual triggers run in rehearseLegacyManualGate: each tick scans every schedule durably.
+  assertInertGate(f, scheduler, counter);
+  phase("automatic scheduler gate");
   // All domains preflight before the first deletion, just like the production coordinator.
   const reverse = domains().reverse(); for (const domain of reverse) await domain.preflightRollback();
   assertSource(); for (const domain of reverse) await domain.rollback();
   assert.deepEqual(fileHashes(f, paths), beforeFiles); assert.deepEqual(projection(f), before);
   const rolledBack = childProbe(home); assert.deepEqual(rolledBack.state, before);
+  phase("rolled back and probed");
   for (const domain of domains().reverse()) await domain.rollback(); assert.deepEqual(projection(f), before);
   // A fresh domain instance reads durable journals. It cannot rely on the old object's memory.
   assertSource(); for (const domain of domains()) await domain.apply();
@@ -156,6 +192,7 @@ export async function rehearseLegacyCopies({ root, jobs, taskPlan, roles, source
     const { agentId: _beforeId, ...expected } = original, { agentId: _afterId, ...actual } = upgraded;
     assert.deepEqual(actual, expected); original.reupgradedAgentId = upgraded.agentId;
   }
+  phase("re-upgraded and inspected");
   assert.equal(f.resources.agents.list().mainAgentId, main.agentId);
   const final = childProbe(home); assert.deepEqual(final.state, projection(f));
   const other = catalog.create("Other copy Workspace", catalog.read().revision), otherResources = new WorkspaceResources(home, other.scope);
@@ -163,6 +200,7 @@ export async function rehearseLegacyCopies({ root, jobs, taskPlan, roles, source
   const otherStorage = new WorkspaceResourceStorage(home, other.scope); otherStorage.initialize();
   assert.equal(otherResources.agents.list().agents.length, 1);
   assert.equal(new WorkspaceFeatures(otherStorage, home, other.scope.workspaceId).schedules().length, 0); assertSource();
+  phase("final probe and other Workspace");
   for (const row of [...tasks, ...roleResults]) Object.assign(row, { restart: true, idempotent: true, sourceMutationRejected: true, rollback: true, reupgrade: true });
   return { tasks, roles: roleResults, summary: { tasks: tasks.length, roles: roleResults.length,
     enabledAfter: tasks.filter(row => row.enabledAfter).length, quarantined: tasks.filter(row => row.quarantined).length,
@@ -170,9 +208,20 @@ export async function rehearseLegacyCopies({ root, jobs, taskPlan, roles, source
     childProcessProbes: 3, independentProbePids: [restarted.pid, rolledBack.pid, final.pid], parentPid: process.pid,
     repeatRounds: 3, sourceMutationRejections: tasks.length + roleResults.length, rollbackPreimagesExact: true,
     existingDestinationObjectsPreserved: true, mainAgentIdUnchanged: true, otherWorkspaceInherited: 0,
-    automaticTicks: 2, manualDefaultOffChecks: tasks.length, schedulerClaims: 0, migratedEnabled: false,
+    automaticTicks: 2, schedulerClaims: 0, migratedEnabled: false,
     originalCommandsExecuted: 0, providerCalls: 0, keychainCalls: 0, messagesSent: 0,
     liveHandoffPerformed: false, real24hObserved: false, nativeUpgradeVerified: false, completeReleaseGatePassed: false } };
+}
+
+/** Manual "run now" on each migrated row before handoff must neither claim nor execute; `ids` selects this file's share. */
+export async function rehearseLegacyManualGate({ root, jobs, taskPlan, roles, sourceFingerprint, legacyWorkspacePath, ids, assertSource = () => {}, phase = () => {} }) {
+  const { f, main, rows } = await seedAndApply({ root, jobs, taskPlan, roles, sourceFingerprint, legacyWorkspacePath, assertSource, phase });
+  const selected = rows.filter(row => ids.includes(row.id)); assert.equal(selected.length, ids.length);
+  const { counter, scheduler } = inertScheduler(f);
+  for (const row of selected) await scheduler().tick(main.agentId, Date.now(), row.id);
+  assertInertGate(f, scheduler, counter); assertSource();
+  phase("manual scheduler gate");
+  return { manualDefaultOffChecks: selected.length, schedulerClaims: 0, originalCommandsExecuted: counter.executions };
 }
 
 if (process.argv[2] === "--probe") {

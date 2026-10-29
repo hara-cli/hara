@@ -47,6 +47,8 @@ test("real ARM64 full suite precedes tag and keeps original file/case deadlines,
   assert.equal(batches[2].concurrency, 1);assert.equal(batches[2].isolated, true);
   for (const file of ["legacy-startup.test.mjs", "legacy-startup-pi.test.mjs", "legacy-startup-rollback.test.mjs"])
     assert(batches[0].files.includes(file), `legacy-startup scenarios stay serialized as durable fixtures: ${file}`);
+  for (const file of ["legacy-copy-roundtrip.test.mjs", "legacy-copy-roundtrip-manual-a.test.mjs", "legacy-copy-roundtrip-manual-b.test.mjs"])
+    assert(batches[0].files.includes(file), `legacy copy roundtrip scenarios stay serialized as durable fixtures: ${file}`);
   assert.deepEqual(nativeTestBatches(files,"x64"),intelTestBatches(files));
   assert.throws(()=>nativeTestBatches(files,"ia32"),/architecture/);
   const workflow=readFileSync(new URL("../.github/workflows/ci.yml",import.meta.url),"utf8");
