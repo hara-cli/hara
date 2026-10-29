@@ -122,3 +122,7 @@ test("vendor catalog freezes stable release checksums; missing/ambiguous identit
     await assert.rejects(resolveOfficialRuntimeArtifact(id, { platform: "win32", arch: "arm64" }, read));
   }
 });
+
+test("Antigravity has no official download artifact", async () => {
+ await assert.rejects(resolveOfficialRuntimeArtifact("agy",{platform:process.platform,arch:process.arch},async()=>{throw new Error("network must not be used")}),/local detection and registration/);
+});

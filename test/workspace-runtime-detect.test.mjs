@@ -65,3 +65,24 @@ test("actual subprocess timeout kills only its own command group; broken version
  assert.equal(await boundedRuntimeCommand("/bin/sh",["-c","exit 1"],env,1000),null);
  const start=Date.now();assert.equal(await boundedRuntimeCommand("/bin/sh",["-c","sleep 3"],env,50),null);assert(Date.now()-start<2000);
 });
+
+test("Antigravity local binary is detected with an isolated version probe and resolves with account Home", async () => {
+ const account=dir(), probe=dir(), command=binary(join(account,".local/bin/agy"));
+ const storage=new WorkspaceResourceStorage(dir(),{schemaVersion:1,workspaceId:`ws_${randomUUID()}`,authority:{kind:"local",localAuthorityId:randomUUID()}});storage.initialize();
+ const discovery=options(account,{probeHome:probe,run:async(_command,args,env)=>{
+   if(args[0]==="-lic") return null;
+   assert.equal(env.HOME,probe); return "agy 1.4.10";
+ }});
+ const installer=new WorkspaceRuntimeInstaller(storage,{discovery});
+ try {
+   await installer.discover();
+   const row=installer.list().options.find(r=>r.runtimeId==="agy");
+   assert.equal(row.version,"1.4.10");assert.equal(row.state,"detected");
+   installer.registerLocal("agy",row.fingerprint);
+   const resolved=installer.resolveLocal("agy");
+   assert.equal(resolved.command,command);assert.equal(resolved.env.HOME,account);
+   assert.equal(resolved.env.USERPROFILE,account);assert.notEqual(resolved.env.HOME,probe);
+   assert.match(resolved.env.PATH, /\.local\/bin/);
+   await assert.rejects(installer.propose("agy","controller",()=>{}),/local registration only/);
+ } finally { await installer.close(); }
+});

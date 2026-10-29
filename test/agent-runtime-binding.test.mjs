@@ -115,7 +115,7 @@ test("real session persistence keeps binding provenance and rejects a forged tas
   assert.deepEqual(loadSession(id).task.runtimeBinding, task.runtimeBinding);
 });
 
-for (const runtimeId of ["pi", "opencode", "codex", "claude"]) {
+for (const runtimeId of ["pi", "opencode", "codex", "claude", "agy"]) {
   test(`the compatibility loop cannot silently run a task bound to ${runtimeId} outside Serve`, async () => {
     const task = createTaskExecution("hello", "fixture-turn");
     task.runtimeBinding = freezeTaskRuntimeBinding({ version: 1, spaceId: "personal", agentRef: "main", runtimeId, revision: 1 }, task.id);
@@ -128,3 +128,8 @@ for (const runtimeId of ["pi", "opencode", "codex", "claude"]) {
     assert.deepEqual(history, [{ role: "user", content: "hello" }]);
   });
 }
+
+test("Antigravity is a visible pending colleague runtime without a driver", () => {
+ const option=new AgentRuntimeRegistry().options().find(row=>row.id==="agy");
+ assert.deepEqual(option,{id:"agy",label:"Antigravity",available:false,reason:"general_agent_adapter_pending",recommended:false});
+});
