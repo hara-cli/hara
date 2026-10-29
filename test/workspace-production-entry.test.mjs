@@ -50,6 +50,38 @@ test("formal six-step Host flow uses an explicit mock Provider; no DEV flags, la
     assert.throws(() => new LocalWorkspaceHost(dir(), { mode: "workspace", realKeyFile: "/not-read" }), /cannot inherit/);
   } finally { await restored?.close(); await host.close(); }
 });
+test("one LocalJob offers only one agent_create confirmation and softly refuses a second attempt", async t => {
+  const events = new EventEmitter(), root = dir();
+  const host = new LocalWorkspaceHost(root, { mode: "workspace", credentialVault: new MemoryCredentialVault(),
+    onChange: event => events.emit("change", event), providerFactory(connection, binding, context) {
+      const synthetic = createWorkspaceSyntheticProvider(connection, binding, context);
+      return { ...synthetic, async turn(args) {
+        const createResults = args.history.flatMap(row => row.role === "tool" ? row.results.filter(result => result.name === "agent_create") : []);
+        if (createResults.length === 1 && JSON.parse(createResults[0].content).created === true) {
+          return { text: "", toolUses: [{ id: randomUUID(), name: "agent_create",
+            input: { username: "second", displayName: "Second", title: "Second colleague", instructions: "Help with work." } }], stop: "tool_use" };
+        }
+        if (createResults.length === 2) return { text: "Stopped after the turn limit.", toolUses: [], stop: "end" };
+        return synthetic.turn(args);
+      } };
+    } });
+  try {
+    const workspace = host.createWorkspace("Personal", host.list().revision), id = workspace.workspaceId, main = workspace.selectedAgentId;
+    host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
+    const { job, card } = await waitForHostApproval({ events, signal: t.signal,
+      start: () => host.start("client", id, main, "建立同事 Coder", randomUUID()),
+      read: () => host.snapshot(id, main, "client").approvals[0], wait: runId => host.wait(runId) });
+    assert.equal(host.snapshot(id, main, "client").approvals.length, 1);
+    host.answerApproval("client", id, card.id, true); await host.wait(job.runId);
+    const view = host.snapshot(id, main, "client");
+    const receipts = view.conversation.history.filter(row => row.role === "tool").flatMap(row => row.results).filter(row => row.name === "agent_create");
+    assert.equal(view.approvals.length, 0); assert.equal(view.agents.length, 2);
+    assert.equal(receipts.length, 2); assert.equal(receipts[0].isError, false); assert.equal(receipts[1].isError, false);
+    const refusal = JSON.parse(receipts[1].content);
+    assert.equal(refusal.created, false); assert.equal(refusal.refused, "turn_limit");
+    assert.equal(refusal.humanConfirmed, false); assert.equal(refusal.limit, 1);
+  } finally { await host.close(); }
+});
 test("formal protocol advertises Workspace capabilities and rejects Lab configuration and renderer-selected sources", async () => {
   const root = dir(), handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port: 0 }, { root, mode: "workspace", version: "test" });
   const socket = new WebSocket(`ws://127.0.0.1:${handle.port}`); await once(socket, "open"); let serial = 0;

@@ -662,6 +662,7 @@ export class LocalWorkspaceHost {
   }
   private jobTools(job: LocalJob, agent: WorkspaceAgentView): Tool[] {
     const assertCurrent = () => { assertWorkspaceRunAdmission(job.permit, job.options!, "pi"); };
+    let agentCreateAttempts = 0;
     const bundles = job.context.features.enabledSkills();
     const tools = [...localWorkspaceFileTools(job.context.project, assertCurrent), job.receipts!.tool(), job.startContext!.tool(assertCurrent),
       workspaceMemorySearchTool((query, limit) => job.context.resources.memory.search(query, job.context.project, limit), assertCurrent),
@@ -698,6 +699,8 @@ export class LocalWorkspaceHost {
         if (!plain(input) || !exact(input, ["username", "displayName", "title", "instructions"]) || !text(input.username, 64)
           || !text(input.displayName, 80) || !text(input.title, 180) || typeof input.instructions !== "string" || input.instructions.length > 8000) throw new Error("invalid colleague proposal");
         assertCurrent();
+        if (agentCreateAttempts >= 1) return JSON.stringify({ created: false, refused: "turn_limit", humanConfirmed: false, limit: 1 });
+        agentCreateAttempts += 1; // Reserve before approval yields so parallel tool uses cannot show two cards.
         const approved = await host.approval(job, { username: input.username, displayName: input.displayName, title: input.title, instructions: input.instructions, runtimeId: "pi" });
         if (!approved) throw new Error("同事建立未獲確認；沒有建立 Agent");
         assertCurrent();
@@ -893,6 +896,7 @@ export class LocalWorkspaceHost {
           + `${owned.startContext.prompt}\n`
           + `Use workspace_context_lookup to resolve missing names and aliases. Core pauses after two unresolved lookups or a budget warning. Use ask_user for a real problem or material ambiguity; never guess a user answer.\n`
           + `For creation use agent_create and wait for the human card; for delegation use agent_contact with an existing exact agentId.\n`
+          + `每轮最多建立一位同事。\n`
           + `For a requested rename use agent_rename on the resolved existing colleague; the new name is not a reference to look up.\n`
           + `agent_create returns only AFTER the human has approved; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. Check agent_list before creating so an active colleague is not duplicated.\n`
           + `Successful Workspace tool results repeat the exact citation ID in receipt.toolCallId. Copy that exact value for completion.checks; never invent IDs or repeat side effects to fix a rejected citation. After restart, re-observe state with read-only tools and cite the new receipt.\n`
