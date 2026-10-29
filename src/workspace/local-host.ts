@@ -61,8 +61,10 @@ export interface LocalWorkspaceApproval {
   channelId?: string;
   kind: "agent_create"; draft: { username: string; displayName: string; title: string; instructions: string; runtimeId: "pi" };
 }
+type ApprovalSettleState = "declined" | "expired" | "aborted";
+type ApprovalDecision = { approved: true } | { approved: false; state: ApprovalSettleState };
 interface PendingApproval { card: LocalWorkspaceApproval; clientId: string; selectionEpoch: number; job: LocalJob;
-  finish(approved: boolean): void; timer: ReturnType<typeof setTimeout> }
+  finish(decision: ApprovalDecision): void; timer: ReturnType<typeof setTimeout> }
 interface LocalJob {
   id: string; workspaceId: string; agentId: string; clientId: string;
   context: WorkspaceHostContext; store: WorkspaceConversationStore; value: WorkspaceConversation;
@@ -114,6 +116,8 @@ export class LocalWorkspaceHost {
     realKeyFile?: string;
     realKeySlice?: ArkAcceptanceSlice;
     interactiveApprovals?: boolean;
+    /** Test/dev only: shorten agent_create confirmation card lifetime without changing run budget. */
+    approvalTimeoutMs?: number;
     onChange?: (event: { workspaceId: string; agentId?: string }) => void;
     /** Trusted native/owner composition only; never supplied by an RPC or imported instructions. */
     legacyBusinessFactory?: (input: { storage: WorkspaceResourceStorage; features: WorkspaceFeatures; resources: WorkspaceLegacyResources }) => WorkspaceLegacyBusiness;
@@ -366,7 +370,7 @@ export class LocalWorkspaceHost {
   }
   releaseUpdate(clientId: string, id: string) { if (this.updateLease?.clientId !== clientId || this.updateLease.id !== id) throw new Error("Update lease changed"); this.updateLease = null; }
   private dismissApprovals(clientId: string): void {
-    for (const pending of [...this.pending.values()]) if (pending.clientId === clientId) pending.finish(false);
+    for (const pending of [...this.pending.values()]) if (pending.clientId === clientId) pending.finish({ approved: false, state: "aborted" });
     for (const context of this.contexts.values()) context.runtimes.dismiss(clientId);
   }
   async proposeRuntime(clientId: string, workspaceId: string, runtimeId: unknown) {
@@ -558,22 +562,29 @@ export class LocalWorkspaceHost {
     if (!pending || pending.card.workspaceId !== workspaceId || pending.clientId !== clientId || !selection || selection.workspaceId !== pending.card.workspaceId
       || (pending.card.channelId ? selection.channelId !== pending.card.channelId : selection.channelId || selection.agentId !== pending.card.agentId)
       || selection.epoch !== pending.selectionEpoch || pending.job.signal.aborted || Date.parse(pending.card.expiresAt) <= Date.now()) throw new Error("approval expired or belongs to another view");
-    assertWorkspaceRunAdmission(pending.job.permit, pending.job.options!, "pi"); pending.finish(approved);
+    assertWorkspaceRunAdmission(pending.job.permit, pending.job.options!, "pi");
+    pending.finish(approved ? { approved: true } : { approved: false, state: "declined" });
   }
-  private approval(job: LocalJob, draft: LocalWorkspaceApproval["draft"]): Promise<boolean> {
+  private approval(job: LocalJob, draft: LocalWorkspaceApproval["draft"]): Promise<ApprovalDecision> {
     const selection = this.clients.get(job.clientId);
     if (this.options.interactiveApprovals === false || !selection || selection.workspaceId !== job.workspaceId
-      || (job.channelId ? selection.channelId !== job.channelId : selection.channelId || selection.agentId !== job.agentId) || job.signal.aborted) { job.controller.abort(); return Promise.resolve(false); }
+      || (job.channelId ? selection.channelId !== job.channelId : selection.channelId || selection.agentId !== job.agentId) || job.signal.aborted) {
+      job.controller.abort(); return Promise.resolve({ approved: false, state: "aborted" });
+    }
     const card: LocalWorkspaceApproval = { id: randomUUID(), workspaceId: job.workspaceId, agentId: job.agentId,
       resourceGeneration: job.binding.agent.resourceBinding.generation, ...(job.channelId ? { channelId: job.channelId } : {}),
-      runId: job.binding.runId, kind: "agent_create", expiresAt: new Date(Date.parse(job.value.attempt!.startedAt) + job.binding.budget.timeoutMs).toISOString(), draft: Object.freeze({ ...draft }) };
+      runId: job.binding.runId, kind: "agent_create", expiresAt: new Date(Date.parse(job.value.attempt!.startedAt) + (typeof this.options.approvalTimeoutMs === "number" && this.options.approvalTimeoutMs > 0 ? this.options.approvalTimeoutMs : job.binding.budget.timeoutMs)).toISOString(), draft: Object.freeze({ ...draft }) };
     return new Promise(resolve => {
-      const onAbort = () => finish(false);
-      const finish = (approved: boolean) => {
+      const onAbort = () => finish({ approved: false, state: "aborted" });
+      const finish = (decision: ApprovalDecision) => {
         if (!this.pending.delete(card.id)) return;
-        clearTimeout(timer); job.signal.removeEventListener("abort", onAbort); if (!approved) job.controller.abort(); resolve(approved); this.changed(job.workspaceId, job.agentId);
+        clearTimeout(timer); job.signal.removeEventListener("abort", onAbort);
+        // declined/expired soft-return like turn_limit — keep the job alive so the model can tell the human.
+        // aborted (disconnect/close/signal) still cancels the run.
+        if (!decision.approved && decision.state === "aborted") job.controller.abort();
+        resolve(decision); this.changed(job.workspaceId, job.agentId);
       };
-      const timer = setTimeout(() => finish(false), Math.max(1, Date.parse(card.expiresAt) - Date.now())); timer.unref();
+      const timer = setTimeout(() => finish({ approved: false, state: "expired" }), Math.max(1, Date.parse(card.expiresAt) - Date.now())); timer.unref();
       this.pending.set(card.id, { card, clientId: job.clientId, selectionEpoch: selection.epoch, job, finish, timer });
       job.signal.addEventListener("abort", onAbort, { once: true }); this.changed(job.workspaceId, job.agentId);
     });
@@ -701,8 +712,10 @@ export class LocalWorkspaceHost {
         assertCurrent();
         if (agentCreateAttempts >= 1) return JSON.stringify({ created: false, refused: "turn_limit", humanConfirmed: false, limit: 1 });
         agentCreateAttempts += 1; // Reserve before approval yields so parallel tool uses cannot show two cards.
-        const approved = await host.approval(job, { username: input.username, displayName: input.displayName, title: input.title, instructions: input.instructions, runtimeId: "pi" });
-        if (!approved) throw new Error("同事建立未獲確認；沒有建立 Agent");
+        const decision = await host.approval(job, { username: input.username, displayName: input.displayName, title: input.title, instructions: input.instructions, runtimeId: "pi" });
+        if (!decision.approved) {
+          return JSON.stringify({ created: false, humanConfirmed: false, approvalState: decision.state, displayName: input.displayName });
+        }
         assertCurrent();
         const created = job.context.resources.agents.create({ username: input.username, profile: { displayName: input.displayName, title: input.title }, instructions: input.instructions, runtimeId: "pi" }, job.context.resources.agents.list().revision);
         host.changed(job.workspaceId, job.agentId); return JSON.stringify({ created: true, humanConfirmed: true, approvalState: "consumed", agent: created });
@@ -898,7 +911,7 @@ export class LocalWorkspaceHost {
           + `For creation use agent_create and wait for the human card; for delegation use agent_contact with an existing exact agentId.\n`
           + `每轮最多建立一位同事。\n`
           + `For a requested rename use agent_rename on the resolved existing colleague; the new name is not a reference to look up.\n`
-          + `agent_create returns only AFTER the human has approved; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. Check agent_list before creating so an active colleague is not duplicated.\n`
+          + `agent_create returns only AFTER the human has approved; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. created:false with approvalState declined/expired/aborted means no colleague was created — tell the human they can ask again; do not re-open a card unless they ask. Check agent_list before creating so an active colleague is not duplicated.\n`
           + `Successful Workspace tool results repeat the exact citation ID in receipt.toolCallId. Copy that exact value for completion.checks; never invent IDs or repeat side effects to fix a rejected citation. After restart, re-observe state with read-only tools and cite the new receipt.\n`
           + `Enabled version-locked Workspace skills (load every page of instructions via workspace_skill before acting; no extra permissions): ${boundWorkspaceText(JSON.stringify(context.features.enabledSkills().map(item => ({ id: item.id, description: item.description, version: item.version }))), 1200)}.\n`
           + `For file tasks read first; write only if necessary, then workspace_verify. End accepted tasks with task_checkpoint completion and observed tool_call_ids, not a prose-only claim.`,
@@ -937,7 +950,7 @@ export class LocalWorkspaceHost {
         job.value.attempt = { ...job.value.attempt!, state: job.signal.aborted ? "cancelled" : "blocked", endedAt: new Date().toISOString() }; this.commit(job); } catch { /* original checkpoint retained; no stale business authority */ }
     } finally {
       try { await closeWorkspaceRunPermit(job.permit!); } catch { job.error = "原執行鎖的身份無法確認；已保留，請診斷後再恢復。"; }
-      job.closed = true; for (const pending of [...this.pending.values()]) if (pending.job === job) pending.finish(false);
+      job.closed = true; for (const pending of [...this.pending.values()]) if (pending.job === job) pending.finish({ approved: false, state: "aborted" });
       if (this.jobs.get(job.id) === job) this.jobs.delete(job.id);
       this.changed(job.workspaceId, job.agentId);
     }
@@ -956,7 +969,7 @@ export class LocalWorkspaceHost {
   async close(): Promise<void> {
     if (this.scheduleTimer) clearInterval(this.scheduleTimer);
     if (this.usageTimer) clearInterval(this.usageTimer);
-    this.closing = true; for (const pending of [...this.pending.values()]) pending.finish(false);
+    this.closing = true; for (const pending of [...this.pending.values()]) pending.finish({ approved: false, state: "aborted" });
     for (const job of this.jobs.values()) if (!job.closed) job.controller.abort();
     await Promise.all([...this.channels.values()].map(rooms => rooms.close()));
     await Promise.all([...this.jobs.values()].map(job => job.promise));
