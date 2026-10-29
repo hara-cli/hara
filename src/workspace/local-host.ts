@@ -47,6 +47,7 @@ import { workspaceMemorySearchTool } from "./memory-tool.js";
 import { WorkspaceLegacyStartup, hasLegacyStartupSource, noLegacyStartup, type LegacyStartupStatus } from "./legacy-startup.js";
 import { WorkspaceLegacyBusiness } from "./legacy-business.js";
 import { WorkspaceLegacyResources } from "./legacy-resources.js";
+import { WorkspaceRuntimeUsageCache, planColleagueUsageDispatch, type WorkspaceUsageAccount, type WorkspaceUsageCollector } from "./runtime-account-usage.js";
 import { executeLegacyPrint } from "./legacy-print.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
@@ -89,6 +90,8 @@ export class LocalWorkspaceHost {
   private closing = false;
   private updateLease: { clientId: string; id: string } | null = null;
   private scheduleTimer?: ReturnType<typeof setInterval>;
+  private usageTimer?: ReturnType<typeof setInterval>;
+  private readonly usageCache: WorkspaceRuntimeUsageCache;
   private schedulerTicking = false;
   private readonly realKey?: WorkspaceRealKeyLane;
   private readonly vault: CredentialVault;
@@ -106,6 +109,8 @@ export class LocalWorkspaceHost {
     credentialVault?: CredentialVault;
     runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1];
     providerFactory?: LocalWorkspaceProviderFactory;
+    /** Host-owned native account reader; never accepted from a renderer or model tool argument. */
+    usageCollector?: WorkspaceUsageCollector;
     realKeyFile?: string;
     realKeySlice?: ArkAcceptanceSlice;
     interactiveApprovals?: boolean;
@@ -113,6 +118,13 @@ export class LocalWorkspaceHost {
     /** Trusted native/owner composition only; never supplied by an RPC or imported instructions. */
     legacyBusinessFactory?: (input: { storage: WorkspaceResourceStorage; features: WorkspaceFeatures; resources: WorkspaceLegacyResources }) => WorkspaceLegacyBusiness;
   } = {}) {
+    this.usageCache = new WorkspaceRuntimeUsageCache(options.usageCollector);
+    if (options.usageCollector) {
+      this.usageTimer = setInterval(() => {
+        for (const [workspaceId, context] of this.contexts) void this.refreshRuntimeUsage(workspaceId, context);
+      }, 60_000);
+      this.usageTimer.unref?.();
+    }
     if (options.mode && (options.realKeyFile || options.realKeySlice)) throw new Error("Workspace mode cannot inherit an acceptance Key lane");
     const opened = openLocalWorkspaceDevRoot(root, options.mode ?? "synthetic"); this.root = opened.root; this.home = opened.home; this.project = opened.project;
     this.catalog = new LocalWorkspaceCatalog(this.home);
@@ -213,7 +225,23 @@ export class LocalWorkspaceHost {
         }
         throw new Error("Owner project runtime adapter unavailable; no global fallback");
       } });
-    this.contexts.set(workspaceId, context); this.pruneExecutionAudits(workspaceId, context); return context;
+    this.contexts.set(workspaceId, context); this.pruneExecutionAudits(workspaceId, context);
+    if (this.options.usageCollector) void this.refreshRuntimeUsage(workspaceId, context);
+    return context;
+  }
+  private runtimeUsageAccounts(workspaceId: string, context: WorkspaceHostContext): WorkspaceUsageAccount[] {
+    const list = this.connectionSnapshot(context);
+    const connectionId = list.activeConnectionId ?? list.defaultConnectionId ?? null;
+    return context.resources.agents.list().agents.filter(agent => agent.state === "active")
+      .map(agent => ({ workspaceId, agentId: agent.agentId, runtimeId: agent.runtime.id, connectionId }));
+  }
+  private async refreshRuntimeUsage(workspaceId: string, context: WorkspaceHostContext): Promise<void> {
+    try {
+      const accounts = this.runtimeUsageAccounts(workspaceId, context);
+      this.usageCache.prune(workspaceId, accounts);
+      await Promise.all(accounts.map(account => this.usageCache.refresh(account)));
+      if (!this.closing) this.changed(workspaceId);
+    } catch { /* An unavailable reader is unknown, never zero or a dispatch grant. */ }
   }
   private pruneExecutionAudits(workspaceId: string, context: WorkspaceHostContext): void {
     const now = Date.now();
@@ -390,7 +418,7 @@ export class LocalWorkspaceHost {
     if (!approved || !(store instanceof WorkspaceSecureConnections)) throw new Error("Explicit secure migration retry approval required");
     const value = store.retryMigration(expected); this.changed(workspaceId); return value;
   }
-  selectConnection(workspaceId: string, id: string, expected: number) { this.context(workspaceId).connections.select(id, expected); this.changed(workspaceId); }
+  selectConnection(workspaceId: string, id: string, expected: number) { this.context(workspaceId).connections.select(id, expected); this.queueUsageRefresh(workspaceId); this.changed(workspaceId); }
   workspaceFeatures(workspaceId: string) { const context = this.context(workspaceId); return { ...context.features.list(), scheduler: context.scheduler!.list(),
     inheritance: workspaceId === this.inheritanceWorkspaceId ? this.inheritanceState : noLegacyStartup(), legacyOutcomes: context.legacyBusiness!.outcomes.list() }; }
   workspaceTasks(workspaceId: string) {
@@ -442,21 +470,24 @@ export class LocalWorkspaceHost {
   }
   configureSynthetic(workspaceId: string, expectedRevision: number): void {
     if (this.realKey || this.options.mode === "workspace") throw new Error("Synthetic connections require the explicit isolated Lab");
-    this.context(workspaceId).connections.add({ ...SYNTHETIC_CONNECTION }, expectedRevision); this.changed(workspaceId);
+    this.context(workspaceId).connections.add({ ...SYNTHETIC_CONNECTION }, expectedRevision); this.queueUsageRefresh(workspaceId); this.changed(workspaceId);
   }
   configureApprovedConnection(workspaceId: string, expectedRevision: number): void {
     if (!this.realKey) throw new Error("Real-key acceptance was not explicitly enabled");
-    this.context(workspaceId).connections.add(this.realKey.connectionInput(), expectedRevision); this.changed(workspaceId);
+    this.context(workspaceId).connections.add(this.realKey.connectionInput(), expectedRevision); this.queueUsageRefresh(workspaceId); this.changed(workspaceId);
   }
   configureConnection(workspaceId: string, input: unknown, expectedRevision: number): void {
     if (this.realKey) throw new Error("This acceptance lane only permits its approved file-reference connection");
     if (!plain(input)) throw new Error("invalid connection input");
     this.context(workspaceId).connections.add(input as unknown as Parameters<WorkspaceConnectionStoreV2["add"]>[0], expectedRevision);
-    this.changed(workspaceId);
+    this.queueUsageRefresh(workspaceId); this.changed(workspaceId);
   }
   revokeConnection(workspaceId: string, connectionId: string, expectedRevision: number): void {
     try { this.context(workspaceId).connections.revoke(connectionId, expectedRevision); }
-    finally { this.abortObsoleteConnectionRuns(workspaceId, connectionId); this.changed(workspaceId); }
+    finally { this.abortObsoleteConnectionRuns(workspaceId, connectionId); this.queueUsageRefresh(workspaceId); this.changed(workspaceId); }
+  }
+  private queueUsageRefresh(workspaceId: string): void {
+    if (this.options.usageCollector) void this.refreshRuntimeUsage(workspaceId, this.context(workspaceId));
   }
   snapshot(workspaceId: string, agentId?: string, clientId?: string) {
     const row = this.catalog.resolve(workspaceId), context = this.context(workspaceId), catalog = context.resources.agents.list();
@@ -468,7 +499,9 @@ export class LocalWorkspaceHost {
     return { workspaceId, resourceGeneration: context.storage.run(() => currentWorkspaceResourceBinding()!.generation),
       inheritance: workspaceId === this.inheritanceWorkspaceId ? this.inheritanceState : noLegacyStartup(),
       label: row.label, agentRevision: catalog.revision, agents: catalog.agents, selectedAgentId: selected,
-      connections, runtimes: context.runtimes.list(), conversation: { revision: value.revision, sessionId: value.sessionId,
+      connections, runtimes: context.runtimes.list(),
+      accountUsage: this.runtimeUsageAccounts(workspaceId, context).map(account => ({ agentId: account.agentId,
+        ...this.usageCache.read(account) })), conversation: { revision: value.revision, sessionId: value.sessionId,
         state: live ? live.controller.signal.aborted ? "draining" : "running"
           : value.attempt?.state === "running" || value.attempt?.state === "draining" ? "needs_recovery"
           : this.pendingUserQuestion(context, value) ? "awaiting_user"
@@ -683,7 +716,8 @@ export class LocalWorkspaceHost {
         return JSON.stringify({ renamed: true, agentId: renamed.agentId, previousName: current.identity.displayName, displayName: renamed.identity.displayName });
       } });
     const host = this;
-    const handoff = (value: { completed: boolean; agentId: string; taskId: string; runId: string; completion: unknown; retainedReceipt?: boolean }) => {
+    const handoff = (value: { completed: boolean; agentId: string; taskId: string; runId: string; completion: unknown;
+      retainedReceipt?: boolean; usageAtDispatch?: { availability: "available" | "unknown"; fresh: boolean } }) => {
       const raw = JSON.stringify(value);
       if (raw.length <= 1200) return raw;
       const fullReceiptFile = job.receipts!.retain({ id: value.runId, name: "colleague_handoff", content: raw });
@@ -697,6 +731,17 @@ export class LocalWorkspaceHost {
         const target = job.context.resources.agents.get(input.agentId);
         if (!target || target.kind !== "colleague" || target.state !== "active" || target.runtime.id !== "pi") throw new Error("同空間同事不可用");
         if (job.channelId && !host.localChannels(job.workspaceId).get(job.channelId).memberIds.includes(target.agentId)) throw new Error("Invite this colleague into the channel before delegating");
+        const accounts = host.runtimeUsageAccounts(job.workspaceId, job.context);
+        const targetAccount = accounts.find(row => row.agentId === target.agentId)!;
+        const usage = host.usageCache.read(targetAccount);
+        const usagePlan = planColleagueUsageDispatch(usage, accounts.filter(row => row.agentId !== target.agentId
+          && job.context.resources.agents.get(row.agentId)?.kind === "colleague")
+          .map(row => ({ agentId: row.agentId, usage: host.usageCache.read(row) })));
+        if (usagePlan.action === "exhausted") return JSON.stringify({ status: "usage_exhausted",
+          recipient: { agentId: target.agentId, displayName: target.identity.displayName },
+          availability: usagePlan.availability, fresh: usagePlan.fresh,
+          alternatives: usagePlan.alternatives, resetAt: usagePlan.resetAt,
+          instruction: "该同事的账号额度已用尽。请让用户换同事或稍后再试；有重置时间时可告知时间。没有自动改派或自动续跑。" });
         const prior = new WorkspaceConversationStore(job.context.storage, target.agentId, job.channelId).read();
         const sameDelegation = prior.task?.workspaceRunBinding?.lineage.parentRunId === job.id;
         if (sameDelegation && prior.task?.status === "completed" && prior.task.checkpoint?.completion?.state === "verified") {
@@ -710,7 +755,8 @@ export class LocalWorkspaceHost {
         if (!child.outcome || child.outcome.status !== "completed" || child.value.task?.status !== "completed"
           || child.value.task.checkpoint?.completion?.state !== "verified") throw new Error("同事任務未完成；請查看同事聊天，不重複執行");
         return handoff({ completed: true, agentId: target.agentId, taskId: child.value.task.id, runId: child.id,
-          completion: child.value.task.checkpoint?.completion ?? null });
+          completion: child.value.task.checkpoint?.completion ?? null,
+          usageAtDispatch: { availability: usagePlan.availability as "available" | "unknown", fresh: usagePlan.fresh } });
       } });
     return withWorkspaceToolReceipts(tools);
   }
@@ -905,6 +951,7 @@ export class LocalWorkspaceHost {
   async wait(runId: string): Promise<void> { const job = this.jobs.get(runId); if (job) await job.promise; }
   async close(): Promise<void> {
     if (this.scheduleTimer) clearInterval(this.scheduleTimer);
+    if (this.usageTimer) clearInterval(this.usageTimer);
     this.closing = true; for (const pending of [...this.pending.values()]) pending.finish(false);
     for (const job of this.jobs.values()) if (!job.closed) job.controller.abort();
     await Promise.all([...this.channels.values()].map(rooms => rooms.close()));
