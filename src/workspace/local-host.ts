@@ -34,6 +34,7 @@ import { boundWorkspaceText } from "./model-context.js";
 import { createWorkspaceProvider } from "./provider.js";
 import { legacyWorkspaceProviderFailure, WorkspaceProviderAdmissionError, WorkspaceProviderRecovery } from "./provider-recovery.js";
 import { WorkspaceRuntimeInstaller, optionalRuntimeId } from "./runtime-install.js";
+import { WorkspaceRuntimeModels } from "./runtime-models.js";
 import { WorkspaceSecureConnections } from "./secure-connections.js";
 import { MacKeychainCredentialVault, type CredentialVault } from "./credential-vault.js";
 import { LegacyConnectionCatalog } from "./legacy-connections.js";
@@ -51,7 +52,7 @@ import { WorkspaceRuntimeUsageCache, planColleagueUsageDispatch, type WorkspaceU
 import { executeLegacyPrint } from "./legacy-print.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
-interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; features: WorkspaceFeatures; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
+interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
 type WorkspaceConnectionSnapshot = ReturnType<WorkspaceConnectionStoreV2["list"]> & {
   readOnly?: boolean; recovered?: boolean; migrationPending?: boolean; unavailable?: boolean; activeConnectionId?: string | null;
 };
@@ -199,10 +200,11 @@ export class LocalWorkspaceHost {
       try { connections.stageLegacyImport(this.legacy.personalSeeds(source)); }
       catch { /* Snapshot isolates unavailable connections; history/roster must remain usable. */ }
     }
+    const runtimes = new WorkspaceRuntimeInstaller(storage, { ...((this.options.discoveryHome ?? this.options.hostHome) ? { discovery: { home: (this.options.discoveryHome ?? this.options.hostHome)!, probeHome: this.options.hostHome, shell: process.env.HARA_WORKSPACE_HOST_SHELL } } : {}),
+      ...this.options.runtimeInstallerOptions, onChange: () => this.changed(workspaceId) });
     const context: WorkspaceHostContext = { storage, resources, connections, project,
       features: new WorkspaceFeatures(storage, project, workspaceId, this.options.mode === "workspace" ? this.options.hostHome : undefined),
-      runtimes: new WorkspaceRuntimeInstaller(storage, { ...((this.options.discoveryHome ?? this.options.hostHome) ? { discovery: { home: (this.options.discoveryHome ?? this.options.hostHome)!, probeHome: this.options.hostHome, shell: process.env.HARA_WORKSPACE_HOST_SHELL } } : {}),
-        ...this.options.runtimeInstallerOptions, onChange: () => this.changed(workspaceId) }) };
+      runtimes, runtimeModels: new WorkspaceRuntimeModels(storage, runtimes) };
     const folders = new WorkspaceLegacyResources(storage);
     context.legacyBusiness = this.options.legacyBusinessFactory?.({ storage, features: context.features, resources: folders })
       ?? new WorkspaceLegacyBusiness(storage, context.features, folders, { commands: { authorize: () => undefined,
@@ -390,6 +392,10 @@ export class LocalWorkspaceHost {
   registerLocalRuntime(workspaceId: string, runtimeId: unknown, fingerprint: unknown): void {
     if (!optionalRuntimeId(runtimeId) || typeof fingerprint !== "string") throw new Error("Invalid local runtime registration");
     this.context(workspaceId).runtimes.registerLocal(runtimeId, fingerprint); this.changed(workspaceId);
+  }
+  listRuntimeModels(workspaceId: string, runtimeId: unknown) { return this.context(workspaceId).runtimeModels.list(runtimeId); }
+  selectRuntimeModel(workspaceId: string, runtimeId: unknown, modelId: unknown, expectedRevision: unknown): void {
+    this.context(workspaceId).runtimeModels.select(runtimeId, modelId, expectedRevision); this.changed(workspaceId);
   }
   getPreferences() { const current = this.preferences.read(); if (!current.readOnly && current.revision === 0) this.preferences.save(current.theme, 0); return this.preferences.read(); }
   setPreferences(theme: unknown, expected: number, extra = {}) { this.preferences.save(theme, expected, extra); return this.preferences.read(); }
