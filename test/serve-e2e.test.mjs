@@ -2045,6 +2045,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "sessions.pause-migrate.v1",
         "models.capabilities.v1",
         "automations.skip-diagnostics.v1",
+        "automations.colleague-owner.v1",
         "sessions.command-idempotency.v1",
         "sessions.command-idempotency.durable.v2",
         "sessions.control-lease.v1",

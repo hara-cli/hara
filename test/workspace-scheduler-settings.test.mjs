@@ -96,3 +96,19 @@ test("device display/update settings persist with theme across restart and have 
   assert.equal(restarted.updates.skippedVersion, "0.1.189"); assert.equal(restarted.updates.autoCheck, false);
   assert.throws(() => prefs.save("dark", restarted.revision, { updates: { autoCheck: "yes" } }));
 });
+test("colleague schedule list exposes only its scoped owner and safe editable fields", () => {
+  const f = fixture();
+  f.features.saveSchedule(task("owned", { agentId: "colleague-1", tz: "Asia/Taipei" }), 0);
+  const [owned] = f.features.list().schedules;
+  assert.equal(owned.agentId, "colleague-1");
+  assert.equal(owned.task, "Use fixture data only");
+  assert.equal(owned.tz, "Asia/Taipei");
+  assert.equal(Object.hasOwn(owned, "definition"), false);
+  assert.throws(() => f.features.saveSchedule(task("owned", { agentId: "colleague-2" }), 1), /owner cannot change/);
+  assert.throws(() => f.features.saveSchedule(task("bad", { agentId: "colleague-1", tz: "Invalid/Zone" }), 1), /Invalid scheduled task/);
+  f.features.importLegacy([{ id: "legacy", name: "Legacy", schedule: { kind: "cron", expr: "* * * * *" }, enabled: false,
+    workspaceId: f.storage.scope.workspaceId, migrationId: "legacy", source: "legacy", definition: { task: "private legacy task", agentId: "colleague-1" } }]);
+  const legacy = f.features.list().schedules.find(row => row.id === "legacy");
+  assert.equal(Object.hasOwn(legacy, "task"), false);
+  assert.equal(Object.hasOwn(legacy, "agentId"), false);
+});
