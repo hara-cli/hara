@@ -1069,6 +1069,10 @@ test("print automations launch as fresh persisted sessions for Desktop run histo
     ["-p", "daily brief", "--approval", "full-auto", "--resume", "cron-run-session"],
   );
   assert.deepEqual(
+    cronAgentArgs({ mode: "print", task: "daily brief", ownerBotId: "global:dora" }, "colleague-run"),
+    ["-p", "daily brief", "--approval", "full-auto", "--resume", "colleague-run", "--role", "global:dora"],
+  );
+  assert.deepEqual(
     cronAgentArgs({ mode: "org", task: "ship release" }, "unused"),
     ["org", "ship release"],
   );

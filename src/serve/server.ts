@@ -1676,6 +1676,7 @@ function automationJobForClient(
     name: job.name,
     mode: job.mode,
     cwd: job.cwd,
+    ...(job.ownerBotId ? { ownerBotId: job.ownerBotId } : {}),
     enabled: job.enabled,
     task: job.task,
     taskPreview,
@@ -9989,6 +9990,32 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps | LocalWorkspa
             if (p.clearDeliver !== undefined) {
               return reply(rpcError(id, ERR.PARAMS, "clearDeliver only applies when updating a task"));
             }
+            let ownerBotId: string | undefined;
+            let ownerCwd: string | undefined;
+            if (p.ownerBotId !== undefined) {
+              if (typeof p.ownerBotId !== "string" || !p.ownerBotId.trim() || p.ownerBotId === "main") {
+                return reply(rpcError(id, ERR.PARAMS, "ownerBotId must be a qualified colleague reference"));
+              }
+              if (typeof p.sessionId !== "string" || !p.sessionId.trim()) {
+                return reply(rpcError(id, ERR.PARAMS, "sessionId is required for a colleague schedule"));
+              }
+              const ownerSession = hub.get(p.sessionId);
+              if (!ownerSession || ownerSession.meta.agentRef !== p.ownerBotId) {
+                return reply(rpcError(id, ERR.UNAUTHORIZED, "schedule owner must match the current colleague conversation"));
+              }
+              const resolved = resolveServeAgent(p.ownerBotId, ownerSession.meta.cwd, ownerSession.meta.profileId);
+              if (!resolved || "ambiguous" in resolved || resolved.ref !== p.ownerBotId) {
+                return reply(rpcError(id, ERR.CONFLICT, "schedule colleague is no longer available"));
+              }
+              ownerBotId = resolved.ref;
+              ownerCwd = resolved.cwd;
+              if (p.mode === "command" || p.mode === "org") {
+                return reply(rpcError(id, ERR.PARAMS, "colleague schedules must use print mode"));
+              }
+              if (p.cwd !== undefined && p.cwd !== ownerCwd) {
+                return reply(rpcError(id, ERR.PARAMS, "colleague schedule cwd must match its workspace"));
+              }
+            }
             const mode: CronJob["mode"] = p.mode === "org" || p.mode === "command" ? p.mode : "print";
             const sched = parseSchedule(p.schedule, Date.now());
             if ("error" in sched) return reply(rpcError(id, ERR.PARAMS, `bad schedule: ${sched.error}`));
@@ -10027,7 +10054,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps | LocalWorkspa
               schedule: sched,
               task: p.task,
               mode,
-              cwd: typeof p.cwd === "string" ? p.cwd.trim() : opts.cwd,
+              cwd: ownerCwd ?? (typeof p.cwd === "string" ? p.cwd.trim() : opts.cwd),
+              ...(ownerBotId ? { ownerBotId } : {}),
               ...(timezone ? { tz: timezone } : {}),
               ...(deliver ? { deliver } : {}),
               ...(deliverMode ? { deliverMode } : {}),

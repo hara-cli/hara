@@ -91,6 +91,8 @@ export interface CronJob {
    *  COMMAND, deterministically — no agent, no tokens (hermes-style script lane). */
   mode: "print" | "org" | "command";
   cwd: string; // working directory the job runs in
+  /** Qualified colleague identity. Absent on legacy workspace-wide jobs. */
+  ownerBotId?: string;
   /** IANA timezone for cron-expr matching (e.g. "Asia/Shanghai"). Absent = local time. */
   tz?: string;
   /** Push each run's outcome to a channel: telegram:<chatId> | feishu:<chatId> | webhook:<url>. */
@@ -575,6 +577,8 @@ function validCronJob(value: unknown): value is CronJob {
     && typeof job.task === "string"
     && (job.mode === "print" || job.mode === "org" || job.mode === "command")
     && typeof job.cwd === "string" && !!job.cwd
+    && (job.ownerBotId === undefined || (typeof job.ownerBotId === "string"
+      && /^(?:global|[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?):[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(job.ownerBotId)))
     && typeof job.enabled === "boolean"
     && validFinite(job.createdAt)
     && (

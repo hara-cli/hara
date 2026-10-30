@@ -234,7 +234,7 @@
 //   learning.sync     {cwd?}                       → versioned Control-approved organization bundle
 //                                                    → {learning}; approve/reject/revoke local personal/project
 //                                                    records only; organization records require Control review.
-//   automation.list   {sessionCursor?,sessionLimit?} → {jobs:[{id,name,mode,enabled,task,scheduleSpec,
+//   automation.list   {sessionCursor?,sessionLimit?} → {jobs:[{id,name,mode,enabled,task,scheduleSpec,ownerBotId?,
 //                                                    delivery:{kind,label,mode?},nextRunAt?,nextRunDeferred?,
 //                                                    lastSkippedAt?,lastSkipCode?,lastSkipReason?,…}],
 //                                                    sessions:[{id,title,source,sourceName,jobId?,updatedAt,
@@ -341,7 +341,8 @@
 //                                                        Every mutation is organization-pinned; credentials
 //                                                        remain inside Engine and never cross the loopback RPC.
 //   automation.validate {schedule,tz?,id?}         → {schedule,description,nextRuns:[…],nextRunDeferred?}
-//   automation.add    {name,schedule,task,mode?,cwd?,tz?,deliver?,deliverMode?,alertAfter?}
+//   automation.add    {name,schedule,task,mode?,cwd?,tz?,deliver?,deliverMode?,alertAfter?,
+//                      ownerBotId?,sessionId?}  ownerBotId requires the matching colleague session
 //                                                               → {id,name,schedule}
 //   automation.update {id,name,schedule,task,mode,cwd?,tz?,deliver?,deliverMode?,clearDeliver?,alertAfter?}
 //                                                               → {id,name,schedule,scheduleSpec}
