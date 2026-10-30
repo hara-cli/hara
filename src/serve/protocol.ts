@@ -346,12 +346,12 @@
 //   automation.add    {name,schedule,task,mode?,cwd?,tz?,deliver?,deliverMode?,alertAfter?,
 //                      ownerBotId?,sessionId?}  ownerBotId requires the matching colleague session
 //                                                               → {id,name,schedule}
-//   automation.update {id,name,schedule,task,mode,cwd?,tz?,deliver?,deliverMode?,clearDeliver?,alertAfter?}
+//   automation.update {id,name,schedule,task,mode,cwd?,tz?,deliver?,deliverMode?,clearDeliver?,alertAfter?,ownerBotId?}
 //                                                               → {id,name,schedule,scheduleSpec}
 //                                                    Omit deliver to preserve it; clearDeliver removes it.
-//   automation.run    {id}                         → {id,ok,error?}
-//   automation.toggle {id,enabled}                → {id,enabled}
-//   automation.delete {id}                        → {id,deleted}
+//   automation.run    {id,ownerBotId?}             → {id,ok,error?}
+//   automation.toggle {id,enabled,ownerBotId?}    → {id,enabled}
+//   automation.delete {id,ownerBotId?}            → {id,deleted}
 //   automation.scheduler.install {}               → {scheduler:{installed,supported,platform,detail}}
 //   artifact.import   {sourcePath,title?,kind?}    → {artifact,currentRevision,content}
 //   artifact.commit   {artifactId,baseRevisionId,sourcePath,taskRunId?,changedPaths?}

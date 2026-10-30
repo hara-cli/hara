@@ -10085,6 +10085,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps | LocalWorkspa
             }
             let existing = findJob(p.id);
             if (!existing) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
+            if (existing.ownerBotId && p.ownerBotId !== existing.ownerBotId) {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "colleague schedule owner does not match"));
+            }
             if (existing.lastStatus === "running") {
               const state = recoverJobRunningState(existing.id);
               if (state.recovered) {
@@ -10102,6 +10105,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps | LocalWorkspa
             }
             if (p.mode !== "print" && p.mode !== "org" && p.mode !== "command") {
               return reply(rpcError(id, ERR.PARAMS, "mode must be print, org, or command"));
+            }
+            if (existing.ownerBotId && (p.mode !== "print" || (p.cwd !== undefined && p.cwd !== existing.cwd))) {
+              return reply(rpcError(id, ERR.PARAMS, "colleague schedule execution route cannot change"));
             }
             if (p.cwd !== undefined && (typeof p.cwd !== "string" || !p.cwd.trim())) {
               return reply(rpcError(id, ERR.PARAMS, "cwd must be a non-empty path"));
@@ -10202,6 +10208,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps | LocalWorkspa
             }
             let job = findJob(p.id);
             if (!job) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
+            if (job.ownerBotId && p.ownerBotId !== job.ownerBotId) {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "colleague schedule owner does not match"));
+            }
             if (job.lastStatus === "running") {
               const state = recoverJobRunningState(job.id);
               if (state.recovered) {
@@ -10237,6 +10246,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps | LocalWorkspa
           case "automation.toggle": {
             if (typeof p.id !== "string" || !p.id.trim() || typeof p.enabled !== "boolean") return reply(rpcError(id, ERR.PARAMS, "id + enabled required"));
             const job = findJob(p.id);
+            if (job?.ownerBotId && p.ownerBotId !== job.ownerBotId) {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "colleague schedule owner does not match"));
+            }
             if (!job || !setEnabled(job.id, p.enabled)) {
               return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
             }
@@ -10246,6 +10258,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps | LocalWorkspa
             if (typeof p.id !== "string" || !p.id.trim()) return reply(rpcError(id, ERR.PARAMS, "id required"));
             let job = findJob(p.id);
             if (!job) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
+            if (job.ownerBotId && p.ownerBotId !== job.ownerBotId) {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "colleague schedule owner does not match"));
+            }
             if (job.lastStatus === "running") {
               const state = recoverJobRunningState(job.id);
               if (state.recovered) {
