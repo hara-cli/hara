@@ -140,12 +140,13 @@ export interface SelfInvocation {
 /** User-facing arguments for one agent-backed automation occurrence. Print jobs get a fresh durable session
  * so Desktop can show each run independently and associate it through the HARA_CRON_ID metadata. */
 export function cronAgentArgs(
-  job: Pick<CronJob, "mode" | "task">,
+  job: Pick<CronJob, "mode" | "task" | "ownerBotId">,
   sessionId: string = randomUUID(),
 ): string[] {
   return job.mode === "org"
     ? ["org", job.task]
-    : ["-p", job.task, "--approval", "full-auto", "--resume", sessionId];
+    : ["-p", job.task, "--approval", "full-auto", "--resume", sessionId,
+      ...(job.ownerBotId ? ["--role", job.ownerBotId] : [])];
 }
 
 /** Bind a headless occurrence to the same IANA zone used to decide when that job is due. */
@@ -167,7 +168,7 @@ export function cronAgentEnv(
  * the session lock. An early launch failure still remains visible in Desktop without pretending it was
  * already bound to a provider, profile, or organization Space. */
 export function persistPrintAutomationOccurrence(
-  job: Pick<CronJob, "id" | "name" | "cwd">,
+  job: Pick<CronJob, "id" | "name" | "cwd" | "ownerBotId">,
   sessionId = randomUUID(),
   at = new Date(),
 ): string {
@@ -183,6 +184,7 @@ export function persistPrintAutomationOccurrence(
     source: "cron",
     sourceName: job.name,
     jobId: job.id,
+    ...(job.ownerBotId ? { agentRef: job.ownerBotId } : {}),
     pendingRouteBinding: "cron",
     automationRun: {
       status: "running",

@@ -234,7 +234,7 @@
 //   learning.sync     {cwd?}                       → versioned Control-approved organization bundle
 //                                                    → {learning}; approve/reject/revoke local personal/project
 //                                                    records only; organization records require Control review.
-//   automation.list   {sessionCursor?,sessionLimit?} → {jobs:[{id,name,mode,enabled,task,scheduleSpec,
+//   automation.list   {sessionCursor?,sessionLimit?} → {jobs:[{id,name,mode,enabled,task,scheduleSpec,ownerBotId?,
 //                                                    delivery:{kind,label,mode?},nextRunAt?,nextRunDeferred?,
 //                                                    lastSkippedAt?,lastSkipCode?,lastSkipReason?,…}],
 //                                                    sessions:[{id,title,source,sourceName,jobId?,updatedAt,
@@ -243,6 +243,8 @@
 //                                                    scheduler:{installed,supported,platform,detail}}
 //                                                    Raw delivery targets are write-only and never returned.
 //                                                    Feature automations.skip-diagnostics.v1 means a due run
+//                                                    Feature automations.colleague-owner.v1 means ownerBotId
+//                                                    binds creation and headless runs to one colleague.
 //                                                    blocked before launch remains pending and exposes a
 //                                                    redacted skip reason without overwriting its last outcome.
 //   models.list       {sessionId?}                → {models:[…],current,currentAvailable?,recommendedModel?,
@@ -341,14 +343,15 @@
 //                                                        Every mutation is organization-pinned; credentials
 //                                                        remain inside Engine and never cross the loopback RPC.
 //   automation.validate {schedule,tz?,id?}         → {schedule,description,nextRuns:[…],nextRunDeferred?}
-//   automation.add    {name,schedule,task,mode?,cwd?,tz?,deliver?,deliverMode?,alertAfter?}
+//   automation.add    {name,schedule,task,mode?,cwd?,tz?,deliver?,deliverMode?,alertAfter?,
+//                      ownerBotId?,sessionId?}  ownerBotId requires the matching colleague session
 //                                                               → {id,name,schedule}
-//   automation.update {id,name,schedule,task,mode,cwd?,tz?,deliver?,deliverMode?,clearDeliver?,alertAfter?}
+//   automation.update {id,name,schedule,task,mode,cwd?,tz?,deliver?,deliverMode?,clearDeliver?,alertAfter?,ownerBotId?}
 //                                                               → {id,name,schedule,scheduleSpec}
 //                                                    Omit deliver to preserve it; clearDeliver removes it.
-//   automation.run    {id}                         → {id,ok,error?}
-//   automation.toggle {id,enabled}                → {id,enabled}
-//   automation.delete {id}                        → {id,deleted}
+//   automation.run    {id,ownerBotId?}             → {id,ok,error?}
+//   automation.toggle {id,enabled,ownerBotId?}    → {id,enabled}
+//   automation.delete {id,ownerBotId?}            → {id,deleted}
 //   automation.scheduler.install {}               → {scheduler:{installed,supported,platform,detail}}
 //   artifact.import   {sourcePath,title?,kind?}    → {artifact,currentRevision,content}
 //   artifact.commit   {artifactId,baseRevisionId,sourcePath,taskRunId?,changedPaths?}
