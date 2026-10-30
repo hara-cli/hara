@@ -243,6 +243,8 @@
 //                                                    scheduler:{installed,supported,platform,detail}}
 //                                                    Raw delivery targets are write-only and never returned.
 //                                                    Feature automations.skip-diagnostics.v1 means a due run
+//                                                    Feature automations.colleague-owner.v1 means ownerBotId
+//                                                    binds creation and headless runs to one colleague.
 //                                                    blocked before launch remains pending and exposes a
 //                                                    redacted skip reason without overwriting its last outcome.
 //   models.list       {sessionId?}                → {models:[…],current,currentAvailable?,recommendedModel?,
