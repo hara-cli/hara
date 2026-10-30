@@ -128,6 +128,9 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (method === "workspace.runtime.detect") { fields(["workspaceId", "expectedGeneration"]); await host.detectRuntimes(workspaceId); host.assertGeneration(workspaceId, params.expectedGeneration); return host.snapshot(workspaceId, undefined, client.id).runtimes; }
     if (method === "workspace.runtime.registerLocal") { fields(["workspaceId", "expectedGeneration", "runtimeId", "fingerprint", "approved"]);
       if (params.approved !== true) throw new Error("Explicit local runtime approval required"); host.registerLocalRuntime(workspaceId, params.runtimeId, params.fingerprint); return { registered: true }; }
+    if (method === "workspace.runtime.listModels") { fields(["workspaceId", "expectedGeneration", "runtimeId"]); return host.listRuntimeModels(workspaceId, params.runtimeId); }
+    if (method === "workspace.runtime.selectModel") { fields(["workspaceId", "expectedGeneration", "runtimeId", "modelId", "expectedRevision"]);
+      host.selectRuntimeModel(workspaceId, params.runtimeId, params.modelId, params.expectedRevision); return { selected: true }; }
     if (method === "workspace.runtime.propose") { fields(["workspaceId", "expectedGeneration", "runtimeId"]); return host.proposeRuntime(client.id, workspaceId, params.runtimeId); }
     if (method === "workspace.runtime.approve") { fields(["workspaceId", "expectedGeneration", "proposalId", "approved"]);
       if (typeof params.proposalId !== "string" || !UUID.test(params.proposalId) || typeof params.approved !== "boolean") throw new Error("invalid runtime approval");
