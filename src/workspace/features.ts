@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { WorkspaceJsonState, canonical, plain, text } from "./local-state.js";
 import { sameWorkspaceResourceBinding, workspaceStateHome, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { WorkspaceSkillLibrary, forkWorkspaceSkill, validateWorkspaceSkill, type WorkspaceSkillBundle } from "./skills.js";
-import { parseCron, type Schedule } from "../cron/schedule.js";
+import { parseCron, validTz, type Schedule } from "../cron/schedule.js";
 import { redactSensitiveText } from "../security/secrets.js";
 import { WorkspaceInheritedSkills } from "./legacy-skills.js";
 
@@ -40,7 +40,10 @@ export class WorkspaceFeatures {
     for (const row of inherited) skills.set(row.id, row);
     for (const row of value.skills) skills.set(row.id, row);
     return { revision: value.revision, workspaceId: this.workspaceId,
-      schedules: value.schedules.map(({ definition: _task, ...row }) => ({ ...row, name: safe(row.name) })),
+      schedules: value.schedules.map(({ definition, ...row }) => ({ ...row, name: safe(row.name),
+        ...(row.source === "workspace" && typeof definition.agentId === "string" ? { agentId: definition.agentId } : {}),
+        ...(row.source === "workspace" && typeof definition.task === "string" ? { task: safe(definition.task) } : {}),
+        ...(row.source === "workspace" && typeof definition.tz === "string" ? { tz: definition.tz } : {}) })),
       skills: [...skills.values()].map(row => ({ id: row.id, description: row.description, enabled: row.enabled, version: row.version, source: row.source,
         locked: value.skills.some(pin => pin.id === row.id) || inherited.some(pin => pin.id === row.id), availableVersion: candidates.find(candidate => candidate.id === row.id)?.version ?? row.version })) };
   }
@@ -50,12 +53,13 @@ export class WorkspaceFeatures {
   schedules(): WorkspaceSchedule[] { return this.state.read().schedules; }
   saveSchedule(input: unknown, expected: number) {
     if (!plain(input) || !text(input.id) || !text(input.name, 256) || !validWorkspaceSchedule(input.schedule) || typeof input.enabled !== "boolean"
-      || !text(input.task, 8000) || typeof input.agentId !== "string" || redactSensitiveText(JSON.stringify(input)).redactions.length) throw new Error("Invalid scheduled task");
+      || !text(input.task, 8000) || typeof input.agentId !== "string" || (input.tz !== undefined && (typeof input.tz !== "string" || !validTz(input.tz))) || redactSensitiveText(JSON.stringify(input)).redactions.length) throw new Error("Invalid scheduled task");
     this.state.update(expected, current => {
       const previous = current.schedules.find(row => row.id === input.id);
+      if (previous && (previous.source !== "workspace" || previous.definition.agentId !== input.agentId)) throw new Error("Schedule owner cannot change");
       const row: WorkspaceSchedule = { id: input.id as string, name: input.name as string, enabled: input.enabled as boolean, schedule: structuredClone(input.schedule) as Schedule,
         workspaceId: this.workspaceId, migrationId: previous?.migrationId ?? "", source: previous?.source ?? "workspace",
-        definition: { task: input.task, agentId: input.agentId, mode: "print", createdAt: previous?.definition.createdAt ?? Date.now() } };
+        definition: { task: input.task, agentId: input.agentId, ...(input.tz ? { tz: input.tz } : {}), mode: "print", createdAt: previous?.definition.createdAt ?? Date.now() } };
       return { ...current, schedules: [...current.schedules.filter(item => item.id !== row.id), row] };
     });
   }
