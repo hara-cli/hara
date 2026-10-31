@@ -207,7 +207,7 @@ while (inventory.length) {
   const directory = inventory.pop();
   for (const name of readdirSync(directory)) {
     assert.ok(++visited < 100000, "private installed package inventory exceeded bound");
-    assert.ok(!/^(?:opencode|codex|claude|hara-code-runtime)(?:[.]exe)?$/i.test(name) && name !== "claude-agent-sdk" && !/^opencode-(?:darwin|linux|windows)-/.test(name), "private npm dependency tree unexpectedly includes an optional Agent runtime");
+    assert.ok(!/^(?:opencode|codex|claude|agy|hara-code-runtime)(?:[.]exe)?$/i.test(name) && name !== "claude-agent-sdk" && !/^opencode-(?:darwin|linux|windows)-/.test(name), "private npm dependency tree unexpectedly includes an optional Agent runtime");
     const path = join(directory, name), info = lstatSync(path); if (info.isDirectory() && !info.isSymbolicLink()) inventory.push(path);
   }
 }
