@@ -30,6 +30,8 @@ test("native and public standalone gates verify only Pi is preinstalled without 
   assert.ok((release.match(/standalone-coding-runtime-smoke\.mjs/g) ?? []).length >= 3);
   assert.match(codingSmoke, /\["--runtime-manifest"\]/);
   assert.match(codingSmoke, /manifest\.preinstalled, \["pi"\]/);
+  assert.match(codingSmoke, /manifest\.optional, \["opencode", "codex", "claude", "agy"\]/);
+  assert.match(codingSmoke, /opencode\|codex\|claude\|agy\|hara-code-runtime/);
   assert.match(codingSmoke, /\["workspace", "init", "--root", workspace\]/);
   assert.match(codingSmoke, /no optional runtime may be materialized/);
   assert.doesNotMatch(codingSmoke, /"coding", "sessions"|CODE_RUNTIME_VERSION/);
