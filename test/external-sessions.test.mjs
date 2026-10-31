@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough, Writable } from "node:stream";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -17,7 +19,20 @@ import {
   JsonlRpcClient,
   probeExternalCommand,
   resolveExternalCommand,
+  runJsonlRpcSequence,
 } from "../dist/external-sessions/process.js";
+
+test("JSONL RPC sequence rejects a broken App Server stdin without an uncaught EPIPE", async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.stdin = new Writable({ write(_chunk, _encoding, callback) {
+    callback(Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+  } });
+  await assert.rejects(runJsonlRpcSequence({ command: process.execPath, spawnProcess: () => child,
+    requests: [{ id: 1, method: "initialize", params: {} }], resultId: 1, timeoutMs: 500 }),
+  /closed before completing its request/);
+});
 
 // Both the parent and its real child-process fixtures publish complete documents. Keep this function
 // self-contained so the generated Herdr fixture and the staged-write regression execute the same writer.

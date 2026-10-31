@@ -34,6 +34,7 @@ exit 1
   fs.writeFileSync(`${path}.models`, JSON.stringify({ models: [
     { slug: "fixture-new", display_name: "Fixture New", description: "Bound binary model" },
     ...Array.from({ length: 8000 }, (_, i) => ({ slug: `fixture-${i}`, display_name: `Fixture ${i}` })),
+    { slug: "hidden-only", display_name: "Hidden Only", visibility: "hide" },
   ] }));
 }
 function openCodeBinary(path) {

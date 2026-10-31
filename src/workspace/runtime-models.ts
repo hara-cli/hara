@@ -17,7 +17,10 @@ const CATALOG: Partial<Record<OptionalRuntimeId, readonly RuntimeModel[]>> = {
 };
 function codexModels(parsed: unknown, field: "models" | "data"): RuntimeModel[] {
   if (!plain(parsed) || !Array.isArray(parsed[field])) throw new Error("codex model inventory is invalid");
-  const models = parsed[field].map((value: unknown) => {
+  const visible = parsed[field].filter((value: unknown) => !plain(value) || (field === "models"
+    ? value.visibility === undefined || value.visibility === "list"
+    : value.hidden !== true));
+  const models = visible.map((value: unknown) => {
     if (!plain(value)) throw new Error("codex model inventory is invalid");
     const id = field === "models" ? value.slug : value.id;
     const label = field === "models" ? value.display_name : value.displayName;
