@@ -11,6 +11,7 @@ import {
   createProviderForTarget,
   withVolcengineAgentPlanAutoFallback,
 } from "../dist/providers/factory.js";
+import { providerIsLocal, providerRequiresApiKey } from "../dist/config.js";
 
 const personalConfig = {
   provider: "openai",
@@ -38,6 +39,29 @@ const personalConfig = {
   mcpServers: {},
   cwd: "/tmp/project",
 };
+
+test("provider label helpers safely handle connection IDs and preserve known provider behavior", () => {
+  for (const unknown of ["coding-plan", "unlisted-provider"]) {
+    assert.equal(providerIsLocal(unknown), false);
+    assert.equal(providerRequiresApiKey(unknown), true);
+  }
+  assert.equal(providerIsLocal("volcengine-coding-plan"), false);
+  assert.equal(providerRequiresApiKey("volcengine-coding-plan"), true);
+  assert.equal(providerIsLocal("ollama"), true);
+  assert.equal(providerRequiresApiKey("ollama"), false);
+});
+
+test("named profile with a connection ID in provider fails with a repairable error", () => {
+  assert.throws(
+    () => resolveByokProviderTarget(personalConfig, {
+      id: "coding-plan",
+      kind: "byok",
+      provider: "coding-plan",
+      defaultModel: "ark-code-latest",
+    }, false, {}),
+    /Profile "coding-plan" has unknown provider "coding-plan"; select a supported provider/,
+  );
+});
 
 test("Volcengine auto retries the stable alias only for an empty Agent Plan capability rejection", async () => {
   let primaryTurns = 0;
