@@ -210,14 +210,14 @@ export function bindWorkspaceRunOptions(permit: WorkspaceRunPermit, input: Omit<
     provider: state.provider, workspaceRun: permit, toolFilter: name => state.tools.has(name), autoContinue: false,
     maxRounds: permit.binding.budget.maxRounds, timeoutMs: permit.binding.budget.timeoutMs };
   state.options = options;
-  assertWorkspaceRunAdmission(permit, options, "pi");
+  assertWorkspaceRunAdmission(permit, options, permit.binding.agent.runtimeId);
   return Object.freeze(options);
 }
 
 export function assertWorkspaceRunAdmission(permit: unknown, options: RunOpts, runtimeId: string): void {
   const state = stateOf(permit), binding = (permit as WorkspaceRunPermit).binding, pinned = state.options;
   state.assertLive();
-  if (!pinned || options.workspaceRun !== permit || runtimeId !== binding.agent.runtimeId || runtimeId !== "pi"
+  if (!pinned || options.workspaceRun !== permit || runtimeId !== binding.agent.runtimeId
     || options.provider !== state.provider || options.taskIntake !== pinned.taskIntake || options.extraTools !== pinned.extraTools
     || options.toolFilter !== pinned.toolFilter || options.hooks !== false || options.guardian || options.fallback
     || options.ctx.cwd !== state.cwd || options.ctx.sessionId !== binding.sessionId || options.ctx.stateHome !== state.stateHome

@@ -248,12 +248,12 @@ export class WorkspaceRuntimeInstaller {
         const valid = Boolean(inspected && inspected.realPath === selected.realPath && inspected.fingerprint === selected.fingerprint);
         return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: valid, registered: Boolean(local && valid), version: selected.version,
           path: selected.path, fingerprint: valid ? selected.fingerprint : null, source: selected.source,
-          generalAgentDriverAvailable: false, state: valid ? local ? "local_registered" : "detected" : "integrity_failed" };
+          generalAgentDriverAvailable: Boolean(local && valid && (runtimeId === "codex" || runtimeId === "claude")), state: valid ? local ? "local_registered" : "detected" : "integrity_failed" };
       }
       const installed = value.entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
       let verified = false; if (installed) try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* tampering revokes use, never repair or fallback */ }
       return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: verified, registered: verified, version: installed?.artifact.version ?? null,
-        generalAgentDriverAvailable: false, state: installed ? verified ? "registered" : "integrity_failed" : "not_installed" };
+        generalAgentDriverAvailable: Boolean(verified && (runtimeId === "codex" || runtimeId === "claude")), state: installed ? verified ? "registered" : "integrity_failed" : "not_installed" };
     }), operations: [...this.operations.values()].slice(-64).map(({ controller: _c, ...row }) => row) };
   }
   resolve(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string): { command: string; env: NodeJS.ProcessEnv } {

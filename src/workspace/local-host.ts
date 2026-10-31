@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstatSync } from "node:fs";
 import { join } from "node:path";
 import { runConfiguredAgent } from "../agent-runtime/dispatch.js";
+import { AgentRuntimeRegistry } from "../agent-runtime/registry.js";
 import { applyTaskCheckpoint, continueTaskExecution, createTaskExecution, finishTaskExecution, freshTaskCompletion, recordAwaitingTaskDecision, requestsTaskContinuation, type TaskExecution } from "../session/task.js";
 import type { RunOpts, RunOutcome } from "../agent/loop.js";
 import type { Provider } from "../providers/types.js";
@@ -188,7 +189,6 @@ export class LocalWorkspaceHost {
       if (canonical([current.scope, current.actorId, current.policyRevision, current.grantId, current.grantRevision]) !== expected) throw new Error("Workspace authority changed; reopen explicitly");
     };
     const storage = new WorkspaceResourceStorage(this.home, row.scope, assertAuthority); storage.initialize();
-    const resources = new WorkspaceResources(this.home, row.scope, { assertCurrent: assertAuthority }); resources.initialize();
     // The fixture project is workspace data too. Sharing the container root would let B observe
     // or reuse A's same-relative-path artifacts despite isolated chat/config/budget state.
     const project = storage.run(() => ensurePrivateStateSubdirectory(this.root, ["project", row.scope.workspaceId]).path);
@@ -202,6 +202,7 @@ export class LocalWorkspaceHost {
     }
     const runtimes = new WorkspaceRuntimeInstaller(storage, { ...((this.options.discoveryHome ?? this.options.hostHome) ? { discovery: { home: (this.options.discoveryHome ?? this.options.hostHome)!, probeHome: this.options.hostHome, shell: process.env.HARA_WORKSPACE_HOST_SHELL } } : {}),
       ...this.options.runtimeInstallerOptions, onChange: () => this.changed(workspaceId) });
+    const resources = new WorkspaceResources(this.home, row.scope, { assertCurrent: assertAuthority, runtimeInstaller: runtimes }); resources.initialize();
     const context: WorkspaceHostContext = { storage, resources, connections, project,
       features: new WorkspaceFeatures(storage, project, workspaceId, this.options.mode === "workspace" ? this.options.hostHome : undefined),
       runtimes, runtimeModels: new WorkspaceRuntimeModels(storage, runtimes) };
@@ -786,7 +787,8 @@ export class LocalWorkspaceHost {
     origin: WorkspaceRequestOrigin = { source: "host", channel: "internal", clientId }, channel?: { id: string; context: string }, questionId?: string) {
     if (this.closing || this.updateLease || !messageBody(message) || !UUID.test(requestId)) throw new Error("invalid Workspace message or closing/updating Host");
     const context = this.context(workspaceId), agent = context.resources.agents.get(agentId);
-    if (!agent || agent.state !== "active" || agent.runtime.id !== "pi") throw new Error("Agent Runtime unavailable; no fallback selected");
+    if (!agent || agent.state !== "active" || !context.resources.agents.runtimeOptions().some(row => row.id === agent.runtime.id && row.available))
+      throw new Error("Agent Runtime unavailable; no fallback selected");
     if (channel && !this.localChannels(workspaceId).get(channel.id).memberIds.includes(agentId)) throw new Error("Agent is not a member of this local channel");
     if (parent && (parent.workspaceId !== workspaceId || parent.binding.lineage.depth !== 0)) throw new Error("delegation is limited to one same-Workspace hop");
     const isContinue = message.trim() === "/continue" || (!questionId && requestsTaskContinuation(message));
@@ -848,7 +850,7 @@ export class LocalWorkspaceHost {
         if (value.task) value.pastTasks.push({ task: value.task, usage: value.runUsage, endedAt: new Date().toISOString() });
         task = context.resources.agents.bindTask(createTaskExecution(message, randomUUID()), agentId, agent.configRevision, agent.agentEpoch);
         task.workspaceRunBinding = freezeWorkspaceRunBinding({ schemaVersion: 1, scope: row.scope, agent: task.workspaceAgentBinding!,
-          agentBindingHash: workspaceAgentBindingHash(task.workspaceAgentBinding!), connection: context.connections.capture(), runtimeContract: "hara-governed-pi-v1",
+          agentBindingHash: workspaceAgentBindingHash(task.workspaceAgentBinding!), connection: context.connections.capture(), runtimeContract: "hara-governed-runtime-v1",
           project: captureWorkspaceProjectIdentity(context.project), sessionId: store.sessionId, runId: randomUUID(),
           lineage: parent ? { rootRunId: parent.binding.lineage.rootRunId ?? parent.id, parentRunId: parent.id, depth: 1 } : { rootRunId: null, parentRunId: null, depth: 0 },
           createdAt: new Date().toISOString(), host: { hostId: host.hostId, hostEpoch: host.hostEpoch, grantId: row.grantId, grantRevision: row.grantRevision, actorId: row.actorId, policyRevision: row.policyRevision },
@@ -937,7 +939,8 @@ export class LocalWorkspaceHost {
   }
   private async run(job: LocalJob): Promise<void> {
     try {
-      job.outcome = await job.context.storage.run(() => runConfiguredAgent(job.value.history, job.options!));
+      job.outcome = await job.context.storage.run(() => runConfiguredAgent(job.value.history, job.options!,
+        new AgentRuntimeRegistry(undefined, job.context.runtimes, job.context.runtimeModels)));
       this.closeRunInteractions(job);
       if (!job.signal.aborted && job.interaction?.question()) {
         job.value.task = this.questionCheckpoint(job.value.task!, job.interaction.question()!);

@@ -101,6 +101,10 @@ export class WorkspaceRuntimeModels {
     if (!option?.registered || (option.state !== "local_registered" && option.state !== "registered"))
       throw new Error("Runtime not bound in this workspace");
   }
+  selected(runtimeId: OptionalRuntimeId): string | null {
+    this.bound(runtimeId);
+    return this.state.read().selections.find(row => row.runtimeId === runtimeId)?.selectedModelId ?? null;
+  }
   async list(runtimeId: unknown) {
     this.bound(runtimeId);
     const row = this.state.read().selections.find(row => row.runtimeId === runtimeId);

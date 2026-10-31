@@ -6,6 +6,7 @@ import { scanMemory } from "../memory/guard.js";
 import { redactSensitiveText } from "../security/secrets.js";
 import { validateWorkspaceLegacyToolPolicy, type WorkspaceLegacyToolPolicy } from "./legacy-role-policy.js";
 import { AgentRuntimeRegistry, type AgentRuntimeOption } from "../agent-runtime/registry.js";
+import type { WorkspaceRuntimeInstaller } from "./runtime-install.js";
 import { isAgentRuntimeId, type AgentRuntimeId } from "../agent-runtime/bindings.js";
 import {
   normalizeAgentPublicIdentityInput, type AgentPublicIdentity, type AgentPublicIdentityInput,
@@ -133,10 +134,11 @@ function parseConfiguration(value: unknown, username: string): WorkspaceAgentCon
 export class WorkspaceAgentStore {
   private readonly scopeKey: string;
   private readonly scope: WorkspaceResourceScope;
-  private readonly runtimes = new AgentRuntimeRegistry();
-  constructor(scope: WorkspaceResourceScope) {
+  private readonly runtimes: AgentRuntimeRegistry;
+  constructor(scope: WorkspaceResourceScope, installer?: WorkspaceRuntimeInstaller) {
     this.scope = parseWorkspaceResourceScope(scope);
     this.scopeKey = workspaceResourceScopeKey(this.scope);
+    this.runtimes = new AgentRuntimeRegistry(undefined, installer);
   }
 
   private binding(): WorkspaceResourceBinding {
