@@ -94,6 +94,9 @@ export function resolveByokProviderTarget(
   env: NodeJS.ProcessEnv = process.env,
 ): ProviderTarget {
   const personalOrOverride = profile.id === "personal" || auxiliaryOverride;
+  if (profile.provider && !isProviderId(profile.provider)) {
+    throw new Error(`Profile "${profile.id}" has unknown provider "${profile.provider}"; select a supported provider for this profile.`);
+  }
   const profileProvider: ProviderId =
     profile.provider && profile.provider !== "hara-gateway" ? profile.provider : "anthropic";
   const environmentProvider: ProviderId | undefined =

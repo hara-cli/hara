@@ -307,11 +307,11 @@ export function isProviderId(value: unknown): value is ProviderId {
 }
 
 export function providerRequiresApiKey(provider: ProviderId): boolean {
-  return PROVIDER_LABELS[provider].auth === "api-key";
+  return (PROVIDER_LABELS[provider]?.auth ?? "api-key") === "api-key";
 }
 
 export function providerIsLocal(provider: ProviderId): boolean {
-  return PROVIDER_LABELS[provider].location === "local";
+  return PROVIDER_LABELS[provider]?.location === "local";
 }
 
 /** Redacted, deterministic catalog shared by CLI setup, serve and Desktop. */
