@@ -394,8 +394,8 @@ export class LocalWorkspaceHost {
     this.context(workspaceId).runtimes.registerLocal(runtimeId, fingerprint); this.changed(workspaceId);
   }
   listRuntimeModels(workspaceId: string, runtimeId: unknown) { return this.context(workspaceId).runtimeModels.list(runtimeId); }
-  selectRuntimeModel(workspaceId: string, runtimeId: unknown, modelId: unknown, expectedRevision: unknown): void {
-    this.context(workspaceId).runtimeModels.select(runtimeId, modelId, expectedRevision); this.changed(workspaceId);
+  async selectRuntimeModel(workspaceId: string, runtimeId: unknown, modelId: unknown, expectedRevision: unknown): Promise<void> {
+    await this.context(workspaceId).runtimeModels.select(runtimeId, modelId, expectedRevision); this.changed(workspaceId);
   }
   getPreferences() { const current = this.preferences.read(); if (!current.readOnly && current.revision === 0) this.preferences.save(current.theme, 0); return this.preferences.read(); }
   setPreferences(theme: unknown, expected: number, extra = {}) { this.preferences.save(theme, expected, extra); return this.preferences.read(); }

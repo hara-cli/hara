@@ -778,8 +778,14 @@ export async function runJsonlRpcSequence<T>(options: JsonlRpcSequenceOptions): 
       while (!done) {
         const request = options.requests[nextRequest++];
         if (!request) return;
+        if (!child.stdin || child.stdin.destroyed || !child.stdin.writable) {
+          fail("external session adapter closed before completing its request");
+          return;
+        }
         try {
-          child.stdin?.write(`${JSON.stringify(request)}\n`);
+          child.stdin.write(`${JSON.stringify(request)}\n`, (error?: Error | null) => {
+            if (error) fail("external session adapter closed before completing its request");
+          });
         } catch {
           fail("external session adapter closed before completing its request");
           return;
@@ -845,6 +851,9 @@ export async function runJsonlRpcSequence<T>(options: JsonlRpcSequenceOptions): 
     child.stderr?.on("data", (chunk: Buffer) => {
       stderr = boundedAppend(stderr, chunk.toString(), 64 * 1024);
     });
+    // A fast-exiting App Server can close its pipe between write() and its callback.
+    // Writable emits EPIPE asynchronously even when write() itself did not throw.
+    child.stdin?.on("error", () => fail("external session adapter closed before completing its request"));
     child.once("error", () => fail("external session adapter process failed"));
     child.once("close", (code) => {
       if (done) return;
