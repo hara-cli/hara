@@ -101,6 +101,12 @@ export class WorkspaceRuntimeInstaller {
       CLAUDE_CONFIG_DIR: join(privateHome, ".claude"), PATH: `${dirname(row.path)}:${this.options.discovery?.path ?? "/usr/bin:/bin:/usr/sbin:/sbin"}`,
       DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" } };
   }
+  resolveBound(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv } {
+    if (this.locals.read().entries.some(row => row.runtimeId === runtimeId)) return this.resolveLocal(runtimeId);
+    const installed = this.state.read().entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
+    if (!installed) return fail();
+    return this.resolve(runtimeId, installed.artifact.version, installed.artifact.sha256);
+  }
   private assertUrl(raw: string): URL {
     const url = new URL(raw);
     if (url.username || url.password || url.hash || url.href.length > 8192) return fail();
