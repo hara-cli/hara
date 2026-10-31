@@ -8,6 +8,8 @@ import type { ServeHandle, ServeOpts } from "./server.js";
 import { workspaceRequestSource } from "../workspace/request-journal.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { CredentialVault } from "../workspace/credential-vault.js";
+import { isAgentRuntimeId } from "../agent-runtime/bindings.js";
+import type { WorkspaceAgentPersonaInput } from "../workspace/agents.js";
 
 const CAPABILITY = "workspace.local-dev.v2";
 function tokenMatches(actual: unknown, expected: string): boolean {
@@ -139,6 +141,20 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       if (typeof params.operationId !== "string" || !UUID.test(params.operationId)) throw new Error("invalid runtime operation");
       host.cancelRuntime(workspaceId, params.operationId); return { state: "cancelling" }; }
     if (method === "workspace.agent.select") { fields(["workspaceId", "expectedGeneration", "agentId"]); if (!text(params.agentId)) throw new Error("invalid Agent selection"); host.selectAgent(client.id, workspaceId, params.agentId); return host.snapshot(workspaceId, params.agentId, client.id); }
+    if (method === "workspace.agents.setRuntime") {
+      fields(["workspaceId", "expectedGeneration", "agentId", "runtimeId", "configRevision", "agentEpoch"]);
+      if (!text(params.agentId) || !isAgentRuntimeId(params.runtimeId) || !positive(params.configRevision) || !positive(params.agentEpoch)) throw new Error("invalid Workspace Agent Runtime update");
+      return host.setAgentRuntime(workspaceId, params.agentId, params.runtimeId, params.configRevision, params.agentEpoch);
+    }
+    if (method === "workspace.agents.updatePersona") {
+      fields(["workspaceId", "expectedGeneration", "agentId", "input", "configRevision", "agentEpoch"]);
+      if (!text(params.agentId) || !plain(params.input) || !exact(params.input, ["profile"]) || !plain(params.input.profile)
+        || !positive(params.configRevision) || !positive(params.agentEpoch)) throw new Error("invalid Workspace Agent persona update");
+      const profile = params.input.profile;
+      if (!exact(profile, ["displayName", ...["title", "emoji", "avatar"].filter(key => Object.hasOwn(profile, key))])
+        || !text(profile.displayName, 64)) throw new Error("invalid Workspace Agent persona profile");
+      return host.updateAgentPersona(workspaceId, params.agentId, params.input as unknown as WorkspaceAgentPersonaInput, params.configRevision, params.agentEpoch);
+    }
     if (method === "workspace.connection.synthetic") { fields(["workspaceId", "expectedGeneration", "expectedRevision"]); if (!Number.isSafeInteger(params.expectedRevision) || Number(params.expectedRevision) < 0) throw new Error("invalid connection revision"); host.configureSynthetic(workspaceId, params.expectedRevision as number); return host.snapshot(workspaceId, undefined, client.id); }
     if (method === "workspace.connection.approved") { fields(["workspaceId", "expectedGeneration", "expectedRevision"]); if (!Number.isSafeInteger(params.expectedRevision) || Number(params.expectedRevision) < 0) throw new Error("invalid connection revision"); host.configureApprovedConnection(workspaceId, params.expectedRevision as number); return host.snapshot(workspaceId, undefined, client.id); }
     if (method === "workspace.connection.add") { fields(["workspaceId", "expectedGeneration", "input", "expectedRevision"]); host.configureConnection(workspaceId, params.input, params.expectedRevision as number); return { configured: true }; }
