@@ -217,6 +217,14 @@ export class WorkspaceAgentStore {
       description: config.description, runtime: this.runtimes.options().find(option => option.id === config.runtimeId)!,
       ...(row.kind === "main" ? { brand: "hara" as const } : {}) };
   }
+  currentPersona(agentId: string): WorkspaceAgentPersonaInput {
+    this.binding();
+    const row = this.load().value?.agents.find(entry => entry.agentId === agentId);
+    if (!row) throw new Error("Workspace Agent unavailable");
+    const config = row.configurations[row.currentConfigRevision - 1]!;
+    const { version: _version, source: _source, ...profile } = config.identity;
+    return { profile: structuredClone(profile), description: config.description, instructions: config.instructions };
+  }
   list() {
     const value = this.load().value;
     return { revision: value?.revision ?? 0, mainAgentId: value?.mainAgentId ?? null,

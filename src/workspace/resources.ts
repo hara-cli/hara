@@ -53,6 +53,7 @@ export class WorkspaceResources {
     const agents = new WorkspaceAgentStore(this.storage.scope, options.runtimeInstaller ?? new WorkspaceRuntimeInstaller(this.storage));
     this.agents = Object.freeze({
       list: bind(agents.list.bind(agents)), references: bind(agents.references.bind(agents)), get: bind(agents.get.bind(agents)),
+      currentPersona: bind(agents.currentPersona.bind(agents)),
       initializeMain: bind(agents.initializeMain.bind(agents), "configure"), create: bind(agents.create.bind(agents), "configure"),
       updatePersona: bind(agents.updatePersona.bind(agents), "configure"), rename: bind(agents.rename.bind(agents), "configure"), setRuntime: bind(agents.setRuntime.bind(agents), "configure"),
       setArchived: bind(agents.setArchived.bind(agents), "configure"), runtimeOptions: bind(agents.runtimeOptions.bind(agents)),
