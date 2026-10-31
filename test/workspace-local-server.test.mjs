@@ -20,6 +20,27 @@ async function connect(handle,origin){
   async close(){if(socket.readyState===WebSocket.CLOSED)return;const closed=once(socket,"close");socket.close();await closed;}};
 }
 async function until(check){for(let attempt=0;attempt<150;attempt++){const value=await check();if(value)return value;await new Promise(r=>setTimeout(r,20));}throw new Error("bounded RPC state wait expired");}
+test("Soft Dark agent RPC exposes Registry options and fences persona and runtime edits",async()=>{
+ const root=dir(),handle=await startLocalWorkspaceServe({host:"127.0.0.1",port:0,cwd:root},{root,version:"synthetic"});
+ const client=await connect(handle);try{
+  const init=await client.request("initialize",{token:handle.token});
+  const created=await client.request("workspace.create",{label:"Personal",expectedRevision:init.workspace.revision});
+  const scope={workspaceId:created.workspaceId,expectedGeneration:created.resourceGeneration};
+  const before=await client.request("workspace.snapshot",{workspaceId:created.workspaceId,agentId:null});
+  assert.ok(before.runtimeOptions.some(row=>row.id==="pi"&&row.available));
+  assert.ok(before.runtimeOptions.some(row=>row.id==="opencode"&&!row.available));
+  const agent=before.agents[0],fence={...scope,agentId:agent.agentId,configRevision:agent.configRevision,agentEpoch:agent.agentEpoch};
+  await assert.rejects(client.request("workspace.agents.setRuntime",{...fence,runtimeId:"opencode"}),/not available|adapter|pending/i);
+  await assert.rejects(client.request("workspace.agents.updatePersona",{...fence,input:{profile:{displayName:"Updated Hara"}},grant:true}),/unsupported/);
+  const renamed=await client.request("workspace.agents.updatePersona",{...fence,input:{profile:{displayName:"Updated Hara"}}});
+  assert.equal(renamed.identity.displayName,"Updated Hara");assert.equal(renamed.description,agent.description);
+  await assert.rejects(client.request("workspace.agents.setRuntime",{...fence,runtimeId:"hara"}),/changed|refresh/);
+  const updated=await client.request("workspace.agents.setRuntime",{...fence,configRevision:renamed.configRevision,runtimeId:"hara"});
+  assert.equal(updated.runtime.id,"hara");
+  const after=await client.request("workspace.snapshot",{workspaceId:created.workspaceId,agentId:null});
+  assert.equal(after.agents[0].runtime.id,"hara");assert.equal(after.agents[0].identity.displayName,"Updated Hara");
+ }finally{await client.close();await handle.close();}
+});
 test("formal startServe local branch boots without provider/global config and enforces token/origin/protocol scope",async()=>{
  const root=dir(),handle=await startServe({host:"127.0.0.1",port:0,cwd:root},{version:"synthetic-dev",localWorkspace:{root}});
  const client=await connect(handle);try{

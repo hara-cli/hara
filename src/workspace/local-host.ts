@@ -23,7 +23,8 @@ import { openLocalWorkspaceDevRoot } from "./local-dev-root.js";
 import { localWorkspaceFileTools, withWorkspaceToolReceipts } from "./local-tools.js";
 import { createWorkspaceSyntheticProvider, SYNTHETIC_CONNECTION } from "./synthetic-provider.js";
 import { canonical, exact, messageBody, plain, positive, text, UUID } from "./local-state.js";
-import type { WorkspaceAgentView } from "./agents.js";
+import type { WorkspaceAgentPersonaInput, WorkspaceAgentView } from "./agents.js";
+import type { AgentRuntimeId } from "../agent-runtime/bindings.js";
 import { WorkspaceRealKeyLane, type ArkAcceptanceSlice } from "./real-key-provider.js";
 import { WorkspaceContextReceipts } from "./context-receipts.js";
 import { WorkspaceContextAudit } from "./context-audit.js";
@@ -500,6 +501,18 @@ export class LocalWorkspaceHost {
   private queueUsageRefresh(workspaceId: string): void {
     if (this.options.usageCollector) void this.refreshRuntimeUsage(workspaceId, this.context(workspaceId));
   }
+  setAgentRuntime(workspaceId: string, agentId: string, runtimeId: AgentRuntimeId, configRevision: number, agentEpoch: number): WorkspaceAgentView {
+    const agent = this.context(workspaceId).resources.agents.setRuntime(agentId, runtimeId, configRevision, agentEpoch);
+    this.changed(workspaceId, agentId);
+    return agent;
+  }
+  updateAgentPersona(workspaceId: string, agentId: string, input: WorkspaceAgentPersonaInput, configRevision: number, agentEpoch: number): WorkspaceAgentView {
+    const agents = this.context(workspaceId).resources.agents;
+    const current = agents.currentPersona(agentId);
+    const agent = agents.updatePersona(agentId, { ...current, profile: { ...current.profile, ...input.profile } }, configRevision, agentEpoch);
+    this.changed(workspaceId, agentId);
+    return agent;
+  }
   snapshot(workspaceId: string, agentId?: string, clientId?: string) {
     const row = this.catalog.resolve(workspaceId), context = this.context(workspaceId), catalog = context.resources.agents.list();
     const selected = agentId ?? catalog.mainAgentId;
@@ -509,7 +522,8 @@ export class LocalWorkspaceHost {
     const connections = this.connectionSnapshot(context);
     return { workspaceId, resourceGeneration: context.storage.run(() => currentWorkspaceResourceBinding()!.generation),
       inheritance: workspaceId === this.inheritanceWorkspaceId ? this.inheritanceState : noLegacyStartup(),
-      label: row.label, agentRevision: catalog.revision, agents: catalog.agents, selectedAgentId: selected,
+      label: row.label, agentRevision: catalog.revision, agents: catalog.agents,
+      runtimeOptions: context.resources.agents.runtimeOptions(), selectedAgentId: selected,
       connections, runtimes: context.runtimes.list(),
       accountUsage: this.runtimeUsageAccounts(workspaceId, context).map(account => ({ agentId: account.agentId,
         ...this.usageCache.read(account) })), conversation: { revision: value.revision, sessionId: value.sessionId,
