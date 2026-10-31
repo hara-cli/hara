@@ -47,7 +47,8 @@ export class AgentRuntimeRegistry {
     return AGENT_RUNTIME_IDS.map(id => {
       const row = installed?.find(option => option.runtimeId === id);
       const driver = this.drivers.has(id);
-      const available = id === "codex" || id === "claude" ? Boolean(driver && row?.generalAgentDriverAvailable) : driver;
+      const available = id === "opencode" || id === "agy" ? false
+        : id === "codex" || id === "claude" ? Boolean(driver && row?.generalAgentDriverAvailable) : driver;
       const reason = available ? undefined : id === "opencode" ? "adapter_pending_p05" : id === "agy" ? "general_agent_adapter_pending"
         : row?.state === "integrity_failed" ? "integrity_failed"
         : row?.state === "not_installed" ? "not_installed"

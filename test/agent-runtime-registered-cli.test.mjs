@@ -44,6 +44,8 @@ for (const runtimeId of ["codex", "claude"]) test(`${runtimeId} main binding exe
   assert.equal(installer.list().options.find(option => option.runtimeId === runtimeId).generalAgentDriverAvailable, true);
   assert.equal(resources.agents.runtimeOptions().find(option => option.id === runtimeId).available, true);
   assert.equal(resources.agents.runtimeOptions().find(option => option.id === "opencode").available, false);
+  assert.equal(new AgentRuntimeRegistry([{ id: "opencode", async run() { throw new Error("must not run"); } }])
+    .options().find(option => option.id === "opencode").available, false, "P0.5 stays unavailable even with a stray injected driver");
   const selected = resources.agents.setRuntime(main.agentId, runtimeId, main.configRevision, main.agentEpoch);
   assert.equal(selected.kind, "main");
   assert.throws(() => resources.agents.setArchived(main.agentId, true, selected.configRevision, selected.agentEpoch), /cannot be archived/);
