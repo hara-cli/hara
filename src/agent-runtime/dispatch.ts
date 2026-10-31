@@ -26,12 +26,12 @@ export function bindNewAgentTask(
 
 /** Shared CLI/TUI/headless dispatch, also used by gateway/cron's existing CLI subprocess transport.
  * The selected kernel is exact; read-only helpers with no persistent task retain legacy Hara. */
-export function runConfiguredAgent(history: NeutralMsg[], options: RunOpts): Promise<RunOutcome> {
+export function runConfiguredAgent(history: NeutralMsg[], options: RunOpts, registry = new AgentRuntimeRegistry()): Promise<RunOutcome> {
   const task = options.taskIntake?.current?.() ?? options.taskIntake?.task;
   if (options.workspaceRun !== undefined || task?.workspaceRunBinding !== undefined || options.taskIntake?.task.workspaceRunBinding !== undefined
     || task?.workspaceAgentBinding !== undefined || options.taskIntake?.task.workspaceAgentBinding !== undefined) {
     if (!options.workspaceRun) return Promise.resolve({ status: "error", error: WORKSPACE_AGENT_EXECUTION_PENDING });
-    try { return new AgentRuntimeRegistry().runWorkspace(history, options); }
+    try { return registry.runWorkspace(history, options); }
     catch (error) { return Promise.resolve({ status: "error", error: error instanceof Error ? error.message : "Workspace admission refused" }); }
   }
   if (task?.runtimeBinding === undefined) return runAgent(history, options);

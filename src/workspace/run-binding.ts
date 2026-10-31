@@ -12,7 +12,7 @@ export interface WorkspaceRunBinding {
   agent: Readonly<WorkspaceAgentTaskBinding>;
   agentBindingHash: string;
   connection: Readonly<ScopedRunConnection>;
-  runtimeContract: "hara-governed-pi-v1";
+  runtimeContract: "hara-governed-pi-v1" | "hara-governed-runtime-v1";
   project: { root: string; dev: string | number; ino: string | number };
   sessionId: string;
   runId: string;
@@ -59,9 +59,10 @@ export function captureWorkspaceProjectIdentity(root: string): WorkspaceRunBindi
 function parse(value: unknown): WorkspaceRunBinding {
   const fail = (): never => { throw new Error("invalid or unsupported Workspace RunBinding; execution refused"); };
   if (!plain(value) || !exact(value, ["schemaVersion", "scope", "agent", "agentBindingHash", "connection", "runtimeContract", "project", "sessionId", "runId", "lineage", "createdAt", "host", "budget"])
-    || value.schemaVersion !== 1 || !isWorkspaceAgentTaskBinding(value.agent) || value.agent.runtimeId !== "pi"
+    || value.schemaVersion !== 1 || !isWorkspaceAgentTaskBinding(value.agent)
     || value.agentBindingHash !== workspaceAgentBindingHash(value.agent) || !isScopedRunConnection(value.connection)
-    || value.runtimeContract !== "hara-governed-pi-v1" || !safeId(value.sessionId) || !safeId(value.runId)
+    || !(value.runtimeContract === "hara-governed-runtime-v1" && ["hara", "pi", "codex", "claude"].includes(value.agent.runtimeId)
+      || value.runtimeContract === "hara-governed-pi-v1" && value.agent.runtimeId === "pi") || !safeId(value.sessionId) || !safeId(value.runId)
     || !plain(value.lineage) || !exact(value.lineage, ["rootRunId", "parentRunId", "depth"])
     || !(value.lineage.depth === 0 ? value.lineage.rootRunId === null && value.lineage.parentRunId === null
       : value.lineage.depth === 1 && safeId(value.lineage.rootRunId) && safeId(value.lineage.parentRunId)

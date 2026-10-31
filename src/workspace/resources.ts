@@ -7,6 +7,7 @@ import type { SessionStore } from "../serve/sessions.js";
 import { searchHybrid } from "../search/hybrid.js";
 import { sanitizeMemoryForPrompt } from "../memory/guard.js";
 import { WorkspaceAgentStore } from "./agents.js";
+import { WorkspaceRuntimeInstaller } from "./runtime-install.js";
 import { isTaskExecution, type TaskExecution } from "../session/task.js";
 import {
   currentWorkspaceResourceBinding, sameWorkspaceResourceBinding, WorkspaceResourceStorage,
@@ -39,6 +40,7 @@ export class WorkspaceResources {
   constructor(hostHome: string, scope: WorkspaceResourceScope, options: {
     assertCurrent?: () => void;
     assertAction?: (action: WorkspaceResourceAction, lifecycle?: "session-lock") => void;
+    runtimeInstaller?: WorkspaceRuntimeInstaller;
   } = {}) {
     this.storage = new WorkspaceResourceStorage(hostHome, scope, options.assertCurrent);
     const actionCheck = (action: WorkspaceResourceAction, lifecycle?: "session-lock"): void => {
@@ -48,7 +50,7 @@ export class WorkspaceResources {
       this.storage.run(() => { actionCheck(action, lifecycle); return fn(...args); });
     const bindAsync = <A extends unknown[], R>(fn: (...args: A) => Promise<R>, action: WorkspaceResourceAction = "read") => async (...args: A): Promise<R> =>
       this.storage.run(() => { actionCheck(action); return fn(...args); });
-    const agents = new WorkspaceAgentStore(this.storage.scope);
+    const agents = new WorkspaceAgentStore(this.storage.scope, options.runtimeInstaller ?? new WorkspaceRuntimeInstaller(this.storage));
     this.agents = Object.freeze({
       list: bind(agents.list.bind(agents)), references: bind(agents.references.bind(agents)), get: bind(agents.get.bind(agents)),
       initializeMain: bind(agents.initializeMain.bind(agents), "configure"), create: bind(agents.create.bind(agents), "configure"),
