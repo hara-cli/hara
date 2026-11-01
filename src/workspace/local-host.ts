@@ -393,7 +393,8 @@ export class LocalWorkspaceHost {
   async detectRuntimes(workspaceId: string): Promise<void> { await this.context(workspaceId).runtimes.discover(); }
   registerLocalRuntime(workspaceId: string, runtimeId: unknown, fingerprint: unknown): void {
     if (!optionalRuntimeId(runtimeId) || typeof fingerprint !== "string") throw new Error("Invalid local runtime registration");
-    this.context(workspaceId).runtimes.registerLocal(runtimeId, fingerprint); this.changed(workspaceId);
+    const context = this.context(workspaceId);
+    context.runtimes.registerLocal(runtimeId, fingerprint); context.runtimeModels.warm(runtimeId); this.changed(workspaceId);
   }
   listRuntimeModels(workspaceId: string, runtimeId: unknown) { return this.context(workspaceId).runtimeModels.list(runtimeId); }
   async selectRuntimeModel(workspaceId: string, runtimeId: unknown, modelId: unknown, expectedRevision: unknown): Promise<void> {
@@ -503,6 +504,7 @@ export class LocalWorkspaceHost {
   }
   setAgentRuntime(workspaceId: string, agentId: string, runtimeId: AgentRuntimeId, configRevision: number, agentEpoch: number): WorkspaceAgentView {
     const agent = this.context(workspaceId).resources.agents.setRuntime(agentId, runtimeId, configRevision, agentEpoch);
+    this.context(workspaceId).runtimeModels.warm(runtimeId);
     this.changed(workspaceId, agentId);
     return agent;
   }

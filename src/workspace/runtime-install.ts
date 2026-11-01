@@ -87,8 +87,18 @@ export class WorkspaceRuntimeInstaller {
     const found = this.detected.find(row => row.runtimeId === runtimeId && row.fingerprint === fingerprint);
     const current = found && inspectLocalRuntime(found.path, true);
     if (!found || !current || current.realPath !== found.realPath || current.fingerprint !== fingerprint) return fail();
+    if (runtimeId === "codex") this.privateHome(runtimeId);
     const state = this.locals.read();
     this.locals.update(state.revision, value => ({ ...value, entries: [...value.entries.filter(row => row.runtimeId !== runtimeId), found] }));
+  }
+  private privateHome(runtimeId: OptionalRuntimeId): string {
+    return this.storage.run(() => {
+      const home = workspaceResourceDirectory(["runtime-homes", runtimeId]);
+      // Codex cannot populate its inventory when CODEX_HOME is only an uncreated path.
+      // Use the same link-rejecting Workspace namespace as HOME; never project the user's .codex.
+      if (runtimeId === "codex") workspaceResourceDirectory(["runtime-homes", runtimeId, ".codex"]);
+      return home;
+    });
   }
   resolveLocal(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv } {
     const row = this.locals.read().entries.find(row => row.runtimeId === runtimeId), checked = row && inspectLocalRuntime(row.path, true);
@@ -96,7 +106,7 @@ export class WorkspaceRuntimeInstaller {
     if (runtimeId === "agy") return { command: row.path, env: { HOME: this.options.discovery?.home ?? userInfo().homedir,
       USERPROFILE: this.options.discovery?.home ?? userInfo().homedir, PATH: `${dirname(row.path)}:${this.options.discovery?.path ?? process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin"}`,
       DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" } };
-    const privateHome = this.storage.run(() => workspaceResourceDirectory(["runtime-homes", runtimeId]));
+    const privateHome = this.privateHome(runtimeId);
     return { command: row.path, env: { HOME: privateHome, USERPROFILE: privateHome, CODEX_HOME: join(privateHome, ".codex"),
       CLAUDE_CONFIG_DIR: join(privateHome, ".claude"), PATH: `${dirname(row.path)}:${this.options.discovery?.path ?? "/usr/bin:/bin:/usr/sbin:/sbin"}`,
       DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" } };
@@ -260,7 +270,7 @@ export class WorkspaceRuntimeInstaller {
     if (runtimeId === "agy") return fail();
     const row = this.state.read().entries.find(row => row.artifact.runtimeId === runtimeId && row.artifact.version === version && row.artifact.sha256 === artifactSha256);
     if (!row) return fail(); const checked = this.inspect(row.artifact, row); if (!checked) return fail();
-    const privateHome = this.storage.run(() => workspaceResourceDirectory(["runtime-homes", runtimeId]));
+    const privateHome = this.privateHome(runtimeId);
     return { command: checked.path, env: { HOME: privateHome, USERPROFILE: privateHome, CODEX_HOME: join(privateHome, ".codex"),
       CLAUDE_CONFIG_DIR: join(privateHome, ".claude"), XDG_CONFIG_HOME: join(privateHome, "config"), XDG_DATA_HOME: join(privateHome, "data"),
       XDG_CACHE_HOME: join(privateHome, "cache"), DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" } };
