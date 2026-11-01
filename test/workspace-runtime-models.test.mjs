@@ -99,6 +99,14 @@ test("runtime model RPC requires binding, persists a per-runtime choice, and lea
     await assert.rejects(client.request("workspace.runtime.listModels", { ...scope, runtimeId: "codex" }), /not bound/);
     await client.request("workspace.runtime.registerLocal", { ...scope, runtimeId: "codex", fingerprint: codex.fingerprint, approved: true });
     await client.request("workspace.runtime.registerLocal", { ...scope, runtimeId: "opencode", fingerprint: opencode.fingerprint, approved: true });
+    const guide = await client.request("workspace.runtime.loginInstructions", { ...scope, runtimeId: "codex" });
+    assert.equal(guide.runtimeId, "codex");
+    assert.ok(guide.command.includes("runtime-homes/codex/.codex"));
+    assert.ok(guide.command.includes(command));
+    assert.ok(!guide.command.includes(join(discovery, ".codex")));
+    await assert.rejects(client.request("workspace.runtime.loginInstructions", { ...scope, expectedGeneration: "stale", runtimeId: "codex" }), /generation/);
+    await assert.rejects(client.request("workspace.runtime.loginInstructions", { ...scope, runtimeId: "claude" }), /Only Codex/);
+    await assert.rejects(client.request("workspace.runtime.loginInstructions", { ...scope, runtimeId: "codex", command: "untrusted" }), /fields|parameter/i);
     const registeredCache = await until(() => fs.readdirSync(join(data, "home"), { recursive: true })
       .find(name => name.endsWith("runtime-homes/codex/.codex/models_cache.json")));
     const warmedCache = join(data, "home", registeredCache);

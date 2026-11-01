@@ -21,12 +21,18 @@ const roots = [];
 function root() { const path = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-cli-driver-"))); roots.push(path); return path; }
 after(() => roots.forEach(path => fs.rmSync(path, { recursive: true, force: true })));
 
-for (const runtimeId of ["codex", "claude"]) test(`${runtimeId} main binding executes only its registered binary in a confined mode`, async () => {
-  const home = root(), account = root(), project = root(), catalog = new LocalWorkspaceCatalog(home);
-  const row = catalog.create("Local", 1), storage = new WorkspaceResourceStorage(home, row.scope); storage.initialize();
+for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, null], ["claude", false, null],
+  ["codex", true, null], ["codex", true, null, true], ["codex", true, "project_not_trusted"], ["codex", true, "runtime_auth_required"], ["codex", true, "command_failed"]]) test(`${runtimeId} managed=${managed} git=${hasGit} failure=${failure} stays confined with no fallback`, async () => {
+  const data = root(), home = managed ? join(data, "home") : data, account = root();
+  fs.mkdirSync(home, { recursive: true });
+  const catalog = new LocalWorkspaceCatalog(home), row = catalog.create("Local", 1);
+  const project = managed ? join(data, "project", row.scope.workspaceId) : root();
+  fs.mkdirSync(project, { recursive: true });
+  if (hasGit) fs.mkdirSync(join(project, ".git"));
+  const storage = new WorkspaceResourceStorage(home, row.scope); storage.initialize();
   const command = join(account, ".local", "bin", runtimeId), argv = join(account, "argv.txt");
   fs.mkdirSync(dirname(command), { recursive: true });
-  fs.writeFileSync(command, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${runtimeId} 1.2.3'; exit 0; fi\nif [ "$1" = "app-server" ]; then exit 1; fi\nif [ "$1" = "debug" ]; then echo '{"models":[{"slug":"fixture-model","display_name":"Fixture"}]}'; exit 0; fi\nprintf '%s\\n' "$@" > '${argv}'\necho 'registered ${runtimeId} reply'\n`, { mode: 0o755 });
+  fs.writeFileSync(command, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${runtimeId} 1.2.3'; exit 0; fi\nif [ "$1" = "app-server" ]; then exit 1; fi\nif [ "$1" = "debug" ]; then echo '{"models":[{"slug":"fixture-model","display_name":"Fixture"}]}'; exit 0; fi\nprintf '%s\\n' "$@" > '${argv}'\n${managed && !hasGit ? `case " $* " in *' --skip-git-repo-check '*) ;; *) echo 'Not inside a trusted directory and --skip-git-repo-check was not specified.' >&2; exit 1;; esac` : ''}\n${failure ? `echo '${failure === 'project_not_trusted' ? 'Not inside a trusted directory' : failure === 'runtime_auth_required' ? 'websocket 401 Unauthorized PRIVATE_ACCOUNT_DETAIL' : 'PRIVATE_ACCOUNT_DETAIL'}' >&2; exit 1` : ''}\necho 'registered ${runtimeId} reply'\n`, { mode: 0o755 });
   const installer = new WorkspaceRuntimeInstaller(storage, { discovery: { home: account, path: "/usr/bin:/bin", systemBins: [],
     run: async (_command, args) => args[0] === "-lic" ? null : `${runtimeId} 1.2.3` } });
   const resources = new WorkspaceResources(home, row.scope, { runtimeInstaller: installer }); resources.initialize();
@@ -64,19 +70,38 @@ for (const runtimeId of ["codex", "claude"]) test(`${runtimeId} main binding exe
     budget: { maxRounds: 12, maxToolCalls: 32, maxTokens: 32000, timeoutMs: 60000 } });
   task.workspaceRunBinding = binding;
   const lease = WorkspaceSessionLease.acquire(storage, binding.sessionId), controller = new AbortController();
-  const permit = createWorkspaceRunPermit({ binding, catalog, resources, storage, connections, lease, cwd: project, signal: controller.signal,
+  const permitInput = { binding, catalog, resources, storage, connections, lease, cwd: project, ...(managed ? { managedProjectRoot: project } : {}), signal: controller.signal,
     provider: { id: "openai", model: binding.connection.model, async turn() { throw new Error("unexpected fallback"); } },
-    toolNames: [], usage: { modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 }, updateUsage() {} });
+    toolNames: [], usage: { modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 }, updateUsage() {} };
+  if (!managed) assert.throws(() => createWorkspaceRunPermit({ ...permitInput, managedProjectRoot: project }), /managed Workspace project proof/);
+  const permit = createWorkspaceRunPermit(permitInput);
   const options = bindWorkspaceRunOptions(permit, { ctx: { cwd: project, sessionId: binding.sessionId, sandbox: "off" },
     signal: controller.signal, approval: "auto-edit", approvalChannel: true, confirm: async () => false, hooks: false,
     systemOverride: "Reply concisely", taskIntake: { task, current: () => task } });
   try {
     const history = [{ role: "user", content: "hello" }];
     const result = await storage.run(() => runConfiguredAgent(history, options, new AgentRuntimeRegistry(undefined, installer, models)));
-    assert.equal(result.status, "completed", result.error);
-    assert.equal(history.at(-1).text, `registered ${runtimeId} reply`);
+    assert.equal(result.status, failure ? "error" : "completed", result.error);
+    if (failure) {
+      assert.ok(result.error.includes(`(${failure})`));
+      assert.ok(result.error.includes("no fallback was selected"));
+      assert.ok(!result.error.includes("PRIVATE_ACCOUNT_DETAIL"));
+      assert.equal(history.length, 1);
+    } else assert.equal(history.at(-1).text, `registered ${runtimeId} reply`);
     const args = fs.readFileSync(argv, "utf8");
     assert.match(args, runtimeId === "codex" ? /read-only/ : /plan/);
+    assert.equal(args.includes("--skip-git-repo-check"), managed && !hasGit);
+    assert.equal(fs.existsSync(join(project, ".git")), hasGit);
+    const privateEnv = installer.resolveBound(runtimeId).env;
+    assert.ok(privateEnv.HOME.startsWith(home));
+    assert.equal(fs.existsSync(join(account, ".codex")), false);
+    if (runtimeId === "codex") {
+      const guide = installer.codexLoginInstructions();
+      assert.equal(guide.runtimeId, "codex");
+      assert.ok(guide.command.includes(privateEnv.CODEX_HOME));
+      assert.ok(guide.command.endsWith(" login"));
+      assert.ok(!guide.command.includes("--skip-git-repo-check"));
+    }
     assert.ok(args.includes(modelId), "spawn uses the existing Workspace runtime model selection");
     assert.ok(!args.includes("danger-full-access") && !args.includes("bypassPermissions"));
     fs.appendFileSync(command, "# changed after registration\n");

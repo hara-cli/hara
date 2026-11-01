@@ -50,6 +50,8 @@ export interface ExternalCommandRunOptions {
   /** Preserve bounded stdout on a non-zero exit only for callers that parse a documented structured
    * response. It must never be forwarded to users or diagnostics because provider output may hold account data. */
   retainStdoutOnFailure?: boolean;
+  /** Opt-in, allowlisted classification. Raw stderr never crosses this boundary. */
+  failureKind?: "registered-cli";
 }
 
 const safeExternalErrorCode = (stderr: string): string | undefined => {
@@ -63,6 +65,13 @@ const safeExternalErrorCode = (stderr: string): string | undefined => {
     return undefined;
   }
 };
+
+/** Only fixed categories leave the process boundary; never return stderr, paths or account details. */
+export function registeredCliFailureCode(stderr: string): string | undefined {
+  if (/not inside a trusted directory|--skip-git-repo-check was not specified|not a git repository/i.test(stderr)) return "project_not_trusted";
+  if (/\b401\b|\bunauthorized\b|not logged in|authentication (?:required|failed)|missing (?:authentication|credentials)|please (?:log|sign) in/i.test(stderr)) return "runtime_auth_required";
+  return undefined;
+}
 
 /**
  * Execute one short-lived local runtime command with bounded output. Raw stderr is deliberately discarded:
@@ -159,7 +168,7 @@ export async function runExternalCommandCapture(
         stdout: code === 0 || run.retainStdoutOnFailure === true ? stdout : "",
         code,
         timedOut: false,
-        ...(code === 0 ? {} : { errorCode: safeExternalErrorCode(stderr) ?? "command_failed" }),
+        ...(code === 0 ? {} : { errorCode: (run.failureKind === "registered-cli" ? registeredCliFailureCode(stderr) : undefined) ?? safeExternalErrorCode(stderr) ?? "command_failed" }),
       });
     });
   });

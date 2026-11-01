@@ -396,6 +396,10 @@ export class LocalWorkspaceHost {
     const context = this.context(workspaceId);
     context.runtimes.registerLocal(runtimeId, fingerprint); context.runtimeModels.warm(runtimeId); this.changed(workspaceId);
   }
+  runtimeLoginInstructions(workspaceId: string, runtimeId: unknown) {
+    if (runtimeId !== "codex") throw new Error("Only Codex private-home login guidance is available");
+    return this.context(workspaceId).runtimes.codexLoginInstructions();
+  }
   listRuntimeModels(workspaceId: string, runtimeId: unknown) { return this.context(workspaceId).runtimeModels.list(runtimeId); }
   async selectRuntimeModel(workspaceId: string, runtimeId: unknown, modelId: unknown, expectedRevision: unknown): Promise<void> {
     await this.context(workspaceId).runtimeModels.select(runtimeId, modelId, expectedRevision); this.changed(workspaceId);
@@ -909,7 +913,7 @@ export class LocalWorkspaceHost {
       const configuration = context.resources.agents.resolveTask(binding.agent);
       const tools = this.jobTools(owned, agent).filter(tool => legacyPolicyAllowsTool(configuration.toolPolicy, tool.name, tool.kind));
       owned.permit = createWorkspaceRunPermit({ binding, catalog: this.catalog, resources: context.resources, storage: context.storage, connections: context.connections,
-        lease, provider, cwd: context.project, signal: owned.signal, toolNames: ["task_intake", "task_checkpoint", "todo_write", "ask_user", ...tools.map(tool => tool.name)], usage: value.runUsage,
+        lease, provider, cwd: context.project, managedProjectRoot: context.project, signal: owned.signal, toolNames: ["task_intake", "task_checkpoint", "todo_write", "ask_user", ...tools.map(tool => tool.name)], usage: value.runUsage,
         modelHistory: { history: value.history, start: modelHistoryStart, retain: result => owned.receipts!.retain(result),
           usedTokens: () => { const usage = tree.read().usage; return usage.inputTokens + usage.outputTokens; } },
         observeContext: observation => { owned.lease.assertCurrent(); audit.append(observation); },

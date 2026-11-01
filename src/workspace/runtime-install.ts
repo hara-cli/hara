@@ -117,6 +117,18 @@ export class WorkspaceRuntimeInstaller {
     if (!installed) return fail();
     return this.resolve(runtimeId, installed.artifact.version, installed.artifact.sha256);
   }
+  /** Read-only login guidance for the registered executable and this Workspace's private home.
+   * No login is launched and no global auth/config is read or projected. */
+  codexLoginInstructions(): { runtimeId: "codex"; shell: "posix" | "powershell"; command: string } {
+    const { command, env } = this.resolveBound("codex");
+    const quote = (value: string) => "'" + value.replaceAll("'", process.platform === "win32" ? "''" : "'\"'\"'") + "'";
+    const values = ["HOME", "USERPROFILE", "CODEX_HOME"] as const;
+    if (values.some(key => !env[key] || /[\r\n\0]/.test(env[key]!)) || /[\r\n\0]/.test(command)) return fail();
+    const login = process.platform === "win32"
+      ? values.map(key => `$env:${key}=${quote(env[key]!)}`).join("; ") + `; & ${quote(command)} login`
+      : "env " + values.map(key => `${key}=${quote(env[key]!)}`).join(" ") + ` ${quote(command)} login`;
+    return { runtimeId: "codex", shell: process.platform === "win32" ? "powershell" : "posix", command: login };
+  }
   private assertUrl(raw: string): URL {
     const url = new URL(raw);
     if (url.username || url.password || url.hash || url.href.length > 8192) return fail();

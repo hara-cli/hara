@@ -2,6 +2,7 @@
 // calls this factory; renderer/Agent arguments cannot populate the private WeakMap below.
 import { createHash } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import type { NeutralMsg, Provider, ProviderRetryEvent, TurnResult } from "../providers/types.js";
 import type { RunOpts } from "../agent/loop.js";
 import type { TaskExecution } from "../session/task.js";
@@ -27,6 +28,7 @@ interface PermitState {
   provider: Provider;
   options?: RunOpts;
   cwd: string;
+  managedProject: boolean;
   stateHome: string;
   signal: AbortSignal;
   tools: Set<string>;
@@ -70,6 +72,11 @@ function publishUsage(state: PermitState, delta: Partial<WorkspaceUsage>): void 
   state.usage = next;
 }
 
+/** A path-shaped string alone cannot opt a user project out of the CLI trust check. */
+export function workspaceRunHasManagedProject(permit: WorkspaceRunPermit): boolean {
+  const state = stateOf(permit); state.assertLive(); return state.managedProject;
+}
+
 export function createWorkspaceRunPermit(input: {
   binding: WorkspaceRunBinding;
   catalog: LocalWorkspaceCatalog;
@@ -79,6 +86,8 @@ export function createWorkspaceRunPermit(input: {
   lease: WorkspaceSessionLease;
   provider: Provider;
   cwd: string;
+  /** Only the Host that created this private project namespace may supply this proof. Never RPC input. */
+  managedProjectRoot?: string;
   signal: AbortSignal;
   toolNames: readonly string[];
   usage: WorkspaceUsage;
@@ -93,6 +102,9 @@ export function createWorkspaceRunPermit(input: {
   updateUsage(value: Readonly<WorkspaceUsage>): void;
 }): WorkspaceRunPermit {
   const binding = freezeWorkspaceRunBinding(input.binding), cwd = realpathSync.native(input.cwd);
+  const managedProject = input.managedProjectRoot === cwd && basename(input.catalog.home) === "home"
+    && cwd === join(dirname(input.catalog.home), "project", binding.scope.workspaceId);
+  if (input.managedProjectRoot !== undefined && !managedProject) throw new Error("Invalid managed Workspace project proof");
   if (cwd !== binding.project.root || canonical(input.resources.scope) !== canonical(binding.scope) || canonical(input.storage.scope) !== canonical(binding.scope)
     || input.lease.sessionId !== binding.sessionId || input.provider.model !== binding.connection.model
     || new Set(input.toolNames).size !== input.toolNames.length || input.toolNames.some(name => !/^[a-z][a-z0-9_]{0,63}$/.test(name))) {
@@ -178,7 +190,7 @@ export function createWorkspaceRunPermit(input: {
       }
     },
   };
-  state = { assertLive, provider, cwd, stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
+  state = { assertLive, provider, cwd, managedProject, stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
     updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false, wakeChars: 0,
     interaction: input.interaction, onQuestion: input.onQuestion, onInteractionChanged: input.onInteractionChanged, interactionUsage: input.interactionUsage, startedAt: started, toolTail: Promise.resolve(),
     audit: new WorkspaceExecutionAudit(input.storage, binding.runId, binding.agent.agentId),

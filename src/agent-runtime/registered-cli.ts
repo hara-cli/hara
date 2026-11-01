@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { runExternalCommandCapture } from "../external-sessions/process.js";
 import type { RunOpts, RunOutcome } from "../agent/loop.js";
 import type { NeutralMsg } from "../providers/types.js";
@@ -5,7 +7,7 @@ import type { TaskRuntimeBinding } from "./bindings.js";
 import type { GovernedAgentRuntimeDriver } from "./registry.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
-import { assertWorkspaceRunAdmission, beginWorkspaceGovernedRun, prepareWorkspaceRunHistory } from "../workspace/execution.js";
+import { assertWorkspaceRunAdmission, beginWorkspaceGovernedRun, prepareWorkspaceRunHistory, workspaceRunHasManagedProject } from "../workspace/execution.js";
 
 /** Native CLIs are confined to read-only/plan mode until a separate host-mediated tool bridge exists.
  * Binding a Runtime does not grant a CLI arbitrary write or shell authority. */
@@ -28,10 +30,10 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
     if (!prompt.trim() || prompt.length > 200_000 || projected.some(message => message.role === "user" && message.images?.length)) {
       return { status: "error", error: "Native Agent Runtime context is unsupported or too large" };
     }
-    const args = id === "codex" ? ["exec", prompt, "--cd", options.ctx.cwd, ...(model ? ["-m", model] : []), "--sandbox", "read-only"]
+    const args = id === "codex" ? ["exec", prompt, "--cd", options.ctx.cwd, ...(workspaceRunHasManagedProject(permit) && !existsSync(join(options.ctx.cwd, ".git")) ? ["--skip-git-repo-check"] : []), ...(model ? ["-m", model] : []), "--sandbox", "read-only"]
       : ["-p", prompt, "--output-format", "text", ...(model ? ["--model", model] : []), "--permission-mode", "plan"];
     const result = await runExternalCommandCapture({ command, env }, args, {
-      cwd: options.ctx.cwd, signal: options.signal, timeoutMs: Number(options.timeoutMs) || 120_000, maxOutputBytes: 2 * 1024 * 1024,
+      cwd: options.ctx.cwd, signal: options.signal, failureKind: "registered-cli", timeoutMs: Number(options.timeoutMs) || 120_000, maxOutputBytes: 2 * 1024 * 1024,
     });
     if (!result.ok) return { status: "error", error: `${id} Runtime failed (${result.errorCode ?? (result.timedOut ? "timeout" : "exit")}); no fallback was selected` };
     if (!result.stdout.trim()) return { status: "empty" };
