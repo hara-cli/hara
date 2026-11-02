@@ -11,6 +11,7 @@ import { assertWorkspaceRunAdmission, attachWorkspaceRuntimeModel, workspaceRunH
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { createRegisteredCliMcpTurn, WORKSPACE_MCP_TOKEN_ENV } from "./registered-cli-mcp.js";
 import { createRuntimeStageProcessObserver } from "./stage-observer.js";
+import { runtimeUseProtocolSucceeded } from "./runtime-use-success.js";
 
 /** Only the level published by this Workspace's live model inventory may reach the native CLI. */
 function codexEffortArgs(effort: string | null): string[] {
@@ -59,12 +60,14 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
     if (effort && models && !(await models.effortLaunchable(id))) {
       return { status: "error", error: "Agent Runtime '" + id + "' does not support reasoning effort; no level was applied" };
     }
+    let successfulUse: (() => void) | undefined;
     const native = createRegisteredCliMcpTurn({
       signal: options.signal!, assertCurrent, jsonEvents: id === "codex",
       async launch(endpoint, prompt, activity) {
         assertCurrent();
         // Resolve at the actual physical launch, after context preparation; recheck the installed binary.
         const resolved = installer.resolveBound(id);
+        const recordSuccessfulUse = installer.captureSuccessfulUse(id, resolved.command);
         const stages = workspaceRunRuntimeStages(permit);
         try { stages?.setRuntime({ id, version: installer.list().options.find(row => row.runtimeId === id)?.version ?? null,
           loginSource: resolved.loginSource, model, effort }); } catch { /* Metadata is diagnostic only. */ }
@@ -81,13 +84,18 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
             onStdout: chunk => { observer.onStdout(chunk); activity(); },
           });
           observer.finish(result.ok, result.errorCode, Boolean(result.stdout.trim()));
+          if (result.ok && !native.signal.aborted && runtimeUseProtocolSucceeded(id, result.stdout)) successfulUse = recordSuccessfulUse;
           return { ...result, stdout: redactToolSubprocessOutput(result.stdout, env) };
         } finally { observer.finish(false); delete env[WORKSPACE_MCP_TOKEN_ENV]; }
       },
     });
     try {
       attachWorkspaceRuntimeModel(permit, options, id, args => native.turn(args));
-      return await runGovernedAgent(history, options, id, (provider, args) => provider.turn(args));
+      const outcome = await runGovernedAgent(history, options, id, (provider, args) => provider.turn(args));
+      // A zero process exit alone is not a successful governed CLI turn (JSON errors,
+      // cancellation and protocol failures must not replace the last successful version).
+      if (outcome.status === "completed" && !options.signal?.aborted && successfulUse) { assertCurrent(); successfulUse(); }
+      return outcome;
     } finally { await native.close(history); }
   } };
 }

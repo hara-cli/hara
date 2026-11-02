@@ -72,7 +72,8 @@ export function openCodeRunArgs(cwd: string, model: string, prompt: string): str
   return ["run", "--pure", "--format", "json", "-m", model, "--dir", cwd, "--agent", "hara-general", "--", prompt];
 }
 
-function createOpenCodeTurn(input: { command: string; env: NodeJS.ProcessEnv; model: string; options: RunOpts }) {
+function createOpenCodeTurn(input: { command: string; env: NodeJS.ProcessEnv; model: string; options: RunOpts;
+  captureSuccessfulUse(): () => void; onSuccessfulUse(record: () => void): void }) {
   const stop = new AbortController();
   const signal = input.options.signal ? AbortSignal.any([input.options.signal, stop.signal]) : stop.signal;
   const pending = new Map<string, PendingCall>(), queue: PendingCall[] = [];
@@ -117,6 +118,7 @@ function createOpenCodeTurn(input: { command: string; env: NodeJS.ProcessEnv; mo
             let observer: ReturnType<typeof createRuntimeStageProcessObserver> | undefined;
             try {
               assertCurrent();
+              const recordSuccessfulUse = input.captureSuccessfulUse();
               observer = createRuntimeStageProcessObserver(workspaceRunRuntimeStages(permit), "opencode", signal);
               const result = await runExternalCommandCapture({ command: input.command, env },
                 openCodeRunArgs(input.options.ctx.cwd, input.model, prompt), {
@@ -126,6 +128,8 @@ function createOpenCodeTurn(input: { command: string; env: NodeJS.ProcessEnv; mo
                 });
               observer.finish(result.ok, result.errorCode);
               finished = parseOpenCodeRun(result);
+              // Exit zero is insufficient: the protocol must contain a successful finish frame.
+              if (result.ok && finished.stop !== "error" && !signal.aborted) { assertCurrent(); input.onSuccessfulUse(recordSuccessfulUse); }
             } catch { finished = { text: "", toolUses: [], stop: "error", errorMsg: "runtime_failed" }; }
             finally { observer?.finish(false); notify(); }
           })();
@@ -169,8 +173,17 @@ export function openCodeCliDriver(installer: WorkspaceRuntimeInstaller, models?:
     try { workspaceRunRuntimeStages(permit)?.setRuntime({ id: "opencode",
       version: installer.list().options.find(row => row.runtimeId === "opencode")?.version ?? null,
       loginSource: resolved.loginSource, model: model.modelId, effort: null }); } catch { /* Diagnostic metadata only. */ }
-    const kernel = createOpenCodeTurn({ command: resolved.command, env: resolved.env, model: model.modelId, options });
-    try { return await runGovernedAgent(history, options, "opencode", kernel.turn); }
+    let successfulUse: (() => void) | undefined;
+    const kernel = createOpenCodeTurn({ command: resolved.command, env: resolved.env, model: model.modelId, options,
+      captureSuccessfulUse: () => installer.captureSuccessfulUse("opencode", resolved.command),
+      onSuccessfulUse: record => { successfulUse = record; } });
+    try {
+      const outcome = await runGovernedAgent(history, options, "opencode", kernel.turn);
+      if (outcome.status === "completed" && !options.signal?.aborted && successfulUse) {
+        assertWorkspaceRunAdmission(permit, options, "opencode"); successfulUse();
+      }
+      return outcome;
+    }
     finally { await kernel.close(history); }
   } };
 }

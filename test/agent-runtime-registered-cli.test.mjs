@@ -32,7 +32,7 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
   const storage = new WorkspaceResourceStorage(home, row.scope); storage.initialize();
   const command = join(account, ".local", "bin", runtimeId), argv = join(account, "argv.txt");
   fs.mkdirSync(dirname(command), { recursive: true });
-  fs.writeFileSync(command, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${runtimeId} 1.2.3'; exit 0; fi\nif [ "$1" = "app-server" ]; then exit 1; fi\nif [ "$1" = "debug" ]; then echo '{"models":[{"slug":"fixture-model","display_name":"Fixture"}]}'; exit 0; fi\nprintf '%s\\n' "$@" > '${argv}'\n${managed && !hasGit ? `case " $* " in *' --skip-git-repo-check '*) ;; *) echo 'Not inside a trusted directory and --skip-git-repo-check was not specified.' >&2; exit 1;; esac` : ''}\n${failure ? `echo '${failure === 'project_not_trusted' ? 'Not inside a trusted directory' : failure === 'runtime_auth_required' ? 'websocket 401 Unauthorized PRIVATE_ACCOUNT_DETAIL' : 'PRIVATE_ACCOUNT_DETAIL'}' >&2; exit 1` : ''}\necho 'registered ${runtimeId} reply'\n`, { mode: 0o755 });
+  fs.writeFileSync(command, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${runtimeId} 1.2.3'; exit 0; fi\nif [ "$1" = "app-server" ]; then exit 1; fi\nif [ "$1" = "debug" ]; then echo '{"models":[{"slug":"fixture-model","display_name":"Fixture"}]}'; exit 0; fi\nprintf '%s\\n' "$@" > '${argv}'\n${managed && !hasGit ? `case " $* " in *' --skip-git-repo-check '*) ;; *) echo 'Not inside a trusted directory and --skip-git-repo-check was not specified.' >&2; exit 1;; esac` : ''}\n${failure ? `echo '${failure === 'project_not_trusted' ? 'Not inside a trusted directory' : failure === 'runtime_auth_required' ? 'websocket 401 Unauthorized PRIVATE_ACCOUNT_DETAIL' : 'PRIVATE_ACCOUNT_DETAIL'}' >&2; exit 1` : ''}\n${runtimeId === 'codex' ? `echo '{"type":"item.completed","item":{"type":"agent_message","text":"registered codex reply"}}'\necho '{"type":"turn.completed"}'` : `echo 'registered ${runtimeId} reply'`}\n`, { mode: 0o755 });
   const installer = new WorkspaceRuntimeInstaller(storage, { discovery: { home: account, path: "/usr/bin:/bin", systemBins: [],
     run: async (_command, args) => args[0] === "-lic" ? null : `${runtimeId} 1.2.3` } });
   const resources = new WorkspaceResources(home, row.scope, { runtimeInstaller: installer }); resources.initialize();
@@ -90,6 +90,9 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
         "a failed native run leaves no fabricated text or tool result; the common governor may retain an empty assistant boundary");
       assert.doesNotMatch(JSON.stringify(history), /PRIVATE_ACCOUNT_DETAIL/);
     } else assert.equal(history.at(-1).text, `registered ${runtimeId} reply`);
+    const versionStatus = installer.list().options.find(row => row.runtimeId === runtimeId).versionStatus;
+    assert.equal(versionStatus.lastSuccessfulVersion, failure ? null : "1.2.3");
+    assert.equal(versionStatus.compatibility, failure ? "unverified" : "previously_succeeded");
     const args = fs.readFileSync(argv, "utf8");
     assert.match(args, runtimeId === "codex" ? /read-only/ : /plan/);
     assert.equal(args.includes("--skip-git-repo-check"), managed && !hasGit);
