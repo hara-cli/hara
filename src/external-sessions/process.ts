@@ -1,3 +1,4 @@
+import { runtimeProxyFailureFromText } from "../security/runtime-proxy.js";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir, platform } from "node:os";
@@ -52,6 +53,8 @@ export interface ExternalCommandRunOptions {
   retainStdoutOnFailure?: boolean;
   /** Opt-in, allowlisted classification. Raw stderr never crosses this boundary. */
   failureKind?: "registered-cli";
+  /** Explicit Workspace proxy only; enables evidence-based proxy diagnostics without exposing stderr. */
+  proxyUrl?: string | null;
 }
 
 const safeExternalErrorCode = (stderr: string): string | undefined => {
@@ -168,7 +171,7 @@ export async function runExternalCommandCapture(
         stdout: code === 0 || run.retainStdoutOnFailure === true ? stdout : "",
         code,
         timedOut: false,
-        ...(code === 0 ? {} : { errorCode: (run.failureKind === "registered-cli" ? registeredCliFailureCode(stderr) : undefined) ?? safeExternalErrorCode(stderr) ?? "command_failed" }),
+        ...(code === 0 ? {} : { errorCode: runtimeProxyFailureFromText(stderr, Boolean(run.proxyUrl)) ?? (run.failureKind === "registered-cli" ? registeredCliFailureCode(stderr) : undefined) ?? safeExternalErrorCode(stderr) ?? "command_failed" }),
       });
     });
   });

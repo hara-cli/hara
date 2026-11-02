@@ -63,7 +63,8 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
       async launch(endpoint, prompt, activity) {
         assertCurrent();
         // Resolve at the actual physical launch, after context preparation; recheck the installed binary.
-        const resolved = installer.resolveBound(id);
+        const resolved = await installer.prepareBound(id, native.signal);
+        assertCurrent();
         const env: NodeJS.ProcessEnv = { ...resolved.env, ...endpoint.env,
           HARA_SUBPROCESS_ENV_ALLOW: [resolved.env.HARA_SUBPROCESS_ENV_ALLOW, WORKSPACE_MCP_TOKEN_ENV].filter(Boolean).join(",") };
         const args = registeredCliArgs({ id, prompt, cwd: options.ctx.cwd, model, effort,
@@ -71,7 +72,7 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
           mcp: { url: endpoint.url, timeoutMs: Number(options.timeoutMs) || 120_000 } });
         try {
           const result = await runExternalCommandCapture({ command: resolved.command, env }, args, {
-            cwd: options.ctx.cwd, signal: native.signal, failureKind: "registered-cli", timeoutMs: Number(options.timeoutMs) || 120_000,
+            cwd: options.ctx.cwd, signal: native.signal, failureKind: "registered-cli", proxyUrl: resolved.proxyUrl, timeoutMs: Number(options.timeoutMs) || 120_000,
             maxOutputBytes: 2 * 1024 * 1024, onStdout: activity,
           });
           return { ...result, stdout: redactToolSubprocessOutput(result.stdout, env) };

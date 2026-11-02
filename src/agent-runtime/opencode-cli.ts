@@ -1,3 +1,4 @@
+import { runtimeProxyFailure, runtimeProxyFailureFromText, type RuntimeProxyFailure } from "../security/runtime-proxy.js";
 import { randomUUID } from "node:crypto";
 import { runExternalCommandCapture, type ExternalCommandCaptureResult } from "../external-sessions/process.js";
 import { createCodingHostBridge, type CodingHostBridge } from "../coding/host.js";
@@ -10,13 +11,14 @@ import type { TaskRuntimeBinding } from "./bindings.js";
 import type { GovernedAgentRuntimeDriver } from "./registry.js";
 
 interface PendingCall { id: string; name: string; input: Record<string, unknown>; resolve(result: ToolResult): void }
-type Failure = "runtime_auth_required" | "runtime_network" | "invalid_model" | "runtime_permission_denied" | "runtime_failed";
+type Failure = RuntimeProxyFailure | "runtime_auth_required" | "runtime_network" | "invalid_model" | "runtime_permission_denied" | "runtime_failed";
 const record = (value: unknown): Record<string, unknown> | null =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 
 /** Only fixed categories cross the CLI boundary; raw provider errors can contain URLs or credentials. */
-export function openCodeFailure(value: unknown): Failure {
+export function openCodeFailure(value: unknown, explicitProxy = false): Failure {
   const text = JSON.stringify(value ?? "").slice(0, 16_384);
+  const proxy = runtimeProxyFailureFromText(text, explicitProxy); if (proxy) return proxy;
   if (/\b401\b|unauthori[sz]ed|authentication|not logged in|invalid.api.key/i.test(text)) return "runtime_auth_required";
   if (/unknown.model|model.not.found|model.*not.*recognized|unknown.provider/i.test(text)) return "invalid_model";
   if (/permission.denied|access.denied|forbidden|\b403\b/i.test(text)) return "runtime_permission_denied";
@@ -25,7 +27,8 @@ export function openCodeFailure(value: unknown): Failure {
 }
 
 /** Parse only the documented JSON event stream; an error frame or missing completion fails even on exit 0. */
-export function parseOpenCodeRun(result: ExternalCommandCaptureResult): TurnResult {
+export function parseOpenCodeRun(result: ExternalCommandCaptureResult, explicitProxy = false): TurnResult {
+  if (result.errorCode === "runtime_proxy_failed") return { text: "", toolUses: [], stop: "error", errorMsg: result.errorCode };
   let text = "", finished = false, failure: Failure | null = null, frames = 0;
   for (const line of result.stdout.split(/\r?\n/u)) {
     if (!line.trim()) continue;
@@ -33,7 +36,7 @@ export function parseOpenCodeRun(result: ExternalCommandCaptureResult): TurnResu
     let event: Record<string, unknown> | null;
     try { event = record(JSON.parse(line)); } catch { return { text: "", toolUses: [], stop: "error", errorMsg: "runtime_failed" }; }
     if (!event || typeof event.type !== "string" || ++frames > 4096) return { text: "", toolUses: [], stop: "error", errorMsg: "runtime_failed" };
-    if (event.type === "error") failure = openCodeFailure(event.error ?? event);
+    if (event.type === "error") failure = openCodeFailure(event.error ?? event, explicitProxy);
     if (event.type === "step_finish") finished = true;
     if (event.type === "text") {
       const part = record(event.part);
@@ -71,7 +74,7 @@ export function openCodeRunArgs(cwd: string, model: string, prompt: string): str
   return ["run", "--pure", "--format", "json", "-m", model, "--dir", cwd, "--agent", "hara-general", "--", prompt];
 }
 
-function createOpenCodeTurn(input: { command: string; env: NodeJS.ProcessEnv; model: string; options: RunOpts }) {
+function createOpenCodeTurn(input: { installer: WorkspaceRuntimeInstaller; model: string; options: RunOpts }) {
   const stop = new AbortController();
   const signal = input.options.signal ? AbortSignal.any([input.options.signal, stop.signal]) : stop.signal;
   const pending = new Map<string, PendingCall>(), queue: PendingCall[] = [];
@@ -111,17 +114,19 @@ function createOpenCodeTurn(input: { command: string; env: NodeJS.ProcessEnv; mo
         if (!prompt.trim() || prompt.length > 200_000 || args.history.some(message => message.role === "user" && message.images?.length)) {
           finished = { text: "", toolUses: [], stop: "error", errorMsg: "Native Agent Runtime context is unsupported or too large" };
         } else {
-          const env = openCodeRunEnv(input.env, bridge);
           physical = (async () => {
             try {
-              const result = await runExternalCommandCapture({ command: input.command, env },
+              const resolved = await input.installer.prepareBound("opencode", signal);
+              assertCurrent();
+              const env = openCodeRunEnv(resolved.env, bridge!);
+              const result = await runExternalCommandCapture({ command: resolved.command, env },
                 openCodeRunArgs(input.options.ctx.cwd, input.model, prompt), {
                   cwd: input.options.ctx.cwd, signal, timeoutMs: permit.binding.budget.timeoutMs,
-                  maxOutputBytes: 4 * 1024 * 1024, retainStdoutOnFailure: true,
+                  maxOutputBytes: 4 * 1024 * 1024, retainStdoutOnFailure: true, proxyUrl: resolved.proxyUrl,
                   onStdout: () => args.onActivity?.(),
                 });
-              finished = parseOpenCodeRun(result);
-            } catch { finished = { text: "", toolUses: [], stop: "error", errorMsg: "runtime_failed" }; }
+              finished = parseOpenCodeRun(result, Boolean(resolved.proxyUrl));
+            } catch (error) { finished = { text: "", toolUses: [], stop: "error", errorMsg: runtimeProxyFailure(error) ?? "runtime_failed" }; }
             finally { notify(); }
           })();
         }
@@ -161,7 +166,7 @@ export function openCodeCliDriver(installer: WorkspaceRuntimeInstaller, models?:
     if (!model.modelId || model.effort) return { status: "error", error: "OpenCode requires a selected model without reasoning variant" };
     const catalog = await models.list("opencode");
     if (!catalog.models.some(row => row.id === model.modelId)) return { status: "error", error: "OpenCode selected model is unavailable in the live catalog" };
-    const kernel = createOpenCodeTurn({ command: resolved.command, env: resolved.env, model: model.modelId, options });
+    const kernel = createOpenCodeTurn({ installer, model: model.modelId, options });
     try { return await runGovernedAgent(history, options, "opencode", kernel.turn); }
     finally { await kernel.close(history); }
   } };

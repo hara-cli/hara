@@ -1,3 +1,4 @@
+import { runtimeProxyFailure } from "../security/runtime-proxy.js";
 // A short-lived transport for one frozen Workspace attempt. It never executes a tool itself:
 // calls yield to the same Hara governor used by Pi, then receive its actual tool-result receipt.
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
@@ -174,7 +175,7 @@ export function createRegisteredCliMcpTurn(input: {
               if (!text && !result.stdout.trimStart().startsWith("{")) text = result.stdout.trim();
               finished = { text, toolUses: [], stop: "end", ...(usage ? { usage } : {}) };
             }
-          } catch { finished = { text: "", toolUses: [], stop: "error", errorMsg: "Native Agent Runtime launch failed; no fallback was selected" }; }
+          } catch (error) { finished = { text: "", toolUses: [], stop: "error", errorMsg: runtimeProxyFailure(error) ?? "Native Agent Runtime launch failed; no fallback was selected" }; }
           finally { notify(); }
         })();
       }
