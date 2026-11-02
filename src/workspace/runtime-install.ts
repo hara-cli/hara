@@ -201,11 +201,19 @@ export class WorkspaceRuntimeInstaller {
    * are respected (an explicit override is the only thing that isolates a provider, same as Raft).
    */
   private hostEnv(command: string): NodeJS.ProcessEnv {
-    // Deliberately no HOME/CODEX_HOME/CLAUDE_CONFIG_DIR override: the whole point of this mode is that
-    // the CLI keeps the login the user already has. A caller's ambient override stays in force.
+    // The Workspace engine's own HOME is NOT the user's home: Desktop launches `workspace serve` with
+    // `HOME=<root>/home` (its private data home). Inheriting that would point the CLI at an empty
+    // `<root>/home/.codex` and ask the user to sign in again — the exact failure host mode exists to
+    // remove. The OS-account home comes from the operator-only discovery home (Desktop passes the
+    // getpwuid home as HARA_WORKSPACE_DISCOVERY_HOME; an isolated candidate passes its fixture), never
+    // from RPC or model input. Without a discovery home we keep the process HOME, so test/CLI runs
+    // with an isolated HOME never reach the real account. An explicit ambient CODEX_HOME /
+    // CLAUDE_CONFIG_DIR is still respected (the only way to isolate a provider, same as Raft).
     const ambient = process.env;
+    const home = this.options.discovery?.home ?? ambient.HOME ?? userInfo().homedir;
     return {
       ...ambient,
+      HOME: home, USERPROFILE: home,
       PATH: `${dirname(command)}:${this.options.discovery?.path ?? ambient.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin"}`,
       DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0",
     };

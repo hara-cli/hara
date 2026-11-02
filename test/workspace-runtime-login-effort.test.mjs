@@ -10,6 +10,8 @@ import { startLocalWorkspaceServe } from "../dist/serve/local-workspace.js";
 import { WorkspaceResourceStorage } from "../dist/workspace/resource-context.js";
 import { WorkspaceRuntimeInstaller } from "../dist/workspace/runtime-install.js";
 import { WorkspaceRuntimeModels } from "../dist/workspace/runtime-models.js";
+import { runExternalCommandCapture } from "../dist/external-sessions/process.js";
+import { registeredCliArgs } from "../dist/agent-runtime/registered-cli.js";
 
 const roots = [];
 after(() => roots.forEach(root => fs.rmSync(root, { recursive: true, force: true })));
@@ -38,6 +40,8 @@ if [ "$1" = "debug" ] && [ "$2" = "models" ]; then
 fi
 if [ "$1" = "exec" ]; then
   printf '%s\\n' "$@" > '${path}.argv'
+  printf '%s\\n' "$HOME" > '${path}.home'
+  if [ -f "$HOME/.codex/auth.json" ]; then echo 'login=present' >> '${path}.home'; else echo 'login=missing' >> '${path}.home'; fi
   echo 'exec reply'; exit 0
 fi
 exit 1
@@ -78,9 +82,16 @@ test("a new binding reuses the host login: no HOME/CODEX_HOME override and no co
   try {
     const resolved = f.runtimes.resolveBound("codex");
     assert.equal(resolved.loginSource, "host");
-    assert.equal(resolved.env.HOME, process.env.HOME, "host mode keeps the machine home");
+    // The engine's process HOME is not the account home (Desktop sets it to the private data home);
+    // host mode must launch with the operator-supplied OS-account home instead.
+    assert.notEqual(process.env.HOME, f.host, "fixture keeps the engine HOME distinct from the account home");
+    assert.equal(resolved.env.HOME, f.host, "host mode launches with the OS-account home");
+    assert.equal(resolved.env.USERPROFILE, f.host);
     assert.equal(resolved.env.CODEX_HOME, process.env.CODEX_HOME, "host mode keeps an ambient CODEX_HOME (undefined stays undefined)");
     assert.equal(f.runtimes.list().options.find(row => row.runtimeId === "codex").loginSource, "host");
+    if (process.env.CODEX_HOME === undefined) {
+      assert.match(f.runtimes.hostCodexModelCache(), /host-cached/, "the account's ~/.codex cache is read without any CODEX_HOME override");
+    }
     const previousCodexHome = process.env.CODEX_HOME;
     try {
       process.env.CODEX_HOME = join(f.host, ".codex");
@@ -150,11 +161,51 @@ test("switching an existing binding to the host login is an explicit, recorded o
     assert.equal(f.runtimes.loginSource("codex"), "isolated");
     assert.equal(f.runtimes.setLoginSource("codex", "host"), "host");
     assert.equal(f.runtimes.loginSource("codex"), "host");
-    assert.equal(f.runtimes.resolveBound("codex").env.HOME, process.env.HOME);
+    assert.equal(f.runtimes.resolveBound("codex").env.HOME, f.host);
     assert.equal(f.runtimes.setLoginSource("codex", "isolated"), "isolated");
     assert.ok(f.runtimes.resolveBound("codex").env.HOME.startsWith(join(f.data, "home")));
     assert.throws(() => f.runtimes.setLoginSource("codex", "sideload"), /Invalid runtime login source/);
     assert.throws(() => f.runtimes.setLoginSource("opencode", "host"), /unavailable or unsafe/);
+  } finally { await f.runtimes.close(); }
+});
+
+test("Desktop-shaped engine: host mode escapes the private data HOME and never reads it as the login", async () => {
+  // Reproduces the installed app: `workspace serve` runs with HOME=<root>/home (env_clear + private data
+  // home) and HARA_WORKSPACE_DISCOVERY_HOME=<OS account home>. Before the fix, host mode inherited the
+  // private HOME, Codex found no auth.json there, and the user was asked to sign in again.
+  const f = await fixture("host");
+  const previous = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, CODEX_HOME: process.env.CODEX_HOME };
+  const privateDataHome = join(f.data, "home");
+  try {
+    process.env.HOME = privateDataHome; process.env.USERPROFILE = privateDataHome; delete process.env.CODEX_HOME;
+    const resolved = f.runtimes.resolveBound("codex");
+    assert.equal(resolved.loginSource, "host");
+    assert.equal(resolved.env.HOME, f.host, "the CLI sees the account home, not the engine's private HOME");
+    assert.equal(resolved.env.USERPROFILE, f.host);
+    assert.equal(resolved.env.CODEX_HOME, undefined, "no private CODEX_HOME is injected");
+    assert.ok(fs.existsSync(join(resolved.env.HOME, ".codex", "auth.json")), "the existing host login is where Codex will look");
+    assert.match(f.runtimes.hostCodexModelCache(), /host-cached/);
+    // Spawn through the same launcher and bounded argv the registered-CLI driver uses.
+    const launched = await runExternalCommandCapture({ command: resolved.command, env: resolved.env },
+      registeredCliArgs({ id: "codex", prompt: "hi", cwd: f.host, model: null, effort: null, skipGitRepoCheck: true }),
+      { cwd: f.host, failureKind: "registered-cli", timeoutMs: 10_000 });
+    assert.equal(launched.ok, true);
+    assert.deepEqual(fs.readFileSync(`${f.command}.home`, "utf8").trim().split("\n"), [f.host, "login=present"],
+      "the spawned CLI runs in the account home and finds the existing login");
+    assert.ok(!fs.existsSync(join(privateDataHome, ".codex")), "nothing is copied or linked into the private data home");
+  } finally {
+    for (const [key, value] of Object.entries(previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+    await f.runtimes.close();
+  }
+});
+
+test("without an operator discovery home, host mode keeps the process HOME (isolated test/CLI runs stay isolated)", async () => {
+  const f = await fixture("host");
+  try {
+    const bare = new WorkspaceRuntimeInstaller(f.storage, {});
+    assert.equal(bare.loginSource("codex"), "host");
+    assert.equal(bare.resolveBound("codex").env.HOME, process.env.HOME);
+    await bare.close();
   } finally { await f.runtimes.close(); }
 });
 
