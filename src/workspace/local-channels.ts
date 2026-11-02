@@ -8,20 +8,34 @@ import { WorkspaceConversationStore } from "./conversations.js";
 import { WorkspaceSessionLease } from "./session-lease.js";
 import { channelSessionId } from "./channel-session.js";
 import { redactSensitiveText } from "../security/secrets.js";
+import { channelRoleUnrelated, type ChannelPrefilterProfile } from "./channel-prefilter.js";
 
 export interface LocalChannel { id: string; name: string; memberIds: string[]; createdAt: string }
 interface Catalog { schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; channels: LocalChannel[] }
-type ReplyState = "queued" | "running" | "completed" | "cancelled" | "failed" | "interrupted";
-interface Reply { agentId: string; displayName: string; requestId: string; runId: string | null; startIndex: number; endIndex: number | null; state: ReplyState; questionId?: string;
-  /** Peer wake (Raft-learned): the member whose reply queued this one, and its optional untrusted note. */
-  wokenBy?: string; wakeNote?: string }
-interface ChannelTurn { id: string; digest: string; body: string; createdAt: string; state: "running" | "completed" | "cancelled" | "interrupted"; replies: Reply[] }
+type ReplyState = "queued" | "running" | "completed" | "cancelled" | "failed" | "interrupted" | "passed";
+interface Reply {
+  agentId: string; displayName: string; requestId: string; runId: string | null; startIndex: number; endIndex: number | null;
+  state: ReplyState; questionId?: string; wokenBy?: string; wakeNote?: string;
+  passedBy?: "prefilter"; passReason?: "role_unrelated";
+}
+interface ChannelTurn {
+  id: string; digest: string; body: string; createdAt: string;
+  state: "queued" | "running" | "completed" | "cancelled" | "interrupted"; replies: Reply[];
+}
 interface ChannelHistory { schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; channelId: string; turns: ChannelTurn[] }
-export interface LocalChannelMessage { id: string; turnId: string; agentId: string | null; displayName: string; createdAt: string;
-  message: { role: "user"; content: string } | { role: "assistant"; text: string; tools: string[] } | { role: "tool"; results: { id: string; name: string; content: string; isError: boolean }[] } }
-interface ActiveTurn { cancelled: boolean; runId: string | null; agentId: string | null; promise: Promise<void>; lease: WorkspaceSessionLease }
+export interface LocalChannelMessage {
+  id: string; turnId: string; agentId: string | null; displayName: string; createdAt: string;
+  message: { role: "user"; content: string } | { role: "assistant"; text: string; tools: string[] }
+    | { role: "tool"; results: { id: string; name: string; content: string; isError: boolean }[] };
+}
+interface ActiveTurn {
+  turnId: string; cancelled: boolean; runId: string | null; agentId: string | null;
+  promise: Promise<void>; lease: WorkspaceSessionLease;
+}
 interface ChannelHost {
   agents(): WorkspaceAgentView[];
+  /** Host-private persona projection; never sent to the renderer or written into PASS reasons. */
+  prefilterProfiles?(): ChannelPrefilterProfile[];
   start(agentId: string, body: string, requestId: string, channelId: string, context: string, clientId: string, questionId?: string): { runId: string };
   wait(runId: string): Promise<void>;
   cancel(agentId: string, runId: string): void;
@@ -32,18 +46,17 @@ const time = (v: unknown) => typeof v === "string" && Number.isFinite(Date.parse
 const ids = (v: unknown): v is string[] => Array.isArray(v) && v.every(isWorkspaceAgentId) && new Set(v).size === v.length;
 const nonnegative = (v: unknown): v is number => Number.isSafeInteger(v) && Number(v) >= 0;
 const WAKE_NOTE_MAX = 500;
-const optionalReplyKeys = ["questionId", "wokenBy", "wakeNote"];
-/** ASCII word chars only — so `@Bob` never matches inside `@Bobby`, while `@小明你好` still resolves `小明`. */
+export const LOCAL_CHANNEL_QUEUE_LIMIT = 5;
+const optionalReplyKeys = ["questionId", "wokenBy", "wakeNote", "passedBy", "passReason"];
 const asciiWordEnd = /[A-Za-z0-9_]$/, asciiWordStart = /^[A-Za-z0-9_]/;
 
-/** `@displayName` / `@agentId` mentions of channel members, in body order. The longest name wins at each `@`; an ASCII name
- * ending in a letter/digit must not run into another ASCII word char. CJK names need no trailing separator. */
+/** Longest exact member name wins; an e-mail address or a partial ASCII word is not a mention. */
 export function channelMentions(body: string, members: { agentId: string; displayName: string }[]): string[] {
   const names = members.flatMap(row => [{ agentId: row.agentId, name: row.displayName.toLowerCase() }, { agentId: row.agentId, name: row.agentId.toLowerCase() }])
     .filter(row => row.name.length > 0).sort((a, b) => b.name.length - a.name.length);
   const found: string[] = [];
   for (let at = body.indexOf("@"); at >= 0; at = body.indexOf("@", at + 1)) {
-    if (at > 0 && /[\p{L}\p{N}_.]/u.test(body[at - 1]!)) continue; // an e-mail address, not a mention
+    if (at > 0 && /[\p{L}\p{N}_.]/u.test(body[at - 1]!)) continue;
     const rest = body.slice(at + 1), lower = rest.toLowerCase();
     const hit = names.find(row => lower.startsWith(row.name) && !(asciiWordEnd.test(row.name) && asciiWordStart.test(rest.slice(row.name.length))));
     if (hit && !found.includes(hit.agentId)) found.push(hit.agentId);
@@ -51,11 +64,14 @@ export function channelMentions(body: string, members: { agentId: string; displa
   return found;
 }
 
-/** Local room metadata, transcript references and execution queue. No Account or collab dependency. */
+/** Private persisted room queue. A queued turn has never been dispatched and is not a runtime resume. */
 export class WorkspaceLocalChannels {
   private readonly catalog: WorkspaceJsonState<Catalog>;
   private readonly active = new Map<string, ActiveTurn>();
   private readonly cleanupFailed = new Set<string>();
+  /** Socket identities are transient: a restart requires an explicit current client to resume the queue. */
+  private readonly queuedClients = new Map<string, string>();
+  private closed = false;
   constructor(private readonly storage: WorkspaceResourceStorage, private readonly host: ChannelHost) {
     this.catalog = new WorkspaceJsonState(storage, "local-channels.json", value => {
       if (!plain(value) || !exact(value, ["schemaVersion", "revision", "resourceBinding", "channels"]) || value.schemaVersion !== 1 || !positive(value.revision)
@@ -69,6 +85,8 @@ export class WorkspaceLocalChannels {
       return structuredClone(value) as unknown as Catalog;
     }, () => ({ schemaVersion: 1, revision: 0, resourceBinding: this.catalog.binding(), channels: [] }));
   }
+  private accepting() { return !this.closed && this.host.accepting(); }
+  private clientKey(channelId: string, turnId: string) { return channelId + ":" + turnId; }
   list() { const value = this.catalog.read(); return { revision: value.revision, channels: value.channels }; }
   get(channelId: string): LocalChannel {
     if (!UUID.test(channelId)) throw new Error("invalid local channel identity");
@@ -76,12 +94,12 @@ export class WorkspaceLocalChannels {
     if (!row) throw new Error("local channel is not in this Workspace");
     return row;
   }
-  private members(memberIds: unknown): asserts memberIds is string[] {
-    if (!ids(memberIds) || memberIds.some(id => !this.host.agents().some(agent => agent.agentId === id && agent.kind === "colleague" && agent.state === "active")))
+  private members(memberIds: unknown, roster = this.host.agents()): asserts memberIds is string[] {
+    if (!ids(memberIds) || memberIds.some(id => !roster.some(agent => agent.agentId === id && agent.kind === "colleague" && agent.state === "active")))
       throw new Error("channel members must be active colleagues in this Workspace");
   }
   create(id: string, name: string, memberIds: unknown, expectedRevision: number) {
-    if (!this.host.accepting() || !UUID.test(id) || !text(name, 80)) throw new Error("invalid local channel creation");
+    if (!this.accepting() || !UUID.test(id) || !text(name, 80)) throw new Error("invalid local channel creation");
     this.members(memberIds);
     const prior = this.catalog.read().channels.find(row => row.id === id);
     if (prior) {
@@ -92,7 +110,7 @@ export class WorkspaceLocalChannels {
     this.host.changed(); return this.list();
   }
   update(channelId: string, name: string, memberIds: unknown, expectedRevision: number) {
-    if (!this.host.accepting() || !text(name, 80) || this.active.has(channelId)) throw new Error("channel is busy or name is invalid");
+    if (!this.accepting() || !text(name, 80) || this.active.has(channelId)) throw new Error("channel is busy or name is invalid");
     this.get(channelId); this.members(memberIds);
     const lease = WorkspaceSessionLease.acquire(this.storage, channelSessionId(channelId, "room-queue"));
     try { this.catalog.update(expectedRevision, value => { lease.assertCurrent(); const row = value.channels.find(row => row.id === channelId)!; row.name = name; row.memberIds = memberIds; return value; }); }
@@ -100,14 +118,14 @@ export class WorkspaceLocalChannels {
     this.host.changed(); return this.list();
   }
   private history(channelId: string) {
-    return new WorkspaceJsonState<ChannelHistory>(this.storage, `local-channel-${channelId}.json`, value => {
+    return new WorkspaceJsonState<ChannelHistory>(this.storage, "local-channel-" + channelId + ".json", value => {
       if (!plain(value) || !exact(value, ["schemaVersion", "revision", "resourceBinding", "channelId", "turns"]) || value.schemaVersion !== 1 || !positive(value.revision)
         || value.channelId !== channelId || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, this.catalog.binding()) || !Array.isArray(value.turns)) throw new Error("invalid channel history; retained");
       const seen = new Set<string>();
       for (const turn of value.turns) {
         if (!plain(turn) || !exact(turn, ["id", "digest", "body", "createdAt", "state", "replies"]) || typeof turn.id !== "string" || !UUID.test(turn.id) || seen.has(turn.id)
           || typeof turn.digest !== "string" || !/^[a-f0-9]{64}$/.test(turn.digest) || !messageBody(turn.body) || !time(turn.createdAt)
-          || !["running", "completed", "cancelled", "interrupted"].includes(String(turn.state)) || !Array.isArray(turn.replies)) throw new Error("invalid channel turn; retained");
+          || !["queued", "running", "completed", "cancelled", "interrupted"].includes(String(turn.state)) || !Array.isArray(turn.replies)) throw new Error("invalid channel turn; retained");
         const members = new Set<string>();
         for (const reply of turn.replies) {
           if (!plain(reply) || !exact(reply, ["agentId", "displayName", "requestId", "runId", "startIndex", "endIndex", "state", ...optionalReplyKeys.filter(key => Object.hasOwn(reply, key))]) || !isWorkspaceAgentId(reply.agentId) || members.has(reply.agentId)
@@ -116,159 +134,276 @@ export class WorkspaceLocalChannels {
             || (reply.wokenBy !== undefined && (!isWorkspaceAgentId(reply.wokenBy) || reply.wokenBy === reply.agentId))
             || (reply.wakeNote !== undefined && (reply.wokenBy === undefined || !messageBody(reply.wakeNote, WAKE_NOTE_MAX)))
             || !nonnegative(reply.startIndex) || (reply.endIndex !== null && (!nonnegative(reply.endIndex) || reply.endIndex < reply.startIndex))
-            || !["queued", "running", "completed", "cancelled", "failed", "interrupted"].includes(String(reply.state))) throw new Error("invalid channel reply; retained");
+            || !["queued", "running", "completed", "cancelled", "failed", "interrupted", "passed"].includes(String(reply.state))) throw new Error("invalid channel reply; retained");
+          if (reply.state === "passed") {
+            if (reply.passedBy !== "prefilter" || reply.passReason !== "role_unrelated" || reply.runId !== null || reply.startIndex !== 0 || reply.endIndex !== null
+              || reply.questionId !== undefined || reply.wokenBy !== undefined) throw new Error("invalid prefilter pass; retained");
+          } else if (reply.passedBy !== undefined || reply.passReason !== undefined) throw new Error("pass metadata is only valid on passed replies");
+          if (turn.state === "queued" && (reply.runId !== null || !["queued", "passed"].includes(String(reply.state)))) throw new Error("queued turn already contains a started reply; retained");
           members.add(reply.agentId);
         }
         seen.add(turn.id);
       }
+      if (value.turns.filter(turn => (turn as ChannelTurn).state === "queued").length > LOCAL_CHANNEL_QUEUE_LIMIT) throw new Error("channel queue exceeds its limit; retained");
       return structuredClone(value) as unknown as ChannelHistory;
     }, () => ({ schemaVersion: 1, revision: 0, resourceBinding: this.catalog.binding(), channelId, turns: [] }));
   }
   snapshot(channelId: string) {
     const channel = this.get(channelId), value = this.history(channelId).read(), active = this.active.get(channelId);
-    const messages: LocalChannelMessage[] = [];
+    const messages: LocalChannelMessage[] = [], started = new Set<string>();
     for (const turn of value.turns) {
       messages.push({ id: turn.id, turnId: turn.id, agentId: null, displayName: "", createdAt: turn.createdAt, message: { role: "user", content: turn.body } });
       for (const reply of turn.replies) {
-        if (!reply.runId && reply.state === "queued") continue;
+        if (reply.runId) started.add(reply.requestId);
+        if (reply.state === "passed" || (!reply.runId && ["queued", "cancelled"].includes(reply.state))) continue;
         const conversation = new WorkspaceConversationStore(this.storage, reply.agentId, channelId).read();
         const accepted = conversation.requests.find(row => row.requestId === reply.requestId);
         if (!accepted && !reply.runId) continue;
-        // The accepted request must belong to this reply; no stale/foreign session can enter a room.
         if (!accepted || (reply.runId && accepted.runId !== reply.runId)) throw new Error("channel response ownership changed");
+        started.add(reply.requestId);
         const history = conversation.history.slice(reply.startIndex + 1, reply.endIndex ?? undefined);
-        history.forEach((message, index) => messages.push({ id: `${turn.id}:${reply.agentId}:${index}`, turnId: turn.id, agentId: reply.agentId, displayName: reply.displayName, createdAt: turn.createdAt,
+        history.forEach((message, index) => messages.push({ id: turn.id + ":" + reply.agentId + ":" + index, turnId: turn.id, agentId: reply.agentId, displayName: reply.displayName, createdAt: turn.createdAt,
           message: message.role === "assistant" ? { role: "assistant", text: message.text, tools: message.toolUses.map(tool => tool.name) }
             : message.role === "tool" ? { role: "tool", results: message.results.map(row => ({ ...row, isError: row.isError ?? false })) } : { role: "user", content: message.content } }));
       }
     }
-    const last = value.turns.at(-1);
-    return { channel, revision: value.revision, state: active ? active.cancelled ? "draining" : "running" : this.cleanupFailed.has(channelId) || last?.state === "running" ? "interrupted" : last?.state ?? "idle",
+    const pendingCount = value.turns.filter(turn => turn.state === "queued").length, last = value.turns.filter(turn => turn.state !== "queued").at(-1);
+    return { channel, revision: value.revision,
+      state: active ? active.cancelled ? "draining" : "running" : this.cleanupFailed.has(channelId) || last?.state === "running" ? "interrupted" : pendingCount ? "queued" : last?.state ?? "idle",
+      pendingCount, queueNeedsResume: pendingCount > 0 && !active,
       turns: value.turns.map(turn => ({ id: turn.id, state: !active && turn.state === "running" ? "interrupted" : turn.state,
-        replies: turn.replies.map(reply => ({ agentId: reply.agentId, displayName: reply.displayName, state: !active && ["queued", "running"].includes(reply.state) ? "interrupted" : reply.state,
-          ...(reply.wokenBy ? { wokenBy: reply.wokenBy } : {}) })) })), messages };
+        replies: turn.replies.map(reply => ({ agentId: reply.agentId, displayName: reply.displayName, started: started.has(reply.requestId),
+          state: !active && turn.state !== "queued" && ["queued", "running"].includes(reply.state) ? "interrupted" : reply.state,
+          ...(reply.wokenBy ? { wokenBy: reply.wokenBy } : {}),
+          ...(reply.state === "passed" ? { passedBy: reply.passedBy!, passReason: reply.passReason! } : {}) })) })), messages };
   }
   receipt(channelId: string, requestId: string) {
     this.get(channelId); if (!UUID.test(requestId)) throw new Error("invalid channel receipt");
-    return { channelId, requestId, state: this.history(channelId).read().turns.some(row => row.id === requestId) ? "accepted" : "unknown" };
+    const turns = this.history(channelId).read().turns, turn = turns.find(row => row.id === requestId), queue = turns.filter(row => row.state === "queued");
+    return { channelId, requestId, state: turn ? "accepted" : "unknown", queued: turn?.state === "queued", position: turn?.state === "queued" ? queue.findIndex(row => row.id === requestId) + 1 : 0 };
   }
-  private name(agentId: string) { return this.host.agents().find(row => row.agentId === agentId)?.identity.displayName ?? agentId; }
+  private name(agentId: string, roster = this.host.agents()) { return roster.find(row => row.agentId === agentId)?.identity.displayName ?? agentId; }
   private context(channelId: string, wake?: { by: string; note?: string }) {
-    const snapshot = this.snapshot(channelId);
-    return JSON.stringify({ channel: snapshot.channel.name, members: snapshot.channel.memberIds.map(id => ({ agentId: id, name: this.name(id) })),
-      messages: snapshot.messages.map(row => ({ sender: row.agentId ? row.displayName : "User", message: row.message })),
-      // A peer's wake note is conversation data from another participant, never user authority.
-      ...(wake ? { wokenBy: { agentId: wake.by, name: this.name(wake.by), ...(wake.note ? { note: wake.note } : {}) } } : {}) });
+    const snapshot = this.snapshot(channelId), active = this.active.get(channelId), turnIndex = active ? snapshot.turns.findIndex(turn => turn.id === active.turnId) : snapshot.turns.length - 1;
+    const visible = new Set(snapshot.turns.slice(0, turnIndex + 1).map(turn => turn.id)), roster = this.host.agents();
+    return JSON.stringify({ channel: snapshot.channel.name, members: snapshot.channel.memberIds.map(id => ({ agentId: id, name: this.name(id, roster) })),
+      messages: snapshot.messages.filter(row => visible.has(row.turnId)).map(row => ({ sender: row.agentId ? row.displayName : "User", message: row.message })),
+      ...(wake ? { wokenBy: { agentId: wake.by, name: this.name(wake.by, roster), ...(wake.note ? { note: wake.note } : {}) } } : {}) });
   }
-  /** channel_sync: the same JSON a reply receives at start, re-read now so replies written mid-turn are visible. Read-only. */
   sync(channelId: string) { return this.context(channelId); }
-  /** channel_peer_wake: the reply running right now queues another member into the same turn. Still serial; no re-entry. */
   peerWake(channelId: string, runId: string, agentId: string, target: string, note?: string) {
     const channel = this.get(channelId), active = this.active.get(channelId);
-    // Outside an active reply is a host misuse; expected wake refusals return structured {ok:false} so the
-    // colleague can keep working (throw would mark the tool isError and can end the channel run early).
     if (!active || active.cancelled || active.runId !== runId || active.agentId !== agentId) throw new Error("peer wake is only available to the colleague currently replying in this channel turn");
-    if (note !== undefined && !messageBody(note, WAKE_NOTE_MAX)) return { ok: false as const, error: `wake note must be 1-${WAKE_NOTE_MAX} plain characters` };
-    const wanted = target.replace(/^@/, "").trim().toLowerCase();
-    const matches = channel.memberIds.filter(id => id.toLowerCase() === wanted || this.name(id).toLowerCase() === wanted);
-    if (matches.length !== 1) {
-      return { ok: false as const, error: matches.length ? "more than one channel member has that name; wake by exact agentId" : "peer wake target is not a member of this channel" };
-    }
+    if (note !== undefined && !messageBody(note, WAKE_NOTE_MAX)) return { ok: false as const, error: "wake note must be 1-" + WAKE_NOTE_MAX + " plain characters" };
+    const roster = this.host.agents(), wanted = target.replace(/^@/, "").trim().toLowerCase();
+    const matches = channel.memberIds.filter(id => id.toLowerCase() === wanted || this.name(id, roster).toLowerCase() === wanted);
+    if (matches.length !== 1) return { ok: false as const, error: matches.length ? "more than one channel member has that name; wake by exact agentId" : "peer wake target is not a member of this channel" };
     const targetId = matches[0]!;
     if (targetId === agentId) return { ok: false as const, error: "a colleague cannot wake itself" };
-    this.members([targetId]); active.lease.assertCurrent();
-    const state = this.history(channelId), value = state.read(), prior = value.turns.at(-1)!.replies.find(row => row.agentId === targetId);
-    if (prior && prior.state !== "queued") return { ok: false as const, error: "that colleague already replied in this turn; no re-entry" };
-    if (!prior) {
-      state.update(value.revision, next => { active.lease.assertCurrent();
-        next.turns.at(-1)!.replies.push({ agentId: targetId, displayName: this.name(targetId), requestId: randomUUID(), runId: null, startIndex: 0, endIndex: null, state: "queued",
-          wokenBy: agentId, ...(note ? { wakeNote: redactSensitiveText(note).text } : {}) }); return next; });
+    this.members([targetId], roster); active.lease.assertCurrent();
+    const state = this.history(channelId), value = state.read(), turn = value.turns.find(row => row.id === active.turnId)!;
+    const prior = turn.replies.find(row => row.agentId === targetId);
+    if (prior && !["queued", "passed"].includes(prior.state)) return { ok: false as const, error: "that colleague already replied in this turn; no re-entry" };
+    if (!prior || prior.state === "passed") {
+      state.update(value.revision, next => {
+        active.lease.assertCurrent();
+        const replies = next.turns.find(row => row.id === active.turnId)!.replies;
+        const previous = replies.findIndex(row => row.agentId === targetId);
+        const entry: Reply = previous >= 0 ? replies.splice(previous, 1)[0]! : { agentId: targetId, displayName: this.name(targetId, roster), requestId: randomUUID(), runId: null, startIndex: 0, endIndex: null, state: "queued" };
+        delete entry.passedBy; delete entry.passReason;
+        entry.state = "queued"; entry.wokenBy = agentId;
+        if (note) entry.wakeNote = redactSensitiveText(note).text;
+        replies.push(entry); return next;
+      });
       this.host.changed();
     }
-    return { ok: true as const, queued: true, alreadyQueued: Boolean(prior), agentId: targetId, displayName: this.name(targetId) };
+    return { ok: true as const, queued: true, alreadyQueued: prior?.state === "queued", agentId: targetId, displayName: this.name(targetId, roster) };
+  }
+  private recoverInterrupted(value: ChannelHistory, lease: WorkspaceSessionLease): ChannelHistory {
+    lease.assertCurrent();
+    for (const old of value.turns) if (old.state === "running") {
+      old.state = "interrupted";
+      for (const row of old.replies) {
+        const wasRunning = row.state === "running";
+        if (["queued", "running"].includes(row.state)) row.state = "interrupted";
+        if (row.endIndex !== null || row.state === "passed" || (!row.runId && !wasRunning)) continue;
+        const conversation = new WorkspaceConversationStore(this.storage, row.agentId, value.channelId).read();
+        row.runId ??= conversation.requests.find(entry => entry.requestId === row.requestId)?.runId ?? null;
+        if (row.runId) row.endIndex = conversation.history.length;
+      }
+    }
+    return value;
+  }
+  private begin(channelId: string, turnId: string, clientId: string, lease: WorkspaceSessionLease) {
+    const state = this.history(channelId), before = state.read();
+    state.update(before.revision, next => { this.recoverInterrupted(next, lease); next.turns.find(row => row.id === turnId)!.state = "running"; return next; });
+    const active: ActiveTurn = { turnId, cancelled: false, runId: null, agentId: null, promise: Promise.resolve(), lease };
+    this.active.set(channelId, active); this.cleanupFailed.delete(channelId);
+    active.promise = this.run(clientId, channelId, active);
+    this.host.changed();
   }
   send(clientId: string, channelId: string, body: string, requestId: string, recipientIds: unknown, questionId?: string) {
-    const channel = this.get(channelId);
-    if (!this.host.accepting() || !messageBody(body) || !UUID.test(requestId) || !ids(recipientIds) || recipientIds.some(id => !channel.memberIds.includes(id))) throw new Error("invalid local channel message or recipients");
-    this.members(recipientIds);
-    // Mentions widen a non-empty recipient list only; with no recipients the message is a note to the room and starts nobody.
-    const available = channel.memberIds.filter(id => this.host.agents().some(row => row.agentId === id && row.kind === "colleague" && row.state === "active"));
-    const recipients = recipientIds.length ? [...recipientIds, ...channelMentions(body, available.map(id => ({ agentId: id, displayName: this.name(id) })))
-      .filter(id => !recipientIds.includes(id))] : recipientIds;
+    const channel = this.get(channelId), roster = this.host.agents();
+    if (!this.accepting() || !messageBody(body) || !UUID.test(requestId) || !ids(recipientIds) || recipientIds.some(id => !channel.memberIds.includes(id))) throw new Error("invalid local channel message or recipients");
+    this.members(recipientIds, roster);
+    const available = channel.memberIds.filter(id => roster.some(row => row.agentId === id && row.kind === "colleague" && row.state === "active"));
+    const mentioned = channelMentions(body, available.map(id => ({ agentId: id, displayName: this.name(id, roster) })));
+    const recipients = recipientIds.length ? [...recipientIds, ...mentioned.filter(id => !recipientIds.includes(id))] : recipientIds;
     const state = this.history(channelId), before = state.read(), digest = createHash("sha256").update(canonical(questionId ? [body, recipientIds, questionId] : [body, recipientIds])).digest("hex");
     const duplicate = before.turns.find(row => row.id === requestId);
-    if (duplicate) { if (duplicate.digest !== digest) throw new Error("channel message identity already used"); return { channelId, requestId, accepted: true }; }
-    if (this.active.has(channelId)) throw new Error("channel colleagues are still working");
-    const lease = WorkspaceSessionLease.acquire(this.storage, channelSessionId(channelId, "room-queue"));
+    if (duplicate) {
+      if (duplicate.digest !== digest) throw new Error("channel message identity already used");
+      const receipt = this.receipt(channelId, requestId);
+      return { channelId, requestId, accepted: true, queued: receipt.queued, position: receipt.position };
+    }
+    const pendingCount = before.turns.filter(turn => turn.state === "queued").length, existing = this.active.get(channelId);
+    if (pendingCount >= LOCAL_CHANNEL_QUEUE_LIMIT) throw new Error("channel queue is full (maximum 5); message was not accepted");
+    const lease = existing?.lease ?? WorkspaceSessionLease.acquire(this.storage, channelSessionId(channelId, "room-queue"));
+    let retained = false;
     try {
+      lease.assertCurrent();
+      const profiles = recipients.length >= 3 && !questionId ? this.host.prefilterProfiles?.() : undefined;
+      const replies: Reply[] = recipients.map(agentId => {
+        const unrelated = profiles !== undefined && !mentioned.includes(agentId) && channelRoleUnrelated(body, profiles.find(row => row.agentId === agentId));
+        return { agentId, displayName: this.name(agentId, roster), requestId: randomUUID(), runId: null, startIndex: 0, endIndex: null,
+          state: unrelated ? "passed" : "queued", ...(unrelated ? { passedBy: "prefilter" as const, passReason: "role_unrelated" as const } : {}), ...(questionId ? { questionId } : {}) };
+      });
       state.update(before.revision, value => {
-        for (const old of value.turns) {
-          if (old.state === "running") old.state = "interrupted";
-          for (const row of old.replies) {
-            if (["queued", "running"].includes(row.state)) row.state = "interrupted";
-            if (row.endIndex !== null) continue;
-            const conversation = new WorkspaceConversationStore(this.storage, row.agentId, channelId).read();
-            row.runId ??= conversation.requests.find(entry => entry.requestId === row.requestId)?.runId ?? null;
-            if (row.runId) row.endIndex = conversation.history.length;
+        lease.assertCurrent();
+        value.turns.push({ id: requestId, digest, body: redactSensitiveText(body).text, createdAt: new Date().toISOString(), state: "queued", replies });
+        return value;
+      });
+      this.queuedClients.set(this.clientKey(channelId, requestId), clientId);
+      const queued = Boolean(existing) || pendingCount > 0;
+      if (!queued) { this.begin(channelId, requestId, clientId, lease); retained = true; }
+      this.host.changed();
+      return { channelId, requestId, accepted: true, queued, position: queued ? pendingCount + 1 : 0 };
+    } finally { if (!existing && !retained) lease.release(); }
+  }
+  resumeQueue(clientId: string, channelId: string) {
+    this.get(channelId);
+    if (!this.accepting()) throw new Error("channel is not accepting new work");
+    if (this.active.has(channelId)) return { channelId, resumed: false, pendingCount: this.snapshot(channelId).pendingCount };
+    const state = this.history(channelId), before = state.read(), queued = before.turns.filter(turn => turn.state === "queued");
+    if (!queued.length) return { channelId, resumed: false, pendingCount: 0 };
+    const lease = WorkspaceSessionLease.acquire(this.storage, channelSessionId(channelId, "room-queue"));
+    let retained = false;
+    try {
+      lease.assertCurrent();
+      for (const turn of queued) this.queuedClients.set(this.clientKey(channelId, turn.id), clientId);
+      this.begin(channelId, queued[0]!.id, clientId, lease); retained = true;
+      return { channelId, resumed: true, pendingCount: queued.length - 1 };
+    } finally { if (!retained) lease.release(); }
+  }
+  clearQueue(channelId: string) {
+    this.get(channelId);
+    if (!this.accepting()) throw new Error("channel is not accepting queue changes");
+    const active = this.active.get(channelId), lease = active?.lease ?? WorkspaceSessionLease.acquire(this.storage, channelSessionId(channelId, "room-queue"));
+    try {
+      lease.assertCurrent();
+      const state = this.history(channelId), before = state.read();
+      const cleared = before.turns.filter(turn => turn.state === "queued").map(turn => turn.id);
+      if (cleared.length) state.update(before.revision, next => {
+        lease.assertCurrent();
+        for (const turn of next.turns) if (turn.state === "queued") {
+          turn.state = "cancelled";
+          for (const reply of turn.replies) if (reply.state === "queued") reply.state = "cancelled";
+        }
+        return next;
+      });
+      for (const id of cleared) this.queuedClients.delete(this.clientKey(channelId, id));
+      this.host.changed(); return { channelId, cleared: cleared.length };
+    } finally { if (!active) lease.release(); }
+  }
+  private changeReply(channelId: string, turnId: string, requestId: string, change: (reply: Reply) => void) {
+    const active = this.active.get(channelId);
+    if (!active || active.turnId !== turnId) throw new Error("channel turn is not owned");
+    active.lease.assertCurrent();
+    const state = this.history(channelId), value = state.read();
+    state.update(value.revision, next => { change(next.turns.find(row => row.id === turnId)!.replies.find(row => row.requestId === requestId)!); return next; });
+    this.host.changed();
+  }
+  private async runTurn(clientId: string, channelId: string, active: ActiveTurn) {
+    const turnId = active.turnId;
+    while (true) {
+      const turn = this.history(channelId).read().turns.find(row => row.id === turnId)!;
+      const reply = turn.replies.find(row => row.state === "queued");
+      if (!reply || active.cancelled || !this.accepting()) break;
+      active.lease.assertCurrent();
+      let admitted = false, attempted = false;
+      try {
+        if (!this.get(channelId).memberIds.includes(reply.agentId)) throw new Error("queued colleague is no longer a channel member");
+        this.members([reply.agentId]);
+        const store = new WorkspaceConversationStore(this.storage, reply.agentId, channelId), startIndex = store.read().history.length;
+        this.changeReply(channelId, turnId, reply.requestId, row => { row.startIndex = startIndex; row.state = "running"; });
+        attempted = true;
+        const accepted = this.host.start(reply.agentId, turn.body, reply.requestId, channelId,
+          this.context(channelId, reply.wokenBy ? { by: reply.wokenBy, note: reply.wakeNote } : undefined), clientId, reply.questionId);
+        active.runId = accepted.runId; active.agentId = reply.agentId; active.lease.setDraining(true);
+        this.changeReply(channelId, turnId, reply.requestId, row => { row.runId = accepted.runId; });
+        admitted = true;
+        await this.host.wait(accepted.runId); active.lease.setDraining(false);
+        const completed = store.read();
+        this.changeReply(channelId, turnId, reply.requestId, row => {
+          row.endIndex = completed.history.length;
+          row.state = completed.attempt?.state === "completed" ? "completed" : completed.attempt?.state === "cancelled" ? "cancelled" : "failed";
+        });
+      } catch {
+        if (attempted && !admitted) {
+          // A throwing start may already have accepted the request. Pause rather than infer rejection.
+          active.cancelled = true;
+          if (!active.runId) {
+            const accepted = new WorkspaceConversationStore(this.storage, reply.agentId, channelId).read().requests.find(row => row.requestId === reply.requestId);
+            if (accepted) { active.runId = accepted.runId; active.agentId = reply.agentId; active.lease.setDraining(true); }
           }
         }
-        value.turns.push({ id: requestId, digest, body: redactSensitiveText(body).text, createdAt: new Date().toISOString(), state: "running", replies: recipients.map(agentId => ({ agentId,
-          displayName: this.host.agents().find(row => row.agentId === agentId)!.identity.displayName, requestId: randomUUID(), runId: null, startIndex: 0, endIndex: null, state: "queued", ...(questionId ? { questionId } : {}) })) }); return value;
-      });
-    } catch (error) { lease.release(); throw error; }
-    const active: ActiveTurn = { cancelled: false, runId: null, agentId: null, promise: Promise.resolve(), lease }; this.active.set(channelId, active);
-    this.cleanupFailed.delete(channelId);
-    active.promise = this.run(clientId, channelId, requestId, active); this.host.changed();
-    return { channelId, requestId, accepted: true };
+        if (active.runId && active.agentId) {
+          try { this.host.cancel(active.agentId, active.runId); } catch { /* Already settled. */ }
+          await this.host.wait(active.runId); active.lease.setDraining(false);
+          if (!admitted) active.cancelled = true; // Accepted but receipt publication failed: never replay or advance the queue.
+        }
+        this.changeReply(channelId, turnId, reply.requestId, row => {
+          row.state = "failed";
+          if (active.runId) { row.runId = active.runId; row.endIndex = new WorkspaceConversationStore(this.storage, row.agentId, channelId).read().history.length; }
+        });
+      } finally { active.runId = null; active.agentId = null; }
+    }
+    const state = this.history(channelId), value = state.read();
+    state.update(value.revision, next => {
+      active.lease.assertCurrent(); const turn = next.turns.find(row => row.id === turnId)!;
+      turn.state = active.cancelled || !this.accepting() ? "cancelled" : "completed";
+      for (const row of turn.replies) if (row.state === "queued") row.state = "cancelled";
+      return next;
+    });
+    this.host.changed();
   }
-  private changeReply(channelId: string, turnId: string, index: number, change: (reply: Reply) => void) {
-    const active = this.active.get(channelId); if (!active) throw new Error("channel turn is not owned"); active.lease.assertCurrent();
-    const state = this.history(channelId), value = state.read(); state.update(value.revision, next => { change(next.turns.find(row => row.id === turnId)!.replies[index]!); return next; }); this.host.changed();
-  }
-  private async run(clientId: string, channelId: string, turnId: string, active: ActiveTurn) {
+  private async run(clientId: string, channelId: string, active: ActiveTurn) {
     try {
-      // Re-read every step: channel_peer_wake may append replies while an earlier one is running.
-      for (let index = 0; ; index++) {
-        const turn = this.history(channelId).read().turns.find(row => row.id === turnId)!, reply = turn.replies[index];
-        if (!reply) break;
+      while (true) {
+        await this.runTurn(this.queuedClients.get(this.clientKey(channelId, active.turnId)) ?? clientId, channelId, active);
+        this.queuedClients.delete(this.clientKey(channelId, active.turnId));
         active.lease.assertCurrent();
-        if (active.cancelled || !this.host.accepting()) break;
-        let admitted = false;
-        try {
-          const store = new WorkspaceConversationStore(this.storage, reply.agentId, channelId), startIndex = store.read().history.length;
-          this.changeReply(channelId, turnId, index, row => { row.startIndex = startIndex; row.state = "running"; });
-          const accepted = this.host.start(reply.agentId, turn.body, reply.requestId, channelId, this.context(channelId, reply.wokenBy ? { by: reply.wokenBy, note: reply.wakeNote } : undefined), clientId, reply.questionId);
-          active.runId = accepted.runId; active.agentId = reply.agentId;
-          this.changeReply(channelId, turnId, index, row => { row.runId = accepted.runId; });
-          admitted = true;
-          await this.host.wait(accepted.runId); active.lease.assertCurrent();
-          const completed = store.read();
-          this.changeReply(channelId, turnId, index, row => { row.endIndex = completed.history.length;
-            row.state = completed.attempt?.state === "completed" ? "completed" : completed.attempt?.state === "cancelled" ? "cancelled" : "failed"; });
-        } catch {
-          if (active.runId && active.agentId) {
-            try { this.host.cancel(active.agentId, active.runId); } catch { /* Already settled. */ }
-            await this.host.wait(active.runId);
-            if (!admitted) active.cancelled = true; // A room-receipt write failed after acceptance: stop the queue.
-          }
-          this.changeReply(channelId, turnId, index, row => { row.state = "failed";
-            if (active.runId) { row.runId = active.runId; row.endIndex = new WorkspaceConversationStore(this.storage, row.agentId, channelId).read().history.length; }
-          });
-        } finally { active.runId = null; active.agentId = null; }
+        if (active.cancelled || !this.accepting()) break;
+        const state = this.history(channelId), before = state.read(), next = before.turns.find(turn => turn.state === "queued");
+        if (!next) break;
+        active.turnId = next.id;
+        state.update(before.revision, value => { active.lease.assertCurrent(); value.turns.find(turn => turn.id === next.id)!.state = "running"; return value; });
+        this.host.changed();
       }
-      const state = this.history(channelId), value = state.read();
-      state.update(value.revision, next => { active.lease.assertCurrent(); const turn = next.turns.find(row => row.id === turnId)!; turn.state = active.cancelled || !this.host.accepting() ? "cancelled" : "completed";
-        for (const row of turn.replies) if (row.state === "queued") row.state = "cancelled"; return next; });
-    } catch { /* State/lease failures are preserved as interrupted; never replay a participant request. */ }
-    finally { this.active.delete(channelId); try { active.lease.release(); } catch { this.cleanupFailed.add(channelId); } this.host.changed(); }
+    } catch { this.cleanupFailed.add(channelId); /* Preserve uncertain running/queued records; explicit recovery only. */ }
+    finally {
+      this.active.delete(channelId);
+      try { active.lease.release(); } catch { this.cleanupFailed.add(channelId); }
+      this.host.changed();
+    }
   }
   cancel(channelId: string) {
     this.get(channelId); const active = this.active.get(channelId); if (!active) return;
     active.cancelled = true;
-    if (active.agentId && active.runId) { try { this.host.cancel(active.agentId, active.runId); } catch { /* Already settled; remaining queued replies still stop. */ } }
+    if (active.agentId && active.runId) { try { this.host.cancel(active.agentId, active.runId); } catch { /* Physical draining remains owned. */ } }
     this.host.changed();
   }
   running() { return this.active.size; }
   async wait(channelId: string) { await this.active.get(channelId)?.promise; }
-  async close() { for (const channelId of this.active.keys()) this.cancel(channelId); await Promise.all([...this.active.values()].map(row => row.promise)); }
+  async close() { this.closed = true; for (const channelId of this.active.keys()) this.cancel(channelId); await Promise.all([...this.active.values()].map(row => row.promise)); }
 }

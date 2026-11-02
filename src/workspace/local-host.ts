@@ -303,6 +303,7 @@ export class LocalWorkspaceHost {
     if (!rooms) {
       rooms = new WorkspaceLocalChannels(context.storage, {
         agents: () => context.resources.agents.list().agents,
+        prefilterProfiles: () => context.resources.agents.channelPrefilterProfiles(),
         accepting: () => !this.closing && !this.updateLease,
         changed: () => this.changed(workspaceId),
         start: (agentId, body, requestId, channelId, shared, clientId, questionId) => this.start(clientId, workspaceId, agentId, body, requestId, Boolean(questionId), undefined, undefined,
@@ -335,7 +336,8 @@ export class LocalWorkspaceHost {
   }
   channelSnapshot(workspaceId: string, channelId: string, clientId: string) {
     const context = this.context(workspaceId), channel = this.localChannels(workspaceId).get(channelId), snapshot = this.localChannels(workspaceId).snapshot(channelId);
-    const participants = new Set(snapshot.turns.flatMap(turn => turn.replies.map(reply => reply.agentId)));
+    const participants = new Set(snapshot.turns.flatMap(turn => turn.replies
+      .filter(reply => reply.started).map(reply => reply.agentId)));
     const questions = channel.memberIds.filter(agentId => participants.has(agentId)).flatMap(agentId => {
       const value = new WorkspaceConversationStore(context.storage, agentId, channelId).read(), pendingQuestion = this.pendingUserQuestion(context, value);
       const pendingInteractions = this.pendingInteractions(context, value, []);
@@ -367,6 +369,14 @@ export class LocalWorkspaceHost {
   }
   cancelChannel(clientId: string, workspaceId: string, channelId: string) {
     this.channelView(clientId, workspaceId, channelId); this.localChannels(workspaceId).cancel(channelId);
+  }
+  resumeChannelQueue(clientId: string, workspaceId: string, channelId: string) {
+    this.channelView(clientId, workspaceId, channelId); this.localChannels(workspaceId).resumeQueue(clientId, channelId);
+    return this.channelSnapshot(workspaceId, channelId, clientId);
+  }
+  clearChannelQueue(clientId: string, workspaceId: string, channelId: string) {
+    this.channelView(clientId, workspaceId, channelId); this.localChannels(workspaceId).clearQueue(channelId);
+    return this.channelSnapshot(workspaceId, channelId, clientId);
   }
   async waitChannel(workspaceId: string, channelId: string) { await this.localChannels(workspaceId).wait(channelId); }
   activity() { return { running: [...this.jobs.values()].filter(job => !job.closed).length + [...this.channels.values()].reduce((sum, rooms) => sum + rooms.running(), 0) }; }
