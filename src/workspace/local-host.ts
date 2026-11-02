@@ -46,6 +46,7 @@ import { WorkspacePreferences } from "./preferences.js";
 import { WorkspaceFeatures } from "./features.js";
 import { workspaceSkillTool } from "./skills.js";
 import { WorkspaceLocalChannels } from "./local-channels.js";
+import { assertChannelAutonomyProductionDispatch } from "./channel-autonomy.js";
 import { WorkspaceScheduler } from "./scheduler.js";
 import { legacyPolicyAllowsTool } from "./legacy-role-policy.js";
 import { workspaceMemorySearchTool } from "./memory-tool.js";
@@ -326,8 +327,8 @@ export class LocalWorkspaceHost {
   createChannel(clientId: string, workspaceId: string, channelId: string, name: string, memberIds: unknown, expectedRevision: number) {
     this.channelView(clientId, workspaceId); this.localChannels(workspaceId).create(channelId, name, memberIds, expectedRevision); return this.listChannels(workspaceId);
   }
-  updateChannel(clientId: string, workspaceId: string, channelId: string, name: string, memberIds: unknown, expectedRevision: number) {
-    this.channelView(clientId, workspaceId, channelId); this.localChannels(workspaceId).update(channelId, name, memberIds, expectedRevision); return this.listChannels(workspaceId);
+  updateChannel(clientId: string, workspaceId: string, channelId: string, name: string, memberIds: unknown, expectedRevision: number, autonomy?: unknown) {
+    this.channelView(clientId, workspaceId, channelId); this.localChannels(workspaceId).update(channelId, name, memberIds, expectedRevision, autonomy); return this.listChannels(workspaceId);
   }
   selectChannel(clientId: string, workspaceId: string, channelId: string) {
     const previous = this.channelView(clientId, workspaceId); this.localChannels(workspaceId).get(channelId);
@@ -350,6 +351,8 @@ export class LocalWorkspaceHost {
     return { workspaceId, resourceGeneration: this.snapshotGeneration(workspaceId), ...snapshot, questions,
       approvals: [...this.pending.values()].filter(row => row.clientId === clientId && row.card.workspaceId === workspaceId && row.card.channelId === channelId).map(row => row.card) };
   }
+  /** Reserved engine boundary. No RPC, environment, persisted metadata or prompt can enable dispatch. */
+  startChannelAutonomy(): never { return assertChannelAutonomyProductionDispatch(); }
   sendChannel(clientId: string, workspaceId: string, channelId: string, message: string, requestId: string, recipientIds: unknown) {
     this.channelView(clientId, workspaceId, channelId);
     return { workspaceId, resourceGeneration: this.snapshotGeneration(workspaceId), ...this.localChannels(workspaceId).send(clientId, channelId, message, requestId, recipientIds) };

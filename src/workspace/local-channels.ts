@@ -9,18 +9,20 @@ import { WorkspaceSessionLease } from "./session-lease.js";
 import { channelSessionId } from "./channel-session.js";
 import { redactSensitiveText } from "../security/secrets.js";
 import { channelRoleUnrelated, type ChannelPrefilterProfile } from "./channel-prefilter.js";
+import { readChannelAutonomy, parseChannelAutonomyUpdate, assertChannelAutonomyProductionDispatch, type ChannelAutonomyPolicy } from "./channel-autonomy.js";
 
-export interface LocalChannel { id: string; name: string; memberIds: string[]; createdAt: string }
+export interface LocalChannel { id: string; name: string; memberIds: string[]; createdAt: string; autonomy?: ChannelAutonomyPolicy }
 interface Catalog { schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; channels: LocalChannel[] }
 type ReplyState = "queued" | "running" | "completed" | "cancelled" | "failed" | "interrupted" | "passed";
 interface Reply {
   agentId: string; displayName: string; requestId: string; runId: string | null; startIndex: number; endIndex: number | null;
   state: ReplyState; questionId?: string; wokenBy?: string; wakeNote?: string;
-  passedBy?: "prefilter"; passReason?: "role_unrelated";
+  passedBy?: "prefilter"; passReason?: "role_unrelated"; depth?: number;
 }
 interface ChannelTurn {
   id: string; digest: string; body: string; createdAt: string;
   state: "queued" | "running" | "completed" | "cancelled" | "interrupted"; replies: Reply[];
+  origin?: "user" | "autonomy"; rootTurnId?: string;
 }
 interface ChannelHistory { schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; channelId: string; turns: ChannelTurn[] }
 export interface LocalChannelMessage {
@@ -47,7 +49,8 @@ const ids = (v: unknown): v is string[] => Array.isArray(v) && v.every(isWorkspa
 const nonnegative = (v: unknown): v is number => Number.isSafeInteger(v) && Number(v) >= 0;
 const WAKE_NOTE_MAX = 500;
 export const LOCAL_CHANNEL_QUEUE_LIMIT = 5;
-const optionalReplyKeys = ["questionId", "wokenBy", "wakeNote", "passedBy", "passReason"];
+const optionalReplyKeys = ["questionId", "wokenBy", "wakeNote", "passedBy", "passReason", "depth"];
+const optionalTurnKeys = ["origin", "rootTurnId"];
 const asciiWordEnd = /[A-Za-z0-9_]$/, asciiWordStart = /^[A-Za-z0-9_]/;
 
 /** Longest exact member name wins; an e-mail address or a partial ASCII word is not a mention. */
@@ -78,8 +81,9 @@ export class WorkspaceLocalChannels {
         || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, this.catalog.binding()) || !Array.isArray(value.channels)) throw new Error("invalid local channel catalog; retained");
       const seen = new Set<string>();
       for (const row of value.channels) {
-        if (!plain(row) || !exact(row, ["id", "name", "memberIds", "createdAt"]) || typeof row.id !== "string" || !UUID.test(row.id) || seen.has(row.id)
+        if (!plain(row) || !exact(row, ["id", "name", "memberIds", "createdAt", ...(Object.hasOwn(row, "autonomy") ? ["autonomy"] : [])]) || typeof row.id !== "string" || !UUID.test(row.id) || seen.has(row.id)
           || !text(row.name, 80) || !ids(row.memberIds) || !time(row.createdAt)) throw new Error("invalid local channel metadata; retained");
+        readChannelAutonomy(row.autonomy, row.memberIds);
         seen.add(row.id);
       }
       return structuredClone(value) as unknown as Catalog;
@@ -87,12 +91,13 @@ export class WorkspaceLocalChannels {
   }
   private accepting() { return !this.closed && this.host.accepting(); }
   private clientKey(channelId: string, turnId: string) { return channelId + ":" + turnId; }
-  list() { const value = this.catalog.read(); return { revision: value.revision, channels: value.channels }; }
+  private view(channel: LocalChannel): LocalChannel { return { ...channel, autonomy: readChannelAutonomy(channel.autonomy, channel.memberIds) }; }
+  list() { const value = this.catalog.read(); return { revision: value.revision, channels: value.channels.map(channel => this.view(channel)) }; }
   get(channelId: string): LocalChannel {
     if (!UUID.test(channelId)) throw new Error("invalid local channel identity");
     const row = this.catalog.read().channels.find(row => row.id === channelId);
     if (!row) throw new Error("local channel is not in this Workspace");
-    return row;
+    return this.view(row);
   }
   private members(memberIds: unknown, roster = this.host.agents()): asserts memberIds is string[] {
     if (!ids(memberIds) || memberIds.some(id => !roster.some(agent => agent.agentId === id && agent.kind === "colleague" && agent.state === "active")))
@@ -106,15 +111,24 @@ export class WorkspaceLocalChannels {
       if (prior.name !== name || canonical(prior.memberIds) !== canonical(memberIds)) throw new Error("channel request identity already used");
       return this.list();
     }
-    this.catalog.update(expectedRevision, value => { value.channels.push({ id, name, memberIds, createdAt: new Date().toISOString() }); return value; });
+    this.catalog.update(expectedRevision, value => { value.channels.push({ id, name, memberIds, createdAt: new Date().toISOString(), autonomy: readChannelAutonomy(undefined, memberIds) }); return value; });
     this.host.changed(); return this.list();
   }
-  update(channelId: string, name: string, memberIds: unknown, expectedRevision: number) {
-    if (!this.accepting() || !text(name, 80) || this.active.has(channelId)) throw new Error("channel is busy or name is invalid");
-    this.get(channelId); this.members(memberIds);
-    const lease = WorkspaceSessionLease.acquire(this.storage, channelSessionId(channelId, "room-queue"));
-    try { this.catalog.update(expectedRevision, value => { lease.assertCurrent(); const row = value.channels.find(row => row.id === channelId)!; row.name = name; row.memberIds = memberIds; return value; }); }
-    finally { lease.release(); }
+  update(channelId: string, name: string, memberIds: unknown, expectedRevision: number, autonomy?: unknown) {
+    if (!this.accepting() || !text(name, 80)) throw new Error("channel is not accepting changes or name is invalid");
+    const channel = this.get(channelId), active = this.active.get(channelId); this.members(memberIds);
+    if (active && (autonomy === undefined || name !== channel.name || canonical(memberIds) !== canonical(channel.memberIds)))
+      throw new Error("channel is busy; only autonomy settings may change while colleagues are replying");
+    const policy = autonomy === undefined
+      ? readChannelAutonomy({ ...channel.autonomy!, mutedAgentIds: channel.autonomy!.mutedAgentIds.filter(id => memberIds.includes(id)) }, memberIds)
+      : parseChannelAutonomyUpdate(autonomy, memberIds);
+    const lease = active?.lease ?? WorkspaceSessionLease.acquire(this.storage, channelSessionId(channelId, "room-queue"));
+    try {
+      this.catalog.update(expectedRevision, value => {
+        lease.assertCurrent(); const row = value.channels.find(row => row.id === channelId)!;
+        row.name = name; row.memberIds = memberIds; row.autonomy = policy; return value;
+      });
+    } finally { if (!active) lease.release(); }
     this.host.changed(); return this.list();
   }
   private history(channelId: string) {
@@ -123,9 +137,12 @@ export class WorkspaceLocalChannels {
         || value.channelId !== channelId || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, this.catalog.binding()) || !Array.isArray(value.turns)) throw new Error("invalid channel history; retained");
       const seen = new Set<string>();
       for (const turn of value.turns) {
-        if (!plain(turn) || !exact(turn, ["id", "digest", "body", "createdAt", "state", "replies"]) || typeof turn.id !== "string" || !UUID.test(turn.id) || seen.has(turn.id)
+        if (!plain(turn) || !exact(turn, ["id", "digest", "body", "createdAt", "state", "replies", ...optionalTurnKeys.filter(key => Object.hasOwn(turn, key))]) || typeof turn.id !== "string" || !UUID.test(turn.id) || seen.has(turn.id)
           || typeof turn.digest !== "string" || !/^[a-f0-9]{64}$/.test(turn.digest) || !messageBody(turn.body) || !time(turn.createdAt)
-          || !["queued", "running", "completed", "cancelled", "interrupted"].includes(String(turn.state)) || !Array.isArray(turn.replies)) throw new Error("invalid channel turn; retained");
+          || !["queued", "running", "completed", "cancelled", "interrupted"].includes(String(turn.state)) || !Array.isArray(turn.replies)
+          || (turn.origin !== undefined && !["user", "autonomy"].includes(String(turn.origin)))
+          || (turn.rootTurnId !== undefined && (typeof turn.rootTurnId !== "string" || !UUID.test(turn.rootTurnId)))
+          || ((turn.origin ?? "user") === "user" && turn.rootTurnId !== undefined && turn.rootTurnId !== turn.id)) throw new Error("invalid channel turn; retained");
         const members = new Set<string>();
         for (const reply of turn.replies) {
           if (!plain(reply) || !exact(reply, ["agentId", "displayName", "requestId", "runId", "startIndex", "endIndex", "state", ...optionalReplyKeys.filter(key => Object.hasOwn(reply, key))]) || !isWorkspaceAgentId(reply.agentId) || members.has(reply.agentId)
@@ -133,6 +150,7 @@ export class WorkspaceLocalChannels {
             || (reply.questionId !== undefined && (typeof reply.questionId !== "string" || !UUID.test(reply.questionId)))
             || (reply.wokenBy !== undefined && (!isWorkspaceAgentId(reply.wokenBy) || reply.wokenBy === reply.agentId))
             || (reply.wakeNote !== undefined && (reply.wokenBy === undefined || !messageBody(reply.wakeNote, WAKE_NOTE_MAX)))
+            || (reply.depth !== undefined && (!nonnegative(reply.depth) || reply.depth > 1))
             || !nonnegative(reply.startIndex) || (reply.endIndex !== null && (!nonnegative(reply.endIndex) || reply.endIndex < reply.startIndex))
             || !["queued", "running", "completed", "cancelled", "failed", "interrupted", "passed"].includes(String(reply.state))) throw new Error("invalid channel reply; retained");
           if (reply.state === "passed") {
@@ -171,8 +189,8 @@ export class WorkspaceLocalChannels {
     return { channel, revision: value.revision,
       state: active ? active.cancelled ? "draining" : "running" : this.cleanupFailed.has(channelId) || last?.state === "running" ? "interrupted" : pendingCount ? "queued" : last?.state ?? "idle",
       pendingCount, queueNeedsResume: pendingCount > 0 && !active,
-      turns: value.turns.map(turn => ({ id: turn.id, state: !active && turn.state === "running" ? "interrupted" : turn.state,
-        replies: turn.replies.map(reply => ({ agentId: reply.agentId, displayName: reply.displayName, started: started.has(reply.requestId),
+      turns: value.turns.map(turn => ({ id: turn.id, origin: turn.origin ?? "user", rootTurnId: turn.rootTurnId ?? turn.id, state: !active && turn.state === "running" ? "interrupted" : turn.state,
+        replies: turn.replies.map(reply => ({ agentId: reply.agentId, displayName: reply.displayName, started: started.has(reply.requestId), depth: reply.depth ?? 0,
           state: !active && turn.state !== "queued" && ["queued", "running"].includes(reply.state) ? "interrupted" : reply.state,
           ...(reply.wokenBy ? { wokenBy: reply.wokenBy } : {}),
           ...(reply.state === "passed" ? { passedBy: reply.passedBy!, passReason: reply.passReason! } : {}) })) })), messages };
@@ -202,6 +220,7 @@ export class WorkspaceLocalChannels {
     if (targetId === agentId) return { ok: false as const, error: "a colleague cannot wake itself" };
     this.members([targetId], roster); active.lease.assertCurrent();
     const state = this.history(channelId), value = state.read(), turn = value.turns.find(row => row.id === active.turnId)!;
+    this.assertUserTurnDispatch(turn);
     const prior = turn.replies.find(row => row.agentId === targetId);
     if (prior && !["queued", "passed"].includes(prior.state)) return { ok: false as const, error: "that colleague already replied in this turn; no re-entry" };
     if (!prior || prior.state === "passed") {
@@ -209,9 +228,9 @@ export class WorkspaceLocalChannels {
         active.lease.assertCurrent();
         const replies = next.turns.find(row => row.id === active.turnId)!.replies;
         const previous = replies.findIndex(row => row.agentId === targetId);
-        const entry: Reply = previous >= 0 ? replies.splice(previous, 1)[0]! : { agentId: targetId, displayName: this.name(targetId, roster), requestId: randomUUID(), runId: null, startIndex: 0, endIndex: null, state: "queued" };
+        const entry: Reply = previous >= 0 ? replies.splice(previous, 1)[0]! : { agentId: targetId, displayName: this.name(targetId, roster), requestId: randomUUID(), runId: null, startIndex: 0, endIndex: null, state: "queued", depth: 0 };
         delete entry.passedBy; delete entry.passReason;
-        entry.state = "queued"; entry.wokenBy = agentId;
+        entry.state = "queued"; entry.depth = 0; entry.wokenBy = agentId;
         if (note) entry.wakeNote = redactSensitiveText(note).text;
         replies.push(entry); return next;
       });
@@ -234,8 +253,13 @@ export class WorkspaceLocalChannels {
     }
     return value;
   }
+  private assertUserTurnDispatch(turn: ChannelTurn) {
+    if ((turn.origin ?? "user") !== "user" || (turn.rootTurnId ?? turn.id) !== turn.id || turn.replies.some(reply => (reply.depth ?? 0) !== 0))
+      assertChannelAutonomyProductionDispatch();
+  }
   private begin(channelId: string, turnId: string, clientId: string, lease: WorkspaceSessionLease) {
     const state = this.history(channelId), before = state.read();
+    this.assertUserTurnDispatch(before.turns.find(row => row.id === turnId)!);
     state.update(before.revision, next => { this.recoverInterrupted(next, lease); next.turns.find(row => row.id === turnId)!.state = "running"; return next; });
     const active: ActiveTurn = { turnId, cancelled: false, runId: null, agentId: null, promise: Promise.resolve(), lease };
     this.active.set(channelId, active); this.cleanupFailed.delete(channelId);
@@ -257,6 +281,7 @@ export class WorkspaceLocalChannels {
       return { channelId, requestId, accepted: true, queued: receipt.queued, position: receipt.position };
     }
     const pendingCount = before.turns.filter(turn => turn.state === "queued").length, existing = this.active.get(channelId);
+    if (questionId && (existing || pendingCount > 0)) throw new Error("channel question answers cannot be queued; wait for the current turn and queue to finish");
     if (pendingCount >= LOCAL_CHANNEL_QUEUE_LIMIT) throw new Error("channel queue is full (maximum 5); message was not accepted");
     const lease = existing?.lease ?? WorkspaceSessionLease.acquire(this.storage, channelSessionId(channelId, "room-queue"));
     let retained = false;
@@ -265,12 +290,12 @@ export class WorkspaceLocalChannels {
       const profiles = recipients.length >= 3 && !questionId ? this.host.prefilterProfiles?.() : undefined;
       const replies: Reply[] = recipients.map(agentId => {
         const unrelated = profiles !== undefined && !mentioned.includes(agentId) && channelRoleUnrelated(body, profiles.find(row => row.agentId === agentId));
-        return { agentId, displayName: this.name(agentId, roster), requestId: randomUUID(), runId: null, startIndex: 0, endIndex: null,
+        return { agentId, displayName: this.name(agentId, roster), requestId: randomUUID(), runId: null, startIndex: 0, endIndex: null, depth: 0,
           state: unrelated ? "passed" : "queued", ...(unrelated ? { passedBy: "prefilter" as const, passReason: "role_unrelated" as const } : {}), ...(questionId ? { questionId } : {}) };
       });
       state.update(before.revision, value => {
         lease.assertCurrent();
-        value.turns.push({ id: requestId, digest, body: redactSensitiveText(body).text, createdAt: new Date().toISOString(), state: "queued", replies });
+        value.turns.push({ id: requestId, digest, body: redactSensitiveText(body).text, createdAt: new Date().toISOString(), state: "queued", replies, origin: "user", rootTurnId: requestId });
         return value;
       });
       this.queuedClients.set(this.clientKey(channelId, requestId), clientId);
@@ -329,7 +354,7 @@ export class WorkspaceLocalChannels {
       const turn = this.history(channelId).read().turns.find(row => row.id === turnId)!;
       const reply = turn.replies.find(row => row.state === "queued");
       if (!reply || active.cancelled || !this.accepting()) break;
-      active.lease.assertCurrent();
+      active.lease.assertCurrent(); this.assertUserTurnDispatch(turn);
       let admitted = false, attempted = false;
       try {
         if (!this.get(channelId).memberIds.includes(reply.agentId)) throw new Error("queued colleague is no longer a channel member");
@@ -386,6 +411,7 @@ export class WorkspaceLocalChannels {
         if (active.cancelled || !this.accepting()) break;
         const state = this.history(channelId), before = state.read(), next = before.turns.find(turn => turn.state === "queued");
         if (!next) break;
+        this.assertUserTurnDispatch(next);
         active.turnId = next.id;
         state.update(before.revision, value => { active.lease.assertCurrent(); value.turns.find(turn => turn.id === next.id)!.state = "running"; return value; });
         this.host.changed();
