@@ -7,9 +7,10 @@ import type { TaskRuntimeBinding } from "./bindings.js";
 import type { GovernedAgentRuntimeDriver } from "./registry.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
-import { assertWorkspaceRunAdmission, attachWorkspaceRuntimeModel, workspaceRunHasManagedProject } from "../workspace/execution.js";
+import { assertWorkspaceRunAdmission, attachWorkspaceRuntimeModel, recordWorkspaceRuntimeUsage, workspaceRunHasManagedProject } from "../workspace/execution.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { createRegisteredCliMcpTurn, WORKSPACE_MCP_TOKEN_ENV } from "./registered-cli-mcp.js";
+import { codexSessionPool } from "./codex-session.js";
 
 /** Only the level published by this Workspace's live model inventory may reach the native CLI. */
 function codexEffortArgs(effort: string | null): string[] {
@@ -58,10 +59,18 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
     if (effort && models && !(await models.effortLaunchable(id))) {
       return { status: "error", error: "Agent Runtime '" + id + "' does not support reasoning effort; no level was applied" };
     }
+    const session = id === "codex" ? await codexSessionPool(installer).acquire(permit, assertCurrent) : undefined;
     const native = createRegisteredCliMcpTurn({
       signal: options.signal!, assertCurrent, jsonEvents: id === "codex",
-      async launch(endpoint, prompt, activity) {
+      ...(session ? { bearerToken: session.token,
+        prompt: (args: import("../providers/types.js").TurnArgs) => args.history.flatMap(message => message.role === "user" ? [message.content] : []).join("\n\n"),
+        takeUsage: () => session.takeUsage(), decorateResult: session.decorateResult.bind(session) } : {}),
+      async launch(endpoint, prompt, activity, turnArgs) {
         assertCurrent();
+        if (session) {
+          if (turnArgs.system.length > 200_000) throw new Error("Native Agent Runtime system context is too large");
+          return session.launch(endpoint, prompt, turnArgs, { model, effort, cwd: options.ctx.cwd, signal: native.signal, assertCurrent, activity });
+        }
         // Resolve at the actual physical launch, after context preparation; recheck the installed binary.
         const resolved = installer.resolveBound(id);
         const env: NodeJS.ProcessEnv = { ...resolved.env, ...endpoint.env,
@@ -81,6 +90,9 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
     try {
       attachWorkspaceRuntimeModel(permit, options, id, args => native.turn(args));
       return await runGovernedAgent(history, options, id, (provider, args) => provider.turn(args));
-    } finally { await native.close(history); }
+    } finally {
+      try { await native.close(history); }
+      finally { if (session) { try { recordWorkspaceRuntimeUsage(permit, session.takeUsage()); } finally { await session.release(); } } }
+    }
   } };
 }

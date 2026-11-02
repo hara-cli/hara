@@ -97,6 +97,12 @@ export class WorkspaceRuntimeInstaller {
   private readonly metadata = new Set<AbortController>();
   private readonly target: RuntimeTarget;
   private closed = false;
+  private readonly nativeResources = new Set<() => Promise<void>>();
+  /** Host-owned native sessions share this installer's lifetime, including non-Host harnesses. */
+  ownNativeResource(close: () => Promise<void>): void {
+    if (this.closed) throw new Error("Workspace runtime installer is closed");
+    this.nativeResources.add(close);
+  }
   constructor(private readonly storage: WorkspaceResourceStorage, private readonly options: {
     target?: RuntimeTarget;
     fixtureOrigin?: string;
@@ -450,6 +456,7 @@ export class WorkspaceRuntimeInstaller {
   async close(): Promise<void> {
     this.closed = true; this.proposals.clear(); for (const operation of this.active.values()) operation.controller.abort();
     for (const controller of this.metadata) controller.abort();
+    await Promise.all([...this.nativeResources].map(close => close())); this.nativeResources.clear();
     // Own downloads have a finite deadline; callers can observe incomplete drain rather than delete locks.
     const deadline = Date.now() + 5000;
     while ((this.active.size || this.metadata.size) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));

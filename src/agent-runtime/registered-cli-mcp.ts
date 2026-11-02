@@ -21,10 +21,13 @@ export async function createWorkspaceMcpEndpoint(input: {
   assertCurrent(): void;
   tools(): readonly ToolSpec[];
   call(name: string, args: Record<string, unknown>): Promise<ToolResult>;
+  /** Host-owned process secret. Each endpoint still has an immutable attempt/lease closure. */
+  bearerToken?: string;
 }): Promise<WorkspaceMcpEndpoint> {
   input.assertCurrent();
   if (input.signal.aborted) throw new Error("Workspace MCP attempt ended");
-  let token = randomBytes(32).toString("hex"), closed = false, closing: Promise<void> | undefined;
+  if (input.bearerToken !== undefined && !/^[a-f0-9]{64}$/.test(input.bearerToken)) throw new Error("Invalid Workspace MCP bearer");
+  let token = input.bearerToken ?? randomBytes(32).toString("hex"), closed = false, closing: Promise<void> | undefined;
   const env: NodeJS.ProcessEnv = { [WORKSPACE_MCP_TOKEN_ENV]: token };
   const expected = Buffer.from("Bearer " + token);
   const transport = new StreamableHTTPServerTransport({
@@ -105,7 +108,11 @@ export function createRegisteredCliMcpTurn(input: {
   signal: AbortSignal;
   jsonEvents?: boolean;
   assertCurrent(): void;
-  launch(endpoint: WorkspaceMcpEndpoint, prompt: string, activity: () => void): Promise<ExternalCommandCaptureResult>;
+  bearerToken?: string;
+  prompt?(args: TurnArgs): string;
+  decorateResult?(result: ToolResult, args: TurnArgs): ToolResult;
+  takeUsage?(): TurnResult["usage"];
+  launch(endpoint: WorkspaceMcpEndpoint, prompt: string, activity: () => void, args: TurnArgs): Promise<ExternalCommandCaptureResult>;
 }) {
   const stopped = new AbortController();
   const pending = new Map<string, PendingCall>(), queue: PendingCall[] = [];
@@ -113,10 +120,10 @@ export function createRegisteredCliMcpTurn(input: {
   let tools: readonly ToolSpec[] = [], finished: TurnResult | undefined, wake: (() => void) | undefined;
   let activity: (() => void) | undefined, closed = false, ended = false;
   const notify = () => { wake?.(); wake = undefined; };
-  const flush = (history: readonly NeutralMsg[]) => {
+  const flush = (history: readonly NeutralMsg[], args?: TurnArgs) => {
     for (const message of history) if (message.role === "tool") for (const result of message.results) {
       const call = pending.get(result.id);
-      if (call) { pending.delete(result.id); call.resolve(result); }
+      if (call) { pending.delete(result.id); call.resolve(args && input.decorateResult ? input.decorateResult(result, args) : result); }
     }
   };
   const close = async (history: readonly NeutralMsg[] = []) => {
@@ -135,9 +142,10 @@ export function createRegisteredCliMcpTurn(input: {
     async turn(args: TurnArgs): Promise<TurnResult> {
       input.assertCurrent();
       if (closed || args.signal?.aborted) return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
-      tools = args.tools; activity = args.onActivity; flush(args.history);
+      tools = args.tools; activity = args.onActivity; flush(args.history, args);
       if (!physical) {
         endpoint = await createWorkspaceMcpEndpoint({ signal: AbortSignal.any([input.signal, stopped.signal]), assertCurrent: input.assertCurrent,
+          bearerToken: input.bearerToken,
           tools: () => tools, call(name, parameters) {
             input.assertCurrent();
             if (closed || pending.size >= 16) throw new Error("Workspace MCP call limit reached");
@@ -146,7 +154,7 @@ export function createRegisteredCliMcpTurn(input: {
               const item = { call, resolve }; pending.set(call.id, item); queue.push(item); notify();
             });
           } });
-        const prompt = [args.system, ...args.history.map(message => message.role === "user" ? "User: " + message.content
+        const prompt = input.prompt?.(args) ?? [args.system, ...args.history.map(message => message.role === "user" ? "User: " + message.content
           : message.role === "assistant" ? "Assistant: " + message.text : "")]
           .filter(Boolean).join("\n\n");
         if (!prompt.trim() || prompt.length > 200_000 || args.history.some(message => message.role === "user" && message.images?.length)) {
@@ -154,7 +162,7 @@ export function createRegisteredCliMcpTurn(input: {
         }
         physical = (async () => {
           try {
-            const result = await input.launch(endpoint!, prompt, () => activity?.());
+            const result = await input.launch(endpoint!, prompt, () => activity?.(), args);
             if (!result.ok) finished = { text: "", toolUses: [], stop: "error",
               errorMsg: "registered Runtime failed (" + (result.errorCode ?? (result.timedOut ? "timeout" : "exit")) + "); no fallback was selected" };
             else if (input.jsonEvents === false) finished = { text: result.stdout.trim(), toolUses: [], stop: "end" };
@@ -181,10 +189,16 @@ export function createRegisteredCliMcpTurn(input: {
       while (!closed) {
         input.assertCurrent();
         const next = queue.shift();
-        if (next) return { text: "", toolUses: [next.call], stop: "tool_use" };
-        if (finished) { const result = finished; finished = undefined; ended = true; return result; }
+        if (next) return { text: "", toolUses: [next.call], stop: "tool_use", ...(input.takeUsage ? { usage: input.takeUsage() } : {}) };
+        if (finished) { const result = finished; finished = undefined; ended = true;
+          return input.takeUsage ? { ...result, usage: input.takeUsage() } : result; }
         if (ended) return { text: "", toolUses: [], stop: "error", errorMsg: "Native CLI ended before the governed task completed; no automatic replay" };
-        await new Promise<void>(resolve => { wake = resolve; });
+        await new Promise<void>(resolve => {
+          const onAbort = () => { void close().catch(() => {}); settle(); };
+          const settle = () => { args.signal?.removeEventListener("abort", onAbort); resolve(); };
+          wake = settle;
+          if (args.signal?.aborted) onAbort(); else args.signal?.addEventListener("abort", onAbort, { once: true });
+        });
       }
       return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
     },

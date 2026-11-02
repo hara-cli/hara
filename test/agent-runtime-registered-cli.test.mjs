@@ -16,6 +16,7 @@ import { createWorkspaceRunPermit, bindWorkspaceRunOptions, closeWorkspaceRunPer
 import { AgentRuntimeRegistry } from "../dist/agent-runtime/registry.js";
 import { runConfiguredAgent } from "../dist/agent-runtime/dispatch.js";
 import { createTaskExecution } from "../dist/session/task.js";
+import { writeFakeCodex } from "./helpers/workspace-cli-mcp.mjs";
 
 const roots = [];
 function root() { const path = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-cli-driver-"))); roots.push(path); return path; }
@@ -33,6 +34,7 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
   const command = join(account, ".local", "bin", runtimeId), argv = join(account, "argv.txt");
   fs.mkdirSync(dirname(command), { recursive: true });
   fs.writeFileSync(command, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${runtimeId} 1.2.3'; exit 0; fi\nif [ "$1" = "app-server" ]; then exit 1; fi\nif [ "$1" = "debug" ]; then echo '{"models":[{"slug":"fixture-model","display_name":"Fixture"}]}'; exit 0; fi\nprintf '%s\\n' "$@" > '${argv}'\n${managed && !hasGit ? `case " $* " in *' --skip-git-repo-check '*) ;; *) echo 'Not inside a trusted directory and --skip-git-repo-check was not specified.' >&2; exit 1;; esac` : ''}\n${failure ? `echo '${failure === 'project_not_trusted' ? 'Not inside a trusted directory' : failure === 'runtime_auth_required' ? 'websocket 401 Unauthorized PRIVATE_ACCOUNT_DETAIL' : 'PRIVATE_ACCOUNT_DETAIL'}' >&2; exit 1` : ''}\necho 'registered ${runtimeId} reply'\n`, { mode: 0o755 });
+  if (runtimeId === "codex") writeFakeCodex(command, { mode: "reply", failure });
   const installer = new WorkspaceRuntimeInstaller(storage, { discovery: { home: account, path: "/usr/bin:/bin", systemBins: [],
     run: async (_command, args) => args[0] === "-lic" ? null : `${runtimeId} 1.2.3` } });
   const resources = new WorkspaceResources(home, row.scope, { runtimeInstaller: installer }); resources.initialize();
@@ -83,16 +85,16 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
     const result = await storage.run(() => runConfiguredAgent(history, options, new AgentRuntimeRegistry(undefined, installer, models)));
     assert.equal(result.status, failure ? "error" : "completed", result.error);
     if (failure) {
-      assert.ok(result.error.includes(`(${failure})`));
+      assert.ok(result.error.includes(runtimeId === "codex" ? "(codex_thread_start_failed)" : `(${failure})`));
       assert.ok(result.error.includes("no fallback was selected"));
       assert.ok(!result.error.includes("PRIVATE_ACCOUNT_DETAIL"));
       assert.ok(history.slice(1).every(row => row.role === "assistant" && row.text === "" && row.toolUses.length === 0),
         "a failed native run leaves no fabricated text or tool result; the common governor may retain an empty assistant boundary");
       assert.doesNotMatch(JSON.stringify(history), /PRIVATE_ACCOUNT_DETAIL/);
     } else assert.equal(history.at(-1).text, `registered ${runtimeId} reply`);
-    const args = fs.readFileSync(argv, "utf8");
+    const args = runtimeId === "codex" ? fs.readFileSync(command + ".rpc.jsonl", "utf8") : fs.readFileSync(argv, "utf8");
     assert.match(args, runtimeId === "codex" ? /read-only/ : /plan/);
-    assert.equal(args.includes("--skip-git-repo-check"), managed && !hasGit);
+    assert.equal(args.includes("--skip-git-repo-check"), runtimeId !== "codex" && managed && !hasGit);
     assert.equal(fs.existsSync(join(project, ".git")), hasGit);
     const privateEnv = installer.resolveBound(runtimeId).env;
     assert.ok(privateEnv.HOME.startsWith(home));
@@ -104,7 +106,7 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
       assert.ok(guide.command.endsWith(" login"));
       assert.ok(!guide.command.includes("--skip-git-repo-check"));
     }
-    assert.ok(args.includes(modelId), "spawn uses the existing Workspace runtime model selection");
+    assert.ok(args.includes(modelId), "native launch uses the existing Workspace runtime model selection");
     assert.ok(!args.includes("danger-full-access") && !args.includes("bypassPermissions"));
     fs.appendFileSync(command, "# changed after registration\n");
     assert.equal(resources.agents.runtimeOptions().find(option => option.id === runtimeId).available, false);

@@ -540,6 +540,7 @@ interface PendingJsonlRequest {
  * pending request is rejected and the whole process group is stopped when the transport becomes invalid.
  */
 export class JsonlRpcClient {
+  private readonly exited: Promise<void>;
   private readonly child: ChildProcess;
   private readonly processGroup: boolean;
   private readonly requestTimeoutMs: number;
@@ -556,12 +557,14 @@ export class JsonlRpcClient {
     private readonly options: JsonlRpcClientOptions,
   ) {
     this.child = child;
+    this.exited = new Promise(resolve => child.once("close", () => resolve()));
     this.processGroup = processGroup;
     this.requestTimeoutMs = Math.max(500, Math.min(options.timeoutMs ?? 30_000, 120_000));
     this.maxOutputBytes = Math.max(64 * 1024, Math.min(options.maxOutputBytes ?? 16 * 1024 * 1024, 64 * 1024 * 1024));
     child.stdout?.on("data", (chunk: Buffer) => this.consume(chunk));
     // Provider stderr may contain paths, native IDs or configuration data. Drain it without retaining it.
     child.stderr?.on("data", () => {});
+    child.stdin?.on("error", () => this.fail("external session adapter input closed"));
     child.once("error", () => this.fail("external session adapter process failed"));
     child.once("close", (code) => {
       if (!this.closed) this.fail(`external session adapter exited unexpectedly (code ${code ?? "unknown"})`);
@@ -732,6 +735,9 @@ export class JsonlRpcClient {
   close(): void {
     this.fail("external session adapter closed");
   }
+
+  /** Process completion, rather than logical cancellation, releases an owned execution lease. */
+  waitForClose(): Promise<void> { return this.exited; }
 }
 
 /**

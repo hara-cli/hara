@@ -24,6 +24,7 @@ import type { WorkspaceUserInteraction, WorkspaceUserQuestion } from "./user-int
 
 export interface WorkspaceRunPermit { readonly binding: Readonly<WorkspaceRunBinding> }
 interface PermitState {
+  storage: WorkspaceResourceStorage;
   assertLive(): void;
   provider: Provider;
   options?: RunOpts;
@@ -192,7 +193,7 @@ export function createWorkspaceRunPermit(input: {
       }
     },
   };
-  state = { assertLive, provider, cwd, managedProject, stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
+  state = { storage: input.storage, assertLive, provider, cwd, managedProject, stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
     updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false, wakeChars: 0,
     interaction: input.interaction, onQuestion: input.onQuestion, onInteractionChanged: input.onInteractionChanged, interactionUsage: input.interactionUsage, startedAt: started, toolTail: Promise.resolve(),
     audit: new WorkspaceExecutionAudit(input.storage, binding.runId, binding.agent.agentId),
@@ -262,6 +263,23 @@ export function beginWorkspaceGovernedRun(permit: WorkspaceRunPermit, options: R
   state.started = true;
 }
 export function workspaceRunToolAllowed(permit: WorkspaceRunPermit, name: string): boolean { return stateOf(permit).tools.has(name); }
+/** Trusted native transport composition; never derived from a renderer path or the foreground scope. */
+export function workspaceRuntimeStorage(permit: WorkspaceRunPermit): WorkspaceResourceStorage {
+  const state = stateOf(permit); state.assertLive(); return state.storage;
+}
+/** Charge observed native telemetry even when cancellation prevented another provider boundary. */
+export function recordWorkspaceRuntimeUsage(permit: WorkspaceRunPermit, usage: TurnResult["usage"]): void {
+  if (usage) publishUsage(stateOf(permit), { inputTokens: usage.input, outputTokens: usage.output });
+}
+/** Native inference can make progress between virtual governor boundaries. Stop on observed overage
+ * immediately; accounting still travels through the ordinary provider result or final drain. */
+export function assertWorkspaceRuntimeUsage(permit: WorkspaceRunPermit, pending: { input: number; output: number }): void {
+  const state = stateOf(permit); state.assertLive();
+  if (!Number.isSafeInteger(pending.input) || !Number.isSafeInteger(pending.output) || pending.input < 0 || pending.output < 0
+    || state.usage.inputTokens + state.usage.outputTokens + pending.input + pending.output > permit.binding.budget.maxTokens) {
+    throw new Error("Workspace native token telemetry safety ceiling reached");
+  }
+}
 /** Trusted Host composition may retain a long instruction reference before options are pinned. */
 export function assertWorkspaceRunContextCurrent(permit: WorkspaceRunPermit): void { stateOf(permit).assertLive(); }
 export function prepareWorkspaceRunHistory(permit: WorkspaceRunPermit, history: NeutralMsg[]): NeutralMsg[] {
