@@ -35,7 +35,7 @@ import { WorkspaceUserInteraction, workspacePermissionInteraction, type Workspac
 import { boundWorkspaceText } from "./model-context.js";
 import { createWorkspaceProvider } from "./provider.js";
 import { legacyWorkspaceProviderFailure, WorkspaceProviderAdmissionError, WorkspaceProviderRecovery } from "./provider-recovery.js";
-import { WorkspaceRuntimeInstaller, optionalRuntimeId } from "./runtime-install.js";
+import { WorkspaceRuntimeInstaller, optionalRuntimeId, type RuntimeLoginSource } from "./runtime-install.js";
 import { WorkspaceRuntimeModels } from "./runtime-models.js";
 import { WorkspaceSecureConnections } from "./secure-connections.js";
 import { MacKeychainCredentialVault, type CredentialVault } from "./credential-vault.js";
@@ -386,23 +386,23 @@ export class LocalWorkspaceHost {
       this.assertGeneration(workspaceId, generation);
     }, () => { if (this.closing) throw new Error("Workspace host is closing"); this.assertGeneration(workspaceId, generation); });
   }
-  approveRuntime(clientId: string, workspaceId: string, id: string, approved: boolean) {
-    return this.context(workspaceId).runtimes.approve(id, approved, clientId);
+  approveRuntime(clientId: string, workspaceId: string, id: string, approved: boolean, loginSource: RuntimeLoginSource = "host") {
+    return this.context(workspaceId).runtimes.approve(id, approved, clientId, loginSource);
   }
   cancelRuntime(workspaceId: string, operationId: string): void { this.context(workspaceId).runtimes.cancel(operationId); }
   async detectRuntimes(workspaceId: string): Promise<void> { await this.context(workspaceId).runtimes.discover(); }
-  registerLocalRuntime(workspaceId: string, runtimeId: unknown, fingerprint: unknown): void {
+  registerLocalRuntime(workspaceId: string, runtimeId: unknown, fingerprint: unknown, loginSource: RuntimeLoginSource = "host"): void {
     if (!optionalRuntimeId(runtimeId) || typeof fingerprint !== "string") throw new Error("Invalid local runtime registration");
     const context = this.context(workspaceId);
-    context.runtimes.registerLocal(runtimeId, fingerprint); context.runtimeModels.warm(runtimeId); this.changed(workspaceId);
+    context.runtimes.registerLocal(runtimeId, fingerprint, loginSource); context.runtimeModels.warm(runtimeId); this.changed(workspaceId);
   }
   runtimeLoginInstructions(workspaceId: string, runtimeId: unknown) {
     if (runtimeId !== "codex") throw new Error("Only Codex private-home login guidance is available");
     return this.context(workspaceId).runtimes.codexLoginInstructions();
   }
   listRuntimeModels(workspaceId: string, runtimeId: unknown) { return this.context(workspaceId).runtimeModels.list(runtimeId); }
-  async selectRuntimeModel(workspaceId: string, runtimeId: unknown, modelId: unknown, expectedRevision: unknown): Promise<void> {
-    await this.context(workspaceId).runtimeModels.select(runtimeId, modelId, expectedRevision); this.changed(workspaceId);
+  async selectRuntimeModel(workspaceId: string, runtimeId: unknown, modelId: unknown, expectedRevision: unknown, effort?: unknown): Promise<void> {
+    await this.context(workspaceId).runtimeModels.select(runtimeId, modelId, expectedRevision, effort); this.changed(workspaceId);
   }
   getPreferences() { const current = this.preferences.read(); if (!current.readOnly && current.revision === 0) this.preferences.save(current.theme, 0); return this.preferences.read(); }
   setPreferences(theme: unknown, expected: number, extra = {}) { this.preferences.save(theme, expected, extra); return this.preferences.read(); }

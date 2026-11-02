@@ -43,12 +43,27 @@ for (const [id, format] of [["opencode", "zip"], ["codex", "tar.gz"], ["claude",
     const receipt = f.installer.approve(card.id, true, "client"); assert.throws(() => f.installer.approve(card.id, true, "client"), /unsafe/);
     assert.equal((await settled(f.installer, receipt.operationId)).state, "registered"); assert.equal(f.downloads(), 1);
     const executable = f.installer.resolve(id, "1.2.3", card.sha256); assert.deepEqual(fs.readFileSync(executable.command), native());
-    for (const key of ["HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"]) assert.ok(executable.env[key].startsWith(f.resource.run(() => workspaceStateHome())));
+    assert.equal(executable.loginSource, "host");
+    assert.equal(executable.env.HOME, process.env.HOME);
+    assert.equal(executable.env.CODEX_HOME, process.env.CODEX_HOME);
+    assert.equal(f.installer.list().options.find(row => row.runtimeId === id).loginSource, "host");
     assert.equal(f.installer.list().options.find(row => row.runtimeId === id).generalAgentDriverAvailable, id !== "opencode");
     const reopened = new WorkspaceRuntimeInstaller(f.resource, { fixtureOrigin: card.origin });
     assert.equal(reopened.resolve(id, "1.2.3", card.sha256).command, executable.command); assert.equal(f.downloads(), 1); await reopened.close();
     if (process.platform !== "win32") fs.chmodSync(executable.command, 0o700); fs.writeFileSync(executable.command, native(process.platform, process.arch === "arm64" ? "x64" : "arm64")); if (process.platform !== "win32") fs.chmodSync(executable.command, 0o500);
     assert.throws(() => f.installer.resolve(id, "1.2.3", card.sha256), /unsafe/); assert.equal(f.installer.list().options.find(row => row.runtimeId === id).state, "integrity_failed");
+  } finally { await f.close(); }
+});
+test("download approval records an explicit isolated login and rejects an invalid source", async () => {
+  const f = await fixture(); try {
+    const card = await f.installer.propose("codex", "client", () => {});
+    assert.throws(() => f.installer.approve(card.id, true, "client", "other"), /unsafe/);
+    const receipt = f.installer.approve(card.id, true, "client", "isolated");
+    assert.equal((await settled(f.installer, receipt.operationId)).state, "registered");
+    const resolved = f.installer.resolve("codex", "1.2.3", card.sha256);
+    assert.equal(resolved.loginSource, "isolated");
+    assert.ok(resolved.env.HOME.startsWith(f.resource.run(() => workspaceStateHome())));
+    assert.equal(f.installer.list().options.find(row => row.runtimeId === "codex").loginSource, "isolated");
   } finally { await f.close(); }
 });
 for (const [label, options] of [["wrong digest", { badHash: true }], ["wrong CPU", { bytes: native(process.platform, process.arch === "arm64" ? "x64" : "arm64") }], ["oversize", { maxBytes: 64 }], ["untrusted redirect", { redirect: "http://localhost:9/not-allowed" }]]) test(`${label}: failed verification never registers or resolves`, async () => {
