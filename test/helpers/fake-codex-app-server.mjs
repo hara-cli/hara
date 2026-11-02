@@ -75,9 +75,14 @@ export async function fakeCodexMain() {
     const message = JSON.parse(line), p = message.params ?? {};
     if (message.id === undefined) continue;
     fs.appendFileSync(command + ".rpc.jsonl", JSON.stringify({ pid: process.pid, method: message.method, params: p }) + "\n");
+    if (message.method === "model/list" && mode().inventory) { reply(message, mode().inventory); continue; }
     if (message.method === "model/list") { reply(message, { data: ["fixture-model", "fixture-model-2"].map(id => ({ id, displayName: id,
       supportedReasoningEfforts: ["low", "high"].map(reasoningEffort => ({ reasoningEffort, description: reasoningEffort })), isDefault: id === "fixture-model" })) }); continue; }
     if (["thread/start", "thread/resume"].includes(message.method)) {
+      if (mode().recordHome) {
+        fs.writeFileSync(command + ".home", process.env.HOME + "\nlogin=" + (fs.existsSync(process.env.HOME + "/.codex/auth.json") ? "present" : "missing") + "\n");
+        fs.writeFileSync(command + ".codexhome", (process.env.CODEX_HOME ?? "unset") + "\n");
+      }
       if (mode().failure || mode().mode === "resume-fail" && message.method === "thread/resume") { error(message); continue; }
       if (message.method === "thread/resume") {
         const state = JSON.parse(fs.readFileSync(command + ".native.json", "utf8"));

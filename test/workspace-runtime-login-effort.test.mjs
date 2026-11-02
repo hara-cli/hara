@@ -14,6 +14,7 @@ import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
 import { SYNTHETIC_CONNECTION } from "../dist/workspace/synthetic-provider.js";
 import { runExternalCommandCapture } from "../dist/external-sessions/process.js";
 import { registeredCliArgs } from "../dist/agent-runtime/registered-cli.js";
+import { writeFakeCodex } from "./helpers/workspace-cli-mcp.mjs";
 
 const roots = [];
 after(() => roots.forEach(root => fs.rmSync(root, { recursive: true, force: true })));
@@ -253,6 +254,7 @@ test("effort selection accepts only a level the model published and persists it"
 
 test("the main Hara bot uses the same detect/register/bind/model/effort path as a colleague", async () => {
   const data = root(), host = root(), command = join(host, ".local/bin/codex"); binary(command);
+  writeFakeCodex(command, { mode: "reply", recordHome: true, inventory: JSON.parse(fs.readFileSync(`${command}.appmodels`, "utf8")) });
   fs.mkdirSync(join(host, ".codex"), { recursive: true });
   fs.writeFileSync(join(host, ".codex", "auth.json"), '{"fixture":true}');
   const handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port: 0 }, { root: data, mode: "workspace", version: "fixture", credentialVault: new MemoryCredentialVault(),
@@ -298,7 +300,7 @@ test("the main Hara bot uses the same detect/register/bind/model/effort path as 
     // Registering with an unknown login source is refused.
     await assert.rejects(request("workspace.runtime.registerLocal", { ...scope, runtimeId: "codex", fingerprint: codex.fingerprint, approved: true, loginSource: "ambient" }), /Invalid runtime login source/);
     await assert.rejects(request("workspace.runtime.registerLocal", { ...scope, runtimeId: "codex", fingerprint: codex.fingerprint, approved: false }), /Explicit local runtime approval/);
-    // Exercise the main-bot RPC -> local-host -> governed runtime -> registered CLI spawn path.
+    // Exercise main-bot RPC -> local-host -> governed runtime -> registered native app-server.
     const accepted = await request("workspace.session.send", { ...scope, agentId: main.agentId,
       message: "Reply with a short greeting.", requestId: randomUUID(), source: "ui" });
     assert.equal(typeof accepted.runId, "string");
@@ -311,8 +313,11 @@ test("the main Hara bot uses the same detect/register/bind/model/effort path as 
     assert.equal(finished?.conversation.state, "completed", "registered Codex finishes the main-bot turn");
     assert.deepEqual(fs.readFileSync(`${command}.home`, "utf8").trim().split("\n"), [host, "login=present"]);
     assert.equal(fs.readFileSync(`${command}.codexhome`, "utf8").trim(), "unset");
-    const argv = fs.readFileSync(`${command}.argv`, "utf8").trim().split("\n");
-    assert(argv.includes("-m") && argv.includes("gpt-5.6-sol"), "selected model reaches codex exec");
-    assert(argv.includes("-c") && argv.includes('model_reasoning_effort="xhigh"'), "selected effort reaches codex exec");
+    const requests = fs.readFileSync(`${command}.rpc.jsonl`, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const thread = requests.find(row => row.method === "thread/start"), turn = requests.find(row => row.method === "turn/start");
+    assert.equal(thread.params.model, "gpt-5.6-sol", "selected model reaches the native thread");
+    assert.equal(thread.params.config.model_reasoning_effort, "xhigh", "selected effort reaches the native thread");
+    assert.equal(turn.params.model, "gpt-5.6-sol"); assert.equal(turn.params.effort, "xhigh");
+    assert.equal(thread.params.sandbox, "read-only"); assert.equal(thread.params.approvalPolicy, "on-request");
   } finally { const closed = once(socket, "close"); socket.close(); await closed; await handle.close(); }
 });
