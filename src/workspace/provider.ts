@@ -3,6 +3,7 @@ import { createAnthropicProvider } from "../providers/anthropic.js";
 import type { Provider } from "../providers/types.js";
 import type { ScopedConnection, ScopedRunConnection } from "./scoped-connections.js";
 import { resolveWorkspaceFileCredential } from "./file-credential.js";
+import type { Effort } from "../providers/reasoning.js";
 
 /** No ambient profile/env/OAuth fallback: the admitted Workspace generation is the whole audience. */
 export function createWorkspaceProvider(connection: ScopedConnection, binding: ScopedRunConnection): Provider {
@@ -12,8 +13,9 @@ export function createWorkspaceProvider(connection: ScopedConnection, binding: S
   }
   const apiKey = connection.credentialFile ? resolveWorkspaceFileCredential(connection.credentialFile) : connection.apiKey;
   if (!apiKey) throw new Error("Workspace credential unavailable");
+  const reasoningEffort = binding.reasoning as Effort | null;
   // Deliberately no automatic retry/provider/model failover at this authority boundary.
   return connection.provider === "anthropic"
-    ? createAnthropicProvider({ apiKey, baseURL: connection.baseURL, model: binding.model, workspaceScoped: true })
-    : createOpenAIProvider({ apiKey, baseURL: connection.baseURL, model: binding.model, workspaceScoped: true });
+    ? createAnthropicProvider({ apiKey, baseURL: connection.baseURL, model: binding.model, reasoningEffort: reasoningEffort ?? undefined, workspaceScoped: true })
+    : createOpenAIProvider({ apiKey, baseURL: connection.baseURL, model: binding.model, reasoningEffort: reasoningEffort ?? undefined, workspaceScoped: true });
 }

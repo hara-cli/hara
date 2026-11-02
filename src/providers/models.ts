@@ -103,7 +103,17 @@ export async function listModels(
    * entry can still see and re-pick it instead of silently losing their current route. */
   keep?: string,
 ): Promise<string[]> {
-  if (!baseURL) return []; // SDK-default hosts (anthropic/openai) — no custom endpoint to enumerate
+  return (await listModelsWithSource(baseURL, apiKey, fetchImpl, keep)).models;
+}
+
+/** The Workspace picker needs to distinguish an authoritative response from documented fallback. */
+export async function listModelsWithSource(
+  baseURL: string | undefined,
+  apiKey: string,
+  fetchImpl: typeof fetch = userModelFetch,
+  keep?: string,
+): Promise<{ models: string[]; source: "live" | "documented" }> {
+  if (!baseURL) return { models: [], source: "documented" }; // no custom endpoint to enumerate
   const fallback = [
     ...codingPlanFallbackModels(baseURL),
     ...deepSeekFallbackModels(baseURL),
@@ -116,7 +126,7 @@ export async function listModels(
     const headers: Record<string, string> = {};
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
     const r = await fetchImpl(url, { headers, signal: AbortSignal.timeout(5_000) });
-    if (!r.ok) return fallback;
+    if (!r.ok) return { models: fallback, source: "documented" };
     const j = (await r.json()) as { data?: { id?: unknown }[] };
     const ids = (j?.data ?? []).map((m) => m?.id).filter((x): x is string => typeof x === "string" && x.length > 0);
     // Stable order + de-dup so the picker list doesn't jump around between opens.
@@ -134,8 +144,10 @@ export async function listModels(
             isVolcengineCodingPlanInteractiveModel(id)
             && (!isVolcengineCodingPlanSupersededModel(id) || id === keep))
       : discovered;
-    return selectable.length ? selectable : fallback;
+    return selectable.length
+      ? { models: selectable, source: "live" }
+      : { models: fallback, source: "documented" };
   } catch {
-    return fallback;
+    return { models: fallback, source: "documented" };
   }
 }
