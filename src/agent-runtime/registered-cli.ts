@@ -1,3 +1,5 @@
+import { classifyRuntimeFailure, runtimeFailureMessage } from "./failure-diagnostics.js";
+import { runtimeFailureTracker } from "./failure-tracker.js";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { runExternalCommandCapture } from "../external-sessions/process.js";
@@ -63,7 +65,15 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
       async launch(endpoint, prompt, activity) {
         assertCurrent();
         // Resolve at the actual physical launch, after context preparation; recheck the installed binary.
-        const resolved = installer.resolveBound(id);
+        let resolved;
+        try { resolved = installer.resolveBound(id); }
+        catch { return { ok: false, stdout: "", code: null, timedOut: false,
+          runtimeFailure: runtimeFailureMessage({ ...installer.failureContext(id), kind: "runtime_failed", elapsedMs: 0 }) }; }
+        const tracker = runtimeFailureTracker(installer, id, permit.binding.agent.agentId,
+          JSON.stringify([resolved.command, resolved.loginSource, resolved.env.HOME, permit.binding.agent.configRevision, model, effort]), resolved);
+        const held = tracker.blocked();
+        if (held) return { ok: false, stdout: "", code: null, timedOut: false, runtimeFailure: held };
+        const started = Date.now();
         const env: NodeJS.ProcessEnv = { ...resolved.env, ...endpoint.env,
           HARA_SUBPROCESS_ENV_ALLOW: [resolved.env.HARA_SUBPROCESS_ENV_ALLOW, WORKSPACE_MCP_TOKEN_ENV].filter(Boolean).join(",") };
         const args = registeredCliArgs({ id, prompt, cwd: options.ctx.cwd, model, effort,
@@ -71,9 +81,28 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
           mcp: { url: endpoint.url, timeoutMs: Number(options.timeoutMs) || 120_000 } });
         try {
           const result = await runExternalCommandCapture({ command: resolved.command, env }, args, {
-            cwd: options.ctx.cwd, signal: native.signal, failureKind: "registered-cli", timeoutMs: Number(options.timeoutMs) || 120_000,
-            maxOutputBytes: 2 * 1024 * 1024, onStdout: activity,
+            cwd: options.ctx.cwd, signal: native.signal, failureKind: "runtime", timeoutMs: Number(options.timeoutMs) || 120_000,
+            maxOutputBytes: 2 * 1024 * 1024, onStdout: activity, retainStdoutOnFailure: id === "codex",
           });
+          // Codex may deliver a terminal error frame with a zero exit. Classify only the error frame,
+          // never model prose, and discard all native output on this path.
+          let eventFailure: string | undefined;
+          if (id === "codex") for (const line of result.stdout.split(/\r?\n/u)) {
+            try {
+              const event = JSON.parse(line);
+              if (event.type === "turn.completed") eventFailure = undefined;
+              else if (event.type === "error" || event.type === "turn.failed") {
+                eventFailure = JSON.stringify(event.error ?? event.message ?? {}).slice(0, 64 * 1024);
+              }
+            } catch { /* text-mode fixtures and older CLIs remain supported */ }
+          }
+          if (!result.ok || eventFailure !== undefined) {
+            if (native.signal.aborted || result.errorCode === "interrupted") return { ...result, ok: false, stdout: "", errorCode: "interrupted" };
+            const kind = classifyRuntimeFailure({ code: eventFailure !== undefined && result.errorCode === "runtime_failed" ? undefined : result.errorCode,
+              stderr: eventFailure, timedOut: result.timedOut });
+            return { ...result, ok: false, stdout: "", runtimeFailure: tracker.failed(kind, Date.now() - started) };
+          }
+          tracker.succeeded();
           return { ...result, stdout: redactToolSubprocessOutput(result.stdout, env) };
         } finally { delete env[WORKSPACE_MCP_TOKEN_ENV]; }
       },

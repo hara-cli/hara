@@ -11107,3 +11107,11 @@ explicitly deferred with two alternatives. Earlier historical failures and stres
   minimal exact hunks before syntax-checking; no build, signing or source mutation ran on failure.
 
 ---
+
+
+## [ERR-20261103-RUNTIME-DIAGNOSTIC-FIXTURES] resolved native failure fixtures
+
+- Added Claude network/proxy/version fixtures initially inherited a Codex-only trusted-project argument check. The next run still had the matching old argument assertion. Both were fixed only in the fixture and expected CLI-specific arguments; product confinement was unchanged.
+- Keep raw-output retention opt-in for a documented JSON parser. A nonzero native exit otherwise discards stdout before the driver can classify its terminal error frame. Generic transport failure must not overwrite a specific structured error event.
+- Resolve files with `rg --files` in the intended repository before cross-repository reads. Guessed sibling filenames and reads at the task root produced harmless missing-file/not-a-repository errors during this run; no source or shared state changed from those reads.
+- Final focused and full results are recorded in the workspace inbox handoff. Preserve the initial failure logs separately from the final verification.

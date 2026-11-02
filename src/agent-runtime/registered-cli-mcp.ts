@@ -156,7 +156,7 @@ export function createRegisteredCliMcpTurn(input: {
           try {
             const result = await input.launch(endpoint!, prompt, () => activity?.());
             if (!result.ok) finished = { text: "", toolUses: [], stop: "error",
-              errorMsg: "registered Runtime failed (" + (result.errorCode ?? (result.timedOut ? "timeout" : "exit")) + "); no fallback was selected" };
+              errorMsg: result.runtimeFailure ?? "registered Runtime failed (" + (result.errorCode ?? (result.timedOut ? "timeout" : "exit")) + "); no fallback was selected" };
             else if (input.jsonEvents === false) finished = { text: result.stdout.trim(), toolUses: [], stop: "end" };
             else {
               // JSON events contain native session IDs and internal calls. Persist only the final text.

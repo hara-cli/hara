@@ -1,3 +1,4 @@
+import { classifyRuntimeFailure } from "../agent-runtime/failure-diagnostics.js";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir, platform } from "node:os";
@@ -37,6 +38,8 @@ export interface ExternalCommandCaptureResult {
   timedOut: boolean;
   /** A bounded machine-readable code only. Provider stderr is never returned. */
   errorCode?: string;
+  /** Fixed-field runtime diagnostic; never contains provider output. */
+  runtimeFailure?: string;
 }
 
 export interface ExternalCommandRunOptions {
@@ -51,7 +54,7 @@ export interface ExternalCommandRunOptions {
    * response. It must never be forwarded to users or diagnostics because provider output may hold account data. */
   retainStdoutOnFailure?: boolean;
   /** Opt-in, allowlisted classification. Raw stderr never crosses this boundary. */
-  failureKind?: "registered-cli";
+  failureKind?: "registered-cli" | "runtime";
 }
 
 const safeExternalErrorCode = (stderr: string): string | undefined => {
@@ -103,8 +106,10 @@ export async function runExternalCommandCapture(
         windowsHide: true,
         ...(cwd ? { cwd } : {}),
       });
-    } catch {
-      resolve({ ok: false, stdout: "", code: null, timedOut: false, errorCode: "spawn_failed" });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      resolve({ ok: false, stdout: "", code: null, timedOut: false, errorCode: run.failureKind === "runtime" && ["ENOENT", "EACCES", "EPERM"].includes(code ?? "")
+        ? classifyRuntimeFailure({ code }) : "spawn_failed" });
       return;
     }
 
@@ -159,16 +164,18 @@ export async function runExternalCommandCapture(
         stdout: "",
         code: null,
         timedOut: false,
-        errorCode: error.code === "ENOENT" ? "command_not_found" : "spawn_failed",
+        errorCode: run.failureKind === "runtime" ? classifyRuntimeFailure({ code: error.code ?? "spawn_failed" })
+          : error.code === "ENOENT" ? "command_not_found" : "spawn_failed",
       });
     });
-    child.once("close", (code) => {
+    child.once("close", (code, signal) => {
       finish({
         ok: code === 0,
         stdout: code === 0 || run.retainStdoutOnFailure === true ? stdout : "",
         code,
         timedOut: false,
-        ...(code === 0 ? {} : { errorCode: (run.failureKind === "registered-cli" ? registeredCliFailureCode(stderr) : undefined) ?? safeExternalErrorCode(stderr) ?? "command_failed" }),
+        ...(code === 0 ? {} : { errorCode: run.failureKind === "runtime" ? classifyRuntimeFailure({ stderr, code: safeExternalErrorCode(stderr), ...(signal ? { signal } : {}) })
+          : (run.failureKind === "registered-cli" ? registeredCliFailureCode(stderr) : undefined) ?? safeExternalErrorCode(stderr) ?? "command_failed" }),
       });
     });
   });

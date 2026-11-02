@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import type { RuntimeFailureContext } from "../agent-runtime/failure-diagnostics.js";
 import { userInfo } from "node:os";
-import { join, dirname, isAbsolute } from "node:path";
+import { join, dirname, isAbsolute, resolve } from "node:path";
 import { WorkspaceJsonState, exact, plain, UUID } from "./local-state.js";
 import { sameWorkspaceResourceBinding, workspaceResourceDirectory, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { OPTIONAL_RUNTIMES, RUNTIME_DOWNLOAD_HOSTS, RUNTIME_LABELS, resolveOfficialRuntimeArtifact } from "./runtime-catalog.js";
@@ -247,6 +248,24 @@ export class WorkspaceRuntimeInstaller {
     const installed = this.state.read().entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
     if (!installed) return fail();
     return this.resolve(runtimeId, installed.artifact.version, installed.artifact.sha256);
+  }
+  /** Diagnostic metadata only: no login files, environment dump, paths or version probe. */
+  failureContext(runtimeId: "codex" | "claude" | "opencode",
+    launched?: { env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource }): RuntimeFailureContext {
+    let version: string | null = null, loginSource: RuntimeFailureContext["loginSource"] = "unknown";
+    try {
+      const local = this.locals.read().entries.find(row => row.runtimeId === runtimeId);
+      version = local?.version ?? this.state.read().entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1)?.artifact.version ?? null;
+      loginSource = launched?.loginSource ?? this.loginSource(runtimeId);
+    } catch { /* unavailable metadata is unknown, never proof of a missing login */ }
+    let homeMatchesAccount: boolean | null = null;
+    if (launched?.env.HOME) {
+      try {
+        const comparable = (path: string) => process.platform === "win32" ? realpathSync(resolve(path)).toLowerCase() : realpathSync(resolve(path));
+        homeMatchesAccount = comparable(launched.env.HOME) === comparable(this.accountHome());
+      } catch { /* account lookup failure is not a mismatched home */ }
+    }
+    return { runtime: runtimeId, version, loginSource, homeMatchesAccount };
   }
   /**
    * Read-only snapshot of the host's own Codex model cache, only while this binding launches with the
