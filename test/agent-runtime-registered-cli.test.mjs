@@ -42,7 +42,7 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
   const detected = installer.list().options.find(option => option.runtimeId === runtimeId);
   assert.equal(detected.state, "detected");
   assert.equal(resources.agents.runtimeOptions().find(option => option.id === runtimeId).available, false);
-  installer.registerLocal(runtimeId, detected.fingerprint);
+  installer.registerLocal(runtimeId, detected.fingerprint, "isolated");
   const models = new WorkspaceRuntimeModels(storage, installer);
   const modelId = runtimeId === "codex" ? "fixture-model" : "claude-sonnet-4-5";
   await models.select(runtimeId, modelId, 0);
@@ -86,7 +86,9 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
       assert.ok(result.error.includes(`(${failure})`));
       assert.ok(result.error.includes("no fallback was selected"));
       assert.ok(!result.error.includes("PRIVATE_ACCOUNT_DETAIL"));
-      assert.equal(history.length, 1);
+      assert.ok(history.slice(1).every(row => row.role === "assistant" && row.text === "" && row.toolUses.length === 0),
+        "a failed native run leaves no fabricated text or tool result; the common governor may retain an empty assistant boundary");
+      assert.doesNotMatch(JSON.stringify(history), /PRIVATE_ACCOUNT_DETAIL/);
     } else assert.equal(history.at(-1).text, `registered ${runtimeId} reply`);
     const args = fs.readFileSync(argv, "utf8");
     assert.match(args, runtimeId === "codex" ? /read-only/ : /plan/);
@@ -109,4 +111,19 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
     assert.equal(installer.list().options.find(option => option.runtimeId === runtimeId).state, "integrity_failed");
     assert.throws(() => new AgentRuntimeRegistry(undefined, installer).assertAvailable(runtimeId), /no fallback/);
   } finally { await closeWorkspaceRunPermit(permit); await installer.close(); }
+});
+
+test("registered CLI args project model and effort without widening write or shell authority", async () => {
+  const { registeredCliArgs } = await import("../dist/agent-runtime/registered-cli.js");
+  const codex = registeredCliArgs({ id: "codex", prompt: "hi", cwd: "/fixture/project", model: "gpt-5.6-sol", effort: "xhigh", skipGitRepoCheck: true });
+  assert.deepEqual(codex, ["exec", "hi", "--cd", "/fixture/project", "--skip-git-repo-check", "-m", "gpt-5.6-sol",
+    "-c", 'model_reasoning_effort="xhigh"', "--sandbox", "read-only"]);
+  assert(!codex.includes("danger-full-access") && !codex.includes("--yolo"));
+  const claude = registeredCliArgs({ id: "claude", prompt: "hi", cwd: "/fixture/project", model: "claude-sonnet-4-5", effort: "high", skipGitRepoCheck: false });
+  assert.deepEqual(claude, ["-p", "hi", "--output-format", "text", "--model", "claude-sonnet-4-5", "--effort", "high", "--permission-mode", "plan"]);
+  assert(!claude.includes("bypassPermissions"));
+  // No selected model and no effort must not invent either flag.
+  const bare = registeredCliArgs({ id: "codex", prompt: "hi", cwd: "/fixture/project", model: null, effort: null, skipGitRepoCheck: false });
+  assert.deepEqual(bare, ["exec", "hi", "--cd", "/fixture/project", "--sandbox", "read-only"]);
+  assert(!bare.includes("-c") && !bare.includes("-m"));
 });

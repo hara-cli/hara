@@ -1195,9 +1195,10 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
  * There is one physical model request, not a Hara planner delegating its full task to a second planner. */
 export type AgentRuntimeTurn = (provider: Provider, args: TurnArgs) => Promise<TurnResult>;
 export async function runGovernedAgent(
-  history: NeutralMsg[], opts: RunOpts, runtimeId: "hara" | "pi", executeTurn?: AgentRuntimeTurn,
+  history: NeutralMsg[], opts: RunOpts, runtimeId: "hara" | "pi" | "codex" | "claude", executeTurn?: AgentRuntimeTurn,
 ): Promise<RunOutcome> {
-  if ((runtimeId !== "hara" && runtimeId !== "pi") || (runtimeId === "pi" && !executeTurn)) {
+  if (!["hara", "pi", "codex", "claude"].includes(runtimeId) || (runtimeId !== "hara" && !executeTurn)
+    || ((runtimeId === "codex" || runtimeId === "claude") && !opts.workspaceRun)) {
     return { status: "error", error: "Agent Runtime kernel is unavailable; no fallback was started." };
   }
   // CLI/headless callers also reach this compatibility engine directly. A persisted task bound to

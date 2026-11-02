@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readSync, unlinkSync, writeFileSync } from "node:fs";
-import { join, dirname } from "node:path";
 import { userInfo } from "node:os";
+import { join, dirname, isAbsolute } from "node:path";
 import { WorkspaceJsonState, exact, plain, UUID } from "./local-state.js";
 import { sameWorkspaceResourceBinding, workspaceResourceDirectory, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { OPTIONAL_RUNTIMES, RUNTIME_DOWNLOAD_HOSTS, RUNTIME_LABELS, resolveOfficialRuntimeArtifact } from "./runtime-catalog.js";
@@ -14,21 +15,80 @@ export interface RuntimeTarget { platform: NodeJS.Platform; arch: string }
 export interface RuntimeArtifact { runtimeId: OptionalRuntimeId; version: string; target: RuntimeTarget; url: string;
   sha256: string; format: "raw" | "tar.gz" | "zip"; member: string | null; maxBytes: number }
 interface Registration { artifact: RuntimeArtifact; executableSha256: string; bytes: number; installedAt: string }
-interface InstallState { resourceBinding: WorkspaceResourceBinding; revision: number; entries: Registration[] }
+/**
+ * Which CLI login a bound runtime launches with.
+ *
+ * - `host` (default for new bindings): use the OS account home so a runtime the user
+ *   already logged into works immediately. Hara never copies or links the host credential into its
+ *   private runtime home; the child receives the OS account home explicitly.
+ * - `isolated`: the historical behaviour — `HOME`/`CODEX_HOME` point at this Workspace's private
+ *   `runtime-homes/<id>` directory, so the user signs in again inside Hara.
+ *
+ * The record is stored per binding so switching back to `isolated` stays available to anyone who wants
+ * the separated home. A missing record means `isolated`: older state files never gain host access
+ * without an explicit, confirmed switch.
+ */
+export type RuntimeLoginSource = "host" | "isolated";
+export interface RuntimeLoginBinding { runtimeId: OptionalRuntimeId; source: RuntimeLoginSource; confirmedAt: string }
+interface InstallState { resourceBinding: WorkspaceResourceBinding; revision: number; entries: Registration[]; loginSources: RuntimeLoginBinding[] }
+interface LocalState { resourceBinding: WorkspaceResourceBinding; revision: number; entries: DetectedRuntime[]; loginSources: RuntimeLoginBinding[] }
 export interface RuntimeInstallCard { id: string; runtimeId: OptionalRuntimeId; label: string; version: string;
   origin: string; sha256: string; maxBytes: number; expiresAt: string; target: RuntimeTarget }
 interface Proposal { card: RuntimeInstallCard; artifact: RuntimeArtifact; controllerId: string; assertCurrent(): void; assertInstallCurrent(): void }
 interface Operation { id: string; runtimeId: OptionalRuntimeId; state: "downloading" | "registered" | "cancelled" | "failed"; controller: AbortController }
 const hash = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 const HASH = /^[a-f0-9]{64}$/;
+const MAX_HOST_CACHE_BYTES = 4 * 1024 * 1024;
+/** A host file is not Hara state, so it cannot use the private-state binder. It still refuses links and
+ * anything but a plain regular file, and never creates, repairs or rewrites the path. */
+function readOptionalHostText(path: string, maxBytes: number): string | null {
+  let before;
+  try { before = lstatSync(path); } catch { return null; }
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size <= 0 || before.size > maxBytes) return null;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.nlink !== 1 || opened.size !== before.size) return null;
+    const chunks: Buffer[] = []; let total = 0; const chunk = Buffer.alloc(64 * 1024);
+    for (;;) {
+      const length = readSync(fd, chunk, 0, chunk.length, null);
+      if (!length) break;
+      total += length;
+      if (total > maxBytes) return null;
+      chunks.push(Buffer.from(chunk.subarray(0, length)));
+    }
+    if (total !== before.size) return null;
+    return Buffer.concat(chunks).toString("utf8");
+  } catch { return null; }
+  finally { if (fd !== undefined) try { closeSync(fd); } catch { /* already closed */ } }
+}
 const fail = (): never => { throw new Error("Runtime installation unavailable or unsafe; no global configuration was changed"); };
-export function optionalRuntimeId(value: unknown): value is OptionalRuntimeId { return typeof value === "string" && OPTIONAL_RUNTIMES.includes(value as OptionalRuntimeId); }
+export const optionalRuntimeId = (value: unknown): value is OptionalRuntimeId => typeof value === "string" && OPTIONAL_RUNTIMES.includes(value as OptionalRuntimeId);
+const LOGIN_SOURCE_FIELDS = ["runtimeId", "source", "confirmedAt"] as const;
+const isLoginSource = (value: unknown): value is RuntimeLoginSource => value === "host" || value === "isolated";
+const validConfirmedAt = (value: unknown): value is string => typeof value === "string" && Number.isFinite(Date.parse(value));
+
+/** Legacy state files carry no `loginSources`. They stay isolated: host credentials are never granted
+ * by a migration the user did not confirm. Unknown or malformed records fail closed instead of being
+ * dropped, so a damaged file cannot silently widen credential scope. */
+function parseLoginSources(value: unknown): RuntimeLoginBinding[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 4) return fail();
+  const seen = new Set<string>();
+  return value.map(row => {
+    if (!plain(row) || !exact(row, [...LOGIN_SOURCE_FIELDS]) || !optionalRuntimeId(row.runtimeId)
+      || seen.has(row.runtimeId) || !isLoginSource(row.source) || !validConfirmedAt(row.confirmedAt)) return fail();
+    seen.add(row.runtimeId);
+    return { runtimeId: row.runtimeId, source: row.source, confirmedAt: row.confirmedAt };
+  });
+}
 
 /** Workspace-bound installation registry, NOT a claim that a general-Agent driver is implemented.
  * Host-only fixture resolver/fetch policy cannot be supplied by RPC, model tools or downloaded metadata. */
 export class WorkspaceRuntimeInstaller {
   private readonly state: WorkspaceJsonState<InstallState>;
-  private readonly locals: WorkspaceJsonState<{ resourceBinding: WorkspaceResourceBinding; revision: number; entries: DetectedRuntime[] }>;
+  private readonly locals: WorkspaceJsonState<LocalState>;
   private detected: DetectedRuntime[] = [];
   private discovery?: Promise<void>;
   private readonly proposals = new Map<string, Proposal>();
@@ -43,12 +103,15 @@ export class WorkspaceRuntimeInstaller {
     resolveArtifact?: (id: OptionalRuntimeId, target: RuntimeTarget, signal?: AbortSignal) => Promise<RuntimeArtifact>;
     onChange?: () => void;
     discovery?: DetectionOptions;
+    /** Test-only OS account home seam; production always calls userInfo().homedir. */
+    accountHome?: () => string;
   } = {}) {
     this.target = Object.freeze({ platform: options.target?.platform ?? process.platform, arch: options.target?.arch ?? process.arch });
     if (options.fixtureOrigin) { const url = new URL(options.fixtureOrigin); if (url.origin !== options.fixtureOrigin || url.protocol !== "http:" || url.hostname !== "127.0.0.1") fail(); }
     const binding = () => this.state.binding();
-    this.state = new WorkspaceJsonState(storage, "runtime-installations-v1.json", value => {
-      if (!plain(value) || !exact(value, ["resourceBinding", "revision", "entries"]) || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, binding())
+    this.state = new WorkspaceJsonState<InstallState>(storage, "runtime-installations-v1.json", value => {
+      if (!plain(value) || !exact(value, ["resourceBinding", "revision", "entries", ...(value.loginSources === undefined ? [] : ["loginSources"])])
+        || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, binding())
         || !Number.isSafeInteger(value.revision) || Number(value.revision) < 1
         || !Array.isArray(value.entries) || value.entries.length > 64) return fail();
       const seen = new Set<string>();
@@ -58,10 +121,11 @@ export class WorkspaceRuntimeInstaller {
         const artifact = this.validateArtifact(row.artifact), key = `${artifact.runtimeId}:${artifact.version}:${artifact.sha256}`;
         if (seen.has(key)) return fail(); seen.add(key);
       }
-      return structuredClone(value) as unknown as InstallState;
-    }, () => ({ resourceBinding: binding(), revision: 0, entries: [] }));
-    this.locals = new WorkspaceJsonState(storage, "runtime-local-v1.json", value => {
-      if (!plain(value) || !exact(value, ["resourceBinding", "revision", "entries"]) || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, this.state.binding())
+      return { ...structuredClone(value), loginSources: parseLoginSources(value.loginSources) } as unknown as InstallState;
+    }, () => ({ resourceBinding: binding(), revision: 0, entries: [], loginSources: [] }));
+    this.locals = new WorkspaceJsonState<LocalState>(storage, "runtime-local-v1.json", value => {
+      if (!plain(value) || !exact(value, ["resourceBinding", "revision", "entries", ...(value.loginSources === undefined ? [] : ["loginSources"])])
+        || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, this.state.binding())
         || !Number.isSafeInteger(value.revision) || Number(value.revision) < 1 || !Array.isArray(value.entries) || value.entries.length > 4) return fail();
       const seen = new Set<string>();
       for (const row of value.entries) {
@@ -69,8 +133,8 @@ export class WorkspaceRuntimeInstaller {
           || typeof row.path !== "string" || typeof row.realPath !== "string" || typeof row.version !== "string" || typeof row.source !== "string" || typeof row.fingerprint !== "string" || !HASH.test(row.fingerprint)) return fail();
         seen.add(row.runtimeId);
       }
-      return structuredClone(value) as unknown as { resourceBinding: WorkspaceResourceBinding; revision: number; entries: DetectedRuntime[] };
-    }, () => ({ resourceBinding: this.state.binding(), revision: 0, entries: [] }));
+      return { ...structuredClone(value), loginSources: parseLoginSources(value.loginSources) } as unknown as LocalState;
+    }, () => ({ resourceBinding: this.state.binding(), revision: 0, entries: [], loginSources: [] }));
   }
   async discover(): Promise<void> {
     if (this.closed || !this.options.discovery) return;
@@ -82,14 +146,47 @@ export class WorkspaceRuntimeInstaller {
     })().finally(() => { this.discovery = undefined; });
     return this.discovery;
   }
-  registerLocal(runtimeId: OptionalRuntimeId, fingerprint: string): void {
+  registerLocal(runtimeId: OptionalRuntimeId, fingerprint: string, loginSource: RuntimeLoginSource = runtimeId === "agy" ? "isolated" : "host"): void {
     if (this.closed) return fail();
-    const found = this.detected.find(row => row.runtimeId === runtimeId && row.fingerprint === fingerprint);
+    // A confirmed legacy binding may switch login source after restart, before a fresh discovery.
+    // Its stored path and fingerprint are re-inspected just like a newly detected binary.
+    const found = this.detected.find(row => row.runtimeId === runtimeId && row.fingerprint === fingerprint)
+      ?? this.locals.read().entries.find(row => row.runtimeId === runtimeId && row.fingerprint === fingerprint);
     const current = found && inspectLocalRuntime(found.path, true);
     if (!found || !current || current.realPath !== found.realPath || current.fingerprint !== fingerprint) return fail();
-    if (runtimeId === "codex") this.privateHome(runtimeId);
+    if (!isLoginSource(loginSource) || runtimeId === "agy" && loginSource !== "isolated") return fail();
+    if (loginSource === "isolated" && runtimeId === "codex") this.privateHome(runtimeId);
     const state = this.locals.read();
-    this.locals.update(state.revision, value => ({ ...value, entries: [...value.entries.filter(row => row.runtimeId !== runtimeId), found] }));
+    this.locals.update(state.revision, value => ({ ...value, entries: [...value.entries.filter(row => row.runtimeId !== runtimeId), found],
+      loginSources: [...value.loginSources.filter(row => row.runtimeId !== runtimeId),
+        { runtimeId, source: loginSource, confirmedAt: new Date().toISOString() }] }));
+  }
+  /** Which stored login this binding launches with. Absent means the legacy isolated home. */
+  loginSource(runtimeId: OptionalRuntimeId): RuntimeLoginSource {
+    if (!optionalRuntimeId(runtimeId)) return "isolated";
+    return this.locals.read().loginSources.find(row => row.runtimeId === runtimeId)?.source
+      ?? this.state.read().loginSources.find(row => row.runtimeId === runtimeId)?.source ?? "isolated";
+  }
+  /**
+   * Explicit, confirmed switch between the host login and this Workspace's private home.
+   * Core records the decision; the renderer's confirmation card is the human gate. Re-registering the
+   * same fingerprint is the only way a legacy isolated binding can gain host access.
+   */
+  setLoginSource(runtimeId: unknown, source: unknown): RuntimeLoginSource {
+    if (!optionalRuntimeId(runtimeId) || !isLoginSource(source) || runtimeId === "agy" && source !== "isolated") throw new Error("Invalid runtime login source");
+    const local = this.locals.read().entries.some(row => row.runtimeId === runtimeId);
+    if (!local && !this.state.read().entries.some(row => row.artifact.runtimeId === runtimeId)) return fail();
+    if (source === "isolated" && runtimeId === "codex") this.privateHome(runtimeId);
+    const record = (current: { loginSources: RuntimeLoginBinding[] }) => [...current.loginSources.filter(row => row.runtimeId !== runtimeId),
+      { runtimeId, source, confirmedAt: new Date().toISOString() }];
+    if (local) {
+      const current = this.locals.read();
+      this.locals.update(current.revision, value => ({ ...value, loginSources: record(value) }));
+    } else {
+      const current = this.state.read();
+      this.state.update(current.revision, value => ({ ...value, loginSources: record(value) }));
+    }
+    return source;
   }
   private privateHome(runtimeId: OptionalRuntimeId): string {
     return this.storage.run(() => {
@@ -100,27 +197,75 @@ export class WorkspaceRuntimeInstaller {
       return home;
     });
   }
-  resolveLocal(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv } {
+  /** Bun's os.userInfo() follows HOME on macOS; query the passwd record independently. */
+  private accountHome(): string {
+    let home: string;
+    if (this.options.accountHome) home = this.options.accountHome();
+    else if (process.platform === "darwin") {
+      const uid = process.geteuid?.();
+      if (uid === undefined) return fail();
+      let fields: string[];
+      try {
+        fields = execFileSync("/usr/bin/id", ["-P"], { encoding: "utf8", timeout: 1500,
+          maxBuffer: 4096, env: { PATH: "/usr/bin:/bin" } }).trim().split(":");
+      } catch { return fail(); }
+      if (fields.length !== 10 || fields[2] !== String(uid)) return fail();
+      home = fields[8]!;
+    } else home = this.options.discovery?.home ?? userInfo().homedir;
+    if (!isAbsolute(home) || home === "/" || /[\u0000-\u001f\u007f]/.test(home)) return fail();
+    return home;
+  }
+  /** Launch a host-bound runtime with the account login directory, without copying credentials. */
+  private hostEnv(command: string): NodeJS.ProcessEnv {
+    const { CODEX_HOME: _codexHome, CLAUDE_CONFIG_DIR: _claudeConfigDir, ...ambient } = process.env;
+    const home = this.accountHome();
+    return {
+      ...ambient,
+      HOME: home, USERPROFILE: home,
+      PATH: `${dirname(command)}:${this.options.discovery?.path ?? ambient.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin"}`,
+      DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0",
+    };
+  }
+  resolveLocal(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
     const row = this.locals.read().entries.find(row => row.runtimeId === runtimeId), checked = row && inspectLocalRuntime(row.path, true);
     if (!row || !checked || checked.realPath !== row.realPath || checked.fingerprint !== row.fingerprint) return fail();
     if (runtimeId === "agy") return { command: row.path, env: { HOME: this.options.discovery?.home ?? userInfo().homedir,
       USERPROFILE: this.options.discovery?.home ?? userInfo().homedir, PATH: `${dirname(row.path)}:${this.options.discovery?.path ?? process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin"}`,
-      DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" } };
+      DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" }, loginSource: "isolated" };
+    const loginSource = this.loginSource(runtimeId);
+    if (loginSource === "host") return { command: row.path, env: this.hostEnv(row.path), loginSource };
     const privateHome = this.privateHome(runtimeId);
     return { command: row.path, env: { HOME: privateHome, USERPROFILE: privateHome, CODEX_HOME: join(privateHome, ".codex"),
       CLAUDE_CONFIG_DIR: join(privateHome, ".claude"), PATH: `${dirname(row.path)}:${this.options.discovery?.path ?? "/usr/bin:/bin:/usr/sbin:/sbin"}`,
-      DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" } };
+      DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" }, loginSource };
   }
-  resolveBound(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv } {
+  resolveBound(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
     if (this.locals.read().entries.some(row => row.runtimeId === runtimeId)) return this.resolveLocal(runtimeId);
     const installed = this.state.read().entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
     if (!installed) return fail();
     return this.resolve(runtimeId, installed.artifact.version, installed.artifact.sha256);
   }
+  /**
+   * Read-only snapshot of the host's own Codex model cache, only while this binding launches with the
+   * host login. The file is read through the same no-follow/no-hardlink checks as private state, but it
+   * is never copied into `runtime-homes/*` and never written; a missing or unsafe file simply yields null.
+   */
+  hostCodexModelCache(): string | null {
+    if (this.loginSource("codex") !== "host") return null;
+    this.resolveBound("codex"); // revalidate the current registration before reading host metadata
+    const root = join(this.accountHome(), ".codex");
+    try {
+      if (!isAbsolute(root) || /[\u0000-\u001f\u007f]/.test(root)) return null;
+      return readOptionalHostText(join(root, "models_cache.json"), MAX_HOST_CACHE_BYTES);
+    } catch { return null; }
+  }
   /** Read-only login guidance for the registered executable and this Workspace's private home.
    * No login is launched and no global auth/config is read or projected. */
   codexLoginInstructions(): { runtimeId: "codex"; shell: "posix" | "powershell"; command: string } {
-    const { command, env } = this.resolveBound("codex");
+    const { command, env, loginSource } = this.resolveBound("codex");
+    // Host mode reuses the machine login; there is nothing to sign in again for, and returning a
+    // command that re-points HOME would quietly contradict the mode the user confirmed.
+    if (loginSource === "host") throw new Error("Codex reuses the host login; no separate sign-in is required");
     const quote = (value: string) => "'" + value.replaceAll("'", process.platform === "win32" ? "''" : "'\"'\"'") + "'";
     const values = ["HOME", "USERPROFILE", "CODEX_HOME"] as const;
     if (values.some(key => !env[key] || /[\r\n\0]/.test(env[key]!)) || /[\r\n\0]/.test(command)) return fail();
@@ -189,17 +334,19 @@ export class WorkspaceRuntimeInstaller {
       target: this.target, expiresAt: new Date(Date.now() + 5 * 60000).toISOString() });
     this.proposals.set(card.id, { card, artifact: Object.freeze(artifact), controllerId, assertCurrent, assertInstallCurrent }); return card;
   }
-  approve(id: string, approved: boolean, controllerId: string): { operationId: string | null; state: string } {
-    if (this.closed || typeof approved !== "boolean" || !UUID.test(id)) return fail();
+  approve(id: string, approved: boolean, controllerId: string, loginSource: RuntimeLoginSource = "host"): { operationId: string | null; state: string } {
+    if (this.closed || typeof approved !== "boolean" || !UUID.test(id) || !isLoginSource(loginSource)) return fail();
     const proposal = this.proposals.get(id);
     if (!proposal || proposal.controllerId !== controllerId || Date.parse(proposal.card.expiresAt) <= Date.now()) return fail();
-    proposal.assertCurrent(); this.proposals.delete(id); // single use, including a refusal
+    proposal.assertCurrent();
+    if (approved && proposal.card.runtimeId === "agy" && loginSource !== "isolated") throw new Error("Agy requires isolated login");
+    this.proposals.delete(id); // single use, including a refusal
     if (!approved) return { operationId: null, state: "declined" };
     if (this.active.has(proposal.card.runtimeId)) throw new Error("Runtime installation is already active; do not resend");
     for (const [id, prior] of this.operations) if (this.operations.size >= 64 && prior.state !== "downloading") this.operations.delete(id);
     const operation: Operation = { id: randomUUID(), runtimeId: proposal.card.runtimeId, state: "downloading", controller: new AbortController() };
     this.operations.set(operation.id, operation); this.active.set(operation.runtimeId, operation);
-    void this.install(proposal, operation).finally(() => {
+    void this.install(proposal, operation, loginSource).finally(() => {
       this.active.delete(operation.runtimeId);
       try { this.options.onChange?.(); } catch { /* A disconnected observer cannot invalidate a durable outcome. */ }
     });
@@ -230,7 +377,7 @@ export class WorkspaceRuntimeInstaller {
       this.storage.run(() => {}); return { path, bytes };
     } finally { if (fd !== undefined) closeSync(fd); }
   }
-  private async install(proposal: Proposal, operation: Operation): Promise<void> {
+  private async install(proposal: Proposal, operation: Operation, loginSource: RuntimeLoginSource): Promise<void> {
     try {
       const { artifact } = proposal, signal = operation.controller.signal;
       proposal.assertInstallCurrent();
@@ -255,37 +402,45 @@ export class WorkspaceRuntimeInstaller {
       }
       proposal.assertInstallCurrent(); signal.throwIfAborted(); this.inspect(artifact, registration);
       const current = this.state.read();
-      if (!current.entries.some(row => row.artifact.runtimeId === artifact.runtimeId && row.artifact.sha256 === artifact.sha256 && row.artifact.version === artifact.version)) {
-        this.state.update(current.revision, value => ({ ...value, entries: [...value.entries, registration] }));
-      }
+      this.state.update(current.revision, value => ({ ...value,
+        entries: value.entries.some(row => row.artifact.runtimeId === artifact.runtimeId && row.artifact.sha256 === artifact.sha256 && row.artifact.version === artifact.version)
+          ? value.entries : [...value.entries, registration],
+        loginSources: [...value.loginSources.filter(row => row.runtimeId !== artifact.runtimeId),
+          { runtimeId: artifact.runtimeId, source: loginSource, confirmedAt: new Date().toISOString() }] }));
       operation.state = "registered";
     } catch { operation.state = operation.controller.signal.aborted ? "cancelled" : "failed"; }
   }
   list() {
     const value = this.state.read(), locals = this.locals.read();
+    // Local registrations win over an older downloaded install, so their recorded source is the
+    // effective one; merge in that same order instead of letting a stale record shadow it.
+    const loginSources = [...locals.loginSources, ...value.loginSources.filter(row => !locals.loginSources.some(prior => prior.runtimeId === row.runtimeId))];
     return { revision: value.revision, builtIn: "pi", options: OPTIONAL_RUNTIMES.map(runtimeId => {
       const local = locals.entries.find(row => row.runtimeId === runtimeId), detected = this.detected.find(row => row.runtimeId === runtimeId);
+      const loginSource = loginSources.find(row => row.runtimeId === runtimeId)?.source ?? "isolated";
       if (local || detected) {
         const selected = local ?? detected!, inspected = inspectLocalRuntime(selected.path);
         const valid = Boolean(inspected && inspected.realPath === selected.realPath && inspected.fingerprint === selected.fingerprint);
         return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: valid, registered: Boolean(local && valid), version: selected.version,
-          path: selected.path, fingerprint: valid ? selected.fingerprint : null, source: selected.source,
+          path: selected.path, fingerprint: valid ? selected.fingerprint : null, source: selected.source, loginSource,
           generalAgentDriverAvailable: Boolean(local && valid && (runtimeId === "codex" || runtimeId === "claude")), state: valid ? local ? "local_registered" : "detected" : "integrity_failed" };
       }
       const installed = value.entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
       let verified = false; if (installed) try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* tampering revokes use, never repair or fallback */ }
       return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: verified, registered: verified, version: installed?.artifact.version ?? null,
-        generalAgentDriverAvailable: Boolean(verified && (runtimeId === "codex" || runtimeId === "claude")), state: installed ? verified ? "registered" : "integrity_failed" : "not_installed" };
+        loginSource, generalAgentDriverAvailable: Boolean(verified && (runtimeId === "codex" || runtimeId === "claude")), state: installed ? verified ? "registered" : "integrity_failed" : "not_installed" };
     }), operations: [...this.operations.values()].slice(-64).map(({ controller: _c, ...row }) => row) };
   }
-  resolve(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string): { command: string; env: NodeJS.ProcessEnv } {
+  resolve(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
     if (runtimeId === "agy") return fail();
     const row = this.state.read().entries.find(row => row.artifact.runtimeId === runtimeId && row.artifact.version === version && row.artifact.sha256 === artifactSha256);
     if (!row) return fail(); const checked = this.inspect(row.artifact, row); if (!checked) return fail();
+    const loginSource = this.loginSource(runtimeId);
+    if (loginSource === "host") return { command: checked.path, env: this.hostEnv(checked.path), loginSource };
     const privateHome = this.privateHome(runtimeId);
     return { command: checked.path, env: { HOME: privateHome, USERPROFILE: privateHome, CODEX_HOME: join(privateHome, ".codex"),
       CLAUDE_CONFIG_DIR: join(privateHome, ".claude"), XDG_CONFIG_HOME: join(privateHome, "config"), XDG_DATA_HOME: join(privateHome, "data"),
-      XDG_CACHE_HOME: join(privateHome, "cache"), DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" } };
+      XDG_CACHE_HOME: join(privateHome, "cache"), DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" }, loginSource };
   }
   async close(): Promise<void> {
     this.closed = true; this.proposals.clear(); for (const operation of this.active.values()) operation.controller.abort();

@@ -7,10 +7,16 @@ import { inspectWorkspaceResourceFile, sameWorkspaceResourceBinding, workspaceSt
   type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { optionalRuntimeId, type OptionalRuntimeId, type WorkspaceRuntimeInstaller } from "./runtime-install.js";
 
-export interface RuntimeModel { id: string; label: string; description?: string; recommended?: boolean }
-interface ModelSelection { runtimeId: OptionalRuntimeId; revision: number; selectedModelId: string | null }
+export interface RuntimeModel { id: string; label: string; description?: string; recommended?: boolean;
+  /** Reasoning levels this exact model advertised on the live inventory. Absent/empty means the
+   * capability is unknown, and effort selection must be refused rather than guessed. */
+  supportedReasoningEfforts?: string[]; defaultReasoningEffort?: string }
+interface ModelSelection { runtimeId: OptionalRuntimeId; revision: number; selectedModelId: string | null; selectedEffort: string | null }
 interface RuntimeModelsState { resourceBinding: WorkspaceResourceBinding; revision: number; selections: ModelSelection[] }
 const MAX_INVENTORY_BYTES = 4 * 1024 * 1024;
+const MAX_EFFORTS = 8;
+const EFFORT_ID = /^[a-z][a-z0-9-]{0,31}$/;
+const selectionFields = ["runtimeId", "revision", "selectedModelId"] as const;
 
 // These runtimes have no stable, non-interactive model inventory yet.
 const CATALOG: Partial<Record<OptionalRuntimeId, readonly RuntimeModel[]>> = {
@@ -27,8 +33,10 @@ function codexModels(parsed: unknown, field: "models" | "data"): RuntimeModel[] 
     const id = field === "models" ? value.slug : value.id;
     const label = field === "models" ? value.display_name : value.displayName;
     if (!validModelId(id) || typeof label !== "string" || !label.trim()) throw new Error("codex model inventory is invalid");
+    // `debug models` (and cached copies) do not publish reasoning capability; only live `model/list`.
+    const efforts = field === "data" ? codexEfforts(value) : {};
     return { id, label, ...(typeof value.description === "string" ? { description: value.description } : {}),
-      ...(value.isDefault === true ? { recommended: true } : {}) };
+      ...(value.isDefault === true ? { recommended: true } : {}), ...efforts };
   });
   if (new Set(models.map(model => model.id)).size !== models.length) throw new Error("codex model inventory has duplicate IDs");
   return models;
@@ -54,6 +62,13 @@ function cachedCodexModels(env: NodeJS.ProcessEnv, storage: WorkspaceResourceSto
   try { return codexModels(JSON.parse(snapshot.text), "models"); }
   catch { throw new Error("cache invalid"); }
 }
+/** Host mode: the CLI's own cache is a legitimate read-only fallback, never a copy target. */
+function hostCodexModels(runtimes: WorkspaceRuntimeInstaller): RuntimeModel[] {
+  const text = runtimes.hostCodexModelCache();
+  if (text === null) throw new Error("cache missing (host CODEX_HOME)");
+  try { return codexModels(JSON.parse(text), "models"); }
+  catch { throw new Error("cache invalid (host CODEX_HOME)"); }
+}
 function cacheCodexModels(models: RuntimeModel[], env: NodeJS.ProcessEnv, storage: WorkspaceResourceStorage): void {
   // Store only validated model metadata. Unknown native fields and authentication data are never copied.
   const text = JSON.stringify({ models: models.map(model => ({ slug: model.id, display_name: model.label,
@@ -70,10 +85,12 @@ function cacheCodexModels(models: RuntimeModel[], env: NodeJS.ProcessEnv, storag
 }
 async function liveModels(runtimeId: "codex" | "opencode", runtimes: WorkspaceRuntimeInstaller,
   storage: WorkspaceResourceStorage): Promise<RuntimeModel[]> {
-  const { command, env } = runtimes.resolveBound(runtimeId);
+  const { command, env, loginSource } = runtimes.resolveBound(runtimeId);
   const failures: string[] = [];
   const remember = (models: RuntimeModel[]): RuntimeModel[] => {
-    try { cacheCodexModels(models, env, storage); }
+    // The private cache is Hara-owned state inside runtime-homes/<id>. A host login must not be
+    // mirrored into it: that would copy a credential-adjacent inventory out of the user's own home.
+    if (loginSource === "isolated") try { cacheCodexModels(models, env, storage); }
     catch { /* A refused cache write must not hide a usable live inventory or bypass its private-file checks. */ }
     return models;
   };
@@ -106,7 +123,7 @@ async function liveModels(runtimeId: "codex" | "opencode", runtimes: WorkspaceRu
         catch (error) { failures.push(`debug models: ${codexFailure(error)}`); }
       }
     }
-    try { return cachedCodexModels(env, storage); }
+    try { return loginSource === "isolated" ? cachedCodexModels(env, storage) : hostCodexModels(runtimes); }
     catch (error) {
       const reason = error instanceof Error ? error.message : "cache unsafe";
       throw new Error(`codex model inventory failed; ${[...failures, reason].join("; ")}`);
@@ -122,6 +139,25 @@ async function liveModels(runtimeId: "codex" | "opencode", runtimes: WorkspaceRu
 }
 const validModelId = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(value)
   && !value.includes("..") && !value.includes("//") && !value.endsWith("/");
+const validEffort = (value: unknown): value is string => typeof value === "string" && EFFORT_ID.test(value);
+
+/** Live app-server entries carry reasoning capability; `debug models` and the private cache do not.
+ * Keep only values the provider actually declared so an unknown model can never receive an effort. */
+function codexEfforts(value: unknown): { supportedReasoningEfforts?: string[]; defaultReasoningEffort?: string } {
+  const raw = plain(value) && Array.isArray(value.supportedReasoningEfforts) ? value.supportedReasoningEfforts : null;
+  if (!raw) return {};
+  const ids: string[] = [];
+  for (const entry of raw) {
+    const id = typeof entry === "string" ? entry : plain(entry) ? (entry.reasoningEffort ?? entry.id) : null;
+    // The live contract (and the daemon's own parser) accepts either bare ids or `{ reasonEffort | id }`.
+    if (!validEffort(id) || ids.includes(id)) continue;
+    ids.push(id);
+    if (ids.length >= MAX_EFFORTS) break;
+  }
+  const defaultEffort = plain(value) && validEffort(value.defaultReasoningEffort) && ids.includes(value.defaultReasoningEffort)
+    ? value.defaultReasoningEffort : undefined;
+  return ids.length ? { supportedReasoningEfforts: ids, ...(defaultEffort ? { defaultReasoningEffort: defaultEffort } : {}) } : {};
+}
 
 /** Workspace-scoped model preference, separate from all connection and coding settings state. */
 export class WorkspaceRuntimeModels {
@@ -135,13 +171,16 @@ export class WorkspaceRuntimeModels {
         || !Array.isArray(value.selections) || value.selections.length > 4) throw new Error("Runtime model state is damaged");
       const seen = new Set<string>();
       for (const row of value.selections) {
-        if (!plain(row) || !exact(row, ["runtimeId", "revision", "selectedModelId"])
+        // `selectedEffort` is written from now on but must stay optional on read: state files created
+        // before effort existed have no such field, and an older Hara must never be locked out by it.
+        if (!plain(row) || !exact(row, [...selectionFields, ...(row.selectedEffort === undefined ? [] : ["selectedEffort"])])
           || !optionalRuntimeId(row.runtimeId) || seen.has(row.runtimeId)
           || !Number.isSafeInteger(row.revision) || Number(row.revision) < 1
-          || !validModelId(row.selectedModelId)) throw new Error("Runtime model state is damaged");
+          || !validModelId(row.selectedModelId)
+          || (row.selectedEffort !== undefined && row.selectedEffort !== null && !validEffort(row.selectedEffort))) throw new Error("Runtime model state is damaged");
         seen.add(row.runtimeId);
       }
-      return structuredClone(value) as unknown as RuntimeModelsState;
+      return { ...structuredClone(value), selections: (value.selections as ModelSelection[]).map(row => ({ ...row, selectedEffort: row.selectedEffort ?? null })) } as unknown as RuntimeModelsState;
     }, () => ({ resourceBinding: this.state.binding(), revision: 0, selections: [] }));
   }
   private bound(runtimeId: unknown): asserts runtimeId is OptionalRuntimeId {
@@ -150,10 +189,50 @@ export class WorkspaceRuntimeModels {
     if (!option?.registered || (option.state !== "local_registered" && option.state !== "registered"))
       throw new Error("Runtime not bound in this workspace");
   }
-  selected(runtimeId: OptionalRuntimeId): string | null {
-    this.bound(runtimeId);
-    return this.state.read().selections.find(row => row.runtimeId === runtimeId)?.selectedModelId ?? null;
+  /**
+   * Claude's model inventory is a static catalog, but its `--effort` flag is version-dependent. Ask the
+   * registered binary once per resolved identity and only publish levels it actually lists; a CLI without
+   * the flag reports no levels, so the UI cannot offer a level the launch would reject.
+   */
+  private claudeEfforts: { key: string; levels: string[] } | null = null;
+  private async claudeEffortLevels(): Promise<string[]> {
+    let resolved: ReturnType<WorkspaceRuntimeInstaller["resolveBound"]>;
+    try { resolved = this.runtimes.resolveBound("claude"); } catch { return []; }
+    const bound = this.runtimes.list().options.find(row => row.runtimeId === "claude");
+    const key = JSON.stringify([resolved.command, bound?.fingerprint ?? bound?.version ?? null]);
+    if (this.claudeEfforts?.key === key) return this.claudeEfforts.levels;
+    const result = await runExternalCommandCapture({ command: resolved.command, env: resolved.env }, ["--help"],
+      { cwd: resolved.env.HOME, timeoutMs: 10_000, maxOutputBytes: 256 * 1024 });
+    const text = result.ok ? result.stdout : "";
+    const flag = /--effort\s+(?:<[^>]+>)?[\s\S]{0,400}?\(([a-z][a-z0-9, ]*)\)/.exec(text);
+    const levels = flag ? [...new Set(flag[1]!.split(",").map(value => value.trim()).filter(validEffort))].slice(0, MAX_EFFORTS) : [];
+    this.claudeEfforts = { key, levels };
+    return levels;
   }
+  private async catalogModels(runtimeId: OptionalRuntimeId): Promise<RuntimeModel[]> {
+    const models = CATALOG[runtimeId]!.map(model => ({ ...model }));
+    if (runtimeId !== "claude") return models;
+    const levels = await this.claudeEffortLevels();
+    return levels.length ? models.map(model => ({ ...model, supportedReasoningEfforts: [...levels] })) : models;
+  }
+  /**
+   * Whether this runtime's registered binary can accept a reasoning level at launch. Codex always can
+   * (`-c model_reasoning_effort` is a config override). Claude only when its own `--help` lists the flag;
+   * the answer is cached per verified binary fingerprint, so a replacement is checked on the next launch.
+   */
+  async effortLaunchable(runtimeId: OptionalRuntimeId): Promise<boolean> {
+    this.bound(runtimeId);
+    if (runtimeId === "codex") return true;
+    if (runtimeId !== "claude") return false;
+    return (await this.claudeEffortLevels()).length > 0;
+  }
+  selection(runtimeId: OptionalRuntimeId): { modelId: string | null; effort: string | null } {
+    this.bound(runtimeId);
+    const row = this.state.read().selections.find(row => row.runtimeId === runtimeId);
+    return { modelId: row?.selectedModelId ?? null, effort: row?.selectedEffort ?? null };
+  }
+  selected(runtimeId: OptionalRuntimeId): string | null { return this.selection(runtimeId).modelId; }
+  selectedEffort(runtimeId: OptionalRuntimeId): string | null { return this.selection(runtimeId).effort; }
   /** Registration/binding can prepare inventory without making authentication a prerequisite for binding. */
   warm(runtimeId: unknown): void {
     if (runtimeId === "codex") void this.list(runtimeId).catch(() => { /* listModels reports stage failures on demand. */ });
@@ -171,27 +250,43 @@ export class WorkspaceRuntimeModels {
   async list(runtimeId: unknown) {
     this.bound(runtimeId);
     const row = this.state.read().selections.find(row => row.runtimeId === runtimeId);
-    const models = runtimeId === "codex" || runtimeId === "opencode" ? await this.live(runtimeId) : CATALOG[runtimeId]!.map(model => ({ ...model }));
+    const models = runtimeId === "codex" || runtimeId === "opencode" ? await this.live(runtimeId) : await this.catalogModels(runtimeId);
     this.bound(runtimeId);
     return { runtimeId, revision: row?.revision ?? 0, selectedModelId: row?.selectedModelId ?? null,
-      models };
+      selectedEffort: row?.selectedEffort ?? null, models };
   }
-  async select(runtimeId: unknown, modelId: unknown, expectedRevision: unknown): Promise<void> {
+  /**
+   * Persist the model and, optionally, its reasoning level.
+   *
+   * `effort` is three-valued: `undefined` keeps the current level, `null` clears it, and a string must
+   * be one the selected model declared on the live inventory. An unknown model capability is a refusal,
+   * never a silent reset — the caller asked for a level this model cannot promise.
+   */
+  async select(runtimeId: unknown, modelId: unknown, expectedRevision: unknown, effort?: unknown): Promise<void> {
     this.bound(runtimeId);
     if (!validModelId(modelId)) throw new Error("Invalid runtime modelId");
-    const models = runtimeId === "codex" || runtimeId === "opencode" ? await this.live(runtimeId) : CATALOG[runtimeId]!;
-    if (!models.some(model => model.id === modelId)) throw new Error("Invalid runtime modelId");
+    if (effort !== undefined && effort !== null && !validEffort(effort)) throw new Error("Invalid runtime effort");
+    const models = runtimeId === "codex" || runtimeId === "opencode" ? await this.live(runtimeId) : await this.catalogModels(runtimeId);
+    const model = models.find(row => row.id === modelId);
+    if (!model) throw new Error("Invalid runtime modelId");
+    if (effort !== undefined && effort !== null) {
+      const declared = model.supportedReasoningEfforts ?? [];
+      if (!declared.length) throw new Error("This model does not report reasoning effort; no level was selected");
+      if (!declared.includes(effort as string)) throw new Error("Invalid runtime effort");
+    }
     if (!Number.isSafeInteger(expectedRevision) || Number(expectedRevision) < 0) throw new Error("Invalid runtime model revision");
     const current = this.state.read();
-    if ((current.selections.find(row => row.runtimeId === runtimeId)?.revision ?? 0) !== expectedRevision)
-      throw new Error("Runtime model revision changed; refresh before selecting");
+    const prior = current.selections.find(row => row.runtimeId === runtimeId);
+    if ((prior?.revision ?? 0) !== expectedRevision) throw new Error("Runtime model revision changed; refresh before selecting");
+    const nextEffort = effort === undefined ? (prior?.selectedModelId === modelId ? prior?.selectedEffort ?? null : null)
+      : effort as string | null;
     this.state.update(current.revision, value => {
       // Recheck under the state lock so a concurrent selection cannot overwrite this runtime.
       if ((value.selections.find(row => row.runtimeId === runtimeId)?.revision ?? 0) !== expectedRevision)
         throw new Error("Runtime model revision changed; refresh before selecting");
       this.bound(runtimeId);
       return { ...value, selections: [...value.selections.filter(row => row.runtimeId !== runtimeId),
-        { runtimeId, revision: Number(expectedRevision) + 1, selectedModelId: modelId }] };
+        { runtimeId, revision: Number(expectedRevision) + 1, selectedModelId: modelId, selectedEffort: nextEffort }] };
     });
   }
 }

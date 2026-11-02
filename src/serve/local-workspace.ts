@@ -58,7 +58,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, capabilities: [capability, "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.colleague-schedules.v1", ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, capabilities: [capability, "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
@@ -128,16 +128,27 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (method === "workspace.skill.read") { fields(["workspaceId", "expectedGeneration", "id"]); if (!text(params.id)) throw new Error("Invalid skill"); return host.workspaceSkill(workspaceId, params.id); }
     if (method === "workspace.skill.fork") { fields(["workspaceId", "expectedGeneration", "id", "content", "approved", "expectedRevision"]); if (!text(params.id) || params.approved !== true) throw new Error("Private skill fork requires confirmation"); return host.forkWorkspaceSkill(workspaceId, params.id, params.content, params.expectedRevision as number); }
     if (method === "workspace.runtime.detect") { fields(["workspaceId", "expectedGeneration"]); await host.detectRuntimes(workspaceId); host.assertGeneration(workspaceId, params.expectedGeneration); return host.snapshot(workspaceId, undefined, client.id).runtimes; }
-    if (method === "workspace.runtime.registerLocal") { fields(["workspaceId", "expectedGeneration", "runtimeId", "fingerprint", "approved"]);
-      if (params.approved !== true) throw new Error("Explicit local runtime approval required"); host.registerLocalRuntime(workspaceId, params.runtimeId, params.fingerprint); return { registered: true }; }
+    if (method === "workspace.runtime.registerLocal") { fields(["workspaceId", "expectedGeneration", "runtimeId", "fingerprint", "approved",
+      ...(Object.hasOwn(params, "loginSource") ? ["loginSource"] : [])]);
+      if (params.approved !== true) throw new Error("Explicit local runtime approval required");
+      // A new binding defaults to the host login; `isolated` must be asked for explicitly because it is
+      // the mode that makes the user sign in again. The renderer's confirmation card is the human gate.
+      if (params.loginSource !== undefined && params.loginSource !== "host" && params.loginSource !== "isolated") throw new Error("Invalid runtime login source");
+      host.registerLocalRuntime(workspaceId, params.runtimeId, params.fingerprint, params.loginSource === "isolated" || params.loginSource === undefined && params.runtimeId === "agy" ? "isolated" : "host");
+      return { registered: true }; }
+    // Switching back and forth reuses `registerLocal` with the same verified fingerprint and a different
+    // `loginSource`; no second method name is introduced for the same confirmed decision.
     if (method === "workspace.runtime.loginInstructions") { fields(["workspaceId", "expectedGeneration", "runtimeId"]); return host.runtimeLoginInstructions(workspaceId, params.runtimeId); }
     if (method === "workspace.runtime.listModels") { fields(["workspaceId", "expectedGeneration", "runtimeId"]); return host.listRuntimeModels(workspaceId, params.runtimeId); }
-    if (method === "workspace.runtime.selectModel") { fields(["workspaceId", "expectedGeneration", "runtimeId", "modelId", "expectedRevision"]);
-      await host.selectRuntimeModel(workspaceId, params.runtimeId, params.modelId, params.expectedRevision); return { selected: true }; }
+    if (method === "workspace.runtime.selectModel") { fields(["workspaceId", "expectedGeneration", "runtimeId", "modelId", "expectedRevision",
+      ...(Object.hasOwn(params, "effort") ? ["effort"] : [])]);
+      await host.selectRuntimeModel(workspaceId, params.runtimeId, params.modelId, params.expectedRevision, params.effort); return { selected: true }; }
     if (method === "workspace.runtime.propose") { fields(["workspaceId", "expectedGeneration", "runtimeId"]); return host.proposeRuntime(client.id, workspaceId, params.runtimeId); }
-    if (method === "workspace.runtime.approve") { fields(["workspaceId", "expectedGeneration", "proposalId", "approved"]);
+    if (method === "workspace.runtime.approve") { fields(["workspaceId", "expectedGeneration", "proposalId", "approved",
+      ...(Object.hasOwn(params, "loginSource") ? ["loginSource"] : [])]);
       if (typeof params.proposalId !== "string" || !UUID.test(params.proposalId) || typeof params.approved !== "boolean") throw new Error("invalid runtime approval");
-      return host.approveRuntime(client.id, workspaceId, params.proposalId, params.approved); }
+      if (params.loginSource !== undefined && params.loginSource !== "host" && params.loginSource !== "isolated") throw new Error("Invalid runtime login source");
+      return host.approveRuntime(client.id, workspaceId, params.proposalId, params.approved, params.loginSource === "isolated" ? "isolated" : "host"); }
     if (method === "workspace.runtime.cancel") { fields(["workspaceId", "expectedGeneration", "operationId"]);
       if (typeof params.operationId !== "string" || !UUID.test(params.operationId)) throw new Error("invalid runtime operation");
       host.cancelRuntime(workspaceId, params.operationId); return { state: "cancelling" }; }

@@ -97,7 +97,7 @@ test("runtime model RPC requires binding, persists a per-runtime choice, and lea
     const codex = detected.options.find(row => row.runtimeId === "codex"); assert.equal(codex.state, "detected");
     const opencode = detected.options.find(row => row.runtimeId === "opencode"); assert.equal(opencode.state, "detected");
     await assert.rejects(client.request("workspace.runtime.listModels", { ...scope, runtimeId: "codex" }), /not bound/);
-    await client.request("workspace.runtime.registerLocal", { ...scope, runtimeId: "codex", fingerprint: codex.fingerprint, approved: true });
+    await client.request("workspace.runtime.registerLocal", { ...scope, runtimeId: "codex", fingerprint: codex.fingerprint, approved: true, loginSource: "isolated" });
     await client.request("workspace.runtime.registerLocal", { ...scope, runtimeId: "opencode", fingerprint: opencode.fingerprint, approved: true });
     const guide = await client.request("workspace.runtime.loginInstructions", { ...scope, runtimeId: "codex" });
     assert.equal(guide.runtimeId, "codex");
@@ -116,7 +116,7 @@ test("runtime model RPC requires binding, persists a per-runtime choice, and lea
     fs.writeFileSync(`${openCodeCommand}.fail`, "");
     await assert.rejects(client.request("workspace.runtime.listModels", { ...scope, runtimeId: "opencode" }), /inventory failed/);
     const listed = await client.request("workspace.runtime.listModels", { ...scope, runtimeId: "codex" });
-    assert.deepEqual(Object.keys(listed).sort(), ["models", "revision", "runtimeId", "selectedModelId"]);
+    assert.deepEqual(Object.keys(listed).sort(), ["models", "revision", "runtimeId", "selectedEffort", "selectedModelId"]);
     assert.equal(listed.selectedModelId, null); assert.equal(listed.revision, 0);
     assert.deepEqual(listed.models, [{ id: "fixture-app", label: "Fixture App", recommended: true }]);
     fs.unlinkSync(warmedCache);
@@ -160,14 +160,14 @@ test("runtime model RPC requires binding, persists a per-runtime choice, and lea
     const files = fs.readdirSync(state, { recursive: true }).filter(name => name.endsWith("runtime-models-v1.json"));
     assert.equal(files.length, 1);
     const stored = JSON.parse(fs.readFileSync(join(state, files[0]), "utf8"));
-    assert.deepEqual(stored.selections.map(row => [row.runtimeId, row.selectedModelId, row.revision]), [["codex", "fixture-new", 1]]);
+    assert.deepEqual(stored.selections.map(row => [row.runtimeId, row.selectedModelId, row.revision, row.selectedEffort]), [["codex", "fixture-new", 1, null]]);
     const second = await client.request("workspace.create", { label: "Other", expectedRevision: (await client.request("workspace.list")).revision });
     await assert.rejects(client.request("workspace.runtime.listModels", { workspaceId: second.workspaceId, expectedGeneration: second.resourceGeneration, runtimeId: "codex" }), /not bound/);
     const otherScope = { workspaceId: second.workspaceId, expectedGeneration: second.resourceGeneration };
     fs.writeFileSync(`${command}.fail`, "");
     const otherCodex = (await client.request("workspace.runtime.detect", otherScope)).options.find(row => row.runtimeId === "codex");
     assert.deepEqual(await client.request("workspace.runtime.registerLocal", { ...otherScope, runtimeId: "codex",
-      fingerprint: otherCodex.fingerprint, approved: true }), { registered: true }, "cold inventory does not block registration");
+      fingerprint: otherCodex.fingerprint, approved: true, loginSource: "isolated" }), { registered: true }, "cold inventory does not block registration");
     const otherMain = (await client.request("workspace.snapshot", { workspaceId: second.workspaceId, agentId: null })).agents[0];
     const otherBound = await client.request("workspace.agents.setRuntime", { ...otherScope, agentId: otherMain.agentId, runtimeId: "codex",
       configRevision: otherMain.configRevision, agentEpoch: otherMain.agentEpoch });
@@ -186,7 +186,7 @@ async function inventoryFixture() {
     run: async (_command, args) => args[0] === "-lic" ? null : "codex 1.2.3" } });
   await runtimes.discover();
   const detected = runtimes.list().options.find(row => row.runtimeId === "codex");
-  runtimes.registerLocal("codex", detected.fingerprint);
+  runtimes.registerLocal("codex", detected.fingerprint, "isolated");
   const models = new WorkspaceRuntimeModels(storage, runtimes);
   const { env } = runtimes.resolveBound("codex");
   return { discovery, command, storage, runtimes, models, env, cache: join(env.CODEX_HOME, "models_cache.json") };

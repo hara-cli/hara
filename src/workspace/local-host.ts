@@ -35,7 +35,7 @@ import { WorkspaceUserInteraction, workspacePermissionInteraction, type Workspac
 import { boundWorkspaceText } from "./model-context.js";
 import { createWorkspaceProvider } from "./provider.js";
 import { legacyWorkspaceProviderFailure, WorkspaceProviderAdmissionError, WorkspaceProviderRecovery } from "./provider-recovery.js";
-import { WorkspaceRuntimeInstaller, optionalRuntimeId } from "./runtime-install.js";
+import { WorkspaceRuntimeInstaller, optionalRuntimeId, type RuntimeLoginSource } from "./runtime-install.js";
 import { WorkspaceRuntimeModels } from "./runtime-models.js";
 import { WorkspaceSecureConnections } from "./secure-connections.js";
 import { MacKeychainCredentialVault, type CredentialVault } from "./credential-vault.js";
@@ -386,23 +386,23 @@ export class LocalWorkspaceHost {
       this.assertGeneration(workspaceId, generation);
     }, () => { if (this.closing) throw new Error("Workspace host is closing"); this.assertGeneration(workspaceId, generation); });
   }
-  approveRuntime(clientId: string, workspaceId: string, id: string, approved: boolean) {
-    return this.context(workspaceId).runtimes.approve(id, approved, clientId);
+  approveRuntime(clientId: string, workspaceId: string, id: string, approved: boolean, loginSource: RuntimeLoginSource = "host") {
+    return this.context(workspaceId).runtimes.approve(id, approved, clientId, loginSource);
   }
   cancelRuntime(workspaceId: string, operationId: string): void { this.context(workspaceId).runtimes.cancel(operationId); }
   async detectRuntimes(workspaceId: string): Promise<void> { await this.context(workspaceId).runtimes.discover(); }
-  registerLocalRuntime(workspaceId: string, runtimeId: unknown, fingerprint: unknown): void {
+  registerLocalRuntime(workspaceId: string, runtimeId: unknown, fingerprint: unknown, loginSource: RuntimeLoginSource = "host"): void {
     if (!optionalRuntimeId(runtimeId) || typeof fingerprint !== "string") throw new Error("Invalid local runtime registration");
     const context = this.context(workspaceId);
-    context.runtimes.registerLocal(runtimeId, fingerprint); context.runtimeModels.warm(runtimeId); this.changed(workspaceId);
+    context.runtimes.registerLocal(runtimeId, fingerprint, loginSource); context.runtimeModels.warm(runtimeId); this.changed(workspaceId);
   }
   runtimeLoginInstructions(workspaceId: string, runtimeId: unknown) {
     if (runtimeId !== "codex") throw new Error("Only Codex private-home login guidance is available");
     return this.context(workspaceId).runtimes.codexLoginInstructions();
   }
   listRuntimeModels(workspaceId: string, runtimeId: unknown) { return this.context(workspaceId).runtimeModels.list(runtimeId); }
-  async selectRuntimeModel(workspaceId: string, runtimeId: unknown, modelId: unknown, expectedRevision: unknown): Promise<void> {
-    await this.context(workspaceId).runtimeModels.select(runtimeId, modelId, expectedRevision); this.changed(workspaceId);
+  async selectRuntimeModel(workspaceId: string, runtimeId: unknown, modelId: unknown, expectedRevision: unknown, effort?: unknown): Promise<void> {
+    await this.context(workspaceId).runtimeModels.select(runtimeId, modelId, expectedRevision, effort); this.changed(workspaceId);
   }
   getPreferences() { const current = this.preferences.read(); if (!current.readOnly && current.revision === 0) this.preferences.save(current.theme, 0); return this.preferences.read(); }
   setPreferences(theme: unknown, expected: number, extra = {}) { this.preferences.save(theme, expected, extra); return this.preferences.read(); }
@@ -589,7 +589,7 @@ export class LocalWorkspaceHost {
     if (!pending || pending.card.workspaceId !== workspaceId || pending.clientId !== clientId || !selection || selection.workspaceId !== pending.card.workspaceId
       || (pending.card.channelId ? selection.channelId !== pending.card.channelId : selection.channelId || selection.agentId !== pending.card.agentId)
       || selection.epoch !== pending.selectionEpoch || pending.job.signal.aborted || Date.parse(pending.card.expiresAt) <= Date.now()) throw new Error("approval expired or belongs to another view");
-    assertWorkspaceRunAdmission(pending.job.permit, pending.job.options!, "pi");
+    assertWorkspaceRunAdmission(pending.job.permit, pending.job.options!, pending.job.binding.agent.runtimeId);
     pending.finish(approved ? { approved: true } : { approved: false, state: "declined" });
   }
   private approval(job: LocalJob, draft: LocalWorkspaceApproval["draft"]): Promise<ApprovalDecision> {
@@ -699,7 +699,7 @@ export class LocalWorkspaceHost {
     this.changed(job.workspaceId, job.agentId);
   }
   private jobTools(job: LocalJob, agent: WorkspaceAgentView): Tool[] {
-    const assertCurrent = () => { assertWorkspaceRunAdmission(job.permit, job.options!, "pi"); };
+    const assertCurrent = () => { assertWorkspaceRunAdmission(job.permit, job.options!, job.binding.agent.runtimeId); };
     let agentCreateAttempts = 0;
     const bundles = job.context.features.enabledSkills();
     const tools = [...localWorkspaceFileTools(job.context.project, assertCurrent), job.receipts!.tool(), job.startContext!.tool(assertCurrent),
