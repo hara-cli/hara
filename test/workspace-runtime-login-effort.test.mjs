@@ -1,7 +1,7 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join, dirname } from "node:path";
 import { once } from "node:events";
 import { randomUUID } from "node:crypto";
@@ -68,7 +68,7 @@ async function fixture(loginSource) {
   const storage = new WorkspaceResourceStorage(join(data, "home"), { schemaVersion: 1, workspaceId: `ws_${randomUUID()}`,
     authority: { kind: "local", localAuthorityId: randomUUID() } });
   storage.initialize();
-  const runtimes = new WorkspaceRuntimeInstaller(storage, { discovery: { home: host, path: "/usr/bin:/bin", systemBins: [],
+  const runtimes = new WorkspaceRuntimeInstaller(storage, { accountHome: () => host, discovery: { home: host, path: "/usr/bin:/bin", systemBins: [],
     run: async (_command, args) => args[0] === "-lic" ? null : "codex 1.2.3" } });
   await runtimes.discover();
   const detected = runtimes.list().options.find(row => row.runtimeId === "codex");
@@ -77,7 +77,7 @@ async function fixture(loginSource) {
   return { data, host, command, storage, runtimes, models };
 }
 
-test("a new binding reuses the host login: no HOME/CODEX_HOME override and no copied credential", async () => {
+test("a new binding reuses the account login without copied credentials", async () => {
   const f = await fixture("host");
   try {
     const resolved = f.runtimes.resolveBound("codex");
@@ -87,20 +87,10 @@ test("a new binding reuses the host login: no HOME/CODEX_HOME override and no co
     assert.notEqual(process.env.HOME, f.host, "fixture keeps the engine HOME distinct from the account home");
     assert.equal(resolved.env.HOME, f.host, "host mode launches with the OS-account home");
     assert.equal(resolved.env.USERPROFILE, f.host);
-    assert.equal(resolved.env.CODEX_HOME, process.env.CODEX_HOME, "host mode keeps an ambient CODEX_HOME (undefined stays undefined)");
+    assert.equal(resolved.env.CODEX_HOME, undefined);
+    assert.equal(resolved.env.CLAUDE_CONFIG_DIR, undefined);
     assert.equal(f.runtimes.list().options.find(row => row.runtimeId === "codex").loginSource, "host");
-    if (process.env.CODEX_HOME === undefined) {
-      assert.match(f.runtimes.hostCodexModelCache(), /host-cached/, "the account's ~/.codex cache is read without any CODEX_HOME override");
-    }
-    const previousCodexHome = process.env.CODEX_HOME;
-    try {
-      process.env.CODEX_HOME = join(f.host, ".codex");
-      assert.match(f.runtimes.hostCodexModelCache(), /host-cached/, "host mode reads only the ambient Codex cache");
-      assert.equal(f.runtimes.resolveBound("codex").env.CODEX_HOME, process.env.CODEX_HOME);
-    } finally {
-      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = previousCodexHome;
-    }
+    assert.match(f.runtimes.hostCodexModelCache(), /host-cached/, "the account's ~/.codex cache is read without inherited overrides");
     // Live model/list wins, and it carries the reasoning capability Hara needs for the effort picker.
     const listed = await f.models.list("codex");
     assert.deepEqual(listed.models[0].supportedReasoningEfforts, ["low", "medium", "high", "xhigh"]);
@@ -142,7 +132,7 @@ test("legacy state files without a login record stay isolated and are never sile
     const legacy = JSON.parse(fs.readFileSync(files[0], "utf8"));
     delete legacy.loginSources;
     fs.writeFileSync(files[0], JSON.stringify(legacy));
-    const reopened = new WorkspaceRuntimeInstaller(f.storage, { discovery: { home: f.host, path: "/usr/bin:/bin", systemBins: [] } });
+    const reopened = new WorkspaceRuntimeInstaller(f.storage, { accountHome: () => f.host, discovery: { home: f.host, path: "/usr/bin:/bin", systemBins: [] } });
     assert.equal(reopened.loginSource("codex"), "isolated", "a missing field means isolated");
     assert.ok(reopened.resolveBound("codex").env.HOME.startsWith(join(f.data, "home")));
     // Present-but-null is damaged, not a legacy missing field.
@@ -174,17 +164,26 @@ test("Desktop-shaped engine: host mode escapes the private data HOME and never r
   // home) and HARA_WORKSPACE_DISCOVERY_HOME=<OS account home>. Before the fix, host mode inherited the
   // private HOME, Codex found no auth.json there, and the user was asked to sign in again.
   const f = await fixture("host");
-  const previous = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, CODEX_HOME: process.env.CODEX_HOME };
+  const previous = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, CODEX_HOME: process.env.CODEX_HOME,
+    CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR };
   const privateDataHome = join(f.data, "home");
   try {
-    process.env.HOME = privateDataHome; process.env.USERPROFILE = privateDataHome; delete process.env.CODEX_HOME;
+    process.env.HOME = privateDataHome; process.env.USERPROFILE = privateDataHome;
+    process.env.CODEX_HOME = join(privateDataHome, ".codex");
+    process.env.CLAUDE_CONFIG_DIR = join(privateDataHome, ".claude");
     const resolved = f.runtimes.resolveBound("codex");
     assert.equal(resolved.loginSource, "host");
     assert.equal(resolved.env.HOME, f.host, "the CLI sees the account home, not the engine's private HOME");
     assert.equal(resolved.env.USERPROFILE, f.host);
-    assert.equal(resolved.env.CODEX_HOME, undefined, "no private CODEX_HOME is injected");
+    assert.equal(resolved.env.CODEX_HOME, undefined, "private CODEX_HOME is removed");
+    assert.equal(resolved.env.CLAUDE_CONFIG_DIR, undefined, "private Claude config override is removed");
     assert.ok(fs.existsSync(join(resolved.env.HOME, ".codex", "auth.json")), "the existing host login is where Codex will look");
     assert.match(f.runtimes.hostCodexModelCache(), /host-cached/);
+    const wrongDiscovery = new WorkspaceRuntimeInstaller(f.storage, { accountHome: () => f.host,
+      discovery: { home: privateDataHome, path: "/usr/bin:/bin", systemBins: [] } });
+    assert.equal(wrongDiscovery.resolveBound("codex").env.HOME, f.host, "discovery home cannot redirect host login");
+    assert.match(wrongDiscovery.hostCodexModelCache(), /host-cached/);
+    await wrongDiscovery.close();
     // Spawn through the same launcher and bounded argv the registered-CLI driver uses.
     const launched = await runExternalCommandCapture({ command: resolved.command, env: resolved.env },
       registeredCliArgs({ id: "codex", prompt: "hi", cwd: f.host, model: null, effort: null, skipGitRepoCheck: true }),
@@ -199,21 +198,26 @@ test("Desktop-shaped engine: host mode escapes the private data HOME and never r
   }
 });
 
-test("without an operator discovery home, host mode keeps the process HOME (isolated test/CLI runs stay isolated)", async () => {
+test("host mode uses the OS account home even when discovery is absent and process HOME is private", async () => {
   const f = await fixture("host");
+  const previousHome = process.env.HOME;
   try {
+    process.env.HOME = join(f.data, "home");
     const bare = new WorkspaceRuntimeInstaller(f.storage, {});
     assert.equal(bare.loginSource("codex"), "host");
-    assert.equal(bare.resolveBound("codex").env.HOME, process.env.HOME);
+    assert.equal(bare.resolveBound("codex").env.HOME, userInfo().homedir);
     await bare.close();
-  } finally { await f.runtimes.close(); }
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    await f.runtimes.close();
+  }
 });
 
 test("a legacy isolated registration can switch to host after restart without discovery", async () => {
   const f = await fixture("isolated");
   try {
     const registered = f.runtimes.list().options.find(row => row.runtimeId === "codex");
-    const reopened = new WorkspaceRuntimeInstaller(f.storage, { discovery: { home: f.host, path: "/usr/bin:/bin", systemBins: [] } });
+    const reopened = new WorkspaceRuntimeInstaller(f.storage, { accountHome: () => f.host, discovery: { home: f.host, path: "/usr/bin:/bin", systemBins: [] } });
     assert.equal(reopened.loginSource("codex"), "isolated");
     reopened.registerLocal("codex", registered.fingerprint, "host");
     assert.equal(reopened.resolveBound("codex").loginSource, "host");
@@ -247,7 +251,7 @@ test("effort selection accepts only a level the model published and persists it"
 test("the main Hara bot uses the same detect/register/bind/model/effort path as a colleague", async () => {
   const data = root(), host = root(), command = join(host, ".local/bin/codex"); binary(command);
   const handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port: 0 }, { root: data, mode: "workspace", version: "fixture",
-    runtimeInstallerOptions: { discovery: { home: host, path: "/usr/bin:/bin", systemBins: [],
+    runtimeInstallerOptions: { accountHome: () => host, discovery: { home: host, path: "/usr/bin:/bin", systemBins: [],
       run: async (_command, args) => args[0] === "-lic" ? null : "codex 1.2.3" } } });
   const socket = new WebSocket(`ws://127.0.0.1:${handle.port}`); await once(socket, "open"); let nextId = 0;
   const request = (method, params = {}) => new Promise((resolve, reject) => {

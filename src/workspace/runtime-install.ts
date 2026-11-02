@@ -17,9 +17,9 @@ interface Registration { artifact: RuntimeArtifact; executableSha256: string; by
 /**
  * Which CLI login a bound runtime launches with.
  *
- * - `host` (default for new bindings): keep the machine's own `HOME`/`CODEX_HOME` so a runtime the user
+ * - `host` (default for new bindings): use the OS account home so a runtime the user
  *   already logged into works immediately. Hara never copies or links the host credential into its
- *   private runtime home; the child just inherits the real one, exactly like Raft's default.
+ *   private runtime home; the child receives the OS account home explicitly.
  * - `isolated`: the historical behaviour — `HOME`/`CODEX_HOME` point at this Workspace's private
  *   `runtime-homes/<id>` directory, so the user signs in again inside Hara.
  *
@@ -102,6 +102,8 @@ export class WorkspaceRuntimeInstaller {
     resolveArtifact?: (id: OptionalRuntimeId, target: RuntimeTarget, signal?: AbortSignal) => Promise<RuntimeArtifact>;
     onChange?: () => void;
     discovery?: DetectionOptions;
+    /** Test-only OS account home seam; production always calls userInfo().homedir. */
+    accountHome?: () => string;
   } = {}) {
     this.target = Object.freeze({ platform: options.target?.platform ?? process.platform, arch: options.target?.arch ?? process.arch });
     if (options.fixtureOrigin) { const url = new URL(options.fixtureOrigin); if (url.origin !== options.fixtureOrigin || url.protocol !== "http:" || url.hostname !== "127.0.0.1") fail(); }
@@ -194,23 +196,16 @@ export class WorkspaceRuntimeInstaller {
       return home;
     });
   }
-  /**
-   * The machine's own CLI login. `host` launches with the real home so an already-authenticated CLI
-   * (and its model cache) is used as-is; nothing is copied, linked or re-pointed into Hara's private
-   * home. PATH still leads with the verified runtime directory, and ambient CODEX_HOME/CLAUDE_CONFIG_DIR
-   * are respected (an explicit override is the only thing that isolates a provider, same as Raft).
-   */
+  /** The OS account home is independent of the sidecar's private process HOME. */
+  private accountHome(): string {
+    const home = this.options.accountHome?.() ?? userInfo().homedir;
+    if (!isAbsolute(home) || /[\u0000-\u001f\u007f]/.test(home)) return fail();
+    return home;
+  }
+  /** Launch a host-bound runtime with the account login directory, without copying credentials. */
   private hostEnv(command: string): NodeJS.ProcessEnv {
-    // The Workspace engine's own HOME is NOT the user's home: Desktop launches `workspace serve` with
-    // `HOME=<root>/home` (its private data home). Inheriting that would point the CLI at an empty
-    // `<root>/home/.codex` and ask the user to sign in again — the exact failure host mode exists to
-    // remove. The OS-account home comes from the operator-only discovery home (Desktop passes the
-    // getpwuid home as HARA_WORKSPACE_DISCOVERY_HOME; an isolated candidate passes its fixture), never
-    // from RPC or model input. Without a discovery home we keep the process HOME, so test/CLI runs
-    // with an isolated HOME never reach the real account. An explicit ambient CODEX_HOME /
-    // CLAUDE_CONFIG_DIR is still respected (the only way to isolate a provider, same as Raft).
-    const ambient = process.env;
-    const home = this.options.discovery?.home ?? ambient.HOME ?? userInfo().homedir;
+    const { CODEX_HOME: _codexHome, CLAUDE_CONFIG_DIR: _claudeConfigDir, ...ambient } = process.env;
+    const home = this.accountHome();
     return {
       ...ambient,
       HOME: home, USERPROFILE: home,
@@ -244,8 +239,8 @@ export class WorkspaceRuntimeInstaller {
    */
   hostCodexModelCache(): string | null {
     if (this.loginSource("codex") !== "host") return null;
-    const { env } = this.resolveBound("codex");
-    const root = env.CODEX_HOME ?? join(env.HOME ?? userInfo().homedir, ".codex");
+    this.resolveBound("codex"); // revalidate the current registration before reading host metadata
+    const root = join(this.accountHome(), ".codex");
     try {
       if (!isAbsolute(root) || /[\u0000-\u001f\u007f]/.test(root)) return null;
       return readOptionalHostText(join(root, "models_cache.json"), MAX_HOST_CACHE_BYTES);
