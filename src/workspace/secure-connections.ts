@@ -10,10 +10,13 @@ interface LegacyImport { state: "pending" | "complete"; rows: { sourceId: string
 interface Document { schemaVersion: 3; resourceBinding: WorkspaceResourceBinding; revision: number; activeConnectionId: string | null; connections: Metadata[]; legacyImport?: LegacyImport }
 export interface LegacyConnectionSeed { id: string; label: string; provider: "openai" | "anthropic"; baseURL: string; defaultModel: string; isDefault?: boolean; keySaved?: boolean }
 function checked(value: unknown) {
-  if (!plain(value) || !text(value.label, 80) || !text(value.defaultModel) || !text(value.baseURL, 4096) || !["openai", "anthropic"].includes(String(value.provider))) throw new Error("Invalid model connection metadata");
+  if (!plain(value) || !text(value.label, 80) || !text(value.defaultModel) || !text(value.baseURL, 4096) || !["openai", "anthropic"].includes(String(value.provider))
+    || value.defaultReasoning !== undefined && value.defaultReasoning !== null
+      && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value.defaultReasoning))) throw new Error("Invalid model connection metadata");
   let url: URL; try { url = new URL(value.baseURL); } catch { throw new Error("Invalid model endpoint"); }
   if (url.username || url.password || url.search || url.hash || !["http:", "https:"].includes(url.protocol) || url.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) throw new Error("Unsafe model endpoint");
-  return { label: value.label, provider: value.provider as "openai" | "anthropic", baseURL: value.baseURL, defaultModel: value.defaultModel };
+  return { label: value.label, provider: value.provider as "openai" | "anthropic", baseURL: value.baseURL, defaultModel: value.defaultModel,
+    ...(Object.hasOwn(value, "defaultReasoning") ? { defaultReasoning: value.defaultReasoning as ScopedConnectionInput["defaultReasoning"] } : {}) };
 }
 export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
   private readonly document: VersionedSettings<Document>;
@@ -69,6 +72,7 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     const pending = state.value.legacyImport?.state === "pending";
     return { revision: state.value.revision, defaultConnectionId: pending || state.value.connections.some(row => row.id === state.value.activeConnectionId && (row.credentialInvalid || row.credentialMissing)) ? null : state.value.activeConnectionId, activeConnectionId: state.value.activeConnectionId, readOnly: state.readOnly || pending, recovered: state.recovered, migrationPending: state.migrationPending || pending,
       connections: state.value.connections.map(row => ({ id: row.id, label: row.label, provider: row.provider, baseURL: row.baseURL, defaultModel: row.defaultModel,
+        defaultReasoning: row.defaultReasoning ?? null,
         credentialGeneration: row.credentialGeneration, revision: row.revision, status: row.status, keySaved: !pending && !row.credentialMissing && row.status === "active", keyState: pending || row.credentialMissing ? "pending" : row.credentialInvalid ? "invalid" : "saved", credentialRequired: row.credentialMissing === true, cleanupPending: Boolean(row.retiredKeyRefs?.length), createdAt: row.createdAt, updatedAt: row.updatedAt })) };
   }
   /** Metadata-only prefill, once per personal Workspace. No vault access or secret persistence. */
@@ -134,7 +138,8 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     const generation = `gen_${randomUUID()}`, ref = `${state.value.resourceBinding.scopeKey}:${id}:${generation}`;
     this.vault.set(ref, key);
     try { this.document.update(expected, current => ({ ...current, connections: current.connections.map(item => item.id === id
-      ? { ...item, ...metadata, keyRef: ref, credentialInvalid: false, credentialMissing: false, retiredKeyRefs: [...new Set([...(item.retiredKeyRefs ?? []), item.keyRef])], credentialGeneration: generation, revision: item.revision + 1, updatedAt: new Date().toISOString() } : item) })); }
+      ? { ...item, ...metadata, defaultReasoning: Object.hasOwn(value, "defaultReasoning") ? metadata.defaultReasoning ?? null : metadata.defaultModel === item.defaultModel ? item.defaultReasoning ?? null : null,
+        keyRef: ref, credentialInvalid: false, credentialMissing: false, retiredKeyRefs: [...new Set([...(item.retiredKeyRefs ?? []), item.keyRef])], credentialGeneration: generation, revision: item.revision + 1, updatedAt: new Date().toISOString() } : item) })); }
     catch (error) { this.discardUncommittedCredential(ref, expected); throw error; }
     this.cleanupCredentials(id, this.document.read().value.revision);
   }
@@ -168,9 +173,11 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     for (const ref of refs) this.vault.remove(ref);
     this.document.update(expected, current => ({ ...current, connections: current.connections.map(item => item.id === id ? { ...item, retiredKeyRefs: [] } : item) }));
   }
-  override select(id: string, expected: number) { this.document.update(expected, current => {
+  override select(id: string, expected: number, modelId?: string, effort?: ScopedConnectionInput["defaultReasoning"]) { this.document.update(expected, current => {
     if (current.legacyImport?.state === "pending") throw new Error("Credential authorization pending");
-    if (!current.connections.some(row => row.id === id && row.status === "active")) throw new Error("Connection unavailable");
+    const row = current.connections.find(row => row.id === id && row.status === "active");
+    if (!row || modelId !== undefined && !text(modelId)) throw new Error("Connection unavailable");
+    if (modelId !== undefined) { row.defaultModel = modelId; row.defaultReasoning = effort ?? null; row.updatedAt = new Date().toISOString(); }
     current.activeConnectionId = id; return current;
   }); }
   override capture(id?: string, model?: string): Readonly<ScopedRunConnection> {
@@ -178,7 +185,7 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     if (state.legacyImport?.state === "pending") throw new Error("Credential authorization pending; no model call allowed");
     const row = state.connections.find(row => row.id === (id ?? state.activeConnectionId) && row.status === "active");
     if (!row || row.credentialInvalid || row.credentialMissing || model !== undefined && !text(model)) throw new Error("invalid or unavailable scoped model connection; no fallback was selected");
-    return deepFreeze({ connectionId: row.id, credentialGeneration: row.credentialGeneration, connectionRevision: row.revision, model: model ?? row.defaultModel, reasoning: null });
+    return deepFreeze({ connectionId: row.id, credentialGeneration: row.credentialGeneration, connectionRevision: row.revision, model: model ?? row.defaultModel, reasoning: row.defaultReasoning ?? null });
   }
   override resolve(binding: ScopedRunConnection): Readonly<ScopedConnection> {
     if (!isScopedRunConnection(binding)) throw new Error("Invalid connection binding");

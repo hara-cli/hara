@@ -38,6 +38,8 @@ import { legacyWorkspaceProviderFailure, WorkspaceProviderAdmissionError, Worksp
 import { WorkspaceRuntimeInstaller, optionalRuntimeId, type RuntimeLoginSource } from "./runtime-install.js";
 import { WorkspaceRuntimeModels } from "./runtime-models.js";
 import { WorkspaceSecureConnections } from "./secure-connections.js";
+import { connectionModelEfforts, connectionModels } from "./connection-models.js";
+import { resolveWorkspaceFileCredential } from "./file-credential.js";
 import { MacKeychainCredentialVault, type CredentialVault } from "./credential-vault.js";
 import { LegacyConnectionCatalog } from "./legacy-connections.js";
 import { WorkspacePreferences } from "./preferences.js";
@@ -435,7 +437,34 @@ export class LocalWorkspaceHost {
     if (!approved || !(store instanceof WorkspaceSecureConnections)) throw new Error("Explicit secure migration retry approval required");
     const value = store.retryMigration(expected); this.changed(workspaceId); return value;
   }
-  selectConnection(workspaceId: string, id: string, expected: number) { this.context(workspaceId).connections.select(id, expected); this.queueUsageRefresh(workspaceId); this.changed(workspaceId); }
+  async listConnectionModels(workspaceId: string, agentId: string, connectionId: string) {
+    const context = this.context(workspaceId);
+    const agent = context.resources.agents.list().agents.find(row => row.agentId === agentId);
+    if (!agent || agent.runtime.id !== "pi") throw new Error("Pi agent unavailable in this workspace");
+    const view = context.connections.list(), row = view.connections.find(item => item.id === connectionId && item.status === "active");
+    if (!row) throw new Error("Connection unavailable in this workspace");
+    const binding = context.connections.capture(connectionId), connection = context.connections.resolve(binding);
+    const key = connection.credentialFile ? resolveWorkspaceFileCredential(connection.credentialFile) : connection.apiKey;
+    if (!key) throw new Error("Connection credential unavailable");
+    const catalog = await connectionModels(connection, key);
+    if (this.context(workspaceId) !== context || !context.resources.agents.list().agents.some(item => item.agentId === agentId && item.runtime.id === "pi"))
+      throw new Error("Workspace model view changed; refresh");
+    const latest = context.connections.list();
+    if (latest.revision !== view.revision || !latest.connections.some(item => item.id === connectionId && item.status === "active" && item.revision === row.revision))
+      throw new Error("Connection changed; refresh model list");
+    return { connectionId, revision: view.revision, source: catalog.source, selectedModelId: row.defaultModel,
+      selectedEffort: connection.defaultReasoning ?? null, models: catalog.models };
+  }
+  selectConnection(workspaceId: string, id: string, expected: number, modelId?: string, effort?: string | null) {
+    const store = this.context(workspaceId).connections;
+    if (modelId !== undefined) {
+      const binding = store.capture(id), connection = store.resolve(binding);
+      const supported = connectionModelEfforts(connection, modelId);
+      if (!text(modelId, 200) || effort !== undefined && effort !== null && !supported.includes(effort)) throw new Error("Invalid connection model or reasoning effort");
+    } else if (effort !== undefined) throw new Error("Model is required when selecting reasoning effort");
+    store.select(id, expected, modelId, effort as ScopedConnection["defaultReasoning"]);
+    this.queueUsageRefresh(workspaceId); this.changed(workspaceId);
+  }
   workspaceFeatures(workspaceId: string) { const context = this.context(workspaceId); return { ...context.features.list(), scheduler: context.scheduler!.list(),
     inheritance: workspaceId === this.inheritanceWorkspaceId ? this.inheritanceState : noLegacyStartup(), legacyOutcomes: context.legacyBusiness!.outcomes.list() }; }
   workspaceTasks(workspaceId: string) {
