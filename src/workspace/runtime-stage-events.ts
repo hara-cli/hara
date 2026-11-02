@@ -78,7 +78,7 @@ const spanKinds: readonly string[] = ["spawn", "cold_start", "model_roundtrip", 
 const integer = (value: unknown, maximum = MAX_COUNTER): value is number => Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= maximum;
 const errorKind = (value: unknown): value is RuntimeStageErrorKind => typeof value === "string" && (RUNTIME_STAGE_ERROR_KINDS as readonly string[]).includes(value);
 const nullableError = (value: unknown): value is RuntimeStageErrorKind | null => value === null || errorKind(value);
-const toolName = (value: unknown): value is string => typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value);
+const toolName = (value: unknown): value is string => typeof value === "string" && value === value.trim() && /^[a-z][a-z0-9_]{0,63}$/.test(value);
 const source = (value: unknown): value is RuntimeStageSource => typeof value === "string" && sources.includes(value);
 const duration = (value: unknown): value is number => integer(value, MAX_RUNTIME_STAGE_DURATION_MS);
 function invalid(): never { throw new Error("Invalid Runtime stage metadata; no content was exported"); }
@@ -89,10 +89,10 @@ function validIdentity(value: Record<string, unknown>): boolean {
     && integer(value.historyStart, MAX_HISTORY);
 }
 function safeVersion(value: unknown): string | null {
-  return typeof value === "string" && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(value) ? value : null;
+  return typeof value === "string" && value === value.trim() && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(value) ? value : null;
 }
 function safeModel(value: unknown): string | null {
-  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,159}$/.test(value)
+  if (typeof value !== "string" || value !== value.trim() || !/^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,159}$/.test(value)
     || /^(?:sk[-_]|gh[pousr]_|github_pat_|xox[baprs]-|Bearer|https?:|[A-Za-z]:[\\/])/i.test(value)
     || /(?:^|\/)(?:Users|home|credentials?|secrets?)(?:\/|$)/i.test(value)
     || /^[a-f0-9]{32,}$/i.test(value)) return null;

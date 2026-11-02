@@ -226,3 +226,13 @@ test("a linked diagnostic output directory cannot redirect the export into a for
   assert.throws(() => f.store.export(f.id.attemptId));
   assert.deepEqual(fs.readdirSync(elsewhere), []);
 });
+
+test("metadata whitelist rejects trailing line/control whitespace rather than trusting the regex dollar anchor", () => {
+  for (const suffix of ["\n", "\r", "\t", " "]) {
+    const { value } = recorder(identity(), { ...runtime(), version: "1.2.3" + suffix, model: "provider/model" + suffix });
+    assert.equal(value.snapshot().runtime.version, null); assert.equal(value.snapshot().runtime.model, null);
+    assert.throws(() => value.beginEvent("tool_call", { call: 1, toolName: "workspace_read" + suffix }), /Invalid Runtime stage/);
+    const valid = recorder().value.snapshot();
+    assert.throws(() => parseRuntimeStageReport({ ...valid, runtime: { ...valid.runtime, version: "1.2.3" + suffix } }), /Invalid Runtime stage/);
+  }
+});
