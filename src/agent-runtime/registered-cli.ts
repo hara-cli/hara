@@ -10,6 +10,7 @@ import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
 import { assertWorkspaceRunAdmission, attachWorkspaceRuntimeModel, workspaceRunHasManagedProject } from "../workspace/execution.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { createRegisteredCliMcpTurn, WORKSPACE_MCP_TOKEN_ENV } from "./registered-cli-mcp.js";
+import { codexHostToolOverrides } from "./codex-host-config.js";
 
 /** Only the level published by this Workspace's live model inventory may reach the native CLI. */
 function codexEffortArgs(effort: string | null): string[] {
@@ -21,7 +22,7 @@ function claudeEffortArgs(effort: string | null): string[] { return effort ? ["-
  * its calls still yield to the canonical Hara governor and Desk approval, never to tool.run here. */
 export function registeredCliArgs(input: {
   id: "codex" | "claude"; prompt: string; cwd: string; model: string | null; effort: string | null; skipGitRepoCheck: boolean;
-  mcp?: { url: string; timeoutMs: number };
+  mcp?: { url: string; timeoutMs: number }; hostToolOverrides?: string[];
 }): string[] {
   const bridge = input.mcp;
   const mcp = !bridge ? [] : input.id === "codex" ? [
@@ -38,7 +39,8 @@ export function registeredCliArgs(input: {
     "--allowedTools", "mcp__hara__*"];
   return input.id === "codex"
     ? ["exec", input.prompt, "--cd", input.cwd, ...(input.skipGitRepoCheck ? ["--skip-git-repo-check"] : []),
-      ...(input.model ? ["-m", input.model] : []), ...codexEffortArgs(input.effort), "--sandbox", "read-only", ...mcp]
+      ...(input.model ? ["-m", input.model] : []), ...codexEffortArgs(input.effort), "--sandbox", "read-only",
+      ...(bridge ? input.hostToolOverrides ?? [] : []), ...mcp]
     : ["-p", input.prompt, "--output-format", "text", ...(input.model ? ["--model", input.model] : []),
       ...claudeEffortArgs(input.effort), "--permission-mode", "plan", ...mcp];
 }
@@ -54,7 +56,8 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
     const assertCurrent = () => assertWorkspaceRunAdmission(permit, options, id);
     assertCurrent();
     if (options.signal?.aborted) return { status: "error", error: "Agent Runtime execution cancelled" };
-    const selection = models?.selection(id), model = selection?.modelId ?? null, effort = selection?.effort ?? null;
+    const selection = models ? await models.launchSelection(id).catch(() => models.selection(id)) : null;
+    const model = selection?.modelId ?? null, effort = selection?.effort ?? null;
     if (effort && models && !(await models.effortLaunchable(id))) {
       return { status: "error", error: "Agent Runtime '" + id + "' does not support reasoning effort; no level was applied" };
     }
@@ -68,6 +71,8 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
           HARA_SUBPROCESS_ENV_ALLOW: [resolved.env.HARA_SUBPROCESS_ENV_ALLOW, WORKSPACE_MCP_TOKEN_ENV].filter(Boolean).join(",") };
         const args = registeredCliArgs({ id, prompt, cwd: options.ctx.cwd, model, effort,
           skipGitRepoCheck: workspaceRunHasManagedProject(permit) && !existsSync(join(options.ctx.cwd, ".git")),
+          hostToolOverrides: id === "codex" && resolved.loginSource === "host" && resolved.env.HOME
+            ? codexHostToolOverrides(resolved.env.HOME) : [],
           mcp: { url: endpoint.url, timeoutMs: Number(options.timeoutMs) || 120_000 } });
         try {
           const result = await runExternalCommandCapture({ command: resolved.command, env }, args, {

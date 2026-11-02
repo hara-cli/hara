@@ -8,6 +8,7 @@ import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js"
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
 import type { TaskRuntimeBinding } from "./bindings.js";
 import type { GovernedAgentRuntimeDriver } from "./registry.js";
+import { CLI_TOOL_GUIDANCE } from "./tool-guidance.js";
 
 interface PendingCall { id: string; name: string; input: Record<string, unknown>; resolve(result: ToolResult): void }
 type Failure = "runtime_auth_required" | "runtime_network" | "invalid_model" | "runtime_permission_denied" | "runtime_failed";
@@ -106,7 +107,7 @@ function createOpenCodeTurn(input: { command: string; env: NodeJS.ProcessEnv; mo
           budget: { maxProviderRounds: 1, maxToolCalls: permit.binding.budget.maxToolCalls,
             maxTokens: permit.binding.budget.maxTokens, timeoutMs: permit.binding.budget.timeoutMs },
         });
-        const prompt = [args.system, ...args.history.map(message => message.role === "user" ? "User: " + message.content
+        const prompt = [args.system, CLI_TOOL_GUIDANCE, ...args.history.map(message => message.role === "user" ? "User: " + message.content
           : message.role === "assistant" ? "Assistant: " + message.text : "")].filter(Boolean).join("\n\n");
         if (!prompt.trim() || prompt.length > 200_000 || args.history.some(message => message.role === "user" && message.images?.length)) {
           finished = { text: "", toolUses: [], stop: "error", errorMsg: "Native Agent Runtime context is unsupported or too large" };

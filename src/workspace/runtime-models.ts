@@ -6,12 +6,13 @@ import { HARA_RUNTIME_VERSION } from "../version.js";
 import { inspectWorkspaceResourceFile, sameWorkspaceResourceBinding, workspaceStateHome,
   type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { optionalRuntimeId, type OptionalRuntimeId, type WorkspaceRuntimeInstaller } from "./runtime-install.js";
+import { defaultEffortForLevels } from "./default-effort.js";
 
 export interface RuntimeModel { id: string; label: string; description?: string; recommended?: boolean;
   /** Reasoning levels this exact model advertised on the live inventory. Absent/empty means the
    * capability is unknown, and effort selection must be refused rather than guessed. */
   supportedReasoningEfforts?: string[]; defaultReasoningEffort?: string }
-interface ModelSelection { runtimeId: OptionalRuntimeId; revision: number; selectedModelId: string | null; selectedEffort: string | null }
+interface ModelSelection { runtimeId: OptionalRuntimeId; revision: number; selectedModelId: string | null; selectedEffort?: string | null }
 interface RuntimeModelsState { resourceBinding: WorkspaceResourceBinding; revision: number; selections: ModelSelection[] }
 const MAX_INVENTORY_BYTES = 4 * 1024 * 1024;
 const MAX_EFFORTS = 8;
@@ -163,6 +164,7 @@ function codexEfforts(value: unknown): { supportedReasoningEfforts?: string[]; d
 export class WorkspaceRuntimeModels {
   private readonly state: WorkspaceJsonState<RuntimeModelsState>;
   private readonly pending = new Map<string, Promise<RuntimeModel[]>>();
+  private readonly launchDefaults = new Map<string, Promise<{ modelId: string | null; effort: string | null }>>();
   constructor(storage: WorkspaceResourceStorage, private readonly runtimes: WorkspaceRuntimeInstaller) {
     this.state = new WorkspaceJsonState(storage, "runtime-models-v1.json", value => {
       if (!plain(value) || !exact(value, ["resourceBinding", "revision", "selections"])
@@ -180,7 +182,7 @@ export class WorkspaceRuntimeModels {
           || (row.selectedEffort !== undefined && row.selectedEffort !== null && !validEffort(row.selectedEffort))) throw new Error("Runtime model state is damaged");
         seen.add(row.runtimeId);
       }
-      return { ...structuredClone(value), selections: (value.selections as ModelSelection[]).map(row => ({ ...row, selectedEffort: row.selectedEffort ?? null })) } as unknown as RuntimeModelsState;
+      return structuredClone(value) as unknown as RuntimeModelsState;
     }, () => ({ resourceBinding: this.state.binding(), revision: 0, selections: [] }));
   }
   private bound(runtimeId: unknown): asserts runtimeId is OptionalRuntimeId {
@@ -231,6 +233,30 @@ export class WorkspaceRuntimeModels {
     const row = this.state.read().selections.find(row => row.runtimeId === runtimeId);
     return { modelId: row?.selectedModelId ?? null, effort: row?.selectedEffort ?? null };
   }
+  /** New/legacy unchosen strength gets a live-model-backed default at launch. Explicit saved
+   * string or null is never changed. The returned choice is not persisted behind the user's back. */
+  async launchSelection(runtimeId: OptionalRuntimeId): Promise<{ modelId: string | null; effort: string | null }> {
+    this.bound(runtimeId);
+    const row = this.state.read().selections.find(value => value.runtimeId === runtimeId);
+    if (row && Object.hasOwn(row, "selectedEffort")) return this.selection(runtimeId);
+    // The first lookup needs the live inventory; repeating app-server model/list on every chat
+    // would add a second native process to the latency path. Reuse only for this bound runtime
+    // identity and state revision. A failed lookup is retried on the next attempt.
+    const key = JSON.stringify([runtimeId, row?.revision ?? 0, row?.selectedModelId ?? null,
+      this.runtimes.list().options.find(value => value.runtimeId === runtimeId)]);
+    let choice = this.launchDefaults.get(key);
+    if (!choice) {
+      choice = this.list(runtimeId).then(inventory => {
+        const model = inventory.models.find(value => value.id === row?.selectedModelId)
+          ?? (!row ? inventory.models.find(value => value.recommended) : undefined);
+        return { modelId: row?.selectedModelId ?? model?.id ?? null,
+          effort: runtimeId === "opencode" ? null : defaultEffortForLevels(model?.supportedReasoningEfforts) };
+      }).catch(error => { this.launchDefaults.delete(key); throw error; });
+      if (this.launchDefaults.size >= 8) this.launchDefaults.clear();
+      this.launchDefaults.set(key, choice);
+    }
+    return choice;
+  }
   selected(runtimeId: OptionalRuntimeId): string | null { return this.selection(runtimeId).modelId; }
   selectedEffort(runtimeId: OptionalRuntimeId): string | null { return this.selection(runtimeId).effort; }
   /** Registration/binding can prepare inventory without making authentication a prerequisite for binding. */
@@ -252,8 +278,10 @@ export class WorkspaceRuntimeModels {
     const row = this.state.read().selections.find(row => row.runtimeId === runtimeId);
     const models = runtimeId === "codex" || runtimeId === "opencode" ? await this.live(runtimeId) : await this.catalogModels(runtimeId);
     this.bound(runtimeId);
+    const selected = models.find(value => value.id === row?.selectedModelId);
     return { runtimeId, revision: row?.revision ?? 0, selectedModelId: row?.selectedModelId ?? null,
-      selectedEffort: row?.selectedEffort ?? null, models };
+      selectedEffort: row && Object.hasOwn(row, "selectedEffort") ? row.selectedEffort ?? null
+        : runtimeId === "opencode" ? null : defaultEffortForLevels(selected?.supportedReasoningEfforts), models };
   }
   /**
    * Persist the model and, optionally, its reasoning level.
@@ -278,7 +306,8 @@ export class WorkspaceRuntimeModels {
     const current = this.state.read();
     const prior = current.selections.find(row => row.runtimeId === runtimeId);
     if ((prior?.revision ?? 0) !== expectedRevision) throw new Error("Runtime model revision changed; refresh before selecting");
-    const nextEffort = effort === undefined ? (prior?.selectedModelId === modelId ? prior?.selectedEffort ?? null : null)
+    const nextEffort = effort === undefined ? (prior?.selectedModelId === modelId && prior !== undefined && Object.hasOwn(prior, "selectedEffort")
+      ? prior?.selectedEffort ?? null : runtimeId === "opencode" ? null : defaultEffortForLevels(model.supportedReasoningEfforts))
       : effort as string | null;
     this.state.update(current.revision, value => {
       // Recheck under the state lock so a concurrent selection cannot overwrite this runtime.

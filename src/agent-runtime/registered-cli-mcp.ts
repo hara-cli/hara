@@ -7,6 +7,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema, McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import type { NeutralMsg, ToolResult, ToolSpec, TurnArgs, TurnResult } from "../providers/types.js";
 import type { ExternalCommandCaptureResult } from "../external-sessions/process.js";
+import { CLI_TOOL_GUIDANCE } from "./tool-guidance.js";
 
 export const WORKSPACE_MCP_TOKEN_ENV = "HARA_WORKSPACE_MCP_TOKEN";
 export interface WorkspaceMcpEndpoint {
@@ -31,7 +32,7 @@ export async function createWorkspaceMcpEndpoint(input: {
     sessionIdGenerator: () => randomUUID(), enableJsonResponse: true, maxRequestBodySize: 256 * 1024,
   });
   const server = new Server({ name: "hara", version: "1.0.0" }, { capabilities: { tools: { listChanged: true } },
-    instructions: "These are the frozen tools of this Hara Workspace attempt. Hara governs every call, including task understanding, budgets, evidence and Desk confirmation. Never infer approval from MCP connectivity." });
+    instructions: "These are the frozen tools of this Hara Workspace attempt. Hara governs every call, including task understanding, budgets, evidence and Desk confirmation. Never infer approval from MCP connectivity. " + CLI_TOOL_GUIDANCE });
   const assertLive = () => {
     if (closed || input.signal.aborted) throw new Error("Workspace MCP attempt ended");
     input.assertCurrent();
@@ -146,7 +147,7 @@ export function createRegisteredCliMcpTurn(input: {
               const item = { call, resolve }; pending.set(call.id, item); queue.push(item); notify();
             });
           } });
-        const prompt = [args.system, ...args.history.map(message => message.role === "user" ? "User: " + message.content
+        const prompt = [args.system, CLI_TOOL_GUIDANCE, ...args.history.map(message => message.role === "user" ? "User: " + message.content
           : message.role === "assistant" ? "Assistant: " + message.text : "")]
           .filter(Boolean).join("\n\n");
         if (!prompt.trim() || prompt.length > 200_000 || args.history.some(message => message.role === "user" && message.images?.length)) {
