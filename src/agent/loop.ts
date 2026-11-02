@@ -84,6 +84,7 @@ import { AssistantTextSanitizer, sanitizeAssistantText } from "./assistant-text.
 import { completionCloseoutText, pausedCloseoutText } from "./task-closeout.js";
 import { CompletionEvidenceLedger, completionEvidenceScope } from "./completion-evidence.js";
 import { ReadOnlyAnswerTrace } from "./readonly-light.js";
+import { engineTaskBrief, simpleChangeObjective, WorkspaceChangeTrace } from "./governance-c-lite.js";
 import { recordTouch } from "./touched.js";
 import { resolve as resolvePath } from "node:path";
 import { redactSensitiveText, requestsCredentialDisclosure } from "../security/secrets.js";
@@ -1386,6 +1387,8 @@ async function runAgentInner(
   let intakeTask = opts.taskIntake?.task;
   const completionEvidence = new CompletionEvidenceLedger();
   const readOnlyAnswerTrace = opts.workspaceRun && opts.taskIntake ? new ReadOnlyAnswerTrace() : null;
+  const workspaceChangeTrace = opts.workspaceRun && opts.taskIntake ? new WorkspaceChangeTrace() : null;
+  let engineBriefCreated = false;
   let taskStateDirty = false;
   const syncIntakeTask = (): void => {
     const current = opts.taskIntake?.current?.();
@@ -1431,7 +1434,9 @@ async function runAgentInner(
   const taskIntakeTool: Tool | undefined = opts.taskIntake
     ? {
         name: "task_intake",
-        description:
+        description: opts.workspaceRun
+          ? "Optionally revise Hara's engine-generated task brief when the user changes intent, target or scope. Hara records the first brief from the user request and your first response before side effects."
+          :
           "Record or revise your explicit understanding of the active task before side effects. Send it in the same " +
           "response as the first actions it authorizes: Hara saves the brief first, then runs those calls against it. " +
           "Call this only after using the conversation and any needed read-only evidence to identify " +
@@ -1461,6 +1466,7 @@ async function runAgentInner(
         kind: "read",
         classify: () => ({ effect: "state", concurrencySafe: false }),
         run: async (input) => {
+          engineBriefCreated = false;
           // Multiple engine-owned state updates may share one serial tool round. Refresh only before the
           // first update; a later refresh would replace the not-yet-checkpointed local transition.
           if (!taskStateDirty) syncIntakeTask();
@@ -1480,7 +1486,9 @@ async function runAgentInner(
   const taskCheckpointTool: Tool | undefined = opts.taskIntake
     ? {
         name: "task_checkpoint",
-        description:
+        description: opts.workspaceRun
+          ? "Optionally record progress, complex completion checks, or a typed human-only blocker. Hara automatically records simple verified read-only and write/create/delegation completion from actual tool receipts. Explicit completion still needs observed checks and final_answer."
+          :
           "Persist the active task's shared execution state. Use after a major stage, whenever a verified fact " +
           "or required capability state changes, before reporting a blocker, and before final synthesis. Keep the " +
           "canonical completed/pending step list in todo_write; this tool stores the current/blocked/next cursor, " +
@@ -1613,6 +1621,11 @@ async function runAgentInner(
         classify: () => ({ effect: "state", concurrencySafe: false }),
         run: async (input) => {
           if (!taskStateDirty) syncIntakeTask();
+          if (opts.workspaceRun && intakeTask?.brief?.intent === "change"
+            && (input as { completion?: { state?: unknown } } | null)?.completion?.state === "verified"
+            && !workspaceChangeTrace?.evidence()) {
+            return "Error: task checkpoint rejected — no verified write, create, rename or delegation receipt was observed";
+          }
           const boundEvidence = completionEvidence.bind(intakeTask, input);
           if (!boundEvidence.ok) return `Error: task checkpoint rejected — ${boundEvidence.reason}`;
           input = boundEvidence.input;
@@ -2434,6 +2447,22 @@ async function runAgentInner(
         r = { ...r, toolUses: split.state };
       }
     }
+    // The first model response supplies an execution hint, while the user's objective remains the
+    // sole authority for intent. Persist this host-owned brief before planning any side effect.
+    if (opts.workspaceRun && opts.taskIntake && !intakeTask?.brief && r.stop !== "error"
+      && !r.toolUses.some(call => call.name === "task_intake")) {
+      syncIntakeTask();
+      if (intakeTask && !intakeTask.brief) {
+        const applied = applyTaskBrief(intakeTask, engineTaskBrief(intakeTask, r));
+        if (!applied.ok) return interactionFailure("engine task brief", applied.reason);
+        try {
+          intakeTask = applied.task;
+          opts.taskIntake.onUpdate?.(intakeTask);
+          opts.taskIntake.onCheckpoint?.(intakeTask);
+          engineBriefCreated = true;
+        } catch (error) { return interactionFailure("engine task brief", error); }
+      }
+    }
     const assistantHistoryMessage: Extract<NeutralMsg, { role: "assistant" }> = {
       role: "assistant",
       // Tool protocol stays complete, but unaccepted completion prose is not a user-visible message.
@@ -2561,7 +2590,28 @@ async function runAgentInner(
       && intakeTask?.brief?.intent === "change"
       && !freshTaskCompletion(intakeTask)
     ) {
-      if (successfulOwnedActionObserved) {
+      if (engineBriefCreated && workspaceChangeTrace && r.text.trim() && opts.workspaceRun
+        && simpleChangeObjective(intakeTask.objective)) {
+        syncIntakeTask();
+        let pendingInteraction = true;
+        try { pendingInteraction = workspaceRunHasPendingInteraction(opts.workspaceRun); } catch { /* fail closed */ }
+        const evidence = !pendingInteraction && !hasPendingTaskSteering(intakeTask)
+          && !currentTodos(ctx.todoScope).some(todo => todo.status !== "done")
+          ? workspaceChangeTrace.evidence() : null;
+        if (evidence) {
+          const applied = applyTaskCheckpoint(intakeTask, { completion: { state: "verified", evidence } });
+          if (applied.ok) {
+            try {
+              intakeTask = applied.task;
+              opts.taskIntake?.onUpdate?.(intakeTask);
+              opts.taskIntake?.onCheckpoint?.(intakeTask);
+            } catch (error) { return interactionFailure("engine change completion", error); }
+          }
+        }
+      }
+      if (freshTaskCompletion(intakeTask)) {
+        // The normal final-response branch below now sees a durable verified completion.
+      } else if (successfulOwnedActionObserved) {
         if (completionReceiptRetries < 1) {
           completionReceiptRetries += 1;
           history.pop();
@@ -2591,6 +2641,7 @@ async function runAgentInner(
           error: "Work was performed, but the accepted completion checks were not verified. Hara kept the result as a resumable checkpoint instead of reporting the task as complete.",
         };
       }
+      else {
       history.pop();
       try {
         if (!opts.workspaceRun) captureLearning({
@@ -2627,7 +2678,7 @@ async function runAgentInner(
         history.push({
           role: "user",
           content: wrapReminders([
-            "Execution ownership correction: the accepted task intent is change. Your previous prose-only response was not shown or accepted as completion. Take the next concrete in-scope action with an available tool now. If and only if a human-only blocker is currently observed, record task_checkpoint completion.state=awaiting_user with its allowed dependency kind, exact detail, evidence, and any blocked capability. Otherwise continue through verification and record a verified completion receipt before final prose.",
+            "未见实际修改回执，请执行或说明。Your previous prose-only response was not accepted as completion. Take one concrete in-scope action with an available tool now, or report a currently observed typed human-only blocker.",
           ]),
         });
         continue;
@@ -2635,6 +2686,7 @@ async function runAgentInner(
       const message = "Agent execution ownership guard stopped this run after the model twice returned advice instead of acting or recording a valid human dependency.";
       showRunNotice(opts, message, true);
       return { status: "error", error: message };
+      }
     }
     // A "tool_use" stop with text but no tools (rare) has nothing to execute — end after showing the text
     // rather than pushing an empty tool round and re-requesting in a loop.
@@ -3758,6 +3810,10 @@ async function runAgentInner(
     if (readOnlyAnswerTrace) for (let i = 0; i < results.length; i++) {
       readOnlyAnswerTrace.observe(r.toolUses[i]!.name, r.toolUses[i]!.id, plans[i]?.operation?.effect,
         results[i]!, plans[i]?.denied !== undefined || looksFailed(results[i]!.content, results[i]!.name));
+    }
+    if (workspaceChangeTrace) for (let i = 0; i < results.length; i++) {
+      workspaceChangeTrace.observe(results[i]!, plans[i]?.denied !== undefined
+        || looksFailed(results[i]!.content, results[i]!.name));
     }
     history.push({ role: "tool", results });
     const acceptedCompletionReply = Boolean(
