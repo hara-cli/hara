@@ -7,6 +7,7 @@ import { assertWorkspaceRunAdmission } from "../workspace/execution.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
 import { registeredCliDriver } from "./registered-cli.js";
+import { openCodeCliDriver } from "./opencode-cli.js";
 
 /** Host-owned code only. Imported persona text and renderer fields cannot register a driver or grant
  * tools. New drivers must implement the same Hara admission, approval, cancellation and recovery rules. */
@@ -34,7 +35,7 @@ export class AgentRuntimeRegistry {
   constructor(drivers?: readonly GovernedAgentRuntimeDriver[], private readonly installer?: WorkspaceRuntimeInstaller,
     models?: WorkspaceRuntimeModels) {
     const selected = drivers ?? [{ id: "hara", run: runAgent }, { id: "pi", run: runPiAgent }];
-    for (const driver of [...selected, ...(installer ? [registeredCliDriver("codex", installer, models), registeredCliDriver("claude", installer, models)] : [])]) {
+    for (const driver of [...selected, ...(installer ? [registeredCliDriver("codex", installer, models), registeredCliDriver("claude", installer, models), openCodeCliDriver(installer, models)] : [])]) {
       if (!AGENT_RUNTIME_IDS.includes(driver.id) || this.drivers.has(driver.id) || typeof driver.run !== "function") {
         throw new Error("invalid or duplicate governed Agent Runtime driver");
       }
@@ -47,9 +48,9 @@ export class AgentRuntimeRegistry {
     return AGENT_RUNTIME_IDS.map(id => {
       const row = installed?.find(option => option.runtimeId === id);
       const driver = this.drivers.has(id);
-      const available = id === "opencode" || id === "agy" ? false
-        : id === "codex" || id === "claude" ? Boolean(driver && row?.generalAgentDriverAvailable) : driver;
-      const reason = available ? undefined : id === "opencode" ? "adapter_pending_p05" : id === "agy" ? "general_agent_adapter_pending"
+      const available = id === "agy" ? false
+        : id === "codex" || id === "claude" || id === "opencode" ? Boolean(driver && row?.generalAgentDriverAvailable) : driver;
+      const reason = available ? undefined : id === "agy" ? "general_agent_adapter_pending"
         : row?.state === "integrity_failed" ? "integrity_failed"
         : row?.state === "not_installed" ? "not_installed"
         : row?.state === "detected" || !row ? "not_registered" : "general_agent_adapter_pending";
