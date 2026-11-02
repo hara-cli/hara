@@ -210,11 +210,11 @@ export class WorkspaceAgentStore {
       assertCurrent,
     });
   }
-  private view(row: AgentRecord): WorkspaceAgentView {
+  private view(row: AgentRecord, runtimes: readonly AgentRuntimeOption[] = this.runtimes.options()): WorkspaceAgentView {
     const config = row.configurations[row.currentConfigRevision - 1]!;
     return { workspaceId: this.scope.workspaceId, agentId: row.agentId, username: row.username, kind: row.kind,
       state: row.state, agentEpoch: row.epoch, configRevision: config.revision, identity: structuredClone(config.identity),
-      description: config.description, runtime: this.runtimes.options().find(option => option.id === config.runtimeId)!,
+      description: config.description, runtime: { ...runtimes.find(option => option.id === config.runtimeId)! },
       ...(row.kind === "main" ? { brand: "hara" as const } : {}) };
   }
   currentPersona(agentId: string): WorkspaceAgentPersonaInput {
@@ -227,8 +227,11 @@ export class WorkspaceAgentStore {
   }
   list() {
     const value = this.load().value;
+    // One read-only roster reply uses one fresh inventory. Task binding/resolution and execution
+    // still read availability independently; this snapshot never grants permission to run.
+    const runtimes = value?.agents.length ? this.runtimes.options() : [];
     return { revision: value?.revision ?? 0, mainAgentId: value?.mainAgentId ?? null,
-      agents: value?.agents.map(row => this.view(row)) ?? [] };
+      agents: value?.agents.map(row => this.view(row, runtimes)) ?? [] };
   }
   references() {
     return (this.load().value?.agents ?? []).map(row => ({ agentId: row.agentId,
