@@ -154,7 +154,8 @@ export class WorkspaceRuntimeInstaller {
       ?? this.locals.read().entries.find(row => row.runtimeId === runtimeId && row.fingerprint === fingerprint);
     const current = found && inspectLocalRuntime(found.path, true);
     if (!found || !current || current.realPath !== found.realPath || current.fingerprint !== fingerprint) return fail();
-    if (!isLoginSource(loginSource) || runtimeId === "agy" && loginSource !== "isolated") return fail();
+    if (!isLoginSource(loginSource) || runtimeId === "agy" && loginSource !== "isolated"
+      || runtimeId === "opencode" && loginSource !== "host") return fail();
     if (loginSource === "isolated" && runtimeId === "codex") this.privateHome(runtimeId);
     const state = this.locals.read();
     this.locals.update(state.revision, value => ({ ...value, entries: [...value.entries.filter(row => row.runtimeId !== runtimeId), found],
@@ -173,7 +174,8 @@ export class WorkspaceRuntimeInstaller {
    * same fingerprint is the only way a legacy isolated binding can gain host access.
    */
   setLoginSource(runtimeId: unknown, source: unknown): RuntimeLoginSource {
-    if (!optionalRuntimeId(runtimeId) || !isLoginSource(source) || runtimeId === "agy" && source !== "isolated") throw new Error("Invalid runtime login source");
+    if (!optionalRuntimeId(runtimeId) || !isLoginSource(source) || runtimeId === "agy" && source !== "isolated"
+      || runtimeId === "opencode" && source !== "host") throw new Error("Invalid runtime login source");
     const local = this.locals.read().entries.some(row => row.runtimeId === runtimeId);
     if (!local && !this.state.read().entries.some(row => row.artifact.runtimeId === runtimeId)) return fail();
     if (source === "isolated" && runtimeId === "codex") this.privateHome(runtimeId);
@@ -233,6 +235,7 @@ export class WorkspaceRuntimeInstaller {
       USERPROFILE: this.options.discovery?.home ?? userInfo().homedir, PATH: `${dirname(row.path)}:${this.options.discovery?.path ?? process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin"}`,
       DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" }, loginSource: "isolated" };
     const loginSource = this.loginSource(runtimeId);
+    if (runtimeId === "opencode" && loginSource !== "host") return fail();
     if (loginSource === "host") return { command: row.path, env: this.hostEnv(row.path), loginSource };
     const privateHome = this.privateHome(runtimeId);
     return { command: row.path, env: { HOME: privateHome, USERPROFILE: privateHome, CODEX_HOME: join(privateHome, ".codex"),
@@ -340,6 +343,7 @@ export class WorkspaceRuntimeInstaller {
     if (!proposal || proposal.controllerId !== controllerId || Date.parse(proposal.card.expiresAt) <= Date.now()) return fail();
     proposal.assertCurrent();
     if (approved && proposal.card.runtimeId === "agy" && loginSource !== "isolated") throw new Error("Agy requires isolated login");
+    if (approved && proposal.card.runtimeId === "opencode" && loginSource !== "host") throw new Error("OpenCode requires host login");
     this.proposals.delete(id); // single use, including a refusal
     if (!approved) return { operationId: null, state: "declined" };
     if (this.active.has(proposal.card.runtimeId)) throw new Error("Runtime installation is already active; do not resend");
@@ -423,12 +427,12 @@ export class WorkspaceRuntimeInstaller {
         const valid = Boolean(inspected && inspected.realPath === selected.realPath && inspected.fingerprint === selected.fingerprint);
         return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: valid, registered: Boolean(local && valid), version: selected.version,
           path: selected.path, fingerprint: valid ? selected.fingerprint : null, source: selected.source, loginSource,
-          generalAgentDriverAvailable: Boolean(local && valid && (runtimeId === "codex" || runtimeId === "claude")), state: valid ? local ? "local_registered" : "detected" : "integrity_failed" };
+          generalAgentDriverAvailable: Boolean(local && valid && (runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode" && loginSource === "host")), state: valid ? local ? "local_registered" : "detected" : "integrity_failed" };
       }
       const installed = value.entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
       let verified = false; if (installed) try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* tampering revokes use, never repair or fallback */ }
       return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: verified, registered: verified, version: installed?.artifact.version ?? null,
-        loginSource, generalAgentDriverAvailable: Boolean(verified && (runtimeId === "codex" || runtimeId === "claude")), state: installed ? verified ? "registered" : "integrity_failed" : "not_installed" };
+        loginSource, generalAgentDriverAvailable: Boolean(verified && (runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode" && loginSource === "host")), state: installed ? verified ? "registered" : "integrity_failed" : "not_installed" };
     }), operations: [...this.operations.values()].slice(-64).map(({ controller: _c, ...row }) => row) };
   }
   resolve(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
@@ -436,6 +440,7 @@ export class WorkspaceRuntimeInstaller {
     const row = this.state.read().entries.find(row => row.artifact.runtimeId === runtimeId && row.artifact.version === version && row.artifact.sha256 === artifactSha256);
     if (!row) return fail(); const checked = this.inspect(row.artifact, row); if (!checked) return fail();
     const loginSource = this.loginSource(runtimeId);
+    if (runtimeId === "opencode" && loginSource !== "host") return fail();
     if (loginSource === "host") return { command: checked.path, env: this.hostEnv(checked.path), loginSource };
     const privateHome = this.privateHome(runtimeId);
     return { command: checked.path, env: { HOME: privateHome, USERPROFILE: privateHome, CODEX_HOME: join(privateHome, ".codex"),

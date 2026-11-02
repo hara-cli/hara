@@ -47,7 +47,7 @@ for (const [id, format] of [["opencode", "zip"], ["codex", "tar.gz"], ["claude",
     assert.equal(executable.env.HOME, userInfo().homedir);
     assert.equal(executable.env.CODEX_HOME, undefined);
     assert.equal(f.installer.list().options.find(row => row.runtimeId === id).loginSource, "host");
-    assert.equal(f.installer.list().options.find(row => row.runtimeId === id).generalAgentDriverAvailable, id !== "opencode");
+    assert.equal(f.installer.list().options.find(row => row.runtimeId === id).generalAgentDriverAvailable, true);
     const reopened = new WorkspaceRuntimeInstaller(f.resource, { fixtureOrigin: card.origin });
     assert.equal(reopened.resolve(id, "1.2.3", card.sha256).command, executable.command); assert.equal(f.downloads(), 1); await reopened.close();
     if (process.platform !== "win32") fs.chmodSync(executable.command, 0o700); fs.writeFileSync(executable.command, native(process.platform, process.arch === "arm64" ? "x64" : "arm64")); if (process.platform !== "win32") fs.chmodSync(executable.command, 0o500);
