@@ -54,6 +54,9 @@ import { WorkspaceLegacyBusiness } from "./legacy-business.js";
 import { WorkspaceLegacyResources } from "./legacy-resources.js";
 import { WorkspaceRuntimeUsageCache, planColleagueUsageDispatch, type WorkspaceUsageAccount, type WorkspaceUsageCollector } from "./runtime-account-usage.js";
 import { executeLegacyPrint } from "./legacy-print.js";
+import { RuntimeStageRecorder, WorkspaceRuntimeStageStore, projectRuntimeStageReports,
+  MAX_RUNTIME_STAGE_REPORTS, type RuntimeStageReport } from "./runtime-stage-events.js";
+import { runtimeStageErrorKind } from "../agent-runtime/stage-observer.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
 interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
@@ -76,6 +79,7 @@ interface LocalJob {
   lease: WorkspaceSessionLease; controller: AbortController; signal: AbortSignal; binding: Readonly<WorkspaceRunBinding>;
   permit?: WorkspaceRunPermit; options?: RunOpts; promise: Promise<void>; outcome?: RunOutcome; error?: string; closed: boolean;
   receipts?: WorkspaceContextReceipts;
+  runtimeStages?: RuntimeStageRecorder; stageStore?: WorkspaceRuntimeStageStore; stageSavedAt?: number;
   interaction?: WorkspaceUserInteraction;
   startContext?: ReturnType<typeof prepareWorkspaceStartContext>;
   channelId?: string;
@@ -574,12 +578,46 @@ export class LocalWorkspaceHost {
         pendingInteractions: this.pendingInteractions(context, value, [...this.pending.values()].filter(pending => pending.card.workspaceId === workspaceId
           && pending.card.agentId === selected && !pending.card.channelId && pending.clientId === clientId).map(pending => pending.card)),
         usage: value.usage, runUsage: value.runUsage, pastTaskCount: value.pastTasks.length,
+        runtimeStages: this.runtimeStageReports(context, selected, value.sessionId),
         resumeAdmission: this.resumeAdmission(context, value),
         history: value.history.map(message => message.role === "assistant" ? { role: message.role, text: message.text, tools: message.toolUses.map(tool => tool.name) }
           : message.role === "tool" ? { role: message.role, results: message.results.map(result => ({ id: result.id, name: result.name, content: result.content, isError: result.isError ?? false })) }
           : { role: message.role, content: message.content }) },
       approvals: [...this.pending.values()].filter(pending => pending.card.workspaceId === workspaceId && pending.card.agentId === selected && !pending.card.channelId && pending.clientId === clientId).map(pending => pending.card),
       ...this.modelMode() };
+  }
+  private saveRuntimeStages(job: LocalJob, force = false): void {
+    if (!job.runtimeStages || !job.stageStore || !force && Date.now() - (job.stageSavedAt ?? 0) < 1000) return;
+    try { job.stageStore.save(job.runtimeStages.snapshot()); job.stageSavedAt = Date.now(); }
+    catch { /* Diagnostics are optional; corrupt/changed private state is preserved. */ }
+  }
+  private runtimeStageReports(context: WorkspaceHostContext, agentId: string, sessionId: string): RuntimeStageReport[] {
+    const reports = new Map<string, RuntimeStageReport>();
+    try { for (const row of new WorkspaceRuntimeStageStore(context.storage, sessionId, agentId).list()) reports.set(row.attemptId, row); }
+    catch { /* No raw diagnostic or damaged file is projected to the renderer. */ }
+    const active = new Set<string>();
+    for (const job of this.jobs.values()) if (!job.closed && job.context === context && job.agentId === agentId && job.store.sessionId === sessionId) {
+      active.add(job.lease.attemptId);
+      try { const report = job.runtimeStages?.snapshot(); if (report) reports.set(report.attemptId, report); } catch { /* Optional live diagnostics. */ }
+    }
+    return [...reports.values()].slice(-MAX_RUNTIME_STAGE_REPORTS).flatMap(report => {
+      try { return projectRuntimeStageReports([report], active); } catch { return []; }
+    });
+  }
+  /** Human transport only. Accept identity, never report content, filenames or a destination path. */
+  exportRuntimeDiagnostic(workspaceId: string, agentId: string, sessionId: string, runId: string, attemptId: string) {
+    if (![sessionId, runId, attemptId].every(value => UUID.test(value))) throw new Error("Invalid Runtime diagnostic identity");
+    const context = this.context(workspaceId), agent = context.resources.agents.get(agentId);
+    if (!agent || agent.state !== "active") throw new Error("Runtime diagnostic Agent is unavailable");
+    const conversation = new WorkspaceConversationStore(context.storage, agentId);
+    if (conversation.sessionId !== sessionId) throw new Error("Runtime diagnostic belongs to another conversation");
+    const live = [...this.jobs.values()].find(job => !job.closed && job.context === context && job.agentId === agentId
+      && job.store.sessionId === sessionId && job.id === runId && job.lease.attemptId === attemptId);
+    if (live) this.saveRuntimeStages(live, true);
+    const store = new WorkspaceRuntimeStageStore(context.storage, sessionId, agentId);
+    const report = store.list().find(row => row.attemptId === attemptId);
+    if (!report || report.runId !== runId) throw new Error("Runtime diagnostic attempt is unavailable");
+    return store.export(attemptId, { active: Boolean(live) });
   }
   private connectionSnapshot(context: WorkspaceHostContext): WorkspaceConnectionSnapshot {
     try { return context.connections.list(); }
@@ -936,6 +974,15 @@ export class LocalWorkspaceHost {
       job = { id: binding.runId, workspaceId, agentId, clientId, context, store, value, lease, controller, ...(channel ? { channelId: channel.id } : {}),
         signal: parent ? AbortSignal.any([controller.signal, parent.signal, ...(parentSignal ? [parentSignal] : [])]) : controller.signal, binding, promise: Promise.resolve(), closed: false };
       const owned = job, tree = new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget);
+      try {
+        owned.stageStore = new WorkspaceRuntimeStageStore(context.storage, store.sessionId, agentId);
+        owned.runtimeStages = new RuntimeStageRecorder({ workspaceId,
+          resourceGeneration: context.storage.run(() => currentWorkspaceResourceBinding()!.generation),
+          agentId, sessionId: store.sessionId, runId: binding.runId, attemptId: lease.attemptId, historyStart: modelHistoryStart },
+        { id: binding.agent.runtimeId, version: null, loginSource: "unknown",
+          model: binding.agent.runtimeId === "pi" ? binding.connection.model : null, effort: null });
+        this.saveRuntimeStages(owned, true);
+      } catch { /* No diagnostic initialization may change a durably accepted execution. */ }
       owned.interaction = interaction; owned.startContext = startContext;
       owned.receipts = new WorkspaceContextReceipts(context.storage, binding.runId, agentId, () => { assertWorkspaceRunContextCurrent(owned.permit!); });
       const audit = new WorkspaceContextAudit(context.storage, binding.runId, agentId);
@@ -946,6 +993,8 @@ export class LocalWorkspaceHost {
         modelHistory: { history: value.history, start: modelHistoryStart, retain: result => owned.receipts!.retain(result),
           usedTokens: () => { const usage = tree.read().usage; return usage.inputTokens + usage.outputTokens; } },
         observeContext: observation => { owned.lease.assertCurrent(); audit.append(observation); },
+        runtimeStages: owned.runtimeStages,
+        onRuntimeStageChanged: () => { this.saveRuntimeStages(owned); this.changed(owned.workspaceId, owned.agentId); },
         interaction: owned.interaction, interactionUsage: () => tree.read().usage,
         onQuestion: question => { this.commit(owned, this.questionCheckpoint(owned.value.task!, question)); },
         onInteractionChanged: () => { this.changed(owned.workspaceId, owned.agentId); },
@@ -1008,6 +1057,12 @@ export class LocalWorkspaceHost {
         job.value.attempt = { ...job.value.attempt!, state: job.signal.aborted ? "cancelled" : "blocked", endedAt: new Date().toISOString() }; this.commit(job); } catch { /* original checkpoint retained; no stale business authority */ }
     } finally {
       try { await closeWorkspaceRunPermit(job.permit!); } catch { job.error = "原執行鎖的身份無法確認；已保留，請診斷後再恢復。"; }
+      try {
+        const state = job.signal.aborted ? "cancelled" : job.outcome?.status === "error" ? "error"
+          : job.value.task?.status === "completed" ? "completed" : "blocked";
+        job.runtimeStages?.finish(state, state === "error" ? runtimeStageErrorKind(job.outcome?.status === "error" ? job.outcome.error : job.error) : undefined);
+        this.saveRuntimeStages(job, true);
+      } catch { /* A diagnostic failure never rewrites the task outcome. */ }
       job.closed = true; for (const pending of [...this.pending.values()]) if (pending.job === job) pending.finish({ approved: false, state: "aborted" });
       if (this.jobs.get(job.id) === job) this.jobs.delete(job.id);
       this.changed(job.workspaceId, job.agentId);

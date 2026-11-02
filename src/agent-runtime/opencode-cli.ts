@@ -3,11 +3,12 @@ import { runExternalCommandCapture, type ExternalCommandCaptureResult } from "..
 import { createCodingHostBridge, type CodingHostBridge } from "../coding/host.js";
 import { runGovernedAgent, type RunOpts, type RunOutcome } from "../agent/loop.js";
 import type { NeutralMsg, ToolResult, ToolSpec, TurnArgs, TurnResult } from "../providers/types.js";
-import { assertWorkspaceRunAdmission } from "../workspace/execution.js";
+import { assertWorkspaceRunAdmission, workspaceRunRuntimeStages } from "../workspace/execution.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
 import type { TaskRuntimeBinding } from "./bindings.js";
 import type { GovernedAgentRuntimeDriver } from "./registry.js";
+import { createRuntimeStageProcessObserver } from "./stage-observer.js";
 
 interface PendingCall { id: string; name: string; input: Record<string, unknown>; resolve(result: ToolResult): void }
 type Failure = "runtime_auth_required" | "runtime_network" | "invalid_model" | "runtime_permission_denied" | "runtime_failed";
@@ -113,16 +114,20 @@ function createOpenCodeTurn(input: { command: string; env: NodeJS.ProcessEnv; mo
         } else {
           const env = openCodeRunEnv(input.env, bridge);
           physical = (async () => {
+            let observer: ReturnType<typeof createRuntimeStageProcessObserver> | undefined;
             try {
+              assertCurrent();
+              observer = createRuntimeStageProcessObserver(workspaceRunRuntimeStages(permit), "opencode", signal);
               const result = await runExternalCommandCapture({ command: input.command, env },
                 openCodeRunArgs(input.options.ctx.cwd, input.model, prompt), {
                   cwd: input.options.ctx.cwd, signal, timeoutMs: permit.binding.budget.timeoutMs,
                   maxOutputBytes: 4 * 1024 * 1024, retainStdoutOnFailure: true,
-                  onStdout: () => args.onActivity?.(),
+                  onSpawn: observer.onSpawn, onStdout: chunk => { observer?.onStdout(chunk); args.onActivity?.(); },
                 });
+              observer.finish(result.ok, result.errorCode);
               finished = parseOpenCodeRun(result);
             } catch { finished = { text: "", toolUses: [], stop: "error", errorMsg: "runtime_failed" }; }
-            finally { notify(); }
+            finally { observer?.finish(false); notify(); }
           })();
         }
       }
@@ -161,6 +166,9 @@ export function openCodeCliDriver(installer: WorkspaceRuntimeInstaller, models?:
     if (!model.modelId || model.effort) return { status: "error", error: "OpenCode requires a selected model without reasoning variant" };
     const catalog = await models.list("opencode");
     if (!catalog.models.some(row => row.id === model.modelId)) return { status: "error", error: "OpenCode selected model is unavailable in the live catalog" };
+    try { workspaceRunRuntimeStages(permit)?.setRuntime({ id: "opencode",
+      version: installer.list().options.find(row => row.runtimeId === "opencode")?.version ?? null,
+      loginSource: resolved.loginSource, model: model.modelId, effort: null }); } catch { /* Diagnostic metadata only. */ }
     const kernel = createOpenCodeTurn({ command: resolved.command, env: resolved.env, model: model.modelId, options });
     try { return await runGovernedAgent(history, options, "opencode", kernel.turn); }
     finally { await kernel.close(history); }

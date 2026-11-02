@@ -7,9 +7,10 @@ import type { TaskRuntimeBinding } from "./bindings.js";
 import type { GovernedAgentRuntimeDriver } from "./registry.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
-import { assertWorkspaceRunAdmission, attachWorkspaceRuntimeModel, workspaceRunHasManagedProject } from "../workspace/execution.js";
+import { assertWorkspaceRunAdmission, attachWorkspaceRuntimeModel, workspaceRunHasManagedProject, workspaceRunRuntimeStages } from "../workspace/execution.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { createRegisteredCliMcpTurn, WORKSPACE_MCP_TOKEN_ENV } from "./registered-cli-mcp.js";
+import { createRuntimeStageProcessObserver } from "./stage-observer.js";
 
 /** Only the level published by this Workspace's live model inventory may reach the native CLI. */
 function codexEffortArgs(effort: string | null): string[] {
@@ -64,6 +65,10 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
         assertCurrent();
         // Resolve at the actual physical launch, after context preparation; recheck the installed binary.
         const resolved = installer.resolveBound(id);
+        const stages = workspaceRunRuntimeStages(permit);
+        try { stages?.setRuntime({ id, version: installer.list().options.find(row => row.runtimeId === id)?.version ?? null,
+          loginSource: resolved.loginSource, model, effort }); } catch { /* Metadata is diagnostic only. */ }
+        const observer = createRuntimeStageProcessObserver(stages, id, native.signal);
         const env: NodeJS.ProcessEnv = { ...resolved.env, ...endpoint.env,
           HARA_SUBPROCESS_ENV_ALLOW: [resolved.env.HARA_SUBPROCESS_ENV_ALLOW, WORKSPACE_MCP_TOKEN_ENV].filter(Boolean).join(",") };
         const args = registeredCliArgs({ id, prompt, cwd: options.ctx.cwd, model, effort,
@@ -72,10 +77,12 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
         try {
           const result = await runExternalCommandCapture({ command: resolved.command, env }, args, {
             cwd: options.ctx.cwd, signal: native.signal, failureKind: "registered-cli", timeoutMs: Number(options.timeoutMs) || 120_000,
-            maxOutputBytes: 2 * 1024 * 1024, onStdout: activity,
+            maxOutputBytes: 2 * 1024 * 1024, onSpawn: observer.onSpawn,
+            onStdout: chunk => { observer.onStdout(chunk); activity(); },
           });
+          observer.finish(result.ok, result.errorCode, Boolean(result.stdout.trim()));
           return { ...result, stdout: redactToolSubprocessOutput(result.stdout, env) };
-        } finally { delete env[WORKSPACE_MCP_TOKEN_ENV]; }
+        } finally { observer.finish(false); delete env[WORKSPACE_MCP_TOKEN_ENV]; }
       },
     });
     try {
