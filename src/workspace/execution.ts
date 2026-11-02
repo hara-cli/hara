@@ -290,6 +290,12 @@ export function workspaceRunQuestion(permit: WorkspaceRunPermit): WorkspaceUserQ
   if (question) state.onQuestion?.(question);
   return question;
 }
+/** Read-only completion must not close a turn while a user question/card is still open. */
+export function workspaceRunHasPendingInteraction(permit: WorkspaceRunPermit): boolean {
+  const state = stateOf(permit);
+  if (state.retired || state.signal.aborted) return true;
+  return Boolean(state.interaction?.question() || state.interaction?.pendingInteractions().length);
+}
 /** ask_user enters the same run-bound ask channel as the observation gates. sync retains the one
  * blocking question; async posts a card and lets non-interactive work continue. */
 export function workspaceRunAsk(permit: WorkspaceRunPermit, input: { question: string; header?: string; options: string[] },

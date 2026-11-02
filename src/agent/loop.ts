@@ -1,7 +1,7 @@
 import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment, TurnArgs, TurnResult } from "../providers/types.js";
 import { isTaskRuntimeBinding } from "../agent-runtime/bindings.js";
 import { WORKSPACE_AGENT_EXECUTION_PENDING } from "../workspace/agent-binding.js";
-import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, workspaceRunQuestion, workspaceRunBeginToolBatch, workspaceRunAsk, workspaceRunAsyncAnswers, type WorkspaceRunPermit } from "../workspace/execution.js";
+import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, workspaceRunQuestion, workspaceRunHasPendingInteraction, workspaceRunBeginToolBatch, workspaceRunAsk, workspaceRunAsyncAnswers, type WorkspaceRunPermit } from "../workspace/execution.js";
 import { createToolImageStore, redactOwnedToolImageText } from "../tools/tool-images.js";
 import { redactOwnedToolImageValue } from "../security/tool-media-redaction.js";
 import { createComputerRunScope, closeComputerRunScope } from "../tools/computer-run.js";
@@ -83,6 +83,7 @@ import { setTurnPhase } from "./phase.js";
 import { AssistantTextSanitizer, sanitizeAssistantText } from "./assistant-text.js";
 import { completionCloseoutText, pausedCloseoutText } from "./task-closeout.js";
 import { CompletionEvidenceLedger, completionEvidenceScope } from "./completion-evidence.js";
+import { ReadOnlyAnswerTrace } from "./readonly-light.js";
 import { recordTouch } from "./touched.js";
 import { resolve as resolvePath } from "node:path";
 import { redactSensitiveText, requestsCredentialDisclosure } from "../security/secrets.js";
@@ -101,6 +102,7 @@ import {
   applyTaskCheckpoint,
   extendTaskRoundBudget,
   freshTaskCompletion,
+  hasPendingTaskSteering,
   recordTaskDecision,
   recordTaskRoundUsage,
   taskRoundBudget,
@@ -1383,6 +1385,7 @@ async function runAgentInner(
   };
   let intakeTask = opts.taskIntake?.task;
   const completionEvidence = new CompletionEvidenceLedger();
+  const readOnlyAnswerTrace = opts.workspaceRun && opts.taskIntake ? new ReadOnlyAnswerTrace() : null;
   let taskStateDirty = false;
   const syncIntakeTask = (): void => {
     const current = opts.taskIntake?.current?.();
@@ -1486,7 +1489,7 @@ async function runAgentInner(
           "the final reply in completion.final_answer (only todo_write may accompany it): " +
           "set completion to verified with observable acceptance evidence, or awaiting_user only with a typed, evidenced " +
           "human-only dependency. Never use awaiting_user merely because giving instructions is easier than acting. " +
-          "Without this fresh receipt an accepted task remains paused. A changed prior fact requires fresh evidence. " +
+          "Without this fresh receipt an accepted task remains paused, except for a pure Workspace read-only answer that Hara itself verifies and records when you reply directly. A changed prior fact requires fresh evidence. " +
           "A changed capability state requires fresh detail. Pass an empty string to clear a resolved cursor/blocker " +
           "field and pass the full artifact list when updating artifacts.",
         input_schema: {
@@ -2049,6 +2052,7 @@ async function runAgentInner(
     });
     // Never persisted: the durable history stays free of engine context, and the next request rebuilds it.
     if (turnContext) modelHistory.push({ role: "user", content: wrapTurnContext(turnContext) });
+    readOnlyAnswerTrace?.observeModelView(system, modelHistory);
     if (prepared.changed && !contextGuardNotified && !opts.quiet) {
       contextGuardNotified = true;
       const note = `✻ context guard bounded this model request (${Math.round(prepared.originalChars / 1000)}k → ${Math.round(prepared.preparedChars / 1000)}k chars); durable history is unchanged`;
@@ -2634,7 +2638,28 @@ async function runAgentInner(
     }
     // A "tool_use" stop with text but no tools (rare) has nothing to execute — end after showing the text
     // rather than pushing an empty tool round and re-requesting in a loop.
-    if (r.stop !== "tool_use" || r.toolUses.length === 0) return { status: "completed" };
+    if (r.stop !== "tool_use" || r.toolUses.length === 0) {
+      // Only the engine can grant the one-round read-only closeout. The model's `answer` label is
+      // insufficient: user objective, actual dispatched tools, paged receipts and open cards all gate it.
+      if (readOnlyAnswerTrace && opts.workspaceRun && r.text.trim()) {
+        syncIntakeTask();
+        let pendingInteraction = true;
+        try { pendingInteraction = workspaceRunHasPendingInteraction(opts.workspaceRun); } catch { /* fail closed */ }
+        const evidence = readOnlyAnswerTrace.evidence(intakeTask, pendingInteraction,
+          hasPendingTaskSteering(intakeTask), currentTodos(ctx.todoScope).some(todo => todo.status !== "done"));
+        if (evidence) {
+          const applied = applyTaskCheckpoint(intakeTask, { completion: { state: "verified", evidence } });
+          if (applied.ok) {
+            try {
+              intakeTask = applied.task;
+              opts.taskIntake?.onUpdate?.(intakeTask);
+              opts.taskIntake?.onCheckpoint?.(intakeTask);
+            } catch (error) { return interactionFailure("read-only completion checkpoint", error); }
+          }
+        }
+      }
+      return { status: "completed" };
+    }
     // Once an assistant tool_use turn enters history, every tool_use MUST receive a matching tool result.
     // OpenAI/Anthropic both reject a later user turn after an unclosed tool round. Cancellation can happen
     // while planning, approving, or executing, so finalize the round with real results for work that already
@@ -3730,6 +3755,10 @@ async function runAgentInner(
     // output without spooling into the ambient homedir cache or rewriting canonical tool results.
     const boundedContents = opts.workspaceRun ? results.map(result => result.content) : limitToolResultBatch(results.map((result) => result.content));
     for (let i = 0; i < results.length; i++) results[i].content = boundedContents[i];
+    if (readOnlyAnswerTrace) for (let i = 0; i < results.length; i++) {
+      readOnlyAnswerTrace.observe(r.toolUses[i]!.name, r.toolUses[i]!.id, plans[i]?.operation?.effect,
+        results[i]!, plans[i]?.denied !== undefined || looksFailed(results[i]!.content, results[i]!.name));
+    }
     history.push({ role: "tool", results });
     const acceptedCompletionReply = Boolean(
       opts.taskIntake
