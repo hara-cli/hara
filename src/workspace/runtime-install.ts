@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readSync, unlinkSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
 import { join, dirname, isAbsolute } from "node:path";
@@ -196,10 +197,22 @@ export class WorkspaceRuntimeInstaller {
       return home;
     });
   }
-  /** The OS account home is independent of the sidecar's private process HOME. */
+  /** Bun's os.userInfo() follows HOME on macOS; query the passwd record independently. */
   private accountHome(): string {
-    const home = this.options.accountHome?.() ?? userInfo().homedir;
-    if (!isAbsolute(home) || /[\u0000-\u001f\u007f]/.test(home)) return fail();
+    let home: string;
+    if (this.options.accountHome) home = this.options.accountHome();
+    else if (process.platform === "darwin") {
+      const uid = process.geteuid?.();
+      if (uid === undefined) return fail();
+      let fields: string[];
+      try {
+        fields = execFileSync("/usr/bin/id", ["-P"], { encoding: "utf8", timeout: 1500,
+          maxBuffer: 4096, env: { PATH: "/usr/bin:/bin" } }).trim().split(":");
+      } catch { return fail(); }
+      if (fields.length !== 10 || fields[2] !== String(uid)) return fail();
+      home = fields[8]!;
+    } else home = this.options.discovery?.home ?? userInfo().homedir;
+    if (!isAbsolute(home) || home === "/" || /[\u0000-\u001f\u007f]/.test(home)) return fail();
     return home;
   }
   /** Launch a host-bound runtime with the account login directory, without copying credentials. */

@@ -10,6 +10,8 @@ import { startLocalWorkspaceServe } from "../dist/serve/local-workspace.js";
 import { WorkspaceResourceStorage } from "../dist/workspace/resource-context.js";
 import { WorkspaceRuntimeInstaller } from "../dist/workspace/runtime-install.js";
 import { WorkspaceRuntimeModels } from "../dist/workspace/runtime-models.js";
+import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
+import { SYNTHETIC_CONNECTION } from "../dist/workspace/synthetic-provider.js";
 import { runExternalCommandCapture } from "../dist/external-sessions/process.js";
 import { registeredCliArgs } from "../dist/agent-runtime/registered-cli.js";
 
@@ -41,6 +43,7 @@ fi
 if [ "$1" = "exec" ]; then
   printf '%s\\n' "$@" > '${path}.argv'
   printf '%s\\n' "$HOME" > '${path}.home'
+  printf '%s\\n' "\${CODEX_HOME-unset}" > '${path}.codexhome'
   if [ -f "$HOME/.codex/auth.json" ]; then echo 'login=present' >> '${path}.home'; else echo 'login=missing' >> '${path}.home'; fi
   echo 'exec reply'; exit 0
 fi
@@ -250,7 +253,9 @@ test("effort selection accepts only a level the model published and persists it"
 
 test("the main Hara bot uses the same detect/register/bind/model/effort path as a colleague", async () => {
   const data = root(), host = root(), command = join(host, ".local/bin/codex"); binary(command);
-  const handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port: 0 }, { root: data, mode: "workspace", version: "fixture",
+  fs.mkdirSync(join(host, ".codex"), { recursive: true });
+  fs.writeFileSync(join(host, ".codex", "auth.json"), '{"fixture":true}');
+  const handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port: 0 }, { root: data, mode: "workspace", version: "fixture", credentialVault: new MemoryCredentialVault(),
     runtimeInstallerOptions: { accountHome: () => host, discovery: { home: host, path: "/usr/bin:/bin", systemBins: [],
       run: async (_command, args) => args[0] === "-lic" ? null : "codex 1.2.3" } } });
   const socket = new WebSocket(`ws://127.0.0.1:${handle.port}`); await once(socket, "open"); let nextId = 0;
@@ -265,6 +270,9 @@ test("the main Hara bot uses the same detect/register/bind/model/effort path as 
     assert(init.capabilities.includes("workspace.runtime-login-effort.v1"));
     const workspace = await request("workspace.create", { label: "Main", expectedRevision: init.workspace.revision });
     const scope = { workspaceId: workspace.workspaceId, expectedGeneration: workspace.resourceGeneration };
+    await request("workspace.connection.add", { ...scope, input: { ...SYNTHETIC_CONNECTION }, expectedRevision: 0 });
+    const catalog = await request("workspace.list");
+    await request("workspace.select", { workspaceId: scope.workspaceId, expectedRevision: catalog.revision });
     const snapshot = await request("workspace.snapshot", { workspaceId: scope.workspaceId, agentId: null });
     const main = snapshot.agents.find(agent => agent.kind === "main");
     assert(main, "the Workspace has a main Hara agent");
@@ -290,5 +298,21 @@ test("the main Hara bot uses the same detect/register/bind/model/effort path as 
     // Registering with an unknown login source is refused.
     await assert.rejects(request("workspace.runtime.registerLocal", { ...scope, runtimeId: "codex", fingerprint: codex.fingerprint, approved: true, loginSource: "ambient" }), /Invalid runtime login source/);
     await assert.rejects(request("workspace.runtime.registerLocal", { ...scope, runtimeId: "codex", fingerprint: codex.fingerprint, approved: false }), /Explicit local runtime approval/);
+    // Exercise the main-bot RPC -> local-host -> governed runtime -> registered CLI spawn path.
+    const accepted = await request("workspace.session.send", { ...scope, agentId: main.agentId,
+      message: "Reply with a short greeting.", requestId: randomUUID(), source: "ui" });
+    assert.equal(typeof accepted.runId, "string");
+    let finished;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const current = await request("workspace.snapshot", { workspaceId: scope.workspaceId, agentId: main.agentId });
+      if (["completed", "blocked"].includes(current.conversation.state)) { finished = current; break; }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.equal(finished?.conversation.state, "completed", "registered Codex finishes the main-bot turn");
+    assert.deepEqual(fs.readFileSync(`${command}.home`, "utf8").trim().split("\n"), [host, "login=present"]);
+    assert.equal(fs.readFileSync(`${command}.codexhome`, "utf8").trim(), "unset");
+    const argv = fs.readFileSync(`${command}.argv`, "utf8").trim().split("\n");
+    assert(argv.includes("-m") && argv.includes("gpt-5.6-sol"), "selected model reaches codex exec");
+    assert(argv.includes("-c") && argv.includes('model_reasoning_effort="xhigh"'), "selected effort reaches codex exec");
   } finally { const closed = once(socket, "close"); socket.close(); await closed; await handle.close(); }
 });
