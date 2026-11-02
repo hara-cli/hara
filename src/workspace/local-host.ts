@@ -589,7 +589,7 @@ export class LocalWorkspaceHost {
     if (!pending || pending.card.workspaceId !== workspaceId || pending.clientId !== clientId || !selection || selection.workspaceId !== pending.card.workspaceId
       || (pending.card.channelId ? selection.channelId !== pending.card.channelId : selection.channelId || selection.agentId !== pending.card.agentId)
       || selection.epoch !== pending.selectionEpoch || pending.job.signal.aborted || Date.parse(pending.card.expiresAt) <= Date.now()) throw new Error("approval expired or belongs to another view");
-    assertWorkspaceRunAdmission(pending.job.permit, pending.job.options!, "pi");
+    assertWorkspaceRunAdmission(pending.job.permit, pending.job.options!, pending.job.binding.agent.runtimeId);
     pending.finish(approved ? { approved: true } : { approved: false, state: "declined" });
   }
   private approval(job: LocalJob, draft: LocalWorkspaceApproval["draft"]): Promise<ApprovalDecision> {
@@ -699,7 +699,7 @@ export class LocalWorkspaceHost {
     this.changed(job.workspaceId, job.agentId);
   }
   private jobTools(job: LocalJob, agent: WorkspaceAgentView): Tool[] {
-    const assertCurrent = () => { assertWorkspaceRunAdmission(job.permit, job.options!, "pi"); };
+    const assertCurrent = () => { assertWorkspaceRunAdmission(job.permit, job.options!, job.binding.agent.runtimeId); };
     let agentCreateAttempts = 0;
     const bundles = job.context.features.enabledSkills();
     const tools = [...localWorkspaceFileTools(job.context.project, assertCurrent), job.receipts!.tool(), job.startContext!.tool(assertCurrent),

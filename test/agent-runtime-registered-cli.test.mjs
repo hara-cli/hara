@@ -86,7 +86,9 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
       assert.ok(result.error.includes(`(${failure})`));
       assert.ok(result.error.includes("no fallback was selected"));
       assert.ok(!result.error.includes("PRIVATE_ACCOUNT_DETAIL"));
-      assert.equal(history.length, 1);
+      assert.ok(history.slice(1).every(row => row.role === "assistant" && row.text === "" && row.toolUses.length === 0),
+        "a failed native run leaves no fabricated text or tool result; the common governor may retain an empty assistant boundary");
+      assert.doesNotMatch(JSON.stringify(history), /PRIVATE_ACCOUNT_DETAIL/);
     } else assert.equal(history.at(-1).text, `registered ${runtimeId} reply`);
     const args = fs.readFileSync(argv, "utf8");
     assert.match(args, runtimeId === "codex" ? /read-only/ : /plan/);

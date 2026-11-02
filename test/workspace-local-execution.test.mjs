@@ -187,3 +187,33 @@ test("credential revocation during a provider stream mutes late text and never r
   assert.equal(JSON.stringify(history).includes("late secret sentinel"),false);assert.equal(JSON.stringify(history).includes("late reply"),false);
  }finally{await a.close();}
 });
+
+for (const revoked of ["generation", "lease"]) test("MCP refuses a real Workspace " + revoked + " revocation with its original live bearer", async () => {
+ const { createWorkspaceMcpEndpoint, WORKSPACE_MCP_TOKEN_ENV } = await import("../dist/agent-runtime/registered-cli-mcp.js");
+ const { assertWorkspaceRunAdmission } = await import("../dist/workspace/execution.js");
+ const { workspaceResourceScopeKey } = await import("../dist/workspace/resource-context.js");
+ const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+ const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
+ const a=fixture(async()=>reply("not called")),client=new Client({name:"fence-fixture",version:"1"});
+ let endpoint,original,marker;
+ try {
+  beginWorkspaceGovernedRun(a.permit,a.options,"pi");
+  endpoint=await createWorkspaceMcpEndpoint({signal:a.controller.signal,
+   assertCurrent(){assertWorkspaceRunAdmission(a.permit,a.options,"pi");},tools:()=>[],
+   async call(){throw new Error("no fixture tools");}});
+  await client.connect(new StreamableHTTPClientTransport(new URL(endpoint.url),{requestInit:{headers:{
+   Authorization:"Bearer "+endpoint.env[WORKSPACE_MCP_TOKEN_ENV]}}}));
+  assert.deepEqual((await client.listTools()).tools,[]);
+  if(revoked==="lease")a.lease.release();
+  else{
+   marker=join(a.home,".hara","workspace-data","v1",workspaceResourceScopeKey(a.row.scope),"scope.json");
+   original=fs.readFileSync(marker);const value=JSON.parse(original);value.generation=randomUUID();
+   fs.writeFileSync(marker,JSON.stringify(value),{mode:0o600});
+  }
+  await assert.rejects(client.listTools());
+  assert.equal(a.requests,0,"a rejected capability cannot start another model");
+ }finally{
+  if(original)fs.writeFileSync(marker,original,{mode:0o600});
+  await client.close().catch(()=>{});await endpoint?.close();await a.close();
+ }
+});

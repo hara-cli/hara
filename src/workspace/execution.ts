@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import type { NeutralMsg, Provider, ProviderRetryEvent, TurnResult } from "../providers/types.js";
+import type { NeutralMsg, Provider, ProviderRetryEvent, TurnResult, TurnArgs } from "../providers/types.js";
 import type { RunOpts } from "../agent/loop.js";
 import type { TaskExecution } from "../session/task.js";
 import type { Tool } from "../tools/registry.js";
@@ -38,6 +38,7 @@ interface PermitState {
   lease: WorkspaceSessionLease;
   retired: boolean;
   started: boolean;
+  runtimeModel?: (args: TurnArgs) => Promise<TurnResult>;
   modelHistory?: { history: NeutralMsg[]; start: number; prefixDigest: string; retain?: (result: ToolResult) => string; usedTokens?: () => number };
   contextStats?: WorkspaceContextStats;
   wakeChars: number;
@@ -145,6 +146,7 @@ export function createWorkspaceRunPermit(input: {
       assertLive();
       if (!state.started) throw new Error("Workspace model requires the governed entry");
       if (signal?.aborted) throw new Error("Workspace model preparation cancelled");
+      if (state.runtimeModel) return undefined; // Native CLI owns its model transport; never prepare another provider route.
       const result = await track(state, Promise.resolve().then(() => { assertLive(); return input.provider.prepareTurn?.(history, signal); }));
       assertLive(); return result;
     },
@@ -170,7 +172,7 @@ export function createWorkspaceRunPermit(input: {
         onReasoning: forward(args.onReasoning), onActivity: forward(args.onActivity), onRetry: forward((event: ProviderRetryEvent) => {
           state.audit.retry(auditIndex, event); args.onRetry?.(event);
         }) };
-      const operation = Promise.resolve().then(() => { assertLive(); if (guardedArgs.signal.aborted) throw new Error("Workspace model cancelled"); return input.provider.turn(guardedArgs); });
+      const operation = Promise.resolve().then(() => { assertLive(); if (guardedArgs.signal.aborted) throw new Error("Workspace model cancelled"); return state.runtimeModel ? state.runtimeModel(guardedArgs) : input.provider.turn(guardedArgs); });
       try {
         const result: TurnResult = await track(state, operation);
         // Even a cancelled/late request consumes its recorded telemetry, but never releases more tools.
@@ -241,6 +243,17 @@ export function assertWorkspaceRunAdmission(permit: unknown, options: RunOpts, r
     || options.ctx.inspectImage || options.ctx.describeImage || options.ctx.locate || options.ctx.toolImageMode) {
     throw new Error("Workspace execution options do not match the trusted Host permit");
   }
+}
+/** Trusted native Runtime composition only: one immutable model transport before admission is consumed.
+ * The existing provider wrapper retains liveness, accounting, audit, cancellation and physical tracking. */
+export function attachWorkspaceRuntimeModel(permit: WorkspaceRunPermit, options: RunOpts, runtimeId: "codex" | "claude",
+  execute: (args: TurnArgs) => Promise<TurnResult>): void {
+  assertWorkspaceRunAdmission(permit, options, runtimeId);
+  const state = stateOf(permit);
+  if ((runtimeId !== "codex" && runtimeId !== "claude") || state.started || state.runtimeModel || typeof execute !== "function") {
+    throw new Error("Workspace Runtime model transport is unavailable or already attached");
+  }
+  state.runtimeModel = execute;
 }
 export function beginWorkspaceGovernedRun(permit: WorkspaceRunPermit, options: RunOpts, runtimeId: string): void {
   assertWorkspaceRunAdmission(permit, options, runtimeId);
