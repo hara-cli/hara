@@ -698,8 +698,8 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
     assert.ok(nativeTerminalArgs, "the detached WezTerm fixture must receive the handoff");
     assert.deepEqual(nativeTerminalArgs.slice(0, 4), ["start", "--no-auto-connect", "--always-new-process", "--"]);
     assert.deepEqual(nativeTerminalArgs.slice(-4), ["terminal", "attach", "native-terminal-secret", "--takeover"]);
-    assert.doesNotMatch(nativeTerminalArgs.join(" "), /agent start|\bcodex\b|\bclaude\b/,
-      "the WezTerm companion attaches to the existing terminal and never launches another agent");
+    assert.deepEqual(nativeTerminalArgs.slice(4, -4), [realpathSync(process.execPath), fixture, "--session", "hara-runtime"],
+      "the WezTerm companion launches only the fixture runtime's existing terminal attach, with no new agent command");
 
     const listed = await adapter.list({ limit: 10 });
     const metadata = JSON.stringify({ source, listed });
