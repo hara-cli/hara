@@ -20,7 +20,7 @@ test("Claude full candidate enables native tools, blocks plan and scheduling, an
   assert.equal(args[args.indexOf("--effort") + 1], "high");
 });
 
-test("production stays controlled until its write-protection execution interface is attached", () => {
+test("legacy arguments without a frozen tier remain plan", () => {
   const args = registeredCliArgs(common);
   assert.equal(args[args.indexOf("--permission-mode") + 1], "plan");
   assert(!args.includes("bypassPermissions"));
@@ -33,6 +33,14 @@ test("custom providers and native host login share a customization boundary with
   const args = registeredCliArgs({ ...common, claudePermissionMode: "bypassPermissions", claudeCustomProvider: true });
   assert.equal(args[args.indexOf("--setting-sources") + 1], "project,local");
   const codex = registeredCliArgs({ ...common, id: "codex", claudePermissionMode: "bypassPermissions", claudeCustomProvider: true });
-  assert(codex.includes("read-only"));
+  assert(codex.includes("--dangerously-bypass-approvals-and-sandbox"));
   assert(!codex.includes("bypassPermissions") && !codex.includes("--setting-sources"));
+});
+
+test("the frozen tier takes precedence over a legacy caller permission-mode hint", () => {
+  const controlled = registeredCliArgs({ ...common, permissionTier: "controlled", claudePermissionMode: "bypassPermissions" });
+  const full = registeredCliArgs({ ...common, permissionTier: "full-protected", claudePermissionMode: "plan", claudeStreamJson: true });
+  assert.equal(controlled[controlled.indexOf("--permission-mode") + 1], "plan");
+  assert.equal(full[full.indexOf("--permission-mode") + 1], "bypassPermissions");
+  assert(full.includes("--allow-dangerously-skip-permissions") && full.includes("--dangerously-skip-permissions"));
 });

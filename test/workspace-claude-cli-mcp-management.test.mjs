@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { cliMcpFixture, until } from "./helpers/workspace-cli-mcp.mjs";
+import { claudeCliMcpFixture as cliMcpFixture, until } from "./helpers/claude-cli-mcp.mjs";
 
 const done = view => ["completed", "blocked", "paused", "cancelled"].includes(view.conversation.state);
 async function closed(url) {

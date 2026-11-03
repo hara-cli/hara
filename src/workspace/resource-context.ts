@@ -192,10 +192,9 @@ export class WorkspaceResourceStorage {
     this.directories = ["workspace-data", "v1", this.scopeKey];
   }
 
-  /** Host-only launch metadata. This is a protection boundary, never a writable-root grant. */
+  /** Host-only protection root, never a renderer writable grant. From Claude runtime 5555d2a. */
   runtimeProtectedStateRoot(): string {
-    this.checkAuthority(); verifyDirectory(this.host);
-    return join(this.host.path, ".hara");
+    this.checkAuthority(); verifyDirectory(this.host); return join(this.host.path, ".hara");
   }
 
   /** Explicit first initialization/reopen; never copies profiles, memory, sessions, or Account login.

@@ -1,5 +1,9 @@
+import { claudeRuntimeEnvironment, parseClaudeCliOutput } from "./claude-cli.js";
+import { workspaceRunPermissionTier } from "./execution-policy.js";
+import { newWorkspaceNativePolicy, endWorkspaceNativePolicy, observeWorkspaceNativeItem } from "./workspace-native-policy.js";
 import { classifyRuntimeFailure, runtimeFailureMessage } from "./failure-diagnostics.js";
 import { runtimeFailureTracker } from "./failure-tracker.js";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { runExternalCommandCapture } from "../external-sessions/process.js";
@@ -9,15 +13,14 @@ import type { TaskRuntimeBinding } from "./bindings.js";
 import type { GovernedAgentRuntimeDriver } from "./registry.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
-import { assertWorkspaceRunAdmission, attachWorkspaceRuntimeModel, workspaceRunHasManagedProject, workspaceRunRuntimeStages } from "../workspace/execution.js";
+import { assertWorkspaceRunAdmission, attachWorkspaceRuntimeModel, recordWorkspaceRuntimeUsage, workspaceRunHasManagedProject, workspaceRunRuntimeStages } from "../workspace/execution.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { createRegisteredCliMcpTurn, WORKSPACE_MCP_TOKEN_ENV } from "./registered-cli-mcp.js";
 import { codexHostToolOverrides } from "./codex-host-config.js";
 import { runtimeProxyFailure } from "../security/runtime-proxy.js";
 import { createRuntimeStageProcessObserver } from "./stage-observer.js";
 import { runtimeUseProtocolSucceeded } from "./runtime-use-success.js";
-import { createRuntimeExecutionPolicy, workspaceRunPermissionTier, type RuntimeExecutionPolicy } from "./execution-policy.js";
-import { claudeRuntimeEnvironment, parseClaudeCliOutput } from "./claude-cli.js";
+import { codexSessionPool } from "./codex-session.js";
 
 /** Only the level published by this Workspace's live model inventory may reach the native CLI. */
 function codexEffortArgs(effort: string | null): string[] {
@@ -25,39 +28,36 @@ function codexEffortArgs(effort: string | null): string[] {
 }
 function claudeEffortArgs(effort: string | null): string[] { return effort ? ["--effort", effort] : []; }
 
-/** Only Hara's per-attempt MCP server is trusted; calls still yield to the canonical governor.
- * Full Claude arguments are selected only after its outer protection policy has been prepared. */
+/** Keep read-only/plan confinement. Only Hara's per-attempt MCP server is explicitly trusted:
+ * its calls still yield to the canonical Hara governor and Desk approval, never to tool.run here. */
 export function registeredCliArgs(input: {
   id: "codex" | "claude"; prompt: string; cwd: string; model: string | null; effort: string | null; skipGitRepoCheck: boolean;
-  mcp?: { url: string; timeoutMs: number }; hostToolOverrides?: string[];
-  /** Full mode is explicit here; execution must attach its validated write protector first. */
-  claudePermissionMode?: "plan" | "bypassPermissions";
-  claudeCustomProvider?: boolean;
-  claudeStreamJson?: boolean;
+  mcp?: { url: string; timeoutMs: number; serverName?: string }; hostToolOverrides?: string[]; permissionTier?: "full-protected" | "controlled"; claudeStreamJson?: boolean; claudePermissionMode?: "plan" | "bypassPermissions";
 }): string[] {
   const bridge = input.mcp;
+  const server = bridge?.serverName ?? "hara_workspace";
+  if (!/^hara_workspace(?:_[a-f0-9]{24})?$/u.test(server)) throw new Error("Invalid Host MCP namespace");
   const mcp = !bridge ? [] : input.id === "codex" ? [
-    "-c", "mcp_servers.hara={}",
-    "-c", "mcp_servers.hara.url=" + JSON.stringify(bridge.url),
-    "-c", "mcp_servers.hara.bearer_token_env_var=" + JSON.stringify(WORKSPACE_MCP_TOKEN_ENV),
-    "-c", 'mcp_servers.hara.default_tools_approval_mode="auto"',
-    "-c", "mcp_servers.hara.required=true",
-    "-c", "mcp_servers.hara.tool_timeout_sec=" + Math.ceil(bridge.timeoutMs / 1000),
-    "-c", 'approval_policy="on-request"',
+    "-c", `mcp_servers.${server}={}`,
+    "-c", `mcp_servers.${server}.url=` + JSON.stringify(bridge.url),
+    "-c", `mcp_servers.${server}.bearer_token_env_var=` + JSON.stringify(WORKSPACE_MCP_TOKEN_ENV),
+    "-c", `mcp_servers.${server}.default_tools_approval_mode="approve"`,
+    "-c", `mcp_servers.${server}.required=true`,
+    "-c", `mcp_servers.${server}.tool_timeout_sec=` + Math.ceil(bridge.timeoutMs / 1000),
+    "-c", 'approval_policy="never"',
     "-c", 'shell_environment_policy.set.HARA_WORKSPACE_MCP_TOKEN=""', "--json",
   ] : ["--strict-mcp-config", "--mcp-config", JSON.stringify({ mcpServers: { hara: { type: "http", url: bridge.url,
     headers: { Authorization: "Bearer $" + "{" + WORKSPACE_MCP_TOKEN_ENV + "}" }, timeout: bridge.timeoutMs } } }),
     "--allowedTools", "mcp__hara__*"];
   return input.id === "codex"
     ? ["exec", input.prompt, "--cd", input.cwd, ...(input.skipGitRepoCheck ? ["--skip-git-repo-check"] : []),
-      ...(input.model ? ["-m", input.model] : []), ...codexEffortArgs(input.effort), "--sandbox", "read-only",
+      ...(input.model ? ["-m", input.model] : []), ...codexEffortArgs(input.effort), "--dangerously-bypass-approvals-and-sandbox",
       ...(bridge ? input.hostToolOverrides ?? [] : []), ...mcp]
-    : ["-p", input.prompt, "--output-format", input.claudeStreamJson ? "stream-json" : "text",
-      ...(input.claudeStreamJson ? ["--verbose"] : []), ...(input.model ? ["--model", input.model] : []),
-      ...claudeEffortArgs(input.effort), "--permission-mode", input.claudePermissionMode ?? "plan",
-      "--disallowedTools", "EnterPlanMode", "ExitPlanMode", "ScheduleWakeup", "CronCreate", "CronList", "CronDelete", "Cron*", "Monitor",
-      // Excluding user settings preserves native login, but prevents personal global hooks/plugins.
-      "--setting-sources", "project,local", "--settings", JSON.stringify({ disableAllHooks: true, sandbox: { enabled: false } }), ...mcp];
+    : ["-p", input.prompt, "--output-format", input.claudeStreamJson ? "stream-json" : "text", ...(input.claudeStreamJson ? ["--verbose"] : []), ...(input.model ? ["--model", input.model] : []),
+      ...claudeEffortArgs(input.effort), "--permission-mode", input.permissionTier !== undefined ? input.permissionTier === "full-protected" ? "bypassPermissions" : "plan" : input.claudePermissionMode ?? "plan",
+      ...(input.permissionTier === "full-protected" ? ["--allow-dangerously-skip-permissions", "--dangerously-skip-permissions"] : []),
+      "--setting-sources", "project,local", "--settings", JSON.stringify({ disableAllHooks: true, sandbox: { enabled: false } }),
+      "--disallowedTools", "EnterPlanMode", "ExitPlanMode", "ScheduleWakeup", "CronCreate", "CronList", "CronDelete", "Cron*", "Monitor", "Agent", "Task", ...mcp];
 }
 
 /** Native CLIs own model inference. Hara owns the exact same tool/governor path as Pi. */
@@ -77,10 +77,31 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
       return { status: "error", error: "Agent Runtime '" + id + "' does not support reasoning effort; no level was applied" };
     }
     let successfulUse: (() => void) | undefined;
+    const session = id === "codex" ? await codexSessionPool(installer).acquire(permit, assertCurrent) : undefined;
     const native = createRegisteredCliMcpTurn({
       signal: options.signal!, assertCurrent, jsonEvents: id === "codex",
-      async launch(endpoint, prompt, activity) {
+      ...(session ? { bearerToken: session.token,
+        prompt: (args: import("../providers/types.js").TurnArgs) => args.history.flatMap(message => message.role === "user" ? [message.content] : []).join("\n\n"),
+        takeUsage: () => session.takeUsage(), decorateResult: session.decorateResult.bind(session) } : {}),
+      async launch(endpoint, prompt, activity, turnArgs) {
         assertCurrent();
+        if (session) {
+          if (turnArgs.system.length > 200_000) throw new Error("Native Agent Runtime system context is too large");
+          const resolved = installer.resolveBound(id), started = Date.now();
+          const tracker = runtimeFailureTracker(installer, id, permit.binding.agent.agentId,
+            JSON.stringify([resolved.command, resolved.loginSource, resolved.env.HOME, installer.proxy.read().revision, permit.binding.agent.configRevision, model, effort]), resolved);
+          const held = tracker.blocked(); if (held) return { ok: false, stdout: "", code: null, timedOut: false, runtimeFailure: held };
+          try {
+            const result = await session.launch(endpoint, prompt, turnArgs, { model, effort, cwd: options.ctx.cwd, signal: native.signal, assertCurrent, activity });
+            if (!result.ok) return native.signal.aborted || result.errorCode === "interrupted" ? result : { ...result,
+              runtimeFailure: tracker.failed(result.nativeFailureKind ?? classifyRuntimeFailure({ code: result.errorCode }), Date.now() - started) };
+            tracker.succeeded();
+            if (!native.signal.aborted) successfulUse = installer.captureSuccessfulUse(id, resolved.command);
+            return result;
+          } catch (error) {
+            return { ok: false, stdout: "", code: null, timedOut: false, runtimeFailure: tracker.failed(runtimeProxyFailure(error) ? "runtime_proxy" : "runtime_failed", Date.now() - started) };
+          }
+        }
         // Resolve at the actual physical launch, after context preparation; recheck the installed binary.
         let resolved;
         try { resolved = await installer.prepareBound(id, native.signal); assertCurrent(); }
@@ -97,46 +118,35 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
         const held = tracker.blocked();
         if (held) return { ok: false, stdout: "", code: null, timedOut: false, runtimeFailure: held };
         const started = Date.now();
-        const env: NodeJS.ProcessEnv = { ...(id === "claude" ? claudeRuntimeEnvironment(resolved.env) : resolved.env), ...endpoint.env,
-          HARA_SUBPROCESS_ENV_ALLOW: [resolved.env.HARA_SUBPROCESS_ENV_ALLOW, WORKSPACE_MCP_TOKEN_ENV].filter(Boolean).join(",") };
-        let policy: RuntimeExecutionPolicy | undefined;
+        const env: NodeJS.ProcessEnv = { ...resolved.env, ...endpoint.env,
+          HARA_SUBPROCESS_ENV_ALLOW: [resolved.env.HARA_SUBPROCESS_ENV_ALLOW, WORKSPACE_MCP_TOKEN_ENV].filter(Boolean).join(","),
+          ...(id === "claude" ? { CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1", CLAUDE_CODE_DISABLE_AGENT_VIEW: "1" } : {}) };
+        const serverName = "hara_workspace_" + createHash("sha256").update(permit.binding.sessionId).digest("hex").slice(0, 24);
+        const args = registeredCliArgs({ id, claudeStreamJson: id === "claude", permissionTier: workspaceRunPermissionTier(permit), prompt, cwd: options.ctx.cwd, model, effort,
+          skipGitRepoCheck: workspaceRunHasManagedProject(permit) && !existsSync(join(options.ctx.cwd, ".git")),
+          hostToolOverrides: id === "codex" && resolved.loginSource === "host" && resolved.env.HOME
+            ? codexHostToolOverrides(resolved.env.HOME, resolved.env.CODEX_HOME, options.ctx.cwd, serverName) : [],
+          mcp: { serverName, url: endpoint.url, timeoutMs: Number(options.timeoutMs) || 120_000 } });
+        const policy = newWorkspaceNativePolicy(permit, id, resolved, installer);
         try {
-          if (id === "claude") {
-            policy = createRuntimeExecutionPolicy({ runtimeId: id, tier: workspaceRunPermissionTier(permit),
-              workRoot: options.ctx.cwd, ...installer.executionPolicyDirectories(id, resolved),
-              loginSource: resolved.loginSource, lifetime: "attempt" });
-            policy.beginAttempt(permit.binding.runId);
-          }
-        } catch {
-          delete env[WORKSPACE_MCP_TOKEN_ENV]; await policy?.close();
-          return { ok: false, stdout: "", code: null, timedOut: false,
-            runtimeFailure: "Claude write protection could not be prepared; no unprotected process was started" };
-        }
-        try {
-          const args = registeredCliArgs({ id, prompt, cwd: options.ctx.cwd, model, effort,
-            ...(id === "claude" ? { claudePermissionMode: workspaceRunPermissionTier(permit) === "full-protected" ? "bypassPermissions" as const : "plan" as const,
-              claudeStreamJson: true } : {}),
-            skipGitRepoCheck: workspaceRunHasManagedProject(permit) && !existsSync(join(options.ctx.cwd, ".git")),
-            hostToolOverrides: id === "codex" && resolved.loginSource === "host" && resolved.env.HOME
-              ? codexHostToolOverrides(resolved.env.HOME) : [],
-            mcp: { url: endpoint.url, timeoutMs: Number(options.timeoutMs) || 120_000 } });
-          if (id === "claude" && !policy) throw new Error("Claude requires its outer execution policy");
-          const launch = policy ? policy.wrap({ command: resolved.command, args, env }) : { command: resolved.command, args, env };
-          if (id === "claude" && policy) launch.env = claudeRuntimeEnvironment(launch.env, policy.tempRoot);
-          const result = await runExternalCommandCapture({ command: launch.command, env: launch.env }, launch.args, {
-            cwd: options.ctx.cwd, signal: native.signal, failureKind: "runtime", proxyUrl: resolved.proxyUrl, timeoutMs: Number(options.timeoutMs) || 120_000,
+          const launch = policy.wrap({ command: resolved.command, env, args });
+          if (id === "claude") launch.env = claudeRuntimeEnvironment(launch.env, policy.tempRoot);
+          const result = await runExternalCommandCapture(launch, launch.args, {
+            cwd: options.ctx.cwd, signal: native.signal, waitForClose: true, failureKind: "runtime", proxyUrl: resolved.proxyUrl, timeoutMs: Number(options.timeoutMs) || 120_000,
             maxOutputBytes: 2 * 1024 * 1024, onSpawn: observer.onSpawn,
-            onStdout: chunk => { observer.onStdout(chunk); activity(); }, retainStdoutOnFailure: true, waitForClose: Boolean(policy),
+            onStdout: chunk => { observer.onStdout(chunk); activity(); }, retainStdoutOnFailure: true,
           });
+
           // Codex may deliver a terminal error frame with a zero exit. Classify only the error frame,
           // never model prose, and discard all native output on this path.
           let eventFailure: string | undefined;
-          const claude = id === "claude" ? parseClaudeCliOutput(result.stdout, event => policy?.observeNativeEvent(event)) : null;
+          const claude = id === "claude" ? parseClaudeCliOutput(result.stdout, event => policy.observeNativeEvent(event)) : null;
           if (claude && !claude.ok) eventFailure = claude.error;
           observer.finish(result.ok && (claude?.ok ?? true), result.errorCode, Boolean((claude?.text ?? result.stdout).trim()));
           if (id === "codex") for (const line of result.stdout.split(/\r?\n/u)) {
             try {
               const event = JSON.parse(line);
+              if (event.item) observeWorkspaceNativeItem(permit, policy, event.item, "completed");
               if (event.type === "turn.completed") eventFailure = undefined;
               else if (event.type === "error" || event.type === "turn.failed") {
                 eventFailure = JSON.stringify(event.error ?? event.message ?? {}).slice(0, 64 * 1024);
@@ -150,18 +160,24 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
             return { ...result, ok: false, stdout: "", runtimeFailure: tracker.failed(kind, Date.now() - started) };
           }
           tracker.succeeded();
-          if (result.ok && !native.signal.aborted && (claude?.ok ?? runtimeUseProtocolSucceeded(id, result.stdout))) successfulUse = recordSuccessfulUse;
+          if (result.ok && !native.signal.aborted && runtimeUseProtocolSucceeded(id, result.stdout)) successfulUse = recordSuccessfulUse;
           return { ...result, stdout: redactToolSubprocessOutput(claude?.text ?? result.stdout, env) };
-        } finally { observer.finish(false); delete env[WORKSPACE_MCP_TOKEN_ENV]; await policy?.close(); }
+        } finally { observer.finish(false); delete env[WORKSPACE_MCP_TOKEN_ENV]; await endWorkspaceNativePolicy(permit, policy); await policy.close(); }
       },
     });
     try {
-      attachWorkspaceRuntimeModel(permit, options, id, args => native.turn(args));
+      attachWorkspaceRuntimeModel(permit, options, id, async args => {
+        const result = await native.turn(args);
+        return session?.needsNewSession ? { ...result, errorMsg: "Native context limit reached. Open a new session to continue.",
+          errorMetadata: { code: "native_context_limit" } } : result;
+      });
       const outcome = await runGovernedAgent(history, options, id, (provider, args) => provider.turn(args));
-      // A zero process exit alone is not a successful governed CLI turn (JSON errors,
-      // cancellation and protocol failures must not replace the last successful version).
       if (outcome.status === "completed" && !options.signal?.aborted && successfulUse) { assertCurrent(); successfulUse(); }
-      return outcome;
-    } finally { await native.close(history); }
+      return session?.needsNewSession && !options.signal?.aborted
+        ? { status: "halted", stopReason: "native_context_limit", error: "Native context limit reached. Open a new session to continue." } : outcome;
+    } finally {
+      try { await native.close(history); }
+      finally { if (session) { try { recordWorkspaceRuntimeUsage(permit, session.takeUsage()); } finally { await session.release(); } } }
+    }
   } };
 }

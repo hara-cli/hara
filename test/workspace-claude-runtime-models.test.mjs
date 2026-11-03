@@ -13,7 +13,7 @@ async function fixture(t, effort = true) {
   const home = join(root, "home"), account = join(root, "account"), command = join(account, ".local/bin/claude");
   fs.mkdirSync(home); fs.mkdirSync(dirname(command), { recursive: true });
   fs.writeFileSync(command, "#!" + process.execPath + "\n" + (effort
-    ? 'console.log(process.argv[2] === "--help" ? "--effort <level> Effort level (low, medium, high, xhigh, max)" : "claude 1.2.3");\n'
+    ? 'console.log(process.argv.slice(2).includes("--help") ? "--effort <level> Effort level (low, medium, high, xhigh, max)" : "claude 1.2.3");\n'
     : 'console.log("claude 1.2.3");\n'), { mode: 0o755 });
   const storage = new WorkspaceResourceStorage(home, { schemaVersion: 1, workspaceId: "ws_" + randomUUID(),
     authority: { kind: "local", localAuthorityId: randomUUID() } });

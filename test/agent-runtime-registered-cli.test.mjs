@@ -1,7 +1,7 @@
+import { writeFakeCodex } from "./helpers/workspace-cli-mcp.mjs";
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import http from "node:http";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -23,7 +23,7 @@ function root() { const path = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir
 after(() => roots.forEach(path => fs.rmSync(path, { recursive: true, force: true })));
 
 for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, null], ["claude", false, null],
-  ["codex", true, null], ["codex", true, null, true], ["codex", true, "project_not_trusted"], ["codex", true, "runtime_auth_required"], ["codex", true, "command_failed"], ["claude", true, "runtime_network"], ["claude", true, "runtime_proxy"], ["claude", true, "version_incompatible"], ["codex", true, "runtime_auth_event"], ["codex", true, "runtime_auth_event_nonzero"], ["codex", true, "runtime_auth_recovered"]]) test(`${runtimeId} managed=${managed} git=${hasGit} failure=${failure} stays confined with no fallback`, async t => {
+  ["codex", true, null], ["codex", true, null, true], ["codex", true, "project_not_trusted"], ["codex", true, "runtime_auth_required"], ["codex", true, "command_failed"], ["claude", true, "runtime_network"], ["claude", true, "runtime_proxy"], ["claude", true, "version_incompatible"], ["codex", true, "runtime_auth_event"], ["codex", true, "runtime_auth_event_nonzero"], ["codex", true, "runtime_auth_recovered"]]) test(`${runtimeId} managed=${managed} git=${hasGit} failure=${failure} stays confined with no fallback`, async () => {
   const expectedFailure = failure && failure !== "runtime_auth_recovered";
   const data = root(), home = managed ? join(data, "home") : data, account = root();
   fs.mkdirSync(home, { recursive: true });
@@ -32,18 +32,12 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
   fs.mkdirSync(project, { recursive: true });
   if (hasGit) fs.mkdirSync(join(project, ".git"));
   const storage = new WorkspaceResourceStorage(home, row.scope); storage.initialize();
-  const command = join(account, ".local", "bin", runtimeId), argv = join(account, "argv.txt");
+  const bin = join(account, runtimeId === "codex" ? ".codex/tmp/bin" : ".claude/projects/fixture-bin");
+  const command = join(bin, runtimeId), argv = runtimeId === "codex" ? command + ".rpc.jsonl" : join(bin, "argv.txt");
   fs.mkdirSync(dirname(command), { recursive: true });
-  // Capture argv in the parent so the fake CLI never needs authority to write outside its policy.
-  const recorder = http.createServer(async (req, res) => {
-    let body = ""; for await (const chunk of req) { body += chunk; if (body.length > 256 * 1024) throw new Error("fixture argv limit"); }
-    fs.appendFileSync(argv + ".launches", "launch\n"); fs.writeFileSync(argv, body); res.writeHead(204); res.end();
-  });
-  await new Promise(resolve => recorder.listen(0, "127.0.0.1", resolve));
-  t.after(() => new Promise(resolve => recorder.close(resolve)));
-  const recordUrl = "http://127.0.0.1:" + recorder.address().port;
-  fs.writeFileSync(command, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${runtimeId} 1.2.3'; exit 0; fi\nif [ "$1" = "app-server" ]; then exit 1; fi\nif [ "$1" = "debug" ]; then echo '{"models":[{"slug":"fixture-model","display_name":"Fixture"}]}'; exit 0; fi\nprintf '%s\\n' "$@" | /usr/bin/curl --silent --fail --max-time 5 --data-binary @- '${recordUrl}' > /dev/null || exit 1\n${runtimeId === "codex" && managed && !hasGit ? `case " $* " in *' --skip-git-repo-check '*) ;; *) echo 'Not inside a trusted directory and --skip-git-repo-check was not specified.' >&2; exit 1;; esac` : ''}\n${failure === 'runtime_auth_recovered' ? `echo '{"type":"error","message":"temporary network error PRIVATE_ACCOUNT_DETAIL"}'; echo '{"type":"item.completed","item":{"type":"agent_message","text":"registered codex reply"}}'; echo '{"type":"turn.completed"}'; exit 0` : failure?.startsWith('runtime_auth_event') ? `echo '{"type":"turn.failed","error":{"message":"401 Unauthorized PRIVATE_ACCOUNT_DETAIL"}}'; exit ${failure === 'runtime_auth_event' ? 0 : 1}` : failure ? `echo '${failure === 'project_not_trusted' ? 'Not inside a trusted directory' : failure === 'runtime_auth_required' ? 'websocket 401 Unauthorized PRIVATE_ACCOUNT_DETAIL' : failure === 'runtime_network' ? 'ECONNRESET PRIVATE_ACCOUNT_DETAIL' : failure === 'runtime_proxy' ? 'proxy connect failed PRIVATE_ACCOUNT_DETAIL' : failure === 'version_incompatible' ? 'unrecognized option --fixture PRIVATE_ACCOUNT_DETAIL' : 'PRIVATE_ACCOUNT_DETAIL'}' >&2; exit 1` : ''}\n${runtimeId === 'codex' ? `echo '{"type":"item.completed","item":{"type":"agent_message","text":"registered codex reply"}}'\necho '{"type":"turn.completed"}'` : `echo '{"type":"result","subtype":"success","is_error":false,"result":"registered ${runtimeId} reply"}'`}\n`, { mode: 0o755 });
-  const installer = new WorkspaceRuntimeInstaller(storage, { accountHome: () => account, discovery: { home: account, path: "/usr/bin:/bin", systemBins: [],
+  fs.writeFileSync(command, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${runtimeId} 1.2.3'; exit 0; fi\nif [ "$1" = "app-server" ]; then exit 1; fi\nif [ "$1" = "debug" ]; then echo '{"models":[{"slug":"fixture-model","display_name":"Fixture"}]}'; exit 0; fi\nprintf 'launch\\n' >> '${argv}.launches'\nprintf '%s\\n' "$@" > '${argv}'\n${runtimeId === "codex" && managed && !hasGit ? `case " $* " in *' --skip-git-repo-check '*) ;; *) echo 'Not inside a trusted directory and --skip-git-repo-check was not specified.' >&2; exit 1;; esac` : ''}\n${failure === 'runtime_auth_recovered' ? `echo '{"type":"error","message":"temporary network error PRIVATE_ACCOUNT_DETAIL"}'; echo '{"type":"item.completed","item":{"type":"agent_message","text":"registered codex reply"}}'; echo '{"type":"turn.completed"}'; exit 0` : failure?.startsWith('runtime_auth_event') ? `echo '{"type":"turn.failed","error":{"message":"401 Unauthorized PRIVATE_ACCOUNT_DETAIL"}}'; exit ${failure === 'runtime_auth_event' ? 0 : 1}` : failure ? `echo '${failure === 'project_not_trusted' ? 'Not inside a trusted directory' : failure === 'runtime_auth_required' ? 'websocket 401 Unauthorized PRIVATE_ACCOUNT_DETAIL' : failure === 'runtime_network' ? 'ECONNRESET PRIVATE_ACCOUNT_DETAIL' : failure === 'runtime_proxy' ? 'proxy connect failed PRIVATE_ACCOUNT_DETAIL' : failure === 'version_incompatible' ? 'unrecognized option --fixture PRIVATE_ACCOUNT_DETAIL' : 'PRIVATE_ACCOUNT_DETAIL'}' >&2; exit 1` : ''}\n${runtimeId === 'codex' ? `echo '{"type":"item.completed","item":{"type":"agent_message","text":"registered codex reply"}}'\necho '{"type":"turn.completed"}'` : `echo '{"type":"result","subtype":"success","is_error":false,"result":"registered ${runtimeId} reply"}'`}\n`, { mode: 0o755 });
+  if (runtimeId === "codex") writeFakeCodex(command, { mode: "reply", failure });
+  const installer = new WorkspaceRuntimeInstaller(storage, { accountHome: () => account, discovery: { home: account, path: bin + ":/usr/bin:/bin", systemBins: [],
     run: async (_command, args) => args[0] === "-lic" ? null : `${runtimeId} 1.2.3` } });
   const resources = new WorkspaceResources(home, row.scope, { runtimeInstaller: installer }); resources.initialize();
   const main = resources.agents.initializeMain();
@@ -52,7 +46,7 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
   const detected = installer.list().options.find(option => option.runtimeId === runtimeId);
   assert.equal(detected.state, "detected");
   assert.equal(resources.agents.runtimeOptions().find(option => option.id === runtimeId).available, false);
-  installer.registerLocal(runtimeId, detected.fingerprint, "isolated");
+  installer.registerLocal(runtimeId, detected.fingerprint, "host");
   const models = new WorkspaceRuntimeModels(storage, installer);
   const modelId = runtimeId === "codex" ? "fixture-model" : "sonnet";
   await models.select(runtimeId, modelId, 0);
@@ -101,8 +95,8 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
       assert.equal(diagnostic.kind, expected);
       assert.equal(diagnostic.runtime, runtimeId);
       assert.equal(diagnostic.version, "1.2.3");
-      assert.equal(diagnostic.loginSource, "isolated");
-      assert.equal(diagnostic.homeMatchesAccount, false);
+      assert.equal(diagnostic.loginSource, "host");
+      assert.equal(diagnostic.homeMatchesAccount, true);
       assert.ok(diagnostic.elapsedMs >= 0 && diagnostic.elapsedMs <= 600000);
       assert.equal(diagnostic.consecutiveFailures, 1);
       assert.ok(diagnostic.retryAtMs > Date.now() - 1000);
@@ -134,7 +128,7 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
           const held = JSON.parse(/hara_runtime_failure_v1=(\{[^{}]+\})/.exec(repeated.error)[1]);
           assert.equal(held.retryAtMs, diagnostic.retryAtMs, "blocked retries do not extend or clear the failure");
           assert.equal(held.consecutiveFailures, 1);
-          assert.equal(fs.readFileSync(`${argv}.launches`, "utf8").trim().split("\n").length, 1, "no second inference process");
+          assert.equal(fs.readFileSync(argv, "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(row => row.method === "thread/start").length, 1, "no second native startup after the cooldown");
         } finally { Date.now = realNow; await closeWorkspaceRunPermit(retryPermit); }
       }
     } else {
@@ -145,21 +139,17 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
     assert.equal(versionStatus.lastSuccessfulVersion, expectedFailure ? null : "1.2.3");
     assert.equal(versionStatus.compatibility, expectedFailure ? "unverified" : "previously_succeeded");
     const args = fs.readFileSync(argv, "utf8");
-    assert.match(args, runtimeId === "codex" ? /read-only/ : /plan/);
-    assert.equal(args.includes("--skip-git-repo-check"), runtimeId === "codex" && managed && !hasGit);
+    assert.match(args, runtimeId === "codex" ? /danger-full-access/ : /bypassPermissions/);
+    assert.equal(args.includes("--skip-git-repo-check"), false, "S3 uses an admitted thread cwd, without an exec trust-check flag");
     assert.equal(fs.existsSync(join(project, ".git")), hasGit);
     const privateEnv = installer.resolveBound(runtimeId).env;
-    assert.ok(privateEnv.HOME.startsWith(home));
-    assert.equal(fs.existsSync(join(account, ".codex")), false);
+    assert.equal(privateEnv.HOME, account);
+    assert.equal(fs.existsSync(join(account, ".codex/auth.json")), false, "binding creates no host login credential");
     if (runtimeId === "codex") {
-      const guide = installer.codexLoginInstructions();
-      assert.equal(guide.runtimeId, "codex");
-      assert.ok(guide.command.includes(privateEnv.CODEX_HOME));
-      assert.ok(guide.command.endsWith(" login"));
-      assert.ok(!guide.command.includes("--skip-git-repo-check"));
+      assert.throws(() => installer.codexLoginInstructions(), /reuses the host login/);
     }
-    assert.ok(args.includes(modelId), "spawn uses the existing Workspace runtime model selection");
-    assert.ok(!args.includes("danger-full-access") && !args.includes("bypassPermissions"));
+    assert.ok(args.includes(modelId), "native launch uses the existing Workspace runtime model selection");
+    assert.ok(args.includes(runtimeId === "codex" ? "danger-full-access" : "bypassPermissions"));
     fs.appendFileSync(command, "# changed after registration\n");
     assert.equal(resources.agents.runtimeOptions().find(option => option.id === runtimeId).available, false);
     assert.equal(installer.list().options.find(option => option.runtimeId === runtimeId).state, "integrity_failed");
@@ -167,19 +157,13 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
   } finally { await closeWorkspaceRunPermit(permit); await installer.close(); }
 });
 
-test("registered CLI args project model and effort without widening write or shell authority", async () => {
+test("native args keep model/effort choices while the outer policy owns both permission tiers", async () => {
   const { registeredCliArgs } = await import("../dist/agent-runtime/registered-cli.js");
-  const codex = registeredCliArgs({ id: "codex", prompt: "hi", cwd: "/fixture/project", model: "gpt-5.6-sol", effort: "xhigh", skipGitRepoCheck: true });
-  assert.deepEqual(codex, ["exec", "hi", "--cd", "/fixture/project", "--skip-git-repo-check", "-m", "gpt-5.6-sol",
-    "-c", 'model_reasoning_effort="xhigh"', "--sandbox", "read-only"]);
-  assert(!codex.includes("danger-full-access") && !codex.includes("--yolo"));
-  const claude = registeredCliArgs({ id: "claude", prompt: "hi", cwd: "/fixture/project", model: "sonnet", effort: "high", skipGitRepoCheck: false });
-  assert.deepEqual(claude.slice(0, 10), ["-p", "hi", "--output-format", "text", "--model", "sonnet", "--effort", "high", "--permission-mode", "plan"]);
-  assert.equal(claude[claude.indexOf("--setting-sources") + 1], "project,local");
-  assert.deepEqual(JSON.parse(claude[claude.indexOf("--settings") + 1]), { disableAllHooks: true, sandbox: { enabled: false } });
-  assert(!claude.includes("bypassPermissions"));
-  // No selected model and no effort must not invent either flag.
-  const bare = registeredCliArgs({ id: "codex", prompt: "hi", cwd: "/fixture/project", model: null, effort: null, skipGitRepoCheck: false });
-  assert.deepEqual(bare, ["exec", "hi", "--cd", "/fixture/project", "--sandbox", "read-only"]);
-  assert(!bare.includes("-c") && !bare.includes("-m"));
+  for (const permissionTier of ["controlled", "full-protected"]) {
+    const codex = registeredCliArgs({ id: "codex", permissionTier, prompt: "hi", cwd: "/fixture/project", model: "gpt-5.6-sol", effort: "xhigh", skipGitRepoCheck: true });
+    assert.ok(codex.includes('model_reasoning_effort="xhigh"')); assert.ok(codex.includes("gpt-5.6-sol")); assert.ok(codex.includes("--dangerously-bypass-approvals-and-sandbox")); assert.equal(codex.includes("--sandbox"),false);
+    const claude = registeredCliArgs({ id: "claude", permissionTier, claudeStreamJson: true, prompt: "hi", cwd: "/fixture/project", model: "claude-sonnet-4-5", effort: "high", skipGitRepoCheck: false });
+    assert.ok(claude.includes("claude-sonnet-4-5")); assert.ok(claude.includes("high")); assert.ok(claude.includes(permissionTier === "controlled" ? "plan" : "bypassPermissions")); assert.ok(claude.includes("stream-json")); assert.ok(claude.includes("Cron*")); assert.ok(claude.includes("project,local"));
+  }
+  const bare = registeredCliArgs({ id: "codex", prompt: "hi", cwd: "/fixture/project", model: null, effort: null, skipGitRepoCheck: false }); assert(!bare.includes("-c") && !bare.includes("-m"));
 });
