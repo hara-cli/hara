@@ -51,6 +51,7 @@ import type { JsonCliPolicyFactory } from "../agent-runtime/json-cli-policy.js";
 import { WorkspaceExtensions, type ExtensionChange, type ExtensionToolSnapshot } from "./extensions.js";
 import { readHostWorkspaceExtensionCatalog, type ExtensionCatalogProvider } from "./extension-catalog.js";
 import { workspaceSkillTool } from "./skills.js";
+import { isWorkspaceOperationSkill, withWorkspaceOperationSkill } from "./operation-cards.js";
 import { WorkspaceLocalChannels } from "./local-channels.js";
 import { assertChannelAutonomyProductionDispatch } from "./channel-autonomy.js";
 import { WorkspaceScheduler } from "./scheduler.js";
@@ -903,7 +904,7 @@ export class LocalWorkspaceHost {
     const bundles = job.context.features.enabledSkills();
     const tools = [...localWorkspaceFileTools(job.context.project, assertCurrent), job.receipts!.tool(), job.startContext!.tool(assertCurrent),
       workspaceMemorySearchTool((query, limit) => job.context.resources.memory.search(query, job.context.project, limit), assertCurrent),
-      ...(bundles.length ? [workspaceSkillTool(bundles, (id, version) => { assertCurrent(); job.context.features.assertSkill(id, version); })] : [])];
+      workspaceSkillTool(bundles, (id, version) => { assertCurrent(); if (!isWorkspaceOperationSkill(id, version)) job.context.features.assertSkill(id, version); })];
     tools.push({ name: "workspace_native_evidence", description: "Read the current Host-observed native file diff evidence for this attempt. No diff, partial sampling, read-only mode or concurrent writers gives no evidence. Native evidence does not prove Hara management effects. Use its ID as native_evidence_ids in completion checks.", kind: "read",
       input_schema: { type: "object", properties: {} }, async run(input) {
         if (!plain(input) || !exact(input, [])) throw new Error("Native evidence takes no paths or claims");

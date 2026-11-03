@@ -11203,3 +11203,21 @@ The isolated Pi 1.5.0 RPC process accepted get_state but refused prompt with a c
   catalog/authorization/RPC regressions. Failed catalog refreshes revoke cached metadata immediately.
 - Related: src/workspace/extension-catalog.ts, src/workspace/extensions.ts,
   test/workspace-extensions.test.mjs, test/workspace-local-server.test.mjs.
+
+## [ERR-20261103-OP-CARDS-FIXTURE-MODEL] Operation-card fixture must use the admitted model
+
+**Logged**: 2026-11-03T11:10:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+The first operation-card test fixture hard-coded provider.model=fixture after selecting the synthetic connection. The live Workspace dependency guard rejected the mismatch before model dispatch; 11 tests reported hookFailed, while existing skills 5/5 passed. The fixture now uses binding.model, as the production provider boundary requires. No dependency guard, timeout or assertion was weakened. Other preparation mistakes were absent guessed paths (located with rg --files) and sandbox denial for the required external task init (identical elevated command passed the capacity gate). Evidence is retained in the task evidence directory; not a Hara product defect or real-home operation.
+
+- Related Files: test/workspace-operation-cards.test.mjs
+- Pattern-Key: tests.fake_provider_matches_admitted_binding
+
+Operation-card fixture follow-up: the first governed tool-use probe emitted stopReason/inputTokens instead of the actual TurnResult.stop/usage fields. The engine correctly did not interpret that fake result as a tool-use continuation (26/27 pass). Fixed the fixture DTO and retained focused-final.log; no production governor, timeout or assertion was weakened.
+
+The follow-up unknown-outcome fixture created a new WorkspaceResourceStorage wrapper without initialize(); the existing resource guard refused its journal read. Initialized that same isolated wrapper before the journal fixture. Original focused-verified.log retained. The input .sha256 files use inbox-relative names; an initial check from the workspace root failed to locate them, and checking from inbox passed both unchanged digests.
+
+Final verification: build-pass.log succeeded; focused-pass.log contains 27/27 pass, 0 fail/cancel/skip (13 new operation-card checks, 9 login/effort checks, 5 existing skills checks), Node 22.23.1, concurrency=1, original 120000ms test limit and isolated HOME/TMP. No full-suite run or external model request. Owned node_modules symlink removed after test completion; the shared dependency target was not modified.
