@@ -1,3 +1,4 @@
+import type { NativeWorkspaceEvidence } from "../agent-runtime/execution-policy.js";
 import { createHash } from "node:crypto";
 import type { TaskBriefInput, TaskExecution } from "../session/task.js";
 import type { ToolResult } from "../providers/types.js";
@@ -46,7 +47,7 @@ export class WorkspaceChangeTrace {
       digest: createHash("sha256").update(result.content).digest("hex"), value: record });
   }
 
-  evidence(): string[] | null {
+  evidence(native?: NativeWorkspaceEvidence | null): string[] | null {
     if (this.unsafe) return null;
     const writes = this.observations.filter(item => item.name === "workspace_write" && item.value.written === true
       && typeof item.value.path === "string" && typeof item.value.sha256 === "string");
@@ -59,6 +60,9 @@ export class WorkspaceChangeTrace {
       || (item.name === "agent_contact" && item.value.completed === true
         && typeof item.value.completion === "object" && item.value.completion !== null
         && (item.value.completion as Record<string, unknown>).state === "verified"));
+    if (native?.verified && native.nativeEventCount > 0 && native.changes.length && !writes.length && !intrinsic.length && !this.observations.some(item => item.name === "workspace_native_evidence" && item.value.verified !== true)) {
+      return [`native-workspace-diff evidenceId=${native.id} sha256=${native.digest} files=${native.changes.length} nativeEvents=${native.nativeEventCount}`];
+    }
     const actions = [...verified, ...intrinsic];
     // A simple one-outcome objective cannot silently close after a second unverified mutation.
     if (actions.length !== 1 || writes.length !== verified.length || intrinsic.length + writes.length !== 1) return null;

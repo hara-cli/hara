@@ -1166,6 +1166,7 @@ export function isRecoverableRunPause(outcome: RunOutcome | undefined): boolean 
     || outcome.stopReason === "no_progress"
     || outcome.stopReason === "repeat_loop"
     || outcome.stopReason === "completion_verification"
+    || outcome.stopReason === "native_context_limit"
   );
 }
 
@@ -1211,6 +1212,11 @@ export function finishTaskExecution(
   };
   const progressPause = outcome?.status === "halted"
     && (outcome.stopReason === "no_progress" || outcome.stopReason === "repeat_loop");
+  if (outcome?.status === "halted" && outcome.stopReason === "native_context_limit") {
+    checkpoint.blockedStep = checkpoint.currentStep ?? "continue with the current native context";
+    checkpoint.blockReason = "Native context limit reached. Open a new session to continue.";
+    checkpoint.nextStep = "Open a new session explicitly; the original thread and task history are retained.";
+  }
   if (status === "completed") {
     delete checkpoint.currentStep;
     delete checkpoint.blockedStep;
