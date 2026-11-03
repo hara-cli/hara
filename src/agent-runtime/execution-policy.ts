@@ -198,7 +198,7 @@ export class RuntimeExecutionPolicy {
     ];
     for (const root of forbidden) lines.push(`(deny file-read-data (require-all (subpath ${quote(root)}) ${isolated ? `(require-not (subpath ${quote(isolated)}))` : ""} ${readableExceptions}))`);
     if (input.runtimeId === "codex") lines.push(`(allow file-write* (regex #${quote("^" + runtimeHome.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "/(state_[0-9]+|logs_[0-9]+)[.]sqlite(-wal|-shm)?$")}) (literal ${quote(join(runtimeHome, "history.jsonl"))}) (literal ${quote(join(runtimeHome, "session_index.jsonl"))}))`);
-    if (piAuth) lines.push(`(allow file-write* (literal ${quote(join(runtimeHome, "auth.json.lock"))}))`,
+    if (piAuth) lines.push(`(allow file-write* (require-all (literal ${quote(join(runtimeHome, "auth.json.lock"))}) (vnode-type DIRECTORY)))`,
       `(deny file-write* ${literals([piAuth, join(runtimeHome, "models.json"), join(runtimeHome, "settings.json")])})`);
     // Denials come last as well: no native state exception may open Hara or credential writes.
     lines.push(`(deny file-write*\n  ${protectedPaths}\n  ${quotedSubpaths([...secretDirs, ...keychains])}\n  ${literals([...allCredentials, ...ownCredentials])}\n  (regex ${generic}))`);
