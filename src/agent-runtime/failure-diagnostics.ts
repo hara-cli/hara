@@ -1,3 +1,4 @@
+import { expandedExtensionsIsolation } from "./expanded-isolation.js";
 /** Stable evidence categories. Native output is inspected here, never returned or retained. */
 export const RUNTIME_FAILURE_KINDS = [
   "not_installed", "version_incompatible", "runtime_auth_required", "runtime_auth_rejected",
@@ -12,6 +13,7 @@ export interface RuntimeFailureContext {
   homeMatchesAccount: boolean | null;
 }
 export interface RuntimeFailureDiagnostic extends RuntimeFailureContext {
+  extensionsIsolation?: "inherited";
   kind: RuntimeFailureKind;
   elapsedMs: number;
   retryAtMs: number;
@@ -76,6 +78,7 @@ export function runtimeFailureMessage(input: RuntimeFailureContext & {
   if (!["codex", "claude", "opencode", "copilot", "cursor", "grok"].includes(input.runtime)) throw new Error("Invalid diagnostic runtime");
   const diagnostic: RuntimeFailureDiagnostic = {
     runtime: input.runtime,
+    ...(expandedExtensionsIsolation(input.runtime) ? { extensionsIsolation: "inherited" as const } : {}),
     kind: knownKind(input.kind) ? input.kind : "runtime_failed",
     version: safeRuntimeVersion(input.version),
     loginSource: input.loginSource === "host" || input.loginSource === "isolated" ? input.loginSource : "unknown",

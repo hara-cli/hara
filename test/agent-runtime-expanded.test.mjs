@@ -84,12 +84,12 @@ test("Copilot uses a private, task-owned config file and removes it on close", t
   assert.equal(statSync(config.path).mode & 0o777, 0o600);
   config.close(); assert.equal(existsSync(config.path), false); config.close();
 });
-test("Cursor project overlay restores original bytes and mode, excluding other MCPs during the attempt", t => {
+test("Cursor project overlay restores original bytes and mode, preserving personal MCPs during the attempt", t => {
   const dir = root(t); mkdirSync(join(dir, ".cursor"), { mode: 0o700 });
   const file = join(dir, ".cursor/mcp.json"), original = '{ "mcpServers": { "kept": { "url": "http://127.0.0.1:2/mcp" } }, "other": true }\n';
   writeFileSync(file, original); chmodSync(file, 0o640);
   const config = overlayCursorMcpConfig(dir, endpoint), value = JSON.parse(readFileSync(file, "utf8"));
-  assert.equal(value.other, true); assert.deepEqual(Object.keys(value.mcpServers), ["hara"]);
+  assert.equal(value.other, true); assert.deepEqual(Object.keys(value.mcpServers).sort(), ["hara", "kept"]); assert.equal(value.mcpServers.kept.url, "http://127.0.0.1:2/mcp");
   assert.equal(value.mcpServers.hara.url, endpoint.url);
   assert.throws(() => overlayCursorMcpConfig(dir, endpoint), /EEXIST/);
   config.close(); config.close(); assert.equal(readFileSync(file, "utf8"), original); assert.equal(statSync(file).mode & 0o777, 0o640);
@@ -112,6 +112,7 @@ test("discovery never runs a missing CLI, and the generic agent alias must ident
 for (const id of ids) test(id + " diagnostic and first-output stage use closed metadata", () => {
   const diagnostic = runtimeFailureMessage({ runtime: id, version: "1.2.3", loginSource: "host", homeMatchesAccount: true, kind: "runtime_network", elapsedMs: 4 });
   assert.equal(JSON.parse(diagnostic.split("=")[1]).runtime, id);
+  assert.equal(JSON.parse(diagnostic.split("=")[1]).extensionsIsolation, "inherited");
   const marks = [], recorder = { beginEvent() { return () => {}; }, mark(kind, source) { marks.push([kind, source]); } };
   const observer = createRuntimeStageProcessObserver(recorder, id, new AbortController().signal); observer.onSpawn();
   const frame = id === "copilot" ? { type: "assistant.message", data: { content: "fixture" } } : id === "cursor"
@@ -128,18 +129,37 @@ test("native scheduling/wakeup/background tools are refused, while Hara Schedule
   }
   for (const name of ["read_file", "todo_write", "hara__schedule_create", "mcp__hara__schedule_create"]) assert.equal(isForbiddenNativeTool(name), false);
 });
-test("the production guard cannot be enabled by environment or caller input", async () => {
-  const { assertExpandedRuntimeIsolation, expandedRuntimeIsolationReady } = await import("../dist/agent-runtime/expanded-isolation.js");
+test("Jeff A admits personal extensions only for the three expanded runtimes", async () => {
+  const { assertExpandedRuntimeIsolation, expandedRuntimeIsolationReady, expandedExtensionsIsolation } = await import("../dist/agent-runtime/expanded-isolation.js");
   const { sharedExpandedRuntimeProtection } = await import("../dist/agent-runtime/expanded-policy-adapter.js");
   for (const id of ids) {
-    assert.equal(expandedRuntimeIsolationReady(id), false);
-    assert.throws(() => assertExpandedRuntimeIsolation(id), /permission/);
-    assert.throws(() => sharedExpandedRuntimeProtection.assertLaunchSupported(id), /permission/);
-    await assert.rejects(sharedExpandedRuntimeProtection({ runtimeId: id, options: {}, command: "/fixture", env: { HOME: "/fixture" } }), /permission/);
+    assert.equal(expandedRuntimeIsolationReady(id), true);
+    assert.equal(expandedExtensionsIsolation(id), "inherited");
+    assert.doesNotThrow(() => assertExpandedRuntimeIsolation(id));
+    assert.doesNotThrow(() => sharedExpandedRuntimeProtection.assertLaunchSupported(id));
   }
+  for (const id of ["claude", "codex", "opencode", "gemini", "pi"]) assert.equal(expandedExtensionsIsolation(id), undefined);
+  assert.throws(() => assertExpandedRuntimeIsolation("unregistered"), /permission/);
 });
-
-test("metadata subprocesses cannot bypass the production scheduling/extension gate", async () => {
+test("normal runtime stage metadata records inherited without changing isolated runtime records", async () => {
+  const { projectRuntimeStageRuntime } = await import("../dist/workspace/runtime-stage-events.js");
+  const base = { version: "1.2.3", loginSource: "host", model: "fixture", effort: null };
+  for (const id of ids) assert.equal(projectRuntimeStageRuntime({ ...base, id }).extensionsIsolation, "inherited");
+  for (const id of ["claude", "codex", "opencode", "pi"]) assert.equal(Object.hasOwn(projectRuntimeStageRuntime({ ...base, id }), "extensionsIsolation"), false);
+});
+test("metadata accepts inherited fixture configuration while retaining real outer Seatbelt", { skip: process.platform !== "darwin" }, async t => {
   const { captureExpandedMetadata } = await import("../dist/agent-runtime/expanded-metadata.js");
-  for (const id of ["copilot", "cursor"]) await assert.rejects(captureExpandedMetadata({ runtimeId: id, command: "/does-not-exist", env: { HOME: "/fixture" } }), /runtime_permission_denied/);
+  for (const id of ["copilot", "cursor"]) {
+    const dir = root(t), home = join(dir, "account"), protectedRoot = join(dir, "hara-state"), command = join(dir, "fake-cli");
+    for (const path of [join(home, "." + id), join(home, ".hara"), join(home, ".codex"), protectedRoot]) mkdirSync(path, { recursive: true });
+    const config = id === "cursor" ? ".cursor/mcp.json" : ".copilot/mcp-config.json";
+    writeFileSync(join(home, config), "SYNTHETIC_PERSONAL_EXTENSION");
+    writeFileSync(join(home, ".codex/auth.json"), "SYNTHETIC_OTHER_LOGIN");
+    writeFileSync(join(protectedRoot, "state.json"), "SYNTHETIC_HARA");
+    const code = `const fs=require('fs'),home=process.env.HOME;let haraDenied=false,foreignDenied=false;try{fs.writeFileSync(${JSON.stringify(join(protectedRoot, "state.json"))},'x')}catch{haraDenied=true}try{fs.readFileSync(home+'/.codex/auth.json')}catch{foreignDenied=true}console.log(JSON.stringify({marker:fs.readFileSync(home+'/'+${JSON.stringify(config)},'utf8'),home,haraDenied,foreignDenied,args:process.argv.slice(2)}));`;
+    writeFileSync(command, "#!" + process.execPath + "\n" + code, { mode: 0o755 });
+    const result = await captureExpandedMetadata({ runtimeId: id, command, env: { ...process.env, HOME: home }, protectedStateRoots: [protectedRoot] });
+    assert.equal(result.ok, true);
+    assert.deepEqual(JSON.parse(result.stdout), { marker: "SYNTHETIC_PERSONAL_EXTENSION", home, haraDenied: true, foreignDenied: true, args: id === "cursor" ? ["models"] : ["--help"] });
+  }
 });

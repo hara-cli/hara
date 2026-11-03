@@ -13,7 +13,7 @@ import { classifyRuntimeFailure, runtimeFailureMessage } from "./failure-diagnos
 import { runtimeFailureTracker } from "./failure-tracker.js";
 import { createRuntimeStageProcessObserver } from "./stage-observer.js";
 import { runtimeProxyFailure } from "../security/runtime-proxy.js";
-import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
+import { redactToolSubprocessOutput, terminateSubprocessTree } from "../security/subprocess-env.js";
 import type { ExpandedRuntimeId } from "./expanded-models.js";
 import { expandedCliArgs, grokPermissionResult, grokUpdate, parseExpandedRun } from "./expanded-protocol.js";
 import { overlayCursorMcpConfig, writeCopilotMcpConfig } from "./expanded-mcp-config.js";
@@ -152,7 +152,9 @@ export function expandedCliDriver(id: ExpandedRuntimeId, installer: WorkspaceRun
             physicallyStopped = false;
             try {
               result = await runExternalCommandCapture({ command: wrapped.command, env: wrapped.env,
-                spawnProcess(command, argv, spawnOptions) { child = crossSpawn(command, [...argv], spawnOptions); return child; } }, wrapped.args, {
+                spawnProcess(command, argv, spawnOptions) { child = crossSpawn(command, [...argv], spawnOptions);
+                  const owned = child; owned.once("exit", () => terminateSubprocessTree(owned, { force: true, processGroup: process.platform !== "win32" }));
+                  return child; } }, wrapped.args, {
                 cwd: options.ctx.cwd, signal: native.signal, timeoutMs: permit.binding.budget.timeoutMs, maxOutputBytes: 4 * 1024 * 1024,
                 failureKind: "runtime", proxyUrl: current.proxyUrl, retainStdoutOnFailure: true,
                 onSpawn: observer.onSpawn, onStdout(chunk) { observer.onStdout(chunk); activity(); },

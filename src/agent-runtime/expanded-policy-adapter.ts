@@ -7,7 +7,7 @@ import { assertExpandedRuntimeIsolation } from "./expanded-isolation.js";
 import type { ExpandedRuntimeProtection, PreflightExpandedRuntimeProtection } from "./expanded-protection.js";
 
 /** Interface v2. The native Host bridge owns attempt binding, writer exclusion, evidence and risk
- * publication. A missing bridge or an unproved extension/scheduling boundary fails BEFORE spawn. */
+ * publication. A missing bridge still fails BEFORE spawn; inherited personal extensions are explicitly allowed by Jeff option A. */
 const protect: ExpandedRuntimeProtection = async input => {
   assertExpandedRuntimeIsolation(input.runtimeId);
   const permit = input.options.workspaceRun;

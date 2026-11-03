@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { runExternalCommandCapture } from "../dist/external-sessions/process.js";
 import { createTaskExecution } from "../dist/session/task.js";
 import test, { after } from "node:test";
@@ -35,6 +36,10 @@ if(args[0]==="--help"){console.log("--effort <level> (low, medium, high, xhigh, 
 if(args[0]==="models"){console.log("fixture-model - Synthetic model");process.exit(0);}
 if(process.env.HOME!==${JSON.stringify(account)}||args.includes("login")||args.includes("--reauth"))process.exit(9);
 fs.writeFileSync(${JSON.stringify(argv)},JSON.stringify({args,home:process.env.HOME}));
+if(mode==="background"){
+ const child=require("node:child_process").spawn(process.execPath,["-e","setInterval(()=>{},1000)",${JSON.stringify(argv)}],{stdio:"ignore"});
+ fs.writeFileSync(${JSON.stringify(argv + ".child")},String(child.pid));child.unref();
+}
 const output=frame=>process.stdout.write(JSON.stringify(frame)+"\\n");
 async function callMcp(remote){
  if(!remote.url.startsWith("http://127.0.0.1:"))throw Error("non-fixture destination");
@@ -170,9 +175,10 @@ for (const [id, mode] of [["copilot", "terminal-error"], ["grok", "foreign-permi
     assert.equal(f.installer.list().options.find(row => row.runtimeId === id).versionStatus.lastSuccessfulVersion, null);
   });
 
-for (const id of ["copilot", "cursor", "grok"]) test(id + " production preflight refuses an unproved global-plugin/scheduler boundary before spawn", async t => {
+for (const id of ["copilot", "cursor", "grok"]) test(id + " missing Host bridge still refuses an unprotected process after extension admission", async t => {
   const f = await fixture(t, id), outcome = await f.run();
   assert.equal(outcome.status, "error"); assert.match(outcome.error, /runtime_permission_denied/);
+  assert.match(outcome.error, /"extensionsIsolation":"inherited"/);
   assert.equal(fs.existsSync(f.argv), false); assert.equal(f.state().calls, 0); assert.equal(f.state().wrapped, 0);
 });
 test("Grok cancellation closes the physical fake ACP process and never records a success", async t => {
@@ -183,4 +189,17 @@ test("Grok cancellation closes the physical fake ACP process and never records a
   const outcome = await pending;
   assert.notEqual(outcome.status, "completed"); assert.equal(f.state().closed, 1); assert.equal(f.state().calls, 0);
   assert.equal(f.installer.list().options.find(row => row.runtimeId === "grok").versionStatus.lastSuccessfulVersion, null);
+});
+
+for (const id of ["copilot", "cursor", "grok"]) test(id + " attempt clears an inherited background child on normal completion", async t => {
+  const f = await fixture(t, id, "main", "background");
+  const inspect = pid => { try { return execFileSync("/bin/ps", ["-o", "state=,command=", "-p", String(pid)], { encoding: "utf8" }).trim(); } catch { return ""; } };
+  let pid;
+  t.after(() => { if (pid) { const state = inspect(pid); if (state.includes(f.argv) && !state.startsWith("Z")) try { process.kill(pid, "SIGKILL"); } catch {} } });
+  const outcome = await f.run(f.testProtector);
+  pid = Number(fs.readFileSync(f.argv + ".child", "utf8")); assert.ok(Number.isSafeInteger(pid) && pid > 1);
+  assert.equal(outcome.status, "completed", outcome.error);
+  const deadline = Date.now() + 5000; let state;
+  do { state = inspect(pid); if (!state || state.startsWith("Z")) break; await new Promise(resolve => setTimeout(resolve, 25)); } while (Date.now() < deadline);
+  assert.ok(!state || state.startsWith("Z"), "owned background child must no longer run");
 });

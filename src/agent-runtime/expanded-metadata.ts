@@ -1,3 +1,4 @@
+import { terminateSubprocessTree } from "../security/subprocess-env.js";
 import crossSpawn from "cross-spawn";
 import type { ChildProcess } from "node:child_process";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
@@ -9,8 +10,8 @@ import { assertExpandedRuntimeIsolation } from "./expanded-isolation.js";
 
 export type ExpandedMetadataCapture = (input: { runtimeId: "copilot" | "cursor"; command: string;
   env: NodeJS.ProcessEnv; proxyUrl?: string | null; protectedStateRoots: readonly string[] }) => Promise<ExternalCommandCaptureResult>;
-/** Metadata queries are also native subprocesses. They do not get an unprotected back door around
- * the production extension gate. The optional Host constructor seam is for synthetic CLI tests. */
+/** Metadata queries remain protected native subprocesses. Jeff option A permits inherited personal
+ * extensions; HOME and its original login stay in place. The optional Host constructor seam is for synthetic CLI tests. */
 export const captureExpandedMetadata: ExpandedMetadataCapture = async input => {
   assertExpandedRuntimeIsolation(input.runtimeId);
   if (!input.env.HOME || !input.protectedStateRoots?.length) throw new Error("runtime_permission_denied");
@@ -23,7 +24,9 @@ export const captureExpandedMetadata: ExpandedMetadataCapture = async input => {
     const launch = policy.wrap({ command: input.command, args: input.runtimeId === "cursor" ? ["models"] : ["--help"], env: input.env });
     stopped = false;
     try { return await runExternalCommandCapture({ command: launch.command, env: launch.env,
-      spawnProcess(command, argv, options) { child = crossSpawn(command, [...argv], options); return child; } }, launch.args,
+      spawnProcess(command, argv, options) { child = crossSpawn(command, [...argv], options);
+        const owned = child; owned.once("exit", () => terminateSubprocessTree(owned, { force: true, processGroup: process.platform !== "win32" }));
+        return child; } }, launch.args,
       { cwd, proxyUrl: input.proxyUrl, timeoutMs: 15000, maxOutputBytes: 1024 * 1024 });
     } finally {
       if (child?.pid && child.exitCode === null && child.signalCode === null) await new Promise<void>((resolve, reject) => {

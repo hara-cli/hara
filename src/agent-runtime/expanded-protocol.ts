@@ -27,8 +27,8 @@ export function nativeToolObservation(name: unknown, state: NativeToolObservatio
   return { name: safeName, state, effect, ...(risk ? { risk: "external-publish" as const } : {}), ...(deletionTarget ? { deletionTarget } : {}) };
 }
 /** Hara Scheduler tools remain governed MCP calls. Never authorize a runtime's native scheduler,
- * wakeup or persistent background-agent tool. This is an additional refusal, not the production
- * isolation receipt: always-approve CLIs can execute before emitting observations. */
+ * wakeup or persistent background-agent tool. This is an additional refusal, not an execution
+ * interception guarantee: always-approve CLIs can execute before emitting observations. */
 export function isForbiddenNativeTool(name: unknown): boolean {
   if (typeof name !== "string") return false;
   if (/^(?:mcp__)?hara(?:__|[./:])/.test(name)) return false;
@@ -99,7 +99,7 @@ export function parseExpandedRun(id: "copilot" | "cursor", result: ExternalComma
 export function expandedCliArgs(input: { id: ExpandedRuntimeId; prompt: string; model: string | null; effort: string | null;
   fullProtected: boolean; mcpConfigPath?: string }): string[] {
   const model = input.model ? ["--model", input.model] : [];
-  if (input.id === "copilot") return ["-p", input.prompt, "--output-format", "json", "--disable-builtin-mcps", "--no-auto-update", ...(input.fullProtected ? ["--allow-all-tools", "--allow-all-paths"] : ["--allow-tool=read", "--allow-tool=hara", "--deny-tool=write", "--deny-tool=shell"]),
+  if (input.id === "copilot") return ["-p", input.prompt, "--output-format", "json", "--no-auto-update", ...(input.fullProtected ? ["--allow-all-tools", "--allow-all-paths"] : ["--allow-tool=read", "--allow-tool=hara", "--deny-tool=write", "--deny-tool=shell"]),
     ...model, ...(input.effort ? ["--effort", input.effort] : []),
     ...(input.mcpConfigPath ? ["--additional-mcp-config=@" + input.mcpConfigPath] : [])];
   if (input.effort) throw new Error("invalid_model");
