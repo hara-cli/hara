@@ -1,3 +1,4 @@
+import { captureExpandedMetadata, type ExpandedMetadataCapture } from "../agent-runtime/expanded-metadata.js";
 import { DOCUMENTED_EXPANDED_MODELS, EXPANDED_MODEL_SOURCES, copilotHelpEfforts, parseCursorModels } from "../agent-runtime/expanded-models.js";
 import { OPTIONAL_RUNTIMES } from "./runtime-catalog.js";
 import { WorkspaceJsonState, exact, plain } from "./local-state.js";
@@ -87,10 +88,10 @@ function cacheCodexModels(models: RuntimeModel[], env: NodeJS.ProcessEnv, storag
   }));
 }
 async function liveModels(runtimeId: "codex" | "opencode" | "cursor", runtimes: WorkspaceRuntimeInstaller,
-  storage: WorkspaceResourceStorage): Promise<RuntimeModel[]> {
+  storage: WorkspaceResourceStorage, expandedMetadata: ExpandedMetadataCapture): Promise<RuntimeModel[]> {
   let { command, env, loginSource, proxyUrl } = await runtimes.prepareBound(runtimeId);
   if (runtimeId === "cursor") {
-    const result = await runExternalCommandCapture({ command, env }, ["models"], { cwd: env.HOME, proxyUrl, timeoutMs: 15000, maxOutputBytes: 1024 * 1024 });
+    const result = await expandedMetadata({ runtimeId, command, env, proxyUrl });
     if (!result.ok) throw new Error(result.errorCode === "runtime_proxy_failed" ? result.errorCode : "cursor model inventory failed");
     return parseCursorModels(result.stdout);
   }
@@ -176,7 +177,8 @@ export class WorkspaceRuntimeModels {
   private readonly state: WorkspaceJsonState<RuntimeModelsState>;
   private readonly pending = new Map<string, Promise<RuntimeModel[]>>();
   private readonly launchDefaults = new Map<string, Promise<{ modelId: string | null; effort: string | null }>>();
-  constructor(storage: WorkspaceResourceStorage, private readonly runtimes: WorkspaceRuntimeInstaller) {
+  constructor(storage: WorkspaceResourceStorage, private readonly runtimes: WorkspaceRuntimeInstaller,
+    private readonly expandedMetadata: ExpandedMetadataCapture = captureExpandedMetadata) {
     this.state = new WorkspaceJsonState(storage, "runtime-models-v1.json", value => {
       if (!plain(value) || !exact(value, ["resourceBinding", "revision", "selections"])
         || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, this.state.binding())
@@ -228,8 +230,9 @@ export class WorkspaceRuntimeModels {
     const bound = this.runtimes.list().options.find(row => row.runtimeId === "copilot");
     const key = JSON.stringify([resolved.command, bound?.fingerprint ?? bound?.version]);
     if (this.copilotEfforts?.key === key) return this.copilotEfforts.levels;
-    const result = await runExternalCommandCapture({ command: resolved.command, env: resolved.env }, ["--help"],
-      { cwd: resolved.env.HOME, timeoutMs: 10000, maxOutputBytes: 256 * 1024 });
+    let result;
+    try { result = await this.expandedMetadata({ runtimeId: "copilot", command: resolved.command, env: resolved.env, proxyUrl: resolved.proxyUrl }); }
+    catch { return []; } // A closed metadata gate must not claim live effort support.
     const levels = result.ok ? copilotHelpEfforts(result.stdout) : [];
     this.copilotEfforts = { key, levels }; return levels;
   }
@@ -298,7 +301,7 @@ export class WorkspaceRuntimeModels {
     const key = JSON.stringify([this.runtimes.list().options.find(row => row.runtimeId === runtimeId), this.runtimes.proxy.read().revision]);
     let pending = this.pending.get(key);
     if (!pending) {
-      pending = liveModels(runtimeId, this.runtimes, this.state.storage).finally(() => this.pending.delete(key));
+      pending = liveModels(runtimeId, this.runtimes, this.state.storage, this.expandedMetadata).finally(() => this.pending.delete(key));
       this.pending.set(key, pending);
     }
     return pending;

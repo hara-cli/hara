@@ -17,7 +17,7 @@ import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import type { ExpandedRuntimeId } from "./expanded-models.js";
 import { expandedCliArgs, grokPermissionResult, grokUpdate, parseExpandedRun } from "./expanded-protocol.js";
 import { overlayCursorMcpConfig, writeCopilotMcpConfig } from "./expanded-mcp-config.js";
-import { unavailableExpandedProtection, type ExpandedRuntimeProtection, type ProtectedExpandedRuntime } from "./expanded-protection.js";
+import { unavailableExpandedProtection, type ExpandedRuntimeProtection, type PreflightExpandedRuntimeProtection, type ProtectedExpandedRuntime } from "./expanded-protection.js";
 
 const object = (value: unknown): Record<string, unknown> | null =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -57,6 +57,10 @@ async function grokTurn(input: {
         if (request.method !== "session/request_permission") { reject(-32601, "Unsupported client method"); return; }
         try {
           input.assertCurrent(); input.protection.assertCurrent();
+          // Even an identical retry loses authority when its turn/session ends or is cancelled.
+          if (!active || !sessionId || input.signal.aborted || request.params?.sessionId !== sessionId) {
+            reply({ outcome: { outcome: "cancelled" } }); return;
+          }
           const key = JSON.stringify(request.id), fingerprint = JSON.stringify(request.params);
           const previous = permissionReplies.get(key);
           if (previous) {
@@ -108,6 +112,8 @@ export function expandedCliDriver(id: ExpandedRuntimeId, installer: WorkspaceRun
       status: "error" as const, error: runtimeFailureMessage({ ...installer.failureContext(id, resolved), kind, elapsedMs: 0 }),
     });
     if (resolved.loginSource !== "host") return diagnostic("runtime_auth_required");
+    try { (protect as PreflightExpandedRuntimeProtection).assertLaunchSupported?.(id); }
+    catch { return diagnostic("runtime_permission_denied"); }
     let selection;
     try { selection = await models.launchSelection(id); } catch { return diagnostic("invalid_model"); }
     if (!selection.modelId || selection.effort && !await models.effortLaunchable(id)) return diagnostic("invalid_model");

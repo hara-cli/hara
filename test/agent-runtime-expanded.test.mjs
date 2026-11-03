@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, symlinkSync, chmodSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expandedCliArgs, grokPermissionResult, grokUpdate, parseExpandedRun } from "../dist/agent-runtime/expanded-protocol.js";
+import { expandedCliArgs, grokPermissionResult, grokUpdate, isForbiddenNativeTool, parseExpandedRun } from "../dist/agent-runtime/expanded-protocol.js";
 import { copilotHelpEfforts, parseCursorModels } from "../dist/agent-runtime/expanded-models.js";
 import { writeCopilotMcpConfig, overlayCursorMcpConfig } from "../dist/agent-runtime/expanded-mcp-config.js";
 import { unavailableExpandedProtection } from "../dist/agent-runtime/expanded-protection.js";
@@ -23,7 +23,7 @@ for (const id of ids) test(id + " has an explicit ID and full parameters require
   const args = expandedCliArgs({ id, prompt: "fixture", model: null, effort: null, fullProtected: true, mcpConfigPath: "/fixture/mcp.json" });
   for (const forbidden of ["login", "--reauth", "--resume", "--continue"]) assert.equal(args.includes(forbidden), false);
   if (id === "copilot") { assert.ok(args.includes("--allow-all-tools")); assert.ok(args.includes("--allow-all-paths")); assert.ok(args.includes("--additional-mcp-config=@/fixture/mcp.json")); }
-  if (id === "cursor") { assert.ok(args.includes("--force")); assert.ok(args.includes("--approve-mcps")); }
+  if (id === "cursor") { assert.ok(args.includes("--force")); assert.ok(args.includes("--approve-mcps")); assert.equal(args[args.indexOf("--sandbox") + 1], "disabled"); assert.equal(controlled[controlled.indexOf("--sandbox") + 1], "disabled"); }
   if (id === "grok") { assert.deepEqual(args, ["agent", "--no-leader", "--always-approve", "stdio"]); }
 });
 test("Copilot normalizes text and tool effects without retaining tool inputs", () => {
@@ -50,6 +50,7 @@ test("exit zero, malformed JSON, missing terminal frames and typed provider erro
     for (const candidate of [
       { ok: true, stdout: "not json", code: 0, timedOut: false },
       result([{ type: "assistant.message", data: { content: "unverified" } }]),
+      result([{ type: "assistant.turn_end" }]),
       result([{ type: "session.error", data: { message: "401 PRIVATE_ACCOUNT" } }, { type: "session.idle" }]),
     ]) { const parsed = parseExpandedRun(id, candidate); assert.equal(parsed.completed, false); assert.equal(parsed.text, ""); }
   }
@@ -69,7 +70,7 @@ test("Grok ACP accepts only the current session and strips native tool arguments
   assert.deepEqual(observed.tool, { name: "write_file", state: "completed", effect: "write" });
 });
 test("Grok approval is allow-once only, bound to an active protected turn; all other contexts cancel", () => {
-  const params = { sessionId: "one", options: [{ kind: "allow_always", optionId: "forever" }, { kind: "allow_once", optionId: "once" }] };
+  const params = { sessionId: "one", toolCall: { title: "read_file" }, options: [{ kind: "allow_always", optionId: "forever" }, { kind: "allow_once", optionId: "once" }] };
   const input = { sessionId: "one", active: true, fullProtected: true, aborted: false };
   assert.deepEqual(grokPermissionResult(params, input), { outcome: { outcome: "selected", optionId: "once" } });
   for (const patch of [{ sessionId: "other" }, { active: false }, { fullProtected: false }, { aborted: true }, { sessionId: null }])
@@ -83,12 +84,12 @@ test("Copilot uses a private, task-owned config file and removes it on close", t
   assert.equal(statSync(config.path).mode & 0o777, 0o600);
   config.close(); assert.equal(existsSync(config.path), false); config.close();
 });
-test("Cursor project overlay restores original bytes and mode, preserving unrelated MCP settings", t => {
+test("Cursor project overlay restores original bytes and mode, excluding other MCPs during the attempt", t => {
   const dir = root(t); mkdirSync(join(dir, ".cursor"), { mode: 0o700 });
   const file = join(dir, ".cursor/mcp.json"), original = '{ "mcpServers": { "kept": { "url": "http://127.0.0.1:2/mcp" } }, "other": true }\n';
   writeFileSync(file, original); chmodSync(file, 0o640);
   const config = overlayCursorMcpConfig(dir, endpoint), value = JSON.parse(readFileSync(file, "utf8"));
-  assert.equal(value.other, true); assert.equal(value.mcpServers.kept.url, "http://127.0.0.1:2/mcp");
+  assert.equal(value.other, true); assert.deepEqual(Object.keys(value.mcpServers), ["hara"]);
   assert.equal(value.mcpServers.hara.url, endpoint.url);
   assert.throws(() => overlayCursorMcpConfig(dir, endpoint), /EEXIST/);
   config.close(); config.close(); assert.equal(readFileSync(file, "utf8"), original); assert.equal(statSync(file).mode & 0o777, 0o640);
@@ -116,4 +117,29 @@ for (const id of ids) test(id + " diagnostic and first-output stage use closed m
   const frame = id === "copilot" ? { type: "assistant.message", data: { content: "fixture" } } : id === "cursor"
     ? { type: "assistant", message: { content: [{ type: "text", text: "fixture" }] } } : { method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "fixture" } } } };
   observer.onStdout(JSON.stringify(frame) + "\n"); observer.finish(true); assert.ok(marks.some(([kind]) => kind === "first_output"));
+});
+
+test("native scheduling/wakeup/background tools are refused, while Hara Scheduler stays governed", () => {
+  for (const name of ["CronCreate", "cron_list", "ScheduleWakeup", "schedule_job", "background_task", "spawn_agent", "task"]) {
+    assert.equal(isForbiddenNativeTool(name), true);
+    assert.throws(() => grokUpdate({ sessionId: "one", update: { sessionUpdate: "tool_call", title: name, status: "pending" } }, "one"), /permission/);
+    assert.deepEqual(grokPermissionResult({ sessionId: "one", toolCall: { title: name }, options: [{ kind: "allow_once", optionId: "once" }] },
+      { sessionId: "one", active: true, fullProtected: true, aborted: false }), { outcome: { outcome: "cancelled" } });
+  }
+  for (const name of ["read_file", "todo_write", "hara__schedule_create", "mcp__hara__schedule_create"]) assert.equal(isForbiddenNativeTool(name), false);
+});
+test("the production guard cannot be enabled by environment or caller input", async () => {
+  const { assertExpandedRuntimeIsolation, expandedRuntimeIsolationReady } = await import("../dist/agent-runtime/expanded-isolation.js");
+  const { sharedExpandedRuntimeProtection } = await import("../dist/agent-runtime/expanded-policy-adapter.js");
+  for (const id of ids) {
+    assert.equal(expandedRuntimeIsolationReady(id), false);
+    assert.throws(() => assertExpandedRuntimeIsolation(id), /permission/);
+    assert.throws(() => sharedExpandedRuntimeProtection.assertLaunchSupported(id), /permission/);
+    await assert.rejects(sharedExpandedRuntimeProtection({ runtimeId: id, options: {}, command: "/fixture", env: { HOME: "/fixture" } }), /permission/);
+  }
+});
+
+test("metadata subprocesses cannot bypass the production scheduling/extension gate", async () => {
+  const { captureExpandedMetadata } = await import("../dist/agent-runtime/expanded-metadata.js");
+  for (const id of ["copilot", "cursor"]) await assert.rejects(captureExpandedMetadata({ runtimeId: id, command: "/does-not-exist", env: { HOME: "/fixture" } }), /runtime_permission_denied/);
 });

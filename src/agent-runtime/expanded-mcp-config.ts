@@ -39,7 +39,7 @@ export function writeCopilotMcpConfig(temporaryDirectory: string, endpoint: Work
     if (current.ino !== original.ino || current.hash !== original.hash) throw new Error("runtime_permission_denied");
     unlinkSync(path); } };
 }
-/** Temporary project overlay only; no home config. Refuse links, concurrent Hara overlays and changed
+/** Temporary Hara-only project MCP overlay; no home config. Refuse links, concurrent Hara overlays and changed
  * files. Restore original bytes/mode, and never discard an observed change made by another writer. */
 export function overlayCursorMcpConfig(cwd: string, endpoint: WorkspaceMcpEndpoint): { path: string; close(): void } {
   const directory = join(realpathSync(cwd), ".cursor");
@@ -60,7 +60,7 @@ export function overlayCursorMcpConfig(cwd: string, endpoint: WorkspaceMcpEndpoi
     if (!object(value) || value.mcpServers !== undefined && !object(value.mcpServers)) throw new Error("runtime_permission_denied");
     const current = snapshot(path);
     if ((current?.ino ?? null) !== (before?.ino ?? null) || (current?.hash ?? null) !== (before?.hash ?? null)) throw new Error("runtime_permission_denied");
-    atomic(path, Buffer.from(JSON.stringify({ ...value, mcpServers: { ...(value.mcpServers as object ?? {}), hara: (({ type: _type, ...remote }) => remote)(server(endpoint)) } }) + "\n"), 0o600);
+    atomic(path, Buffer.from(JSON.stringify({ ...value, mcpServers: { hara: (({ type: _type, ...remote }) => remote)(server(endpoint)) } }) + "\n"), 0o600);
     installed = snapshot(path);
   } catch (error) { release(); if (createdDirectory) try { rmdirSync(directory); } catch { /* retain existing files */ } throw error; }
   return { path, close() {

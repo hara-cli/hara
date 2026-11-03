@@ -1,3 +1,4 @@
+import { runExternalCommandCapture } from "../dist/external-sessions/process.js";
 import { createTaskExecution } from "../dist/session/task.js";
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
@@ -60,7 +61,7 @@ if(id==="grok"){
   const request=JSON.parse(line);if(request.jsonrpc!=="2.0")process.exit(11);
   if(request.method==="initialize"){output({jsonrpc:"2.0",id:request.id,result:{protocolVersion:1,agentCapabilities:{mcpCapabilities:{http:mode!=="no-mcp"}}}});}
   else if(request.method==="session/new"){remote=request.params.mcpServers[0];if(request.params.cwd!==process.cwd())process.exit(12);output({jsonrpc:"2.0",id:request.id,result:{sessionId:"fixture-session"}});}
-  else if(request.method==="session/prompt"){promptId=request.id;output({jsonrpc:"2.0",id:99,method:"session/request_permission",params:{sessionId:mode==="foreign-permission"?"foreign":"fixture-session",options:[{kind:"allow_once",optionId:"once"}]}});}
+  else if(request.method==="session/prompt"){promptId=request.id;if(mode==="cancel")return;output({jsonrpc:"2.0",id:99,method:"session/request_permission",params:{sessionId:mode==="foreign-permission"?"foreign":"fixture-session",toolCall:{title:mode==="native-schedule"?"CronCreate":"read_file"},options:[{kind:"allow_once",optionId:"once"}]}});}
   else if(request.id===99){
     if(request.result?.outcome?.outcome!=="selected"){output({jsonrpc:"2.0",id:promptId,error:{code:-32000,message:"permission cancelled PRIVATE_ACCOUNT"}});return;}
     const text=await callMcp(remote);
@@ -100,7 +101,12 @@ async function fixture(t, id, kind = "main", mode = "ok") {
   await installer.discover(); const detected = installer.list().options.find(row => row.runtimeId === id);
   assert.equal(detected.state, "detected"); assert.throws(() => installer.registerLocal(id, detected.fingerprint, "isolated"), /unsafe/);
   installer.registerLocal(id, detected.fingerprint, "host");
-  const models = new WorkspaceRuntimeModels(storage, installer), inventory = await models.list(id);
+  // Only these fake binaries may use the direct metadata contract seam.
+  const models = new WorkspaceRuntimeModels(storage, installer, async input => {
+    assert.equal(input.command, command); assert.equal(input.env.HOME, account);
+    return runExternalCommandCapture({ command: input.command, env: input.env }, input.runtimeId === "cursor" ? ["models"] : ["--help"],
+      { cwd: account, timeoutMs: 5000 });
+  }), inventory = await models.list(id);
   assert.equal(inventory.source, id === "cursor" ? "live" : "documented");
   await models.select(id, inventory.models[0].id, 0, null);
   const agent = kind === "main" ? main : resources.agents.create({ username: "tester", profile: { displayName: "Tester" } }, resources.agents.list().revision);
@@ -139,7 +145,7 @@ async function fixture(t, id, kind = "main", mode = "ok") {
   };
   const history = [{ role: "user", content: "List colleagues" }];
   const run = protect => storage.run(() => runConfiguredAgent(history, options, new AgentRuntimeRegistry(undefined, installer, models, protect)));
-  return { id, run, testProtector, history, argv, models, installer, observations, state: () => ({ calls, wrapped, closed, collected }) };
+  return { id, run, testProtector, history, argv, models, installer, observations, controller, state: () => ({ calls, wrapped, closed, collected }) };
 }
 for (const id of ["copilot", "cursor", "grok"]) for (const kind of ["main", "colleague"])
   test(id + " " + kind + " reaches the governed Hara MCP bridge with only a fake host login", async t => {
@@ -156,10 +162,25 @@ test("a missing common protector cannot start a full CLI process", async t => {
   assert.equal(result.status, "error"); assert.equal(fs.existsSync(f.argv), false); assert.equal(f.state().calls, 0);
   assert.match(result.error, /runtime_permission_denied/);
 });
-for (const [id, mode] of [["copilot", "terminal-error"], ["grok", "foreign-permission"], ["grok", "no-mcp"]])
+for (const [id, mode] of [["copilot", "terminal-error"], ["grok", "foreign-permission"], ["grok", "no-mcp"], ["grok", "native-schedule"]])
   test(id + " " + mode + " cannot record a successful version or leak a raw account error", async t => {
     const f = await fixture(t, id, "main", mode), result = await f.run(f.testProtector);
     assert.equal(result.status, "error"); assert.equal(result.error.includes("PRIVATE_ACCOUNT"), false);
     assert.equal(f.state().closed, 1);
     assert.equal(f.installer.list().options.find(row => row.runtimeId === id).versionStatus.lastSuccessfulVersion, null);
   });
+
+for (const id of ["copilot", "cursor", "grok"]) test(id + " production preflight refuses an unproved global-plugin/scheduler boundary before spawn", async t => {
+  const f = await fixture(t, id), outcome = await f.run();
+  assert.equal(outcome.status, "error"); assert.match(outcome.error, /runtime_permission_denied/);
+  assert.equal(fs.existsSync(f.argv), false); assert.equal(f.state().calls, 0); assert.equal(f.state().wrapped, 0);
+});
+test("Grok cancellation closes the physical fake ACP process and never records a success", async t => {
+  const f = await fixture(t, "grok", "main", "cancel"), pending = f.run(f.testProtector);
+  const deadline = Date.now() + 5000;
+  while (!fs.existsSync(f.argv) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(fs.existsSync(f.argv), true); f.controller.abort();
+  const outcome = await pending;
+  assert.notEqual(outcome.status, "completed"); assert.equal(f.state().closed, 1); assert.equal(f.state().calls, 0);
+  assert.equal(f.installer.list().options.find(row => row.runtimeId === "grok").versionStatus.lastSuccessfulVersion, null);
+});

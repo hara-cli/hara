@@ -111,7 +111,7 @@ export function createRegisteredCliMcpTurn(input: {
 }) {
   const stopped = new AbortController();
   const pending = new Map<string, PendingCall>(), queue: PendingCall[] = [];
-  let endpoint: WorkspaceMcpEndpoint | undefined, physical: Promise<void> | undefined;
+  let endpoint: WorkspaceMcpEndpoint | undefined, physical: Promise<void> | undefined, closing: Promise<void> | undefined;
   let tools: readonly ToolSpec[] = [], finished: TurnResult | undefined, wake: (() => void) | undefined;
   let activity: (() => void) | undefined, closed = false, ended = false;
   const notify = () => { wake?.(); wake = undefined; };
@@ -121,14 +121,18 @@ export function createRegisteredCliMcpTurn(input: {
       if (call) { pending.delete(result.id); call.resolve(result); }
     }
   };
-  const close = async (history: readonly NeutralMsg[] = []) => {
-    if (closed) return;
+  const close = (history: readonly NeutralMsg[] = []): Promise<void> => {
+    if (closing) return closing;
     closed = true; flush(history); stopped.abort();
     for (const { call, resolve } of pending.values()) resolve({ id: call.id, name: call.name, content: "Error: Workspace attempt ended", isError: true });
     pending.clear(); queue.length = 0; notify();
-    await endpoint?.close();
-    await physical;
-    input.signal.removeEventListener("abort", onAbort);
+    // Abort listeners and the driver's finally may close concurrently. Every caller joins the same
+    // physical cleanup; a second close must not report completion while the child is still alive.
+    closing = (async () => {
+      try { await endpoint?.close(); await physical; }
+      finally { input.signal.removeEventListener("abort", onAbort); }
+    })();
+    return closing;
   };
   const onAbort = () => { void close().catch(() => {}); };
   input.signal.addEventListener("abort", onAbort, { once: true });

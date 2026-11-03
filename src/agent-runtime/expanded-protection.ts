@@ -16,4 +16,8 @@ export interface ProtectedExpandedRuntime {
 export type ExpandedRuntimeProtection = (input: {
   runtimeId: ExpandedRuntimeId; options: RunOpts; command: string; env: NodeJS.ProcessEnv;
 }) => Promise<ProtectedExpandedRuntime>;
+// Optional trusted preflight runs before even model/help queries. Only Host composition supplies it.
+export type PreflightExpandedRuntimeProtection = ExpandedRuntimeProtection & {
+  assertLaunchSupported?(runtimeId: ExpandedRuntimeId): void;
+};
 export const unavailableExpandedProtection: ExpandedRuntimeProtection = async () => { throw new Error("runtime_permission_denied"); };

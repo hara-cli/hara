@@ -23,7 +23,18 @@ export function nativeToolObservation(name: unknown, state: NativeToolObservatio
   const risk = /\b(?:git\s+push|npm\s+publish|pnpm\s+publish|gh\s+(?:release\s+create|pr\s+merge))\b/.test(command);
   const path = details?.path ?? details?.filePath;
   const deletionTarget = /delete|remove|unlink/.test(text) && typeof path === "string" && path.length <= 4096 && !/[\r\n\0]/.test(path) ? path : undefined;
+  if (isForbiddenNativeTool(safeName)) throw new Error("runtime_permission_denied");
   return { name: safeName, state, effect, ...(risk ? { risk: "external-publish" as const } : {}), ...(deletionTarget ? { deletionTarget } : {}) };
+}
+/** Hara Scheduler tools remain governed MCP calls. Never authorize a runtime's native scheduler,
+ * wakeup or persistent background-agent tool. This is an additional refusal, not the production
+ * isolation receipt: always-approve CLIs can execute before emitting observations. */
+export function isForbiddenNativeTool(name: unknown): boolean {
+  if (typeof name !== "string") return false;
+  if (/^(?:mcp__)?hara(?:__|[./:])/.test(name)) return false;
+  const canonical = name.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return /^(?:cron|schedule|wakeup|background|spawnbackground|startbackground|persistentagent)/.test(canonical)
+    || canonical === "task" || canonical === "spawnagent";
 }
 export interface ExpandedRunResult { text: string; completed: boolean; tools: NativeToolObservation[]; failure: RuntimeFailureKind | null }
 /** Parse content-free tool observations separately from final response text. Exit zero alone is not success. */
@@ -37,6 +48,8 @@ export function parseExpandedRun(id: "copilot" | "cursor", result: ExternalComma
     let frame: Record<string, unknown> | null;
     try { frame = object(JSON.parse(line)); } catch { return fail(); }
     if (!frame || typeof frame.type !== "string") return fail();
+    // Replayed records and subagent terminals cannot close the main attempt.
+    if (frame.checkpoint === true || frame.agentId !== undefined) continue;
     const data = object(frame.data) ?? {};
     if (frame.type === "error" || frame.type === "session.error" || frame.is_error === true) {
       failure = classifyRuntimeFailure({ stderr: JSON.stringify(frame.error ?? data ?? frame).slice(0, 65_536) });
@@ -48,7 +61,10 @@ export function parseExpandedRun(id: "copilot" | "cursor", result: ExternalComma
       if (frame.type === "assistant.message" && typeof data.content === "string") assembled = data.content;
       if (frame.type === "tool.execution_start" || frame.type === "tool.execution_complete")
         tools.push(nativeToolObservation(data.toolName, frame.type.endsWith("_start") ? "started" : data.success === false ? "failed" : "completed", undefined, data.arguments));
-      if (frame.type === "assistant.turn_end" || frame.type === "session.idle") terminal = true;
+      if (frame.type === "session.idle") {
+        if (data.aborted === true) failure = "runtime_failed";
+        else if (data.mode !== "autopilot") terminal = true;
+      }
       if (frame.type === "result") {
         const code = frame.exitCode ?? data.exitCode;
         if (typeof code === "number" && code !== 0) failure = "runtime_failed";
@@ -83,11 +99,11 @@ export function parseExpandedRun(id: "copilot" | "cursor", result: ExternalComma
 export function expandedCliArgs(input: { id: ExpandedRuntimeId; prompt: string; model: string | null; effort: string | null;
   fullProtected: boolean; mcpConfigPath?: string }): string[] {
   const model = input.model ? ["--model", input.model] : [];
-  if (input.id === "copilot") return ["-p", input.prompt, "--output-format", "json", ...(input.fullProtected ? ["--allow-all-tools", "--allow-all-paths"] : ["--allow-tool=read", "--allow-tool=hara", "--deny-tool=write", "--deny-tool=shell"]),
+  if (input.id === "copilot") return ["-p", input.prompt, "--output-format", "json", "--disable-builtin-mcps", "--no-auto-update", ...(input.fullProtected ? ["--allow-all-tools", "--allow-all-paths"] : ["--allow-tool=read", "--allow-tool=hara", "--deny-tool=write", "--deny-tool=shell"]),
     ...model, ...(input.effort ? ["--effort", input.effort] : []),
     ...(input.mcpConfigPath ? ["--additional-mcp-config=@" + input.mcpConfigPath] : [])];
   if (input.effort) throw new Error("invalid_model");
-  if (input.id === "cursor") return ["--print", "--output-format", "stream-json", ...(input.fullProtected ? ["--force"] : ["--mode", "ask"]), "--approve-mcps", "--trust", ...model, input.prompt];
+  if (input.id === "cursor") return ["--print", "--output-format", "stream-json", ...(input.fullProtected ? ["--force"] : ["--mode", "ask"]), "--sandbox", "disabled", "--approve-mcps", "--trust", ...model, input.prompt];
   return ["agent", "--no-leader", ...(input.fullProtected ? ["--always-approve"] : []), ...model, "stdio"];
 }
 /** Reject foreign-session updates instead of attributing their text/tool effects to this attempt. */
@@ -110,6 +126,9 @@ export function grokPermissionResult(params: Record<string, unknown> | undefined
   sessionId: string | null; active: boolean; fullProtected: boolean; aborted: boolean;
 }): Record<string, unknown> {
   if (!params || !input.sessionId || params.sessionId !== input.sessionId || !input.active || !input.fullProtected || input.aborted)
+    return { outcome: { outcome: "cancelled" } };
+  const call = object(params.toolCall), meta = object(call?._meta), native = object(meta?.["x.ai/tool"]);
+  if (!call || isForbiddenNativeTool(native?.name) || isForbiddenNativeTool(call.name) || isForbiddenNativeTool(call.title))
     return { outcome: { outcome: "cancelled" } };
   const options = Array.isArray(params.options) ? params.options : [];
   const selected = options.map(object).find(option => option?.kind === "allow_once" && typeof option.optionId === "string"
