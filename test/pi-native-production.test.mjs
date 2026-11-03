@@ -134,24 +134,24 @@ test("repeated MCP close waits for the same physical native launch after cancell
   release(); await closing; await turn; assert.equal(closed, true);
 });
 
-test("Pi MCP cannot commit done while its native process is still active", async t => {
+test("Pi MCP completion proposals reach the governor only after native settle and drain", async t => {
   const { createRegisteredCliMcpTurn } = await import("../dist/agent-runtime/registered-cli-mcp.js");
   const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
   const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
-  const signal = new AbortController().signal;
+  const signal = new AbortController().signal; let launchEnded = false;
   const native = createRegisteredCliMcpTurn({ signal, jsonEvents: false, deferNativeCompletion: true, assertCurrent() {}, async launch(endpoint) {
     const client = new Client({ name: "synthetic-pi", version: "1" });
     try {
       await client.connect(new StreamableHTTPClientTransport(new URL(endpoint.url), { requestInit: { headers: { Authorization: "Bearer " + endpoint.env.HARA_WORKSPACE_MCP_TOKEN } } }));
       const result = await client.callTool({ name: "task_checkpoint", arguments: { done: true } });
-      assert.equal(result.isError, true); assert.match(result.content[0].text, /protected process tree drains/);
-      return { ok: true, stdout: "settled", code: 0, timedOut: false };
+      assert.notEqual(result.isError, true); assert.equal(JSON.parse(result.content[0].text).committed, false);
+      assert.equal(launchEnded,false); launchEnded = true; return { ok: true, stdout: "settled", code: 0, timedOut: false };
     } finally { await client.close(); }
   } });
   t.after(() => native.close());
   const result = await native.turn({ system: "synthetic", history: [{ role: "user", content: "finish" }], signal, onText() {},
     tools: [{ name: "task_checkpoint", description: "Host completion", input_schema: { type: "object", properties: { done: { type: "boolean" } } } }] });
-  assert.equal(result.stop, "end"); assert.equal(result.toolUses.length, 0);
+  assert.equal(launchEnded,true); assert.equal(result.stop, "tool_use"); assert.equal(result.toolUses[0].name,"task_checkpoint");
 });
 
 test("the production bundled Pi RPC entry executes native tools and Hara MCP using the common process boundary", async t => {
@@ -280,4 +280,94 @@ test("frozen Workspace proxy is request-local, survives async work and keeps loo
   assert.equal(await withWorkspaceModelProxy(proxyUrl, () => withWorkspaceModelProxy(null, async () => (await modelFetch("http://outside.fixture.invalid/nested")).text())), "outside-direct");
   assert.equal(await withWorkspaceModelProxy(proxyUrl, async () => (await modelFetch("http://127.0.0.1:" + upstream.address().port)).text()), "model-fixture");
   release(); assert.equal(await routed, "model-fixture"); assert.equal(tunnels, 1); assert.equal(outside, 2);
+});
+
+async function fullWorkspaceFixture(t, providerTurn) {
+  await import("../dist/tools/all.js");
+  const { LocalWorkspaceCatalog } = await import("../dist/workspace/local-catalog.js");
+  const { WorkspaceResources } = await import("../dist/workspace/resources.js");
+  const { WorkspaceConnectionStoreV2 } = await import("../dist/workspace/connections.js");
+  const { captureWorkspaceProjectIdentity, freezeWorkspaceRunBinding, workspaceAgentBindingHash } = await import("../dist/workspace/run-binding.js");
+  const { WorkspaceSessionLease } = await import("../dist/workspace/session-lease.js");
+  const { createWorkspaceRunPermit, bindWorkspaceRunOptions, closeWorkspaceRunPermit, workspaceRunNativeEvidence } = await import("../dist/workspace/execution.js");
+  const { WorkspaceRuntimeInstaller } = await import("../dist/workspace/runtime-install.js");
+  const { AgentRuntimeRegistry } = await import("../dist/agent-runtime/registry.js");
+  const { createTaskExecution } = await import("../dist/session/task.js");
+  const root = realpathSync(mkdtempSync(join(tmpdir(),"hara-pi-workspace-"))), home = join(root,"host-state"), account = join(root,"account"), project = join(root,"work"), temporary = join(root,"runtime-tmp");
+  for (const dir of [home,account,project,temporary]) mkdirSync(dir,{mode:0o700});
+  const catalog = new LocalWorkspaceCatalog(home), row = catalog.create("Native fixture",1);
+  const resources = new WorkspaceResources(home,row.scope); resources.initialize(); const main = resources.agents.initializeMain();
+  assert.equal(main.permissionTier,"full-protected");
+  const storage = new WorkspaceResourceStorage(home,row.scope); storage.initialize();
+  const connections = new WorkspaceConnectionStoreV2(storage);
+  connections.add({label:"Synthetic",provider:"openai",baseURL:"http://127.0.0.1:1/v1",apiKey:"synthetic-never-sent-upstream",defaultModel:"frozen-native-fixture"},0);
+  let task = resources.agents.bindTask(createTaskExecution("Create result.txt","native-turn"),main.agentId,main.configRevision,main.agentEpoch);
+  const sessionId = main.agentId.slice(3), binding = freezeWorkspaceRunBinding({schemaVersion:1,scope:row.scope,agent:task.workspaceAgentBinding,
+    agentBindingHash:workspaceAgentBindingHash(task.workspaceAgentBinding),connection:connections.capture(),runtimeContract:"hara-governed-pi-v1",
+    project:captureWorkspaceProjectIdentity(project),sessionId,runId:randomUUID(),lineage:{rootRunId:null,parentRunId:null,depth:0},createdAt:new Date().toISOString(),
+    host:{hostId:catalog.read().hostId,hostEpoch:1,grantId:row.grantId,grantRevision:1,actorId:row.actorId,policyRevision:1},
+    budget:{maxRounds:12,maxToolCalls:32,maxTokens:32000,timeoutMs:60000}});
+  task.workspaceRunBinding = binding;
+  const lease = WorkspaceSessionLease.acquire(storage,sessionId), controller = new AbortController();
+  let usage = {modelCalls:0,toolCalls:0,inputTokens:0,outputTokens:0}, calls = 0, permit;
+  const nativeProof = {name:"workspace_native_evidence",description:"Read actual Host native evidence",kind:"read",input_schema:{type:"object",properties:{}},
+    async run() { const proof = workspaceRunNativeEvidence(permit); return JSON.stringify({verified:!!proof,nativeEvidence:proof}); } };
+  permit = createWorkspaceRunPermit({binding,catalog,resources,storage,connections,lease,cwd:project,signal:controller.signal,
+    provider:{id:"openai",model:binding.connection.model,async turn(args){ calls++; return providerTurn(args,calls); }},
+    toolNames:["task_intake","task_checkpoint",nativeProof.name],usage,updateUsage(value){usage={...value};}});
+  const options = bindWorkspaceRunOptions(permit,{ctx:{cwd:project,sessionId,todoScope:"native-"+sessionId,sandbox:"off"},signal:controller.signal,
+    approval:"auto-edit",approvalChannel:true,confirm:async()=>false,hooks:false,quiet:true,extraTools:[nativeProof],systemOverride:"Use only the frozen native fixture task and Hara tools.",
+    taskIntake:{task,current:()=>task,onUpdate(next){task=next;},onCheckpoint(next){task=next;},onRoundUsage(next){task=next;}}});
+  const installer = new WorkspaceRuntimeInstaller(storage,{accountHome:()=>account}), registry = new AgentRuntimeRegistry(undefined,installer);
+  t.after(async()=>{try { await closeWorkspaceRunPermit(permit);await installer.close(); } finally { rmSync(root,{recursive:true,force:true}); }});
+  return {root,project,storage,permit,options,registry,binding,get calls(){return calls;},get usage(){return usage;},get task(){return task;},
+    async run() { const previous = process.env.TMPDIR;process.env.TMPDIR=temporary;
+      try { const {runConfiguredAgent}=await import("../dist/agent-runtime/dispatch.js"); return await runConfiguredAgent([{role:"user",content:"Create result.txt"}],options,registry); }
+      finally { if(previous===undefined)delete process.env.TMPDIR;else process.env.TMPDIR=previous; }
+    }};
+}
+for (const writeEffect of [true,false]) test("actual full Pi Workspace dispatch " + (writeEffect ? "verifies native N1 after drain with one charge per model call" : "rejects a completion proposal without a native write effect"), async t => {
+  if(process.platform!=="darwin")return t.skip("macOS protected runtime required");
+  const mcp=(id,name,input)=>({text:"",toolUses:[{id,name:piWorkspaceToolName(name),input}],stop:"tool_use",usage:{input:7,output:3}});
+  const f = await fullWorkspaceFixture(t,async(args,n)=>{
+    assert.ok(n<=5,"no native prompt or paid request replay");
+    if(n===1)return mcp("intake","task_intake",{intent:"change",goal:"Create result.txt",constraints:["only the frozen project"],acceptance:["result.txt contains verified bytes"],steps:["write","verify"]});
+    if(n===2)return {text:"",toolUses:[{id:"native-effect",name:writeEffect?"write":"read",input:writeEffect?{path:"result.txt",content:"verified native bytes"}:{path:"fixture.txt"}}],stop:"tool_use",usage:{input:7,output:3}};
+    if(n===3)return mcp("proof","workspace_native_evidence",{});
+    if(n===4){
+      let proof;
+      for(const message of args.history)if(message.role==="tool")for(const result of message.results){try{const value=JSON.parse(result.content);if(value.nativeEvidence)proof=value.nativeEvidence;}catch{}}
+      assert.equal(!!proof,writeEffect);
+      return mcp("propose","task_checkpoint",{completion:{state:"verified",evidence:["Host native diff"],checks:[{acceptance_index:0,evidence:"Host native diff",native_evidence_ids:[proof?.id??"invented-native-id"]}],final_answer:"The native file is verified."}});
+    }
+    assert.ok(args.history.some(message=>message.role==="tool"&&message.results.some(result=>result.content.includes('"committed":false'))));
+    return reply("The native file is verified.");
+  });
+  writeFileSync(join(f.project,"fixture.txt"),"read-only fixture");
+  const outcome = await f.run();
+  assert.equal(f.calls,5,JSON.stringify(outcome));assert.equal(f.usage.modelCalls,5);assert.equal(f.binding.agent.permissionTier,"full-protected");
+  if(writeEffect){assert.equal(outcome.status,"completed",JSON.stringify(outcome));assert.equal(readFileSync(join(f.project,"result.txt"),"utf8"),"verified native bytes");assert.equal(f.task.checkpoint.completion.state,"verified");}
+  else {assert.notEqual(outcome.status,"completed");assert.notEqual(f.task.checkpoint?.completion?.state,"verified");}
+});
+
+
+test("Pi full Seatbelt permits a tiny Bun file dependency install with file-link denied", async t => {
+  const command = process.env.HARA_PI_TEST_BUN;
+  if(process.platform!=="darwin"||!command)return t.skip("a local Bun executable and macOS are required");
+  const {createRuntimeExecutionPolicy}=await import("../dist/agent-runtime/execution-policy.js");
+  const {runExternalCommandCapture}=await import("../dist/external-sessions/process.js");
+  const root=fixture(t),work=join(root,"work"),home=join(root,"account"),agent=join(root,"agent");
+  for(const path of [work,home,agent,join(work,"packages/local-proof")])mkdirSync(path,{recursive:true,mode:0o700});
+  writeFileSync(join(agent,"auth.json"),"{}");
+  writeFileSync(join(work,"package.json"),JSON.stringify({name:"private-policy-fixture",private:true,dependencies:{"local-proof":"file:./packages/local-proof"}}));
+  writeFileSync(join(work,"packages/local-proof/package.json"),JSON.stringify({name:"local-proof",version:"1.0.0",main:"index.js"}));
+  writeFileSync(join(work,"packages/local-proof/index.js"),'module.exports="local-install-proof";');
+  const policy=createRuntimeExecutionPolicy({runtimeId:"pi",tier:"full-protected",accountHome:home,runtimeHome:agent,workRoot:work,loginSource:"isolated"});
+  policy.beginAttempt("bun-install-fixture");t.after(()=>policy.close());
+  assert.ok(policy.profile.includes("(deny file-link)"));
+  const launch=policy.wrap({command:realpathSync(command),args:["install","--ignore-scripts","--no-progress","--registry","http://127.0.0.1:1","--cache-dir",join(work,".bun-cache")],
+    env:{HOME:home,USERPROFILE:home,PATH:process.execPath.slice(0,process.execPath.lastIndexOf("/"))+":/usr/bin:/bin",NO_COLOR:"1"}});
+  const result=await runExternalCommandCapture(launch,launch.args,{cwd:work,timeoutMs:20000,waitForClose:true});
+  assert.equal(result.ok,true,"Bun local file install failed under the real protected policy");
+  assert.equal(readFileSync(join(work,"node_modules/local-proof/index.js"),"utf8"),'module.exports="local-install-proof";');
 });

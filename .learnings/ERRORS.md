@@ -11115,6 +11115,32 @@ explicitly deferred with two alternatives. Earlier historical failures and stres
 - Keep raw-output retention opt-in for a documented JSON parser. A nonzero native exit otherwise discards stdout before the driver can classify its terminal error frame. Generic transport failure must not overwrite a specific structured error event.
 - Resolve files with `rg --files` in the intended repository before cross-repository reads. Guessed sibling filenames and reads at the task root produced harmless missing-file/not-a-repository errors during this run; no source or shared state changed from those reads.
 - Final focused and full results are recorded in the workspace inbox handoff. Preserve the initial failure logs separately from the final verification.
+## [ERR-20261103-CODEX-PERSISTENT-MCP] Native approval mode and resumed usage need real protocol verification
+
+**Logged**: 2026-11-03T01:20:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: backend
+
+### Summary
+Codex 0.166 `auto` can request native MCP approval before a governed tool reaches Hara. A persistent process also needs explicit thread unload before new endpoint/instruction overrides can take effect.
+
+### Details
+The first implementation passed fake RPC/MCP checks, but a real app-server tool probe was rejected before Hara recorded a tool call. Only the fresh attempt's Hara endpoint now uses `approve`; other inherited MCP servers are cleared, native execution stays read-only/on-request/user, and every Hara tool remains subject to its immutable permit, governor and Desk card. Model and effort responses are verified. Each attempt unsubscribes with zero native unload delay and waits for thread/closed, retaining the app-server process only after that boundary.
+
+Usage is charged from the first current-turn request's explicit `last` telemetry, then native cumulative deltas. Replay from an earlier native turn is fenced out. Updating a separate durable watermark before governor accounting could lose the crash gap; it is not an accounting authority. Token overage is checked on each observed update and the final drain retains observed usage. A real longer conversation reached 147606 input / 228 output against the frozen 128000 token limit and was stopped; this was not solved by raising the budget. Future context/budget policy needs a separate decision.
+
+### Resolution
+- Source implements scoped process pooling, per-attempt MCP, explicit resume failure without replay, native event attribution, process exit drain and token rotation on process replacement.
+- Focused protocol/governor/card/lifecycle checks: 21/21 passed. Real tool calls reached Hara after the native approval correction; full-suite and handoff results live in the workspace inbox report.
+- First build had a local `args` name collision; fixed without changing behavior. The private live harness also had revision/variable-shadowing setup mistakes. Its already accepted first request was preserved and not replayed.
+- A cumulative S3 test file hit the unchanged 120-second file deadline under full-suite load; split by lifecycle without raising limits or removing assertions. Two unchanged Host/channel files also failed under that load and passed 12/12 on the fixed baseline in isolation.
+
+### Metadata
+- Source: real protocol test
+- Related Files: src/agent-runtime/codex-session.ts, src/agent-runtime/registered-cli-mcp.ts, src/workspace/execution.ts, test/workspace-codex-session-recovery.test.mjs
+- Tags: codex, app-server, mcp, governance, accounting, recovery
+- Pattern-Key: native_session.context_is_not_authority
 
 ## [ERR-20261103-PI-RPC-EMPTY-AUTH-LOCK] Pi RPC requires a narrow lock directory even for empty auth
 

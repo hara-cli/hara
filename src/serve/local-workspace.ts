@@ -1,3 +1,4 @@
+import { isRuntimePermissionTier } from "../agent-runtime/execution-policy.js";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import { LocalWorkspaceHost, type LocalWorkspaceProviderFactory } from "../workspace/local-host.js";
@@ -58,7 +59,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, capabilities: [capability, "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, capabilities: [capability, "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
@@ -164,6 +165,11 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       if (typeof params.operationId !== "string" || !UUID.test(params.operationId)) throw new Error("invalid runtime operation");
       host.cancelRuntime(workspaceId, params.operationId); return { state: "cancelling" }; }
     if (method === "workspace.agent.select") { fields(["workspaceId", "expectedGeneration", "agentId"]); if (!text(params.agentId)) throw new Error("invalid Agent selection"); host.selectAgent(client.id, workspaceId, params.agentId); return host.snapshot(workspaceId, params.agentId, client.id); }
+    if (method === "workspace.agents.setPermissionTier") {
+      fields(["workspaceId", "expectedGeneration", "agentId", "permissionTier", "configRevision", "agentEpoch"]);
+      if (!text(params.agentId) || !isRuntimePermissionTier(params.permissionTier) || !positive(params.configRevision) || !positive(params.agentEpoch)) throw new Error("Invalid colleague permission update");
+      return host.setAgentPermissionTier(workspaceId, params.agentId, params.permissionTier, params.configRevision, params.agentEpoch);
+    }
     if (method === "workspace.agents.setRuntime") {
       fields(["workspaceId", "expectedGeneration", "agentId", "runtimeId", "configRevision", "agentEpoch"]);
       if (!text(params.agentId) || !isAgentRuntimeId(params.runtimeId) || !positive(params.configRevision) || !positive(params.agentEpoch)) throw new Error("invalid Workspace Agent Runtime update");
@@ -209,6 +215,13 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       fields(["workspaceId", "expectedGeneration", "agentId", "requestId"]);
       if (!text(params.agentId) || typeof params.requestId !== "string" || !UUID.test(params.requestId)) throw new Error("invalid Workspace receipt request");
       return host.requestReceipt(workspaceId, params.agentId, params.requestId);
+    }
+    if (method === "workspace.session.new") {
+      fields(["workspaceId", "expectedGeneration", "agentId", "expectedRevision", "expectedNativeRevision", "requestId", "approved"]);
+      if (!text(params.agentId) || params.approved !== true || typeof params.requestId !== "string" || !UUID.test(params.requestId)
+        || !Number.isSafeInteger(params.expectedRevision) || Number(params.expectedRevision) < 0
+        || !Number.isSafeInteger(params.expectedNativeRevision) || Number(params.expectedNativeRevision) < 0) throw new Error("Explicit native session reset approval and current revisions required");
+      return host.newNativeSession(client.id, workspaceId, params.agentId, Number(params.expectedRevision), Number(params.expectedNativeRevision), params.requestId);
     }
     if (method === "workspace.session.cancel") { fields(["workspaceId", "expectedGeneration", "agentId", "runId"]); if (!text(params.agentId) || !text(params.runId)) throw new Error("invalid cancel"); host.cancel(workspaceId, params.agentId, params.runId); return { state: "draining" }; }
     throw new Error("unsupported Workspace method; no legacy route or authority fallback");

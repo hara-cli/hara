@@ -26,17 +26,13 @@ import type { WorkspaceUserInteraction, WorkspaceUserQuestion } from "./user-int
 
 export interface WorkspaceRunPermit { readonly binding: Readonly<WorkspaceRunBinding> }
 interface PermitState {
+  storage: WorkspaceResourceStorage;
   assertLive(): void;
   provider: Provider;
   options?: RunOpts;
   cwd: string;
   managedProject: boolean;
   stateHome: string;
-  storage: WorkspaceResourceStorage;
-  nativePolicy?: RuntimeExecutionPolicy;
-  nativeEvidence?: NativeWorkspaceEvidence;
-  nativeRisks?: RuntimeRiskEvent[];
-  onNativeRisks?(risks: readonly RuntimeRiskEvent[]): void;
   signal: AbortSignal;
   tools: Set<string>;
   usage: WorkspaceUsage;
@@ -45,6 +41,10 @@ interface PermitState {
   lease: WorkspaceSessionLease;
   retired: boolean;
   started: boolean;
+  nativePolicy?: RuntimeExecutionPolicy;
+  nativeEvidence?: NativeWorkspaceEvidence;
+  nativeRisks?: RuntimeRiskEvent[];
+  onNativeRisks?(risks: readonly RuntimeRiskEvent[]): void;
   runtimeModel?: (args: TurnArgs) => Promise<TurnResult>;
   modelHistory?: { history: NeutralMsg[]; start: number; prefixDigest: string; retain?: (result: ToolResult) => string; usedTokens?: () => number };
   contextStats?: WorkspaceContextStats;
@@ -82,6 +82,13 @@ function publishUsage(state: PermitState, delta: Partial<WorkspaceUsage>): void 
   if (state.updateUsage(Object.freeze({ ...next })) !== undefined) throw new Error("Workspace usage persistence must complete synchronously");
   state.usage = next;
 }
+/** Only native Codex has the approved non-cache run-budget policy. Preserve raw/cache counts in its
+ * private thread telemetry and context audit; other Runtime/provider budget semantics are unchanged. */
+function runtimeUsageDelta(usage: NonNullable<TurnResult["usage"]>, nativeCodex: boolean): Partial<WorkspaceUsage> {
+  const cached = nativeCodex ? usage.cachedInput ?? 0 : 0;
+  if (!Number.isSafeInteger(cached) || cached < 0 || cached > usage.input) throw new Error("invalid Workspace native cache telemetry");
+  return { inputTokens: usage.input - cached, outputTokens: usage.output };
+}
 
 /** A path-shaped string alone cannot opt a user project out of the CLI trust check. */
 export function workspaceRunHasManagedProject(permit: WorkspaceRunPermit): boolean {
@@ -106,9 +113,9 @@ export function createWorkspaceRunPermit(input: {
   modelHistory?: { history: NeutralMsg[]; start: number; retain?: (result: ToolResult) => string; usedTokens?: () => number };
   observeContext?(value: WorkspaceContextObservation): void;
   /** Host-created diagnostic recorder, never accepted from model/RPC data. */
-  onNativeRisks?(risks: readonly RuntimeRiskEvent[]): void;
   runtimeStages?: RuntimeStageRecorder;
   onRuntimeStageChanged?(): void;
+  onNativeRisks?(risks: readonly RuntimeRiskEvent[]): void;
   interaction?: WorkspaceUserInteraction;
   onQuestion?(question: WorkspaceUserQuestion): void;
   /** Host view refresh after an ask card is posted (async cards do not pass through a checkpoint). */
@@ -198,7 +205,7 @@ export function createWorkspaceRunPermit(input: {
       try {
         const result: TurnResult = await track(state, operation);
         // Even a cancelled/late request consumes its recorded telemetry, but never releases more tools.
-        try { if (result.usage) publishUsage(state, { inputTokens: result.usage.input, outputTokens: result.usage.output }); }
+        try { if (result.usage) publishUsage(state, runtimeUsageDelta(result.usage, Boolean(state.runtimeModel) && binding.agent.runtimeId === "codex")); }
         finally { input.observeContext?.({ ...observation, input: result.usage?.input ?? null, output: result.usage?.output ?? null,
           inputWarning: (result.usage?.input ?? 0) > 12000 }); }
         assertLive();
@@ -286,6 +293,25 @@ export function beginWorkspaceGovernedRun(permit: WorkspaceRunPermit, options: R
   state.started = true;
 }
 export function workspaceRunToolAllowed(permit: WorkspaceRunPermit, name: string): boolean { return stateOf(permit).tools.has(name); }
+/** Trusted native transport composition; never derived from a renderer path or the foreground scope. */
+export function workspaceRuntimeStorage(permit: WorkspaceRunPermit): WorkspaceResourceStorage {
+  const state = stateOf(permit); state.assertLive(); return state.storage;
+}
+/** Charge observed native telemetry even when cancellation prevented another provider boundary. */
+export function recordWorkspaceRuntimeUsage(permit: WorkspaceRunPermit, usage: TurnResult["usage"]): void {
+  const state = stateOf(permit);
+  if (usage) publishUsage(state, runtimeUsageDelta(usage, Boolean(state.runtimeModel) && permit.binding.agent.runtimeId === "codex"));
+}
+/** Native inference can make progress between virtual governor boundaries. Stop on observed overage
+ * immediately; accounting still travels through the ordinary provider result or final drain. */
+export function assertWorkspaceRuntimeUsage(permit: WorkspaceRunPermit, pending: { input: number; output: number; cachedInput?: number }): void {
+  const state = stateOf(permit); state.assertLive();
+  const delta = runtimeUsageDelta(pending, permit.binding.agent.runtimeId === "codex");
+  if (!Number.isSafeInteger(pending.input) || !Number.isSafeInteger(pending.output) || pending.input < 0 || pending.output < 0
+    || state.usage.inputTokens + state.usage.outputTokens + delta.inputTokens! + pending.output > permit.binding.budget.maxTokens) {
+    throw new Error("Workspace native token telemetry safety ceiling reached");
+  }
+}
 /** Trusted Host composition may retain a long instruction reference before options are pinned. */
 export function assertWorkspaceRunContextCurrent(permit: WorkspaceRunPermit): void { stateOf(permit).assertLive(); }
 export function prepareWorkspaceRunHistory(permit: WorkspaceRunPermit, history: NeutralMsg[]): NeutralMsg[] {
@@ -376,8 +402,9 @@ export async function closeWorkspaceRunPermit(permit: WorkspaceRunPermit): Promi
   if (state.nativePolicy) {
     state.lease.setDraining(true);
     const policy = state.nativePolicy;
+    // A failed native teardown never releases the physical lease or silently reuses a resident.
     const { endWorkspaceNativePolicy } = await import("../agent-runtime/workspace-native-policy.js");
-    await endWorkspaceNativePolicy(permit, policy); await policy.close();
+    await endWorkspaceNativePolicy(permit, policy, { keepResidentRoot: false }); await policy.close();
     state.lease.setDraining(false);
   }
   state.lease.release();
@@ -393,22 +420,11 @@ export function workspaceRunRuntimeStages(permit: WorkspaceRunPermit): RuntimeSt
   const state = stateOf(permit); state.assertLive(); return state.runtimeStages;
 }
 
-/** Host-only scoped storage. Same public-layer contract used by native session receipts. */
-export function workspaceRuntimeStorage(permit: WorkspaceRunPermit): WorkspaceResourceStorage {
-  const state = stateOf(permit); state.assertLive(); return state.storage;
-}
-/** Native Pi tool batches are issued by the Host model bridge, never inferred from CLI success text. */
-export function recordWorkspacePiNativeCalls(permit: WorkspaceRunPermit, names: readonly string[]): void {
-  const state = stateOf(permit); state.assertLive();
-  const native = new Set(["read", "bash", "edit", "write"]);
-  if (!state.started || !state.nativePolicy || permit.binding.agent.runtimeId !== "pi" || names.some(name => !native.has(name)) || names.length > 256
-    || state.usage.toolCalls + names.length > permit.binding.budget.maxToolCalls) throw new Error("Workspace native Pi tool budget exhausted");
-  if (names.length) publishUsage(state, { toolCalls: names.length });
-}
-
+/** Host composition only. Serialized events and model tool inputs cannot install a policy. */
 export function attachWorkspaceNativePolicy(permit: WorkspaceRunPermit, policy: RuntimeExecutionPolicy): void {
   const state = stateOf(permit); state.assertLive();
   if (state.nativePolicy && state.nativePolicy !== policy) throw new Error("A native process already owns this attempt");
+  if (policy.runtimeId !== permit.binding.agent.runtimeId || policy.tier !== (permit.binding.agent.permissionTier ?? "controlled")) throw new Error("Native policy does not match the frozen runtime and permission tier");
   if (policy.workRoot !== state.cwd) throw new Error("Native working directory does not match the admitted project");
   state.nativePolicy = policy; state.nativeEvidence = undefined;
 }
@@ -417,6 +433,15 @@ export function workspaceRunNativeEvidence(permit: WorkspaceRunPermit): NativeWo
   if (state.nativePolicy) state.nativeEvidence = state.nativePolicy.collectWorkspaceEvidence() ?? undefined;
   return state.nativeEvidence ? structuredClone(state.nativeEvidence) : null;
 }
+export function publishWorkspaceNativeRisks(permit: WorkspaceRunPermit): void {
+  const state = stateOf(permit), policy = state.nativePolicy;
+  if (!policy) return;
+  const risks = policy.risks.map(row => ({ ...row }));
+  if (JSON.stringify(risks) !== JSON.stringify(state.nativeRisks)) {
+    state.nativeRisks = risks; state.onNativeRisks?.(risks);
+  }
+}
+/** Called before policy cleanup, including cancellation; collection never makes a retired permit live. */
 export function finishWorkspaceNativePolicy(permit: WorkspaceRunPermit, policy: RuntimeExecutionPolicy): void {
   const state = stateOf(permit);
   if (state.nativePolicy !== policy) return;
@@ -424,9 +449,11 @@ export function finishWorkspaceNativePolicy(permit: WorkspaceRunPermit, policy: 
   finally { state.nativePolicy = undefined; }
 }
 
-export function publishWorkspaceNativeRisks(permit: WorkspaceRunPermit): void {
-  const state = stateOf(permit), policy = state.nativePolicy;
-  if (!policy) return;
-  const risks = policy.risks.map(row => ({ ...row }));
-  if (JSON.stringify(risks) !== JSON.stringify(state.nativeRisks)) { state.nativeRisks = risks; state.onNativeRisks?.(risks); }
+/** Native Pi tool batches are issued by the Host model bridge, never inferred from CLI success text. */
+export function recordWorkspacePiNativeCalls(permit: WorkspaceRunPermit, names: readonly string[]): void {
+  const state = stateOf(permit); state.assertLive();
+  const native = new Set(["read", "bash", "edit", "write"]);
+  if (!state.started || !state.nativePolicy || permit.binding.agent.runtimeId !== "pi" || names.some(name => !native.has(name)) || names.length > 256
+    || state.usage.toolCalls + names.length > permit.binding.budget.maxToolCalls) throw new Error("Workspace native Pi tool budget exhausted");
+  if (names.length) publishUsage(state, { toolCalls: names.length });
 }

@@ -101,6 +101,12 @@ export class WorkspaceRuntimeInstaller {
   private readonly metadata = new Set<AbortController>();
   private readonly target: RuntimeTarget;
   private closed = false;
+  private readonly nativeResources = new Set<() => Promise<void>>();
+  /** Host-owned native sessions share this installer's lifetime, including non-Host harnesses. */
+  ownNativeResource(close: () => Promise<void>): void {
+    if (this.closed) throw new Error("Workspace runtime installer is closed");
+    this.nativeResources.add(close);
+  }
   constructor(private readonly storage: WorkspaceResourceStorage, private readonly options: {
     target?: RuntimeTarget;
     fixtureOrigin?: string;
@@ -270,6 +276,17 @@ export class WorkspaceRuntimeInstaller {
     const installed = this.state.read().entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
     if (!installed) return fail();
     return this.resolveUnproxied(runtimeId, installed.artifact.version, installed.artifact.sha256);
+  }
+  /** Host-attested directories, revalidated against the exact installed command and login selection. */
+  executionPolicyDirectories(runtimeId: "codex" | "claude" | "opencode",
+    launched: { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource }) {
+    const current = this.resolveBoundUnproxied(runtimeId);
+    if (current.command !== launched.command || current.loginSource !== launched.loginSource || current.env.HOME !== launched.env.HOME
+      || current.env.CODEX_HOME !== launched.env.CODEX_HOME || current.env.CLAUDE_CONFIG_DIR !== launched.env.CLAUDE_CONFIG_DIR) return fail();
+    const accountHome = this.accountHome(), home = current.env.HOME; if (!home) return fail();
+    const runtimeHome = runtimeId === "claude" ? current.env.CLAUDE_CONFIG_DIR ?? join(home, ".claude")
+      : runtimeId === "codex" ? current.env.CODEX_HOME ?? join(home, ".codex") : join(current.env.XDG_DATA_HOME ?? join(home, ".local/share"), "opencode");
+    return Object.freeze({ accountHome, runtimeHome, protectedStateRoots: Object.freeze([this.storage.runtimeProtectedStateRoot()]) });
   }
   /** Diagnostic metadata only: no login files, environment dump, paths or version probe. */
   failureContext(runtimeId: "codex" | "claude" | "opencode",
@@ -546,6 +563,7 @@ export class WorkspaceRuntimeInstaller {
   async close(): Promise<void> {
     this.closed = true; this.proposals.clear(); for (const operation of this.active.values()) operation.controller.abort();
     for (const controller of this.metadata) controller.abort();
+    await Promise.all([...this.nativeResources].map(close => close())); this.nativeResources.clear();
     // Own downloads have a finite deadline; callers can observe incomplete drain rather than delete locks.
     const deadline = Date.now() + 5000;
     while ((this.active.size || this.metadata.size) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));

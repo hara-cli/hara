@@ -23,10 +23,13 @@ export async function createWorkspaceMcpEndpoint(input: {
   assertCurrent(): void;
   tools(): readonly ToolSpec[];
   call(name: string, args: Record<string, unknown>): Promise<ToolResult>;
+  /** Host-owned process secret. Each endpoint still has an immutable attempt/lease closure. */
+  bearerToken?: string;
 }): Promise<WorkspaceMcpEndpoint> {
   input.assertCurrent();
   if (input.signal.aborted) throw new Error("Workspace MCP attempt ended");
-  let token = randomBytes(32).toString("hex"), closed = false, closing: Promise<void> | undefined;
+  if (input.bearerToken !== undefined && !/^[a-f0-9]{64}$/.test(input.bearerToken)) throw new Error("Invalid Workspace MCP bearer");
+  let token = input.bearerToken ?? randomBytes(32).toString("hex"), closed = false, closing: Promise<void> | undefined;
   const env: NodeJS.ProcessEnv = { [WORKSPACE_MCP_TOKEN_ENV]: token };
   const expected = Buffer.from("Bearer " + token);
   const transport = new StreamableHTTPServerTransport({
@@ -111,25 +114,28 @@ export function createRegisteredCliMcpTurn(input: {
   /** Host-only serialization for an embedded native RPC runtime with its own system prompt. */
   prompt?(args: TurnArgs): string;
   assertCurrent(): void;
-  launch(endpoint: WorkspaceMcpEndpoint, prompt: string, activity: () => void): Promise<ExternalCommandCaptureResult>;
+  bearerToken?: string;
+  decorateResult?(result: ToolResult, args: TurnArgs): ToolResult;
+  takeUsage?(): TurnResult["usage"];
+  launch(endpoint: WorkspaceMcpEndpoint, prompt: string, activity: () => void, args: TurnArgs): Promise<ExternalCommandCaptureResult>;
 }) {
   const stopped = new AbortController();
   const pending = new Map<string, PendingCall>(), queue: PendingCall[] = [];
   let endpoint: WorkspaceMcpEndpoint | undefined, physical: Promise<void> | undefined;
   let tools: readonly ToolSpec[] = [], finished: TurnResult | undefined, wake: (() => void) | undefined;
   let activity: (() => void) | undefined, closed = false, ended = false;
-  let closing: Promise<void> | undefined;
+  let closing: Promise<void> | undefined, deferredCompletion: PendingCall | undefined;
   const notify = () => { wake?.(); wake = undefined; };
-  const flush = (history: readonly NeutralMsg[]) => {
+  const flush = (history: readonly NeutralMsg[], args?: TurnArgs) => {
     for (const message of history) if (message.role === "tool") for (const result of message.results) {
       const call = pending.get(result.id);
-      if (call) { pending.delete(result.id); call.resolve(result); }
+      if (call) { pending.delete(result.id); call.resolve(args && input.decorateResult ? input.decorateResult(result, args) : result); }
     }
   };
   const close = (history: readonly NeutralMsg[] = []): Promise<void> => closing ??= (async () => {
     closed = true; flush(history); stopped.abort();
     for (const { call, resolve } of pending.values()) resolve({ id: call.id, name: call.name, content: "Error: Workspace attempt ended", isError: true });
-    pending.clear(); queue.length = 0; notify();
+    pending.clear(); queue.length = 0; deferredCompletion = undefined; notify();
     try { await endpoint?.close(); await physical; }
     finally { input.signal.removeEventListener("abort", onAbort); }
   })();
@@ -140,14 +146,20 @@ export function createRegisteredCliMcpTurn(input: {
     async turn(args: TurnArgs): Promise<TurnResult> {
       input.assertCurrent();
       if (closed || args.signal?.aborted) return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
-      tools = args.tools; activity = args.onActivity; flush(args.history);
+      tools = args.tools; activity = args.onActivity; flush(args.history, args);
       if (!physical) {
         endpoint = await createWorkspaceMcpEndpoint({ signal: AbortSignal.any([input.signal, stopped.signal]), assertCurrent: input.assertCurrent,
+          bearerToken: input.bearerToken,
           tools: () => tools, call(name, parameters) {
             input.assertCurrent();
-            if (closed || pending.size >= 16) throw new Error("Workspace MCP call limit reached");
-            if (input.deferNativeCompletion && name === "task_checkpoint" && parameters.done === true) {
-              return Promise.resolve({ id: randomUUID(), name, content: "The native run is still active. Finish your reply; Hara will verify completion after the native process settles and the protected process tree drains.", isError: true });
+            if (closed || finished || ended || pending.size >= 16) throw new Error("Workspace MCP call limit reached");
+            if (input.deferNativeCompletion && name === "task_checkpoint" && (parameters.done === true
+              || (parameters.completion as { state?: unknown } | undefined)?.state === "verified")) {
+              if (deferredCompletion) return Promise.resolve({ id: randomUUID(), name, content: "A completion proposal is already pending Host verification", isError: true });
+              const call = { id: randomUUID(), name, input: parameters };
+              deferredCompletion = { call, resolve() {} };
+              return Promise.resolve({ id: call.id, name, content: JSON.stringify({ completionDeferred: true, committed: false,
+                instruction: "Finish your reply. Hara verifies this proposal only after the native run settles and the protected process tree drains. This is not a successful completion receipt." }) });
             }
             return new Promise<ToolResult>(resolve => {
               const call = { id: randomUUID(), name, input: parameters };
@@ -162,7 +174,7 @@ export function createRegisteredCliMcpTurn(input: {
         }
         physical = (async () => {
           try {
-            const result = await input.launch(endpoint!, prompt, () => activity?.());
+            const result = await input.launch(endpoint!, prompt, () => activity?.(), args);
             if (!result.ok) finished = { text: "", toolUses: [], stop: "error",
               errorMsg: result.runtimeFailure ?? "registered Runtime failed (" + (result.errorCode ?? (result.timedOut ? "timeout" : "exit")) + "); no fallback was selected" };
             else if (input.jsonEvents === false) finished = { text: result.stdout.trim(), toolUses: [], stop: "end" };
@@ -183,16 +195,27 @@ export function createRegisteredCliMcpTurn(input: {
               finished = { text, toolUses: [], stop: "end", ...(usage ? { usage } : {}) };
             }
           } catch (error) { finished = { text: "", toolUses: [], stop: "error", errorMsg: runtimeProxyFailure(error) ?? "Native Agent Runtime launch failed; no fallback was selected" }; }
-          finally { notify(); }
+          finally {
+            if (!closed && finished && finished.stop !== "error" && deferredCompletion) {
+              pending.set(deferredCompletion.call.id, deferredCompletion); queue.push(deferredCompletion);
+            }
+            deferredCompletion = undefined; notify();
+          }
         })();
       }
       while (!closed) {
         input.assertCurrent();
         const next = queue.shift();
-        if (next) return { text: "", toolUses: [next.call], stop: "tool_use" };
-        if (finished) { const result = finished; finished = undefined; ended = true; return result; }
+        if (next) return { text: "", toolUses: [next.call], stop: "tool_use", ...(input.takeUsage ? { usage: input.takeUsage() } : {}) };
+        if (finished) { const result = finished; finished = undefined; ended = true;
+          return input.takeUsage ? { ...result, usage: input.takeUsage() } : result; }
         if (ended) return { text: "", toolUses: [], stop: "error", errorMsg: "Native CLI ended before the governed task completed; no automatic replay" };
-        await new Promise<void>(resolve => { wake = resolve; });
+        await new Promise<void>(resolve => {
+          const onAbort = () => { void close().catch(() => {}); settle(); };
+          const settle = () => { args.signal?.removeEventListener("abort", onAbort); resolve(); };
+          wake = settle;
+          if (args.signal?.aborted) onAbort(); else args.signal?.addEventListener("abort", onAbort, { once: true });
+        });
       }
       return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
     },

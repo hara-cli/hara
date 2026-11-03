@@ -156,3 +156,11 @@ test("recoverable run boundaries and an unspecified outcome retain a conditional
     assert.doesNotMatch(text, /task is blocked/u);
   }
 });
+
+test("native context pause directs an explicit new session instead of continuation or failure", () => {
+  for (const language of ["en", "zh-Hans"]) {
+    const text = pausedCloseoutText(receipt(["partial receipt"]), [], language, { status: "halted", stopReason: "native_context_limit" });
+    assert.match(text, /The task is paused|任务已暂停/u); assert.match(text, /Open a new session|开新会话/u);
+    assert.doesNotMatch(text, /\/continue|task is blocked|发生错误/u);
+  }
+});

@@ -1,7 +1,7 @@
 import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment, TurnArgs, TurnResult } from "../providers/types.js";
 import { isTaskRuntimeBinding } from "../agent-runtime/bindings.js";
 import { WORKSPACE_AGENT_EXECUTION_PENDING } from "../workspace/agent-binding.js";
-import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, workspaceRunQuestion, workspaceRunHasPendingInteraction, workspaceRunBeginToolBatch, workspaceRunAsk, workspaceRunAsyncAnswers, type WorkspaceRunPermit } from "../workspace/execution.js";
+import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, workspaceRunQuestion, workspaceRunHasPendingInteraction, workspaceRunBeginToolBatch, workspaceRunAsk, workspaceRunAsyncAnswers, workspaceRunNativeEvidence, type WorkspaceRunPermit } from "../workspace/execution.js";
 import { createToolImageStore, redactOwnedToolImageText } from "../tools/tool-images.js";
 import { redactOwnedToolImageValue } from "../security/tool-media-redaction.js";
 import { createComputerRunScope, closeComputerRunScope } from "../tools/computer-run.js";
@@ -82,7 +82,7 @@ import { coreDeferredToolsForHistory } from "./core-capabilities.js";
 import { setTurnPhase } from "./phase.js";
 import { AssistantTextSanitizer, sanitizeAssistantText } from "./assistant-text.js";
 import { completionCloseoutText, pausedCloseoutText } from "./task-closeout.js";
-import { CompletionEvidenceLedger, completionEvidenceScope } from "./completion-evidence.js";
+import { CompletionEvidenceLedger, completionEvidenceScope, nativeEvidenceAllowedForTask } from "./completion-evidence.js";
 import { ReadOnlyAnswerTrace } from "./readonly-light.js";
 import { engineTaskBrief, simpleChangeObjective, WorkspaceChangeTrace } from "./governance-c-lite.js";
 import { recordTouch } from "./touched.js";
@@ -815,7 +815,7 @@ export interface RunOutcome {
   progress?: RunProgressEvent;
 }
 
-export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop" | "no_progress" | "strategy_stall" | "task_round_budget" | "completion_verification";
+export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop" | "no_progress" | "strategy_stall" | "task_round_budget" | "completion_verification" | "native_context_limit";
 
 export interface RunProgressEvent extends ProgressState {
   rounds: number;
@@ -1388,6 +1388,11 @@ async function runAgentInner(
   const completionEvidence = new CompletionEvidenceLedger();
   const readOnlyAnswerTrace = opts.workspaceRun && opts.taskIntake ? new ReadOnlyAnswerTrace() : null;
   const workspaceChangeTrace = opts.workspaceRun && opts.taskIntake ? new WorkspaceChangeTrace() : null;
+  const nativeEvidence = () => {
+    if (!opts.workspaceRun) return null;
+    try { return workspaceRunNativeEvidence(opts.workspaceRun); } catch { return null; }
+  };
+  const changeEvidence = () => workspaceChangeTrace?.evidence(nativeEvidenceAllowedForTask(intakeTask) ? nativeEvidence() : null);
   let engineBriefCreated = false;
   let taskStateDirty = false;
   const syncIntakeTask = (): void => {
@@ -1562,9 +1567,10 @@ async function runAgentInner(
                     properties: {
                       acceptance_index: { type: "integer", minimum: 0, maximum: 11 },
                       evidence: { type: "string", maxLength: 400 },
-                      tool_call_ids: { type: "array", minItems: 1, maxItems: 4, items: { type: "string" } },
+                      native_evidence_ids: { type: "array", items: { type: "string" }, maxItems: 4, description: "Current Host workspace_native_evidence IDs, scoped to this attempt." },
+                        tool_call_ids: { type: "array", minItems: 1, maxItems: 4, items: { type: "string" } },
                     },
-                    required: ["acceptance_index", "evidence", "tool_call_ids"],
+                    required: ["acceptance_index", "evidence"],
                   },
                 },
                 waiting_for: {
@@ -1627,9 +1633,10 @@ async function runAgentInner(
           const explicitChecks = (input as { completion?: { checks?: unknown } } | null)?.completion?.checks;
           if (opts.workspaceRun && intakeTask?.brief?.intent === "change"
             && (input as { completion?: { state?: unknown } } | null)?.completion?.state === "verified"
-            && !Array.isArray(explicitChecks) && !workspaceChangeTrace?.evidence()) {
+            && !Array.isArray(explicitChecks) && !changeEvidence()) {
             return "Error: task checkpoint rejected — no verified write, create, rename or delegation receipt was observed";
           }
+          completionEvidence.observeNative(completionEvidenceScope(intakeTask), nativeEvidence());
           const boundEvidence = completionEvidence.bind(intakeTask, input);
           if (!boundEvidence.ok) return `Error: task checkpoint rejected — ${boundEvidence.reason}`;
           input = boundEvidence.input;
@@ -2359,6 +2366,9 @@ async function runAgentInner(
     // A provider may ignore AbortSignal and return a perfectly valid-looking tool_use after cancellation.
     // The original run signal is authoritative: do not append/approve/execute any late response.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return stoppedOutcome();
+    // Host-owned native transport status, not a provider/model-authored success or a retry request.
+    if (opts.workspaceRun?.binding.agent.runtimeId === "codex" && r.errorMetadata?.code === "native_context_limit")
+      return { status: "halted", stopReason: "native_context_limit" };
     const responseCallIds = new Set<string>();
     const invalidToolIdentity = r.toolUses.some((toolUse) => {
       const id = toolUse.id;
@@ -2601,7 +2611,7 @@ async function runAgentInner(
         try { pendingInteraction = workspaceRunHasPendingInteraction(opts.workspaceRun); } catch { /* fail closed */ }
         const evidence = !pendingInteraction && !hasPendingTaskSteering(intakeTask)
           && !currentTodos(ctx.todoScope).some(todo => todo.status !== "done")
-          ? workspaceChangeTrace.evidence() : null;
+          ? changeEvidence() : null;
         if (evidence) {
           const applied = applyTaskCheckpoint(intakeTask, { completion: { state: "verified", evidence } });
           if (applied.ok) {

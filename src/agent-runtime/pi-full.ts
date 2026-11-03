@@ -18,8 +18,8 @@ import { createRegisteredCliMcpTurn, WORKSPACE_MCP_TOKEN_ENV } from "./registere
 import { piNativeModelTools, PI_NATIVE_TOOL_NAMES } from "./pi-native-tools.js";
 import { PiRpcProcess, type PiProtectedProcessBoundary } from "./pi-rpc-process.js";
 import { PiNativeSessionStore } from "./pi-native-session.js";
-import { newPiWorkspaceNativePolicy, endWorkspaceNativePolicy } from "./workspace-native-policy.js";
-import type { RuntimeExecutionPolicy } from "./execution-policy.js";
+import { beginWorkspaceNativePolicy, endWorkspaceNativePolicy } from "./workspace-native-policy.js";
+import { createRuntimeExecutionPolicy, workspaceRunPermissionTier, type RuntimeExecutionPolicy } from "./execution-policy.js";
 import { classifyRuntimeFailure, type RuntimeFailureKind } from "./failure-diagnostics.js";
 import { runtimeFailureTracker } from "./failure-tracker.js";
 import { runtimeProxyFailure } from "../security/runtime-proxy.js";
@@ -45,6 +45,13 @@ function writeConfig(root: string, name: string, value: unknown): void {
   const file = join(root, "agent", name), temporary = file + ".host-next";
   writeFileSync(temporary, JSON.stringify(value) + "\n", { mode: 0o600, flag: "wx" });
   renameSync(temporary, file);
+}
+
+function newPiWorkspaceNativePolicy(permit: NonNullable<RunOpts["workspaceRun"]>, accountHome: string, runtimeHome: string): RuntimeExecutionPolicy {
+  const policy = createRuntimeExecutionPolicy({ runtimeId: "pi", tier: workspaceRunPermissionTier(permit),
+    accountHome, runtimeHome, workRoot: permit.binding.project.root,
+    protectedStateRoots: [workspaceRuntimeStorage(permit).run(() => workspaceStateHome())], lifetime: "attempt", loginSource: "isolated" });
+  try { beginWorkspaceNativePolicy(permit, policy); return policy; } catch (error) { void policy.close(); throw error; }
 }
 
 /** Native tools remain in Pi. The only governor yields are real Hara MCP calls. */
