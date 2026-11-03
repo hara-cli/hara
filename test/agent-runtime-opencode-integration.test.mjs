@@ -30,7 +30,7 @@ if (process.argv[2] === "--version") { process.stdout.write("opencode 1.2.3\\n")
 if (process.argv[2] === "models") { process.stdout.write("fixture/model\\n"); process.exit(0); }
 if (process.argv[2] !== "run") process.exit(2);
 const config = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT || "{}");
-if (config.permission["*"] !== "deny" || config.tools.bash !== false || config.tools.write !== false ||
+if (config.permission["*"] !== "deny" || config.tools.bash !== ${JSON.stringify(output.full)} || config.tools.write !== ${JSON.stringify(output.full)} ||
     !config.mcp?.hara?.headers?.Authorization || process.env.HOME !== ${JSON.stringify(output.home)}) process.exit(3);
 fs.writeFileSync(${JSON.stringify(output.argv)}, JSON.stringify({ args: process.argv.slice(2), home: process.env.HOME,
   config: { permission: config.permission, tools: config.tools, mcpUrl: config.mcp.hara.url } }));
@@ -63,15 +63,15 @@ const send = async (method, params, session) => {
   fs.writeFileSync(path, script, { mode: 0o755 });
 }
 
-for (const kind of ["main", "colleague"]) test(`OpenCode ${kind} calls agent_list through the governed Workspace MCP bridge`, async () => {
+for (const permissionTier of ["full-protected", "controlled"]) for (const kind of ["main", "colleague"]) test(`OpenCode ${kind} ${permissionTier} calls agent_list through the governed Workspace MCP bridge`, async () => {
   const data = root(), account = root(), home = join(data, "home"), project = root();
   fs.mkdirSync(home, { recursive: true });
   const catalog = new LocalWorkspaceCatalog(home), row = catalog.create("Fixture", 1);
   const storage = new WorkspaceResourceStorage(home, row.scope); storage.initialize();
-  const command = join(account, ".local/bin/opencode"), argv = join(account, "argv.json");
-  fakeOpenCode(command, { argv, home: account });
+  const command = join(account, ".local/share/opencode/fixture-bin/opencode"), argv = command + ".argv.json";
+  fakeOpenCode(command, { argv, home: account, full: permissionTier === "full-protected" });
   const installer = new WorkspaceRuntimeInstaller(storage, { accountHome: () => account,
-    discovery: { home: account, path: `${dirname(process.execPath)}:/usr/bin:/bin`, systemBins: [],
+    discovery: { home: account, path: `${dirname(command)}:${dirname(process.execPath)}:/usr/bin:/bin`, systemBins: [],
       run: async (_command, args) => args[0] === "-lic" ? null : "opencode 1.2.3" } });
   const resources = new WorkspaceResources(home, row.scope, { runtimeInstaller: installer }); resources.initialize();
   const main = resources.agents.initializeMain();
@@ -84,7 +84,8 @@ for (const kind of ["main", "colleague"]) test(`OpenCode ${kind} calls agent_lis
   await models.select("opencode", "fixture/model", 0);
   assert.equal(resources.agents.runtimeOptions().find(option => option.id === "opencode").available, true);
   const agent = kind === "main" ? main : resources.agents.create({ username: "tester", profile: { displayName: "Tester" } }, resources.agents.list().revision);
-  const selected = resources.agents.setRuntime(agent.agentId, "opencode", agent.configRevision, agent.agentEpoch);
+  let selected = resources.agents.setRuntime(agent.agentId, "opencode", agent.configRevision, agent.agentEpoch);
+  selected = resources.agents.setPermissionTier(agent.agentId, permissionTier, selected.configRevision, selected.agentEpoch);
   const task = resources.agents.bindTask(createTaskExecution("List colleagues", randomUUID()), selected.agentId, selected.configRevision, selected.agentEpoch);
   const connections = new WorkspaceSecureConnections(storage, new MemoryCredentialVault());
   connections.add({ label: "Fixture", provider: "openai", baseURL: "http://127.0.0.1:1/v1", apiKey: "fixture", defaultModel: "fixture" }, 0);
@@ -119,6 +120,6 @@ for (const kind of ["main", "colleague"]) test(`OpenCode ${kind} calls agent_lis
     assert(launch.args.includes("fixture/model"));
     assert(!launch.args.includes("--variant") && !launch.args.includes("--session"));
     assert.equal(launch.config.permission.hara_agent_list, "allow");
-    for (const name of ["edit", "write", "bash"]) assert.equal(launch.config.tools[name], false);
+    for (const name of ["edit", "write", "bash"]) assert.equal(launch.config.tools[name], permissionTier === "full-protected");
   } finally { controller.abort(); await closeWorkspaceRunPermit(permit); await installer.close(); }
 });

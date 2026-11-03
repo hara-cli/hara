@@ -7,10 +7,10 @@ const starts = f => f.native().filter(row => ["thread/start", "thread/resume"].i
 async function exchange(f, text) { await f.send(text); return until(f.read, done); }
 
 test("Host restart resumes the saved Codex thread in a new process without replaying the prior message", async t => {
-  const f = await cliMcpFixture(t, "reply");
-  await exchange(f, "S3-BEFORE-RESTART"); const first = f.meta();
+  const f = await cliMcpFixture(t, "list");
+  await exchange(f, "List current colleagues? S3-BEFORE-RESTART"); const first = f.meta();
   f.mode("usage-reset"); await f.restart();
-  const view = await exchange(f, "S3-AFTER-RESTART");
+  const view = await exchange(f, "List current colleagues again? S3-AFTER-RESTART");
   assert.equal(view.conversation.state, "completed"); const resumed = starts(f).at(-1);
   assert.equal(resumed.method, "thread/resume"); assert.notEqual(first.pid, resumed.pid);
   assert.notEqual(first.tokenFingerprint, f.meta().tokenFingerprint);
@@ -19,10 +19,12 @@ test("Host restart resumes the saved Codex thread in a new process without repla
 });
 
 test("resume failure preserves history, reports explicit failure, and never starts a replacement thread or exec", async t => {
-  const f = await cliMcpFixture(t, "reply"); await exchange(f, "First hello.");
-  f.mode("resume-fail"); const view = await exchange(f, "Second hello.");
+  const f = await cliMcpFixture(t, "list"); await exchange(f, "List current colleagues?");
+  f.mode("resume-fail"); const view = await exchange(f, "List current colleagues again?");
   assert.equal(view.conversation.state, "blocked");
   assert.equal(starts(f).filter(row => row.method === "thread/start").length, 1);
   assert.equal(f.native().filter(row => row.method === "turn/start").length, 1);
-  assert.match(JSON.stringify(view.conversation), /codex_resume_failed_history_preserved|no fallback/);
+  assert.equal(view.conversation.nativeSession.status, "recovery_needed");
+  assert.match(view.conversation.blockReason, /hara_runtime_failure_v1=/);
+  assert.doesNotMatch(view.conversation.blockReason, /PRIVATE_ACCOUNT_DETAIL/);
 });
