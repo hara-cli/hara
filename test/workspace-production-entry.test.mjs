@@ -28,7 +28,7 @@ test("formal six-step Host flow uses an explicit mock Provider; no DEV flags, la
     assert.throws(() => host.configureSynthetic(id, 0), /explicit isolated Lab/);
     assert.throws(() => host.start("client", id, main, "hello", randomUUID()), /connection/); assert.equal(host.snapshot(id).conversation.usage.modelCalls, 0);
     host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
-    const hello = host.start("client", id, main, "hello", randomUUID()); await host.wait(hello.runId); assert.equal(host.snapshot(id).conversation.state, "completed");
+    const hello = host.start("client", id, main, "hello", randomUUID()); await host.wait(hello.runId); assert.equal(host.snapshot(id).conversation.state, "blocked");
     const approvalStarted = Date.now();
     const { job: create, card } = await waitForHostApproval({ events, signal: t.signal,
       start: () => host.start("client", id, main, "建立 Pi 同事 Coder", randomUUID()),
@@ -133,7 +133,7 @@ test("formal protocol advertises Workspace capabilities and rejects Lab configur
     const message = raw => { const value = JSON.parse(String(raw)); if (value.id === id) { clearTimeout(timer); socket.off("message", message); value.error ? reject(new Error(value.error.message)) : resolve(value.result); } };
     socket.on("message", message); socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params })); });
   try {
-    const init = await request("initialize", { token: handle.token }); assert.deepEqual(init.capabilities, ["workspace.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1","workspace.colleague-schedules.v1","workspace.runtime-login-effort.v1","workspace.connection-models.v1"]); assert.equal(init.executionMode, "workspace");
+    const init = await request("initialize", { token: handle.token }); assert.deepEqual(init.capabilities, ["workspace.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1","workspace.channel-pass.v1","workspace.channel-queue.v1","workspace.channel-autonomy.v1","workspace.colleague-schedules.v1","workspace.runtime-login-effort.v1","workspace.runtime-proxy.v1","workspace.runtime-stage-events.v1","workspace.connection-models.v1"]); assert.equal(init.executionMode, "workspace");
     const workspace = await request("workspace.create", { label: "P", expectedRevision: init.workspace.revision }), scope = { workspaceId: workspace.workspaceId, expectedGeneration: workspace.resourceGeneration };
     await assert.rejects(request("workspace.connection.synthetic", { ...scope, expectedRevision: 0 }), /Lab/);
     await assert.rejects(request("workspace.runtime.propose", { ...scope, runtimeId: "codex", url: "http://127.0.0.1:9/tool" }), /unsupported/);
@@ -191,7 +191,7 @@ test("formal default factory sends exactly the scoped fake credential/model to a
     const workspace = host.createWorkspace("Mock", host.list().revision);
     host.configureConnection(workspace.workspaceId, { label: "Mock only", provider: "openai", baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: "local-fake-workspace-credential", defaultModel: "local-mock-model" }, 0);
     const run = host.start("client", workspace.workspaceId, workspace.selectedAgentId, "hello", randomUUID()); await host.wait(run.runId);
-    assert.equal(host.snapshot(workspace.workspaceId).conversation.state, "completed"); assert.equal(received.length, 1); assert.equal(received[0].auth, "Bearer local-fake-workspace-credential"); assert.equal(received[0].body.model, "local-mock-model");
+    assert.equal(host.snapshot(workspace.workspaceId).conversation.state, "blocked"); assert.equal(received.length, 1); assert.equal(received[0].auth, "Bearer local-fake-workspace-credential"); assert.equal(received[0].body.model, "local-mock-model");
     assert.equal(JSON.stringify(host.snapshot(workspace.workspaceId)).includes("local-fake-workspace-credential"), false);
   } finally { await host.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 });

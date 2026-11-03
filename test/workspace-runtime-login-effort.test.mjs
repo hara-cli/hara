@@ -308,7 +308,8 @@ test("the main Hara bot uses the same detect/register/bind/model/effort path as 
       if (["completed", "blocked"].includes(current.conversation.state)) { finished = current; break; }
       await new Promise(resolve => setTimeout(resolve, 100));
     }
-    assert.equal(finished?.conversation.state, "completed", "registered Codex finishes the main-bot turn");
+    assert.equal(finished?.conversation.state, "blocked", "registered Codex returns an unverified greeting without completing the task");
+    assert.equal(finished?.conversation.taskState, "paused");
     assert.deepEqual(fs.readFileSync(`${command}.home`, "utf8").trim().split("\n"), [host, "login=present"]);
     assert.equal(fs.readFileSync(`${command}.codexhome`, "utf8").trim(), "unset");
     const argv = fs.readFileSync(`${command}.argv`, "utf8").trim().split("\n");

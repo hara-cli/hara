@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { sameWorkspaceResourceBinding, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { deepFreeze, exact, plain, positive, text, UUID, WorkspaceJsonState } from "./local-state.js";
 import { isWorkspaceFileCredential, resolveWorkspaceFileCredential, type WorkspaceFileCredential } from "./file-credential.js";
+import { connectionModelEfforts } from "./connection-models.js";
+import { defaultEffortForLevels } from "./default-effort.js";
 
 export interface ScopedConnection {
   id: string;
@@ -89,7 +91,10 @@ export class WorkspaceConnectionStoreV2 {
   add(value: ScopedConnectionInput, expectedRevision: number): ScopedConnectionView {
     const checked = input(value), id = `mc_${randomUUID()}`;
     const next = this.state.update(expectedRevision, state => ({ ...state, defaultConnectionId: state.defaultConnectionId ?? id,
-      connections: [...state.connections, { ...checked, id, credentialGeneration: `gen_${randomUUID()}`, revision: 1, status: "active" }] }));
+      connections: [...state.connections, { ...checked,
+        defaultReasoning: Object.hasOwn(value, "defaultReasoning") ? checked.defaultReasoning ?? null
+          : defaultEffortForLevels(connectionModelEfforts(checked, checked.defaultModel)) as ScopedConnection["defaultReasoning"],
+        id, credentialGeneration: `gen_${randomUUID()}`, revision: 1, status: "active" }] }));
     const { apiKey: _key, credentialFile: _reference, baseURL: _url, ...safe } = next.connections.find(row => row.id === id)!;
     return safe;
   }
@@ -99,7 +104,8 @@ export class WorkspaceConnectionStoreV2 {
       const row = state.connections.find(row => row.id === id && row.status === "active");
       if (!row || row.revision >= Number.MAX_SAFE_INTEGER) return fail();
       const defaultReasoning = Object.hasOwn(value, "defaultReasoning") ? checked.defaultReasoning ?? null
-        : checked.defaultModel === row.defaultModel ? row.defaultReasoning ?? null : null;
+        : checked.defaultModel === row.defaultModel ? row.defaultReasoning ?? null
+          : defaultEffortForLevels(connectionModelEfforts(checked, checked.defaultModel)) as ScopedConnection["defaultReasoning"];
       delete row.apiKey; delete row.credentialFile;
       Object.assign(row, checked, { defaultReasoning, credentialGeneration: `gen_${randomUUID()}`, revision: row.revision + 1 });
       return state;
@@ -118,7 +124,11 @@ export class WorkspaceConnectionStoreV2 {
     this.state.update(expectedRevision, state => {
       const row = state.connections.find(row => row.id === id && row.status === "active");
       if (!row || modelId !== undefined && !text(modelId)) return fail();
-      if (modelId !== undefined) { row.defaultModel = modelId; row.defaultReasoning = effort ?? null; }
+      if (modelId !== undefined) {
+        const nextEffort = effort === undefined ? (row.defaultModel === modelId ? row.defaultReasoning ?? null
+          : defaultEffortForLevels(connectionModelEfforts(row, modelId)) as ScopedConnection["defaultReasoning"]) : effort;
+        row.defaultModel = modelId; row.defaultReasoning = nextEffort;
+      }
       state.defaultConnectionId = id; return state;
     });
   }

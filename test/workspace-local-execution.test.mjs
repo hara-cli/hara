@@ -104,7 +104,7 @@ test("shared governor still requires intake, observed work and final receipt for
  ];
  const a=fixture(async(_args,n)=>{assert.ok(n<=4);return steps[n-1];},[write,verify]);project=a.project;
  try{const history=[{role:"user",content:"Create hello.md in the approved project and verify it."}],result=await runConfiguredAgent(history,a.options);
-  assert.equal(result.status,"completed");assert.equal(writes,1);assert.equal(a.requests,4);
+  assert.equal(result.status,"completed",result.error);assert.equal(writes,1);assert.equal(a.requests,4);
   assert.equal(finishTaskExecution(a.task,result).status,"completed");assert.equal(history.at(-1).text,"hello.md is ready and verified.");
  }finally{await a.close();}
 });

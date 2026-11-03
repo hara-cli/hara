@@ -1,14 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import type { RuntimeFailureContext } from "../agent-runtime/failure-diagnostics.js";
 import { userInfo } from "node:os";
-import { join, dirname, isAbsolute } from "node:path";
+import { join, dirname, isAbsolute, resolve } from "node:path";
 import { WorkspaceJsonState, exact, plain, UUID } from "./local-state.js";
 import { sameWorkspaceResourceBinding, workspaceResourceDirectory, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { OPTIONAL_RUNTIMES, RUNTIME_DOWNLOAD_HOSTS, RUNTIME_LABELS, resolveOfficialRuntimeArtifact } from "./runtime-catalog.js";
 import { runtimeArchiveMember } from "./runtime-archive.js";
+import { WorkspaceRuntimeProxy } from "./runtime-proxy.js";
 import { validOpenCodeNativeHeader } from "../coding/bundled-opencode.js";
 import { detectInstalledRuntimes, inspectLocalRuntime, type DetectionOptions, type DetectedRuntime } from "./runtime-detect.js";
+import { WorkspaceRuntimeVersionStore, projectRuntimeVersionStatus, type RuntimeVersionCurrent } from "./runtime-version-history.js";
 
 export type OptionalRuntimeId = "opencode" | "codex" | "claude" | "agy";
 export interface RuntimeTarget { platform: NodeJS.Platform; arch: string }
@@ -87,6 +90,7 @@ function parseLoginSources(value: unknown): RuntimeLoginBinding[] {
 /** Workspace-bound installation registry, NOT a claim that a general-Agent driver is implemented.
  * Host-only fixture resolver/fetch policy cannot be supplied by RPC, model tools or downloaded metadata. */
 export class WorkspaceRuntimeInstaller {
+  readonly proxy: WorkspaceRuntimeProxy;
   private readonly state: WorkspaceJsonState<InstallState>;
   private readonly locals: WorkspaceJsonState<LocalState>;
   private detected: DetectedRuntime[] = [];
@@ -106,6 +110,7 @@ export class WorkspaceRuntimeInstaller {
     /** Test-only OS account home seam; production always calls userInfo().homedir. */
     accountHome?: () => string;
   } = {}) {
+    this.proxy = new WorkspaceRuntimeProxy(storage);
     this.target = Object.freeze({ platform: options.target?.platform ?? process.platform, arch: options.target?.arch ?? process.arch });
     if (options.fixtureOrigin) { const url = new URL(options.fixtureOrigin); if (url.origin !== options.fixtureOrigin || url.protocol !== "http:" || url.hostname !== "127.0.0.1") fail(); }
     const binding = () => this.state.binding();
@@ -228,7 +233,7 @@ export class WorkspaceRuntimeInstaller {
       DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0",
     };
   }
-  resolveLocal(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
+  private resolveLocalUnproxied(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
     const row = this.locals.read().entries.find(row => row.runtimeId === runtimeId), checked = row && inspectLocalRuntime(row.path, true);
     if (!row || !checked || checked.realPath !== row.realPath || checked.fingerprint !== row.fingerprint) return fail();
     if (runtimeId === "agy") return { command: row.path, env: { HOME: this.options.discovery?.home ?? userInfo().homedir,
@@ -242,11 +247,42 @@ export class WorkspaceRuntimeInstaller {
       CLAUDE_CONFIG_DIR: join(privateHome, ".claude"), PATH: `${dirname(row.path)}:${this.options.discovery?.path ?? "/usr/bin:/bin:/usr/sbin:/sbin"}`,
       DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" }, loginSource };
   }
-  resolveBound(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
-    if (this.locals.read().entries.some(row => row.runtimeId === runtimeId)) return this.resolveLocal(runtimeId);
+  resolveLocal(runtimeId: OptionalRuntimeId) {
+    const resolved = this.resolveLocalUnproxied(runtimeId);
+    return { ...resolved, env: this.proxy.apply(resolved.env) };
+  }
+  /** Check only an explicit Workspace proxy, then revalidate the registered binary at physical launch. */
+  async prepareBound(runtimeId: OptionalRuntimeId, signal?: AbortSignal) {
+    const checked = await this.proxy.check(signal), resolved = this.resolveBoundUnproxied(runtimeId);
+    return { ...resolved, env: this.proxy.applyChecked(resolved.env, checked), proxyUrl: checked.proxyUrl };
+  }
+  resolveBound(runtimeId: OptionalRuntimeId) {
+    const resolved = this.resolveBoundUnproxied(runtimeId);
+    return { ...resolved, env: this.proxy.apply(resolved.env) };
+  }
+  private resolveBoundUnproxied(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
+    if (this.locals.read().entries.some(row => row.runtimeId === runtimeId)) return this.resolveLocalUnproxied(runtimeId);
     const installed = this.state.read().entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
     if (!installed) return fail();
-    return this.resolve(runtimeId, installed.artifact.version, installed.artifact.sha256);
+    return this.resolveUnproxied(runtimeId, installed.artifact.version, installed.artifact.sha256);
+  }
+  /** Diagnostic metadata only: no login files, environment dump, paths or version probe. */
+  failureContext(runtimeId: "codex" | "claude" | "opencode",
+    launched?: { env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource }): RuntimeFailureContext {
+    let version: string | null = null, loginSource: RuntimeFailureContext["loginSource"] = "unknown";
+    try {
+      const local = this.locals.read().entries.find(row => row.runtimeId === runtimeId);
+      version = local?.version ?? this.state.read().entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1)?.artifact.version ?? null;
+      loginSource = launched?.loginSource ?? this.loginSource(runtimeId);
+    } catch { /* unavailable metadata is unknown, never proof of a missing login */ }
+    let homeMatchesAccount: boolean | null = null;
+    if (launched?.env.HOME) {
+      try {
+        const comparable = (path: string) => process.platform === "win32" ? realpathSync(resolve(path)).toLowerCase() : realpathSync(resolve(path));
+        homeMatchesAccount = comparable(launched.env.HOME) === comparable(this.accountHome());
+      } catch { /* account lookup failure is not a mismatched home */ }
+    }
+    return { runtime: runtimeId, version, loginSource, homeMatchesAccount };
   }
   /**
    * Read-only snapshot of the host's own Codex model cache, only while this binding launches with the
@@ -414,8 +450,47 @@ export class WorkspaceRuntimeInstaller {
       operation.state = "registered";
     } catch { operation.state = operation.controller.signal.aborted ? "cancelled" : "failed"; }
   }
+  /** Capture the already trusted executable at the physical launch. This closure is Host-only
+   * diagnostic bookkeeping; it cannot register a binary or turn a discovered version into trust. */
+  captureSuccessfulUse(runtimeId: OptionalRuntimeId, command: string): () => void {
+    let before: ReturnType<WorkspaceRuntimeInstaller["boundVersionIdentity"]> = null;
+    try { before = this.boundVersionIdentity(runtimeId); } catch { /* optional history */ }
+    if (!before || before.command !== command) return () => {};
+    const captured = before;
+    return () => {
+      if (this.closed) return;
+      try {
+        const current = this.boundVersionIdentity(runtimeId);
+        if (!current || current.command !== captured.command || current.realPath !== captured.realPath
+          || current.fingerprint !== captured.fingerprint || current.version !== captured.version) return;
+        new WorkspaceRuntimeVersionStore(this.storage).recordSuccessfulUse(runtimeId, captured.version, captured.fingerprint);
+      } catch { /* Damaged/stale history is preserved and never changes an execution result. */ }
+    };
+  }
+  private boundVersionIdentity(runtimeId: OptionalRuntimeId): { command: string; realPath: string; version: string | null; fingerprint: string } | null {
+    if (!optionalRuntimeId(runtimeId)) return null;
+    const version = (value: string) => value === value.trim() && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(value) ? value : null;
+    const local = this.locals.read().entries.find(row => row.runtimeId === runtimeId);
+    if (local) {
+      const checked = inspectLocalRuntime(local.path, true);
+      if (!checked || checked.realPath !== local.realPath || checked.fingerprint !== local.fingerprint) return null;
+      return { command: local.path, realPath: checked.realPath, version: version(local.version), fingerprint: checked.fingerprint };
+    }
+    const installed = this.state.read().entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
+    const checked = installed && this.inspect(installed.artifact, installed);
+    return installed && checked ? { command: checked.path, realPath: checked.path,
+      version: version(installed.artifact.version), fingerprint: installed.executableSha256 } : null;
+  }
+  private versionProjection() {
+    let history: ReturnType<WorkspaceRuntimeVersionStore["list"]> | null;
+    try { history = new WorkspaceRuntimeVersionStore(this.storage).list(); } catch { history = null; }
+    return (runtimeId: OptionalRuntimeId, current: RuntimeVersionCurrent) => {
+      const projected = projectRuntimeVersionStatus(history?.find(row => row.runtimeId === runtimeId) ?? null, current);
+      return history === null ? { ...projected, change: "unknown" as const, compatibility: "unknown" as const } : projected;
+    };
+  }
   list() {
-    const value = this.state.read(), locals = this.locals.read();
+    const value = this.state.read(), locals = this.locals.read(), versionStatus = this.versionProjection();
     // Local registrations win over an older downloaded install, so their recorded source is the
     // effective one; merge in that same order instead of letting a stale record shadow it.
     const loginSources = [...locals.loginSources, ...value.loginSources.filter(row => !locals.loginSources.some(prior => prior.runtimeId === row.runtimeId))];
@@ -423,19 +498,31 @@ export class WorkspaceRuntimeInstaller {
       const local = locals.entries.find(row => row.runtimeId === runtimeId), detected = this.detected.find(row => row.runtimeId === runtimeId);
       const loginSource = loginSources.find(row => row.runtimeId === runtimeId)?.source ?? "isolated";
       if (local || detected) {
-        const selected = local ?? detected!, inspected = inspectLocalRuntime(selected.path);
-        const valid = Boolean(inspected && inspected.realPath === selected.realPath && inspected.fingerprint === selected.fingerprint);
-        return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: valid, registered: Boolean(local && valid), version: selected.version,
+        const localCheck = local && inspectLocalRuntime(local.path);
+        const registered = Boolean(local && localCheck && localCheck.realPath === local.realPath && localCheck.fingerprint === local.fingerprint);
+        const detectedCheck = detected && inspectLocalRuntime(detected.path);
+        const discovered = Boolean(detected && detectedCheck && detectedCheck.realPath === detected.realPath && detectedCheck.fingerprint === detected.fingerprint);
+        // A newly discovered replacement may be explained/confirmed, but the old binding still
+        // refuses it until registerLocal receives a new explicit human confirmation.
+        const selected = registered ? local! : discovered ? detected! : local ?? detected!;
+        const inspected = registered ? localCheck : discovered ? detectedCheck : localCheck ?? detectedCheck;
+        const valid = registered || discovered, version = valid ? selected.version : null;
+        return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: valid, registered, version,
           path: selected.path, fingerprint: valid ? selected.fingerprint : null, source: selected.source, loginSource,
-          generalAgentDriverAvailable: Boolean(local && valid && (runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode" && loginSource === "host")), state: valid ? local ? "local_registered" : "detected" : "integrity_failed" };
+          versionStatus: versionStatus(runtimeId, { version, fingerprint: inspected?.fingerprint ?? null,
+            registered, requiresRetrust: !registered && Boolean(local || discovered) }),
+          generalAgentDriverAvailable: Boolean(registered && (runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode" && loginSource === "host")), state: valid ? registered ? "local_registered" : "detected" : "integrity_failed" };
       }
       const installed = value.entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
       let verified = false; if (installed) try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* tampering revokes use, never repair or fallback */ }
-      return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: verified, registered: verified, version: installed?.artifact.version ?? null,
+      const version = verified ? installed!.artifact.version : null;
+      return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: verified, registered: verified, version,
+        versionStatus: versionStatus(runtimeId, { version, fingerprint: verified ? installed!.executableSha256 : null,
+          registered: verified, requiresRetrust: Boolean(installed && !verified) }),
         loginSource, generalAgentDriverAvailable: Boolean(verified && (runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode" && loginSource === "host")), state: installed ? verified ? "registered" : "integrity_failed" : "not_installed" };
     }), operations: [...this.operations.values()].slice(-64).map(({ controller: _c, ...row }) => row) };
   }
-  resolve(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
+  private resolveUnproxied(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
     if (runtimeId === "agy") return fail();
     const row = this.state.read().entries.find(row => row.artifact.runtimeId === runtimeId && row.artifact.version === version && row.artifact.sha256 === artifactSha256);
     if (!row) return fail(); const checked = this.inspect(row.artifact, row); if (!checked) return fail();
@@ -446,6 +533,10 @@ export class WorkspaceRuntimeInstaller {
     return { command: checked.path, env: { HOME: privateHome, USERPROFILE: privateHome, CODEX_HOME: join(privateHome, ".codex"),
       CLAUDE_CONFIG_DIR: join(privateHome, ".claude"), XDG_CONFIG_HOME: join(privateHome, "config"), XDG_DATA_HOME: join(privateHome, "data"),
       XDG_CACHE_HOME: join(privateHome, "cache"), DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" }, loginSource };
+  }
+  resolve(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string) {
+    const resolved = this.resolveUnproxied(runtimeId, version, artifactSha256);
+    return { ...resolved, env: this.proxy.apply(resolved.env) };
   }
   async close(): Promise<void> {
     this.closed = true; this.proposals.clear(); for (const operation of this.active.values()) operation.controller.abort();

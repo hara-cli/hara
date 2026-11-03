@@ -462,6 +462,7 @@ export type SessionRuntimeItemState =
   | "denied";
 
 export type SessionRuntimeErrorKind =
+  | "runtime_proxy"
   | "context_overflow"
   | "quota_exhausted"
   | "region_unavailable"
@@ -1969,7 +1970,7 @@ function isSessionRuntimeItemEvent(value: unknown, sessionId?: string): value is
     && (event.model === undefined || isBoundedJournalLabel(event.model, 512))
     && (event.errorKind === undefined || [
       "context_overflow", "quota_exhausted", "region_unavailable", "rate_limit", "overloaded", "auth",
-      "timeout", "transient", "circuit_open", "interrupted", "unknown",
+      "timeout", "transient", "circuit_open", "interrupted", "unknown", "runtime_proxy",
     ].includes(event.errorKind as string))
     && (event.generation === undefined || (Number.isSafeInteger(event.generation) && Number(event.generation) >= 1))
     && (event.inputTokens === undefined || isNonNegativeSafeInteger(event.inputTokens))

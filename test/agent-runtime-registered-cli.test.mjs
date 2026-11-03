@@ -15,14 +15,15 @@ import { captureWorkspaceProjectIdentity, freezeWorkspaceRunBinding, workspaceAg
 import { createWorkspaceRunPermit, bindWorkspaceRunOptions, closeWorkspaceRunPermit } from "../dist/workspace/execution.js";
 import { AgentRuntimeRegistry } from "../dist/agent-runtime/registry.js";
 import { runConfiguredAgent } from "../dist/agent-runtime/dispatch.js";
-import { createTaskExecution } from "../dist/session/task.js";
+import { finishTaskExecution, createTaskExecution } from "../dist/session/task.js";
 
 const roots = [];
 function root() { const path = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-cli-driver-"))); roots.push(path); return path; }
 after(() => roots.forEach(path => fs.rmSync(path, { recursive: true, force: true })));
 
 for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, null], ["claude", false, null],
-  ["codex", true, null], ["codex", true, null, true], ["codex", true, "project_not_trusted"], ["codex", true, "runtime_auth_required"], ["codex", true, "command_failed"]]) test(`${runtimeId} managed=${managed} git=${hasGit} failure=${failure} stays confined with no fallback`, async () => {
+  ["codex", true, null], ["codex", true, null, true], ["codex", true, "project_not_trusted"], ["codex", true, "runtime_auth_required"], ["codex", true, "command_failed"], ["claude", true, "runtime_network"], ["claude", true, "runtime_proxy"], ["claude", true, "version_incompatible"], ["codex", true, "runtime_auth_event"], ["codex", true, "runtime_auth_event_nonzero"], ["codex", true, "runtime_auth_recovered"]]) test(`${runtimeId} managed=${managed} git=${hasGit} failure=${failure} stays confined with no fallback`, async () => {
+  const expectedFailure = failure && failure !== "runtime_auth_recovered";
   const data = root(), home = managed ? join(data, "home") : data, account = root();
   fs.mkdirSync(home, { recursive: true });
   const catalog = new LocalWorkspaceCatalog(home), row = catalog.create("Local", 1);
@@ -32,7 +33,7 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
   const storage = new WorkspaceResourceStorage(home, row.scope); storage.initialize();
   const command = join(account, ".local", "bin", runtimeId), argv = join(account, "argv.txt");
   fs.mkdirSync(dirname(command), { recursive: true });
-  fs.writeFileSync(command, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${runtimeId} 1.2.3'; exit 0; fi\nif [ "$1" = "app-server" ]; then exit 1; fi\nif [ "$1" = "debug" ]; then echo '{"models":[{"slug":"fixture-model","display_name":"Fixture"}]}'; exit 0; fi\nprintf '%s\\n' "$@" > '${argv}'\n${managed && !hasGit ? `case " $* " in *' --skip-git-repo-check '*) ;; *) echo 'Not inside a trusted directory and --skip-git-repo-check was not specified.' >&2; exit 1;; esac` : ''}\n${failure ? `echo '${failure === 'project_not_trusted' ? 'Not inside a trusted directory' : failure === 'runtime_auth_required' ? 'websocket 401 Unauthorized PRIVATE_ACCOUNT_DETAIL' : 'PRIVATE_ACCOUNT_DETAIL'}' >&2; exit 1` : ''}\necho 'registered ${runtimeId} reply'\n`, { mode: 0o755 });
+  fs.writeFileSync(command, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${runtimeId} 1.2.3'; exit 0; fi\nif [ "$1" = "app-server" ]; then exit 1; fi\nif [ "$1" = "debug" ]; then echo '{"models":[{"slug":"fixture-model","display_name":"Fixture"}]}'; exit 0; fi\nprintf 'launch\\n' >> '${argv}.launches'\nprintf '%s\\n' "$@" > '${argv}'\n${runtimeId === "codex" && managed && !hasGit ? `case " $* " in *' --skip-git-repo-check '*) ;; *) echo 'Not inside a trusted directory and --skip-git-repo-check was not specified.' >&2; exit 1;; esac` : ''}\n${failure === 'runtime_auth_recovered' ? `echo '{"type":"error","message":"temporary network error PRIVATE_ACCOUNT_DETAIL"}'; echo '{"type":"item.completed","item":{"type":"agent_message","text":"registered codex reply"}}'; echo '{"type":"turn.completed"}'; exit 0` : failure?.startsWith('runtime_auth_event') ? `echo '{"type":"turn.failed","error":{"message":"401 Unauthorized PRIVATE_ACCOUNT_DETAIL"}}'; exit ${failure === 'runtime_auth_event' ? 0 : 1}` : failure ? `echo '${failure === 'project_not_trusted' ? 'Not inside a trusted directory' : failure === 'runtime_auth_required' ? 'websocket 401 Unauthorized PRIVATE_ACCOUNT_DETAIL' : failure === 'runtime_network' ? 'ECONNRESET PRIVATE_ACCOUNT_DETAIL' : failure === 'runtime_proxy' ? 'proxy connect failed PRIVATE_ACCOUNT_DETAIL' : failure === 'version_incompatible' ? 'unrecognized option --fixture PRIVATE_ACCOUNT_DETAIL' : 'PRIVATE_ACCOUNT_DETAIL'}' >&2; exit 1` : ''}\n${runtimeId === 'codex' ? `echo '{"type":"item.completed","item":{"type":"agent_message","text":"registered codex reply"}}'\necho '{"type":"turn.completed"}'` : `echo 'registered ${runtimeId} reply'`}\n`, { mode: 0o755 });
   const installer = new WorkspaceRuntimeInstaller(storage, { discovery: { home: account, path: "/usr/bin:/bin", systemBins: [],
     run: async (_command, args) => args[0] === "-lic" ? null : `${runtimeId} 1.2.3` } });
   const resources = new WorkspaceResources(home, row.scope, { runtimeInstaller: installer }); resources.initialize();
@@ -81,18 +82,62 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
   try {
     const history = [{ role: "user", content: "hello" }];
     const result = await storage.run(() => runConfiguredAgent(history, options, new AgentRuntimeRegistry(undefined, installer, models)));
-    assert.equal(result.status, failure ? "error" : "completed", result.error);
-    if (failure) {
-      assert.ok(result.error.includes(`(${failure})`));
-      assert.ok(result.error.includes("no fallback was selected"));
+    assert.equal(result.status, expectedFailure ? "error" : "completed", result.error);
+    if (expectedFailure) {
+      const match = /hara_runtime_failure_v1=(\{[^{}]+\})/.exec(result.error);
+      assert.ok(match, "a fixed-field diagnostic survives the common governor");
+      const diagnostic = JSON.parse(match[1]);
+      const expected = failure === "runtime_auth_required" || failure.startsWith("runtime_auth_event") ? "runtime_auth_rejected"
+        : failure === "command_failed" ? "runtime_failed" : failure;
+      assert.equal(diagnostic.kind, expected);
+      assert.equal(diagnostic.runtime, runtimeId);
+      assert.equal(diagnostic.version, "1.2.3");
+      assert.equal(diagnostic.loginSource, "isolated");
+      assert.equal(diagnostic.homeMatchesAccount, false);
+      assert.ok(diagnostic.elapsedMs >= 0 && diagnostic.elapsedMs <= 600000);
+      assert.equal(diagnostic.consecutiveFailures, 1);
+      assert.ok(diagnostic.retryAtMs > Date.now() - 1000);
+      assert.equal(Object.keys(diagnostic).length, 8);
+      const checkpoint = finishTaskExecution(task, result).checkpoint;
+      const persisted = JSON.parse(/hara_runtime_failure_v1=(\{[^{}]+\})/.exec(checkpoint.blockReason)[1]);
+      assert.deepEqual(persisted, diagnostic, "the persisted task block reason keeps the complete safe payload");
+      assert.ok(!JSON.stringify(diagnostic).includes(home));
+      assert.ok(!JSON.stringify(diagnostic).includes(account));
       assert.ok(!result.error.includes("PRIVATE_ACCOUNT_DETAIL"));
       assert.ok(history.slice(1).every(row => row.role === "assistant" && row.text === "" && row.toolUses.length === 0),
         "a failed native run leaves no fabricated text or tool result; the common governor may retain an empty assistant boundary");
       assert.doesNotMatch(JSON.stringify(history), /PRIVATE_ACCOUNT_DETAIL/);
-    } else assert.equal(history.at(-1).text, `registered ${runtimeId} reply`);
+      if (failure === "runtime_auth_required") {
+        // New registry + new attempt permit must still observe the same colleague's cooldown.
+        const retryBinding = freezeWorkspaceRunBinding({ ...binding, sessionId: randomUUID(), runId: randomUUID() });
+        const retryTask = { ...task, workspaceRunBinding: retryBinding };
+        const retryLease = WorkspaceSessionLease.acquire(storage, retryBinding.sessionId);
+        const retryPermit = createWorkspaceRunPermit({ ...permitInput, binding: retryBinding, lease: retryLease });
+        const retryOptions = bindWorkspaceRunOptions(retryPermit, { ctx: { cwd: project, sessionId: retryBinding.sessionId, sandbox: "off" },
+          signal: controller.signal, approval: "auto-edit", approvalChannel: true, confirm: async () => false, hooks: false,
+          systemOverride: "Reply concisely", taskIntake: { task: retryTask, current: () => retryTask } });
+        const realNow = Date.now;
+        try {
+          Date.now = () => diagnostic.retryAtMs - 500;
+          const repeated = await storage.run(() => runConfiguredAgent([{ role: "user", content: "hello" }], retryOptions,
+            new AgentRuntimeRegistry(undefined, installer, models)));
+          assert.equal(repeated.status, "error");
+          const held = JSON.parse(/hara_runtime_failure_v1=(\{[^{}]+\})/.exec(repeated.error)[1]);
+          assert.equal(held.retryAtMs, diagnostic.retryAtMs, "blocked retries do not extend or clear the failure");
+          assert.equal(held.consecutiveFailures, 1);
+          assert.equal(fs.readFileSync(`${argv}.launches`, "utf8").trim().split("\n").length, 1, "no second inference process");
+        } finally { Date.now = realNow; await closeWorkspaceRunPermit(retryPermit); }
+      }
+    } else {
+      assert.equal(history.at(-1).text, `registered ${runtimeId} reply`);
+      assert.doesNotMatch(JSON.stringify(history), /PRIVATE_ACCOUNT_DETAIL/);
+    }
+    const versionStatus = installer.list().options.find(row => row.runtimeId === runtimeId).versionStatus;
+    assert.equal(versionStatus.lastSuccessfulVersion, expectedFailure ? null : "1.2.3");
+    assert.equal(versionStatus.compatibility, expectedFailure ? "unverified" : "previously_succeeded");
     const args = fs.readFileSync(argv, "utf8");
     assert.match(args, runtimeId === "codex" ? /read-only/ : /plan/);
-    assert.equal(args.includes("--skip-git-repo-check"), managed && !hasGit);
+    assert.equal(args.includes("--skip-git-repo-check"), runtimeId === "codex" && managed && !hasGit);
     assert.equal(fs.existsSync(join(project, ".git")), hasGit);
     const privateEnv = installer.resolveBound(runtimeId).env;
     assert.ok(privateEnv.HOME.startsWith(home));

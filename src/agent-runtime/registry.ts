@@ -1,3 +1,4 @@
+import { runtimeFailureMessage } from "./failure-diagnostics.js";
 import { runAgent, type RunOpts, type RunOutcome } from "../agent/loop.js";
 import { runPiAgent } from "./pi.js";
 import type { NeutralMsg } from "../providers/types.js";
@@ -67,7 +68,14 @@ export class AgentRuntimeRegistry {
     if (!options.workspaceRun) throw new Error(WORKSPACE_AGENT_EXECUTION_PENDING);
     const runtimeId = options.workspaceRun.binding.agent.runtimeId;
     assertWorkspaceRunAdmission(options.workspaceRun, options, runtimeId);
-    this.assertAvailable(runtimeId);
+    const availability = this.options().find(row => row.id === runtimeId);
+    if (!availability?.available) {
+      if (this.installer && (runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode")) {
+        return Promise.resolve({ status: "error", error: runtimeFailureMessage({ ...this.installer.failureContext(runtimeId),
+          kind: availability?.reason === "not_installed" || availability?.reason === "not_registered" ? "not_installed" : "runtime_failed", elapsedMs: 0 }) });
+      }
+      this.assertAvailable(runtimeId);
+    }
     if (runtimeId === "pi") return runPiAgent(history, options);
     if (runtimeId === "hara") return runAgent(history, options);
     const agent = options.workspaceRun.binding.agent;

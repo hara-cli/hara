@@ -192,6 +192,23 @@ async function inventoryFixture() {
   return { discovery, command, storage, runtimes, models, env, cache: join(env.CODEX_HOME, "models_cache.json") };
 }
 
+test("a new Codex binding uses live model medium without changing an explicit saved automatic choice", async () => {
+  const f = await inventoryFixture();
+  try {
+    fs.writeFileSync(`${f.command}.appmodels`, JSON.stringify({ data: [{ id: "fixture-model", displayName: "Fixture",
+      isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "medium" }, { reasoningEffort: "high" }] }] }));
+    assert.deepEqual(await f.models.launchSelection("codex"), { modelId: "fixture-model", effort: "medium" });
+    const firstLaunchCalls = fs.readFileSync(`${f.command}.calls`, "utf8");
+    assert.deepEqual(await f.models.launchSelection("codex"), { modelId: "fixture-model", effort: "medium" });
+    assert.equal(fs.readFileSync(`${f.command}.calls`, "utf8"), firstLaunchCalls,
+      "later turns reuse the live-backed default without spawning another model inventory process");
+    await f.models.select("codex", "fixture-model", 0);
+    assert.deepEqual(f.models.selection("codex"), { modelId: "fixture-model", effort: "medium" });
+    await f.models.select("codex", "fixture-model", 1, null);
+    assert.deepEqual(await f.models.launchSelection("codex"), { modelId: "fixture-model", effort: null });
+  } finally { await f.runtimes.close(); }
+});
+
 test("an empty private Codex home can list live models and retain a selectable inventory across restart", async () => {
   const f = await inventoryFixture();
   try {

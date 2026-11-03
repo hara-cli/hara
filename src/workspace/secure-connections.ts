@@ -4,6 +4,8 @@ import { currentWorkspaceResourceBinding, sameWorkspaceResourceBinding, workspac
 import { deepFreeze, plain, positive, text } from "./local-state.js";
 import { VersionedSettings, SettingsMigrationPendingError } from "./versioned-settings.js";
 import type { CredentialVault } from "./credential-vault.js";
+import { connectionModelEfforts } from "./connection-models.js";
+import { defaultEffortForLevels } from "./default-effort.js";
 
 interface Metadata extends Omit<ScopedConnection, "apiKey" | "credentialFile"> { keyRef: string; createdAt: string; updatedAt: string; importId?: string; retiredKeyRefs?: string[]; credentialInvalid?: boolean; credentialMissing?: boolean }
 interface LegacyImport { state: "pending" | "complete"; rows: { sourceId: string; connectionId: string }[] }
@@ -126,7 +128,9 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     const id = `mc_${randomUUID()}`, generation = `gen_${randomUUID()}`, keyRef = `${state.value.resourceBinding.scopeKey}:${id}:${generation}`, now = new Date().toISOString();
     this.vault.set(keyRef, value.apiKey);
     try { this.document.update(expected, current => ({ ...current, activeConnectionId: current.activeConnectionId ?? id, connections: [...current.connections,
-      { ...metadata, id, keyRef, credentialGeneration: generation, revision: 1, status: "active", createdAt: now, updatedAt: now, ...(importId ? { importId } : {}) }] })); }
+      { ...metadata, defaultReasoning: Object.hasOwn(value, "defaultReasoning") || importId ? metadata.defaultReasoning ?? null
+        : defaultEffortForLevels(connectionModelEfforts(metadata, metadata.defaultModel)) as ScopedConnection["defaultReasoning"],
+        id, keyRef, credentialGeneration: generation, revision: 1, status: "active", createdAt: now, updatedAt: now, ...(importId ? { importId } : {}) }] })); }
     catch (error) { this.discardUncommittedCredential(keyRef, expected); throw error; }
     return this.list().connections.find(row => row.id === id)!;
   }
@@ -138,7 +142,8 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     const generation = `gen_${randomUUID()}`, ref = `${state.value.resourceBinding.scopeKey}:${id}:${generation}`;
     this.vault.set(ref, key);
     try { this.document.update(expected, current => ({ ...current, connections: current.connections.map(item => item.id === id
-      ? { ...item, ...metadata, defaultReasoning: Object.hasOwn(value, "defaultReasoning") ? metadata.defaultReasoning ?? null : metadata.defaultModel === item.defaultModel ? item.defaultReasoning ?? null : null,
+      ? { ...item, ...metadata, defaultReasoning: Object.hasOwn(value, "defaultReasoning") ? metadata.defaultReasoning ?? null : metadata.defaultModel === item.defaultModel ? item.defaultReasoning ?? null
+        : defaultEffortForLevels(connectionModelEfforts(metadata, metadata.defaultModel)) as ScopedConnection["defaultReasoning"],
         keyRef: ref, credentialInvalid: false, credentialMissing: false, retiredKeyRefs: [...new Set([...(item.retiredKeyRefs ?? []), item.keyRef])], credentialGeneration: generation, revision: item.revision + 1, updatedAt: new Date().toISOString() } : item) })); }
     catch (error) { this.discardUncommittedCredential(ref, expected); throw error; }
     this.cleanupCredentials(id, this.document.read().value.revision);
@@ -177,7 +182,11 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     if (current.legacyImport?.state === "pending") throw new Error("Credential authorization pending");
     const row = current.connections.find(row => row.id === id && row.status === "active");
     if (!row || modelId !== undefined && !text(modelId)) throw new Error("Connection unavailable");
-    if (modelId !== undefined) { row.defaultModel = modelId; row.defaultReasoning = effort ?? null; row.updatedAt = new Date().toISOString(); }
+    if (modelId !== undefined) {
+      const nextEffort = effort === undefined ? (row.defaultModel === modelId ? row.defaultReasoning ?? null
+        : defaultEffortForLevels(connectionModelEfforts(row, modelId)) as ScopedConnection["defaultReasoning"]) : effort;
+      row.defaultModel = modelId; row.defaultReasoning = nextEffort; row.updatedAt = new Date().toISOString();
+    }
     current.activeConnectionId = id; return current;
   }); }
   override capture(id?: string, model?: string): Readonly<ScopedRunConnection> {

@@ -239,6 +239,14 @@ export class WorkspaceAgentStore {
       ...(row.configurations[row.currentConfigRevision - 1]!.identity.title ? { title: row.configurations[row.currentConfigRevision - 1]!.identity.title } : {}),
       aliases: [...new Set([row.username, ...row.configurations.map(config => config.identity.displayName)])] }));
   }
+  /** Host-only L0 input. One manifest read, no runtime inventory or model call; never expose instructions in a DTO. */
+  channelPrefilterProfiles() {
+    return (this.load().value?.agents ?? []).filter(row => row.kind === "colleague" && row.state === "active").map(row => {
+      const config = row.configurations[row.currentConfigRevision - 1]!;
+      return { agentId: row.agentId, title: config.identity.title ?? "", description: config.description, instructions: config.instructions,
+        aliases: [...new Set([row.username, ...row.configurations.map(item => item.identity.displayName)])] };
+    });
+  }
   get(agentId: string): WorkspaceAgentView | null {
     if (!isWorkspaceAgentId(agentId)) throw new Error("invalid Workspace Agent id");
     const row = this.load().value?.agents.find(entry => entry.agentId === agentId);

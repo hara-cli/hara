@@ -1,3 +1,4 @@
+import { runtimeProxyFailure } from "../security/runtime-proxy.js";
 // A short-lived transport for one frozen Workspace attempt. It never executes a tool itself:
 // calls yield to the same Hara governor used by Pi, then receive its actual tool-result receipt.
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
@@ -7,6 +8,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema, McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import type { NeutralMsg, ToolResult, ToolSpec, TurnArgs, TurnResult } from "../providers/types.js";
 import type { ExternalCommandCaptureResult } from "../external-sessions/process.js";
+import { CLI_TOOL_GUIDANCE } from "./tool-guidance.js";
 
 export const WORKSPACE_MCP_TOKEN_ENV = "HARA_WORKSPACE_MCP_TOKEN";
 export interface WorkspaceMcpEndpoint {
@@ -31,7 +33,7 @@ export async function createWorkspaceMcpEndpoint(input: {
     sessionIdGenerator: () => randomUUID(), enableJsonResponse: true, maxRequestBodySize: 256 * 1024,
   });
   const server = new Server({ name: "hara", version: "1.0.0" }, { capabilities: { tools: { listChanged: true } },
-    instructions: "These are the frozen tools of this Hara Workspace attempt. Hara governs every call, including task understanding, budgets, evidence and Desk confirmation. Never infer approval from MCP connectivity." });
+    instructions: "These are the frozen tools of this Hara Workspace attempt. Hara governs every call, including task understanding, budgets, evidence and Desk confirmation. Never infer approval from MCP connectivity. " + CLI_TOOL_GUIDANCE });
   const assertLive = () => {
     if (closed || input.signal.aborted) throw new Error("Workspace MCP attempt ended");
     input.assertCurrent();
@@ -146,7 +148,7 @@ export function createRegisteredCliMcpTurn(input: {
               const item = { call, resolve }; pending.set(call.id, item); queue.push(item); notify();
             });
           } });
-        const prompt = [args.system, ...args.history.map(message => message.role === "user" ? "User: " + message.content
+        const prompt = [args.system, CLI_TOOL_GUIDANCE, ...args.history.map(message => message.role === "user" ? "User: " + message.content
           : message.role === "assistant" ? "Assistant: " + message.text : "")]
           .filter(Boolean).join("\n\n");
         if (!prompt.trim() || prompt.length > 200_000 || args.history.some(message => message.role === "user" && message.images?.length)) {
@@ -156,7 +158,7 @@ export function createRegisteredCliMcpTurn(input: {
           try {
             const result = await input.launch(endpoint!, prompt, () => activity?.());
             if (!result.ok) finished = { text: "", toolUses: [], stop: "error",
-              errorMsg: "registered Runtime failed (" + (result.errorCode ?? (result.timedOut ? "timeout" : "exit")) + "); no fallback was selected" };
+              errorMsg: result.runtimeFailure ?? "registered Runtime failed (" + (result.errorCode ?? (result.timedOut ? "timeout" : "exit")) + "); no fallback was selected" };
             else if (input.jsonEvents === false) finished = { text: result.stdout.trim(), toolUses: [], stop: "end" };
             else {
               // JSON events contain native session IDs and internal calls. Persist only the final text.
@@ -174,7 +176,7 @@ export function createRegisteredCliMcpTurn(input: {
               if (!text && !result.stdout.trimStart().startsWith("{")) text = result.stdout.trim();
               finished = { text, toolUses: [], stop: "end", ...(usage ? { usage } : {}) };
             }
-          } catch { finished = { text: "", toolUses: [], stop: "error", errorMsg: "Native Agent Runtime launch failed; no fallback was selected" }; }
+          } catch (error) { finished = { text: "", toolUses: [], stop: "error", errorMsg: runtimeProxyFailure(error) ?? "Native Agent Runtime launch failed; no fallback was selected" }; }
           finally { notify(); }
         })();
       }

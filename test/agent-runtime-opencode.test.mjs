@@ -14,7 +14,7 @@ test("OpenCode JSON events, not exit zero alone, determine success and fixed fai
   ].join("\n")));
   assert.deepEqual(success, { text: "hello team", toolUses: [], stop: "end" });
   assert.equal(parseOpenCodeRun(result('{"type":"error","error":{"name":"UnknownError","message":"unknown model PRIVATE_DETAIL"}}')).errorMsg, "invalid_model");
-  assert.equal(parseOpenCodeRun(result('{"type":"error","error":{"message":"401 Unauthorized PRIVATE_DETAIL"}}')).errorMsg, "runtime_auth_required");
+  assert.equal(parseOpenCodeRun(result('{"type":"error","error":{"message":"401 Unauthorized PRIVATE_DETAIL"}}')).errorMsg, "runtime_auth_rejected");
   assert.equal(parseOpenCodeRun(result('{"type":"error","error":{"message":"Cannot connect to API PRIVATE_DETAIL"}}')).errorMsg, "runtime_network");
   assert.equal(parseOpenCodeRun(result('{"type":"error","error":{"message":"Permission denied PRIVATE_DETAIL"}}')).errorMsg, "runtime_permission_denied");
   assert.equal(parseOpenCodeRun(result('{"type":"text","part":{"text":"partial"}}')).stop, "error", "missing step_finish fails");
@@ -41,4 +41,11 @@ test("OpenCode launch is model-bound, host-only and denies native write/shell", 
   assert.deepEqual(args, ["run", "--pure", "--format", "json", "-m", "provider/model", "--dir", "/fixture/project", "--agent", "hara-general", "--", "hello"]);
   assert(!args.join(" ").includes("fixture-private-token"));
   assert(!args.includes("--variant") && !args.includes("--session"));
+});
+
+test("generic OpenCode error frames keep more specific process evidence", () => {
+  const failure = { ...result('{"type":"error","error":{"message":"PRIVATE_DETAIL"}}', false), errorCode: "runtime_auth_rejected" };
+  assert.equal(parseOpenCodeRun(failure).errorMsg, "runtime_auth_rejected");
+  assert.equal(parseOpenCodeRun({ ...failure, errorCode: "timeout", timedOut: true }).errorMsg, "timeout");
+  assert.doesNotMatch(JSON.stringify(parseOpenCodeRun(failure)), /PRIVATE/);
 });

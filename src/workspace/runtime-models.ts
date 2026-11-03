@@ -6,12 +6,13 @@ import { HARA_RUNTIME_VERSION } from "../version.js";
 import { inspectWorkspaceResourceFile, sameWorkspaceResourceBinding, workspaceStateHome,
   type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { optionalRuntimeId, type OptionalRuntimeId, type WorkspaceRuntimeInstaller } from "./runtime-install.js";
+import { defaultEffortForLevels } from "./default-effort.js";
 
 export interface RuntimeModel { id: string; label: string; description?: string; recommended?: boolean;
   /** Reasoning levels this exact model advertised on the live inventory. Absent/empty means the
    * capability is unknown, and effort selection must be refused rather than guessed. */
   supportedReasoningEfforts?: string[]; defaultReasoningEffort?: string }
-interface ModelSelection { runtimeId: OptionalRuntimeId; revision: number; selectedModelId: string | null; selectedEffort: string | null }
+interface ModelSelection { runtimeId: OptionalRuntimeId; revision: number; selectedModelId: string | null; selectedEffort?: string | null }
 interface RuntimeModelsState { resourceBinding: WorkspaceResourceBinding; revision: number; selections: ModelSelection[] }
 const MAX_INVENTORY_BYTES = 4 * 1024 * 1024;
 const MAX_EFFORTS = 8;
@@ -90,7 +91,7 @@ function cacheCodexModels(models: RuntimeModel[], env: NodeJS.ProcessEnv, storag
 }
 async function liveModels(runtimeId: "codex" | "opencode", runtimes: WorkspaceRuntimeInstaller,
   storage: WorkspaceResourceStorage): Promise<RuntimeModel[]> {
-  const { command, env, loginSource } = runtimes.resolveBound(runtimeId);
+  let { command, env, loginSource, proxyUrl } = await runtimes.prepareBound(runtimeId);
   const failures: string[] = [];
   const remember = (models: RuntimeModel[]): RuntimeModel[] => {
     // The private cache is Hara-owned state inside runtime-homes/<id>. A host login must not be
@@ -108,9 +109,13 @@ async function liveModels(runtimeId: "codex" | "opencode", runtimes: WorkspaceRu
       return remember(codexModels(result, "data"));
     } catch (error) { failures.push(`app-server model/list: ${codexFailure(error)}`); }
   }
+  // A failed async app-server query is followed by a new physical process, so it needs fresh proxy
+  // admission too. Never let a newly configured Workspace proxy be bypassed by the old unset env.
+  if (runtimeId === "codex") ({ command, env, loginSource, proxyUrl } = await runtimes.prepareBound(runtimeId));
   const result = await runExternalCommandCapture({ command, env: { ...env, NO_COLOR: "1", OPENCODE_DISABLE_AUTOUPDATE: "true",
     OPENCODE_DISABLE_MODELS_FETCH: "true" } }, runtimeId === "codex" ? ["debug", "models"] : ["models"],
-  { cwd: env.HOME, timeoutMs: 15000, maxOutputBytes: 4 * 1024 * 1024 });
+  { cwd: env.HOME, proxyUrl, timeoutMs: 15000, maxOutputBytes: 4 * 1024 * 1024 });
+  if (result.errorCode === "runtime_proxy_failed") throw new Error(result.errorCode);
   if (!result.ok && runtimeId === "opencode") throw new Error("opencode model inventory failed");
   const { stdout } = result;
   let models: RuntimeModel[];
@@ -168,6 +173,7 @@ function codexEfforts(value: unknown): { supportedReasoningEfforts?: string[]; d
 export class WorkspaceRuntimeModels {
   private readonly state: WorkspaceJsonState<RuntimeModelsState>;
   private readonly pending = new Map<string, Promise<RuntimeModel[]>>();
+  private readonly launchDefaults = new Map<string, Promise<{ modelId: string | null; effort: string | null }>>();
   constructor(storage: WorkspaceResourceStorage, private readonly runtimes: WorkspaceRuntimeInstaller) {
     this.state = new WorkspaceJsonState(storage, "runtime-models-v1.json", value => {
       if (!plain(value) || !exact(value, ["resourceBinding", "revision", "selections"])
@@ -185,7 +191,7 @@ export class WorkspaceRuntimeModels {
           || (row.selectedEffort !== undefined && row.selectedEffort !== null && !validEffort(row.selectedEffort))) throw new Error("Runtime model state is damaged");
         seen.add(row.runtimeId);
       }
-      return { ...structuredClone(value), selections: (value.selections as ModelSelection[]).map(row => ({ ...row, selectedEffort: row.selectedEffort ?? null })) } as unknown as RuntimeModelsState;
+      return structuredClone(value) as unknown as RuntimeModelsState;
     }, () => ({ resourceBinding: this.state.binding(), revision: 0, selections: [] }));
   }
   private bound(runtimeId: unknown): asserts runtimeId is OptionalRuntimeId {
@@ -202,7 +208,7 @@ export class WorkspaceRuntimeModels {
   private claudeEfforts: { key: string; levels: string[] } | null = null;
   private async claudeEffortLevels(): Promise<string[]> {
     let resolved: ReturnType<WorkspaceRuntimeInstaller["resolveBound"]>;
-    try { resolved = this.runtimes.resolveBound("claude"); } catch { return []; }
+    try { resolved = await this.runtimes.prepareBound("claude"); } catch (error) { if (error instanceof Error && error.message.startsWith("runtime_proxy_")) throw error; return []; }
     const bound = this.runtimes.list().options.find(row => row.runtimeId === "claude");
     const key = JSON.stringify([resolved.command, bound?.fingerprint ?? bound?.version ?? null]);
     if (this.claudeEfforts?.key === key) return this.claudeEfforts.levels;
@@ -236,6 +242,30 @@ export class WorkspaceRuntimeModels {
     const row = this.state.read().selections.find(row => row.runtimeId === runtimeId);
     return { modelId: row?.selectedModelId ?? null, effort: row?.selectedEffort ?? null };
   }
+  /** New/legacy unchosen strength gets a live-model-backed default at launch. Explicit saved
+   * string or null is never changed. The returned choice is not persisted behind the user's back. */
+  async launchSelection(runtimeId: OptionalRuntimeId): Promise<{ modelId: string | null; effort: string | null }> {
+    this.bound(runtimeId);
+    const row = this.state.read().selections.find(value => value.runtimeId === runtimeId);
+    if (row && Object.hasOwn(row, "selectedEffort")) return this.selection(runtimeId);
+    // The first lookup needs the live inventory; repeating app-server model/list on every chat
+    // would add a second native process to the latency path. Reuse only for this bound runtime
+    // identity and state revision. A failed lookup is retried on the next attempt.
+    const key = JSON.stringify([runtimeId, row?.revision ?? 0, row?.selectedModelId ?? null,
+      this.runtimes.list().options.find(value => value.runtimeId === runtimeId)]);
+    let choice = this.launchDefaults.get(key);
+    if (!choice) {
+      choice = this.list(runtimeId).then(inventory => {
+        const model = inventory.models.find(value => value.id === row?.selectedModelId)
+          ?? (!row ? inventory.models.find(value => value.recommended) : undefined);
+        return { modelId: row?.selectedModelId ?? model?.id ?? null,
+          effort: runtimeId === "opencode" ? null : defaultEffortForLevels(model?.supportedReasoningEfforts) };
+      }).catch(error => { this.launchDefaults.delete(key); throw error; });
+      if (this.launchDefaults.size >= 8) this.launchDefaults.clear();
+      this.launchDefaults.set(key, choice);
+    }
+    return choice;
+  }
   selected(runtimeId: OptionalRuntimeId): string | null { return this.selection(runtimeId).modelId; }
   selectedEffort(runtimeId: OptionalRuntimeId): string | null { return this.selection(runtimeId).effort; }
   /** Registration/binding can prepare inventory without making authentication a prerequisite for binding. */
@@ -244,7 +274,7 @@ export class WorkspaceRuntimeModels {
   }
   private live(runtimeId: "codex" | "opencode"): Promise<RuntimeModel[]> {
     // Coalesce a registration/bind warm-up with an immediate list/select, but never retain stale results.
-    const key = JSON.stringify(this.runtimes.list().options.find(row => row.runtimeId === runtimeId));
+    const key = JSON.stringify([this.runtimes.list().options.find(row => row.runtimeId === runtimeId), this.runtimes.proxy.read().revision]);
     let pending = this.pending.get(key);
     if (!pending) {
       pending = liveModels(runtimeId, this.runtimes, this.state.storage).finally(() => this.pending.delete(key));
@@ -257,8 +287,10 @@ export class WorkspaceRuntimeModels {
     const row = this.state.read().selections.find(row => row.runtimeId === runtimeId);
     const models = runtimeId === "codex" || runtimeId === "opencode" ? await this.live(runtimeId) : await this.catalogModels(runtimeId);
     this.bound(runtimeId);
+    const selected = models.find(value => value.id === row?.selectedModelId);
     return { runtimeId, revision: row?.revision ?? 0, selectedModelId: row?.selectedModelId ?? null,
-      selectedEffort: row?.selectedEffort ?? null, models };
+      selectedEffort: row && Object.hasOwn(row, "selectedEffort") ? row.selectedEffort ?? null
+        : runtimeId === "opencode" ? null : defaultEffortForLevels(selected?.supportedReasoningEfforts), models };
   }
   /**
    * Persist the model and, optionally, its reasoning level.
@@ -283,7 +315,8 @@ export class WorkspaceRuntimeModels {
     const current = this.state.read();
     const prior = current.selections.find(row => row.runtimeId === runtimeId);
     if ((prior?.revision ?? 0) !== expectedRevision) throw new Error("Runtime model revision changed; refresh before selecting");
-    const nextEffort = effort === undefined ? (prior?.selectedModelId === modelId ? prior?.selectedEffort ?? null : null)
+    const nextEffort = effort === undefined ? (prior?.selectedModelId === modelId && prior !== undefined && Object.hasOwn(prior, "selectedEffort")
+      ? prior?.selectedEffort ?? null : runtimeId === "opencode" ? null : defaultEffortForLevels(model.supportedReasoningEfforts))
       : effort as string | null;
     this.state.update(current.revision, value => {
       // Recheck under the state lock so a concurrent selection cannot overwrite this runtime.

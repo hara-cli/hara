@@ -1,31 +1,38 @@
+import { runtimeProxyFailure, runtimeProxyFailureFromText, type RuntimeProxyFailure } from "../security/runtime-proxy.js";
+import { classifyRuntimeFailure, runtimeFailureMessage, type RuntimeFailureKind } from "./failure-diagnostics.js";
+import { runtimeFailureTracker } from "./failure-tracker.js";
 import { randomUUID } from "node:crypto";
 import { runExternalCommandCapture, type ExternalCommandCaptureResult } from "../external-sessions/process.js";
 import { createCodingHostBridge, type CodingHostBridge } from "../coding/host.js";
 import { runGovernedAgent, type RunOpts, type RunOutcome } from "../agent/loop.js";
 import type { NeutralMsg, ToolResult, ToolSpec, TurnArgs, TurnResult } from "../providers/types.js";
-import { assertWorkspaceRunAdmission } from "../workspace/execution.js";
+import { assertWorkspaceRunAdmission, workspaceRunRuntimeStages } from "../workspace/execution.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
 import type { TaskRuntimeBinding } from "./bindings.js";
 import type { GovernedAgentRuntimeDriver } from "./registry.js";
+import { CLI_TOOL_GUIDANCE } from "./tool-guidance.js";
+import { createRuntimeStageProcessObserver } from "./stage-observer.js";
 
 interface PendingCall { id: string; name: string; input: Record<string, unknown>; resolve(result: ToolResult): void }
-type Failure = "runtime_auth_required" | "runtime_network" | "invalid_model" | "runtime_permission_denied" | "runtime_failed";
+type Failure = RuntimeProxyFailure | RuntimeFailureKind;
 const record = (value: unknown): Record<string, unknown> | null =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 
 /** Only fixed categories cross the CLI boundary; raw provider errors can contain URLs or credentials. */
-export function openCodeFailure(value: unknown): Failure {
-  const text = JSON.stringify(value ?? "").slice(0, 16_384);
-  if (/\b401\b|unauthori[sz]ed|authentication|not logged in|invalid.api.key/i.test(text)) return "runtime_auth_required";
-  if (/unknown.model|model.not.found|model.*not.*recognized|unknown.provider/i.test(text)) return "invalid_model";
-  if (/permission.denied|access.denied|forbidden|\b403\b/i.test(text)) return "runtime_permission_denied";
-  if (/cannot.connect|network|ECONN|ETIMEDOUT|fetch.failed/i.test(text)) return "runtime_network";
-  return "runtime_failed";
+export function openCodeFailure(value: unknown, explicitProxy = false): Failure {
+  let text: string;
+  try { text = JSON.stringify(value ?? "").slice(0, 16_384); } catch { return "runtime_failed"; }
+  const proxy = runtimeProxyFailureFromText(text, explicitProxy); if (proxy) return proxy;
+  const object = record(value);
+  return classifyRuntimeFailure({ stderr: text,
+    ...(typeof object?.code === "string" ? { code: object.code } : {}),
+    ...(typeof object?.status === "number" ? { status: object.status } : {}) });
 }
 
 /** Parse only the documented JSON event stream; an error frame or missing completion fails even on exit 0. */
-export function parseOpenCodeRun(result: ExternalCommandCaptureResult): TurnResult {
+export function parseOpenCodeRun(result: ExternalCommandCaptureResult, explicitProxy = false): TurnResult {
+  if (result.errorCode === "runtime_proxy_failed") return { text: "", toolUses: [], stop: "error", errorMsg: result.errorCode };
   let text = "", finished = false, failure: Failure | null = null, frames = 0;
   for (const line of result.stdout.split(/\r?\n/u)) {
     if (!line.trim()) continue;
@@ -33,7 +40,7 @@ export function parseOpenCodeRun(result: ExternalCommandCaptureResult): TurnResu
     let event: Record<string, unknown> | null;
     try { event = record(JSON.parse(line)); } catch { return { text: "", toolUses: [], stop: "error", errorMsg: "runtime_failed" }; }
     if (!event || typeof event.type !== "string" || ++frames > 4096) return { text: "", toolUses: [], stop: "error", errorMsg: "runtime_failed" };
-    if (event.type === "error") failure = openCodeFailure(event.error ?? event);
+    if (event.type === "error") failure = openCodeFailure(event.error ?? event, explicitProxy);
     if (event.type === "step_finish") finished = true;
     if (event.type === "text") {
       const part = record(event.part);
@@ -42,7 +49,7 @@ export function parseOpenCodeRun(result: ExternalCommandCaptureResult): TurnResu
     }
   }
   if (failure || !result.ok || !finished) return { text: "", toolUses: [], stop: "error",
-    errorMsg: failure ?? (result.timedOut ? "runtime_network" : result.errorCode === "runtime_auth_required" ? "runtime_auth_required" : "runtime_failed") };
+    errorMsg: failure && failure !== "runtime_failed" ? failure : classifyRuntimeFailure({ code: result.errorCode, timedOut: result.timedOut }) };
   return { text: text.trim(), toolUses: [], stop: "end" };
 }
 
@@ -71,7 +78,9 @@ export function openCodeRunArgs(cwd: string, model: string, prompt: string): str
   return ["run", "--pure", "--format", "json", "-m", model, "--dir", cwd, "--agent", "hara-general", "--", prompt];
 }
 
-function createOpenCodeTurn(input: { command: string; env: NodeJS.ProcessEnv; model: string; options: RunOpts }) {
+function createOpenCodeTurn(input: { installer: WorkspaceRuntimeInstaller; model: string; options: RunOpts;
+  tracker: ReturnType<typeof runtimeFailureTracker>;
+  captureSuccessfulUse(command: string): () => void; onSuccessfulUse(record: () => void): void }) {
   const stop = new AbortController();
   const signal = input.options.signal ? AbortSignal.any([input.options.signal, stop.signal]) : stop.signal;
   const pending = new Map<string, PendingCall>(), queue: PendingCall[] = [];
@@ -106,23 +115,38 @@ function createOpenCodeTurn(input: { command: string; env: NodeJS.ProcessEnv; mo
           budget: { maxProviderRounds: 1, maxToolCalls: permit.binding.budget.maxToolCalls,
             maxTokens: permit.binding.budget.maxTokens, timeoutMs: permit.binding.budget.timeoutMs },
         });
-        const prompt = [args.system, ...args.history.map(message => message.role === "user" ? "User: " + message.content
+        const prompt = [args.system, CLI_TOOL_GUIDANCE, ...args.history.map(message => message.role === "user" ? "User: " + message.content
           : message.role === "assistant" ? "Assistant: " + message.text : "")].filter(Boolean).join("\n\n");
         if (!prompt.trim() || prompt.length > 200_000 || args.history.some(message => message.role === "user" && message.images?.length)) {
           finished = { text: "", toolUses: [], stop: "error", errorMsg: "Native Agent Runtime context is unsupported or too large" };
         } else {
-          const env = openCodeRunEnv(input.env, bridge);
           physical = (async () => {
+            const started = Date.now();
+            let observer: ReturnType<typeof createRuntimeStageProcessObserver> | undefined;
             try {
-              const result = await runExternalCommandCapture({ command: input.command, env },
+              const held = input.tracker.blocked();
+              if (held) { finished = { text: "", toolUses: [], stop: "error", errorMsg: held }; return; }
+              const resolved = await input.installer.prepareBound("opencode", signal);
+              assertCurrent();
+              const recordSuccessfulUse = input.captureSuccessfulUse(resolved.command);
+              observer = createRuntimeStageProcessObserver(workspaceRunRuntimeStages(permit), "opencode", signal);
+              const env = openCodeRunEnv(resolved.env, bridge!);
+              const result = await runExternalCommandCapture({ command: resolved.command, env },
                 openCodeRunArgs(input.options.ctx.cwd, input.model, prompt), {
                   cwd: input.options.ctx.cwd, signal, timeoutMs: permit.binding.budget.timeoutMs,
                   maxOutputBytes: 4 * 1024 * 1024, retainStdoutOnFailure: true,
-                  onStdout: () => args.onActivity?.(),
+                  failureKind: "runtime", proxyUrl: resolved.proxyUrl,
+                  onSpawn: observer.onSpawn, onStdout: chunk => { observer?.onStdout(chunk); args.onActivity?.(); },
                 });
-              finished = parseOpenCodeRun(result);
-            } catch { finished = { text: "", toolUses: [], stop: "error", errorMsg: "runtime_failed" }; }
-            finally { notify(); }
+              observer.finish(result.ok, result.errorCode);
+              const parsed = parseOpenCodeRun(result, Boolean(resolved.proxyUrl));
+              if (signal.aborted || result.errorCode === "interrupted") finished = { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
+              else if (parsed.stop === "error") finished = { ...parsed, errorMsg: input.tracker.failed(
+                classifyRuntimeFailure({ code: parsed.errorMsg }), Date.now() - started) };
+              else { input.tracker.succeeded(); finished = parsed; assertCurrent(); input.onSuccessfulUse(recordSuccessfulUse); }
+            } catch (error) { finished = { text: "", toolUses: [], stop: "error", errorMsg: signal.aborted ? "interrupted"
+              : input.tracker.failed(runtimeProxyFailure(error) ? "runtime_proxy" : "runtime_failed", Date.now() - started) }; }
+            finally { observer?.finish(false); notify(); }
           })();
         }
       }
@@ -156,13 +180,33 @@ export function openCodeCliDriver(installer: WorkspaceRuntimeInstaller, models?:
     assertWorkspaceRunAdmission(permit, options, "opencode");
     if (options.signal?.aborted) return { status: "error", error: "OpenCode execution cancelled" };
     const resolved = installer.resolveBound("opencode");
-    if (resolved.loginSource !== "host") return { status: "error", error: "OpenCode requires host login" };
+    const diagnostic = (kind: RuntimeFailureKind) => ({ status: "error" as const,
+      error: runtimeFailureMessage({ ...installer.failureContext("opencode", resolved), kind, elapsedMs: 0 }) });
+    if (resolved.loginSource !== "host") return diagnostic("runtime_auth_required");
     const model = models.selection("opencode");
-    if (!model.modelId || model.effort) return { status: "error", error: "OpenCode requires a selected model without reasoning variant" };
-    const catalog = await models.list("opencode");
-    if (!catalog.models.some(row => row.id === model.modelId)) return { status: "error", error: "OpenCode selected model is unavailable in the live catalog" };
-    const kernel = createOpenCodeTurn({ command: resolved.command, env: resolved.env, model: model.modelId, options });
-    try { return await runGovernedAgent(history, options, "opencode", kernel.turn); }
+    if (!model.modelId || model.effort) return diagnostic("invalid_model");
+    const tracker = runtimeFailureTracker(installer, "opencode", permit.binding.agent.agentId,
+      JSON.stringify([resolved.command, resolved.loginSource, resolved.env.HOME, installer.proxy.read().revision, permit.binding.agent.configRevision, model.modelId]), resolved);
+    const held = tracker.blocked();
+    if (held) return { status: "error", error: held };
+    let catalog;
+    try { catalog = await models.list("opencode"); }
+    catch { return diagnostic("runtime_failed"); }
+    if (!catalog.models.some(row => row.id === model.modelId)) return diagnostic("invalid_model");
+    try { workspaceRunRuntimeStages(permit)?.setRuntime({ id: "opencode",
+      version: installer.list().options.find(row => row.runtimeId === "opencode")?.version ?? null,
+      loginSource: resolved.loginSource, model: model.modelId, effort: null }); } catch { /* Diagnostic metadata only. */ }
+    let successfulUse: (() => void) | undefined;
+    const kernel = createOpenCodeTurn({ installer, model: model.modelId, options, tracker,
+      captureSuccessfulUse: command => installer.captureSuccessfulUse("opencode", command),
+      onSuccessfulUse: record => { successfulUse = record; } });
+    try {
+      const outcome = await runGovernedAgent(history, options, "opencode", kernel.turn);
+      if (outcome.status === "completed" && !options.signal?.aborted && successfulUse) {
+        assertWorkspaceRunAdmission(permit, options, "opencode"); successfulUse();
+      }
+      return outcome;
+    }
     finally { await kernel.close(history); }
   } };
 }

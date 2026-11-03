@@ -479,3 +479,11 @@ export function rpcError(id: number | string | null, code: number, message: stri
 export function rpcNotify(method: string, params: Record<string, unknown>): string {
   return JSON.stringify({ jsonrpc: "2.0", method, params });
 }
+
+// Workspace runtime network proxy (capability workspace.runtime-proxy.v1):
+// workspace.runtime.proxy.get {workspaceId,expectedGeneration}
+//   -> {workspaceId,resourceGeneration,revision,proxyUrl:string|null,readOnly:boolean}
+// workspace.runtime.proxy.set {workspaceId,expectedGeneration,expectedRevision,proxyUrl:string|null}
+//   -> same view; empty/unset preserves existing runtime environment behavior.
+// Explicit http(s) proxy URLs have no credentials/query/path. Changes apply at the next native launch;
+// localhost,127.0.0.1,::1 bypass only, and proxy failures never select a direct/provider fallback.

@@ -1432,3 +1432,12 @@ dependency gaps. A candidate-package estimate does not authorize live handoff, i
 - Related Files: src/version.ts, src/workspace/local-cli.ts, test/workspace-production-entry.test.mjs
 
 ---
+
+
+## [LRN-20261103-RUNTIME-DIAGNOSTIC-PROJECTION] best_practice
+
+**Status**: implemented
+**Area**: runtime/security
+**Pattern-Key**: runtime.failure-diagnostic-whitelist
+
+Classify native runtime evidence at the process boundary and project only closed metadata fields into durable errors. Authentication rejection does not prove the account is signed out. Compare launch HOME with the independently resolved OS account home, report only yes/no/unknown, and never inspect credential contents to construct a diagnostic. Keep startup cooldown within the workspace installer, colleague and frozen runtime route; per-turn registry reconstruction must not clear it. A cooldown only limits another explicit attempt and never schedules a replay or changes runtime/provider.
