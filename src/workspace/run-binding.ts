@@ -61,7 +61,7 @@ function parse(value: unknown): WorkspaceRunBinding {
   if (!plain(value) || !exact(value, ["schemaVersion", "scope", "agent", "agentBindingHash", "connection", "runtimeContract", "project", "sessionId", "runId", "lineage", "createdAt", "host", "budget"])
     || value.schemaVersion !== 1 || !isWorkspaceAgentTaskBinding(value.agent)
     || value.agentBindingHash !== workspaceAgentBindingHash(value.agent) || !isScopedRunConnection(value.connection)
-    || !(value.runtimeContract === "hara-governed-runtime-v1" && ["hara", "pi", "codex", "claude", "opencode"].includes(value.agent.runtimeId)
+    || !(value.runtimeContract === "hara-governed-runtime-v1" && ["hara", "pi", "codex", "claude", "opencode", "gemini", "kimi"].includes(value.agent.runtimeId)
       || value.runtimeContract === "hara-governed-pi-v1" && value.agent.runtimeId === "pi") || !safeId(value.sessionId) || !safeId(value.runId)
     || !plain(value.lineage) || !exact(value.lineage, ["rootRunId", "parentRunId", "depth"])
     || !(value.lineage.depth === 0 ? value.lineage.rootRunId === null && value.lineage.parentRunId === null

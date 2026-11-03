@@ -176,6 +176,8 @@ function verifyDirectory(identity: PrivateStateDirectoryIdentity): void {
 export class WorkspaceResourceStorage {
   readonly scope: WorkspaceResourceScope;
   readonly scopeKey: string;
+  /** Host-only policy metadata; no read or write authority is returned. */
+  protectedStateRoot(): string { this.run(() => {}); verifyDirectory(this.host); return join(this.host.path, ".hara"); }
   private readonly host: PrivateStateDirectoryIdentity;
   private readonly directories: string[];
   private context?: StorageContext;

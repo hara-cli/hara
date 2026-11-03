@@ -5,6 +5,7 @@ import { withPrivateStateLockSync, writePrivateStateFileSync } from "../security
 import { HARA_RUNTIME_VERSION } from "../version.js";
 import { inspectWorkspaceResourceFile, sameWorkspaceResourceBinding, workspaceStateHome,
   type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
+import { OPTIONAL_RUNTIMES } from "./runtime-catalog.js";
 import { optionalRuntimeId, type OptionalRuntimeId, type WorkspaceRuntimeInstaller } from "./runtime-install.js";
 import { defaultEffortForLevels } from "./default-effort.js";
 
@@ -22,6 +23,8 @@ const selectionFields = ["runtimeId", "revision", "selectedModelId"] as const;
 // These runtimes have no stable, non-interactive model inventory yet.
 const CATALOG: Partial<Record<OptionalRuntimeId, readonly RuntimeModel[]>> = {
   claude: [{ id: "claude-sonnet-4-5", label: "Claude Sonnet 4.5", recommended: true }, { id: "claude-opus-4-1", label: "Claude Opus 4.1" }],
+  gemini: [{ id: "default", label: "CLI default", recommended: true }, { id: "gemini-3-pro-preview", label: "Gemini 3 Pro Preview" }, { id: "gemini-3-flash-preview", label: "Gemini 3 Flash Preview" }, { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" }, { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" }],
+  kimi: [{ id: "default", label: "CLI default", recommended: true }, { id: "kimi-for-coding", label: "Kimi for Coding" }],
   agy: [{ id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", recommended: true }],
 };
 function codexModels(parsed: unknown, field: "models" | "data"): RuntimeModel[] {
@@ -174,7 +177,7 @@ export class WorkspaceRuntimeModels {
       if (!plain(value) || !exact(value, ["resourceBinding", "revision", "selections"])
         || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, this.state.binding())
         || !Number.isSafeInteger(value.revision) || Number(value.revision) < 1
-        || !Array.isArray(value.selections) || value.selections.length > 4) throw new Error("Runtime model state is damaged");
+        || !Array.isArray(value.selections) || value.selections.length > OPTIONAL_RUNTIMES.length) throw new Error("Runtime model state is damaged");
       const seen = new Set<string>();
       for (const row of value.selections) {
         // `selectedEffort` is written from now on but must stay optional on read: state files created
@@ -205,7 +208,7 @@ export class WorkspaceRuntimeModels {
     let resolved: ReturnType<WorkspaceRuntimeInstaller["resolveBound"]>;
     try { resolved = await this.runtimes.prepareBound("claude"); } catch (error) { if (error instanceof Error && error.message.startsWith("runtime_proxy_")) throw error; return []; }
     const bound = this.runtimes.list().options.find(row => row.runtimeId === "claude");
-    const key = JSON.stringify([resolved.command, bound?.fingerprint ?? bound?.version ?? null]);
+    const key = JSON.stringify([resolved.command, bound && "fingerprint" in bound ? bound.fingerprint : bound?.version ?? null]);
     if (this.claudeEfforts?.key === key) return this.claudeEfforts.levels;
     const result = await runExternalCommandCapture({ command: resolved.command, env: resolved.env }, ["--help"],
       { cwd: resolved.env.HOME, timeoutMs: 10_000, maxOutputBytes: 256 * 1024 });
@@ -283,7 +286,8 @@ export class WorkspaceRuntimeModels {
     const models = runtimeId === "codex" || runtimeId === "opencode" ? await this.live(runtimeId) : await this.catalogModels(runtimeId);
     this.bound(runtimeId);
     const selected = models.find(value => value.id === row?.selectedModelId);
-    return { runtimeId, revision: row?.revision ?? 0, selectedModelId: row?.selectedModelId ?? null,
+    return { runtimeId, ...(runtimeId === "gemini" || runtimeId === "kimi" ? { source: "documented" as const, sourceURL: runtimeId === "gemini"
+      ? "https://geminicli.com/docs/cli/model/" : "https://github.com/MoonshotAI/kimi-cli/blob/main/docs/en/configuration/config-files.md" } : {}), revision: row?.revision ?? 0, selectedModelId: row?.selectedModelId ?? null,
       selectedEffort: row && Object.hasOwn(row, "selectedEffort") ? row.selectedEffort ?? null
         : runtimeId === "opencode" ? null : defaultEffortForLevels(selected?.supportedReasoningEfforts), models };
   }

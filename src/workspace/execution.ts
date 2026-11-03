@@ -263,11 +263,11 @@ export function assertWorkspaceRunAdmission(permit: unknown, options: RunOpts, r
 }
 /** Trusted native Runtime composition only: one immutable model transport before admission is consumed.
  * The existing provider wrapper retains liveness, accounting, audit, cancellation and physical tracking. */
-export function attachWorkspaceRuntimeModel(permit: WorkspaceRunPermit, options: RunOpts, runtimeId: "codex" | "claude",
+export function attachWorkspaceRuntimeModel(permit: WorkspaceRunPermit, options: RunOpts, runtimeId: "codex" | "claude" | "gemini" | "kimi",
   execute: (args: TurnArgs) => Promise<TurnResult>): void {
   assertWorkspaceRunAdmission(permit, options, runtimeId);
   const state = stateOf(permit);
-  if ((runtimeId !== "codex" && runtimeId !== "claude") || state.started || state.runtimeModel || typeof execute !== "function") {
+  if ((!["codex", "claude", "gemini", "kimi"].includes(runtimeId)) || state.started || state.runtimeModel || typeof execute !== "function") {
     throw new Error("Workspace Runtime model transport is unavailable or already attached");
   }
   state.runtimeModel = execute;

@@ -106,6 +106,8 @@ interface PendingCall {
 export function createRegisteredCliMcpTurn(input: {
   signal: AbortSignal;
   jsonEvents?: boolean;
+  parseOutput?(output: string): TurnResult;
+  beforeTool?(): void;
   assertCurrent(): void;
   launch(endpoint: WorkspaceMcpEndpoint, prompt: string, activity: () => void): Promise<ExternalCommandCaptureResult>;
 }) {
@@ -141,7 +143,7 @@ export function createRegisteredCliMcpTurn(input: {
       if (!physical) {
         endpoint = await createWorkspaceMcpEndpoint({ signal: AbortSignal.any([input.signal, stopped.signal]), assertCurrent: input.assertCurrent,
           tools: () => tools, call(name, parameters) {
-            input.assertCurrent();
+            input.assertCurrent(); input.beforeTool?.();
             if (closed || pending.size >= 16) throw new Error("Workspace MCP call limit reached");
             return new Promise<ToolResult>(resolve => {
               const call = { id: randomUUID(), name, input: parameters };
@@ -159,6 +161,7 @@ export function createRegisteredCliMcpTurn(input: {
             const result = await input.launch(endpoint!, prompt, () => activity?.());
             if (!result.ok) finished = { text: "", toolUses: [], stop: "error",
               errorMsg: result.runtimeFailure ?? "registered Runtime failed (" + (result.errorCode ?? (result.timedOut ? "timeout" : "exit")) + "); no fallback was selected" };
+            else if (input.parseOutput) finished = input.parseOutput(result.stdout);
             else if (input.jsonEvents === false) finished = { text: result.stdout.trim(), toolUses: [], stop: "end" };
             else {
               // JSON events contain native session IDs and internal calls. Persist only the final text.

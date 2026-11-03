@@ -6,7 +6,7 @@ export const RUNTIME_FAILURE_KINDS = [
 ] as const;
 export type RuntimeFailureKind = typeof RUNTIME_FAILURE_KINDS[number];
 export interface RuntimeFailureContext {
-  runtime: "codex" | "claude" | "opencode";
+  runtime: "codex" | "claude" | "opencode" | "gemini" | "kimi";
   version: string | null;
   loginSource: "host" | "isolated" | "unknown";
   homeMatchesAccount: boolean | null;
@@ -54,7 +54,7 @@ export function classifyRuntimeFailure(input: {
   if (input.status === 429 || /\b429\b|rate[ ._-]*limit|too many requests|requests per minute|tokens per minute/iu.test(text)) return "runtime_rate_limit";
   if (/\b(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN)\b|cannot[ ._-]*connect|(?:failed|unable) to connect|network[ ._-]*(?:connection[ ._-]*)?(?:error|unreachable|failed)|fetch[ ._-]*failed|connection[ ._-]*(?:refused|reset|closed)|socket[ ._-]*hang[ ._-]*up|DNS[ ._-]*(?:lookup|error)/iu.test(text)) return "runtime_network";
   if (/\bETIMEDOUT\b|\btimed[ ._-]*out\b|\btimeout\b/iu.test(text)) return "timeout";
-  if (/(?:unknown|unrecognized|unsupported)[ ._-]+(?:cli[ ._-]+)?(?:option|flag)|unexpected argument.{0,100}found|(?:cli|runtime|codex|claude|opencode).{0,40}version.{0,40}(?:too old|not supported|unsupported|incompatible)|requires? (?:Node(?:\.js)?|runtime) (?:version )?\d/iu.test(text)) return "version_incompatible";
+  if (/(?:unknown|unrecognized|unsupported)[ ._-]+(?:cli[ ._-]+)?(?:option|flag)|unexpected argument.{0,100}found|(?:cli|runtime|codex|claude|opencode|gemini|kimi).{0,40}version.{0,40}(?:too old|not supported|unsupported|incompatible)|requires? (?:Node(?:\.js)?|runtime) (?:version )?\d/iu.test(text)) return "version_incompatible";
   if (/segmentation fault|\bSIGSEGV\b|\bSIGABRT\b|\bSIGBUS\b|thread.{0,80}panicked|fatal runtime panic|fatal error:.*(?:heap|memory)/iu.test(text)) return "runtime_crashed";
   return "runtime_failed";
 }
@@ -73,7 +73,7 @@ const MAX_DATE_MS = 8_640_000_000_000_000;
 export function runtimeFailureMessage(input: RuntimeFailureContext & {
   kind: RuntimeFailureKind; elapsedMs: number; retryAtMs?: number; consecutiveFailures?: number;
 }): string {
-  if (!["codex", "claude", "opencode"].includes(input.runtime)) throw new Error("Invalid diagnostic runtime");
+  if (!["codex", "claude", "opencode", "gemini", "kimi"].includes(input.runtime)) throw new Error("Invalid diagnostic runtime");
   const diagnostic: RuntimeFailureDiagnostic = {
     runtime: input.runtime,
     kind: knownKind(input.kind) ? input.kind : "runtime_failed",

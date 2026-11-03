@@ -21,7 +21,7 @@ const observe = <T>(fn: () => T): T | undefined => { try { return fn(); } catch 
 /** Observe only protocol discriminators and content presence in a bounded temporary line
  * buffer. A lifecycle frame is never a token, and content is never retained in the report. */
 export function createRuntimeStageProcessObserver(recorder: RuntimeStageRecorder | undefined,
-  runtime: "codex" | "claude" | "opencode", signal: AbortSignal) {
+  runtime: "codex" | "claude" | "opencode" | "gemini" | "kimi", signal: AbortSignal) {
   let closed = false, spawned = false, ready = false, sawOutput = false, sawToken = false;
   let line = "", dropping = false;
   const endSpawn = observe(() => recorder?.beginEvent("spawn"));
@@ -43,6 +43,8 @@ export function createRuntimeStageProcessObserver(recorder: RuntimeStageRecorder
       if ((value.type === "item.completed" || value.type === "item.updated") && value.item?.type === "agent_message"
         && typeof value.item.text === "string" && value.item.text.length) mark("first_output", "native_event");
     }
+    if (runtime === "gemini" && value.type === "message" && value.role === "assistant" && typeof value.content === "string" && value.content.length) mark("first_output", "native_event");
+    if (runtime === "kimi" && value.role === "assistant" && (typeof value.content === "string" ? value.content.length : Array.isArray(value.content) && value.content.some((part: any) => part?.type === "text" && typeof part.text === "string" && part.text.length))) mark("first_output", "native_event");
     if (runtime === "opencode" && value.type === "text" && value.part?.type === "text" && typeof value.part.text === "string" && value.part.text.length)
       mark("first_output", "native_event");
   };
