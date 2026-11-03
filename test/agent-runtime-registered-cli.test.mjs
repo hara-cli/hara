@@ -48,7 +48,7 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
   assert.equal(resources.agents.runtimeOptions().find(option => option.id === runtimeId).available, false);
   installer.registerLocal(runtimeId, detected.fingerprint, "host");
   const models = new WorkspaceRuntimeModels(storage, installer);
-  const modelId = runtimeId === "codex" ? "fixture-model" : "claude-sonnet-4-5";
+  const modelId = runtimeId === "codex" ? "fixture-model" : "sonnet";
   await models.select(runtimeId, modelId, 0);
   assert.equal(models.selected(runtimeId), modelId);
   assert.equal(installer.list().options.find(option => option.runtimeId === runtimeId).generalAgentDriverAvailable, true);
