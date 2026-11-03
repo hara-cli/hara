@@ -37,7 +37,7 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
   fs.mkdirSync(dirname(command), { recursive: true });
   fs.writeFileSync(command, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${runtimeId} 1.2.3'; exit 0; fi\nif [ "$1" = "app-server" ]; then exit 1; fi\nif [ "$1" = "debug" ]; then echo '{"models":[{"slug":"fixture-model","display_name":"Fixture"}]}'; exit 0; fi\nprintf 'launch\\n' >> '${argv}.launches'\nprintf '%s\\n' "$@" > '${argv}'\n${runtimeId === "codex" && managed && !hasGit ? `case " $* " in *' --skip-git-repo-check '*) ;; *) echo 'Not inside a trusted directory and --skip-git-repo-check was not specified.' >&2; exit 1;; esac` : ''}\n${failure === 'runtime_auth_recovered' ? `echo '{"type":"error","message":"temporary network error PRIVATE_ACCOUNT_DETAIL"}'; echo '{"type":"item.completed","item":{"type":"agent_message","text":"registered codex reply"}}'; echo '{"type":"turn.completed"}'; exit 0` : failure?.startsWith('runtime_auth_event') ? `echo '{"type":"turn.failed","error":{"message":"401 Unauthorized PRIVATE_ACCOUNT_DETAIL"}}'; exit ${failure === 'runtime_auth_event' ? 0 : 1}` : failure ? `echo '${failure === 'project_not_trusted' ? 'Not inside a trusted directory' : failure === 'runtime_auth_required' ? 'websocket 401 Unauthorized PRIVATE_ACCOUNT_DETAIL' : failure === 'runtime_network' ? 'ECONNRESET PRIVATE_ACCOUNT_DETAIL' : failure === 'runtime_proxy' ? 'proxy connect failed PRIVATE_ACCOUNT_DETAIL' : failure === 'version_incompatible' ? 'unrecognized option --fixture PRIVATE_ACCOUNT_DETAIL' : 'PRIVATE_ACCOUNT_DETAIL'}' >&2; exit 1` : ''}\n${runtimeId === 'codex' ? `echo '{"type":"item.completed","item":{"type":"agent_message","text":"registered codex reply"}}'\necho '{"type":"turn.completed"}'` : `echo '{"type":"result","subtype":"success","is_error":false,"result":"registered ${runtimeId} reply"}'`}\n`, { mode: 0o755 });
   if (runtimeId === "codex") writeFakeCodex(command, { mode: "reply", failure });
-  const installer = new WorkspaceRuntimeInstaller(storage, { discovery: { home: account, path: bin + ":/usr/bin:/bin", systemBins: [],
+  const installer = new WorkspaceRuntimeInstaller(storage, { accountHome: () => account, discovery: { home: account, path: bin + ":/usr/bin:/bin", systemBins: [],
     run: async (_command, args) => args[0] === "-lic" ? null : `${runtimeId} 1.2.3` } });
   const resources = new WorkspaceResources(home, row.scope, { runtimeInstaller: installer }); resources.initialize();
   const main = resources.agents.initializeMain();
@@ -146,11 +146,7 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
     assert.equal(privateEnv.HOME, account);
     assert.equal(fs.existsSync(join(account, ".codex/auth.json")), false, "binding creates no host login credential");
     if (runtimeId === "codex") {
-      const guide = installer.codexLoginInstructions();
-      assert.equal(guide.runtimeId, "codex");
-      assert.ok(!guide.command.includes("runtime-homes"));
-      assert.ok(guide.command.endsWith(" login"));
-      assert.ok(!guide.command.includes("--skip-git-repo-check"));
+      assert.throws(() => installer.codexLoginInstructions(), /reuses the host login/);
     }
     assert.ok(args.includes(modelId), "native launch uses the existing Workspace runtime model selection");
     assert.ok(args.includes(runtimeId === "codex" ? "danger-full-access" : "bypassPermissions"));

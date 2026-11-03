@@ -16,7 +16,7 @@ const nativeState = f => {
   assert.equal(relative.length, 1); const file = join(f.root, relative[0]);
   return { file, value: JSON.parse(fs.readFileSync(file, "utf8")) };
 };
-async function exchange(f, text = "Hello.") { await f.send(text); return until(f.read, done); }
+async function exchange(f, text = "List current colleagues?") { await f.send(text); return until(f.read, done); }
 const resetParams = (f, view, requestId = randomUUID()) => ({ ...f.scope, agentId: f.main.agentId, requestId,
   approved: true, expectedRevision: view.conversation.revision, expectedNativeRevision: view.conversation.nativeSession.revision });
 
@@ -39,7 +39,7 @@ test("41k to 47k native totals debit only this attempt's 6k delta, with cached t
   let view = await exchange(f); assert.equal(view.conversation.state, "completed");
   assert.equal(view.conversation.runUsage.inputTokens, 1000);
   f.mode({ mode: "telemetry", telemetry: [sample(47000, 45000, 40, 47000, 41000), sample(47000, 45000, 40, 47000, 41000)] });
-  view = await exchange(f, "Second task.");
+  view = await exchange(f, "List current colleagues again?");
   assert.equal(view.conversation.state, "completed");
   assert.deepEqual(view.conversation.nativeSession.lastAttempt, { input: 6000, cachedInput: 5000, output: 20 });
   assert.equal(view.conversation.runUsage.inputTokens, 1000); assert.equal(view.conversation.usage.inputTokens, 2000);
@@ -65,15 +65,15 @@ test("context ceiling pauses with open-new-session guidance and persists across 
   let view = await exchange(f);
   assert.equal(view.conversation.taskState, "paused", JSON.stringify({ blockReason: view.conversation.blockReason, native: view.conversation.nativeSession, usage: view.conversation.runUsage })); assert.equal(view.conversation.nativeSession.status, "new_session_required");
   assert.match(view.conversation.blockReason, /Open a new session/); assert.equal(view.conversation.runUsage.inputTokens, 1000);
-  const oldId = nativeState(f).value.threadId; await f.restart(); f.mode("reply");
+  const oldId = nativeState(f).value.threadId; await f.restart(); f.mode("list");
   view = await exchange(f, "Do not silently replace my thread.");
   assert.equal(view.conversation.taskState, "paused"); assert.equal(nativeState(f).value.threadId, oldId);
   assert.equal(f.native().filter(row => row.method === "turn/start").length, 1);
 });
 
 test("resume-failed recovery requires explicit reset; audit, history and usage survive, nonce replay does not reset twice", async t => {
-  const f = await cliMcpFixture(t, "reply"); await exchange(f, "Retain this history.");
-  f.mode("resume-fail"); let view = await exchange(f, "Second hello.");
+  const f = await cliMcpFixture(t, "list"); await exchange(f, "List current colleagues? Retain this history.");
+  f.mode("resume-fail"); let view = await exchange(f, "List current colleagues again?");
   assert.equal(view.conversation.nativeSession.status, "recovery_needed");
   const prior = nativeState(f).value, before = structuredClone(view.conversation), params = resetParams(f, view);
   await assert.rejects(f.request("workspace.session.new", { ...params, approved: false }), /approval/);
@@ -88,7 +88,7 @@ test("resume-failed recovery requires explicit reset; audit, history and usage s
   assert.ok(Number.isFinite(Date.parse(after.resets[0].at)));
   view = await f.read(); assert.deepEqual(view.conversation.history, before.history); assert.deepEqual(view.conversation.usage, before.usage);
   assert.equal(f.native().filter(row => row.method === "thread/start").length, 1);
-  await f.restart(); f.mode("reply"); view = await exchange(f, "A fresh native context.");
+  await f.restart(); f.mode("list"); view = await exchange(f, "List current colleagues in a fresh native context?");
   assert.equal(view.conversation.state, "completed"); assert.notEqual(nativeState(f).value.threadId, prior.threadId);
   assert.equal(f.native().filter(row => row.method === "thread/start").length, 2);
 });
@@ -108,7 +108,7 @@ test("legacy saved counters migrate without granting cache credit from an unknow
   for (const key of ["cachedInput", "contextTokens", "modelContextWindow", "lastAttempt", "resets"]) delete legacy[key];
   fs.writeFileSync(saved.file, JSON.stringify(legacy)); await f.restart();
   f.mode({ mode: "telemetry", telemetry: [sample(47000, 45000, 40, 47000, 41000)] });
-  const view = await exchange(f, "Hello after migration."); assert.equal(view.conversation.state, "completed");
+  const view = await exchange(f, "List current colleagues after migration?"); assert.equal(view.conversation.state, "completed");
   assert.deepEqual(view.conversation.nativeSession.lastAttempt, { input: 6000, cachedInput: 0, output: 20 });
   assert.equal(view.conversation.runUsage.inputTokens, 6000); assert.equal(nativeState(f).value.schemaVersion, 2);
 });

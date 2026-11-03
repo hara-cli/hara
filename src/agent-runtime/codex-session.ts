@@ -311,12 +311,21 @@ export class GovernedCodexSession {
       const turn = object(started.turn);
       if (!nativeId(turn.id)) throw new Error("Codex did not bind the accepted turn");
       active.id = turn.id; active.bind(turn.id);
-      return await terminal;
-    } catch { active.bind(""); active.finish(false, "codex_delivery_unknown_no_replay"); this.client?.close(); return await terminal; }
+      const result = await terminal;
+      if (!result.ok) this.client?.close();
+      // A native terminal frame is logical completion, not proof its tools have stopped.
+      // Drain before the governor sees the final response or imports the final workspace diff.
+      await this.settleNativeAttempt();
+      return result;
+    } catch {
+      active.bind(""); active.finish(false, "codex_delivery_unknown_no_replay"); this.client?.close();
+      await this.settleNativeAttempt();
+      const result = await terminal;
+      return result.ok ? { ok: false, code: 1, timedOut: false, stdout: "", errorCode: "runtime_process_cleanup_unverified" } : result;
+    }
     finally { input.signal.removeEventListener("abort", interrupt); }
   }
-  async release(): Promise<void> {
-    try {
+  private async settleNativeAttempt(): Promise<void> {
       const client = this.client;
       if (client && this.loaded && this.value.threadId) {
         let timer: ReturnType<typeof setTimeout> | undefined;
@@ -332,7 +341,9 @@ export class GovernedCodexSession {
       }
       if (!this.client) { await this.exit; if (this.policy) { await endWorkspaceNativePolicy(this.permit, this.policy); await this.policy.close(); this.policy = undefined; } }
       else if (this.policy) { await endWorkspaceNativePolicy(this.permit, this.policy, { keepResidentRoot: true }); }
-    } finally {
+  }
+  async release(): Promise<void> {
+    try { await this.settleNativeAttempt(); } finally {
       this.active = undefined; this.busy = false; this.lastUsed = Date.now();
       if (!this.closing) { this.idleTimer = setTimeout(() => { void this.dispose(); }, IDLE_MS); this.idleTimer.unref(); }
     }

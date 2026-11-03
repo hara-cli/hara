@@ -31,3 +31,14 @@ test("a missing process-ownership hook never releases the stopped runtime startu
  await new Promise(resolve=>setTimeout(resolve,100));assert.equal(fs.existsSync(marker),false);child.kill('SIGKILL');await once(child,'close');await assert.rejects(policy.close(),/ownership hook/);
  fs.rmSync(policy.tempRoot,{recursive:true,force:true});fs.rmSync(root,{recursive:true,force:true});
 });
+
+test("resident baseline descendants survive a later attempt but whole-resident close removes them",{skip:process.platform!=="darwin"},async t=>{
+ const f=await fixture(t,"resident");
+ const p=start(f,`const{spawn}=require('child_process');console.log(JSON.stringify({root:process.pid}));require('readline').createInterface({input:process.stdin}).on('line',()=>{const child=spawn('/bin/sleep',['300'],{stdio:'ignore'});console.log(JSON.stringify({pid:child.pid}));});`);
+ await p.next();await f.policy.drainAttempt({keepResidentRoot:true});
+ // A resident-owned service helper appears during idle, before the next turn is admitted.
+ p.child.stdin.write('idle-helper\n');const baseline=(await p.next()).pid;
+ f.policy.beginAttempt('two');await f.policy.prepareAttempt();p.child.stdin.write('attempt-tool\n');const current=(await p.next()).pid;
+ await f.policy.drainAttempt({keepResidentRoot:true});assert.equal(live(current),false);assert.equal(live(baseline),true);assert.equal(live(p.child.pid),true);
+ await f.policy.close();assert.equal(live(baseline),false);assert.equal(live(p.child.pid),false);
+});

@@ -62,7 +62,7 @@ export async function fakeCodexMain() {
       return { isError: Boolean(result.isError), text: result.content?.[0]?.text ?? "" };
     }
     function receiptText(text) { return text.split("\n\n<system-reminder>")[0]; }
-    if (!["reply", "usage-reset", "over-budget", "wrong-events", "telemetry", "native-write", "native-claim", "risk"].includes(selected)) {
+    if (!["reply", "over-budget", "native-write", "native-claim", "risk"].includes(selected)) {
       await request("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "fake-codex", version: "1" } });
       await request("notifications/initialized", {});
       meta.tools = (await request("tools/list", {})).tools.map(tool => tool.name); save();

@@ -7,7 +7,7 @@ const starts = f => f.native().filter(row => ["thread/start", "thread/resume"].i
 async function exchange(f, text) { await f.send(text); return until(f.read, done); }
 
 test("foreign thread and stale turn events cannot finish or overwrite the active Codex reply", async t => {
-  const f = await cliMcpFixture(t, "wrong-events"); const view = await exchange(f, "Hello.");
+  const f = await cliMcpFixture(t, "wrong-events"); const view = await exchange(f, "List current colleagues?");
   assert.equal(view.conversation.state, "completed");
   assert.equal(view.conversation.usage.inputTokens, 100);
   assert.equal(view.conversation.nativeSession.status, "ready");
@@ -20,8 +20,8 @@ test("busy Codex input is refused without a second writer and cancellation drain
   await until(async () => f.meta(), Boolean);
   await assert.rejects(f.send("A competing task."), /busy|running|draining/);
   await f.request("workspace.session.cancel", { ...f.scope, agentId: f.main.agentId, runId: sent.runId });
-  await until(f.read, done); f.mode("reply");
-  const view = await exchange(f, "A fresh user message after cancellation.");
+  await until(f.read, done); f.mode("list");
+  const view = await exchange(f, "List current colleagues after cancellation?");
   assert.equal(view.conversation.state, "completed"); assert.equal(starts(f).at(-1).method, "thread/resume");
   assert.equal(f.native().filter(row => row.method === "turn/start").length, 2);
 });
