@@ -192,7 +192,7 @@ test("formal default factory sends exactly the scoped fake credential/model to a
     const workspace = host.createWorkspace("Mock", host.list().revision);
     host.configureConnection(workspace.workspaceId, { label: "Mock only", provider: "openai", baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: "local-fake-workspace-credential", defaultModel: "local-mock-model" }, 0);
     const run = host.start("client", workspace.workspaceId, workspace.selectedAgentId, "hello", randomUUID()); await host.wait(run.runId);
-    assert.equal(host.snapshot(workspace.workspaceId).conversation.state, "blocked"); assert.equal(received.length, 1); assert.equal(received[0].auth, "Bearer local-fake-workspace-credential"); assert.equal(received[0].body.model, "local-mock-model");
+    assert.equal(host.snapshot(workspace.workspaceId).conversation.state, "completed");assert.equal(host.snapshot(workspace.workspaceId).conversation.completion.state,"verified"); assert.equal(received.length, 1); assert.equal(received[0].auth, "Bearer local-fake-workspace-credential"); assert.equal(received[0].body.model, "local-mock-model");
     assert.equal(JSON.stringify(host.snapshot(workspace.workspaceId)).includes("local-fake-workspace-credential"), false);
   } finally { await host.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 });
