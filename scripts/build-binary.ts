@@ -9,7 +9,7 @@ if (!["pi-only", "desktop-sidecar"].includes(mode)) throw new Error("Only Pi-onl
 const version = JSON.parse(await Bun.file("package.json").text()).version as string;
 const thirdPartyNotices = await Bun.file("THIRD_PARTY_NOTICES.md").text();
 const pi = JSON.parse(await Bun.file("node_modules/@earendil-works/pi-coding-agent/package.json").text());
-if (pi.name !== "@earendil-works/pi-coding-agent" || pi.version !== "1.1.0") throw new Error("Bundled Pi SDK must be exactly 1.1.0");
+if (pi.name !== "@earendil-works/pi-coding-agent" || pi.version !== "1.5.0") throw new Error("Bundled Pi SDK must be exactly 1.5.0");
 const result = await Bun.build({
   entrypoints: [entrypoint],
   // @ts-expect-error Bun's native compile API is ahead of the bundled TypeScript declarations.
