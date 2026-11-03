@@ -11115,3 +11115,18 @@ explicitly deferred with two alternatives. Earlier historical failures and stres
 - Keep raw-output retention opt-in for a documented JSON parser. A nonzero native exit otherwise discards stdout before the driver can classify its terminal error frame. Generic transport failure must not overwrite a specific structured error event.
 - Resolve files with `rg --files` in the intended repository before cross-repository reads. Guessed sibling filenames and reads at the task root produced harmless missing-file/not-a-repository errors during this run; no source or shared state changed from those reads.
 - Final focused and full results are recorded in the workspace inbox handoff. Preserve the initial failure logs separately from the final verification.
+
+
+## [ERR-20261103-EXTENSION-CATALOG-CONTRACT] Strict metadata DTO and capability checks
+
+- Status: resolved
+- Area: backend/tests
+- Source: self-review
+- Summary: Initial extension DTO compilation required explicit union narrowing after plain-record checks.
+  A related RPC regression then correctly rejected an outdated exact capability list after
+  `workspace.extensions.v1` was added. Narrow boundary fields explicitly and advance the exact expected
+  capability contract together with an intentional protocol addition; retain strict equality.
+- Resolution: Explicit descriptor validation/typing, synchronized capability expectation, and focused
+  catalog/authorization/RPC regressions. Failed catalog refreshes revoke cached metadata immediately.
+- Related: src/workspace/extension-catalog.ts, src/workspace/extensions.ts,
+  test/workspace-extensions.test.mjs, test/workspace-local-server.test.mjs.
