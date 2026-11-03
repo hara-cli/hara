@@ -110,6 +110,9 @@ for (const kind of ["main", "colleague"]) test(`OpenCode ${kind} calls agent_lis
     const result = await storage.run(() => runConfiguredAgent(history, options, new AgentRuntimeRegistry(undefined, installer, models)));
     assert.equal(result.status, "completed", result.error + " " + (fs.existsSync(argv + ".error") ? fs.readFileSync(argv + ".error", "utf8") : ""));
     assert.equal(calls, 1);
+    const versionStatus = installer.list().options.find(row => row.runtimeId === "opencode").versionStatus;
+    assert.equal(versionStatus.lastSuccessfulVersion, "1.2.3");
+    assert.equal(versionStatus.compatibility, "previously_succeeded");
     assert.match(history.at(-1).text, /Team: Tester/);
     const launch = JSON.parse(fs.readFileSync(argv, "utf8"));
     assert.equal(launch.home, account);

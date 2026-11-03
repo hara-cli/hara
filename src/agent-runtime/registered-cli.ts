@@ -9,11 +9,13 @@ import type { TaskRuntimeBinding } from "./bindings.js";
 import type { GovernedAgentRuntimeDriver } from "./registry.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
-import { assertWorkspaceRunAdmission, attachWorkspaceRuntimeModel, workspaceRunHasManagedProject } from "../workspace/execution.js";
+import { assertWorkspaceRunAdmission, attachWorkspaceRuntimeModel, workspaceRunHasManagedProject, workspaceRunRuntimeStages } from "../workspace/execution.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { createRegisteredCliMcpTurn, WORKSPACE_MCP_TOKEN_ENV } from "./registered-cli-mcp.js";
 import { codexHostToolOverrides } from "./codex-host-config.js";
 import { runtimeProxyFailure } from "../security/runtime-proxy.js";
+import { createRuntimeStageProcessObserver } from "./stage-observer.js";
+import { runtimeUseProtocolSucceeded } from "./runtime-use-success.js";
 
 /** Only the level published by this Workspace's live model inventory may reach the native CLI. */
 function codexEffortArgs(effort: string | null): string[] {
@@ -64,6 +66,7 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
     if (effort && models && !(await models.effortLaunchable(id))) {
       return { status: "error", error: "Agent Runtime '" + id + "' does not support reasoning effort; no level was applied" };
     }
+    let successfulUse: (() => void) | undefined;
     const native = createRegisteredCliMcpTurn({
       signal: options.signal!, assertCurrent, jsonEvents: id === "codex",
       async launch(endpoint, prompt, activity) {
@@ -74,6 +77,11 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
         catch (error) { return { ok: false, stdout: "", code: null, timedOut: false,
           runtimeFailure: runtimeFailureMessage({ ...installer.failureContext(id),
             kind: runtimeProxyFailure(error) ? "runtime_proxy" : "runtime_failed", elapsedMs: 0 }) }; }
+        const recordSuccessfulUse = installer.captureSuccessfulUse(id, resolved.command);
+        const stages = workspaceRunRuntimeStages(permit);
+        try { stages?.setRuntime({ id, version: installer.list().options.find(row => row.runtimeId === id)?.version ?? null,
+          loginSource: resolved.loginSource, model, effort }); } catch { /* Metadata is diagnostic only. */ }
+        const observer = createRuntimeStageProcessObserver(stages, id, native.signal);
         const tracker = runtimeFailureTracker(installer, id, permit.binding.agent.agentId,
           JSON.stringify([resolved.command, resolved.loginSource, resolved.env.HOME, resolved.proxyUrl, permit.binding.agent.configRevision, model, effort]), resolved);
         const held = tracker.blocked();
@@ -89,8 +97,10 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
         try {
           const result = await runExternalCommandCapture({ command: resolved.command, env }, args, {
             cwd: options.ctx.cwd, signal: native.signal, failureKind: "runtime", proxyUrl: resolved.proxyUrl, timeoutMs: Number(options.timeoutMs) || 120_000,
-            maxOutputBytes: 2 * 1024 * 1024, onStdout: activity, retainStdoutOnFailure: id === "codex",
+            maxOutputBytes: 2 * 1024 * 1024, onSpawn: observer.onSpawn,
+            onStdout: chunk => { observer.onStdout(chunk); activity(); }, retainStdoutOnFailure: id === "codex",
           });
+          observer.finish(result.ok, result.errorCode, Boolean(result.stdout.trim()));
           // Codex may deliver a terminal error frame with a zero exit. Classify only the error frame,
           // never model prose, and discard all native output on this path.
           let eventFailure: string | undefined;
@@ -110,13 +120,18 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
             return { ...result, ok: false, stdout: "", runtimeFailure: tracker.failed(kind, Date.now() - started) };
           }
           tracker.succeeded();
+          if (result.ok && !native.signal.aborted && runtimeUseProtocolSucceeded(id, result.stdout)) successfulUse = recordSuccessfulUse;
           return { ...result, stdout: redactToolSubprocessOutput(result.stdout, env) };
-        } finally { delete env[WORKSPACE_MCP_TOKEN_ENV]; }
+        } finally { observer.finish(false); delete env[WORKSPACE_MCP_TOKEN_ENV]; }
       },
     });
     try {
       attachWorkspaceRuntimeModel(permit, options, id, args => native.turn(args));
-      return await runGovernedAgent(history, options, id, (provider, args) => provider.turn(args));
+      const outcome = await runGovernedAgent(history, options, id, (provider, args) => provider.turn(args));
+      // A zero process exit alone is not a successful governed CLI turn (JSON errors,
+      // cancellation and protocol failures must not replace the last successful version).
+      if (outcome.status === "completed" && !options.signal?.aborted && successfulUse) { assertCurrent(); successfulUse(); }
+      return outcome;
     } finally { await native.close(history); }
   } };
 }

@@ -20,6 +20,7 @@ import { historyChars } from "../agent/context-budget.js";
 import type { ToolResult } from "../providers/types.js";
 import type { WorkspaceContextObservation } from "./context-audit.js";
 import { WorkspaceExecutionAudit, type WorkspaceExecutionError } from "./execution-audit.js";
+import type { RuntimeStageRecorder } from "./runtime-stage-events.js";
 import type { WorkspaceUserInteraction, WorkspaceUserQuestion } from "./user-interaction.js";
 
 export interface WorkspaceRunPermit { readonly binding: Readonly<WorkspaceRunBinding> }
@@ -43,6 +44,9 @@ interface PermitState {
   contextStats?: WorkspaceContextStats;
   wakeChars: number;
   audit: WorkspaceExecutionAudit;
+  runtimeStages?: RuntimeStageRecorder;
+  firstStageToken: boolean;
+  onRuntimeStageChanged?: () => void;
   interaction?: WorkspaceUserInteraction;
   onQuestion?: (question: WorkspaceUserQuestion) => void;
   onInteractionChanged?: () => void;
@@ -95,6 +99,9 @@ export function createWorkspaceRunPermit(input: {
   /** Trusted Host-only attempt boundary. Persisted history stays complete and append-only. */
   modelHistory?: { history: NeutralMsg[]; start: number; retain?: (result: ToolResult) => string; usedTokens?: () => number };
   observeContext?(value: WorkspaceContextObservation): void;
+  /** Host-created diagnostic recorder, never accepted from model/RPC data. */
+  runtimeStages?: RuntimeStageRecorder;
+  onRuntimeStageChanged?(): void;
   interaction?: WorkspaceUserInteraction;
   onQuestion?(question: WorkspaceUserQuestion): void;
   /** Host view refresh after an ask card is posted (async cards do not pass through a checkpoint). */
@@ -158,6 +165,7 @@ export function createWorkspaceRunPermit(input: {
       if (state.interaction?.check(state.interactionUsage?.() ?? state.usage, Date.now() - started)) throw new Error("Workspace is waiting for user input; model not dispatched");
       publishUsage(state, { modelCalls: 1 });
       const auditIndex = state.audit.start("model", state.usage.modelCalls, "provider"), callStarted = performance.now();
+      const endStage = runtimeStageObserve(state, () => state.runtimeStages?.beginEvent("model_roundtrip", { call: state.usage.modelCalls }));
       let outcome: "completed" | "error" | "cancelled" = "error", errorKind: WorkspaceExecutionError = "thrown", status: number | null = null;
       const observation = { modelCall: state.usage.modelCalls, systemChars: args.system.length, toolSchemaChars: JSON.stringify(args.tools).length,
         systemAndToolsUtf8Bytes: Buffer.byteLength(args.system + JSON.stringify(args.tools)), modelHistoryChars: historyChars(args.history), wakeChars: state.wakeChars,
@@ -168,7 +176,14 @@ export function createWorkspaceRunPermit(input: {
         if (!fn || revoked.signal.aborted || args.signal?.aborted) return;
         try { assertLive(); fn(...values); } catch { revoked.abort(); }
       };
-      const guardedArgs = { ...args, signal: AbortSignal.any(signals), onText: forward(args.onText),
+      const guardedArgs = { ...args, signal: AbortSignal.any(signals), onText: forward((chunk: string) => {
+        // A native MCP handoff is a governor wait, not proof of a model token. Native
+        // output is observed by its driver from documented structured events only.
+        if (chunk.length && !state.runtimeModel && state.runtimeStages && !state.firstStageToken) {
+          state.firstStageToken = true; runtimeStageObserve(state, () => state.runtimeStages?.mark("first_token", "provider_stream"));
+        }
+        args.onText?.(chunk);
+      }),
         onReasoning: forward(args.onReasoning), onActivity: forward(args.onActivity), onRetry: forward((event: ProviderRetryEvent) => {
           state.audit.retry(auditIndex, event); args.onRetry?.(event);
         }) };
@@ -188,6 +203,7 @@ export function createWorkspaceRunPermit(input: {
         return result;
       } finally {
         if (input.signal.aborted || args.signal?.aborted || revoked.signal.aborted) { outcome = "cancelled"; errorKind = "cancelled"; }
+        runtimeStageObserve(state, () => endStage?.(outcome, outcome === "error" ? "runtime_failed" : undefined));
         state.audit.finish(auditIndex, performance.now() - callStarted, outcome, errorKind, status);
       }
     },
@@ -196,6 +212,7 @@ export function createWorkspaceRunPermit(input: {
     updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false, wakeChars: 0,
     interaction: input.interaction, onQuestion: input.onQuestion, onInteractionChanged: input.onInteractionChanged, interactionUsage: input.interactionUsage, startedAt: started, toolTail: Promise.resolve(),
     audit: new WorkspaceExecutionAudit(input.storage, binding.runId, binding.agent.agentId),
+    runtimeStages: input.runtimeStages, firstStageToken: false, onRuntimeStageChanged: input.onRuntimeStageChanged,
     ...(input.modelHistory ? { modelHistory: { ...input.modelHistory,
       prefixDigest: createHash("sha256").update(canonical(input.modelHistory.history.slice(0, input.modelHistory.start))).digest("hex") } } : {}) };
   for (const value of Object.values(state.usage)) if (!Number.isSafeInteger(value) || value < 0) throw new Error("invalid Workspace persisted usage");
@@ -328,6 +345,7 @@ export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string
     state.interaction?.admit(name);
     publishUsage(state, { toolCalls: 1 });
     const auditIndex = state.audit.start("tool", state.usage.toolCalls, name), callStarted = performance.now();
+    const endStage = runtimeStageObserve(state, () => state.runtimeStages?.beginEvent("tool_call", { call: state.usage.toolCalls, toolName: name }));
     let outcome: "completed" | "error" | "cancelled" = "error", errorKind: WorkspaceExecutionError = "thrown";
     try {
       state.assertLive(); const result = await execute();
@@ -338,6 +356,7 @@ export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string
       state.interaction?.observe(name, undefined, true); throw error;
     } finally {
       if (state.signal.aborted) { outcome = "cancelled"; errorKind = "cancelled"; }
+      runtimeStageObserve(state, () => endStage?.(outcome, outcome === "error" ? "runtime_failed" : undefined));
       state.audit.finish(auditIndex, performance.now() - callStarted, outcome, errorKind);
     }
   });
@@ -348,4 +367,14 @@ export async function closeWorkspaceRunPermit(permit: WorkspaceRunPermit): Promi
   const state = stateOf(permit); state.retired = true;
   while (state.pending.size) await Promise.allSettled([...state.pending]);
   state.lease.release();
+}
+
+/** Diagnostics never confer execution authority or make an observer failure a task failure. */
+function runtimeStageObserve<T>(state: PermitState, observe: () => T): T | undefined {
+  if (state.retired || !state.runtimeStages) return undefined;
+  try { const value = observe(); state.onRuntimeStageChanged?.(); return value; } catch { return undefined; }
+}
+/** Only a real Host permit may attach native lifecycle metadata. No renderer identity is accepted. */
+export function workspaceRunRuntimeStages(permit: WorkspaceRunPermit): RuntimeStageRecorder | undefined {
+  const state = stateOf(permit); state.assertLive(); return state.runtimeStages;
 }

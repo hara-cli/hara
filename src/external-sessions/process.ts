@@ -49,6 +49,8 @@ export interface ExternalCommandRunOptions {
   cwd?: string;
   /** Abort a long-running provider turn and terminate its complete process group. */
   signal?: AbortSignal;
+  /** Diagnostic notification after a successful OS spawn, with no PID authority. */
+  onSpawn?: () => void;
   /** Observe bounded stdout while retaining the same total output limit and redaction boundary. */
   onStdout?: (chunk: string) => void;
   /** Preserve bounded stdout on a non-zero exit only for callers that parse a documented structured
@@ -141,6 +143,9 @@ export async function runExternalCommandCapture(
       abort();
       return;
     }
+    child.once("spawn", () => {
+      if (!done) { try { run.onSpawn?.(); } catch { /* Diagnostics cannot fail the command. */ } }
+    });
     child.stdout?.on("data", (chunk: Buffer) => {
       if (done) return;
       outputBytes += chunk.length;

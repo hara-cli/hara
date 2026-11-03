@@ -11,6 +11,7 @@ import { runtimeArchiveMember } from "./runtime-archive.js";
 import { WorkspaceRuntimeProxy } from "./runtime-proxy.js";
 import { validOpenCodeNativeHeader } from "../coding/bundled-opencode.js";
 import { detectInstalledRuntimes, inspectLocalRuntime, type DetectionOptions, type DetectedRuntime } from "./runtime-detect.js";
+import { WorkspaceRuntimeVersionStore, projectRuntimeVersionStatus, type RuntimeVersionCurrent } from "./runtime-version-history.js";
 
 export type OptionalRuntimeId = "opencode" | "codex" | "claude" | "agy";
 export interface RuntimeTarget { platform: NodeJS.Platform; arch: string }
@@ -449,8 +450,47 @@ export class WorkspaceRuntimeInstaller {
       operation.state = "registered";
     } catch { operation.state = operation.controller.signal.aborted ? "cancelled" : "failed"; }
   }
+  /** Capture the already trusted executable at the physical launch. This closure is Host-only
+   * diagnostic bookkeeping; it cannot register a binary or turn a discovered version into trust. */
+  captureSuccessfulUse(runtimeId: OptionalRuntimeId, command: string): () => void {
+    let before: ReturnType<WorkspaceRuntimeInstaller["boundVersionIdentity"]> = null;
+    try { before = this.boundVersionIdentity(runtimeId); } catch { /* optional history */ }
+    if (!before || before.command !== command) return () => {};
+    const captured = before;
+    return () => {
+      if (this.closed) return;
+      try {
+        const current = this.boundVersionIdentity(runtimeId);
+        if (!current || current.command !== captured.command || current.realPath !== captured.realPath
+          || current.fingerprint !== captured.fingerprint || current.version !== captured.version) return;
+        new WorkspaceRuntimeVersionStore(this.storage).recordSuccessfulUse(runtimeId, captured.version, captured.fingerprint);
+      } catch { /* Damaged/stale history is preserved and never changes an execution result. */ }
+    };
+  }
+  private boundVersionIdentity(runtimeId: OptionalRuntimeId): { command: string; realPath: string; version: string | null; fingerprint: string } | null {
+    if (!optionalRuntimeId(runtimeId)) return null;
+    const version = (value: string) => value === value.trim() && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(value) ? value : null;
+    const local = this.locals.read().entries.find(row => row.runtimeId === runtimeId);
+    if (local) {
+      const checked = inspectLocalRuntime(local.path, true);
+      if (!checked || checked.realPath !== local.realPath || checked.fingerprint !== local.fingerprint) return null;
+      return { command: local.path, realPath: checked.realPath, version: version(local.version), fingerprint: checked.fingerprint };
+    }
+    const installed = this.state.read().entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
+    const checked = installed && this.inspect(installed.artifact, installed);
+    return installed && checked ? { command: checked.path, realPath: checked.path,
+      version: version(installed.artifact.version), fingerprint: installed.executableSha256 } : null;
+  }
+  private versionProjection() {
+    let history: ReturnType<WorkspaceRuntimeVersionStore["list"]> | null;
+    try { history = new WorkspaceRuntimeVersionStore(this.storage).list(); } catch { history = null; }
+    return (runtimeId: OptionalRuntimeId, current: RuntimeVersionCurrent) => {
+      const projected = projectRuntimeVersionStatus(history?.find(row => row.runtimeId === runtimeId) ?? null, current);
+      return history === null ? { ...projected, change: "unknown" as const, compatibility: "unknown" as const } : projected;
+    };
+  }
   list() {
-    const value = this.state.read(), locals = this.locals.read();
+    const value = this.state.read(), locals = this.locals.read(), versionStatus = this.versionProjection();
     // Local registrations win over an older downloaded install, so their recorded source is the
     // effective one; merge in that same order instead of letting a stale record shadow it.
     const loginSources = [...locals.loginSources, ...value.loginSources.filter(row => !locals.loginSources.some(prior => prior.runtimeId === row.runtimeId))];
@@ -458,15 +498,27 @@ export class WorkspaceRuntimeInstaller {
       const local = locals.entries.find(row => row.runtimeId === runtimeId), detected = this.detected.find(row => row.runtimeId === runtimeId);
       const loginSource = loginSources.find(row => row.runtimeId === runtimeId)?.source ?? "isolated";
       if (local || detected) {
-        const selected = local ?? detected!, inspected = inspectLocalRuntime(selected.path);
-        const valid = Boolean(inspected && inspected.realPath === selected.realPath && inspected.fingerprint === selected.fingerprint);
-        return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: valid, registered: Boolean(local && valid), version: selected.version,
+        const localCheck = local && inspectLocalRuntime(local.path);
+        const registered = Boolean(local && localCheck && localCheck.realPath === local.realPath && localCheck.fingerprint === local.fingerprint);
+        const detectedCheck = detected && inspectLocalRuntime(detected.path);
+        const discovered = Boolean(detected && detectedCheck && detectedCheck.realPath === detected.realPath && detectedCheck.fingerprint === detected.fingerprint);
+        // A newly discovered replacement may be explained/confirmed, but the old binding still
+        // refuses it until registerLocal receives a new explicit human confirmation.
+        const selected = registered ? local! : discovered ? detected! : local ?? detected!;
+        const inspected = registered ? localCheck : discovered ? detectedCheck : localCheck ?? detectedCheck;
+        const valid = registered || discovered, version = valid ? selected.version : null;
+        return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: valid, registered, version,
           path: selected.path, fingerprint: valid ? selected.fingerprint : null, source: selected.source, loginSource,
-          generalAgentDriverAvailable: Boolean(local && valid && (runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode" && loginSource === "host")), state: valid ? local ? "local_registered" : "detected" : "integrity_failed" };
+          versionStatus: versionStatus(runtimeId, { version, fingerprint: inspected?.fingerprint ?? null,
+            registered, requiresRetrust: !registered && Boolean(local || discovered) }),
+          generalAgentDriverAvailable: Boolean(registered && (runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode" && loginSource === "host")), state: valid ? registered ? "local_registered" : "detected" : "integrity_failed" };
       }
       const installed = value.entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
       let verified = false; if (installed) try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* tampering revokes use, never repair or fallback */ }
-      return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: verified, registered: verified, version: installed?.artifact.version ?? null,
+      const version = verified ? installed!.artifact.version : null;
+      return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: verified, registered: verified, version,
+        versionStatus: versionStatus(runtimeId, { version, fingerprint: verified ? installed!.executableSha256 : null,
+          registered: verified, requiresRetrust: Boolean(installed && !verified) }),
         loginSource, generalAgentDriverAvailable: Boolean(verified && (runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode" && loginSource === "host")), state: installed ? verified ? "registered" : "integrity_failed" : "not_installed" };
     }), operations: [...this.operations.values()].slice(-64).map(({ controller: _c, ...row }) => row) };
   }

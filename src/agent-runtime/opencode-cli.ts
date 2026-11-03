@@ -6,12 +6,13 @@ import { runExternalCommandCapture, type ExternalCommandCaptureResult } from "..
 import { createCodingHostBridge, type CodingHostBridge } from "../coding/host.js";
 import { runGovernedAgent, type RunOpts, type RunOutcome } from "../agent/loop.js";
 import type { NeutralMsg, ToolResult, ToolSpec, TurnArgs, TurnResult } from "../providers/types.js";
-import { assertWorkspaceRunAdmission } from "../workspace/execution.js";
+import { assertWorkspaceRunAdmission, workspaceRunRuntimeStages } from "../workspace/execution.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
 import type { TaskRuntimeBinding } from "./bindings.js";
 import type { GovernedAgentRuntimeDriver } from "./registry.js";
 import { CLI_TOOL_GUIDANCE } from "./tool-guidance.js";
+import { createRuntimeStageProcessObserver } from "./stage-observer.js";
 
 interface PendingCall { id: string; name: string; input: Record<string, unknown>; resolve(result: ToolResult): void }
 type Failure = RuntimeProxyFailure | RuntimeFailureKind;
@@ -78,7 +79,8 @@ export function openCodeRunArgs(cwd: string, model: string, prompt: string): str
 }
 
 function createOpenCodeTurn(input: { installer: WorkspaceRuntimeInstaller; model: string; options: RunOpts;
-  tracker: ReturnType<typeof runtimeFailureTracker> }) {
+  tracker: ReturnType<typeof runtimeFailureTracker>;
+  captureSuccessfulUse(command: string): () => void; onSuccessfulUse(record: () => void): void }) {
   const stop = new AbortController();
   const signal = input.options.signal ? AbortSignal.any([input.options.signal, stop.signal]) : stop.signal;
   const pending = new Map<string, PendingCall>(), queue: PendingCall[] = [];
@@ -120,27 +122,31 @@ function createOpenCodeTurn(input: { installer: WorkspaceRuntimeInstaller; model
         } else {
           physical = (async () => {
             const started = Date.now();
+            let observer: ReturnType<typeof createRuntimeStageProcessObserver> | undefined;
             try {
               const held = input.tracker.blocked();
               if (held) { finished = { text: "", toolUses: [], stop: "error", errorMsg: held }; return; }
               const resolved = await input.installer.prepareBound("opencode", signal);
               assertCurrent();
+              const recordSuccessfulUse = input.captureSuccessfulUse(resolved.command);
+              observer = createRuntimeStageProcessObserver(workspaceRunRuntimeStages(permit), "opencode", signal);
               const env = openCodeRunEnv(resolved.env, bridge!);
               const result = await runExternalCommandCapture({ command: resolved.command, env },
                 openCodeRunArgs(input.options.ctx.cwd, input.model, prompt), {
                   cwd: input.options.ctx.cwd, signal, timeoutMs: permit.binding.budget.timeoutMs,
                   maxOutputBytes: 4 * 1024 * 1024, retainStdoutOnFailure: true,
                   failureKind: "runtime", proxyUrl: resolved.proxyUrl,
-                  onStdout: () => args.onActivity?.(),
+                  onSpawn: observer.onSpawn, onStdout: chunk => { observer?.onStdout(chunk); args.onActivity?.(); },
                 });
+              observer.finish(result.ok, result.errorCode);
               const parsed = parseOpenCodeRun(result, Boolean(resolved.proxyUrl));
               if (signal.aborted || result.errorCode === "interrupted") finished = { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
               else if (parsed.stop === "error") finished = { ...parsed, errorMsg: input.tracker.failed(
                 classifyRuntimeFailure({ code: parsed.errorMsg }), Date.now() - started) };
-              else { input.tracker.succeeded(); finished = parsed; }
+              else { input.tracker.succeeded(); finished = parsed; assertCurrent(); input.onSuccessfulUse(recordSuccessfulUse); }
             } catch (error) { finished = { text: "", toolUses: [], stop: "error", errorMsg: signal.aborted ? "interrupted"
               : input.tracker.failed(runtimeProxyFailure(error) ? "runtime_proxy" : "runtime_failed", Date.now() - started) }; }
-            finally { notify(); }
+            finally { observer?.finish(false); notify(); }
           })();
         }
       }
@@ -187,8 +193,20 @@ export function openCodeCliDriver(installer: WorkspaceRuntimeInstaller, models?:
     try { catalog = await models.list("opencode"); }
     catch { return diagnostic("runtime_failed"); }
     if (!catalog.models.some(row => row.id === model.modelId)) return diagnostic("invalid_model");
-    const kernel = createOpenCodeTurn({ installer, model: model.modelId, options, tracker });
-    try { return await runGovernedAgent(history, options, "opencode", kernel.turn); }
+    try { workspaceRunRuntimeStages(permit)?.setRuntime({ id: "opencode",
+      version: installer.list().options.find(row => row.runtimeId === "opencode")?.version ?? null,
+      loginSource: resolved.loginSource, model: model.modelId, effort: null }); } catch { /* Diagnostic metadata only. */ }
+    let successfulUse: (() => void) | undefined;
+    const kernel = createOpenCodeTurn({ installer, model: model.modelId, options, tracker,
+      captureSuccessfulUse: command => installer.captureSuccessfulUse("opencode", command),
+      onSuccessfulUse: record => { successfulUse = record; } });
+    try {
+      const outcome = await runGovernedAgent(history, options, "opencode", kernel.turn);
+      if (outcome.status === "completed" && !options.signal?.aborted && successfulUse) {
+        assertWorkspaceRunAdmission(permit, options, "opencode"); successfulUse();
+      }
+      return outcome;
+    }
     finally { await kernel.close(history); }
   } };
 }
