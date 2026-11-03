@@ -6,7 +6,7 @@ export const RUNTIME_FAILURE_KINDS = [
 ] as const;
 export type RuntimeFailureKind = typeof RUNTIME_FAILURE_KINDS[number];
 export interface RuntimeFailureContext {
-  runtime: "codex" | "claude" | "opencode";
+  runtime: "codex" | "claude" | "opencode" | "pi";
   version: string | null;
   loginSource: "host" | "isolated" | "unknown";
   homeMatchesAccount: boolean | null;
@@ -73,7 +73,7 @@ const MAX_DATE_MS = 8_640_000_000_000_000;
 export function runtimeFailureMessage(input: RuntimeFailureContext & {
   kind: RuntimeFailureKind; elapsedMs: number; retryAtMs?: number; consecutiveFailures?: number;
 }): string {
-  if (!["codex", "claude", "opencode"].includes(input.runtime)) throw new Error("Invalid diagnostic runtime");
+  if (!["codex", "claude", "opencode", "pi"].includes(input.runtime)) throw new Error("Invalid diagnostic runtime");
   const diagnostic: RuntimeFailureDiagnostic = {
     runtime: input.runtime,
     kind: knownKind(input.kind) ? input.kind : "runtime_failed",

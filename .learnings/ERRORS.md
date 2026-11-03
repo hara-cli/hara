@@ -11137,3 +11137,16 @@ The isolated Pi 1.5.0 RPC process accepted get_state but refused prompt with a c
 - Production/defaults/C-lite integration: HOLD pending design review and public-policy Pi support.
 - Related Files: scripts/pi-full-mode-prototype.mjs, scripts/pi-full-mode-prototype.test.mjs, ../inbox/2026-11-03-pi-full-mode-tip.md
 - Pattern-Key: pi_rpc.empty_auth_read_requires_exact_lock
+
+
+## [ERR-20261103-PI-NATIVE-PRODUCTION-BOUNDARIES] Native completion must join physical work
+
+- Logged: 2026-11-03
+- Status: resolved in adapter; final shared-layer integration pending
+- Production integration found that a repeated MCP close could return while its first close still awaited a physical native launch. Close now returns one shared promise. A Pi MCP completion request is deferred until native settle and common process-tree drain; it cannot publish done while native effects remain active.
+- The adapter awaits the public layer's asynchronous STOP/CONT ownership registration. A failed drain leaves the native policy attached and the Workspace lease retained; no private Pi process-tree cleanup was introduced.
+- Per-attempt model/MCP capabilities travel only through one inherited fd 3, consumed and closed before tools/session loading. They are absent from argv, env and launch configuration files. Opaque upstream reasoning remains in authenticated scoped Host storage across gateway replacement.
+- A first native idle-resume fixture incorrectly reused the prior MCP transport session. Recreating the per-attempt endpoint fixes the fixture and matches production; the same native session id resumes without replaying the previous tools. The original failure log is retained.
+- Initial new TypeScript/narrowing and test syntax errors were corrected and the original build/failure logs retained. Do not treat a test file that failed to parse as a passed acceptance check.
+- Verification: production RPC, background descendant drain, resource traps, continuation restoration and request-local proxy tests pass with a hashed public-layer draft snapshot. Exact immutable public Pi/drain/N1 commits and Desk acceptance remain separate prerequisites.
+- Pattern-Key: pi_native.physical_close_and_per_attempt_capability

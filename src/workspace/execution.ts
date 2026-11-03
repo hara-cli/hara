@@ -1,3 +1,4 @@
+import type { RuntimeExecutionPolicy, NativeWorkspaceEvidence, RuntimeRiskEvent } from "../agent-runtime/execution-policy.js";
 // A serialized RunBinding is provenance, never an execution capability. Only trusted Host composition
 // calls this factory; renderer/Agent arguments cannot populate the private WeakMap below.
 import { createHash } from "node:crypto";
@@ -31,6 +32,11 @@ interface PermitState {
   cwd: string;
   managedProject: boolean;
   stateHome: string;
+  storage: WorkspaceResourceStorage;
+  nativePolicy?: RuntimeExecutionPolicy;
+  nativeEvidence?: NativeWorkspaceEvidence;
+  nativeRisks?: RuntimeRiskEvent[];
+  onNativeRisks?(risks: readonly RuntimeRiskEvent[]): void;
   signal: AbortSignal;
   tools: Set<string>;
   usage: WorkspaceUsage;
@@ -100,6 +106,7 @@ export function createWorkspaceRunPermit(input: {
   modelHistory?: { history: NeutralMsg[]; start: number; retain?: (result: ToolResult) => string; usedTokens?: () => number };
   observeContext?(value: WorkspaceContextObservation): void;
   /** Host-created diagnostic recorder, never accepted from model/RPC data. */
+  onNativeRisks?(risks: readonly RuntimeRiskEvent[]): void;
   runtimeStages?: RuntimeStageRecorder;
   onRuntimeStageChanged?(): void;
   interaction?: WorkspaceUserInteraction;
@@ -208,7 +215,7 @@ export function createWorkspaceRunPermit(input: {
       }
     },
   };
-  state = { assertLive, provider, cwd, managedProject, stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
+  state = { onNativeRisks: input.onNativeRisks, storage: input.storage, assertLive, provider, cwd, managedProject, stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
     updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false, wakeChars: 0,
     interaction: input.interaction, onQuestion: input.onQuestion, onInteractionChanged: input.onInteractionChanged, interactionUsage: input.interactionUsage, startedAt: started, toolTail: Promise.resolve(),
     audit: new WorkspaceExecutionAudit(input.storage, binding.runId, binding.agent.agentId),
@@ -366,6 +373,13 @@ export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string
 export async function closeWorkspaceRunPermit(permit: WorkspaceRunPermit): Promise<void> {
   const state = stateOf(permit); state.retired = true;
   while (state.pending.size) await Promise.allSettled([...state.pending]);
+  if (state.nativePolicy) {
+    state.lease.setDraining(true);
+    const policy = state.nativePolicy;
+    const { endWorkspaceNativePolicy } = await import("../agent-runtime/workspace-native-policy.js");
+    await endWorkspaceNativePolicy(permit, policy); await policy.close();
+    state.lease.setDraining(false);
+  }
   state.lease.release();
 }
 
@@ -377,4 +391,42 @@ function runtimeStageObserve<T>(state: PermitState, observe: () => T): T | undef
 /** Only a real Host permit may attach native lifecycle metadata. No renderer identity is accepted. */
 export function workspaceRunRuntimeStages(permit: WorkspaceRunPermit): RuntimeStageRecorder | undefined {
   const state = stateOf(permit); state.assertLive(); return state.runtimeStages;
+}
+
+/** Host-only scoped storage. Same public-layer contract used by native session receipts. */
+export function workspaceRuntimeStorage(permit: WorkspaceRunPermit): WorkspaceResourceStorage {
+  const state = stateOf(permit); state.assertLive(); return state.storage;
+}
+/** Native Pi tool batches are issued by the Host model bridge, never inferred from CLI success text. */
+export function recordWorkspacePiNativeCalls(permit: WorkspaceRunPermit, names: readonly string[]): void {
+  const state = stateOf(permit); state.assertLive();
+  const native = new Set(["read", "bash", "edit", "write"]);
+  if (!state.started || !state.nativePolicy || permit.binding.agent.runtimeId !== "pi" || names.some(name => !native.has(name)) || names.length > 256
+    || state.usage.toolCalls + names.length > permit.binding.budget.maxToolCalls) throw new Error("Workspace native Pi tool budget exhausted");
+  if (names.length) publishUsage(state, { toolCalls: names.length });
+}
+
+export function attachWorkspaceNativePolicy(permit: WorkspaceRunPermit, policy: RuntimeExecutionPolicy): void {
+  const state = stateOf(permit); state.assertLive();
+  if (state.nativePolicy && state.nativePolicy !== policy) throw new Error("A native process already owns this attempt");
+  if (policy.workRoot !== state.cwd) throw new Error("Native working directory does not match the admitted project");
+  state.nativePolicy = policy; state.nativeEvidence = undefined;
+}
+export function workspaceRunNativeEvidence(permit: WorkspaceRunPermit): NativeWorkspaceEvidence | null {
+  const state = stateOf(permit); state.assertLive();
+  if (state.nativePolicy) state.nativeEvidence = state.nativePolicy.collectWorkspaceEvidence() ?? undefined;
+  return state.nativeEvidence ? structuredClone(state.nativeEvidence) : null;
+}
+export function finishWorkspaceNativePolicy(permit: WorkspaceRunPermit, policy: RuntimeExecutionPolicy): void {
+  const state = stateOf(permit);
+  if (state.nativePolicy !== policy) return;
+  try { state.nativeEvidence = policy.collectWorkspaceEvidence() ?? undefined; publishWorkspaceNativeRisks(permit); }
+  finally { state.nativePolicy = undefined; }
+}
+
+export function publishWorkspaceNativeRisks(permit: WorkspaceRunPermit): void {
+  const state = stateOf(permit), policy = state.nativePolicy;
+  if (!policy) return;
+  const risks = policy.risks.map(row => ({ ...row }));
+  if (JSON.stringify(risks) !== JSON.stringify(state.nativeRisks)) { state.nativeRisks = risks; state.onNativeRisks?.(risks); }
 }

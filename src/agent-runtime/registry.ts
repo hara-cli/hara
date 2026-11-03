@@ -35,7 +35,7 @@ export class AgentRuntimeRegistry {
 
   constructor(drivers?: readonly GovernedAgentRuntimeDriver[], private readonly installer?: WorkspaceRuntimeInstaller,
     models?: WorkspaceRuntimeModels) {
-    const selected = drivers ?? [{ id: "hara", run: runAgent }, { id: "pi", run: runPiAgent }];
+    const selected = drivers ?? [{ id: "hara", run: runAgent }, { id: "pi", run: (history: NeutralMsg[], options: RunOpts) => runPiAgent(history, options, installer) }];
     for (const driver of [...selected, ...(installer ? [registeredCliDriver("codex", installer, models), registeredCliDriver("claude", installer, models), openCodeCliDriver(installer, models)] : [])]) {
       if (!AGENT_RUNTIME_IDS.includes(driver.id) || this.drivers.has(driver.id) || typeof driver.run !== "function") {
         throw new Error("invalid or duplicate governed Agent Runtime driver");
@@ -76,7 +76,7 @@ export class AgentRuntimeRegistry {
       }
       this.assertAvailable(runtimeId);
     }
-    if (runtimeId === "pi") return runPiAgent(history, options);
+    if (runtimeId === "pi") return runPiAgent(history, options, this.installer);
     if (runtimeId === "hara") return runAgent(history, options);
     const agent = options.workspaceRun.binding.agent;
     const binding = freezeTaskRuntimeBinding({ version: 1, spaceId: "personal", agentRef: "main", runtimeId,

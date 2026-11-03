@@ -1,7 +1,14 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { execFileSync } from "node:child_process";
 import { isIP } from "node:net";
 import { readRawConfig } from "../config.js";
 import { throttleSignal } from "./throttle-signal.js";
+
+const workspaceModelProxy = new AsyncLocalStorage<string | null>();
+/** A frozen Host runtime proxy applies only to that model operation, with no global env mutation. */
+export function withWorkspaceModelProxy<T>(proxyUrl: string | null, operation: () => Promise<T>): Promise<T> {
+  return workspaceModelProxy.run(proxyUrl === null ? null : normalizeModelProxyUri(proxyUrl), operation);
+}
 
 export type ModelProxySource = "hara-env" | "environment" | "config" | "windows-system";
 
@@ -384,7 +391,9 @@ export function createModelFetch(
   return async (input, init) => {
     const rawUrl = input instanceof Request ? input.url : String(input);
     const url = new URL(rawUrl);
-    const proxy = selectModelProxy(url, { ...resolutionDefaults, configuredProxy });
+    const scoped = workspaceModelProxy.getStore();
+    const proxy = scoped == null ? selectModelProxy(url, { ...resolutionDefaults, configuredProxy })
+      : loopbackHostname(url.hostname) ? undefined : { uri: scoped, source: "config" as const };
     try {
       let response: Response;
       if (!proxy) {

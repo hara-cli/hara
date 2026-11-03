@@ -106,6 +106,10 @@ interface PendingCall {
 export function createRegisteredCliMcpTurn(input: {
   signal: AbortSignal;
   jsonEvents?: boolean;
+  /** Pi completion is committed by the Host only after native settle and shared tree drain. */
+  deferNativeCompletion?: boolean;
+  /** Host-only serialization for an embedded native RPC runtime with its own system prompt. */
+  prompt?(args: TurnArgs): string;
   assertCurrent(): void;
   launch(endpoint: WorkspaceMcpEndpoint, prompt: string, activity: () => void): Promise<ExternalCommandCaptureResult>;
 }) {
@@ -114,6 +118,7 @@ export function createRegisteredCliMcpTurn(input: {
   let endpoint: WorkspaceMcpEndpoint | undefined, physical: Promise<void> | undefined;
   let tools: readonly ToolSpec[] = [], finished: TurnResult | undefined, wake: (() => void) | undefined;
   let activity: (() => void) | undefined, closed = false, ended = false;
+  let closing: Promise<void> | undefined;
   const notify = () => { wake?.(); wake = undefined; };
   const flush = (history: readonly NeutralMsg[]) => {
     for (const message of history) if (message.role === "tool") for (const result of message.results) {
@@ -121,15 +126,13 @@ export function createRegisteredCliMcpTurn(input: {
       if (call) { pending.delete(result.id); call.resolve(result); }
     }
   };
-  const close = async (history: readonly NeutralMsg[] = []) => {
-    if (closed) return;
+  const close = (history: readonly NeutralMsg[] = []): Promise<void> => closing ??= (async () => {
     closed = true; flush(history); stopped.abort();
     for (const { call, resolve } of pending.values()) resolve({ id: call.id, name: call.name, content: "Error: Workspace attempt ended", isError: true });
     pending.clear(); queue.length = 0; notify();
-    await endpoint?.close();
-    await physical;
-    input.signal.removeEventListener("abort", onAbort);
-  };
+    try { await endpoint?.close(); await physical; }
+    finally { input.signal.removeEventListener("abort", onAbort); }
+  })();
   const onAbort = () => { void close().catch(() => {}); };
   input.signal.addEventListener("abort", onAbort, { once: true });
   return {
@@ -143,12 +146,15 @@ export function createRegisteredCliMcpTurn(input: {
           tools: () => tools, call(name, parameters) {
             input.assertCurrent();
             if (closed || pending.size >= 16) throw new Error("Workspace MCP call limit reached");
+            if (input.deferNativeCompletion && name === "task_checkpoint" && parameters.done === true) {
+              return Promise.resolve({ id: randomUUID(), name, content: "The native run is still active. Finish your reply; Hara will verify completion after the native process settles and the protected process tree drains.", isError: true });
+            }
             return new Promise<ToolResult>(resolve => {
               const call = { id: randomUUID(), name, input: parameters };
               const item = { call, resolve }; pending.set(call.id, item); queue.push(item); notify();
             });
           } });
-        const prompt = [args.system, CLI_TOOL_GUIDANCE, ...args.history.map(message => message.role === "user" ? "User: " + message.content
+        const prompt = input.prompt?.(args) ?? [args.system, CLI_TOOL_GUIDANCE, ...args.history.map(message => message.role === "user" ? "User: " + message.content
           : message.role === "assistant" ? "Assistant: " + message.text : "")]
           .filter(Boolean).join("\n\n");
         if (!prompt.trim() || prompt.length > 200_000 || args.history.some(message => message.role === "user" && message.images?.length)) {
