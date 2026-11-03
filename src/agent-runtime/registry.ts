@@ -1,3 +1,5 @@
+import { sharedExpandedRuntimeProtection } from "./expanded-policy-adapter.js";
+import type { ExpandedRuntimeProtection } from "./expanded-protection.js";
 import { runtimeFailureMessage } from "./failure-diagnostics.js";
 import { runAgent, type RunOpts, type RunOutcome } from "../agent/loop.js";
 import { runPiAgent } from "./pi.js";
@@ -8,6 +10,7 @@ import { assertWorkspaceRunAdmission } from "../workspace/execution.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
 import { registeredCliDriver } from "./registered-cli.js";
+import { expandedCliDriver } from "./expanded-cli.js";
 import { openCodeCliDriver } from "./opencode-cli.js";
 
 /** Host-owned code only. Imported persona text and renderer fields cannot register a driver or grant
@@ -27,16 +30,16 @@ export interface AgentRuntimeOption {
 }
 
 const LABELS: Record<AgentRuntimeId, string> = {
-  hara: "Hara（現有相容引擎）", pi: "Pi（內建）", opencode: "OpenCode", codex: "Codex", claude: "Claude Code", agy: "Antigravity",
+  hara: "Hara（現有相容引擎）", pi: "Pi（內建）", opencode: "OpenCode", codex: "Codex", claude: "Claude Code", agy: "Antigravity", copilot: "GitHub Copilot", cursor: "Cursor", grok: "Grok Build",
 };
 
 export class AgentRuntimeRegistry {
   private readonly drivers = new Map<AgentRuntimeId, GovernedAgentRuntimeDriver>();
 
   constructor(drivers?: readonly GovernedAgentRuntimeDriver[], private readonly installer?: WorkspaceRuntimeInstaller,
-    models?: WorkspaceRuntimeModels) {
+    models?: WorkspaceRuntimeModels, expandedProtection: ExpandedRuntimeProtection = sharedExpandedRuntimeProtection) {
     const selected = drivers ?? [{ id: "hara", run: runAgent }, { id: "pi", run: runPiAgent }];
-    for (const driver of [...selected, ...(installer ? [registeredCliDriver("codex", installer, models), registeredCliDriver("claude", installer, models), openCodeCliDriver(installer, models)] : [])]) {
+    for (const driver of [...selected, ...(installer ? [registeredCliDriver("codex", installer, models), registeredCliDriver("claude", installer, models), openCodeCliDriver(installer, models), ...(["copilot", "cursor", "grok"] as const).map(id => expandedCliDriver(id, installer, models, expandedProtection))] : [])]) {
       if (!AGENT_RUNTIME_IDS.includes(driver.id) || this.drivers.has(driver.id) || typeof driver.run !== "function") {
         throw new Error("invalid or duplicate governed Agent Runtime driver");
       }
@@ -50,7 +53,7 @@ export class AgentRuntimeRegistry {
       const row = installed?.find(option => option.runtimeId === id);
       const driver = this.drivers.has(id);
       const available = id === "agy" ? false
-        : id === "codex" || id === "claude" || id === "opencode" ? Boolean(driver && row?.generalAgentDriverAvailable) : driver;
+        : id === "codex" || id === "claude" || id === "opencode" || id === "copilot" || id === "cursor" || id === "grok" ? Boolean(driver && row?.generalAgentDriverAvailable) : driver;
       const reason = available ? undefined : id === "agy" ? "general_agent_adapter_pending"
         : row?.state === "integrity_failed" ? "integrity_failed"
         : row?.state === "not_installed" ? "not_installed"
@@ -70,7 +73,7 @@ export class AgentRuntimeRegistry {
     assertWorkspaceRunAdmission(options.workspaceRun, options, runtimeId);
     const availability = this.options().find(row => row.id === runtimeId);
     if (!availability?.available) {
-      if (this.installer && (runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode")) {
+      if (this.installer && (runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode" || runtimeId === "copilot" || runtimeId === "cursor" || runtimeId === "grok")) {
         return Promise.resolve({ status: "error", error: runtimeFailureMessage({ ...this.installer.failureContext(runtimeId),
           kind: availability?.reason === "not_installed" || availability?.reason === "not_registered" ? "not_installed" : "runtime_failed", elapsedMs: 0 }) });
       }

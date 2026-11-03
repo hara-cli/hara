@@ -8,7 +8,8 @@ export interface DetectedRuntime { runtimeId: OptionalRuntimeId; path: string; r
 export interface DetectionOptions { home: string; probeHome?: string; shell?: string; path?: string; timeoutMs?: number;
   run?: (command: string, args: string[], env: NodeJS.ProcessEnv, timeout: number) => Promise<string | null>;
   systemBins?: string[] }
-const ids: OptionalRuntimeId[] = ["opencode", "codex", "claude", "agy"];
+const ids: OptionalRuntimeId[] = ["opencode", "codex", "claude", "agy", "copilot", "cursor", "grok"];
+const commands = (id: OptionalRuntimeId): string[] => id === "cursor" ? ["cursor-agent", "agent"] : [id];
 export const LOGIN_RUNTIME_PATH_COMMAND = 'printf "__HARA_RUNTIME_PATH__%s\\n" "$PATH"';
 const fingerprints = new Map<string, { identity: string; value: { realPath: string; fingerprint: string } }>();
 const safePath = (value: string) => isAbsolute(value) && value.length < 4096 && !/[\u0000-\u001f\u007f]/.test(value);
@@ -61,21 +62,21 @@ export async function detectInstalledRuntimes(options: DetectionOptions): Promis
   // literal command and a fixed deadline. A noisy/failed rc does not hide deterministic fallbacks.
   const shellOutput = await run(shell, ["-lic", LOGIN_RUNTIME_PATH_COMMAND], env, timeout);
   const loginPath = shellOutput?.split("\n").reverse().find(line => line.startsWith("__HARA_RUNTIME_PATH__"))?.slice("__HARA_RUNTIME_PATH__".length) ?? "";
-  for (const bin of loginPath.split(":").filter(safePath)) for (const id of ids) add(id, join(bin, id), "login-shell");
+  for (const bin of loginPath.split(":").filter(safePath)) for (const id of ids) for (const command of commands(id)) add(id, join(bin, command), "login-shell");
   let versions: string[] = [];
   try { versions = readdirSync(join(options.home, ".nvm/versions/node")).filter(v => /^v\d+\.\d+\.\d+$/.test(v)).sort(nvmVersionOrder); } catch { /* no nvm */ }
   const bins = [{ path: join(options.home, ".local/bin"), source: "local" },
     ...versions.map(v => ({ path: join(options.home, ".nvm/versions/node", v, "bin"), source: "nvm" })),
     ...(options.systemBins ?? ["/opt/homebrew/bin", "/usr/local/bin"]).map(path => ({ path, source: "system-package-manager" })),
     { path: join(options.home, ".volta/bin"), source: "volta" }, { path: join(options.home, ".bun/bin"), source: "bun" }];
-  for (const bin of bins) for (const id of ids) add(id, join(bin.path, id), bin.source);
+  for (const bin of bins) for (const id of ids) for (const command of commands(id)) add(id, join(bin.path, command), bin.source);
   const npmPath = [...versions.map(v => join(options.home, ".nvm/versions/node", v, "bin/npm")), ...path.split(":").filter(safePath).map(p => join(p, "npm"))].find(p => { try { accessSync(p, constants.X_OK); return true; } catch { return false; } });
   const prefix = npmPath ? await run(npmPath, ["config", "get", "prefix"], { ...env, PATH: `${dirname(npmPath)}:${path}`,
     npm_config_update_notifier: "false", NO_UPDATE_NOTIFIER: "1", npm_config_offline: "true", npm_config_logs_max: "0" }, timeout) : null;
   const extras = [prefix && safePath(prefix.trim()) ? join(prefix.trim(), "bin") : "", join(options.home, ".npm-global/bin"), join(options.home, ".volta/bin"), join(options.home, ".bun/bin")];
-  for (const bin of extras.filter(Boolean)) for (const id of ids) add(id, join(bin, id), "npm-or-user-toolchain");
+  for (const bin of extras.filter(Boolean)) for (const id of ids) for (const command of commands(id)) add(id, join(bin, command), "npm-or-user-toolchain");
   // Inherited PATH is still useful on CLI/Windows hosts, but never outranks explicit login/nvm sources.
-  for (const bin of path.split(":").filter(safePath)) for (const id of ids) add(id, join(bin, id), "inherited-path");
+  for (const bin of path.split(":").filter(safePath)) for (const id of ids) for (const command of commands(id)) add(id, join(bin, command), "inherited-path");
   return (await Promise.all(ids.map(async runtimeId => {
     for (const candidate of candidates.get(runtimeId)!) {
       if (Date.now() >= deadline) throw new Error("Local runtime discovery deadline reached; absence is not confirmed");
@@ -83,6 +84,7 @@ export async function detectInstalledRuntimes(options: DetectionOptions): Promis
       const output = await run(candidate.path, ["--version"], { ...env, HOME: probeHome, USERPROFILE: probeHome,
         XDG_CONFIG_HOME: join(probeHome,".config"), XDG_CACHE_HOME: join(probeHome,".cache"), XDG_DATA_HOME: join(probeHome,".local/share"),
         PATH: `${dirname(candidate.path)}:${bins.map(b => b.path).join(":")}:${path}` }, Math.min(timeout, Math.max(25, deadline - Date.now())));
+      if (runtimeId === "cursor" && candidate.path.split(/[\\/]/).at(-1) === "agent" && !/cursor/i.test(output ?? "")) continue;
       const version = output?.match(/\b\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?\b/)?.[0];
       const after = inspectLocalRuntime(candidate.path);
       if (version && after && after.fingerprint === inspected.fingerprint && after.realPath === inspected.realPath)
