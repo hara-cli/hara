@@ -204,7 +204,7 @@ test("an accepted change task cannot end as advice when an authorized tool can a
   assert.equal(p.systems.length, 4, "accepted evidence closes directly without a fifth model request for prose");
   assert.match(notices.join("\n"), /action ownership guard/);
   assert.doesNotMatch(JSON.stringify(history), /run the edit yourself/);
-  assert.match(JSON.stringify(history), /Execution ownership correction/);
+  assert.match(JSON.stringify(history), /未见实际修改回执，请执行或说明/);
 });
 
 test("the action ownership guard fails closed when a model refuses to act twice", async () => {

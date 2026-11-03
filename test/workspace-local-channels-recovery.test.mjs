@@ -82,7 +82,8 @@ test("terminal provider recovery stays isolated between two channels and a DM, i
     f.host.selectChannel("client", f.id, a); f.host.sendChannel("client", f.id, a, "channel-a", nonce, f.members);
     assert.equal(calls, 2, "denied continuations and duplicate channel delivery never call a model");
     const dm = f.host.start("client", f.id, f.members[0], "private task", randomUUID()); await f.host.wait(dm.runId);
-    assert.equal(f.host.snapshot(f.id, f.members[0]).conversation.state, "completed");
+    assert.equal(f.host.snapshot(f.id, f.members[0]).conversation.state, "blocked");
+    assert.equal(f.host.snapshot(f.id, f.members[0]).conversation.taskState, "paused");
     assert.deepEqual(read(a), beforeA); assert.deepEqual(read(b), beforeB);
     await f.host.close(); restored = new LocalWorkspaceHost(f.root, f.options); await restored.initialize();
     assert.throws(() => resume(restored, a), /connection_model_unavailable/);

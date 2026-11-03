@@ -1621,11 +1621,6 @@ async function runAgentInner(
         classify: () => ({ effect: "state", concurrencySafe: false }),
         run: async (input) => {
           if (!taskStateDirty) syncIntakeTask();
-          if (opts.workspaceRun && intakeTask?.brief?.intent === "change"
-            && (input as { completion?: { state?: unknown } } | null)?.completion?.state === "verified"
-            && !workspaceChangeTrace?.evidence()) {
-            return "Error: task checkpoint rejected — no verified write, create, rename or delegation receipt was observed";
-          }
           const boundEvidence = completionEvidence.bind(intakeTask, input);
           if (!boundEvidence.ok) return `Error: task checkpoint rejected — ${boundEvidence.reason}`;
           input = boundEvidence.input;

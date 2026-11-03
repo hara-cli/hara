@@ -32,7 +32,8 @@ test("registered CLI crash closes the per-attempt endpoint and records no fabric
 test("a native CLI cannot leak the per-turn bearer through its final text", async t => {
   const f = await cliMcpFixture(t, "leak"); await f.send("Hello.");
   const view = await until(f.read, done);
-  assert.equal(view.conversation.state, "completed");
+  assert.equal(view.conversation.state, "blocked");
+  assert.equal(view.conversation.taskState, "paused");
   assert.equal(view.conversation.history.filter(row => row.role === "assistant").at(-1).text, "***");
   assert.equal(f.meta().tokenInArgv, false);
 });

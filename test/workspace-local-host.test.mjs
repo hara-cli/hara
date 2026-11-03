@@ -25,7 +25,7 @@ async function until(check){const deadline=Date.now()+intelCaseTimeout(10000,300
 test("no-key boot, main chat, explicit creation card, colleague task and same-root restart are a real Host flow",async()=>{
  const a=setup();try{
   const hello=a.host.start("client",a.workspaceId,a.main,"hello",randomUUID());await a.host.wait(hello.runId);
-  let snapshot=a.host.snapshot(a.workspaceId,a.main,"client");assert.equal(snapshot.conversation.state,"completed");
+  let snapshot=a.host.snapshot(a.workspaceId,a.main,"client");assert.equal(snapshot.conversation.state,"blocked");assert.equal(snapshot.conversation.taskState,"paused");
   assert.ok(snapshot.conversation.history.some(row=>row.role==="assistant"&&row.text.includes("Hara")));
   const create=a.host.start("client",a.workspaceId,a.main,"建立 Pi 同事 Coder",randomUUID());
   const card=await until(()=>a.host.snapshot(a.workspaceId,a.main,"client").approvals[0]);
@@ -143,8 +143,9 @@ test("actual CLI routes before legacy startup and does not create caller Home st
 test("actual CLI sends multiline bodies unchanged through its isolated governed entry",async()=>{
  const a=setup(),callerHome=dir(),execute=promisify(execFile),cli=resolve("dist/cli.js");await a.host.close();
  const message="hello\n你好\r\n第二行\t內容";
- const {stdout}=await execute(process.execPath,[cli,"workspace-dev","run","--root",a.root,"--workspace",a.workspaceId,"--agent",a.main,"--message",message],
-  {cwd:dir(),env:{PATH:process.env.PATH,HOME:callerHome,USERPROFILE:callerHome}});
- const result=JSON.parse(stdout);assert.equal(result.conversation.state,"completed");assert.equal(result.conversation.history[0].content,message);
+  const stopped=await execute(process.execPath,[cli,"workspace-dev","run","--root",a.root,"--workspace",a.workspaceId,"--agent",a.main,"--message",message],
+  {cwd:dir(),env:{PATH:process.env.PATH,HOME:callerHome,USERPROFILE:callerHome}}).then(()=>null,error=>error);
+  assert.equal(stopped?.code,2);
+  const result=JSON.parse(stopped.stdout);assert.equal(result.conversation.state,"blocked");assert.equal(result.conversation.taskState,"paused");assert.equal(result.conversation.history[0].content,message);
  assert.deepEqual(fs.readdirSync(callerHome),[]);
 });
