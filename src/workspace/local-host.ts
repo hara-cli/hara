@@ -45,6 +45,7 @@ import { LegacyConnectionCatalog } from "./legacy-connections.js";
 import { WorkspacePreferences } from "./preferences.js";
 import { WorkspaceFeatures } from "./features.js";
 import { workspaceSkillTool } from "./skills.js";
+import { isWorkspaceOperationSkill, withWorkspaceOperationSkill } from "./operation-cards.js";
 import { WorkspaceLocalChannels } from "./local-channels.js";
 import { WorkspaceScheduler } from "./scheduler.js";
 import { legacyPolicyAllowsTool } from "./legacy-role-policy.js";
@@ -733,7 +734,7 @@ export class LocalWorkspaceHost {
     const bundles = job.context.features.enabledSkills();
     const tools = [...localWorkspaceFileTools(job.context.project, assertCurrent), job.receipts!.tool(), job.startContext!.tool(assertCurrent),
       workspaceMemorySearchTool((query, limit) => job.context.resources.memory.search(query, job.context.project, limit), assertCurrent),
-      ...(bundles.length ? [workspaceSkillTool(bundles, (id, version) => { assertCurrent(); job.context.features.assertSkill(id, version); })] : [])];
+      workspaceSkillTool(bundles, (id, version) => { assertCurrent(); if (!isWorkspaceOperationSkill(id, version)) job.context.features.assertSkill(id, version); })];
     const channelId = job.channelId, rooms = () => this.localChannels(job.workspaceId);
     if (channelId) {
       tools.push({ name: "channel_sync", description: "Re-read this local channel now: members and every message so far, including replies written after your turn started. Read-only; same shape as your starting channel transcript.", kind: "read",
@@ -970,7 +971,7 @@ export class LocalWorkspaceHost {
           + `For a requested rename use agent_rename on the resolved existing colleague; the new name is not a reference to look up.\n`
           + `agent_create returns only AFTER the human has approved; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. created:false with approvalState declined/expired/aborted means no colleague was created — tell the human they can ask again; do not re-open a card unless they ask. Check agent_list before creating so an active colleague is not duplicated.\n`
           + `Successful Workspace tool results repeat the exact citation ID in receipt.toolCallId. Copy that exact value for completion.checks; never invent IDs or repeat side effects to fix a rejected citation. After restart, re-observe state with read-only tools and cite the new receipt.\n`
-          + `Enabled version-locked Workspace skills (load every page of instructions via workspace_skill before acting; no extra permissions): ${boundWorkspaceText(JSON.stringify(context.features.enabledSkills().map(item => ({ id: item.id, description: item.description, version: item.version }))), 1200)}.\n`
+          + `Enabled version-locked Workspace skills (load only relevant instructions via workspace_skill before acting, reading each selected resource to nextOffset:null; no extra permissions): ${boundWorkspaceText(JSON.stringify(withWorkspaceOperationSkill(context.features.enabledSkills()).map(item => ({ id: item.id, description: item.description, version: item.version }))), 1200)}.\n`
           + `For file tasks read first; write only if necessary, then workspace_verify. End accepted tasks with task_checkpoint completion and observed tool_call_ids, not a prose-only claim.`,
         continuationSession: false, // Workspace recovery has its own bounded, fresh-observation wake brief.
         taskIntake: { task, current: () => owned.value.task!, onUpdate: next => { owned.value.task = next; },
