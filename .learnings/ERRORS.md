@@ -11188,3 +11188,18 @@ The isolated Pi 1.5.0 RPC process accepted get_state but refused prompt with a c
 - Bun1.3.9 local file dependency install passes with the real Pi policy and (deny file-link), default backend, isolated HOME/cache and a loopback-only registry. This does not verify pnpm or arbitrary registry packages.
 - Public final 9c75b58 is merged with its S3 parent history; no rewrite/cherry-pick of its terminal fix. The accepted unobserved instantaneous daemon/reparent limitation remains; Pi uses only common ownership/drain.
 - A closeout call used an absolute task path and was held invalid_task_name, removed0. Use the registered task name at final closeout. Preserve original failure logs, without capabilities or real credentials.
+
+
+## [ERR-20261103-EXTENSION-CATALOG-CONTRACT] Strict metadata DTO and capability checks
+
+- Status: resolved
+- Area: backend/tests
+- Source: self-review
+- Summary: Initial extension DTO compilation required explicit union narrowing after plain-record checks.
+  A related RPC regression then correctly rejected an outdated exact capability list after
+  `workspace.extensions.v1` was added. Narrow boundary fields explicitly and advance the exact expected
+  capability contract together with an intentional protocol addition; retain strict equality.
+- Resolution: Explicit descriptor validation/typing, synchronized capability expectation, and focused
+  catalog/authorization/RPC regressions. Failed catalog refreshes revoke cached metadata immediately.
+- Related: src/workspace/extension-catalog.ts, src/workspace/extensions.ts,
+  test/workspace-extensions.test.mjs, test/workspace-local-server.test.mjs.

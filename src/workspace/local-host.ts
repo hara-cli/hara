@@ -48,6 +48,8 @@ import { LegacyConnectionCatalog } from "./legacy-connections.js";
 import { WorkspacePreferences } from "./preferences.js";
 import { WorkspaceFeatures } from "./features.js";
 import type { JsonCliPolicyFactory } from "../agent-runtime/json-cli-policy.js";
+import { WorkspaceExtensions, type ExtensionChange, type ExtensionToolSnapshot } from "./extensions.js";
+import { readHostWorkspaceExtensionCatalog, type ExtensionCatalogProvider } from "./extension-catalog.js";
 import { workspaceSkillTool } from "./skills.js";
 import { WorkspaceLocalChannels } from "./local-channels.js";
 import { assertChannelAutonomyProductionDispatch } from "./channel-autonomy.js";
@@ -66,7 +68,7 @@ import { codexSessionPool } from "../agent-runtime/codex-session.js";
 import { codexThreadState, codexThreadView } from "./codex-thread.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
-interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
+interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; extensions: WorkspaceExtensions; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
 type WorkspaceConnectionSnapshot = ReturnType<WorkspaceConnectionStoreV2["list"]> & {
   readOnly?: boolean; recovered?: boolean; migrationPending?: boolean; unavailable?: boolean; activeConnectionId?: string | null;
 };
@@ -103,6 +105,7 @@ export class LocalWorkspaceHost {
   private readonly contexts = new Map<string, WorkspaceHostContext>();
   private readonly jobs = new Map<string, LocalJob>();
   private readonly pending = new Map<string, PendingApproval>();
+  private readonly extensionProposals = new Map<string, { clientId: string; workspaceId: string; generation: string; epoch: number; revision: number; expiresAt: number; change: ExtensionChange; catalogLock: string }>();
   private readonly clients = new Map<string, { workspaceId: string | null; agentId: string | null; channelId?: string; epoch: number }>();
   private readonly channels = new Map<string, WorkspaceLocalChannels>();
   private closing = false;
@@ -131,6 +134,8 @@ export class LocalWorkspaceHost {
     jsonCliPolicyFactory?: JsonCliPolicyFactory;
     /** Host-owned native account reader; never accepted from a renderer or model tool argument. */
     usageCollector?: WorkspaceUsageCollector;
+    /** Trusted Host metadata provider only; never an RPC path/config object. */
+    extensionCatalog?: ExtensionCatalogProvider;
     realKeyFile?: string;
     realKeySlice?: ArkAcceptanceSlice;
     interactiveApprovals?: boolean;
@@ -219,7 +224,7 @@ export class LocalWorkspaceHost {
     const runtimes = new WorkspaceRuntimeInstaller(storage, { ...((this.options.discoveryHome ?? this.options.hostHome) ? { discovery: { home: (this.options.discoveryHome ?? this.options.hostHome)!, probeHome: this.options.hostHome, shell: process.env.HARA_WORKSPACE_HOST_SHELL } } : {}),
       ...this.options.runtimeInstallerOptions, onChange: () => this.changed(workspaceId) });
     const resources = new WorkspaceResources(this.home, row.scope, { assertCurrent: assertAuthority, runtimeInstaller: runtimes }); resources.initialize();
-    const context: WorkspaceHostContext = { storage, resources, connections, project,
+    const context: WorkspaceHostContext = { storage, resources, connections, project, extensions: new WorkspaceExtensions(storage),
       features: new WorkspaceFeatures(storage, project, workspaceId, this.options.mode === "workspace" ? this.options.hostHome : undefined),
       runtimes, runtimeModels: new WorkspaceRuntimeModels(storage, runtimes) };
     const folders = new WorkspaceLegacyResources(storage);
@@ -401,6 +406,7 @@ export class LocalWorkspaceHost {
   }
   releaseUpdate(clientId: string, id: string) { if (this.updateLease?.clientId !== clientId || this.updateLease.id !== id) throw new Error("Update lease changed"); this.updateLease = null; }
   private dismissApprovals(clientId: string): void {
+    for (const [id, proposal] of this.extensionProposals) if (proposal.clientId === clientId) this.extensionProposals.delete(id);
     for (const pending of [...this.pending.values()]) if (pending.clientId === clientId) pending.finish({ approved: false, state: "aborted" });
     for (const context of this.contexts.values()) context.runtimes.dismiss(clientId);
   }
@@ -417,6 +423,65 @@ export class LocalWorkspaceHost {
     return this.context(workspaceId).runtimes.approve(id, approved, clientId, loginSource);
   }
   cancelRuntime(workspaceId: string, operationId: string): void { this.context(workspaceId).runtimes.cancel(operationId); }
+  private refreshExtensions(workspaceId: string) {
+    const store = this.context(workspaceId).extensions;
+    try { store.refreshCatalog(this.options.extensionCatalog?.() ?? (this.options.mode === "workspace" && this.options.hostHome
+      ? readHostWorkspaceExtensionCatalog(this.options.hostHome, this.catalog.read().hostId) : [])); }
+    catch { store.invalidateCatalog(); throw new Error("Extension source discovery unavailable"); }
+    return store;
+  }
+  workspaceExtensions(workspaceId: string, sourceId?: string) {
+    const store = this.refreshExtensions(workspaceId); return sourceId === undefined ? store.list() : store.describe(sourceId);
+  }
+  private extensionAgent(workspaceId: string, agentId: string, agentEpoch: number) {
+    const agent = this.context(workspaceId).resources.agents.get(agentId);
+    if (!agent || agent.state !== "active" || agent.agentEpoch !== agentEpoch) throw new Error("Extension colleague changed; refresh before editing");
+    return { agentId, agentEpoch };
+  }
+  agentExtensions(workspaceId: string, agentId: string, agentEpoch: number) {
+    return this.refreshExtensions(workspaceId).list(this.extensionAgent(workspaceId, agentId, agentEpoch));
+  }
+  private assertExtensionManager(clientId: string, workspaceId: string) {
+    const selection = this.clients.get(clientId), context = this.context(workspaceId);
+    // The current local Host authenticates the device owner. Account scopes need a future trusted
+    // owner/admin admission adapter; renderer-supplied roles cannot grant configuration authority.
+    if (this.closing || !selection || selection.workspaceId !== workspaceId || context.storage.scope.authority.kind !== "local") throw new Error("Extension settings view unavailable");
+    return selection;
+  }
+  proposeExtensions(clientId: string, workspaceId: string, input: unknown, expectedRevision: number) {
+    const selection = this.assertExtensionManager(clientId, workspaceId), store = this.refreshExtensions(workspaceId);
+    const change = store.validateChange(input, expectedRevision);
+    if (change.target === "agent") this.extensionAgent(workspaceId, change.agentId, change.agentEpoch);
+    for (const [id, row] of this.extensionProposals) if (row.expiresAt < Date.now()) this.extensionProposals.delete(id);
+    if (this.extensionProposals.size >= 64) throw new Error("Too many pending extension changes");
+    const proposalId = randomUUID(), generation = this.snapshotGeneration(workspaceId);
+    const source = store.describe(change.sourceId).sources[0]!;
+    this.extensionProposals.set(proposalId, { clientId, workspaceId, generation, epoch: selection.epoch, revision: expectedRevision,
+      expiresAt: Date.now() + 120_000, change, catalogLock: canonical(source) });
+    return { proposalId, workspaceId, resourceGeneration: generation, revision: expectedRevision, change };
+  }
+  approveExtensions(clientId: string, workspaceId: string, proposalId: string, approved: boolean, expectedRevision: number) {
+    const selection = this.assertExtensionManager(clientId, workspaceId), proposal = this.extensionProposals.get(proposalId);
+    if (!proposal || proposal.clientId !== clientId || proposal.workspaceId !== workspaceId) throw new Error("Extension proposal unavailable");
+    this.extensionProposals.delete(proposalId); // one decision, including rejection/staleness
+    if (proposal.expiresAt < Date.now() || proposal.epoch !== selection.epoch || proposal.revision !== expectedRevision) throw new Error("Extension proposal changed; review again");
+    this.assertGeneration(workspaceId, proposal.generation);
+    const store = this.refreshExtensions(workspaceId);
+    if (!approved) return store.list(proposal.change.target === "agent" ? proposal.change : undefined);
+    if (proposal.change.target === "agent") this.extensionAgent(workspaceId, proposal.change.agentId, proposal.change.agentEpoch);
+    if (canonical(store.describe(proposal.change.sourceId).sources[0]) !== proposal.catalogLock) throw new Error("Extension catalog changed; review again");
+    const view = store.apply(proposal.change, expectedRevision); this.changed(workspaceId); return view;
+  }
+  /** Future registered-cli-mcp/Pi adapters capture once per attempt and recheck before dispatch.
+   * These methods supply metadata only and deliberately do not change jobTools or runtime options. */
+  extensionToolSnapshot(workspaceId: string, agentId: string, agentEpoch: number) {
+    this.extensionAgent(workspaceId, agentId, agentEpoch);
+    return this.refreshExtensions(workspaceId).snapshot(agentId, agentEpoch);
+  }
+  assertExtensionTool(workspaceId: string, snapshot: ExtensionToolSnapshot, sourceId: string, toolId: string) {
+    this.extensionAgent(workspaceId, snapshot.agentId, snapshot.agentEpoch);
+    this.context(workspaceId).extensions.assertCurrentTool(snapshot, sourceId, toolId, snapshot.agentEpoch);
+  }
   runtimeProxy(workspaceId: string) {
     const context = this.context(workspaceId);
     return { workspaceId, resourceGeneration: this.snapshotGeneration(workspaceId), ...context.runtimes.proxy.read() };
@@ -1167,6 +1232,7 @@ export class LocalWorkspaceHost {
   async close(): Promise<void> {
     if (this.scheduleTimer) clearInterval(this.scheduleTimer);
     if (this.usageTimer) clearInterval(this.usageTimer);
+    this.extensionProposals.clear();
     this.closing = true; for (const pending of [...this.pending.values()]) pending.finish({ approved: false, state: "aborted" });
     for (const job of this.jobs.values()) if (!job.closed) job.controller.abort();
     await Promise.all([...this.channels.values()].map(rooms => rooms.close()));
