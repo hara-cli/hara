@@ -150,7 +150,7 @@ export class CompletionEvidenceLedger {
       const interpretation = redactSensitiveText(check.evidence).text.replace(/[\r\n\u0000-\u001f\u007f]+/gu, " ").trim();
       evidence.push({ index, text: `Criterion ${index + 1}: ${interpretation} [engine-observed sources: ${references.join(", ")}]` });
     }
-    // Only the trusted Host can link the immediately preceding unchanged /continue. A previous
+    // Only the trusted Host can link a same-task continuation or actual pending-question answer. A previous
     // dispatch proves an effect occurred, never its current state: EVERY criterion must cite a
     // successful newly dispatched observation in this attempt. Native diffs are never carried.
     if (task?.brief?.intent === "change" && !hasMutation && allChecksFresh && this.journal?.recovery?.currentScope === scope) {

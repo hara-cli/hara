@@ -137,6 +137,9 @@ test("only a tool-free conversation can use an answer hash; Workspace facts stil
   const task = { status: "running", objective: "你好，请用一句话介绍你自己", brief: { intent: "answer" }, decisions: [] };
   const trace = new ReadOnlyAnswerTrace(), proof = { answer: "你好，我是 Hara。", noTools: true };
   assert.match(trace.evidence(task, false, false, false, proof)[0], /^conversational-answer result_sha256=[a-f0-9]{64}$/);
+  for (const answer of ["", "***", "*** ***", "...", "12345"]) {
+    assert.equal(trace.evidence(task, false, false, false, { ...proof, answer }), null, "placeholder-only output is not a conversational answer");
+  }
   assert.equal(trace.evidence(task, false, false, false), null);
   assert.equal(trace.evidence(task, false, false, false, { ...proof, noTools: false }), null);
   assert.equal(trace.evidence(task, true, false, false, proof), null);
@@ -144,4 +147,13 @@ test("only a tool-free conversation can use an answer hash; Workspace facts stil
   for (const objective of ["列出同事", "你好，请修改 note.txt", "介绍自己并列出同事"]) assert.equal(trace.evidence({ ...task, objective }, false, false, false, proof), null);
   trace.observe("ask_user", "ask", "interactive", { id: "ask", name: "ask_user", content: "pending" }, false);
   assert.equal(trace.evidence(task, false, false, false, proof), null);
+});
+
+test("working read receipts cannot verify a placeholder-only reply; a numeric fact answer remains valid", () => {
+  const task = { status: "running", objective: "有几位同事？", brief: { intent: "answer" }, decisions: [] };
+  const trace = new ReadOnlyAnswerTrace();
+  trace.observe("agent_list", "roster", "read", { id: "roster", name: "agent_list", content: JSON.stringify({ agents: [] }) }, false);
+  for (const answer of ["", "***", "*** ***", "..."]) assert.equal(
+    trace.evidence(task, false, false, false, { answer, noTools: false }), null);
+  assert.equal(trace.evidence(task, false, false, false, { answer: "0", noTools: false }).length, 1);
 });

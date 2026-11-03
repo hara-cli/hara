@@ -75,8 +75,12 @@ export class ReadOnlyAnswerTrace {
       || task.checkpoint?.completion?.state === "awaiting_user"
       || pendingInteraction || hasPendingSteering || incompleteTodo || this.unsafe
       || this.neededReceipts.size || this.observed.length > 12) return null;
+    // A working read receipt cannot turn a wholly redacted/punctuation-only reply into an answer.
+    // Numeric fact answers remain valid; the narrower tool-free identity path still needs text.
+    if (conversation && !/[\p{L}\p{N}]/u.test(conversation.answer)) return null;
     if (!this.observed.some(item => item.name !== "workspace_receipt_read" && item.name !== "workspace_skill")) {
-      if (this.observed.length || !conversation?.noTools || !conversation.answer.trim() || !conversationalAnswerObjective(task.objective)) return null;
+      if (this.observed.length || !conversation?.noTools || !conversation.answer.trim() || !/\p{L}/u.test(conversation.answer) || !conversationalAnswerObjective(task.objective)) return null;
+      // An all-redacted bearer or punctuation is not an answer and must never verify the task.
       return [`conversational-answer result_sha256=${createHash("sha256").update(conversation.answer).digest("hex")}`];
     }
     return this.observed.map(item => `${item.name} tool_call_id=${item.id} result_sha256=${item.digest}`);

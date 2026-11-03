@@ -8,7 +8,7 @@ import { CompletionEvidenceLedger, completionEvidenceScope } from "../dist/agent
 import { createWorkspaceCompletionEvidence } from "../dist/workspace/completion-evidence-store.js";
 import { WorkspaceResourceStorage, workspaceStateHome, currentWorkspaceResourceBinding } from "../dist/workspace/resource-context.js";
 import { workspaceAgentBindingHash } from "../dist/workspace/run-binding.js";
-import { createTaskExecution, applyTaskBrief, continueTaskExecution } from "../dist/session/task.js";
+import { createTaskExecution, applyTaskBrief, continueTaskExecution, recordTaskDecision } from "../dist/session/task.js";
 
 const temporary = [];
 after(() => { for (const owned of temporary) fs.rmSync(owned, { recursive: true, force: true }); });
@@ -164,5 +164,34 @@ test("changed task authority and forged binding cannot create a continuation lin
   ]) {
     const next = continueTaskExecution(structuredClone(f.task), { kind: "steer", expectedTurnId: f.task.turnId, turnId: randomUUID() }).task; edit(next);
     assert.throws(() => createWorkspaceCompletionEvidence(f.storage, f.binding, { previousTask: f.task, currentTask: next }), /private completion run binding/);
+  }
+});
+
+test("an actual pending-question answer preserves prior effects only with the exact Host question and fresh verification", () => {
+  const f = fixture(), old = f.open(); observe(old, f.task);
+  const questionId = randomUUID();
+  const answered = recordTaskDecision(f.task, { turnId: f.task.turnId, callId: questionId, question: "Which target?", answer: "Beta", source: "interactive" });
+  assert.equal(answered.ok, true);
+  const next = continueTaskExecution(answered.task, { kind: "steer", expectedTurnId: f.task.turnId, turnId: randomUUID() }).task;
+  const resumed = createWorkspaceCompletionEvidence(f.storage, f.binding, { previousTask: f.task, currentTask: next, answeredQuestionId: questionId });
+  assert.equal(resumed.bind(next, checkpoint("write-1")).ok, false);
+  observe(resumed, next, "fresh-after-answer", "read");
+  assert.equal(resumed.bind(next, checkpoint("fresh-after-answer")).ok, true);
+  for (const bad of [undefined, randomUUID(), "not-a-question"]) assert.throws(() =>
+    createWorkspaceCompletionEvidence(f.storage, f.binding, { previousTask: f.task, currentTask: next, answeredQuestionId: bad }), /private completion run binding/);
+});
+test("defaults, changed decision history and changed scope cannot acquire the pending-question recovery link", () => {
+  const f = fixture(); observe(f.open(), f.task);
+  const questionId = randomUUID();
+  for (const variant of ["default", "rewritten", "scope", "wrong-turn", "extra-answer"]) {
+    const answered = recordTaskDecision(f.task, { turnId: f.task.turnId, callId: questionId, question: "Which target?", answer: "Beta", source: "interactive" }).task;
+    const next = continueTaskExecution(answered, { kind: "steer", expectedTurnId: f.task.turnId, turnId: randomUUID() }).task;
+    if (variant === "default") next.decisions[0].source = "default";
+    if (variant === "rewritten") next.decisions.unshift({ ...next.decisions[0], id: randomUUID(), callId: randomUUID() });
+    if (variant === "scope") next.brief = { ...next.brief, constraints: ["a different authorized scope"] };
+    if (variant === "wrong-turn") next.decisions[0].turnId = randomUUID();
+    if (variant === "extra-answer") next.decisions.push({ ...next.decisions[0], id: randomUUID() });
+    assert.throws(() => createWorkspaceCompletionEvidence(f.storage, f.binding,
+      { previousTask: f.task, currentTask: next, answeredQuestionId: questionId }), /private completion run binding/, variant);
   }
 });

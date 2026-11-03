@@ -1089,10 +1089,11 @@ export class LocalWorkspaceHost {
       }
       const row = this.catalog.resolve(workspaceId), host = this.catalog.read();
       let task: TaskExecution;
-      let completionRecovery: { previousTask: TaskExecution; currentTask: TaskExecution } | undefined;
+      let completionRecovery: { previousTask: TaskExecution; currentTask: TaskExecution; answeredQuestionId?: string } | undefined;
       if (resume) {
         if (!value.task?.workspaceRunBinding || value.task.status === "completed") throw new Error("no interrupted Workspace task to resume");
         if (parent && value.task.workspaceRunBinding.lineage.parentRunId !== parent.id) throw new Error("delegated resume belongs to another parent run");
+        const previousTask = isContinue || questionId ? structuredClone(value.task) : undefined;
         if (questionId) {
           const currentQuestion = this.pendingUserQuestion(context, value);
           if (!currentQuestion || currentQuestion.id !== questionId) throw new Error("Workspace question changed; refresh before answering");
@@ -1105,10 +1106,9 @@ export class LocalWorkspaceHost {
           const answered = recordAwaitingTaskDecision(value.task, message, new Date(), questionId);
           if (!answered.ok) throw new Error(answered.reason); value.task = answered.task;
         }
-        const previousTask = isContinue && !questionId ? structuredClone(value.task) : undefined;
         const continued = continueTaskExecution(value.task, { kind: "steer", expectedTurnId: value.task.turnId, turnId: randomUUID() });
         if (!continued.ok) throw new Error(continued.reason); task = continued.task;
-        if (previousTask?.brief) completionRecovery = { previousTask, currentTask: task };
+        if (previousTask?.brief) completionRecovery = { previousTask, currentTask: task, ...(questionId ? { answeredQuestionId: questionId } : {}) };
         context.resources.agents.resolveTask(task.workspaceRunBinding!.agent); context.connections.resolve(task.workspaceRunBinding!.connection);
       } else {
         if (value.task) value.pastTasks.push({ task: value.task, usage: value.runUsage, endedAt: new Date().toISOString() });

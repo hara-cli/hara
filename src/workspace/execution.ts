@@ -114,8 +114,8 @@ export function createWorkspaceRunPermit(input: {
   signal: AbortSignal;
   toolNames: readonly string[];
   usage: WorkspaceUsage;
-  /** Exact unchanged /continue predecessor from the protected conversation, never renderer input. */
-  completionRecovery?: { previousTask: TaskExecution; currentTask: TaskExecution };
+  /** Same-task continuation predecessor and actual question answer from protected Host state; never renderer task data. */
+  completionRecovery?: { previousTask: TaskExecution; currentTask: TaskExecution; answeredQuestionId?: string };
   /** Trusted Host-only attempt boundary. Persisted history stays complete and append-only. */
   modelHistory?: { history: NeutralMsg[]; start: number; retain?: (result: ToolResult) => string; usedTokens?: () => number };
   observeContext?(value: WorkspaceContextObservation): void;
