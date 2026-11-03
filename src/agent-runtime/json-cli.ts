@@ -3,11 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runExternalCommandCapture } from "../external-sessions/process.js";
 import { runGovernedAgent, type RunOpts } from "../agent/loop.js";
-import { assertWorkspaceRunAdmission, attachWorkspaceRuntimeModel, workspaceRunRuntimeStages } from "../workspace/execution.js";
+import { assertWorkspaceRunAdmission, attachWorkspaceRuntimeModel, publishWorkspaceNativeRisks, workspaceRunRuntimeStages } from "../workspace/execution.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
 import type { GovernedAgentRuntimeDriver } from "./registry.js";
 import { createRegisteredCliMcpTurn, WORKSPACE_MCP_TOKEN_ENV } from "./registered-cli-mcp.js";
+import { beginWorkspaceNativePolicy, endWorkspaceNativePolicy } from "./workspace-native-policy.js";
 import { createJsonCliExecutionPolicy, type JsonCliPolicyFactory, type JsonCliPolicyHandle } from "./json-cli-policy.js";
 import { createJsonCliNativeObserver, jsonCliArgs, jsonCliHelpCompatible, normalizeJsonCliOutput, writeJsonCliMcp, type JsonCliRuntimeId } from "./json-cli-protocol.js";
 import { runtimeFailureTracker } from "./failure-tracker.js";
@@ -28,7 +29,6 @@ export function jsonCliDriver(id: JsonCliRuntimeId, installer: WorkspaceRuntimeI
     let policy: JsonCliPolicyHandle | undefined, directory: string | undefined, success: (() => void) | undefined;
     const native = createRegisteredCliMcpTurn({ signal: options.signal!, assertCurrent,
       parseOutput: output => normalizeJsonCliOutput(id, output).turn,
-      beforeTool() { policy?.policy.collectWorkspaceEvidence(); },
       async launch(endpoint, prompt, activity) {
         assertCurrent(); const started = Date.now();
         let observer: ReturnType<typeof createRuntimeStageProcessObserver> | undefined;
@@ -48,7 +48,7 @@ export function jsonCliDriver(id: JsonCliRuntimeId, installer: WorkspaceRuntimeI
           if (!help.ok || !jsonCliHelpCompatible(id, help.stdout)) return { ok: false, stdout: "", code: help.code, timedOut: help.timedOut,
             runtimeFailure: tracker.failed(help.timedOut ? "timeout" : "version_incompatible", Date.now() - started) };
           policy = await policyFactory({ runtimeId: id, permit, options, installer, resolved }); assertCurrent();
-          policy.policy.beginAttempt(permit.binding.runId);
+          beginWorkspaceNativePolicy(permit, policy.policy);
           // Print alone is AFK. Controlled must add its documented plan flag and outer read-only policy.
           if (policy.tier !== "full-protected" && policy.tier !== "controlled") throw new Error("runtime_protection_unavailable");
           if (policy.tier === "controlled" && !(id === "gemini" ? /--approval-mode(?=[\s,=]|$)/ : /--plan(?=[\s,=]|$)/).test(help.stdout)) throw new Error("runtime_controlled_mode_unavailable");
@@ -61,11 +61,11 @@ export function jsonCliDriver(id: JsonCliRuntimeId, installer: WorkspaceRuntimeI
           stages?.setRuntime({ id, version: installer.list().options.find(row => row.runtimeId === id)?.version ?? null, loginSource: resolved.loginSource,
             model: selection?.modelId ?? null, effort: null });
           observer = createRuntimeStageProcessObserver(stages, id, native.signal);
-          const nativeEvents = createJsonCliNativeObserver(id, event => policy!.policy.observeNativeEvent(event));
+          const nativeEvents = createJsonCliNativeObserver(id, event => { policy!.policy.observeNativeEvent(event); publishWorkspaceNativeRisks(permit); });
           const wrapped = policy.policy.wrap({ command: resolved.command, args, env }); assertCurrent();
-          const result = await runExternalCommandCapture({ command: wrapped.command, env: wrapped.env }, wrapped.args, {
+          const result = await runExternalCommandCapture(wrapped, wrapped.args, {
             cwd: permit.binding.project.root, signal: native.signal, timeoutMs: permit.binding.budget.timeoutMs,
-            failureKind: "runtime", proxyUrl: resolved.proxyUrl, maxOutputBytes: 4 * 1024 * 1024, retainStdoutOnFailure: true,
+            waitForClose: true, failureKind: "runtime", proxyUrl: resolved.proxyUrl, maxOutputBytes: 4 * 1024 * 1024, retainStdoutOnFailure: true,
             onSpawn: observer.onSpawn, onStdout: chunk => { observer?.onStdout(chunk); nativeEvents.onStdout(chunk); activity(); },
           });
           nativeEvents.finish();
@@ -85,7 +85,10 @@ export function jsonCliDriver(id: JsonCliRuntimeId, installer: WorkspaceRuntimeI
           observer?.finish(false, kind);
           return { ok: false, stdout: "", code: null, timedOut: false, runtimeFailure: tracker ? tracker.failed(kind, Date.now() - started)
             : runtimeFailureMessage({ ...installer.failureContext(id), kind, elapsedMs: Date.now() - started }) };
-        } finally { observer?.finish(false); if (env) delete env[WORKSPACE_MCP_TOKEN_ENV]; }
+        } finally {
+          observer?.finish(false); if (env) delete env[WORKSPACE_MCP_TOKEN_ENV];
+          if (policy) { await endWorkspaceNativePolicy(permit, policy.policy); await policy.policy.close(); }
+        }
       },
     });
     try {
@@ -94,8 +97,8 @@ export function jsonCliDriver(id: JsonCliRuntimeId, installer: WorkspaceRuntimeI
       if (outcome.status === "completed" && !options.signal?.aborted && success) { assertCurrent(); success(); }
       return outcome;
     } finally {
-      await native.close(history); // Drain the physical process before closing its policy / private files.
-      await policy?.policy.close();
+      await native.close(history); // launch awaits Host end/drain before returning its final result.
+      if (policy) { await endWorkspaceNativePolicy(permit, policy.policy); await policy.policy.close(); }
       if (directory) rmSync(directory, { recursive: true, force: true });
     }
   } };

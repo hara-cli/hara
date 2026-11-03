@@ -16,7 +16,7 @@ for (const runtime of ["gemini"]) {
     const listed = JSON.parse(meta.listed.content[0].text); assert.deepEqual(listed.agents.map(row => row.agentId), [f.main]);
     assert.ok(view.conversation.history.some(row => row.role === "tool" && row.results.some(result => result.name === "agent_list" && result.id === listed.receipt.toolCallId)));
     assert.equal(meta.isolatedExtensions, true); assert.ok(f.policyCalls.some(row => row.kind === "begin" && row.attemptKey === sent.runId));
-    assert.ok(f.policyCalls.some(row => row.kind === "wrap")); assert.ok(f.policyCalls.filter(row => row.kind === "collect").length >= 2); assert.equal(f.policyCalls.at(-1).kind, "close");
+    assert.ok(f.policyCalls.some(row => row.kind === "wrap")); assert.ok(f.policyCalls.some(row => row.kind === "on-process")); assert.ok(f.policyCalls.some(row => row.kind === "drain-process")); assert.ok(f.policyCalls.filter(row => row.kind === "collect").length >= 2); assert.equal(f.policyCalls.at(-1).kind, "close");
     const stages = view.conversation.runtimeStages.at(-1); assert.equal(stages.runtime.id, runtime); assert.ok(stages.events.some(row => row.kind === "first_output"));
     assert.equal(view.runtimes.options.find(row => row.runtimeId === runtime).versionStatus.lastSuccessfulVersion, "1.2.3");
     await assert.rejects(fetch(meta.url));
@@ -65,8 +65,8 @@ test("Gemini refuses an unreachable explicit Workspace proxy before physical lau
   assert.equal(fs.existsSync(f.metaPath), false); assert.equal(f.policyCalls.length, 0);
 });
 
-test("Gemini default factory runs the fake CLI under real Seatbelt with legacy controlled tier", { skip: process.platform !== "darwin" }, async t => {
-  const f = await jsonCliFixture(t, "gemini", { productionPolicy: true, recordReceipt: false }), sent = f.send();
+test("Gemini default factory runs the fake CLI under real Seatbelt with its frozen controlled tier", { skip: process.platform !== "darwin" }, async t => {
+  const f = await jsonCliFixture(t, "gemini", { productionPolicy: true, recordReceipt: false, tier: "controlled" }), sent = f.send();
   await f.host.wait(sent.runId); const view = f.read();
   assert.equal(view.conversation.state, "completed", JSON.stringify(view.conversation));
   assert.ok(view.conversation.history.some(row => row.role === "tool" && row.results.some(result => result.name === "agent_list")));

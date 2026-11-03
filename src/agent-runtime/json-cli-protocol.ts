@@ -83,9 +83,9 @@ export function normalizeJsonCliOutput(runtime: JsonCliRuntimeId, output: string
   return { turn: { text, toolUses: [], stop: "end", ...(usage ? { usage } : {}) }, events };
 }
 
-// Explicit built-in allowlist: background/schedule/agent/shell tools cannot appear when a CLI
-// adds them. Commands go through Hara MCP, whose governor and WorkspaceScheduler retain control.
-export const GEMINI_NATIVE_TOOLS = Object.freeze(["read_file", "list_directory", "glob", "grep_search", "replace", "write_file", "web_fetch", "google_web_search"]);
+// Explicit built-in allowlist excludes cross-task scheduling and unknown additions. Native shell
+// is scoped to this attempt by the shared ownership/drain boundary; Hara owns durable scheduling.
+export const GEMINI_NATIVE_TOOLS = Object.freeze(["read_file", "list_directory", "glob", "grep_search", "replace", "write_file", "web_fetch", "google_web_search", "run_shell_command"]);
 const safeNativeString = (value: unknown, max: number): string | undefined => typeof value === "string" && value.length <= max
   && !/[\u0000-\u001f\u007f]/u.test(value) ? redactSensitiveText(value).text : undefined;
 function nativeCall(value: Record<string, any>, name: unknown, id: unknown): NormalizedNativeRuntimeEvent {

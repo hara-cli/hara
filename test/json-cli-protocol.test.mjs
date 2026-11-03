@@ -53,7 +53,7 @@ test("process-only MCP settings and argv keep host config untouched and token ou
       if (runtime === "gemini") { assert.equal(config.env.GEMINI_CLI_TRUST_WORKSPACE, "true"); assert.equal(body.mcpServers.hara.trust, true); assert.deepEqual(body.mcp.allowed, ["hara"]);
         assert.equal(body.hooksConfig.enabled, false); assert.equal(body.skills.enabled, false); assert.equal(body.tools.sandbox, false);
         assert.deepEqual(body.tools.core, [...GEMINI_NATIVE_TOOLS]); assert.equal(body.tools.discoveryCommand, ""); assert.equal(body.tools.callCommand, "");
-        assert.ok(!body.tools.core.some(tool => /shell|background|cron|schedule|agent/i.test(tool))); }
+        assert.ok(body.tools.core.includes("run_shell_command")); assert.ok(!body.tools.core.some(tool => /background|cron|schedule|agent/i.test(tool))); }
       else assert.ok(args.includes("--mcp-config-file"));
     }
     const controlled = jsonCliArgs({ runtime: "gemini", prompt: "hello", cwd: root, model: "flash", mcpPath: "unused", tier: "controlled" });

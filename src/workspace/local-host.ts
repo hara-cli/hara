@@ -1,3 +1,6 @@
+import { WorkspaceNativeRiskStore } from "./runtime-native-risks.js";
+import { workspaceRunNativeEvidence } from "./execution.js";
+import { isRuntimePermissionTier, type RuntimePermissionTier } from "../agent-runtime/execution-policy.js";
 import { createHash, randomUUID } from "node:crypto";
 import { lstatSync } from "node:fs";
 import { join } from "node:path";
@@ -59,6 +62,8 @@ import { executeLegacyPrint } from "./legacy-print.js";
 import { RuntimeStageRecorder, WorkspaceRuntimeStageStore, projectRuntimeStageReports,
   MAX_RUNTIME_STAGE_REPORTS, type RuntimeStageReport } from "./runtime-stage-events.js";
 import { runtimeStageErrorKind } from "../agent-runtime/stage-observer.js";
+import { codexSessionPool } from "../agent-runtime/codex-session.js";
+import { codexThreadState, codexThreadView } from "./codex-thread.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
 interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
@@ -563,6 +568,14 @@ export class LocalWorkspaceHost {
   private queueUsageRefresh(workspaceId: string): void {
     if (this.options.usageCollector) void this.refreshRuntimeUsage(workspaceId, this.context(workspaceId));
   }
+  setAgentPermissionTier(workspaceId: string, agentId: string, tier: RuntimePermissionTier, configRevision: number, agentEpoch: number): WorkspaceAgentView {
+    if (!isRuntimePermissionTier(tier)) throw new Error("Invalid runtime permission tier");
+    if (this.closing || this.updateLease || [...this.jobs.values()].some(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId)) {
+      throw new Error("Colleague is running or draining; change permissions after the attempt ends");
+    }
+    const agent = this.context(workspaceId).resources.agents.setPermissionTier(agentId, tier, configRevision, agentEpoch);
+    this.changed(workspaceId, agentId); return agent;
+  }
   setAgentRuntime(workspaceId: string, agentId: string, runtimeId: AgentRuntimeId, configRevision: number, agentEpoch: number): WorkspaceAgentView {
     const agent = this.context(workspaceId).resources.agents.setRuntime(agentId, runtimeId, configRevision, agentEpoch);
     this.context(workspaceId).runtimeModels.warm(runtimeId);
@@ -596,6 +609,7 @@ export class LocalWorkspaceHost {
           : value.attempt?.state === "completed" && value.task?.status !== "completed" ? "blocked" : value.attempt?.state ?? "idle",
         taskId: value.task?.id ?? null, objective: value.task?.objective ?? "", taskState: value.task?.status ?? null,
         runId: value.task?.workspaceRunBinding?.runId ?? null,
+        permissionTier: value.task?.workspaceAgentBinding?.permissionTier ?? "controlled",
         completion: value.task?.checkpoint?.completion ?? null, blockReason: value.task?.checkpoint?.blockReason ?? null,
         pendingQuestion: this.pendingUserQuestion(context, value),
         // Unified interaction view (permission + sync/async ask). pendingQuestion stays the legacy sync shape.
@@ -603,6 +617,9 @@ export class LocalWorkspaceHost {
           && pending.card.agentId === selected && !pending.card.channelId && pending.clientId === clientId).map(pending => pending.card)),
         usage: value.usage, runUsage: value.runUsage, pastTaskCount: value.pastTasks.length,
         runtimeStages: this.runtimeStageReports(context, selected, value.sessionId),
+        nativeRisks: new WorkspaceNativeRiskStore(context.storage, selected, value.sessionId).read(),
+        ...(catalog.agents.find(agent => agent.agentId === selected)?.runtime.id === "codex"
+          ? { nativeSession: codexThreadView(codexThreadState(context.storage, selected, value.sessionId).read()) } : {}),
         resumeAdmission: this.resumeAdmission(context, value),
         history: value.history.map(message => message.role === "assistant" ? { role: message.role, text: message.text, tools: message.toolUses.map(tool => tool.name) }
           : message.role === "tool" ? { role: message.role, results: message.results.map(result => ({ id: result.id, name: result.name, content: result.content, isError: result.isError ?? false })) }
@@ -796,6 +813,12 @@ export class LocalWorkspaceHost {
     const tools = [...localWorkspaceFileTools(job.context.project, assertCurrent), job.receipts!.tool(), job.startContext!.tool(assertCurrent),
       workspaceMemorySearchTool((query, limit) => job.context.resources.memory.search(query, job.context.project, limit), assertCurrent),
       ...(bundles.length ? [workspaceSkillTool(bundles, (id, version) => { assertCurrent(); job.context.features.assertSkill(id, version); })] : [])];
+    tools.push({ name: "workspace_native_evidence", description: "Read the current Host-observed native file diff evidence for this attempt. No diff, partial sampling, read-only mode or concurrent writers gives no evidence. Native evidence does not prove Hara management effects. Use its ID as native_evidence_ids in completion checks.", kind: "read",
+      input_schema: { type: "object", properties: {} }, async run(input) {
+        if (!plain(input) || !exact(input, [])) throw new Error("Native evidence takes no paths or claims");
+        assertCurrent(); const proof = workspaceRunNativeEvidence(job.permit!);
+        return JSON.stringify(proof ? { verified: true, nativeEvidence: proof } : { verified: false, nativeEvidence: null });
+      } });
     const channelId = job.channelId, rooms = () => this.localChannels(job.workspaceId);
     if (channelId) {
       tools.push({ name: "channel_sync", description: "Re-read this local channel now: members and every message so far, including replies written after your turn started. Read-only; same shape as your starting channel transcript.", kind: "read",
@@ -1018,6 +1041,11 @@ export class LocalWorkspaceHost {
           usedTokens: () => { const usage = tree.read().usage; return usage.inputTokens + usage.outputTokens; } },
         observeContext: observation => { owned.lease.assertCurrent(); audit.append(observation); },
         runtimeStages: owned.runtimeStages,
+        onNativeRisks: events => {
+          owned.lease.assertCurrent();
+          new WorkspaceNativeRiskStore(context.storage, agentId, store.sessionId).save(binding.runId, events);
+          this.changed(workspaceId, agentId);
+        },
         onRuntimeStageChanged: () => { this.saveRuntimeStages(owned); this.changed(owned.workspaceId, owned.agentId); },
         interaction: owned.interaction, interactionUsage: () => tree.read().usage,
         onQuestion: question => { this.commit(owned, this.questionCheckpoint(owned.value.task!, question)); },
@@ -1044,6 +1072,7 @@ export class LocalWorkspaceHost {
           + `agent_create returns only AFTER the human has approved; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. created:false with approvalState declined/expired/aborted means no colleague was created — tell the human they can ask again; do not re-open a card unless they ask. Check agent_list before creating so an active colleague is not duplicated.\n`
           + `Successful Workspace tool results repeat the exact citation ID in receipt.toolCallId. Hara records and checks those receipts automatically for simple completed changes. For an explicit checkpoint, copy observed IDs; never invent them or repeat side effects to fix a rejected citation. After restart, re-observe state with read-only tools.\n`
           + `Enabled version-locked Workspace skills (load every page of instructions via workspace_skill before acting; no extra permissions): ${boundWorkspaceText(JSON.stringify(context.features.enabledSkills().map(item => ({ id: item.id, description: item.description, version: item.version }))), 1200)}.\n`
+          + `Native runtime shell/file tools may change only the admitted working directory under the frozen permission tier. Use workspace_native_evidence to read current Host diff IDs for explicit checks; no diff is no proof. Native file evidence cannot prove Hara colleague, delegation, membership or schedule changes. All scheduled work must use Hara WorkspaceScheduler; do not use runtime-native cron, wakeup or background scheduling tools.\n`
           + `For file tasks read first; write only if necessary, then workspace_verify. Reply directly after the checks pass; Hara verifies actual tool receipts and records simple completion. Use task_checkpoint for complex acceptance or a typed human-only blocker.`,
         continuationSession: false, // Workspace recovery has its own bounded, fresh-observation wake brief.
         taskIntake: { task, current: () => owned.value.task!, onUpdate: next => { owned.value.task = next; },
@@ -1096,6 +1125,38 @@ export class LocalWorkspaceHost {
     if (job.context.connections instanceof WorkspaceSecureConnections && /\b401\b|authentication_error|invalid.api.key/i.test(String(error))) {
       try { job.context.connections.markCredentialInvalid(job.binding.connection); } catch { /* Preserve uncertain metadata; no probe or retry. */ }
     }
+  }
+  /** Explicit UI action. Hara history, tasks and usage stay intact; reset and audit commit together. */
+  async newNativeSession(clientId: string, workspaceId: string, agentId: string, expectedRevision: number, expectedNativeRevision: number, requestId: string) {
+    const context = this.context(workspaceId), selection = this.clients.get(clientId);
+    const assertCurrent = () => {
+      if (this.closing || this.updateLease || !selection || selection.workspaceId !== workspaceId || selection.agentId !== agentId || selection.channelId
+        || this.clients.get(clientId) !== selection || context.resources.agents.get(agentId)?.runtime.id !== "codex") throw new Error("Native session view changed; refresh before resetting");
+      context.storage.run(() => {});
+      if ([...this.jobs.values()].some(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId && !job.channelId))
+        throw new Error("Agent is still running or draining; native reset refused");
+    };
+    if (!UUID.test(requestId)) throw new Error("Invalid native session reset request");
+    assertCurrent();
+    const store = new WorkspaceConversationStore(context.storage, agentId), lease = WorkspaceSessionLease.acquire(context.storage, store.sessionId);
+    try {
+      const native = codexThreadState(context.storage, agentId, store.sessionId), previous = native.read();
+      const duplicate = previous.resets.find(row => row.requestId === requestId);
+      if (duplicate) return { requestId, revision: duplicate.revision, duplicate: true };
+      const conversation = store.read();
+      if (conversation.revision !== expectedRevision || previous.revision !== expectedNativeRevision) throw new Error("Native session state changed; refresh before resetting");
+      if (["running", "draining"].includes(conversation.attempt?.state ?? "") || this.pendingUserQuestion(context, conversation)
+        || this.pendingInteractions(context, conversation, []).length) throw new Error("Recover or stop the pending task before resetting its native session");
+      if (previous.resets.length >= 1024) throw new Error("Native session audit is full; history was preserved");
+      await codexSessionPool(context.runtimes).forget(context.storage, agentId, store.sessionId);
+      assertCurrent(); lease.assertCurrent();
+      if (store.read().revision !== expectedRevision) throw new Error("Conversation changed; native reset refused");
+      const actorId = this.catalog.resolve(workspaceId).actorId;
+      const value = native.update(expectedNativeRevision, current => ({ ...current, threadId: null, input: 0, output: 0, cachedInput: 0,
+        contextTokens: null, modelContextWindow: null, phase: "idle", lastAttempt: { input: 0, output: 0, cachedInput: 0 },
+        resets: [...current.resets, { requestId, actorId, at: new Date().toISOString(), oldThreadId: current.threadId, revision: current.revision + 1 }] }));
+      this.changed(workspaceId, agentId); return { requestId, revision: value.revision, duplicate: false };
+    } finally { lease.release(); }
   }
   cancel(workspaceId: string, agentId: string, runId: string): void {
     const job = this.jobs.get(runId);

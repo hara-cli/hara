@@ -27,7 +27,7 @@ test("Kimi classic full contract preserves host extensions, Hara receipts and pr
   assert.equal(f.policyCalls.at(-1).kind, "close"); await assert.rejects(fetch(meta.url));
 });
 test("Kimi default shared policy reuses fake host configuration under real controlled Seatbelt", { skip: process.platform !== "darwin" }, async t => {
-  const f = await jsonCliFixture(t, "kimi", { productionPolicy: true, recordReceipt: false }), sent = f.send(); await f.host.wait(sent.runId); const view = f.read();
+  const f = await jsonCliFixture(t, "kimi", { productionPolicy: true, recordReceipt: false, tier: "controlled" }), sent = f.send(); await f.host.wait(sent.runId); const view = f.read();
   assert.equal(view.conversation.state, "completed", JSON.stringify(view.conversation));
   assert.ok(view.conversation.history.some(row => row.role === "tool" && row.results.some(result => result.name === "agent_list")));
   assert.equal(fs.existsSync(f.extensionMarker), true); assert.equal(digest(f.fakeConfigPath), f.configDigest);

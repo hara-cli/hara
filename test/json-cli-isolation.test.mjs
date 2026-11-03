@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
-import { spawnSync } from "node:child_process";
+import { runExternalCommandCapture } from "../dist/external-sessions/process.js";
 import { randomUUID } from "node:crypto";
 import { WorkspaceResourceStorage } from "../dist/workspace/resource-context.js";
 import { WorkspaceRuntimeInstaller } from "../dist/workspace/runtime-install.js";
@@ -37,13 +37,13 @@ test("new runtimes bind only the proven account HOME and refuse isolated sign-in
     runtime.registerLocal(id, row.fingerprint, "host");
     assert.throws(() => runtime.setLoginSource(id, "isolated"), /Invalid runtime login source/);
     const launch = runtime.resolveBound(id); assert.equal(launch.env.HOME, account); assert.equal(launch.loginSource, "host");
-    assert.equal(runtime.executionPolicyRoots(id, launch).runtimeHome, join(account, id === "gemini" ? ".gemini" : ".kimi"));
-    assert.throws(() => runtime.executionPolicyRoots(id, { ...launch, env: { ...launch.env, HOME: tmpdir() } }));
+    assert.equal(runtime.executionPolicyDirectories(id, launch).runtimeHome, join(account, id === "gemini" ? ".gemini" : ".kimi"));
+    assert.throws(() => runtime.executionPolicyDirectories(id, { ...launch, env: { ...launch.env, HOME: tmpdir() } }));
   }
 });
 test("Kimi inherited extensions do not bypass frozen Workspace permit admission", async () => {
   let rootsCalled = false;
-  await assert.rejects(createJsonCliExecutionPolicy({ runtimeId: "kimi", permit: {}, installer: { executionPolicyRoots() { rootsCalled = true; throw Error("untrusted roots"); } } }));
+  await assert.rejects(createJsonCliExecutionPolicy({ runtimeId: "kimi", permit: {}, installer: { executionPolicyDirectories() { rootsCalled = true; throw Error("untrusted roots"); } } }));
   assert.equal(rootsCalled, false);
 });
 
@@ -58,7 +58,7 @@ for (const id of ["gemini", "kimi"]) test(`${id}: real Seatbelt enforces fake-ho
     const paths = { work: join(work, "yes.txt"), state: join(home, own, id === "gemini" ? "tmp" : "sessions", "yes"), hara: join(home, ".hara/no"), outside: join(root, "outside/no"), ownAuth, foreign, kimiOAuth: join(home, ".kimi/credentials/kimi-code.json"), kimiCustom: join(home, ".kimi/credentials/custom.json"), kimiCode: join(home, ".kimi-code/credentials/kimi-code.json") };
     const script = `const f=require('fs'),p=${JSON.stringify(paths)},out={}; for(const k of ['work','state','hara','outside']) {try {f.writeFileSync(p[k],'fixture');out[k]=true}catch{out[k]=false}} for(const k of ['ownAuth','foreign','kimiOAuth','kimiCustom','kimiCode']) {try {f.readFileSync(p[k]);out[k]=true}catch{out[k]=false}} try{f.writeFileSync(p.ownAuth,'no');out.authWrite=true}catch{out.authWrite=false} console.log(JSON.stringify(out));`;
     const launch = policy.wrap({ command: process.execPath, args: ["-e", script], env: { ...process.env, HOME: home } });
-    const out = spawnSync(launch.command, launch.args, { env: launch.env, cwd: work, encoding: "utf8", timeout: 5000 }); assert.equal(out.status, 0, out.stderr);
+    const out = await runExternalCommandCapture(launch, launch.args, { cwd: work, timeoutMs: 5000, waitForClose: true }); assert.equal(out.ok, true, JSON.stringify(out));
     assert.deepEqual(JSON.parse(out.stdout), { work: true, state: true, hara: false, outside: false, ownAuth: true, foreign: false, kimiOAuth: id === "kimi", kimiCustom: id === "kimi", kimiCode: false, authWrite: false });
     const evidence = policy.collectWorkspaceEvidence(); assert.equal(evidence.attemptKey, "fixture-attempt"); assert.equal(evidence.changes[0].path, "yes.txt");
     assert.ok(policy.profile.includes('global-name "com.apple.securityd"')); // Profile text only, never a service call.
