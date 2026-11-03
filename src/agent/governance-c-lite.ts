@@ -16,11 +16,25 @@ export function simpleChangeObjective(objective: string): boolean {
   return text.length > 0 && text.length <= 400 && CHANGE.test(text) && !MULTI_OUTCOME.test(text);
 }
 
+/** Presentation prefixes never add action authority. */
+export function answerQuestionText(objective: string): string {
+  return objective.trim().replace(/^(?:你好|您好|嗨)[，,\s]+/u, "").replace(ANSWER_PREFIX, "").trim();
+}
+/** Tool-free closeout is limited to greetings and the assistant's own identity/capabilities. */
+export function conversationalAnswerObjective(objective: string): boolean {
+  if (CHANGE.test(objective)) return false;
+  const value = answerQuestionText(objective);
+  return /^(?:(?:请|請)?(?:简单|簡單)?(?:自我介绍|自我介紹|(?:介绍|介紹)(?:一下)?(?:你自己|自己|你|您))|(?:你|您)(?:是(?:谁|誰|什么助手|什麼助手)|叫什么(?:名字)?|叫什麼(?:名字)?|能做(?:什么|什麼)|可以做(?:什么|什麼))|你好|您好|嗨|hello|hi|(?:please\s+)?(?:introduce yourself|who are you|what(?:'s| is) your name))[。.！!?？\s]*$/iu.test(value);
+}
+export function answerQuestionObjective(objective: string): boolean {
+  const question = answerQuestionText(objective);
+  return QUESTION.test(question) || CJK_ANSWER.test(question) || conversationalAnswerObjective(objective);
+}
+
 /** User wording supplies authority; the first model response supplies only a bounded execution hint. */
 export function engineTaskBrief(task: TaskExecution, firstReply: { text: string; toolUses: readonly { name: string }[] }): TaskBriefInput {
   const objective = task.objective.trim();
-  const question = objective.replace(ANSWER_PREFIX, "").trim();
-  const intent = CHANGE.test(objective) ? "change" : QUESTION.test(question) || CJK_ANSWER.test(question) ? "answer" : "investigate";
+  const intent = CHANGE.test(objective) ? "change" : answerQuestionObjective(objective) ? "answer" : "investigate";
   const firstTool = firstReply.toolUses.find(item => item.name !== "task_intake")?.name;
   return {
     intent,

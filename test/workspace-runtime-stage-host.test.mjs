@@ -8,13 +8,14 @@ import { once } from "node:events";
 import { WebSocket } from "ws";
 import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { startLocalWorkspaceServe } from "../dist/serve/local-workspace.js";
+import { scriptedWorkspaceProvider } from "./fixtures/scripted-workspace-provider.mjs";
 function dir(){return fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(),"hara-stage-host-")));}
 function setup(options){const root=dir(),host=new LocalWorkspaceHost(root,options),w=host.createWorkspace("Fixture",host.list().revision);host.configureSynthetic(w.workspaceId,0);return{root,host,w};}
 test("real governed Host persists stage identity and exports only metadata without rerunning a model",async()=>{
- const f=setup({providerFactory(_connection,binding){let called=false;return{id:"openai",model:binding.model,async turn(){
+ const f=setup({providerFactory(_connection,binding){let called=false;return scriptedWorkspaceProvider({id:"openai",model:binding.model,async turn(){
   if(!called){called=true;return{text:"",toolUses:[{id:randomUUID(),name:"agent_list",input:{}}],stop:"tool_use"};}
   return{text:"Listed the current colleagues.",toolUses:[],stop:"end"};
- }};}});try{
+ }});}});try{
   const run=f.host.start("client",f.w.workspaceId,f.w.selectedAgentId,"List colleagues PRIVATE_USER_PROMPT",randomUUID());await f.host.wait(run.runId);
   const c=f.host.snapshot(f.w.workspaceId).conversation,r=c.runtimeStages.at(-1);assert.ok(r);assert.equal(r.runId,run.runId);assert.equal(r.sessionId,c.sessionId);
   assert.equal(r.state,"completed");assert.equal(r.events.at(-1).kind,"complete");assert.ok(r.events.some(e=>e.kind==="model_roundtrip"&&e.phase==="end"));

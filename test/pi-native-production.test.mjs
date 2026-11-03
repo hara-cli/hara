@@ -371,3 +371,15 @@ test("Pi full Seatbelt permits a tiny Bun file dependency install with file-link
   assert.equal(result.ok,true,"Bun local file install failed under the real protected policy");
   assert.equal(readFileSync(join(work,"node_modules/local-proof/index.js"),"utf8"),'module.exports="local-install-proof";');
 });
+
+
+test("a legacy-constrained Pi model gateway cannot request an unadvertised native shell", async t => {
+  const cwd = fixture(t); let issued = 0;
+  const specs = piNativeModelTools(cwd, [], []);
+  assert.deepEqual(specs, []);
+  assert.throws(() => piNativeModelTools(cwd, [], ["CronCreate"]), /native tool subset/);
+  const b = await bridge(t, { tools: specs, nativeModel: { audience: "d".repeat(64), onNativeTools() { issued++; } },
+    provider: { id: "frozen", model: "frozen", async turn() { return { text: "", toolUses: [{ id: "forbidden-shell", name: "bash", input: { command: "echo must-not-run" } }], stop: "tool_use" }; } } });
+  assert.equal((await call(b)).status, 502);
+  assert.equal(issued, 0, "an unadvertised native call never receives authority");
+});

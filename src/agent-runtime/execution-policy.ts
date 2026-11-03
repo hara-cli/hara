@@ -259,6 +259,14 @@ export class RuntimeExecutionPolicy {
       at: new Date().toISOString(), ...(event.nodeId ? { nodeId: event.nodeId.slice(0, 80) } : {}), ...(event.channelId ? { channelId: event.channelId.slice(0, 80) } : {}) });
   }
   invalidateEvidence(): void { this.ambiguous = true; this.lastEvidence = undefined; }
+  /** A direct conversational answer cannot hide a native call, incomplete scan or file change. */
+  canCompleteConversation(): boolean {
+    if (this.closed || this.ambiguous || this.nativeEventCount || !this.baseline.complete) return false;
+    const current = snapshot(this.workRoot);
+    if (!current.complete || current.files.size !== this.baseline.files.size) return false;
+    return [...this.baseline.files].every(([path, before]) => before.kind !== "unsafe"
+      && current.files.get(path)?.kind === before.kind && current.files.get(path)?.digest === before.digest);
+  }
   collectWorkspaceEvidence(): NativeWorkspaceEvidence | null {
     if (this.closed || this.ambiguous || this.input.tier !== "full-protected" || !this.baseline.complete) return null;
     const current = snapshot(this.workRoot); if (!current.complete) return null;

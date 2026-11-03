@@ -26,6 +26,9 @@ test("a user-owned colleague-list answer closes in two model rounds with an engi
     } }; } });
   try {
     const ws = host.createWorkspace("Read only", host.list().revision); host.configureSynthetic(ws.workspaceId, 0);
+    // Exact governor/tool-ID tests keep their original in-process controlled lane.
+    const agent = host.context(ws.workspaceId).resources.agents.get(ws.selectedAgentId);
+    host.context(ws.workspaceId).resources.agents.setPermissionTier(agent.agentId, "controlled", agent.configRevision, agent.agentEpoch);
     host.select("tester", ws.workspaceId, host.list().revision);
     const run = host.start("tester", ws.workspaceId, ws.selectedAgentId, "列出同事", randomUUID());
     await host.wait(run.runId);
@@ -53,6 +56,9 @@ test("engine read-only decision rejects forged answer intent for a change reques
     } }; } });
   try {
     const ws = host.createWorkspace("Forged", host.list().revision); host.configureSynthetic(ws.workspaceId, 0);
+    // Exact governor/tool-ID tests keep their original in-process controlled lane.
+    const agent = host.context(ws.workspaceId).resources.agents.get(ws.selectedAgentId);
+    host.context(ws.workspaceId).resources.agents.setPermissionTier(agent.agentId, "controlled", agent.configRevision, agent.agentEpoch);
     host.select("tester", ws.workspaceId, host.list().revision);
     const run = host.start("tester", ws.workspaceId, ws.selectedAgentId, "创建同事并列出同事", randomUUID());
     await host.wait(run.runId);
@@ -73,6 +79,9 @@ test("a read-only answer that attempts a later write returns to the full intent 
     } }; } });
   try {
     const ws = host.createWorkspace("Read to change", host.list().revision); host.configureSynthetic(ws.workspaceId, 0);
+    // Exact governor/tool-ID tests keep their original in-process controlled lane.
+    const agent = host.context(ws.workspaceId).resources.agents.get(ws.selectedAgentId);
+    host.context(ws.workspaceId).resources.agents.setPermissionTier(agent.agentId, "controlled", agent.configRevision, agent.agentEpoch);
     host.select("tester", ws.workspaceId, host.list().revision);
     const run = host.start("tester", ws.workspaceId, ws.selectedAgentId, "列出同事", randomUUID());
     await host.wait(run.runId);
@@ -121,4 +130,18 @@ test("truncated receipts require every page; ask_user and read-to-change transit
   resumed.observe("agent_list", "r2", "read", { id: "r2", name: "agent_list", content: "{}" }, false);
   resumed.observeModelView("", [{ role: "assistant", text: "", toolUses: [call("old", "workspace_write", { path: "x" })] }]);
   assert.equal(resumed.evidence(task, false, false, false), null, "earlier non-read calls in the same attempt cannot disappear on resume");
+});
+
+
+test("only a tool-free conversation can use an answer hash; Workspace facts still require receipts", () => {
+  const task = { status: "running", objective: "你好，请用一句话介绍你自己", brief: { intent: "answer" }, decisions: [] };
+  const trace = new ReadOnlyAnswerTrace(), proof = { answer: "你好，我是 Hara。", noTools: true };
+  assert.match(trace.evidence(task, false, false, false, proof)[0], /^conversational-answer result_sha256=[a-f0-9]{64}$/);
+  assert.equal(trace.evidence(task, false, false, false), null);
+  assert.equal(trace.evidence(task, false, false, false, { ...proof, noTools: false }), null);
+  assert.equal(trace.evidence(task, true, false, false, proof), null);
+  assert.equal(trace.evidence(task, false, false, true, proof), null);
+  for (const objective of ["列出同事", "你好，请修改 note.txt", "介绍自己并列出同事"]) assert.equal(trace.evidence({ ...task, objective }, false, false, false, proof), null);
+  trace.observe("ask_user", "ask", "interactive", { id: "ask", name: "ask_user", content: "pending" }, false);
+  assert.equal(trace.evidence(task, false, false, false, proof), null);
 });

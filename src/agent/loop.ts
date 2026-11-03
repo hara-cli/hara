@@ -1,7 +1,7 @@
 import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment, TurnArgs, TurnResult } from "../providers/types.js";
 import { isTaskRuntimeBinding } from "../agent-runtime/bindings.js";
 import { WORKSPACE_AGENT_EXECUTION_PENDING } from "../workspace/agent-binding.js";
-import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, workspaceRunQuestion, workspaceRunHasPendingInteraction, workspaceRunBeginToolBatch, workspaceRunAsk, workspaceRunAsyncAnswers, workspaceRunNativeEvidence, type WorkspaceRunPermit } from "../workspace/execution.js";
+import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, workspaceRunQuestion, workspaceRunHasPendingInteraction, workspaceRunBeginToolBatch, workspaceRunAsk, workspaceRunAsyncAnswers, workspaceRunNativeEvidence, workspaceRunCanCompleteConversation, type WorkspaceRunPermit } from "../workspace/execution.js";
 import { createToolImageStore, redactOwnedToolImageText } from "../tools/tool-images.js";
 import { redactOwnedToolImageValue } from "../security/tool-media-redaction.js";
 import { createComputerRunScope, closeComputerRunScope } from "../tools/computer-run.js";
@@ -2711,8 +2711,10 @@ async function runAgentInner(
         syncIntakeTask();
         let pendingInteraction = true;
         try { pendingInteraction = workspaceRunHasPendingInteraction(opts.workspaceRun); } catch { /* fail closed */ }
+        let noTools = false;
+        try { noTools = workspaceRunCanCompleteConversation(opts.workspaceRun); } catch { /* fail closed */ }
         const evidence = readOnlyAnswerTrace.evidence(intakeTask, pendingInteraction,
-          hasPendingTaskSteering(intakeTask), currentTodos(ctx.todoScope).some(todo => todo.status !== "done"));
+          hasPendingTaskSteering(intakeTask), currentTodos(ctx.todoScope).some(todo => todo.status !== "done"), { answer: r.text, noTools });
         if (evidence) {
           const applied = applyTaskCheckpoint(intakeTask, { completion: { state: "verified", evidence } });
           if (applied.ok) {

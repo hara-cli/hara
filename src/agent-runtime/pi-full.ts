@@ -11,7 +11,7 @@ import { createCodingContinuationStore } from "../coding/continuations.js";
 import { workspaceStateHome } from "../workspace/resource-context.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { createCodingHostBridge } from "../coding/host.js";
-import { assertWorkspaceRunAdmission, workspaceRuntimeStorage, workspaceRunRuntimeStages, recordWorkspacePiNativeCalls, publishWorkspaceNativeRisks } from "../workspace/execution.js";
+import { assertWorkspaceRunAdmission, workspaceRuntimeStorage, workspaceRunRuntimeStages, recordWorkspacePiNativeCalls, publishWorkspaceNativeRisks, workspaceRunHasLegacyToolPolicy } from "../workspace/execution.js";
 import { canonical } from "../workspace/local-state.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import { createRegisteredCliMcpTurn, WORKSPACE_MCP_TOKEN_ENV } from "./registered-cli-mcp.js";
@@ -73,6 +73,7 @@ export async function runFullProtectedPi(history: NeutralMsg[], options: RunOpts
   let gateway: Awaited<ReturnType<typeof createCodingHostBridge>> | undefined, rpc: PiRpcProcess | undefined;
   const tools = new Map<string, (failed: boolean) => void>();
   const stages = workspaceRunRuntimeStages(permit);
+  const nativeTools = workspaceRunHasLegacyToolPolicy(permit) ? [] : [...PI_NATIVE_TOOL_NAMES];
   const issuedIds = new Set<string>();
   const noteIssued = (calls: readonly ToolUse[]) => {
     assertCurrent();
@@ -112,7 +113,7 @@ export async function runFullProtectedPi(history: NeutralMsg[], options: RunOpts
               onActivity: () => { activity(); }, onText: () => {}, onReasoning: () => {} }));
             if (result.stop === "error") modelFailure = classifyRuntimeFailure({ stderr: result.errorMsg, status: result.errorMetadata?.status });
             return result;
-          } }, tools: piNativeModelTools(options.ctx.cwd, activeArgs!.tools),
+          } }, tools: piNativeModelTools(options.ctx.cwd, activeArgs!.tools, nativeTools),
           nativeModel: { audience, onNativeTools: noteIssued }, budget: { maxProviderRounds: permit.binding.budget.maxRounds,
             maxToolCalls: permit.binding.budget.maxToolCalls, maxTokens: permit.binding.budget.maxTokens, timeoutMs: permit.binding.budget.timeoutMs },
           assertCurrent, signal: native.signal, executeTool: async () => { throw new Error("The model capability cannot execute Hara tools"); } });
@@ -120,7 +121,7 @@ export async function runFullProtectedPi(history: NeutralMsg[], options: RunOpts
         const config: PiNativeChildConfig = { schemaVersion: 1, sdkVersion: "1.5.0", root, cwd: options.ctx.cwd,
           system: "Execute this Hara task using only the selected native tools and supplied Hara MCP. Hara owns all persistent scheduling and confirmation. Do not create an independent scheduler or background daemon that outlives this task.",
           model: { baseURL: modelOptions.baseURL, token: modelOptions.apiKey },
-          mcp: { url: endpoint.url, token: endpoint.env[WORKSPACE_MCP_TOKEN_ENV]!, tools: activeArgs!.tools }, sessionFile: sessionStore.sessionFile };
+          mcp: { url: endpoint.url, token: endpoint.env[WORKSPACE_MCP_TOKEN_ENV]!, tools: activeArgs!.tools }, nativeTools, sessionFile: sessionStore.sessionFile };
         const launch = piNativeLauncher();
         const env: NodeJS.ProcessEnv = { HOME: join(root, "home"), USERPROFILE: join(root, "home"), PI_CODING_AGENT_DIR: agentDir,
           PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", HARA_UPDATE_CHECK: "0", NO_COLOR: "1", NODE_DISABLE_COMPILE_CACHE: "1",

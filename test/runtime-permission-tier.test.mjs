@@ -82,3 +82,14 @@ test("OpenCode transient settings do not replace the host login data or import a
  const {openCodeRunEnv}=await import("../dist/agent-runtime/opencode-cli.js");const env=openCodeRunEnv({HOME:"/fixture/account",XDG_DATA_HOME:"/fixture/login-data",OPENCODE_CONFIG_CONTENT:"PRIVATE_FAKE_CONFIG",HTTPS_PROXY:"http://127.0.0.1:9999"},{toolNames:["workspace_read"],mcp:{type:"remote",url:"http://127.0.0.1:1/mcp"}},true,"/fixture/owned-temp/config");
  assert.equal(env.HOME,"/fixture/account");assert.equal(env.XDG_DATA_HOME,"/fixture/login-data");assert.equal(env.XDG_CONFIG_HOME,"/fixture/owned-temp/config");assert.equal(env.HTTPS_PROXY,"http://127.0.0.1:9999");const config=JSON.parse(env.OPENCODE_CONFIG_CONTENT);assert.deepEqual(Object.keys(config.mcp),["hara"]);assert.equal(config.tools.bash,true);assert.equal(config.tools.task,false);assert.deepEqual(config.plugin,[]);assert.equal(env.OPENCODE_PURE,"1");
 });
+
+
+test("conversation proof rejects unobserved writes, native calls and invalidated snapshots", t => {
+ const dir=root(t),work=join(dir,"work"),home=join(dir,"account");fs.mkdirSync(work);fs.mkdirSync(home);
+ const p=createRuntimeExecutionPolicy({runtimeId:"pi",tier:"full-protected",accountHome:home,workRoot:work});t.after(()=>p.close());
+ fs.writeFileSync(join(dir,"outside.txt"),"opaque fixture");fs.symlinkSync(join(dir,"outside.txt"),join(work,"unchanged-link"));
+ p.beginAttempt("conversation");assert.equal(p.canCompleteConversation(),true);
+ fs.writeFileSync(join(work,"native.txt"),"unexpected");assert.equal(p.canCompleteConversation(),false);
+ fs.unlinkSync(join(work,"native.txt"));p.observeNativeEvent({type:"tool",status:"completed",operation:"read"});assert.equal(p.canCompleteConversation(),false);
+ p.beginAttempt("fresh-conversation");assert.equal(p.canCompleteConversation(),true);p.invalidateEvidence();assert.equal(p.canCompleteConversation(),false);
+});

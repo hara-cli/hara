@@ -32,6 +32,8 @@ interface PermitState {
   options?: RunOpts;
   cwd: string;
   managedProject: boolean;
+  hasLegacyToolPolicy: boolean;
+  nativeConversationSafe: boolean;
   stateHome: string;
   signal: AbortSignal;
   tools: Set<string>;
@@ -222,7 +224,7 @@ export function createWorkspaceRunPermit(input: {
       }
     },
   };
-  state = { onNativeRisks: input.onNativeRisks, storage: input.storage, assertLive, provider, cwd, managedProject, stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
+  state = { nativeConversationSafe: true, onNativeRisks: input.onNativeRisks, storage: input.storage, assertLive, provider, cwd, managedProject, hasLegacyToolPolicy: Boolean(input.resources.agents.resolveTask(binding.agent).toolPolicy), stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
     updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false, wakeChars: 0,
     interaction: input.interaction, onQuestion: input.onQuestion, onInteractionChanged: input.onInteractionChanged, interactionUsage: input.interactionUsage, startedAt: started, toolTail: Promise.resolve(),
     audit: new WorkspaceExecutionAudit(input.storage, binding.runId, binding.agent.agentId),
@@ -293,6 +295,10 @@ export function beginWorkspaceGovernedRun(permit: WorkspaceRunPermit, options: R
   state.started = true;
 }
 export function workspaceRunToolAllowed(permit: WorkspaceRunPermit, name: string): boolean { return stateOf(permit).tools.has(name); }
+/** Imported role policies grant only their scoped Hara tools, never an extra native shell. */
+export function workspaceRunHasLegacyToolPolicy(permit: WorkspaceRunPermit): boolean {
+  const state = stateOf(permit); state.assertLive(); return state.hasLegacyToolPolicy;
+}
 /** Trusted native transport composition; never derived from a renderer path or the foreground scope. */
 export function workspaceRuntimeStorage(permit: WorkspaceRunPermit): WorkspaceResourceStorage {
   const state = stateOf(permit); state.assertLive(); return state.storage;
@@ -426,7 +432,12 @@ export function attachWorkspaceNativePolicy(permit: WorkspaceRunPermit, policy: 
   if (state.nativePolicy && state.nativePolicy !== policy) throw new Error("A native process already owns this attempt");
   if (policy.runtimeId !== permit.binding.agent.runtimeId || policy.tier !== (permit.binding.agent.permissionTier ?? "controlled")) throw new Error("Native policy does not match the frozen runtime and permission tier");
   if (policy.workRoot !== state.cwd) throw new Error("Native working directory does not match the admitted project");
-  state.nativePolicy = policy; state.nativeEvidence = undefined;
+  state.nativePolicy = policy; state.nativeEvidence = undefined; state.nativeConversationSafe = false;
+}
+/** Host-only proof for a tool-free greeting/self-introduction after native settle and drain. */
+export function workspaceRunCanCompleteConversation(permit: WorkspaceRunPermit): boolean {
+  const state = stateOf(permit); state.assertLive();
+  return state.usage.toolCalls === 0 && !state.nativePolicy && state.nativeConversationSafe;
 }
 export function workspaceRunNativeEvidence(permit: WorkspaceRunPermit): NativeWorkspaceEvidence | null {
   const state = stateOf(permit); state.assertLive();
@@ -445,7 +456,7 @@ export function publishWorkspaceNativeRisks(permit: WorkspaceRunPermit): void {
 export function finishWorkspaceNativePolicy(permit: WorkspaceRunPermit, policy: RuntimeExecutionPolicy): void {
   const state = stateOf(permit);
   if (state.nativePolicy !== policy) return;
-  try { state.nativeEvidence = policy.collectWorkspaceEvidence() ?? undefined; publishWorkspaceNativeRisks(permit); }
+  try { state.nativeEvidence = policy.collectWorkspaceEvidence() ?? undefined; state.nativeConversationSafe = typeof policy.canCompleteConversation === "function" && policy.canCompleteConversation(); publishWorkspaceNativeRisks(permit); }
   finally { state.nativePolicy = undefined; }
 }
 

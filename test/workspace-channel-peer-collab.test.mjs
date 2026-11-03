@@ -3,12 +3,13 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { channelMentions } from "../dist/workspace/local-channels.js";
 import { setup } from "./helpers/local-channels.mjs";
+import { scriptedWorkspaceProvider } from "./fixtures/scripted-workspace-provider.mjs";
 
 // Scripted colleagues: each agent plays its tool calls in order, one per model call, then answers in text.
 // Every call records the system prompt plus the tool results it has seen so far.
 const scripted = (script, calls) => (_connection, binding, context) => {
   let step = 0;
-  return { id: "openai", model: binding.model, async turn(args) {
+  return scriptedWorkspaceProvider({ id: "openai", model: binding.model, async turn(args) {
     const results = args.history.filter(row => row.role === "tool").flatMap(row => row.results);
     const name = context.agent.identity.displayName;
     const next = (script[name] ?? [])[step];
@@ -16,7 +17,7 @@ const scripted = (script, calls) => (_connection, binding, context) => {
     step++;
     if (next) return { text: "", toolUses: [{ id: randomUUID(), name: next.name, input: next.input }], stop: "tool_use", usage: { input: 1, output: 1 } };
     return { text: `${name} replied`, toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
-  } };
+  } });
 };
 
 test("channelMentions resolves @displayName and @agentId, longest first, without matching inside words or e-mail", () => {

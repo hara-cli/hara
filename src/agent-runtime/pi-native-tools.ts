@@ -9,10 +9,11 @@ export function piWorkspaceToolName(name: string): string {
   const full = "mcp__hara__" + name;
   return full.length <= 64 ? full : full.slice(0, 47) + "_" + createHash("sha256").update(full).digest("hex").slice(0, 16);
 }
-export function piNativeModelTools(cwd: string, workspace: readonly ToolSpec[]): ToolSpec[] {
+export function piNativeModelTools(cwd: string, workspace: readonly ToolSpec[], nativeNames: readonly string[] = PI_NATIVE_TOOL_NAMES): ToolSpec[] {
+  if (new Set(nativeNames).size !== nativeNames.length || nativeNames.some(name => !(PI_NATIVE_TOOL_NAMES as readonly string[]).includes(name))) throw new Error("Invalid Pi native tool subset");
   const native = createCodingTools(cwd).filter(tool => (PI_NATIVE_TOOL_NAMES as readonly string[]).includes(tool.name));
   if (native.length !== PI_NATIVE_TOOL_NAMES.length || new Set(native.map(tool => tool.name)).size !== native.length) throw new Error("Pi native tool inventory changed");
-  const result: ToolSpec[] = native.map(tool => ({ name: tool.name, description: tool.description,
+  const result: ToolSpec[] = native.filter(tool => nativeNames.includes(tool.name)).map(tool => ({ name: tool.name, description: tool.description,
     input_schema: JSON.parse(JSON.stringify(tool.parameters)) as Record<string, unknown> }));
   result.push(...workspace.map(tool => ({ ...tool, name: piWorkspaceToolName(tool.name) })));
   if (new Set(result.map(tool => tool.name)).size !== result.length) throw new Error("Pi native tool inventory collided");

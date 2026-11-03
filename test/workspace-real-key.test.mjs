@@ -149,6 +149,8 @@ test("a paused human-dependency receipt is not surfaced as a completed Workspace
   } }; } });
   try {
     const workspace = host.createWorkspace("Paused", host.list().revision); host.configureSynthetic(workspace.workspaceId, 0);
+    const fixtureAgent=host.context(workspace.workspaceId).resources.agents.get(workspace.selectedAgentId);
+    host.context(workspace.workspaceId).resources.agents.setPermissionTier(fixtureAgent.agentId,"controlled",fixtureAgent.configRevision,fixtureAgent.agentEpoch);
     const run = host.start("test", workspace.workspaceId, workspace.selectedAgentId, "wait", randomUUID()); await host.wait(run.runId);
     const conversation = host.snapshot(workspace.workspaceId).conversation;
     assert.equal(conversation.taskState, "paused"); assert.equal(conversation.state, "blocked");

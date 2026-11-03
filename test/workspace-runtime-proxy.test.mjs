@@ -134,7 +134,8 @@ test("a registered runtime child sends HTTPS CONNECT to its Workspace proxy whil
 
 test("Codex inventory fallback rechecks a proxy saved during the async app-server query before spawning debug", { skip: process.platform === "win32" }, async () => {
   const resource = storage(), discovery = root(), bin = join(discovery, "bin"), command = join(bin, "codex"); fs.mkdirSync(bin);
-  const started = join(discovery, "app-server-started"), debug = join(discovery, "debug-spawned");
+  fs.mkdirSync(join(discovery,".codex/log"),{recursive:true,mode:0o700});
+  const started = join(discovery, ".codex/log/app-server-started"), debug = join(discovery, ".codex/log/debug-spawned");
   fs.writeFileSync(command, `#!/usr/bin/env node\nconst fs=require('node:fs');if(process.argv[2]==='app-server'){fs.writeFileSync(${JSON.stringify(started)},'1');setTimeout(()=>process.exit(1),700);}else{fs.writeFileSync(${JSON.stringify(debug)},'1');console.log('{"models":[{"slug":"fake","display_name":"Fake"}]}');}\n`, { mode: 0o700 });
   const installer = new WorkspaceRuntimeInstaller(resource, { accountHome: () => discovery, discovery: { home: discovery, path: `${bin}:${dirname(process.execPath)}:/usr/bin:/bin`, systemBins: [], run: async (_command, args) => args[0] === "-lic" ? null : "codex 1.2.3" } });
   try {

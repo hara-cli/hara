@@ -112,6 +112,10 @@ test("two answer connections compete for one durable question; stale/cross-scope
   assert(init.capabilities.includes("workspace.user-interaction.v1"));
   const w=await a.request("workspace.create",{label:"Question",expectedRevision:init.workspace.revision});
   await a.request("workspace.connection.synthetic",{workspaceId:w.workspaceId,expectedGeneration:w.resourceGeneration,expectedRevision:0});
+  // This fixture tests durable in-process ask recovery, distinct from native outcome-unknown refusal.
+  const before=await a.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId});
+  const agent=before.agents.find(row=>row.agentId===w.selectedAgentId);
+  await a.request("workspace.agents.setPermissionTier",{workspaceId:w.workspaceId,expectedGeneration:w.resourceGeneration,agentId:agent.agentId,permissionTier:"controlled",configRevision:agent.configRevision,agentEpoch:agent.agentEpoch});
   const base={workspaceId:w.workspaceId,expectedGeneration:w.resourceGeneration,agentId:w.selectedAgentId};
   const first=await a.request("workspace.session.send",{...base,message:"Clarify this target",requestId:randomUUID()});
   const pending=await until(async()=>{const view=await a.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId});return view.conversation.state==="awaiting_user"?view.conversation.pendingQuestion:null;});

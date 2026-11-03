@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { answerQuestionObjective, conversationalAnswerObjective } from "./governance-c-lite.js";
 import type { NeutralMsg, ToolResult } from "../providers/types.js";
 import type { TaskExecution } from "../session/task.js";
 import type { ToolEffect } from "../tools/registry.js";
@@ -11,12 +12,11 @@ export const READONLY_ANSWER_TOOLS = new Set([
 ]);
 const REFERENCE = /receipt-([a-f0-9]{64})\.json/gu;
 const CHANGE_WORD = /(?:创建|建立|新增|添加|写入|修改|编辑|删除|移除|重命名|发送|委派|安排|定时|执行|部署|安装|更新|保存|同步|推送|合并|生成|设置|关闭|开启|create|add|write|edit|change|delete|remove|rename|send|delegate|schedule|execute|deploy|install|update|save|sync|push|merge|generate|set up|turn on|turn off)/iu;
-const READ_QUESTION = /[?？]|^(?:\s*(?:list|show|read|describe|explain|what|who|which|how many|tell me|find|search|列出|查看|读取|说明|解释|告诉我|查找|搜索|有哪些|是什么|谁是))/iu;
 
 /** User-owned objective is a conservative second authority, never the model's brief alone. */
 export function readOnlyAnswerObjective(objective: string): boolean {
   const value = objective.trim();
-  return value.length > 0 && value.length <= 2000 && !CHANGE_WORD.test(value) && READ_QUESTION.test(value);
+  return value.length > 0 && value.length <= 2000 && !CHANGE_WORD.test(value) && answerQuestionObjective(value);
 }
 
 interface Observation { id: string; name: string; digest: string }
@@ -69,13 +69,16 @@ export class ReadOnlyAnswerTrace {
   }
 
   evidence(task: TaskExecution | undefined, pendingInteraction: boolean, hasPendingSteering: boolean,
-    incompleteTodo: boolean): string[] | null {
+    incompleteTodo: boolean, conversation?: { answer: string; noTools: boolean }): string[] | null {
     if (!task || task.status !== "running" || task.brief?.intent !== "answer"
       || !readOnlyAnswerObjective(task.objective) || task.decisions?.length || task.steering?.length
       || task.checkpoint?.completion?.state === "awaiting_user"
       || pendingInteraction || hasPendingSteering || incompleteTodo || this.unsafe
-      || this.neededReceipts.size || this.observed.length > 12
-      || !this.observed.some(item => item.name !== "workspace_receipt_read" && item.name !== "workspace_skill")) return null;
+      || this.neededReceipts.size || this.observed.length > 12) return null;
+    if (!this.observed.some(item => item.name !== "workspace_receipt_read" && item.name !== "workspace_skill")) {
+      if (this.observed.length || !conversation?.noTools || !conversation.answer.trim() || !conversationalAnswerObjective(task.objective)) return null;
+      return [`conversational-answer result_sha256=${createHash("sha256").update(conversation.answer).digest("hex")}`];
+    }
     return this.observed.map(item => `${item.name} tool_call_id=${item.id} result_sha256=${item.digest}`);
   }
 }

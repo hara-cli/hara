@@ -23,6 +23,9 @@ function setup() {
   } });
   const workspace = host.createWorkspace("Synthetic resume", host.list().revision);
   host.configureSynthetic(workspace.workspaceId, 0);
+  // This fixture checks the governed-loop safety-ceiling receipt before native transport classification.
+  const agent=host.context(workspace.workspaceId).resources.agents.get(workspace.selectedAgentId);
+  host.context(workspace.workspaceId).resources.agents.setPermissionTier(agent.agentId,"controlled",agent.configRevision,agent.agentEpoch);
   const storage = new WorkspaceResourceStorage(host.home, host.catalog.resolve(workspace.workspaceId).scope); storage.initialize();
   const file = storage.run(() => join(workspaceStateHome(), ".hara", `conversation-${workspace.selectedAgentId.slice(3)}.json`));
   return { root, host, workspace, storage, file, counts: () => ({ factories, calls }) };

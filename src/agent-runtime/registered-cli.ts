@@ -28,8 +28,8 @@ function codexEffortArgs(effort: string | null): string[] {
 }
 function claudeEffortArgs(effort: string | null): string[] { return effort ? ["--effort", effort] : []; }
 
-/** Keep read-only/plan confinement. Only Hara's per-attempt MCP server is explicitly trusted:
- * its calls still yield to the canonical Hara governor and Desk approval, never to tool.run here. */
+/** The outer runtime policy owns native confinement; Codex's nested OS sandbox stays disabled.
+ * Only the private per-attempt Hara MCP server is trusted, with canonical governor/Desk approval. */
 export function registeredCliArgs(input: {
   id: "codex" | "claude"; prompt: string; cwd: string; model: string | null; effort: string | null; skipGitRepoCheck: boolean;
   mcp?: { url: string; timeoutMs: number; serverName?: string }; hostToolOverrides?: string[]; permissionTier?: "full-protected" | "controlled"; claudeStreamJson?: boolean; claudePermissionMode?: "plan" | "bypassPermissions";

@@ -13,12 +13,15 @@ const temporary=[];after(()=>{for(const path of temporary)fs.rmSync(path,{recurs
 function dir(){const path=fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(),"hara-local-crash-")));temporary.push(path);return path;}
 test("actual process death after writing recovers the frozen task, closes protocol history and does not rewrite the verified file",async()=>{
  const root=dir(),callerHome=dir(),first=new LocalWorkspaceHost(root),workspace=first.createWorkspace("Personal",first.list().revision);
- first.configureSynthetic(workspace.workspaceId,0);await first.close();
+ first.configureSynthetic(workspace.workspaceId,0);
+ // Governed in-process crash recovery is distinct from full Pi outcome-unknown refusal.
+ const agent=first.context(workspace.workspaceId).resources.agents.get(workspace.selectedAgentId);
+ first.context(workspace.workspaceId).resources.agents.setPermissionTier(agent.agentId,"controlled",agent.configRevision,agent.agentEpoch);await first.close();
  const base=pathToFileURL(resolve("dist/workspace")).href+"/";
  const code=`import {LocalWorkspaceHost} from '${base}local-host.js';import {createWorkspaceSyntheticProvider} from '${base}synthetic-provider.js';import {randomUUID} from 'node:crypto';
  const host=new LocalWorkspaceHost(process.argv[1],{providerFactory(c,b,x){const p=createWorkspaceSyntheticProvider(c,b,x);return {...p,async turn(args){if(args.history.some(m=>m.role==='tool'&&m.results.some(r=>r.name==='workspace_write'))){console.log('AFTER_WRITE');await new Promise(()=>{});}return p.turn(args);}};}});
  host.start('child',process.argv[2],process.argv[3],'生成 hello.md 並驗證',randomUUID());process.stdin.resume();`;
- const child=spawn(process.execPath,["--input-type=module","--eval",code,root,workspace.workspaceId,workspace.selectedAgentId],{env:{PATH:process.env.PATH,HOME:callerHome,USERPROFILE:callerHome},stdio:["pipe","pipe","pipe"]});
+ const child=spawn(process.execPath,["--input-type=module","--eval",code,root,workspace.workspaceId,workspace.selectedAgentId],{env:{PATH:process.env.PATH,HOME:callerHome,USERPROFILE:callerHome,TMPDIR:process.env.TMPDIR,TMP:process.env.TMP,TEMP:process.env.TEMP},stdio:["pipe","pipe","pipe"]});
  const exited=once(child,"exit");let stderr="";child.stderr.on("data",chunk=>stderr+=chunk);
  try{
   const ready=once(child.stdout,"data").then(([bytes])=>bytes.toString());

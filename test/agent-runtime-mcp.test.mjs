@@ -52,12 +52,15 @@ test("native CLI bridge keeps token values out of argv and trusts only the hara 
   const common = { prompt: "fixture", cwd: "/fixture", model: null, effort: null, skipGitRepoCheck: true,
     mcp: { url: "http://127.0.0.1:1234/mcp", timeoutMs: 120000 } };
   const codex = registeredCliArgs({ id: "codex", ...common });
-  assert(codex.includes("read-only")); assert(codex.includes('approval_policy="on-request"'));
+  // The reviewed outer Seatbelt owns confinement; nested Codex Seatbelt is disabled.
+  assert(codex.includes("--dangerously-bypass-approvals-and-sandbox"));
+  assert(codex.includes('approval_policy="never"'));
   assert(codex.includes('shell_environment_policy.set.HARA_WORKSPACE_MCP_TOKEN=""'));
-  assert(codex.includes('mcp_servers.hara.default_tools_approval_mode="auto"'));
-  assert(codex.includes("mcp_servers.hara.bearer_token_env_var=" + JSON.stringify(WORKSPACE_MCP_TOKEN_ENV)));
-  assert.equal(codex.some(value => value.includes("default_tools_approval_mode") && !value.startsWith("mcp_servers.hara.")), false);
-  assert.equal(codex.some(value => /bypass|danger-full-access|Bearer /u.test(value)), false);
+  assert(codex.includes('mcp_servers.hara_workspace.default_tools_approval_mode="approve"'));
+  assert(codex.includes("mcp_servers.hara_workspace.bearer_token_env_var=" + JSON.stringify(WORKSPACE_MCP_TOKEN_ENV)));
+  assert.equal(codex.some(value => value.includes("default_tools_approval_mode") && !value.startsWith("mcp_servers.hara_workspace.")), false);
+  assert.equal(codex.some(value => /Bearer /u.test(value)), false);
+  assert.throws(() => registeredCliArgs({ id: "codex", ...common, mcp: { ...common.mcp, serverName: "foreign" } }), /Host MCP namespace/);
   const claude = registeredCliArgs({ id: "claude", ...common });
   assert(claude.includes("plan")); assert(claude.includes("--strict-mcp-config"));
   assert.equal(claude[claude.indexOf("--allowedTools") + 1], "mcp__hara__*");

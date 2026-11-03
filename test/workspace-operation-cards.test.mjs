@@ -19,6 +19,7 @@ import { startLocalWorkspaceServe } from "../dist/serve/local-workspace.js";
 import { channelMentions } from "../dist/workspace/local-channels.js";
 import { WorkspaceRequestJournal } from "../dist/workspace/request-journal.js";
 import { canonical } from "../dist/workspace/local-state.js";
+import { scriptedWorkspaceProvider } from "./fixtures/scripted-workspace-provider.mjs";
 
 const roots = [];
 function dir() {
@@ -62,7 +63,7 @@ let host, handle, client, initialized, scope, sample, mainTools, channelTools, c
 before(async () => {
   const root = dir(), home = dir(), captures = [];
   host = new LocalWorkspaceHost(root, { mode: "workspace", hostHome: home, discoveryHome: home, credentialVault: new MemoryCredentialVault(),
-    providerFactory: (_connection, binding) => ({ id: "openai", model: binding.model, async turn(args) {
+    providerFactory: (_connection, binding) => scriptedWorkspaceProvider({ id: "openai", model: binding.model, async turn(args) {
       captures.push(args);
       return { text: "已查看。", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
     } }),
@@ -119,7 +120,7 @@ async function checkRpcFacts(definition) {
 test("built-in cards use the existing bounded skill container with one compact prompt index", async () => {
   const bundle = validateWorkspaceSkill(workspaceOperationSkill());
   assert.equal(WORKSPACE_OPERATION_CARDS.length, 9);
-  assert.equal(Object.keys(bundle.files).length, 9);
+  assert.equal(Object.keys(bundle.files).length, 10, "index plus nine cards");
   assert.match(mainPrompt, /"id":"hara-operations"/);
   assert.equal(mainTools.find(row => row.name === "workspace_skill").input_schema.properties.file.type, "string");
   for (const definition of WORKSPACE_OPERATION_CARDS) assert.ok(!mainPrompt.includes(definition.steps[0]), "card bodies are not in the system prompt");
@@ -133,7 +134,7 @@ test("built-in cards use the existing bounded skill container with one compact p
     const value = JSON.parse(result); assert.equal(value.nextOffset, null); assert.match(value.content, /权限与边界/);
     assert.deepEqual(JSON.parse(value.content.trim().split("\n").at(-1)), { rpcs: definition.rpcs, tools: definition.tools });
   }
-  assert.equal(checked.length, 9, "built-in reads still call the host's current-permit assertion");
+  assert.equal(checked.length, 10, "index and all nine card reads still assert the current permit");
 });
 
 test("runtime/login card binds registration approval, login-source validation and current agent revision", async () => {
@@ -246,19 +247,22 @@ test("contract checker detects renamed tools and schema drift rather than accept
 test("an ordinary formal Host can load just one built-in card through its governed model tool", async () => {
   const root = dir(), home = dir(); let calls = 0;
   const governed = new LocalWorkspaceHost(root, { mode: "workspace", hostHome: home, discoveryHome: home, credentialVault: new MemoryCredentialVault(),
-    providerFactory: (_connection, binding) => ({ id: "openai", model: binding.model, async turn(args) {
+    providerFactory: (_connection, binding) => scriptedWorkspaceProvider({ id: "openai", model: binding.model, async turn(args) {
       calls++;
       const result = args.history.flatMap(row => row.role === "tool" ? row.results : []).find(row => row.name === "workspace_skill");
       if (!result) return { text: "", toolUses: [{ id: "read-operation-card", name: "workspace_skill", input: { id: WORKSPACE_OPERATION_SKILL_ID, file: "cards/model-effort.md" } }], stop: "tool_use", usage: { input: 1, output: 1 } };
       assert.equal(result.isError ?? false, false, result.content);
       const value = JSON.parse(result.content); assert.equal(value.file, "cards/model-effort.md"); assert.equal(value.nextOffset, null);
       assert.ok(value.content.includes(card("model-effort").steps[0])); assert.ok(!value.content.includes(card("proxy-boundary").steps[0]));
-      return { text: "说明已读取。", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+      return { text: "说明已读取。", toolUses: [{id:"verify-help",name:"task_checkpoint",input:{completion:{state:"verified",evidence:["Requested help card read"],checks:[{acceptance_index:0,evidence:"The exact requested model/effort instructions were read",tool_call_ids:[result.id]}],final_answer:"说明已读取。"}}}], stop: "tool_use", usage: { input: 1, output: 1 } };
     } }),
   });
   try {
     const workspace = governed.createWorkspace("Read instructions", governed.list().revision), id = workspace.workspaceId;
     governed.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0);
+    // The help-card proof tests the governed tool ledger, including its two-round explicit completion.
+    const agent = governed.context(id).resources.agents.get(workspace.selectedAgentId);
+    governed.context(id).resources.agents.setPermissionTier(agent.agentId,"controlled",agent.configRevision,agent.agentEpoch);
     const requestId = randomUUID(), message = "如何选择运行时模型？";
     const run = governed.start("reader", id, workspace.selectedAgentId, message, requestId); await governed.wait(run.runId);
     assert.equal(calls, 2, "one fake tool-use turn and one fake answer; zero external model calls");

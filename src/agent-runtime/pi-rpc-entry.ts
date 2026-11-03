@@ -17,6 +17,8 @@ export interface PiNativeChildConfig {
   schemaVersion: 1; sdkVersion: "1.5.0"; cwd: string; root: string; system: string;
   model: { baseURL: string; token: string };
   mcp: { url: string; token: string; tools: ToolSpec[] };
+  /** Exact Host-selected subset; absent only for older trusted callers. */
+  nativeTools?: string[];
   sessionFile: string | null;
 }
 function refused(): never { throw new Error("Pi protected RPC configuration refused"); }
@@ -40,7 +42,7 @@ export function readPiNativeChildConfig(): PiNativeChildConfig {
   } finally { closeSync(3); }
   let config: unknown;
   try { config = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { return refused(); }
-  if (!object(config) || JSON.stringify(Object.keys(config).sort()) !== JSON.stringify(["schemaVersion", "sdkVersion", "cwd", "root", "system", "model", "mcp", "sessionFile"].sort())
+  if (!object(config) || JSON.stringify(Object.keys(config).sort()) !== JSON.stringify(["schemaVersion", "sdkVersion", "cwd", "root", "system", "model", "mcp", "sessionFile", ...(config.nativeTools === undefined ? [] : ["nativeTools"])].sort())
     || config.schemaVersion !== 1 || config.sdkVersion !== "1.5.0" || typeof config.root !== "string" || typeof config.cwd !== "string"
     || realpathSync.native(config.root) !== config.root || realpathSync.native(config.cwd) !== config.cwd || config.cwd !== realpathSync.native(process.cwd())
     || (lstatSync(config.root).mode & 0o077)
@@ -51,6 +53,8 @@ export function readPiNativeChildConfig(): PiNativeChildConfig {
     || base.search || base.hash || base.username || base.password || !/^[A-Za-z0-9_-]{43}$/.test(String(config.model.token))
     || mcp.protocol !== "http:" || mcp.hostname !== "127.0.0.1" || !mcp.port || mcp.pathname !== "/mcp"
     || mcp.search || mcp.hash || mcp.username || mcp.password || !/^[a-f0-9]{64}$/.test(String(config.mcp.token))) return refused();
+  if (config.nativeTools !== undefined && (!Array.isArray(config.nativeTools) || new Set(config.nativeTools).size !== config.nativeTools.length
+    || config.nativeTools.some(name => typeof name !== "string" || !(PI_NATIVE_TOOL_NAMES as readonly string[]).includes(name)))) return refused();
   const names = new Set<string>();
   for (const tool of config.mcp.tools) {
     if (!object(tool) || typeof tool.name !== "string" || names.has(tool.name) || typeof tool.description !== "string" || !object(tool.input_schema)) return refused();
@@ -67,6 +71,7 @@ export async function mainPiNativeRpc(args: string[]): Promise<never> {
   assertHostPiVersion();
   if (args.length !== 4 || args[0] !== "--mode" || args[1] !== "rpc" || args[2] !== "--config-fd" || args[3] !== "3") return refused();
   const input = readPiNativeChildConfig();
+  const nativeTools = input.nativeTools ?? [...PI_NATIVE_TOOL_NAMES];
   process.title = "hara-pi-rpc";
   const agentDir = join(input.root, "agent");
   stage = "model";
@@ -79,7 +84,7 @@ export async function mainPiNativeRpc(args: string[]): Promise<never> {
         supportsReasoningEffort: false, supportsUsageInStreaming: true, supportsLongCacheRetention: false, supportsMidConvoSystemMessages: false, thinkingFormat: "deepseek" } }] });
   const model = modelRuntime.getModel("hara", "coding"); if (!model) return refused();
   const settingsManager = SettingsManager.inMemory({ defaultProvider: "hara", defaultModel: "coding", defaultThinkingLevel: "off", enabledModels: ["hara/coding"],
-    defaultProjectTrust: "never", defaultTools: [...PI_NATIVE_TOOL_NAMES], compaction: { enabled: false }, retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } },
+    defaultProjectTrust: "never", defaultTools: nativeTools, compaction: { enabled: false }, retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } },
     cacheWarming: "off", enableAnalytics: false, enableInstallTelemetry: false, enableSkillCommands: false, packages: [], extensions: [], skills: [], prompts: [], themes: [],
     images: { blockImages: true }, transport: "sse", quietStartup: true });
   const extensionRuntime = createExtensionRuntime();
@@ -106,9 +111,9 @@ export async function mainPiNativeRpc(args: string[]): Promise<never> {
   stage = "session";
   const manager = input.sessionFile ? SessionManager.open(input.sessionFile, join(agentDir, "sessions")) : SessionManager.create(input.cwd, join(agentDir, "sessions"));
   const created = await createAgentSession({ cwd: input.cwd, agentDir, modelRuntime, model, thinkingLevel: "off", scopedModels: [{ model, thinkingLevel: "off" }],
-    resourceLoader, settingsManager, sessionManager: manager, tools: [...PI_NATIVE_TOOL_NAMES, ...customTools.map(tool => tool.name)], customTools });
+    resourceLoader, settingsManager, sessionManager: manager, tools: [...nativeTools, ...customTools.map(tool => tool.name)], customTools });
   if (created.modelFallbackMessage || created.session.model?.provider !== "hara" || created.session.model.id !== "coding"
-    || JSON.stringify(created.session.getActiveToolNames().sort()) !== JSON.stringify([...PI_NATIVE_TOOL_NAMES, ...customTools.map(tool => tool.name)].sort())) return refused();
+    || JSON.stringify(created.session.getActiveToolNames().sort()) !== JSON.stringify([...nativeTools, ...customTools.map(tool => tool.name)].sort())) return refused();
   const services = { cwd: input.cwd, agentDir, modelRuntime, settingsManager, resourceLoader, diagnostics: [] };
   stage = "rpc";
   const runtime = new AgentSessionRuntime(created.session, services, async () => refused());

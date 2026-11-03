@@ -11,6 +11,7 @@ import { createWorkspaceSyntheticProvider } from "../dist/workspace/synthetic-pr
 import { WorkspaceContextReceipts } from "../dist/workspace/context-receipts.js";
 import { WorkspaceResourceStorage, workspaceStateHome } from "../dist/workspace/resource-context.js";
 import { DEFAULT_WORKSPACE_RUN_BUDGET } from "../dist/workspace/run-binding.js";
+import { scriptedWorkspaceProvider } from "./fixtures/scripted-workspace-provider.mjs";
 
 const temporary = [];
 after(() => { for (const path of temporary) fs.rmSync(path, { recursive: true, force: true }); });
@@ -109,13 +110,13 @@ test("synthetic six-step flow uses per-task context, accepts multiline delegatio
   const path = root(), calls = [];
   const host = new LocalWorkspaceHost(path, { providerFactory(connection, binding, context) {
     const provider = createWorkspaceSyntheticProvider(connection, binding, context);
-    return { ...provider, async turn(args) {
+    return scriptedWorkspaceProvider({ ...provider, async turn(args) {
       calls.push({ objective: context.objective, history: structuredClone(args.history), system: args.system });
       const result = await provider.turn(args);
       if (context.objective === "OLD_CHAT_MARKER") return { ...result, text: "OLD_ASSISTANT_MARKER ".repeat(2000) };
       for (const use of result.toolUses) if (use.name === "agent_contact") use.input.task = "生成 hello.md\n內容必須為 hello workspace\\n\n讀取並驗證後回報";
       return result;
-    } };
+    } });
   } });
   try {
     const workspace = host.createWorkspace("Context synthetic", host.list().revision), id = workspace.workspaceId, main = workspace.selectedAgentId;
@@ -146,7 +147,7 @@ test("synthetic six-step flow uses per-task context, accepts multiline delegatio
 test("a verbose colleague completion returns at most2k characters with its full handoff retained privately", async () => {
   const path = root(), host = new LocalWorkspaceHost(path, { providerFactory(connection, binding, context) {
     const provider = createWorkspaceSyntheticProvider(connection, binding, context);
-    return { ...provider, async turn(args) {
+    return scriptedWorkspaceProvider({ ...provider, async turn(args) {
       const result = await provider.turn(args);
       if (context.agent.kind === "colleague") for (const use of result.toolUses) {
         if (use.name === "task_intake") use.input.acceptance = Array.from({ length: 8 }, (_, i) => `Exact file criterion ${i}`);
@@ -155,7 +156,7 @@ test("a verbose colleague completion returns at most2k characters with its full 
         }
       }
       return result;
-    } };
+    } });
   } });
   try {
     const ws = host.createWorkspace("Handoff", host.list().revision); host.configureSynthetic(ws.workspaceId, 0); host.select("test", ws.workspaceId, host.list().revision);
@@ -186,6 +187,9 @@ test("actual governed Host compacts at72% without an extra Provider or a usage r
   } });
   try {
     const ws = host.createWorkspace("Compaction", host.list().revision); host.configureSynthetic(ws.workspaceId, 0);
+    // Exact in-process ledger/compaction/recovery contract; full native transport has separate coverage.
+    const agent = host.context(ws.workspaceId).resources.agents.get(ws.selectedAgentId);
+    host.context(ws.workspaceId).resources.agents.setPermissionTier(agent.agentId,"controlled",agent.configRevision,agent.agentEpoch);
     const run = host.start("test", ws.workspaceId, ws.selectedAgentId, "write hello.md and verify", randomUUID()); await host.wait(run.runId);
     const view = host.snapshot(ws.workspaceId); assert.equal(view.conversation.taskState, "completed"); assert.equal(view.conversation.completion.state, "verified");
     assert.equal(calls, 4); assert.equal(view.conversation.runUsage.modelCalls, 4); assert.equal(view.conversation.runUsage.inputTokens + view.conversation.runUsage.outputTokens, 2 * burstInput + 24);
@@ -211,6 +215,9 @@ test("actual scoped80k output remains complete in local history but enters the m
   } });
   try {
     const ws = host.createWorkspace("Large output", host.list().revision); host.configureSynthetic(ws.workspaceId, 0);
+    // Exact in-process ledger/compaction/recovery contract; full native transport has separate coverage.
+    const agent = host.context(ws.workspaceId).resources.agents.get(ws.selectedAgentId);
+    host.context(ws.workspaceId).resources.agents.setPermissionTier(agent.agentId,"controlled",agent.configRevision,agent.agentEpoch);
     const content = "abcdefg\n".repeat(10000); fs.writeFileSync(join(path, "project", ws.workspaceId, "large.md"), content);
     const run = host.start("test", ws.workspaceId, ws.selectedAgentId, "read large.md only", randomUUID()); await host.wait(run.runId);
     const view = host.snapshot(ws.workspaceId); assert.equal(view.conversation.taskState, "completed");
@@ -232,6 +239,9 @@ test("recovery projects a fresh attempt but retains frozen task/budget, blocked 
   } });
   try {
     const ws = host.createWorkspace("Resume", host.list().revision); host.configureSynthetic(ws.workspaceId, 0);
+    // Exact in-process ledger/compaction/recovery contract; full native transport has separate coverage.
+    const agent = host.context(ws.workspaceId).resources.agents.get(ws.selectedAgentId);
+    host.context(ws.workspaceId).resources.agents.setPermissionTier(agent.agentId,"controlled",agent.configRevision,agent.agentEpoch);
     const message = "ORIGINAL_BLOCKED_OBJECTIVE\nsecond line", requestId = randomUUID();
     const run = host.start("test", ws.workspaceId, ws.selectedAgentId, message, requestId); await ready;
     host.cancel(ws.workspaceId, ws.selectedAgentId, run.runId); release(); await host.wait(run.runId);
