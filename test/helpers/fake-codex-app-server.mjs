@@ -19,6 +19,13 @@ export async function fakeCodexMain() {
     meta = { pid: process.pid, url, mode: selected, tokenPresent: Boolean(token), tokenInArgv: args.some(value => token && value.includes(token)),
       readOnly: false, onRequest: false, nativeSandboxDisabled: true, nativeApprovalDisabled: true, haraOnlyTrust: bridge?.default_tools_approval_mode === "approve",
       tokenFingerprint: crypto.createHash("sha256").update(token ?? "").digest("hex") };
+    const boundary = (paths, write) => Array.isArray(paths) ? paths.map(path => {
+      let allowed = false;
+      try { if (write) fs.writeFileSync(path, "unexpected native boundary write"); else fs.readFileSync(path); allowed = true; } catch {}
+      return { path, allowed };
+    }) : [];
+    meta.boundaryWrites = boundary(mode().boundaryWriteProbes, true);
+    meta.boundaryReads = boundary(mode().boundaryReadProbes, false);
     save();
     const rpc = (method, data) => note(method, { threadId: thread, turnId: currentTurn, ...data });
     if (selected === "hang") return;

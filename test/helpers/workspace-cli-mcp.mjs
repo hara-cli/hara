@@ -22,8 +22,9 @@ export async function cliMcpFixture(t, mode = "list", settings = {}) {
   fs.mkdirSync(dirname(command), { recursive: true });
   writeFakeCodex(command, { mode });
   fs.writeFileSync(command + ".mode.json", JSON.stringify({ mode, ...settings }));
-  fs.mkdirSync(join(root, "workspace"), { mode: 0o700 });
-  const serveOptions = { root: join(root, "workspace"), mode: "workspace",
+  const workspaceRoot = settings.productionLayout ? join(account, ".hara", "workspaces-v1") : join(root, "workspace");
+  fs.mkdirSync(workspaceRoot, { recursive: true, mode: 0o700 });
+  const serveOptions = { root: workspaceRoot, mode: "workspace",
     version: "fixture", credentialVault: new MemoryCredentialVault(),
     runtimeInstallerOptions: { accountHome: () => account, discovery: { home: account, path: dirname(command) + ":/usr/bin:/bin", systemBins: [],
       run: async (_command, args) => args[0] === "-lic" ? null : "codex 1.2.3" } } };
@@ -53,7 +54,7 @@ export async function cliMcpFixture(t, mode = "list", settings = {}) {
   await request("workspace.agents.setRuntime", { ...scope, agentId: main.agentId, runtimeId: "codex", configRevision: main.configRevision, agentEpoch: main.agentEpoch });
   const read = () => request("workspace.snapshot", { workspaceId: scope.workspaceId, agentId: main.agentId });
   const meta = () => fs.existsSync(command + ".meta.json") ? JSON.parse(fs.readFileSync(command + ".meta.json")) : null;
-  return { root, command, scope, main, request, read, meta,
+  return { root, account, workspaceRoot, project: join(workspaceRoot, "project", scope.workspaceId), command, scope, main, request, read, meta,
     native: () => fs.readFileSync(command + ".rpc.jsonl", "utf8").trim().split("\n").map(line => JSON.parse(line)),
     async restart() {
       socket.terminate(); await handle.close();

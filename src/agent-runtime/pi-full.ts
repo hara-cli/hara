@@ -48,7 +48,7 @@ function writeConfig(root: string, name: string, value: unknown): void {
 }
 
 function newPiWorkspaceNativePolicy(permit: NonNullable<RunOpts["workspaceRun"]>, accountHome: string, runtimeHome: string): RuntimeExecutionPolicy {
-  const policy = createRuntimeExecutionPolicy({ runtimeId: "pi", tier: workspaceRunPermissionTier(permit),
+  const policy = createRuntimeExecutionPolicy({ runtimeId: "pi", managedProjectPermit: permit, tier: workspaceRunPermissionTier(permit),
     accountHome, runtimeHome, workRoot: permit.binding.project.root,
     protectedStateRoots: [workspaceRuntimeStorage(permit).run(() => workspaceStateHome())], lifetime: "attempt", loginSource: "isolated" });
   try { beginWorkspaceNativePolicy(permit, policy); return policy; } catch (error) { void policy.close(); throw error; }

@@ -19,7 +19,7 @@ export const createJsonCliExecutionPolicy: JsonCliPolicyFactory = async input =>
   // the extension-isolation gate; the frozen permit and shared Seatbelt boundary stay mandatory.
   const tier = workspaceRunPermissionTier(input.permit);
   const roots = input.installer.executionPolicyDirectories(input.runtimeId, input.resolved);
-  const policy = createRuntimeExecutionPolicy({ runtimeId: input.runtimeId, tier,
+  const policy = createRuntimeExecutionPolicy({ runtimeId: input.runtimeId, managedProjectPermit: input.permit, tier,
     workRoot: input.permit.binding.project.root, ...roots, lifetime: "attempt", loginSource: input.resolved.loginSource });
   return { tier, policy };
 };

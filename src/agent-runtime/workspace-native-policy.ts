@@ -14,13 +14,13 @@ export function workspaceRuntimePolicyInput(permit: WorkspaceRunPermit, runtimeI
   const home = resolved.env.HOME;
   if (!home) throw new Error("Native runtime login HOME is unavailable; no fallback was selected");
   if (installer && (runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode" || runtimeId === "gemini" || runtimeId === "kimi" || runtimeId === "copilot" || runtimeId === "cursor" || runtimeId === "grok")) return {
-    runtimeId, tier: workspaceRunPermissionTier(permit), workRoot: permit.binding.project.root,
+    runtimeId, managedProjectPermit: permit, tier: workspaceRunPermissionTier(permit), workRoot: permit.binding.project.root,
     ...installer.executionPolicyDirectories(runtimeId, resolved), lifetime, loginSource: resolved.loginSource,
   };
   const env = resolved.env;
   const runtimeHome = runtimeId === "codex" ? env.CODEX_HOME : runtimeId === "claude" ? env.CLAUDE_CONFIG_DIR
     : runtimeId === "opencode" && env.XDG_DATA_HOME ? join(env.XDG_DATA_HOME, "opencode") : undefined;
-  return { runtimeId, tier: workspaceRunPermissionTier(permit), accountHome: home, workRoot: permit.binding.project.root,
+  return { runtimeId, managedProjectPermit: permit, tier: workspaceRunPermissionTier(permit), accountHome: home, workRoot: permit.binding.project.root,
     runtimeHome, protectedStateRoots: [workspaceRuntimeStorage(permit).run(() => workspaceStateHome())], lifetime, loginSource: resolved.loginSource };
 }
 export function workspaceRuntimeProcessKey(input: RuntimeExecutionPolicyInput, resolved: Resolved): string {

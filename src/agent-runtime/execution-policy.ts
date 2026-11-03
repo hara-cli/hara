@@ -7,7 +7,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { assertWorkspaceRunContextCurrent, type WorkspaceRunPermit } from "../workspace/execution.js";
+import { assertWorkspaceRunContextCurrent, workspaceRunHasManagedProject, type WorkspaceRunPermit } from "../workspace/execution.js";
 import { redactSensitiveText } from "../security/secrets.js";
 
 export type RuntimePermissionTier = "full-protected" | "controlled";
@@ -29,6 +29,8 @@ function piPackagedCodeReads(): string[] {
 export interface RuntimeExecutionPolicyInput {
   runtimeId: RegisteredPolicyRuntime; tier: RuntimePermissionTier; workRoot: string; accountHome: string;
   runtimeHome?: string; protectedStateRoots?: readonly string[]; lifetime?: "attempt" | "resident";
+  /** Host-only opaque capability for the exact default managed project, never a JSON/path grant. */
+  managedProjectPermit?: WorkspaceRunPermit;
   /** Existing installer decision, never an invitation to log in or copy credentials. */
   loginSource?: "host" | "isolated";
 }
@@ -120,9 +122,26 @@ export function workspaceRunPermissionTier(permit: WorkspaceRunPermit): RuntimeP
   if (!isRuntimePermissionTier(value)) throw new Error("Invalid frozen runtime permission tier");
   return value;
 }
+/** The native App stores user project files beneath .hara, beside (not inside) private Host state.
+ * Only the existing unforgeable Host permit can distinguish this exact admitted project from state.
+ * Custom/arbitrary Hara paths and serialized bindings remain protected. No free writableRoots API. */
+function managedDefaultProject(input: RuntimeExecutionPolicyInput): readonly [string, string, string] | null {
+  const permit = input.managedProjectPermit;
+  if (!permit) return null;
+  assertWorkspaceRunContextCurrent(permit);
+  const root = physical(input.workRoot);
+  if (permit.binding.project.root !== root || permit.binding.agent.runtimeId !== input.runtimeId
+    || workspaceRunPermissionTier(permit) !== input.tier) throw new Error("Managed project policy differs from the admitted binding");
+  if (!workspaceRunHasManagedProject(permit)) return null;
+  const id = permit.binding.scope.workspaceId;
+  if (!/^ws_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u.test(id)
+    || root !== join(physical(input.accountHome), ".hara", "workspaces-v1", "project", id)) return null;
+  return [root, permit.binding.agent.resourceBinding.scopeKey, permit.binding.agent.resourceBinding.generation];
+}
 export function runtimeExecutionPolicyKey(input: RuntimeExecutionPolicyInput): string {
+  const managed = managedDefaultProject(input);
   return hash(JSON.stringify([input.runtimeId, input.tier, physical(input.workRoot), physical(input.accountHome),
-    input.runtimeHome ? physical(input.runtimeHome) : null, input.protectedStateRoots?.map(physical) ?? [], input.loginSource ?? "host", input.lifetime ?? "attempt", input.runtimeId === "pi" ? piPackagedCodeReads() : []]));
+    input.runtimeHome ? physical(input.runtimeHome) : null, input.protectedStateRoots?.map(physical) ?? [], input.loginSource ?? "host", input.lifetime ?? "attempt", input.runtimeId === "pi" ? piPackagedCodeReads() : [], ...(managed ? [managed] : [])]));
 }
 export class RuntimeExecutionPolicy {
   readonly key: string; readonly tempRoot: string; readonly profile: string;
@@ -172,8 +191,10 @@ export class RuntimeExecutionPolicy {
       if (!info.isFile() || info.nlink !== 1 || info.size > 3 || readFileSync(piAuth, "utf8").trim() !== "{}") throw new Error("Pi auth must be the dedicated empty object");
       allCredentials.push(piAuth);
     }
-    const forbidden = [physical(join(home, ".hara")), ...(input.protectedStateRoots ?? []).map(physical)];
-    if (forbidden.some(root => contains(root, this.workRoot))) throw new Error("Runtime working directory is protected Hara state");
+    const haraRoot = physical(join(home, ".hara")), managedWorkRoot = managedDefaultProject(input)?.[0];
+    const stateRoots = (input.protectedStateRoots ?? []).map(physical), forbidden = [haraRoot, ...stateRoots];
+    if (forbidden.some(root => contains(root, this.workRoot) && !(root === haraRoot && managedWorkRoot === this.workRoot))
+      || managedWorkRoot && stateRoots.some(root => contains(managedWorkRoot, root))) throw new Error("Runtime working directory is protected Hara state");
     this.baseline = snapshot(this.workRoot);
     if ([...this.baseline.files.values()].some(row => row.kind === "unsafe")) throw new Error("Runtime working directory has unsafe linked files");
     this.stateDirectories = Object.freeze(writes); this.readableCredentialFiles = Object.freeze(ownCredentials);
@@ -200,7 +221,9 @@ export class RuntimeExecutionPolicy {
     if (forbidden.some(root => contains(root, this.tempRoot))) { rmSync(this.tempRoot, { recursive: true }); throw new Error("Runtime temporary directory overlaps protected Hara state"); }
     const isolated = (input.loginSource === "isolated" || input.runtimeId === "pi") && input.runtimeHome ? runtimeHome : undefined;
     if (isolated && forbidden.some(root => contains(isolated, root))) { rmSync(this.tempRoot, { recursive: true }); throw new Error("Isolated runtime exception cannot contain a Hara protection root"); }
-    const protectedPaths = forbidden.map(root => `(require-all (subpath ${quote(root)}) ${isolated ? `(require-not (subpath ${quote(isolated)}))` : ""})`).join("\n  ");
+    const protectedPaths = forbidden.map(root => "(require-all (subpath " + quote(root) + ") "
+      + (isolated ? "(require-not (subpath " + quote(isolated) + ")) " : "")
+      + (root === haraRoot && managedWorkRoot ? "(require-not (subpath " + quote(managedWorkRoot) + "))" : "") + ")").join("\n  ");
     const writable = [this.tempRoot, ...writes, ...(isolated && input.runtimeId !== "pi" ? [isolated] : []), ...(input.tier === "full-protected" ? [this.workRoot] : [])];
     const lines = ["(version 1)", "(allow default)", "(deny file-write*)", `(allow file-write*\n  ${quotedSubpaths(writable)}\n  (literal \"/dev/null\") (literal \"/dev/stdout\") (literal \"/dev/stderr\") (literal \"/dev/tty\"))`,
       // Never create hard-link aliases to defeat a path-based read/write boundary.
@@ -211,7 +234,7 @@ export class RuntimeExecutionPolicy {
       `${input.runtimeId === "pi" ? "(deny" : "(allow"} mach-lookup (global-name "com.apple.securityd") (global-name "com.apple.secd") (global-name "com.apple.securityd.xpc"))`,
       ...(input.runtimeId === "pi" ? [`(deny file-read-data ${quotedSubpaths(keychains)})`] : []),
     ];
-    for (const root of forbidden) lines.push(`(deny file-read-data (require-all (subpath ${quote(root)}) ${isolated ? `(require-not (subpath ${quote(isolated)}))` : ""} ${readableExceptions}))`);
+    for (const root of forbidden) lines.push(`(deny file-read-data (require-all (subpath ${quote(root)}) ${isolated ? `(require-not (subpath ${quote(isolated)}))` : ""} ${root === haraRoot && managedWorkRoot ? `(require-not (subpath ${quote(managedWorkRoot)}))` : ""} ${readableExceptions}))`);
     if (input.runtimeId === "codex") lines.push(`(allow file-write* (regex #${quote("^" + runtimeHome.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "/(state_[0-9]+|logs_[0-9]+)[.]sqlite(-wal|-shm)?$")}) (literal ${quote(join(runtimeHome, "history.jsonl"))}) (literal ${quote(join(runtimeHome, "session_index.jsonl"))}))`);
     if (piAuth) lines.push(`(allow file-write* (require-all (literal ${quote(join(runtimeHome, "auth.json.lock"))}) (vnode-type DIRECTORY)))`,
       `(deny file-write* ${literals([piAuth, join(runtimeHome, "models.json"), join(runtimeHome, "settings.json")])})`);
