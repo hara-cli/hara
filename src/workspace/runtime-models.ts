@@ -1,9 +1,13 @@
 import { captureExpandedMetadata, type ExpandedMetadataCapture } from "../agent-runtime/expanded-metadata.js";
 import { DOCUMENTED_EXPANDED_MODELS, EXPANDED_MODEL_SOURCES, copilotHelpEfforts, parseCursorModels } from "../agent-runtime/expanded-models.js";
 import { OPTIONAL_RUNTIMES } from "./runtime-catalog.js";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { createRuntimeExecutionPolicy } from "../agent-runtime/execution-policy.js";
+import { codexHostToolOverrides } from "../agent-runtime/codex-host-config.js";
 import { WorkspaceJsonState, exact, plain } from "./local-state.js";
 import { join } from "node:path";
-import { ExternalJsonlRpcRequestError, runExternalCommandCapture, runJsonlRpcSequence } from "../external-sessions/process.js";
+import { ExternalJsonlRpcRequestError, runExternalCommandCapture, JsonlRpcClient } from "../external-sessions/process.js";
 import { withPrivateStateLockSync, writePrivateStateFileSync } from "../security/private-state.js";
 import { HARA_RUNTIME_VERSION } from "../version.js";
 import { inspectWorkspaceResourceFile, sameWorkspaceResourceBinding, workspaceStateHome,
@@ -87,6 +91,21 @@ function cacheCodexModels(models: RuntimeModel[], env: NodeJS.ProcessEnv, storag
     });
   }));
 }
+/** Inventory is not an execution permit. Give its native process an empty, externally read-only cwd. */
+async function protectedInventory<T>(storage: WorkspaceResourceStorage, runtimes: WorkspaceRuntimeInstaller, runtimeId: "codex" | "claude" | "opencode",
+  resolved: ReturnType<WorkspaceRuntimeInstaller["resolveBound"]>, args: string[],
+  run: (launch: { command: string; args: string[]; env: NodeJS.ProcessEnv; onProcess: NonNullable<import("../external-sessions/process.js").ExternalCommandOptions["onProcess"]>; drainProcess(): Promise<void> }) => Promise<T>): Promise<T> {
+  if (!resolved.env.HOME) throw new Error("Runtime login HOME unavailable");
+  const workRoot = mkdtempSync(join(realpathSync.native(tmpdir()), "hara-inventory-"));
+  let policy;
+  try {
+    policy = createRuntimeExecutionPolicy({ runtimeId, tier: "controlled", workRoot,
+      ...runtimes.executionPolicyDirectories(runtimeId, resolved), loginSource: resolved.loginSource });
+    if (runtimeId === "opencode") resolved = { ...resolved, env: { ...resolved.env, XDG_CONFIG_HOME: join(policy.tempRoot, "config"), OPENCODE_CONFIG_DIR: join(policy.tempRoot, "config/opencode") } };
+    const suffix = runtimeId === "codex" ? codexHostToolOverrides(resolved.env.HOME!, resolved.env.CODEX_HOME) : [];
+    return await run(policy.wrap({ command: resolved.command, args: [...args, ...suffix], env: resolved.env }));
+  } finally { await policy?.close(); rmSync(workRoot, { recursive: true, force: true }); }
+}
 async function liveModels(runtimeId: "codex" | "opencode" | "cursor", runtimes: WorkspaceRuntimeInstaller,
   storage: WorkspaceResourceStorage, expandedMetadata: ExpandedMetadataCapture): Promise<RuntimeModel[]> {
   let { command, env, loginSource, proxyUrl } = await runtimes.prepareBound(runtimeId);
@@ -105,19 +124,25 @@ async function liveModels(runtimeId: "codex" | "opencode" | "cursor", runtimes: 
   };
   if (runtimeId === "codex") {
     try {
-      const result = await runJsonlRpcSequence<unknown>({ command, env, timeoutMs: 15000, maxOutputBytes: 4 * 1024 * 1024,
-        requests: [{ id: 1, method: "initialize", params: { clientInfo: { name: "hara", title: "Hara", version: HARA_RUNTIME_VERSION },
-          capabilities: { experimentalApi: false, requestAttestation: false, optOutNotificationMethods: [] } } },
-          { method: "initialized" }, { id: 2, method: "model/list", params: {} }], resultId: 2 });
+      const result = await protectedInventory(storage, runtimes, "codex", { command, env, loginSource }, ["app-server", "--stdio"], async launch => {
+        const client = JsonlRpcClient.start({ ...launch, appServerArgs: launch.args, timeoutMs: 15000, maxOutputBytes: 4 * 1024 * 1024 });
+        try {
+          await client.call("initialize", { clientInfo: { name: "hara", title: "Hara", version: HARA_RUNTIME_VERSION }, capabilities: { experimentalApi: false } });
+          client.notify("initialized"); return await client.call("model/list", {});
+        } finally { client.close(); await client.waitForClose(); }
+      });
       return remember(codexModels(result, "data"));
     } catch (error) { failures.push(`app-server model/list: ${codexFailure(error)}`); }
   }
   // A failed async app-server query is followed by a new physical process, so it needs fresh proxy
   // admission too. Never let a newly configured Workspace proxy be bypassed by the old unset env.
   if (runtimeId === "codex") ({ command, env, loginSource, proxyUrl } = await runtimes.prepareBound(runtimeId));
-  const result = await runExternalCommandCapture({ command, env: { ...env, NO_COLOR: "1", OPENCODE_DISABLE_AUTOUPDATE: "true",
-    OPENCODE_DISABLE_MODELS_FETCH: "true" } }, runtimeId === "codex" ? ["debug", "models"] : ["models"],
-  { cwd: env.HOME, proxyUrl, timeoutMs: 15000, maxOutputBytes: 4 * 1024 * 1024 });
+  const inventoryEnv = { ...env, NO_COLOR: "1", OPENCODE_DISABLE_AUTOUPDATE: "true", OPENCODE_DISABLE_MODELS_FETCH: "true",
+    ...(runtimeId === "opencode" ? { OPENCODE_PURE: "1", OPENCODE_DISABLE_DEFAULT_PLUGINS: "1", OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+      OPENCODE_CONFIG_CONTENT: JSON.stringify({ plugin: [], mcp: {}, permission: { "*": "deny" } }) } : {}) };
+  const result = await protectedInventory(storage, runtimes, runtimeId, { command, env: inventoryEnv, loginSource },
+    runtimeId === "codex" ? ["debug", "models"] : ["models"], launch => runExternalCommandCapture(launch, launch.args,
+      { cwd: env.HOME, proxyUrl, waitForClose: true, timeoutMs: 15000, maxOutputBytes: 4 * 1024 * 1024 }));
   if (result.errorCode === "runtime_proxy_failed") throw new Error(result.errorCode);
   if (!result.ok && runtimeId === "opencode") throw new Error("opencode model inventory failed");
   const { stdout } = result;
@@ -177,7 +202,7 @@ export class WorkspaceRuntimeModels {
   private readonly state: WorkspaceJsonState<RuntimeModelsState>;
   private readonly pending = new Map<string, Promise<RuntimeModel[]>>();
   private readonly launchDefaults = new Map<string, Promise<{ modelId: string | null; effort: string | null }>>();
-  constructor(storage: WorkspaceResourceStorage, private readonly runtimes: WorkspaceRuntimeInstaller,
+  constructor(private readonly storage: WorkspaceResourceStorage, private readonly runtimes: WorkspaceRuntimeInstaller,
     private readonly expandedMetadata: ExpandedMetadataCapture = captureExpandedMetadata) {
     this.state = new WorkspaceJsonState(storage, "runtime-models-v1.json", value => {
       if (!plain(value) || !exact(value, ["resourceBinding", "revision", "selections"])
@@ -216,8 +241,8 @@ export class WorkspaceRuntimeModels {
     const bound = this.runtimes.list().options.find(row => row.runtimeId === "claude");
     const key = JSON.stringify([resolved.command, bound?.fingerprint ?? bound?.version ?? null]);
     if (this.claudeEfforts?.key === key) return this.claudeEfforts.levels;
-    const result = await runExternalCommandCapture({ command: resolved.command, env: resolved.env }, ["--help"],
-      { cwd: resolved.env.HOME, timeoutMs: 10_000, maxOutputBytes: 256 * 1024 });
+    const result = await protectedInventory(this.storage, this.runtimes, "claude", resolved, ["--setting-sources", "project,local", "--settings", JSON.stringify({ disableAllHooks: true, sandbox: { enabled: false } }), "--help"],
+      launch => runExternalCommandCapture(launch, launch.args, { cwd: resolved.env.HOME, waitForClose: true, timeoutMs: 10_000, maxOutputBytes: 256 * 1024 }));
     const text = result.ok ? result.stdout : "";
     const flag = /--effort\s+(?:<[^>]+>)?[\s\S]{0,400}?\(([a-z][a-z0-9, ]*)\)/.exec(text);
     const levels = flag ? [...new Set(flag[1]!.split(",").map(value => value.trim()).filter(validEffort))].slice(0, MAX_EFFORTS) : [];

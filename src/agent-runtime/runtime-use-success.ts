@@ -1,8 +1,9 @@
+import { parseClaudeCliOutput } from "./claude-cli.js";
 /** Extra eligibility for observational success history; never changes execution authority.
  * Codex partial output or exit zero cannot establish a completed protocol turn. */
 export function runtimeUseProtocolSucceeded(runtime: "codex" | "claude", output: string): boolean {
   if (!output.trim() || Buffer.byteLength(output) > 2 * 1024 * 1024) return false;
-  if (runtime === "claude") return true; // This driver explicitly requests buffered text.
+  if (runtime === "claude") return parseClaudeCliOutput(output).ok;
   let completed = false, frames = 0;
   for (const line of output.split(/\r?\n/u)) {
     if (!line.trim()) continue;
