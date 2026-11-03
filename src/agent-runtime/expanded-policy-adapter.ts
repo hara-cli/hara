@@ -1,45 +1,45 @@
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { lstatSync } from "node:fs";
-import { assertWorkspaceRunAdmission } from "../workspace/execution.js";
-import type { WorkspaceRunPermit } from "../workspace/execution.js";
-import { workspaceRunPermissionTier, type RuntimeExecutionPolicy } from "./execution-policy.js";
+import { assertWorkspaceRunAdmission, publishWorkspaceNativeRisks } from "../workspace/execution.js";
+import { workspaceRunPermissionTier } from "./execution-policy.js";
+import { newWorkspaceNativePolicy, endWorkspaceNativePolicy } from "./workspace-native-policy.js";
 import { assertExpandedRuntimeIsolation } from "./expanded-isolation.js";
+import type { ExpandedRuntimeId } from "./expanded-models.js";
 import type { ExpandedRuntimeProtection, PreflightExpandedRuntimeProtection } from "./expanded-protection.js";
 
-/** Interface v2. The native Host bridge owns attempt binding, writer exclusion, evidence and risk
- * publication. A missing bridge still fails BEFORE spawn; inherited personal extensions are explicitly allowed by Jeff option A. */
+/** Fixed native login-file declarations, relative to installer-proved host accountHome.
+ * These are path declarations only: Hara never opens the user's credentials or Keychain items. */
+export const EXPANDED_RUNTIME_LOGIN_FILES: Readonly<Record<ExpandedRuntimeId, readonly string[]>> = {
+  copilot: [".copilot/config.json", ".config/gh/hosts.yml"],
+  cursor: [".cursor/cli-config.json"],
+  grok: [".grok/user-settings.json", ".grok/auth.json"],
+};
+
+/** Public v4: preserve the complete ownership/drain launch and await Host end before cleanup.
+ * Personal extensions inherit by Jeff option A; this does not relax Seatbelt or permit admission. */
 const protect: ExpandedRuntimeProtection = async input => {
   assertExpandedRuntimeIsolation(input.runtimeId);
   const permit = input.options.workspaceRun;
-  if (!permit || !input.env.HOME || !isAbsolute(input.env.HOME)) throw new Error("runtime_permission_denied");
+  if (!permit || input.resolved.loginSource !== "host") throw new Error("runtime_permission_denied");
   const assertCurrent = () => assertWorkspaceRunAdmission(permit, input.options, input.runtimeId);
   assertCurrent();
-  const modulePath = "./workspace-native-policy.js", executionPath = "../workspace/execution.js";
-  const bridge: Record<string, unknown> = await import(modulePath).catch(() => { throw new Error("runtime_permission_denied"); });
-  const host: Record<string, unknown> = await import(executionPath);
-  if (typeof bridge.newWorkspaceNativePolicy !== "function" || typeof bridge.endWorkspaceNativePolicy !== "function"
-    || typeof host.publishWorkspaceNativeRisks !== "function") throw new Error("runtime_permission_denied");
-  const create = bridge.newWorkspaceNativePolicy as (permit: WorkspaceRunPermit, id: string,
-    resolved: { command: string; env: NodeJS.ProcessEnv; loginSource: "host" }) => RuntimeExecutionPolicy;
-  const finish = bridge.endWorkspaceNativePolicy as (permit: WorkspaceRunPermit, policy: RuntimeExecutionPolicy) => void;
-  const publish = host.publishWorkspaceNativeRisks as (permit: WorkspaceRunPermit) => void;
-  // The shared helper calls beginAttempt(permit.binding.runId) and attaches this very policy.
-  const policy = create(permit, input.runtimeId, { command: input.command, env: input.env, loginSource: "host" });
+  const directories = input.installer.executionPolicyDirectories(input.runtimeId, input.resolved);
+  const policy = newWorkspaceNativePolicy(permit, input.runtimeId, input.resolved, input.installer);
+  let ending: Promise<void> | undefined;
+  const finishOnce = () => ending ??= endWorkspaceNativePolicy(permit, policy);
   try {
-    if (typeof policy.tempRoot !== "string" || !isAbsolute(policy.tempRoot)) throw new Error("runtime_permission_denied");
+    if (!isAbsolute(policy.tempRoot)) throw new Error("runtime_permission_denied");
     const stat = lstatSync(policy.tempRoot);
     if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) throw new Error("runtime_permission_denied");
-    let finished = false;
-    const finishOnce = () => { if (!finished) { finished = true; finish(permit, policy); } };
+    const ownLogin = EXPANDED_RUNTIME_LOGIN_FILES[input.runtimeId].map(file => join(directories.accountHome, file));
+    if (policy.readableCredentialFiles.length !== ownLogin.length || policy.readableCredentialFiles.some(file => !ownLogin.includes(file)))
+      throw new Error("runtime_permission_denied");
     return {
-      fullProtected: workspaceRunPermissionTier(permit) === "full-protected",
-      temporaryDirectory: policy.tempRoot, assertCurrent,
+      fullProtected: workspaceRunPermissionTier(permit) === "full-protected", temporaryDirectory: policy.tempRoot, assertCurrent,
       wrap(command, args, env) {
         assertCurrent();
         const launch = policy.wrap({ command, args, env });
-        if (launch.command !== "/usr/bin/sandbox-exec" || launch.args[0] !== "-p" || launch.args[2] !== command
-          || launch.args.length !== args.length + 3 || !args.every((arg, index) => launch.args[index + 3] === arg))
-          throw new Error("runtime_permission_denied");
+        if (typeof launch.onProcess !== "function" || typeof launch.drainProcess !== "function") throw new Error("runtime_permission_denied");
         return launch;
       },
       observeNativeTool(event) {
@@ -47,12 +47,12 @@ const protect: ExpandedRuntimeProtection = async input => {
         policy.observeNativeEvent({ type: "tool", status: event.state, operation: event.name,
           ...(event.risk === "external-publish" ? { command: "git push" } : {}),
           ...(event.deletionTarget ? { type: "file", operation: "delete", path: event.deletionTarget } : {}) });
-        publish(permit);
+        publishWorkspaceNativeRisks(permit);
       },
-      collectEvidence() { assertCurrent(); finishOnce(); },
-      async close() { try { finishOnce(); } finally { await policy.close(); } },
+      async collectEvidence() { assertCurrent(); await finishOnce(); },
+      async close() { try { await finishOnce(); } finally { await policy.close(); } },
     };
-  } catch (error) { try { finish(permit, policy); } finally { await policy.close(); } throw error; }
+  } catch (error) { try { await finishOnce(); } finally { await policy.close(); } throw error; }
 };
 export const sharedExpandedRuntimeProtection: PreflightExpandedRuntimeProtection = Object.assign(protect, {
   assertLaunchSupported: assertExpandedRuntimeIsolation,

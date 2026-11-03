@@ -273,14 +273,16 @@ export class WorkspaceRuntimeInstaller {
     return this.resolveUnproxied(runtimeId, installed.artifact.version, installed.artifact.sha256);
   }
   /** Host-attested directories, revalidated against the exact installed command and login selection. */
-  executionPolicyDirectories(runtimeId: "codex" | "claude" | "opencode",
+  executionPolicyDirectories(runtimeId: "codex" | "claude" | "opencode" | "copilot" | "cursor" | "grok",
     launched: { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource }) {
     const current = this.resolveBoundUnproxied(runtimeId);
     if (current.command !== launched.command || current.loginSource !== launched.loginSource || current.env.HOME !== launched.env.HOME
-      || current.env.CODEX_HOME !== launched.env.CODEX_HOME || current.env.CLAUDE_CONFIG_DIR !== launched.env.CLAUDE_CONFIG_DIR) return fail();
+      || current.env.CODEX_HOME !== launched.env.CODEX_HOME || current.env.CLAUDE_CONFIG_DIR !== launched.env.CLAUDE_CONFIG_DIR
+      || current.env.COPILOT_HOME !== launched.env.COPILOT_HOME || current.env.CURSOR_CONFIG_DIR !== launched.env.CURSOR_CONFIG_DIR || current.env.GROK_HOME !== launched.env.GROK_HOME) return fail();
     const accountHome = this.accountHome(), home = current.env.HOME; if (!home) return fail();
     const runtimeHome = runtimeId === "claude" ? current.env.CLAUDE_CONFIG_DIR ?? join(home, ".claude")
-      : runtimeId === "codex" ? current.env.CODEX_HOME ?? join(home, ".codex") : join(current.env.XDG_DATA_HOME ?? join(home, ".local/share"), "opencode");
+      : runtimeId === "codex" ? current.env.CODEX_HOME ?? join(home, ".codex")
+      : runtimeId === "opencode" ? join(current.env.XDG_DATA_HOME ?? join(home, ".local/share"), "opencode") : join(home, "." + runtimeId);
     return Object.freeze({ accountHome, runtimeHome, protectedStateRoots: Object.freeze([this.storage.runtimeProtectedStateRoot()]) });
   }
   /** Diagnostic metadata only: no login files, environment dump, paths or version probe. */

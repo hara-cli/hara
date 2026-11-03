@@ -557,7 +557,6 @@ export class ExternalJsonlRpcRequestError extends Error {
 export interface JsonlRpcClientOptions extends ExternalCommandOptions {
   cwd?: string;
   signal?: AbortSignal;
-  onSpawn?: () => void;
   jsonRpcVersion?: "2.0";
   maxOutputBytes?: number;
   /** Defaults to a private stdio App Server; Codex daemon clients use `app-server proxy`. */
@@ -606,7 +605,6 @@ export class JsonlRpcClient {
     this.processGroup = processGroup;
     this.requestTimeoutMs = Math.max(500, Math.min(options.timeoutMs ?? 30_000, 120_000));
     this.maxOutputBytes = Math.max(64 * 1024, Math.min(options.maxOutputBytes ?? 16 * 1024 * 1024, 64 * 1024 * 1024));
-    child.once("spawn", () => { try { options.onSpawn?.(); } catch { /* observational callback */ } });
     options.signal?.addEventListener("abort", this.abort, { once: true });
     if (options.signal?.aborted) this.abort();
     child.stdout?.on("data", (chunk: Buffer) => this.consume(chunk));

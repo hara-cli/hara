@@ -158,7 +158,7 @@ test("metadata accepts inherited fixture configuration while retaining real oute
     writeFileSync(join(protectedRoot, "state.json"), "SYNTHETIC_HARA");
     const code = `const fs=require('fs'),home=process.env.HOME;let haraDenied=false,foreignDenied=false;try{fs.writeFileSync(${JSON.stringify(join(protectedRoot, "state.json"))},'x')}catch{haraDenied=true}try{fs.readFileSync(home+'/.codex/auth.json')}catch{foreignDenied=true}console.log(JSON.stringify({marker:fs.readFileSync(home+'/'+${JSON.stringify(config)},'utf8'),home,haraDenied,foreignDenied,args:process.argv.slice(2)}));`;
     writeFileSync(command, "#!" + process.execPath + "\n" + code, { mode: 0o755 });
-    const result = await captureExpandedMetadata({ runtimeId: id, command, env: { ...process.env, HOME: home }, protectedStateRoots: [protectedRoot] });
+    const result = await captureExpandedMetadata({ runtimeId: id, command, env: { ...process.env, HOME: home }, accountHome: home, runtimeHome: join(home, "." + id), protectedStateRoots: [protectedRoot] });
     assert.equal(result.ok, true);
     assert.deepEqual(JSON.parse(result.stdout), { marker: "SYNTHETIC_PERSONAL_EXTENSION", home, haraDenied: true, foreignDenied: true, args: id === "cursor" ? ["models"] : ["--help"] });
   }

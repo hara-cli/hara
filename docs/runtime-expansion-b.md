@@ -1,4 +1,4 @@
-# Copilot / Cursor / Grok Workspace drivers (local candidate, 2026-11-03)
+# Copilot / Cursor / Grok Workspace drivers (local candidate, tier wiring 2026-11-04)
 
 These adapters retain Hara Workspace permits, leases, governor, confirmation cards, MCP, proxy,
 version history and stage/failure contracts. No provider fallback or automatic prompt replay is added.
@@ -26,23 +26,34 @@ the frozen full-protected tier; old task bindings without a tier remain controll
 preserved without login/reauth commands. Missing policy/Host bridge, unsafe paths or unavailable
 Seatbelt refuse execution; option A does not authorize unprotected full mode.
 
-The public module d1ad885 is included (local equivalent 6e23066). The adapter is prepared for the
-common Host bridge `newWorkspaceNativePolicy` / `endWorkspaceNativePolicy` /
-`publishWorkspaceNativeRisks`: it owns beginAttempt(runId), overlapping-writer exclusion, native
-verified diff binding and sanitized risk publication. That bridge is not in the published d1ad885;
-its final implementation still needs coordinated integration. This remaining dependency is separate
-from the removed extension admission gate. No CLI JSON or prose becomes an effect receipt.
+The complete public v4 Core baseline 9c75b58 is merged with its history. All three adapters use
+`newWorkspaceNativePolicy` / `endWorkspaceNativePolicy` and `publishWorkspaceNativeRisks` with
+installer-proved account/runtime/protected-state roots. Every launch retains both `onProcess` and
+`drainProcess`, including Grok ACP and controlled model/help capture. Host owns beginAttempt(runId),
+overlapping-writer exclusion, verified diff binding and sanitized risk publication. No CLI JSON or
+prose becomes an effect receipt. Missing ownership never releases the public startup barrier.
+
+Own login files are declared read-only: Copilot `.copilot/config.json` and `.config/gh/hosts.yml`,
+Cursor `.cursor/cli-config.json`, Grok `.grok/user-settings.json` and `.grok/auth.json`. These are
+path declarations, not credential reads by Hara. The native runtime retains securityd/login-Keychain
+access under system ACLs. Direct writes to Hara state and credentials, and reads of other runtimes'
+credentials, remain denied. Personal extensions inherit the same native process policy.
 
 Known native scheduling/wakeup/background tools remain refused. ACP permissions are allow-once,
 current-session/active-turn bound; late, cancelled and changed-identity requests fail. Observations
 from always-approve CLIs can arrive after execution, so they are not a universal pre-execution
 interceptor. Only Hara WorkspaceScheduler owns scheduling and the normal frozen tier/audit path.
 
-Attempt shutdown uses shared process-tree cleanup. Copilot/Cursor and metadata captures clear their
-owned process group when the native leader exits, including normal completion with inherited helper
-children; ACP closes its owned group. Duplicate MCP close calls join the same physical cleanup.
-Cursor restoration precedes evidence collection, preventing Hara injection files from becoming
-native change evidence. No unrelated process is searched for or terminated.
+Attempt shutdown awaits public process ownership/drain before Host evidence publication and
+private temporary-state cleanup. Duplicate MCP close calls join the same physical cleanup. Cursor's
+project overlay is installed before the attempt baseline and restored after drain/evidence, so live
+and final evidence exclude Hara injection. Restore refuses concurrent config changes. A failed drain
+retains recovery state rather than restoring configuration under a live native child.
+
+The public boundary uses process groups, birth identifiers and observed ancestry. An unobserved
+daemon that instantly detaches and reparents between samples remains outside its proven coverage.
+This is the accepted public-layer limitation; no administrator helper or universal daemon claim is
+added. Only owned processes are terminated.
 
 ## Protocol/model contracts
 
@@ -61,9 +72,12 @@ Fake metadata/protection seams in tests are trusted Host composition only, never
 
 Only focused tests and builds run with Node 22.23.1. Fake HOME/CLI fixtures cover inherited config
 reads under real Seatbelt, denied Hara writes/foreign credential reads, normal/abort process cleanup,
-MCP/governor flow, scheduling refusal and closed diagnostics/stages. Real CLI/account login, Keychain
-ACL behavior, vendor extension discovery, full Host evidence/N1/risk-Desk composition and native app
-visual acceptance are not established. No real Keychain item or paid model is accessed.
+MCP/governor flow, two frozen tiers, Host workspace diff evidence (including controlled write denial),
+scheduling refusal and closed diagnostics/stages. Public common-layer N1 checks and Desk permission
+controls are covered separately. Real CLI/account login, Keychain ACL behavior, vendor extension
+discovery, end-to-end native risk/Desk composition and native app visual acceptance are not established.
+No real Keychain item or paid model is accessed. Focused evidence and exact final SHAs are recorded in
+the local inbox tip; there is no main merge, push, installation or release.
 
 Official references: [Copilot CLI](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference),
 [Copilot config](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference),

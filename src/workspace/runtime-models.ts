@@ -110,7 +110,7 @@ async function liveModels(runtimeId: "codex" | "opencode" | "cursor", runtimes: 
   storage: WorkspaceResourceStorage, expandedMetadata: ExpandedMetadataCapture): Promise<RuntimeModel[]> {
   let { command, env, loginSource, proxyUrl } = await runtimes.prepareBound(runtimeId);
   if (runtimeId === "cursor") {
-    const result = await expandedMetadata({ runtimeId, command, env, proxyUrl, protectedStateRoots: [storage.run(() => workspaceStateHome())] });
+    const result = await expandedMetadata({ runtimeId, command, env, proxyUrl, ...runtimes.executionPolicyDirectories(runtimeId, { command, env, loginSource }) });
     if (!result.ok) throw new Error(result.errorCode === "runtime_proxy_failed" ? result.errorCode : "cursor model inventory failed");
     return parseCursorModels(result.stdout);
   }
@@ -257,7 +257,7 @@ export class WorkspaceRuntimeModels {
     if (this.copilotEfforts?.key === key) return this.copilotEfforts.levels;
     let result;
     try { result = await this.expandedMetadata({ runtimeId: "copilot", command: resolved.command, env: resolved.env, proxyUrl: resolved.proxyUrl,
-      protectedStateRoots: [this.state.storage.run(() => workspaceStateHome())] }); }
+      ...this.runtimes.executionPolicyDirectories("copilot", resolved) }); }
     catch { return []; } // A closed metadata gate must not claim live effort support.
     const levels = result.ok ? copilotHelpEfforts(result.stdout) : [];
     this.copilotEfforts = { key, levels }; return levels;
