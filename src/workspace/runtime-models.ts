@@ -20,7 +20,12 @@ const selectionFields = ["runtimeId", "revision", "selectedModelId"] as const;
 
 // These runtimes have no stable, non-interactive model inventory yet.
 const CATALOG: Partial<Record<OptionalRuntimeId, readonly RuntimeModel[]>> = {
-  claude: [{ id: "claude-sonnet-4-5", label: "Claude Sonnet 4.5", recommended: true }, { id: "claude-opus-4-1", label: "Claude Opus 4.1" }],
+  // Let the installed CLI/provider resolve its current family mapping; never pin a stale model here.
+  claude: [
+    { id: "sonnet", label: "Claude Sonnet (latest)", description: "CLI alias; follows the current Sonnet mapping of the installed Claude CLI/provider.", recommended: true },
+    { id: "opus", label: "Claude Opus (latest)", description: "CLI alias; follows the current Opus mapping of the installed Claude CLI/provider." },
+    { id: "haiku", label: "Claude Haiku (latest)", description: "CLI alias; follows the current Haiku mapping of the installed Claude CLI/provider." },
+  ],
   agy: [{ id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", recommended: true }],
 };
 function codexModels(parsed: unknown, field: "models" | "data"): RuntimeModel[] {

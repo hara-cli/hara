@@ -44,7 +44,7 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
   assert.equal(resources.agents.runtimeOptions().find(option => option.id === runtimeId).available, false);
   installer.registerLocal(runtimeId, detected.fingerprint, "isolated");
   const models = new WorkspaceRuntimeModels(storage, installer);
-  const modelId = runtimeId === "codex" ? "fixture-model" : "claude-sonnet-4-5";
+  const modelId = runtimeId === "codex" ? "fixture-model" : "sonnet";
   await models.select(runtimeId, modelId, 0);
   assert.equal(models.selected(runtimeId), modelId);
   assert.equal(installer.list().options.find(option => option.runtimeId === runtimeId).generalAgentDriverAvailable, true);
@@ -119,8 +119,8 @@ test("registered CLI args project model and effort without widening write or she
   assert.deepEqual(codex, ["exec", "hi", "--cd", "/fixture/project", "--skip-git-repo-check", "-m", "gpt-5.6-sol",
     "-c", 'model_reasoning_effort="xhigh"', "--sandbox", "read-only"]);
   assert(!codex.includes("danger-full-access") && !codex.includes("--yolo"));
-  const claude = registeredCliArgs({ id: "claude", prompt: "hi", cwd: "/fixture/project", model: "claude-sonnet-4-5", effort: "high", skipGitRepoCheck: false });
-  assert.deepEqual(claude, ["-p", "hi", "--output-format", "text", "--model", "claude-sonnet-4-5", "--effort", "high", "--permission-mode", "plan"]);
+  const claude = registeredCliArgs({ id: "claude", prompt: "hi", cwd: "/fixture/project", model: "sonnet", effort: "high", skipGitRepoCheck: false });
+  assert.deepEqual(claude, ["-p", "hi", "--output-format", "text", "--model", "sonnet", "--effort", "high", "--permission-mode", "plan"]);
   assert(!claude.includes("bypassPermissions"));
   // No selected model and no effort must not invent either flag.
   const bare = registeredCliArgs({ id: "codex", prompt: "hi", cwd: "/fixture/project", model: null, effort: null, skipGitRepoCheck: false });

@@ -11,7 +11,9 @@ import { SYNTHETIC_CONNECTION } from "../../dist/workspace/synthetic-provider.js
 async function fakeCli() {
   const fs = await import("node:fs"), readline = await import("node:readline");
   const args = process.argv.slice(2), command = process.argv[1];
-  if (args[0] === "--version") { console.log("codex 1.2.3"); return; }
+  const runtimeId = (await import("node:path")).basename(command) === "claude" ? "claude" : "codex";
+  if (args[0] === "--version") { console.log(runtimeId + " 1.2.3"); return; }
+  if (args[0] === "--help") { console.log("--effort <level> Effort level (low, medium, high, xhigh, max)"); return; }
   if (args[0] === "app-server") {
     for await (const line of readline.createInterface({ input: process.stdin })) {
       const message = JSON.parse(line);
@@ -20,12 +22,21 @@ async function fakeCli() {
     } return;
   }
   if (args[0] === "debug") { console.log(JSON.stringify({ models: [{ slug: "fixture-model" }] })); return; }
-  if (args[0] !== "exec") { process.exitCode = 2; return; }
+  if (args[0] !== (runtimeId === "claude" ? "-p" : "exec")) { process.exitCode = 2; return; }
   const mode = JSON.parse(fs.readFileSync(command + ".mode.json", "utf8")).mode;
   const raw = args.find(value => value.startsWith("mcp_servers.hara.url="));
-  if (!raw) throw new Error("fixture missing MCP URL");
-  const url = JSON.parse(raw.slice(raw.indexOf("=") + 1)), token = process.env.HARA_WORKSPACE_MCP_TOKEN;
-  const meta = { pid: process.pid, url, mode, tokenPresent: Boolean(token), tokenInArgv: args.some(value => token && value.includes(token)),
+  const config = runtimeId === "claude" ? JSON.parse(args[args.indexOf("--mcp-config") + 1]) : null;
+  if (runtimeId === "codex" && !raw) throw new Error("fixture missing MCP URL");
+  if (config && config.mcpServers.hara.headers.Authorization !== "Bearer $" + "{HARA_WORKSPACE_MCP_TOKEN}")
+    throw new Error("fixture expected an environment-only MCP bearer");
+  const url = config ? config.mcpServers.hara.url : JSON.parse(raw.slice(raw.indexOf("=") + 1)), token = process.env.HARA_WORKSPACE_MCP_TOKEN;
+  const meta = { pid: process.pid, url, mode, runtimeId,
+    home: process.env.HOME, userProfile: process.env.USERPROFILE, privateClaudeConfig: process.env.CLAUDE_CONFIG_DIR ?? null,
+    model: runtimeId === "claude" ? args[args.indexOf("--model") + 1] : null,
+    effort: runtimeId === "claude" ? args[args.indexOf("--effort") + 1] : null,
+    plan: args.includes("plan"), strict: args.includes("--strict-mcp-config"),
+    haraOnly: config ? Object.keys(config.mcpServers).join(",") === "hara" && args[args.indexOf("--allowedTools") + 1] === "mcp__hara__*" : null,
+    tokenPresent: Boolean(token), tokenInArgv: args.some(value => token && value.includes(token)),
     readOnly: args.includes("read-only"), onRequest: args.includes('approval_policy="on-request"'),
     haraOnlyTrust: args.includes('mcp_servers.hara.default_tools_approval_mode="auto"') };
   const save = () => { fs.writeFileSync(command + ".meta.next", JSON.stringify(meta)); fs.renameSync(command + ".meta.next", command + ".meta.json"); };
@@ -55,7 +66,9 @@ async function fakeCli() {
       constraints: ["Only this Workspace"], acceptance: ["The colleague is active after human confirmation"],
       steps: ["Check colleagues", "Wait for the human card", "Verify creation"] }); save();
   }
-  const listed = await call("agent_list", {}); meta.listed = listed; save();
+  const listed = await call("agent_list", {}); meta.listed = listed;
+  if (runtimeId === "claude" && !meta.tools.includes("agent_list")) meta.common = await call("workspace_context_lookup", { query: "hara" });
+  save();
   if (mode === "create") {
     const created = await call("agent_create", { username: "fixture-colleague", displayName: "Fixture Colleague",
       title: "Test", instructions: "Only the assigned Workspace task." });
@@ -69,13 +82,16 @@ async function fakeCli() {
     }
   }
   const text = mode === "leak" ? token : "Scoped CLI reply";
-  console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text } }));
-  console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 100, output_tokens: 20 } }));
+  if (runtimeId === "claude") console.log(text);
+  else {
+    console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text } }));
+    console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 100, output_tokens: 20 } }));
+  }
 }
 
-export async function cliMcpFixture(t, mode = "list") {
+export async function cliMcpFixture(t, mode = "list", runtimeId = "codex") {
   const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "hara-cli-mcp-")));
-  const account = join(root, "account"), command = join(account, ".local/bin/codex");
+  const account = join(root, "account"), command = join(account, ".local/bin", runtimeId);
   fs.mkdirSync(dirname(command), { recursive: true });
   fs.writeFileSync(command, "#!" + process.execPath + "\n(" + fakeCli.toString() + ")();\n", { mode: 0o755 });
   fs.writeFileSync(command + ".mode.json", JSON.stringify({ mode }));
@@ -83,7 +99,7 @@ export async function cliMcpFixture(t, mode = "list") {
   const handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port: 0 }, { root: join(root, "workspace"), mode: "workspace",
     version: "fixture", credentialVault: new MemoryCredentialVault(),
     runtimeInstallerOptions: { accountHome: () => account, discovery: { home: account, path: "/usr/bin:/bin", systemBins: [],
-      run: async (_command, args) => args[0] === "-lic" ? null : "codex 1.2.3" } } });
+      run: async (_command, args) => args[0] === "-lic" ? null : runtimeId + " 1.2.3" } } });
   const socket = new WebSocket("ws://127.0.0.1:" + handle.port); await once(socket, "open");
   let serial = 0;
   const request = (method, params = {}) => new Promise((resolve, reject) => {
@@ -103,10 +119,10 @@ export async function cliMcpFixture(t, mode = "list") {
   const catalog = await request("workspace.list"); await request("workspace.select", { workspaceId: scope.workspaceId, expectedRevision: catalog.revision });
   let snapshot = await request("workspace.snapshot", { workspaceId: scope.workspaceId, agentId: null });
   const main = snapshot.agents.find(row => row.kind === "main");
-  const detected = await request("workspace.runtime.detect", scope), codex = detected.options.find(row => row.runtimeId === "codex");
-  await request("workspace.runtime.registerLocal", { ...scope, runtimeId: "codex", fingerprint: codex.fingerprint, approved: true, loginSource: "host" });
-  await request("workspace.runtime.selectModel", { ...scope, runtimeId: "codex", modelId: "fixture-model", expectedRevision: 0 });
-  await request("workspace.agents.setRuntime", { ...scope, agentId: main.agentId, runtimeId: "codex", configRevision: main.configRevision, agentEpoch: main.agentEpoch });
+  const detected = await request("workspace.runtime.detect", scope), runtime = detected.options.find(row => row.runtimeId === runtimeId);
+  await request("workspace.runtime.registerLocal", { ...scope, runtimeId, fingerprint: runtime.fingerprint, approved: true, loginSource: "host" });
+  await request("workspace.runtime.selectModel", { ...scope, runtimeId, modelId: runtimeId === "claude" ? "sonnet" : "fixture-model", expectedRevision: 0, ...(runtimeId === "claude" ? { effort: "high" } : {}) });
+  await request("workspace.agents.setRuntime", { ...scope, agentId: main.agentId, runtimeId, configRevision: main.configRevision, agentEpoch: main.agentEpoch });
   const read = () => request("workspace.snapshot", { workspaceId: scope.workspaceId, agentId: main.agentId });
   const meta = () => fs.existsSync(command + ".meta.json") ? JSON.parse(fs.readFileSync(command + ".meta.json")) : null;
   return { root, command, scope, main, request, read, meta,
