@@ -392,6 +392,14 @@ export class LocalWorkspaceHost {
     return this.context(workspaceId).runtimes.approve(id, approved, clientId, loginSource);
   }
   cancelRuntime(workspaceId: string, operationId: string): void { this.context(workspaceId).runtimes.cancel(operationId); }
+  runtimeProxy(workspaceId: string) {
+    const context = this.context(workspaceId);
+    return { workspaceId, resourceGeneration: this.snapshotGeneration(workspaceId), ...context.runtimes.proxy.read() };
+  }
+  setRuntimeProxy(workspaceId: string, proxyUrl: unknown, expectedRevision: number) {
+    this.context(workspaceId).runtimes.proxy.save(proxyUrl, expectedRevision); this.changed(workspaceId);
+    return this.runtimeProxy(workspaceId);
+  }
   async detectRuntimes(workspaceId: string): Promise<void> { await this.context(workspaceId).runtimes.discover(); }
   registerLocalRuntime(workspaceId: string, runtimeId: unknown, fingerprint: unknown, loginSource: RuntimeLoginSource = "host"): void {
     if (!optionalRuntimeId(runtimeId) || typeof fingerprint !== "string") throw new Error("Invalid local runtime registration");

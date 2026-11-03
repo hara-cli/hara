@@ -4,6 +4,7 @@
 // advance to another authorized connection.
 
 export type ErrKind =
+  | "runtime_proxy"
   | "context_overflow"
   | "quota_exhausted"
   | "region_unavailable"
@@ -33,6 +34,7 @@ function explicitQuotaExhaustion(message: string): boolean {
 export function classifyError(msg: string, status?: number, code?: string): ErrKind {
   const m = (msg || "").toLowerCase();
   const normalizedCode = (code || "").toUpperCase();
+  if (/\bruntime_proxy_(?:invalid|unreachable|failed)\b/u.test(m)) return "runtime_proxy";
   if (m === "interrupted") return "interrupted";
   if (normalizedCode === "HARA_CIRCUIT_OPEN" || /connection circuit open/.test(m)) return "circuit_open";
   if (status === 429 || (status === undefined && requestWindowQuota(m))) {
@@ -90,7 +92,7 @@ export interface FailoverState {
  * exhausted allowance are account-scoped, so another label/model on the same key cannot recover them. A user
  * interruption never switches. Context overflow may use a known larger-context model after bounded compaction. */
 export function failoverAction(kind: ErrKind, s: FailoverState): "fallback" | "fail" {
-  if (kind === "interrupted" || s.replaySafe === false || s.compatible === false) return "fail";
+  if (kind === "runtime_proxy" || kind === "interrupted" || s.replaySafe === false || s.compatible === false) return "fail";
   const differentAccount = s.differentAccount ?? s.differentConnection;
   if ((kind === "auth" || kind === "quota_exhausted") && differentAccount !== true) return "fail";
   if (kind === "auth" && s.hasFallback && !s.triedFallback) return "fallback";
@@ -101,6 +103,8 @@ export function failoverAction(kind: ErrKind, s: FailoverState): "fallback" | "f
 /** A short actionable hint appended to the surfaced error message. */
 export function errorHint(kind: ErrKind): string {
   switch (kind) {
+    case "runtime_proxy":
+      return " — check the Workspace runtime proxy and retry explicitly; no direct connection or provider fallback was selected";
     case "auth":
       return " — the configured credential was rejected or expired; update ~/.hara/config.json, the active profile, or its environment variable, then retry. Do not paste the key into chat";
     case "rate_limit":

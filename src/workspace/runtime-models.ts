@@ -86,7 +86,7 @@ function cacheCodexModels(models: RuntimeModel[], env: NodeJS.ProcessEnv, storag
 }
 async function liveModels(runtimeId: "codex" | "opencode", runtimes: WorkspaceRuntimeInstaller,
   storage: WorkspaceResourceStorage): Promise<RuntimeModel[]> {
-  const { command, env, loginSource } = runtimes.resolveBound(runtimeId);
+  let { command, env, loginSource, proxyUrl } = await runtimes.prepareBound(runtimeId);
   const failures: string[] = [];
   const remember = (models: RuntimeModel[]): RuntimeModel[] => {
     // The private cache is Hara-owned state inside runtime-homes/<id>. A host login must not be
@@ -104,9 +104,13 @@ async function liveModels(runtimeId: "codex" | "opencode", runtimes: WorkspaceRu
       return remember(codexModels(result, "data"));
     } catch (error) { failures.push(`app-server model/list: ${codexFailure(error)}`); }
   }
+  // A failed async app-server query is followed by a new physical process, so it needs fresh proxy
+  // admission too. Never let a newly configured Workspace proxy be bypassed by the old unset env.
+  if (runtimeId === "codex") ({ command, env, loginSource, proxyUrl } = await runtimes.prepareBound(runtimeId));
   const result = await runExternalCommandCapture({ command, env: { ...env, NO_COLOR: "1", OPENCODE_DISABLE_AUTOUPDATE: "true",
     OPENCODE_DISABLE_MODELS_FETCH: "true" } }, runtimeId === "codex" ? ["debug", "models"] : ["models"],
-  { cwd: env.HOME, timeoutMs: 15000, maxOutputBytes: 4 * 1024 * 1024 });
+  { cwd: env.HOME, proxyUrl, timeoutMs: 15000, maxOutputBytes: 4 * 1024 * 1024 });
+  if (result.errorCode === "runtime_proxy_failed") throw new Error(result.errorCode);
   if (!result.ok && runtimeId === "opencode") throw new Error("opencode model inventory failed");
   const { stdout } = result;
   let models: RuntimeModel[];
@@ -199,7 +203,7 @@ export class WorkspaceRuntimeModels {
   private claudeEfforts: { key: string; levels: string[] } | null = null;
   private async claudeEffortLevels(): Promise<string[]> {
     let resolved: ReturnType<WorkspaceRuntimeInstaller["resolveBound"]>;
-    try { resolved = this.runtimes.resolveBound("claude"); } catch { return []; }
+    try { resolved = await this.runtimes.prepareBound("claude"); } catch (error) { if (error instanceof Error && error.message.startsWith("runtime_proxy_")) throw error; return []; }
     const bound = this.runtimes.list().options.find(row => row.runtimeId === "claude");
     const key = JSON.stringify([resolved.command, bound?.fingerprint ?? bound?.version ?? null]);
     if (this.claudeEfforts?.key === key) return this.claudeEfforts.levels;
@@ -265,7 +269,7 @@ export class WorkspaceRuntimeModels {
   }
   private live(runtimeId: "codex" | "opencode"): Promise<RuntimeModel[]> {
     // Coalesce a registration/bind warm-up with an immediate list/select, but never retain stale results.
-    const key = JSON.stringify(this.runtimes.list().options.find(row => row.runtimeId === runtimeId));
+    const key = JSON.stringify([this.runtimes.list().options.find(row => row.runtimeId === runtimeId), this.runtimes.proxy.read().revision]);
     let pending = this.pending.get(key);
     if (!pending) {
       pending = liveModels(runtimeId, this.runtimes, this.state.storage).finally(() => this.pending.delete(key));

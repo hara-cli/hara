@@ -58,7 +58,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, capabilities: [capability, "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, capabilities: [capability, "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-proxy.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
@@ -127,6 +127,8 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (method === "workspace.features.update") { fields(["workspaceId", "expectedGeneration", "kind", "id", "enabled", "expectedRevision", ...(Object.hasOwn(params, "version") ? ["version"] : [])]); return host.updateFeature(workspaceId, params.kind, params.id, params.enabled, params.expectedRevision as number, params.version); }
     if (method === "workspace.skill.read") { fields(["workspaceId", "expectedGeneration", "id"]); if (!text(params.id)) throw new Error("Invalid skill"); return host.workspaceSkill(workspaceId, params.id); }
     if (method === "workspace.skill.fork") { fields(["workspaceId", "expectedGeneration", "id", "content", "approved", "expectedRevision"]); if (!text(params.id) || params.approved !== true) throw new Error("Private skill fork requires confirmation"); return host.forkWorkspaceSkill(workspaceId, params.id, params.content, params.expectedRevision as number); }
+    if (method === "workspace.runtime.proxy.get") { fields(["workspaceId", "expectedGeneration"]); return host.runtimeProxy(workspaceId); }
+    if (method === "workspace.runtime.proxy.set") { fields(["workspaceId", "expectedGeneration", "proxyUrl", "expectedRevision"]); return host.setRuntimeProxy(workspaceId, params.proxyUrl, params.expectedRevision as number); }
     if (method === "workspace.runtime.detect") { fields(["workspaceId", "expectedGeneration"]); await host.detectRuntimes(workspaceId); host.assertGeneration(workspaceId, params.expectedGeneration); return host.snapshot(workspaceId, undefined, client.id).runtimes; }
     if (method === "workspace.runtime.registerLocal") { fields(["workspaceId", "expectedGeneration", "runtimeId", "fingerprint", "approved",
       ...(Object.hasOwn(params, "loginSource") ? ["loginSource"] : [])]);
