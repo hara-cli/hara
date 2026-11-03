@@ -1,6 +1,5 @@
 import { captureExpandedMetadata, type ExpandedMetadataCapture } from "../agent-runtime/expanded-metadata.js";
 import { DOCUMENTED_EXPANDED_MODELS, EXPANDED_MODEL_SOURCES, copilotHelpEfforts, parseCursorModels } from "../agent-runtime/expanded-models.js";
-import { OPTIONAL_RUNTIMES } from "./runtime-catalog.js";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createRuntimeExecutionPolicy } from "../agent-runtime/execution-policy.js";
@@ -247,7 +246,7 @@ export class WorkspaceRuntimeModels {
     let resolved: ReturnType<WorkspaceRuntimeInstaller["resolveBound"]>;
     try { resolved = await this.runtimes.prepareBound("claude"); } catch (error) { if (error instanceof Error && error.message.startsWith("runtime_proxy_")) throw error; return []; }
     const bound = this.runtimes.list().options.find(row => row.runtimeId === "claude");
-    const key = JSON.stringify([resolved.command, bound && "fingerprint" in bound ? bound.fingerprint : bound?.version ?? null]);
+    const key = JSON.stringify([resolved.command, bound?.fingerprint ?? bound?.version ?? null]);
     if (this.claudeEfforts?.key === key) return this.claudeEfforts.levels;
     const result = await protectedInventory(this.storage, this.runtimes, "claude", resolved, ["--setting-sources", "project,local", "--settings", JSON.stringify({ disableAllHooks: true, sandbox: { enabled: false } }), "--help"],
       launch => runExternalCommandCapture(launch, launch.args, { cwd: resolved.env.HOME, waitForClose: true, timeoutMs: 10_000, maxOutputBytes: 256 * 1024 }));
