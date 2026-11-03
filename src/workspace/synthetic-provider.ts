@@ -31,7 +31,7 @@ export function createWorkspaceSyntheticProvider(connection: ScopedConnection, b
     // The default fixture follows C-lite: Host creates the brief before the first action.
     if (options.explicitIntake && !calls.some(call => call.name === "task_intake")) return response("", [tool("task_intake", { intent: "change", goal: objective.slice(0, 1500),
       constraints: ["僅本空間與已授權本機 fixture 項目；不連外、不發布、不調用真實模型"],
-      acceptance: [creation ? "同事經使用者確認後建立" : delegation ? "同事任務有已驗證的完成回執" : "hello.md 內容與雜湊經工具驗證"], steps: ["執行", "驗證", "回覆結果"] })]);
+      acceptance: [creation ? "同事經使用者確認後建立" : delegation ? "同事任務有已驗證的完成回執" : "hello.md 內容與雜湊經工具驗證"], steps: ["執行", "驗證", "回覆結果"] }), ...(!creation && !delegation ? [tool("workspace_read", { path: "hello.md" })] : [])]);
     if (last?.isError || last?.content.startsWith("Error:")) return response("這一步未完成，已停止繼續嘗試；請查看執行詳情或重新確認。沒有宣稱成功。");
     if (creation && !calls.some(call => call.name === "agent_create")) return response("", [tool("agent_create", { username: "coder", displayName: "Coder", title: "Coding colleague", instructions: "在授權項目內完成文件工作並驗證，不連外。" })]);
     if (delegation && !calls.some(call => call.name === "agent_contact")) {

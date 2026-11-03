@@ -146,7 +146,7 @@ test("synthetic six-step flow uses per-task context, accepts multiline delegatio
 
 test("a verbose colleague completion returns at most2k characters with its full handoff retained privately", async () => {
   const path = root(), host = new LocalWorkspaceHost(path, { providerFactory(connection, binding, context) {
-    const provider = createWorkspaceSyntheticProvider(connection, binding, context, { explicitIntake: true });
+    const provider = createWorkspaceSyntheticProvider(connection, binding, context, { explicitIntake: context.agent.kind === "colleague" });
     return scriptedWorkspaceProvider({ ...provider, async turn(args) {
       const result = await provider.turn(args);
       if (context.agent.kind === "colleague") for (const use of result.toolUses) {
