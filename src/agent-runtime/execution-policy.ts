@@ -3,6 +3,8 @@ import { RuntimeProcessBoundary, RUNTIME_GUARD_SCRIPT, type RuntimeDrainReport }
 // Host-owned outer process boundary. Native permission switches cannot relax this Seatbelt profile.
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { assertWorkspaceRunContextCurrent, type WorkspaceRunPermit } from "../workspace/execution.js";
@@ -12,6 +14,18 @@ export type RuntimePermissionTier = "full-protected" | "controlled";
 export type RegisteredPolicyRuntime = "pi" | "codex" | "claude" | "opencode" | "gemini" | "copilot" | "cursor" | "kimi" | "grok";
 const RUNTIMES: readonly string[] = ["pi", "codex", "claude", "opencode", "gemini", "copilot", "cursor", "kimi", "grok"];
 export const isRuntimePermissionTier = (value: unknown): value is RuntimePermissionTier => value === "full-protected" || value === "controlled";
+/** The npm Pi SDK imports OpenAI's source named credentials.mjs. This is code, not a login store.
+ * Resolve only the trusted installed dependency; this exception applies to the generic basename mask,
+ * never to Hara/Keychain/foreign credential directories. Bundled binaries need no filesystem exception. */
+function piPackagedCodeReads(): string[] {
+  try {
+    const sdk = fileURLToPath(import.meta.resolve("@earendil-works/pi-ai"));
+    const openai = createRequire(sdk).resolve("openai");
+    const file = physical(realpathSync.native(join(dirname(openai), "resources/beta/agents/vaults/credentials.mjs")));
+    const info = lstatSync(file);
+    return info.isFile() && info.nlink === 1 ? [file] : [];
+  } catch { return []; }
+}
 export interface RuntimeExecutionPolicyInput {
   runtimeId: RegisteredPolicyRuntime; tier: RuntimePermissionTier; workRoot: string; accountHome: string;
   runtimeHome?: string; protectedStateRoots?: readonly string[]; lifetime?: "attempt" | "resident";
@@ -108,7 +122,7 @@ export function workspaceRunPermissionTier(permit: WorkspaceRunPermit): RuntimeP
 }
 export function runtimeExecutionPolicyKey(input: RuntimeExecutionPolicyInput): string {
   return hash(JSON.stringify([input.runtimeId, input.tier, physical(input.workRoot), physical(input.accountHome),
-    input.runtimeHome ? physical(input.runtimeHome) : null, input.protectedStateRoots?.map(physical) ?? [], input.loginSource ?? "host", input.lifetime ?? "attempt"]));
+    input.runtimeHome ? physical(input.runtimeHome) : null, input.protectedStateRoots?.map(physical) ?? [], input.loginSource ?? "host", input.lifetime ?? "attempt", input.runtimeId === "pi" ? piPackagedCodeReads() : []]));
 }
 export class RuntimeExecutionPolicy {
   readonly key: string; readonly tempRoot: string; readonly profile: string;
@@ -181,6 +195,7 @@ export class RuntimeExecutionPolicy {
     const foreignCredentials = allCredentials.filter(path => !ownCredentials.includes(path) && path !== piAuth);
     const generic = '#"(^|/)(auth[.]json|[.]credentials[.]json|oauth_creds[.]json|credentials([.][^/]*)?|[.]git-credentials|[.]netrc|[.]env([.][^/]*)?)$"';
     const readableExceptions = [...ownCredentials, ...(piAuth ? [piAuth] : [])].map(path => `(require-not (literal ${quote(path)}))`).join(" ");
+    const genericReadExceptions = readableExceptions + (input.runtimeId === "pi" ? piPackagedCodeReads().map(path => ` (require-not (literal ${quote(path)}))`).join("") : "");
     this.tempRoot = mkdtempSync(join(realpathSync.native(tmpdir()), "hara-native-")); chmodSync(this.tempRoot, 0o700);
     if (forbidden.some(root => contains(root, this.tempRoot))) { rmSync(this.tempRoot, { recursive: true }); throw new Error("Runtime temporary directory overlaps protected Hara state"); }
     const isolated = (input.loginSource === "isolated" || input.runtimeId === "pi") && input.runtimeHome ? runtimeHome : undefined;
@@ -191,7 +206,7 @@ export class RuntimeExecutionPolicy {
       // Never create hard-link aliases to defeat a path-based read/write boundary.
       "(deny file-link)",
       `(deny file-write*\n  ${protectedPaths}\n  ${quotedSubpaths([...secretDirs, ...keychains])}\n  ${literals([...allCredentials, ...ownCredentials])}\n  (regex ${generic}))`,
-      `(deny file-read-data\n  ${quotedSubpaths([...secretDirs, ...foreignRoots, ...pluginRoots])}\n  ${literals(foreignCredentials)}\n  (require-all (regex ${generic}) ${readableExceptions}))`,
+      `(deny file-read-data\n  ${quotedSubpaths([...secretDirs, ...foreignRoots, ...pluginRoots])}\n  ${literals(foreignCredentials)}\n  (require-all (regex ${generic}) ${genericReadExceptions}))`,
       // Jeff 2026-11-03: native host login uses the original Keychain and securityd ACL, no copy.
       `${input.runtimeId === "pi" ? "(deny" : "(allow"} mach-lookup (global-name "com.apple.securityd") (global-name "com.apple.secd") (global-name "com.apple.securityd.xpc"))`,
       ...(input.runtimeId === "pi" ? [`(deny file-read-data ${quotedSubpaths(keychains)})`] : []),

@@ -405,6 +405,7 @@ export async function closeWorkspaceRunPermit(permit: WorkspaceRunPermit): Promi
     // A failed native teardown never releases the physical lease or silently reuses a resident.
     const { endWorkspaceNativePolicy } = await import("../agent-runtime/workspace-native-policy.js");
     await endWorkspaceNativePolicy(permit, policy, { keepResidentRoot: false }); await policy.close();
+    state.lease.setDraining(false);
   }
   state.lease.release();
 }
@@ -446,4 +447,13 @@ export function finishWorkspaceNativePolicy(permit: WorkspaceRunPermit, policy: 
   if (state.nativePolicy !== policy) return;
   try { state.nativeEvidence = policy.collectWorkspaceEvidence() ?? undefined; publishWorkspaceNativeRisks(permit); }
   finally { state.nativePolicy = undefined; }
+}
+
+/** Native Pi tool batches are issued by the Host model bridge, never inferred from CLI success text. */
+export function recordWorkspacePiNativeCalls(permit: WorkspaceRunPermit, names: readonly string[]): void {
+  const state = stateOf(permit); state.assertLive();
+  const native = new Set(["read", "bash", "edit", "write"]);
+  if (!state.started || !state.nativePolicy || permit.binding.agent.runtimeId !== "pi" || names.some(name => !native.has(name)) || names.length > 256
+    || state.usage.toolCalls + names.length > permit.binding.budget.maxToolCalls) throw new Error("Workspace native Pi tool budget exhausted");
+  if (names.length) publishUsage(state, { toolCalls: names.length });
 }

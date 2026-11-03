@@ -258,6 +258,11 @@ export class WorkspaceRuntimeInstaller {
     return { ...resolved, env: this.proxy.apply(resolved.env) };
   }
   /** Check only an explicit Workspace proxy, then revalidate the registered binary at physical launch. */
+  /** The bundled Pi has no external login and never receives this account's credentials. */
+  async prepareBuiltinPi(signal?: AbortSignal): Promise<{ accountHome: string; proxyUrl: string | null }> {
+    const checked = await this.proxy.check(signal);
+    return { accountHome: realpathSync.native(this.accountHome()), proxyUrl: checked.proxyUrl };
+  }
   async prepareBound(runtimeId: OptionalRuntimeId, signal?: AbortSignal) {
     const checked = await this.proxy.check(signal), resolved = this.resolveBoundUnproxied(runtimeId);
     return { ...resolved, env: this.proxy.applyChecked(resolved.env, checked), proxyUrl: checked.proxyUrl };

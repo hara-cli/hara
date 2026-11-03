@@ -24,7 +24,8 @@ function dir(){const path=fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(),"h
 const reply=text=>({text,toolUses:[],stop:"end",usage:{input:7,output:3}});
 function fixture(turn,extraTools=[],modelHistory){
  const home=dir(),project=dir(),catalog=new LocalWorkspaceCatalog(home),row=catalog.create("Personal",1);
- const resources=new WorkspaceResources(home,row.scope);resources.initialize();const main=resources.agents.initializeMain();
+ const resources=new WorkspaceResources(home,row.scope);resources.initialize();let main=resources.agents.initializeMain();
+ main=resources.agents.setPermissionTier(main.agentId,"controlled",main.configRevision,main.agentEpoch);
  const storage=new WorkspaceResourceStorage(home,row.scope);storage.initialize();
  const connections=new WorkspaceConnectionStoreV2(storage);connections.add({label:"Fake",provider:"openai",baseURL:"http://127.0.0.1:1/v1",apiKey:"synthetic-not-a-real-key",defaultModel:"fixed-synthetic"},0);
  let task=resources.agents.bindTask(createTaskExecution("synthetic task","fixture-turn"),main.agentId,main.configRevision,main.agentEpoch);
@@ -100,7 +101,7 @@ test("shared governor still requires intake, observed work and final receipt for
   {text:"",stop:"tool_use",toolUses:[{id:"brief",name:"task_intake",input:{intent:"change",goal:"write hello.md",constraints:["only the approved project"],acceptance:["hello.md exact bytes verified"],steps:["write","verify"]}}]},
   {text:"",stop:"tool_use",toolUses:[{id:"write",name:write.name,input:{}}]},
   {text:"",stop:"tool_use",toolUses:[{id:"verify",name:verify.name,input:{}}]},
-  {text:"",stop:"tool_use",toolUses:[{id:"complete",name:"task_checkpoint",input:{completion:{state:"verified",checks:[{acceptance_index:0,evidence:"exact bytes were read",tool_call_ids:["verify"]}],final_answer:"hello.md is ready and verified."}}}]},
+  {text:"",stop:"tool_use",toolUses:[{id:"complete",name:"task_checkpoint",input:{completion:{state:"verified",checks:[{acceptance_index:0,evidence:"exact bytes were read",tool_call_ids:["write","verify"]}],final_answer:"hello.md is ready and verified."}}}]},
  ];
  const a=fixture(async(_args,n)=>{assert.ok(n<=4);return steps[n-1];},[write,verify]);project=a.project;
  try{const history=[{role:"user",content:"Create hello.md in the approved project and verify it."}],result=await runConfiguredAgent(history,a.options);

@@ -17,7 +17,7 @@ export function runtimeFailureTracker(installer: WorkspaceRuntimeInstaller, runt
   const cooldown = row.cooldown;
   const message = (kind: RuntimeFailureKind, elapsedMs: number) => {
     const blocked = cooldown.blocked();
-    return runtimeFailureMessage({ ...installer.failureContext(runtime, launched), kind, elapsedMs,
+    return runtimeFailureMessage({ ...(runtime === "pi" ? { runtime: "pi" as const, version: "1.5.0", loginSource: "isolated" as const, homeMatchesAccount: false } : installer.failureContext(runtime, launched)), kind, elapsedMs,
       retryAtMs: blocked?.retryAtMs ?? 0, consecutiveFailures: blocked?.consecutiveFailures ?? 0 });
   };
   return {

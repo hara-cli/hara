@@ -2,7 +2,7 @@
 
 ## Embedded Pi coding worker
 
-Hara embeds `@earendil-works/pi-coding-agent` 1.1.0 and its locked Pi dependencies as an optional
+Hara embeds `@earendil-works/pi-coding-agent` 1.5.0 and its locked Pi dependencies as an optional
 execution choice. Hara supplies the model route, bounded tools and authorization; the upstream
 standalone Pi application, credentials, extensions and update mechanism are not activated.
 

@@ -109,9 +109,12 @@ interface PendingCall {
 export function createRegisteredCliMcpTurn(input: {
   signal: AbortSignal;
   jsonEvents?: boolean;
+  /** Pi completion is committed by the Host only after native settle and shared tree drain. */
+  deferNativeCompletion?: boolean;
+  /** Host-only serialization for an embedded native RPC runtime with its own system prompt. */
+  prompt?(args: TurnArgs): string;
   assertCurrent(): void;
   bearerToken?: string;
-  prompt?(args: TurnArgs): string;
   decorateResult?(result: ToolResult, args: TurnArgs): ToolResult;
   takeUsage?(): TurnResult["usage"];
   launch(endpoint: WorkspaceMcpEndpoint, prompt: string, activity: () => void, args: TurnArgs): Promise<ExternalCommandCaptureResult>;
@@ -121,6 +124,7 @@ export function createRegisteredCliMcpTurn(input: {
   let endpoint: WorkspaceMcpEndpoint | undefined, physical: Promise<void> | undefined;
   let tools: readonly ToolSpec[] = [], finished: TurnResult | undefined, wake: (() => void) | undefined;
   let activity: (() => void) | undefined, closed = false, ended = false;
+  let closing: Promise<void> | undefined, deferredCompletion: PendingCall | undefined;
   const notify = () => { wake?.(); wake = undefined; };
   const flush = (history: readonly NeutralMsg[], args?: TurnArgs) => {
     for (const message of history) if (message.role === "tool") for (const result of message.results) {
@@ -128,15 +132,13 @@ export function createRegisteredCliMcpTurn(input: {
       if (call) { pending.delete(result.id); call.resolve(args && input.decorateResult ? input.decorateResult(result, args) : result); }
     }
   };
-  const close = async (history: readonly NeutralMsg[] = []) => {
-    if (closed) return;
+  const close = (history: readonly NeutralMsg[] = []): Promise<void> => closing ??= (async () => {
     closed = true; flush(history); stopped.abort();
     for (const { call, resolve } of pending.values()) resolve({ id: call.id, name: call.name, content: "Error: Workspace attempt ended", isError: true });
-    pending.clear(); queue.length = 0; notify();
-    await endpoint?.close();
-    await physical;
-    input.signal.removeEventListener("abort", onAbort);
-  };
+    pending.clear(); queue.length = 0; deferredCompletion = undefined; notify();
+    try { await endpoint?.close(); await physical; }
+    finally { input.signal.removeEventListener("abort", onAbort); }
+  })();
   const onAbort = () => { void close().catch(() => {}); };
   input.signal.addEventListener("abort", onAbort, { once: true });
   return {
@@ -150,7 +152,15 @@ export function createRegisteredCliMcpTurn(input: {
           bearerToken: input.bearerToken,
           tools: () => tools, call(name, parameters) {
             input.assertCurrent();
-            if (closed || pending.size >= 16) throw new Error("Workspace MCP call limit reached");
+            if (closed || finished || ended || pending.size >= 16) throw new Error("Workspace MCP call limit reached");
+            if (input.deferNativeCompletion && name === "task_checkpoint" && (parameters.done === true
+              || (parameters.completion as { state?: unknown } | undefined)?.state === "verified")) {
+              if (deferredCompletion) return Promise.resolve({ id: randomUUID(), name, content: "A completion proposal is already pending Host verification", isError: true });
+              const call = { id: randomUUID(), name, input: parameters };
+              deferredCompletion = { call, resolve() {} };
+              return Promise.resolve({ id: call.id, name, content: JSON.stringify({ completionDeferred: true, committed: false,
+                instruction: "Finish your reply. Hara verifies this proposal only after the native run settles and the protected process tree drains. This is not a successful completion receipt." }) });
+            }
             return new Promise<ToolResult>(resolve => {
               const call = { id: randomUUID(), name, input: parameters };
               const item = { call, resolve }; pending.set(call.id, item); queue.push(item); notify();
@@ -185,7 +195,12 @@ export function createRegisteredCliMcpTurn(input: {
               finished = { text, toolUses: [], stop: "end", ...(usage ? { usage } : {}) };
             }
           } catch (error) { finished = { text: "", toolUses: [], stop: "error", errorMsg: runtimeProxyFailure(error) ?? "Native Agent Runtime launch failed; no fallback was selected" }; }
-          finally { notify(); }
+          finally {
+            if (!closed && finished && finished.stop !== "error" && deferredCompletion) {
+              pending.set(deferredCompletion.call.id, deferredCompletion); queue.push(deferredCompletion);
+            }
+            deferredCompletion = undefined; notify();
+          }
         })();
       }
       while (!closed) {

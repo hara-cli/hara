@@ -5,7 +5,7 @@ import {
 import { bindPrivateHaraStateFile, readPrivateStateFileSnapshotSync, writePrivateStateFileSync } from "../security/private-state.js";
 import type { CodingHostBridge, CodingHostBudget } from "../coding/host.js";
 
-export const HOST_PI_SDK_VERSION = "1.1.0";
+export const HOST_PI_SDK_VERSION = "1.5.0";
 declare const __HARA_BUNDLED_PI_SDK_VERSION__: string | undefined;
 const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 

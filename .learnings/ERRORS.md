@@ -11141,3 +11141,50 @@ Usage is charged from the first current-turn request's explicit `last` telemetry
 - Related Files: src/agent-runtime/codex-session.ts, src/agent-runtime/registered-cli-mcp.ts, src/workspace/execution.ts, test/workspace-codex-session-recovery.test.mjs
 - Tags: codex, app-server, mcp, governance, accounting, recovery
 - Pattern-Key: native_session.context_is_not_authority
+
+## [ERR-20261103-PI-RPC-EMPTY-AUTH-LOCK] Pi RPC requires a narrow lock directory even for empty auth
+
+**Logged**: 2026-11-03T20:48:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: tests
+
+The isolated Pi 1.5.0 RPC process accepted get_state but refused prompt with a credential-store mkdir EPERM. Its file auth backend locks even an empty auth.json before looking up the loopback capability in models.json. The fixture now allows only its dedicated agentDir/auth.json.lock directory; auth.json, models.json and settings.json remain unwritable. Real Seatbelt/native tool, key-absence, token lifecycle, resume and MCP tests pass. This does not grant real Pi credentials, a broad agentDir write grant, or production admission. Shared policy must implement and test this exact empty-lock requirement before Pi integration.
+
+### Related fixture/tooling corrections
+
+- Node fetch did not transmit the deliberately overridden Host header. Use node:http for the Host-confusion negative test; retain the exact 403 assertion.
+- npm rejects a single /dev/null path serving as both userconfig and globalconfig. Two separate empty task-local files preserve isolation and allow the same install without reading user config.
+- Local official Pi reference fetch failed with an early EOF; freshness is unknown. The executed official npm 1.5.0 tarball is pinned and integrity-checked separately. Raft fetch succeeded at db5e399; do not claim that Pi's old source checkout was refreshed.
+
+### Resolution
+
+- Focused local prototype: 11/11 PASS; existing Pi tests: 23/23 PASS; Core build PASS.
+- Production/defaults/C-lite integration: HOLD pending design review and public-policy Pi support.
+- Related Files: scripts/pi-full-mode-prototype.mjs, scripts/pi-full-mode-prototype.test.mjs, ../inbox/2026-11-03-pi-full-mode-tip.md
+- Pattern-Key: pi_rpc.empty_auth_read_requires_exact_lock
+
+
+## [ERR-20261103-PI-NATIVE-PRODUCTION-BOUNDARIES] Native completion must join physical work
+
+- Logged: 2026-11-03
+- Status: resolved in adapter; final shared-layer integration pending
+- Production integration found that a repeated MCP close could return while its first close still awaited a physical native launch. Close now returns one shared promise. A Pi MCP completion request is deferred until native settle and common process-tree drain; it cannot publish done while native effects remain active.
+- The adapter awaits the public layer's asynchronous STOP/CONT ownership registration. A failed drain leaves the native policy attached and the Workspace lease retained; no private Pi process-tree cleanup was introduced.
+- Per-attempt model/MCP capabilities travel only through one inherited fd 3, consumed and closed before tools/session loading. They are absent from argv, env and launch configuration files. Opaque upstream reasoning remains in authenticated scoped Host storage across gateway replacement.
+- A first native idle-resume fixture incorrectly reused the prior MCP transport session. Recreating the per-attempt endpoint fixes the fixture and matches production; the same native session id resumes without replaying the previous tools. The original failure log is retained.
+- Initial new TypeScript/narrowing and test syntax errors were corrected and the original build/failure logs retained. Do not treat a test file that failed to parse as a passed acceptance check.
+- Verification: production RPC, background descendant drain, resource traps, continuation restoration and request-local proxy tests pass with a hashed public-layer draft snapshot. Exact immutable public Pi/drain/N1 commits and Desk acceptance remain separate prerequisites.
+- Pattern-Key: pi_native.physical_close_and_per_attempt_capability
+
+
+## [ERR-20261103-PI-TIER-WIRING] Real SDK dependency code hit the credential basename mask
+
+- Status: resolved in Pi integration, pending coordinator integration
+- The actual full Workspace entry reached zero upstream model calls because the public generic credentials.* read mask also matched OpenAI SDK source resources/beta/agents/vaults/credentials.mjs. The hand-written prototype profile could not reveal this public-policy difference.
+- Keep the credential mask. Resolve the installed Pi SDK's OpenAI dependency from trusted Hara module identity and exempt only that exact single-link source file from the generic basename read mask. Do not exempt its directory, writes, Hara state, Keychain, or foreign credential roots. Its path participates in the policy key. Real Seatbelt verifies the SDK source is readable while a user's same-named SSH credential file is unreadable.
+- Native verified task_checkpoint requests are completion proposals until settled physical drain. They are queued to the real governor after drain, without claiming a successful receipt to the child. Real Workspace positive N1 passes and read-only/invented native proof is rejected; one physical model call is charged once.
+- Fixture corrections: checkpoint schema requires completion.evidence; omit empty optional tool_call_ids for native-only checks; durable completion lives in task.checkpoint.completion. Close the fixture's permit/installer before removing its private state. Existing controlled Pi fixtures must explicitly select controlled now that new bindings default full, and N1 checks must cite the observed write as well as the read verification.
+- Bun1.3.9 local file dependency install passes with the real Pi policy and (deny file-link), default backend, isolated HOME/cache and a loopback-only registry. This does not verify pnpm or arbitrary registry packages.
+- Public final 9c75b58 is merged with its S3 parent history; no rewrite/cherry-pick of its terminal fix. The accepted unobserved instantaneous daemon/reparent limitation remains; Pi uses only common ownership/drain.
+- A closeout call used an absolute task path and was held invalid_task_name, removed0. Use the registered task name at final closeout. Preserve original failure logs, without capabilities or real credentials.

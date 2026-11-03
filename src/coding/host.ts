@@ -21,6 +21,8 @@ export interface CodingHostMetrics {
 }
 
 export interface CodingHostOptions {
+  /** Trusted Host-only native Pi model transport. No tool endpoint or ambient route is admitted. */
+  nativeModel?: { audience: string; onNativeTools?(calls: readonly ToolUse[]): void };
   provider: Provider;
   tools: ToolSpec[];
   executeTool(name: string, input: Record<string, unknown>, signal: AbortSignal): Promise<string | { content: string; isError?: boolean }>;
@@ -144,6 +146,13 @@ export async function createCodingHostBridge(options: CodingHostOptions): Promis
     if (!Number.isSafeInteger(budget[name]) || budget[name] <= 0) throw new Error("invalid coding host budget");
   }
   if (budget.timeoutMs > 2_147_483_647) throw new Error("invalid coding host timeout");
+  if (options.nativeModel && !/^[a-f0-9]{64}$/.test(options.nativeModel.audience)) throw new Error("invalid native model audience");
+  const prefix = options.nativeModel ? "/pi/" + options.nativeModel.audience : "";
+  const modelPath = prefix + "/v1/chat/completions", mcpPath = prefix + "/mcp";
+  const physical = new Set<Promise<unknown>>();
+  const track = <T>(operation: Promise<T>): Promise<T> => {
+    physical.add(operation); void operation.finally(() => physical.delete(operation)).catch(() => {}); return operation;
+  };
   const tools = structuredClone(options.tools);
   const byName = new Map<string, ToolSpec>();
   const aliases = new Map<string, ToolSpec>();
@@ -156,7 +165,7 @@ export async function createCodingHostBridge(options: CodingHostOptions): Promis
     inputValidators.set(tool.name, new AjvJsonSchemaValidator().getValidator(tool.input_schema));
   }
   for (const tool of tools) {
-    for (const alias of [tool.name, `hara_${tool.name}`]) {
+    for (const alias of options.nativeModel ? [tool.name] : [tool.name, `hara_${tool.name}`]) {
       if (aliases.has(alias)) throw new Error("ambiguous coding host tool allowlist");
       aliases.set(alias, tool);
     }
@@ -307,7 +316,7 @@ export async function createCodingHostBridge(options: CodingHostOptions): Promis
       if (counters.providerRounds >= budget.maxProviderRounds || counters.totalTokens + inputEstimate > budget.maxTokens) throw new HostError(429, "host_budget_exhausted");
       counters.providerRounds += 1;
       progress();
-      const prepared = await abortable(Promise.resolve(options.provider.prepareTurn?.(history, signal)), signal);
+      const prepared = await abortable(track(Promise.resolve(options.provider.prepareTurn?.(history, signal))), signal);
       await assertCurrent(signal);
       if (options.organizationPolicyVersion !== undefined && prepared?.organizationPolicyVersion !== undefined
         && prepared.organizationPolicyVersion !== options.organizationPolicyVersion) {
@@ -316,11 +325,11 @@ export async function createCodingHostBridge(options: CodingHostOptions): Promis
       }
       dispatched = true;
       // Child generation hints are not forwarded: the existing Hara model/profile stays authoritative.
-      const result = await abortable(options.provider.turn({
+      const result = await abortable(track(options.provider.turn({
         system, history, tools: injectedTools, signal,
         organizationPolicyVersion: options.organizationPolicyVersion ?? prepared?.organizationPolicyVersion,
         onText: () => {}, onReasoning: () => {}, onActivity: () => {},
-      }), signal);
+      })), signal);
       await assertCurrent(signal);
       const outputEstimate = Buffer.byteLength(JSON.stringify(result));
       const validCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -341,6 +350,12 @@ export async function createCodingHostBridge(options: CodingHostOptions): Promis
         ids.add(tool.id);
         record(tool.input);
         if (!inputValidators.get(aliases.get(tool.name)!.name)!(tool.input).valid) throw new HostError(502, "unsupported_provider_tool_arguments");
+      }
+      if (options.nativeModel) {
+        if (counters.toolCalls + result.toolUses.length > budget.maxToolCalls) throw new HostError(429, "host_budget_exhausted");
+        counters.toolCalls += result.toolUses.length;
+        options.nativeModel.onNativeTools?.(result.toolUses);
+        progress();
       }
       const key = continuationKey(result.text, result.toolUses, history);
       let continuation: AssistantContinuation | undefined;
@@ -456,27 +471,28 @@ export async function createCodingHostBridge(options: CodingHostOptions): Promis
       if (supplied.length !== authorization.length || !timingSafeEqual(supplied, authorization)) throw new HostError(401, "unauthorized");
       if (request.headers.host !== new URL(origin).host || (request.headers.origin !== undefined && request.headers.origin !== origin)) throw new HostError(403, "foreign_origin");
       await assertCurrent(signal);
-      if (request.url === "/mcp" && request.method === "GET") {
+      if (options.nativeModel && request.url !== modelPath) throw new HostError(404, "unsupported_endpoint");
+      if (request.url === mcpPath && request.method === "GET") {
         if (!mcpSession || request.headers["mcp-session-id"] !== mcpSession) throw new HostError(404, "foreign_mcp_session");
         await assertCurrent(signal); response.writeHead(405, { Allow: "POST, DELETE" }); response.end(); return;
       }
-      if (request.url === "/mcp" && request.method === "DELETE") {
+      if (request.url === mcpPath && request.method === "DELETE") {
         if (!mcpSession || request.headers["mcp-session-id"] !== mcpSession) throw new HostError(404, "foreign_mcp_session");
         await assertCurrent(signal); mcpInitialized = false; mcpSession = undefined; mcpEnded = true;
         json(response, 200, {}); return;
       }
       if (request.method !== "POST") throw new HostError(405, "unsupported_http_method");
-      if (request.url !== "/mcp" && request.url !== "/v1/chat/completions") throw new HostError(404, "unsupported_endpoint");
+      if (request.url !== mcpPath && request.url !== modelPath) throw new HostError(404, "unsupported_endpoint");
       const body = await readPayload(request);
-      if (request.url === "/mcp") rpcId = body.id ?? null;
+      if (request.url === mcpPath) rpcId = body.id ?? null;
       await assertCurrent(signal);
-      if (request.url === "/mcp") await mcp(request, response, body, signal);
+      if (request.url === mcpPath) await mcp(request, response, body, signal);
       else await completion(body, response, signal);
       await assertCurrent(signal);
     })().catch((error: unknown) => {
       if (!response.headersSent && !response.destroyed) {
         const failure = error instanceof HostError ? error : new HostError(500, "host_operation_failed");
-        if (request.url === "/mcp") {
+        if (request.url === mcpPath) {
           const code = failure.code === "unsupported_mcp_method" ? -32601 : failure.status === 400 ? -32602 : -32603;
           json(response, failure.status, { jsonrpc: "2.0", id: rpcId, error: { code, message: failure.code } });
         } else json(response, failure.status, { error: { message: failure.code, type: "hara_coding_host_error" } });
@@ -497,10 +513,11 @@ export async function createCodingHostBridge(options: CodingHostOptions): Promis
     clearTimeout(timer);
     options.signal?.removeEventListener("abort", externalAbort);
     continuations.clear();
-    closed = new Promise<void>((resolve) => {
+    const listenerClosed = new Promise<void>((resolve) => {
       server.close(() => resolve());
       for (const socket of sockets) socket.destroy();
     });
+    closed = options.nativeModel ? Promise.all([listenerClosed, ...[...physical].map(operation => operation.catch(() => {}))]).then(() => {}) : listenerClosed;
     return closed;
   };
   lifecycle.signal.addEventListener("abort", () => { queueMicrotask(() => { void close(); }); }, { once: true });
@@ -518,8 +535,8 @@ export async function createCodingHostBridge(options: CodingHostOptions): Promis
     origin = `http://127.0.0.1:${address.port}`;
     return {
       model: "hara/coding",
-      provider: { hara: { npm: "@ai-sdk/openai-compatible", models: { coding: { name: "Hara current connection", limit: { context: 128_000, output: 16_384 } } }, options: { baseURL: `${origin}/v1`, apiKey: token, includeUsage: true } } },
-      mcp: { type: "remote", url: `${origin}/mcp`, headers: { Authorization: `Bearer ${token}` } },
+      provider: { hara: { npm: "@ai-sdk/openai-compatible", models: { coding: { name: "Hara current connection", limit: { context: 128_000, output: 16_384 } } }, options: { baseURL: `${origin}${prefix}/v1`, apiKey: token, includeUsage: true } } },
+      mcp: { type: "remote", url: `${origin}${mcpPath}`, headers: { Authorization: `Bearer ${token}` } },
       toolNames: tools.map((tool) => tool.name),
       budget: { ...budget },
       get metrics() { return { ...counters }; },

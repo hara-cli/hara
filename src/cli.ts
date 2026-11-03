@@ -7,6 +7,13 @@ const runtimeError = unsupportedNodeMessage();
 if (runtimeError) {
   process.stderr.write(`${runtimeError}\n`);
   process.exitCode = 1;
+} else if (process.argv[2] === "--internal-pi-rpc") {
+  // Native Pi RPC is packaged with the Host and never enters portable/global Hara profile startup.
+  void import("./agent-runtime/pi-rpc-entry.js").then(module => module.mainPiNativeRpc(process.argv.slice(3))).catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : "";
+    process.stderr.write((/^Pi protected RPC startup refused: (?:configuration|model|mcp|session|rpc):[a-z_]{3,40}$/.test(message)
+      ? message : "Pi protected RPC startup failed") + "\n"); process.exitCode = 2;
+  });
 } else if (process.env.HARA_LEGACY_CLI_SOCKET !== undefined || process.env.HARA_LEGACY_CLI_TOKEN !== undefined) {
   // A partial/expired bridge must refuse, never fall through to global profiles, cron or providers.
   void import("./workspace/legacy-cli.js").then(module => module.mainLegacyScopedCli(process.argv.slice(2))).catch(() => {

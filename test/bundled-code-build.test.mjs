@@ -5,7 +5,7 @@ import { runtimeDistribution } from "../dist/runtime-distribution.js";
 const read = file => readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
 test("Pi is the only preinstalled Agent runtime in both dependency manifests", () => {
   const pkg = JSON.parse(read("package.json")), lock = JSON.parse(read("package-lock.json"));
-  assert.equal(pkg.dependencies["@earendil-works/pi-coding-agent"], "1.1.0");
+  assert.equal(pkg.dependencies["@earendil-works/pi-coding-agent"], "1.5.0");
   for (const name of Object.keys({ ...pkg.dependencies, ...pkg.optionalDependencies })) assert.ok(!/^opencode-/.test(name) && name !== "@anthropic-ai/claude-agent-sdk", name);
   for (const name of Object.keys(lock.packages)) assert.ok(!/node_modules\/(?:opencode-(?:darwin|linux|windows)-|@anthropic-ai\/claude-agent-sdk(?:\/|$))/.test(name), name);
   assert.deepEqual(runtimeDistribution.preinstalled, ["pi"]); assert.deepEqual(runtimeDistribution.optional, ["opencode", "codex", "claude", "agy"]);
