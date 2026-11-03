@@ -1,3 +1,5 @@
+import type { CompletionEvidenceLedger } from "../agent/completion-evidence.js";
+import { createWorkspaceCompletionEvidence } from "./completion-evidence-store.js";
 import type { RuntimeExecutionPolicy, NativeWorkspaceEvidence, RuntimeRiskEvent } from "../agent-runtime/execution-policy.js";
 // A serialized RunBinding is provenance, never an execution capability. Only trusted Host composition
 // calls this factory; renderer/Agent arguments cannot populate the private WeakMap below.
@@ -26,6 +28,7 @@ import type { WorkspaceUserInteraction, WorkspaceUserQuestion } from "./user-int
 
 export interface WorkspaceRunPermit { readonly binding: Readonly<WorkspaceRunBinding> }
 interface PermitState {
+  completionEvidence: CompletionEvidenceLedger;
   storage: WorkspaceResourceStorage;
   assertLive(): void;
   provider: Provider;
@@ -111,6 +114,8 @@ export function createWorkspaceRunPermit(input: {
   signal: AbortSignal;
   toolNames: readonly string[];
   usage: WorkspaceUsage;
+  /** Exact unchanged /continue predecessor from the protected conversation, never renderer input. */
+  completionRecovery?: { previousTask: TaskExecution; currentTask: TaskExecution };
   /** Trusted Host-only attempt boundary. Persisted history stays complete and append-only. */
   modelHistory?: { history: NeutralMsg[]; start: number; retain?: (result: ToolResult) => string; usedTokens?: () => number };
   observeContext?(value: WorkspaceContextObservation): void;
@@ -224,7 +229,7 @@ export function createWorkspaceRunPermit(input: {
       }
     },
   };
-  state = { nativeConversationSafe: true, onNativeRisks: input.onNativeRisks, storage: input.storage, assertLive, provider, cwd, managedProject, hasLegacyToolPolicy: Boolean(input.resources.agents.resolveTask(binding.agent).toolPolicy), stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
+  state = { completionEvidence: createWorkspaceCompletionEvidence(input.storage, binding, input.completionRecovery), nativeConversationSafe: true, onNativeRisks: input.onNativeRisks, storage: input.storage, assertLive, provider, cwd, managedProject, hasLegacyToolPolicy: Boolean(input.resources.agents.resolveTask(binding.agent).toolPolicy), stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
     updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false, wakeChars: 0,
     interaction: input.interaction, onQuestion: input.onQuestion, onInteractionChanged: input.onInteractionChanged, interactionUsage: input.interactionUsage, startedAt: started, toolTail: Promise.resolve(),
     audit: new WorkspaceExecutionAudit(input.storage, binding.runId, binding.agent.agentId),
@@ -467,4 +472,9 @@ export function recordWorkspacePiNativeCalls(permit: WorkspaceRunPermit, names: 
   if (!state.started || !state.nativePolicy || permit.binding.agent.runtimeId !== "pi" || names.some(name => !native.has(name)) || names.length > 256
     || state.usage.toolCalls + names.length > permit.binding.budget.maxToolCalls) throw new Error("Workspace native Pi tool budget exhausted");
   if (names.length) publishUsage(state, { toolCalls: names.length });
+}
+
+/** Trusted Host permit only. The model cannot supply or restore a provenance journal. */
+export function workspaceRunCompletionEvidence(permit: WorkspaceRunPermit): CompletionEvidenceLedger {
+  const state = stateOf(permit); state.assertLive(); return state.completionEvidence;
 }

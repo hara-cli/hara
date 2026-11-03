@@ -1,7 +1,7 @@
 import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment, TurnArgs, TurnResult } from "../providers/types.js";
 import { isTaskRuntimeBinding } from "../agent-runtime/bindings.js";
 import { WORKSPACE_AGENT_EXECUTION_PENDING } from "../workspace/agent-binding.js";
-import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, workspaceRunQuestion, workspaceRunHasPendingInteraction, workspaceRunBeginToolBatch, workspaceRunAsk, workspaceRunAsyncAnswers, workspaceRunNativeEvidence, workspaceRunCanCompleteConversation, type WorkspaceRunPermit } from "../workspace/execution.js";
+import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, workspaceRunQuestion, workspaceRunHasPendingInteraction, workspaceRunBeginToolBatch, workspaceRunAsk, workspaceRunAsyncAnswers, workspaceRunNativeEvidence, workspaceRunCanCompleteConversation, workspaceRunCompletionEvidence, type WorkspaceRunPermit } from "../workspace/execution.js";
 import { createToolImageStore, redactOwnedToolImageText } from "../tools/tool-images.js";
 import { redactOwnedToolImageValue } from "../security/tool-media-redaction.js";
 import { createComputerRunScope, closeComputerRunScope } from "../tools/computer-run.js";
@@ -1385,7 +1385,7 @@ async function runAgentInner(
     restrictToolsForSkill,
   };
   let intakeTask = opts.taskIntake?.task;
-  const completionEvidence = new CompletionEvidenceLedger();
+  const completionEvidence = opts.workspaceRun ? workspaceRunCompletionEvidence(opts.workspaceRun) : new CompletionEvidenceLedger();
   const readOnlyAnswerTrace = opts.workspaceRun && opts.taskIntake ? new ReadOnlyAnswerTrace() : null;
   const workspaceChangeTrace = opts.workspaceRun && opts.taskIntake ? new WorkspaceChangeTrace() : null;
   const nativeEvidence = () => {
