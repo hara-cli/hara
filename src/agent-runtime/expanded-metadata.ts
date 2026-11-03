@@ -8,18 +8,18 @@ import { createRuntimeExecutionPolicy, type RuntimeExecutionPolicy } from "./exe
 import { assertExpandedRuntimeIsolation } from "./expanded-isolation.js";
 
 export type ExpandedMetadataCapture = (input: { runtimeId: "copilot" | "cursor"; command: string;
-  env: NodeJS.ProcessEnv; proxyUrl?: string | null }) => Promise<ExternalCommandCaptureResult>;
+  env: NodeJS.ProcessEnv; proxyUrl?: string | null; protectedStateRoots: readonly string[] }) => Promise<ExternalCommandCaptureResult>;
 /** Metadata queries are also native subprocesses. They do not get an unprotected back door around
  * the production extension gate. The optional Host constructor seam is for synthetic CLI tests. */
 export const captureExpandedMetadata: ExpandedMetadataCapture = async input => {
   assertExpandedRuntimeIsolation(input.runtimeId);
-  if (!input.env.HOME) throw new Error("runtime_permission_denied");
+  if (!input.env.HOME || !input.protectedStateRoots?.length) throw new Error("runtime_permission_denied");
   const cwd = mkdtempSync(join(realpathSync.native(tmpdir()), "hara-runtime-metadata-"));
   let child: ChildProcess | undefined, stopped = true;
   let policy: RuntimeExecutionPolicy | undefined;
   try {
     policy = createRuntimeExecutionPolicy({ runtimeId: input.runtimeId, tier: "controlled", accountHome: input.env.HOME,
-      workRoot: cwd, loginSource: "host", lifetime: "attempt" });
+      workRoot: cwd, protectedStateRoots: input.protectedStateRoots, loginSource: "host", lifetime: "attempt" });
     const launch = policy.wrap({ command: input.command, args: input.runtimeId === "cursor" ? ["models"] : ["--help"], env: input.env });
     stopped = false;
     try { return await runExternalCommandCapture({ command: launch.command, env: launch.env,
