@@ -8,7 +8,7 @@ export interface DetectedRuntime { runtimeId: OptionalRuntimeId; path: string; r
 export interface DetectionOptions { home: string; probeHome?: string; shell?: string; path?: string; timeoutMs?: number;
   run?: (command: string, args: string[], env: NodeJS.ProcessEnv, timeout: number) => Promise<string | null>;
   systemBins?: string[] }
-const ids: OptionalRuntimeId[] = ["opencode", "codex", "claude", "agy"];
+const ids: OptionalRuntimeId[] = ["opencode", "codex", "claude", "agy", "gemini", "kimi"];
 export const LOGIN_RUNTIME_PATH_COMMAND = 'printf "__HARA_RUNTIME_PATH__%s\\n" "$PATH"';
 const fingerprints = new Map<string, { identity: string; value: { realPath: string; fingerprint: string } }>();
 const safePath = (value: string) => isAbsolute(value) && value.length < 4096 && !/[\u0000-\u001f\u007f]/.test(value);
@@ -81,6 +81,7 @@ export async function detectInstalledRuntimes(options: DetectionOptions): Promis
       if (Date.now() >= deadline) throw new Error("Local runtime discovery deadline reached; absence is not confirmed");
       const inspected = inspectLocalRuntime(candidate.path); if (!inspected) continue;
       const output = await run(candidate.path, ["--version"], { ...env, HOME: probeHome, USERPROFILE: probeHome,
+        GEMINI_CLI_HOME: probeHome, KIMI_SHARE_DIR: join(probeHome, ".kimi"), KIMI_CODE_HOME: join(probeHome, ".kimi-code"),
         XDG_CONFIG_HOME: join(probeHome,".config"), XDG_CACHE_HOME: join(probeHome,".cache"), XDG_DATA_HOME: join(probeHome,".local/share"),
         PATH: `${dirname(candidate.path)}:${bins.map(b => b.path).join(":")}:${path}` }, Math.min(timeout, Math.max(25, deadline - Date.now())));
       const version = output?.match(/\b\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?\b/)?.[0];

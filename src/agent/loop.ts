@@ -1198,10 +1198,10 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
  * There is one physical model request, not a Hara planner delegating its full task to a second planner. */
 export type AgentRuntimeTurn = (provider: Provider, args: TurnArgs) => Promise<TurnResult>;
 export async function runGovernedAgent(
-  history: NeutralMsg[], opts: RunOpts, runtimeId: "hara" | "pi" | "codex" | "claude" | "opencode", executeTurn?: AgentRuntimeTurn,
+  history: NeutralMsg[], opts: RunOpts, runtimeId: "hara" | "pi" | "codex" | "claude" | "opencode" | "gemini" | "kimi", executeTurn?: AgentRuntimeTurn,
 ): Promise<RunOutcome> {
-  if (!["hara", "pi", "codex", "claude", "opencode"].includes(runtimeId) || (runtimeId !== "hara" && !executeTurn)
-    || ((runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode") && !opts.workspaceRun)) {
+  if (!["hara", "pi", "codex", "claude", "opencode", "gemini", "kimi"].includes(runtimeId) || (runtimeId !== "hara" && !executeTurn)
+    || ((runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode" || runtimeId === "gemini" || runtimeId === "kimi") && !opts.workspaceRun)) {
     return { status: "error", error: "Agent Runtime kernel is unavailable; no fallback was started." };
   }
   // CLI/headless callers also reach this compatibility engine directly. A persisted task bound to

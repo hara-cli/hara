@@ -47,6 +47,7 @@ import { MacKeychainCredentialVault, type CredentialVault } from "./credential-v
 import { LegacyConnectionCatalog } from "./legacy-connections.js";
 import { WorkspacePreferences } from "./preferences.js";
 import { WorkspaceFeatures } from "./features.js";
+import type { JsonCliPolicyFactory } from "../agent-runtime/json-cli-policy.js";
 import { workspaceSkillTool } from "./skills.js";
 import { WorkspaceLocalChannels } from "./local-channels.js";
 import { assertChannelAutonomyProductionDispatch } from "./channel-autonomy.js";
@@ -126,6 +127,8 @@ export class LocalWorkspaceHost {
     credentialVault?: CredentialVault;
     runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1];
     providerFactory?: LocalWorkspaceProviderFactory;
+    /** Trusted Host/test composition only; never exposed through RPC or a persisted setting. */
+    jsonCliPolicyFactory?: JsonCliPolicyFactory;
     /** Host-owned native account reader; never accepted from a renderer or model tool argument. */
     usageCollector?: WorkspaceUsageCollector;
     realKeyFile?: string;
@@ -1088,7 +1091,7 @@ export class LocalWorkspaceHost {
   private async run(job: LocalJob): Promise<void> {
     try {
       job.outcome = await job.context.storage.run(() => runConfiguredAgent(job.value.history, job.options!,
-        new AgentRuntimeRegistry(undefined, job.context.runtimes, job.context.runtimeModels)));
+        new AgentRuntimeRegistry(undefined, job.context.runtimes, job.context.runtimeModels, this.options.jsonCliPolicyFactory)));
       this.closeRunInteractions(job);
       if (!job.signal.aborted && job.interaction?.question()) {
         job.value.task = this.questionCheckpoint(job.value.task!, job.interaction.question()!);

@@ -13,7 +13,7 @@ export function workspaceRuntimePolicyInput(permit: WorkspaceRunPermit, runtimeI
   if (runtimeId !== permit.binding.agent.runtimeId) throw new Error("Native policy runtime differs from the admitted binding");
   const home = resolved.env.HOME;
   if (!home) throw new Error("Native runtime login HOME is unavailable; no fallback was selected");
-  if (installer && (runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode")) return {
+  if (installer && (runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode" || runtimeId === "gemini" || runtimeId === "kimi")) return {
     runtimeId, tier: workspaceRunPermissionTier(permit), workRoot: permit.binding.project.root,
     ...installer.executionPolicyDirectories(runtimeId, resolved), lifetime, loginSource: resolved.loginSource,
   };

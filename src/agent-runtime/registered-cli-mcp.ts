@@ -113,6 +113,8 @@ export function createRegisteredCliMcpTurn(input: {
   deferNativeCompletion?: boolean;
   /** Host-only serialization for an embedded native RPC runtime with its own system prompt. */
   prompt?(args: TurnArgs): string;
+  parseOutput?(output: string): TurnResult;
+  beforeTool?(): void;
   assertCurrent(): void;
   bearerToken?: string;
   decorateResult?(result: ToolResult, args: TurnArgs): ToolResult;
@@ -151,7 +153,7 @@ export function createRegisteredCliMcpTurn(input: {
         endpoint = await createWorkspaceMcpEndpoint({ signal: AbortSignal.any([input.signal, stopped.signal]), assertCurrent: input.assertCurrent,
           bearerToken: input.bearerToken,
           tools: () => tools, call(name, parameters) {
-            input.assertCurrent();
+            input.assertCurrent(); input.beforeTool?.();
             if (closed || finished || ended || pending.size >= 16) throw new Error("Workspace MCP call limit reached");
             if (input.deferNativeCompletion && name === "task_checkpoint" && (parameters.done === true
               || (parameters.completion as { state?: unknown } | undefined)?.state === "verified")) {
@@ -177,6 +179,7 @@ export function createRegisteredCliMcpTurn(input: {
             const result = await input.launch(endpoint!, prompt, () => activity?.(), args);
             if (!result.ok) finished = { text: "", toolUses: [], stop: "error",
               errorMsg: result.runtimeFailure ?? "registered Runtime failed (" + (result.errorCode ?? (result.timedOut ? "timeout" : "exit")) + "); no fallback was selected" };
+            else if (input.parseOutput) finished = input.parseOutput(result.stdout);
             else if (input.jsonEvents === false) finished = { text: result.stdout.trim(), toolUses: [], stop: "end" };
             else {
               // JSON events contain native session IDs and internal calls. Persist only the final text.
