@@ -1,3 +1,5 @@
+import { workspaceRunPermissionTier } from "./execution-policy.js";
+import { newWorkspaceNativePolicy, endWorkspaceNativePolicy, observeWorkspaceNativeItem } from "./workspace-native-policy.js";
 import { runtimeProxyFailure, runtimeProxyFailureFromText, type RuntimeProxyFailure } from "../security/runtime-proxy.js";
 import { classifyRuntimeFailure, runtimeFailureMessage, type RuntimeFailureKind } from "./failure-diagnostics.js";
 import { runtimeFailureTracker } from "./failure-tracker.js";
@@ -54,21 +56,21 @@ export function parseOpenCodeRun(result: ExternalCommandCaptureResult, explicitP
 }
 
 /** The CLI may read the host login, but never inherits profile overrides, telemetry or caller tools. */
-export function openCodeRunEnv(host: NodeJS.ProcessEnv, bridge: CodingHostBridge): NodeJS.ProcessEnv {
+export function openCodeRunEnv(host: NodeJS.ProcessEnv, bridge: CodingHostBridge, full = false, transientConfigRoot?: string): NodeJS.ProcessEnv {
   const env = { ...host };
-  for (const name of Object.keys(env)) if (/^(?:OPENCODE_|OTEL_|XDG_)/iu.test(name)) delete env[name];
+  for (const name of Object.keys(env)) if (/^(?:OPENCODE_|OTEL_|XDG_)/iu.test(name) && name !== "XDG_DATA_HOME") delete env[name];
   const allowed = Object.fromEntries(bridge.toolNames.map(name => [`hara_${name}`, "allow"]));
-  const permission = { "*": "deny", read: "allow", glob: "allow", grep: "allow", list: "allow", ...allowed };
+  const permission = { "*": "deny", ...(full ? { edit: "allow", write: "allow", bash: "allow", webfetch: "allow", websearch: "allow" } : {}), read: "allow", glob: "allow", grep: "allow", list: "allow", ...allowed };
   const config = {
     autoupdate: false, share: "disabled", snapshot: false, plugin: [], skills: { paths: [], urls: [] }, instructions: [],
-    permission, tools: { read: true, glob: true, grep: true, list: true, edit: false, write: false, bash: false, task: false, webfetch: false },
+    permission, tools: { read: true, glob: true, grep: true, list: true, edit: full, write: full, bash: full, task: false, webfetch: full },
     agent: { "hara-general": { mode: "primary", permission, steps: 64 },
       build: { disable: true }, plan: { disable: true }, general: { disable: true }, explore: { disable: true } },
     default_agent: "hara-general",
     mcp: { hara: { ...bridge.mcp, enabled: true, timeout: 30_000 } },
     formatter: false, lsp: false, compaction: { auto: false, prune: false },
   };
-  return { ...env, OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_PURE: "1",
+  return { ...env, ...(transientConfigRoot ? { XDG_CONFIG_HOME: transientConfigRoot, OPENCODE_CONFIG_DIR: transientConfigRoot + "/opencode" } : {}), OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_PURE: "1",
     OPENCODE_DISABLE_DEFAULT_PLUGINS: "1", OPENCODE_DISABLE_PROJECT_CONFIG: "1",
     OPENCODE_DISABLE_EXTERNAL_SKILLS: "1", OPENCODE_DISABLE_AUTOUPDATE: "1",
     OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_LSP_DOWNLOAD: "1", NO_COLOR: "1" };
@@ -122,6 +124,7 @@ function createOpenCodeTurn(input: { installer: WorkspaceRuntimeInstaller; model
         } else {
           physical = (async () => {
             const started = Date.now();
+            let policy: ReturnType<typeof newWorkspaceNativePolicy> | undefined;
             let observer: ReturnType<typeof createRuntimeStageProcessObserver> | undefined;
             try {
               const held = input.tracker.blocked();
@@ -130,15 +133,20 @@ function createOpenCodeTurn(input: { installer: WorkspaceRuntimeInstaller; model
               assertCurrent();
               const recordSuccessfulUse = input.captureSuccessfulUse(resolved.command);
               observer = createRuntimeStageProcessObserver(workspaceRunRuntimeStages(permit), "opencode", signal);
-              const env = openCodeRunEnv(resolved.env, bridge!);
-              const result = await runExternalCommandCapture({ command: resolved.command, env },
-                openCodeRunArgs(input.options.ctx.cwd, input.model, prompt), {
-                  cwd: input.options.ctx.cwd, signal, timeoutMs: permit.binding.budget.timeoutMs,
+              policy = newWorkspaceNativePolicy(permit, "opencode", resolved, input.installer);
+              const env = openCodeRunEnv(resolved.env, bridge!, workspaceRunPermissionTier(permit) === "full-protected", policy.tempRoot + "/config");
+              const launch = policy.wrap({ command: resolved.command, env, args: openCodeRunArgs(input.options.ctx.cwd, input.model, prompt) });
+              const result = await runExternalCommandCapture(launch, launch.args, {
+                  cwd: input.options.ctx.cwd, signal, waitForClose: true, timeoutMs: permit.binding.budget.timeoutMs,
                   maxOutputBytes: 4 * 1024 * 1024, retainStdoutOnFailure: true,
                   failureKind: "runtime", proxyUrl: resolved.proxyUrl,
                   onSpawn: observer.onSpawn, onStdout: chunk => { observer?.onStdout(chunk); args.onActivity?.(); },
                 });
               observer.finish(result.ok, result.errorCode);
+              for (const line of result.stdout.split(/\r?\n/u)) { try {
+                const event = JSON.parse(line), part = event.part;
+                if (part?.type === "tool") observeWorkspaceNativeItem(permit, policy, { type: "commandExecution", command: part.state?.input?.command }, "completed");
+              } catch { /* Only normalized native events are observed. */ } }
               const parsed = parseOpenCodeRun(result, Boolean(resolved.proxyUrl));
               if (signal.aborted || result.errorCode === "interrupted") finished = { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
               else if (parsed.stop === "error") finished = { ...parsed, errorMsg: input.tracker.failed(
@@ -146,7 +154,7 @@ function createOpenCodeTurn(input: { installer: WorkspaceRuntimeInstaller; model
               else { input.tracker.succeeded(); finished = parsed; assertCurrent(); input.onSuccessfulUse(recordSuccessfulUse); }
             } catch (error) { finished = { text: "", toolUses: [], stop: "error", errorMsg: signal.aborted ? "interrupted"
               : input.tracker.failed(runtimeProxyFailure(error) ? "runtime_proxy" : "runtime_failed", Date.now() - started) }; }
-            finally { observer?.finish(false); notify(); }
+            finally { observer?.finish(false); if (policy) { await endWorkspaceNativePolicy(permit, policy); await policy.close(); } notify(); }
           })();
         }
       }

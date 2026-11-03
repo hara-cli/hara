@@ -1,3 +1,4 @@
+import type { NativeWorkspaceEvidence } from "../agent-runtime/execution-policy.js";
 import { createHash } from "node:crypto";
 import type { TaskExecution } from "../session/task.js";
 import type { ToolEffect } from "../tools/registry.js";
@@ -22,12 +23,17 @@ interface Observation {
   key: string;
   eligible: boolean;
   ambiguous: boolean;
+  mutating: boolean;
   receipt?: string;
 }
 
 /** Run-local, bounded provenance, not a semantic/business-success oracle. Never retains tool arguments,
  * raw results or credentials. Observations can only be supplied by the dispatch boundary, not history. */
 export class CompletionEvidenceLedger {
+  private native?: { scope: string; evidence: NativeWorkspaceEvidence };
+  observeNative(scope: string | undefined, evidence: NativeWorkspaceEvidence | null): void {
+    this.native = scope && evidence?.verified && evidence.nativeEventCount > 0 ? { scope, evidence: structuredClone(evidence) } : undefined;
+  }
   private readonly observations = new Map<string, Observation>();
 
   begin(scope: string | undefined, id: string, name: string, effect: ToolEffect | undefined): Observation | undefined {
@@ -40,7 +46,7 @@ export class CompletionEvidenceLedger {
     }
     if (this.observations.size >= MAX_OBSERVATIONS) return undefined; // fail closed, no eviction/reuse
     const observation: Observation = {
-      key, ambiguous: false,
+      key, ambiguous: false, mutating: effect === "edit" || effect === "exec" || effect === "computer",
       eligible: !EXCLUDED_TOOLS.has(name) && effect !== undefined && effect !== "state" && effect !== "interactive",
     };
     this.observations.set(key, observation);
@@ -70,6 +76,7 @@ export class CompletionEvidenceLedger {
     if (!Array.isArray(receipt.checks) || receipt.checks.length !== acceptance.length) {
       return { ok: false, reason: "completion.checks must cover each current acceptance_index exactly once" };
     }
+    let hasMutation = false;
     const seen = new Set<number>();
     const evidence: { index: number; text: string }[] = [];
     for (const raw of receipt.checks) {
@@ -83,9 +90,9 @@ export class CompletionEvidenceLedger {
         || requestsCredentialDisclosure(check.evidence)) {
         return { ok: false, reason: "each completion check needs a short, credential-free evidence interpretation (maximum 400 characters)" };
       }
-      const ids = check.tool_call_ids;
-      if (!Array.isArray(ids) || ids.length < 1 || ids.length > MAX_REFERENCES || new Set(ids).size !== ids.length) {
-        return { ok: false, reason: "each completion check needs 1-4 distinct observed tool_call_ids" };
+      const ids = check.tool_call_ids ?? [], nativeIds = check.native_evidence_ids ?? [];
+      if (!Array.isArray(ids) || !Array.isArray(nativeIds) || ids.length + nativeIds.length < 1 || ids.length + nativeIds.length > MAX_REFERENCES || new Set([...ids, ...nativeIds]).size !== ids.length + nativeIds.length) {
+        return { ok: false, reason: "each completion check needs 1-4 distinct observed tool_call_ids or native_evidence_ids" };
       }
       const references: string[] = [];
       for (const id of ids) {
@@ -96,14 +103,27 @@ export class CompletionEvidenceLedger {
         if (!observation?.receipt || observation.ambiguous || !observation.eligible) {
           return { ok: false, reason: "completion references an unavailable, failed, bookkeeping, ambiguous or stale tool result; reconcile existing receipts without repeating side effects" };
         }
-        references.push(`sha256:${observation.receipt}`);
+        references.push(`sha256:${observation.receipt}`); hasMutation ||= observation.mutating;
+      }
+      for (const id of nativeIds) {
+        const proof = this.native?.scope === scope ? this.native.evidence : undefined;
+        if (!proof || typeof id !== "string" || proof.id !== id || !nativeEvidenceAllowedForTask(task)) {
+          return { ok: false, reason: "native evidence is unavailable, stale, ambiguous or outside this file-change task" };
+        }
+        references.push(`native-workspace-diff:sha256:${proof.digest}`); hasMutation = true;
       }
       seen.add(index);
       const interpretation = redactSensitiveText(check.evidence).text.replace(/[\r\n\u0000-\u001f\u007f]+/gu, " ").trim();
       evidence.push({ index, text: `Criterion ${index + 1}: ${interpretation} [engine-observed sources: ${references.join(", ")}]` });
     }
+    if (task?.brief?.intent === "change" && !hasMutation) return { ok: false, reason: "a change completion requires at least one observed write effect; read-only checks are insufficient" };
     const { checks: _checks, ...rest } = receipt;
     return { ok: true, input: { ...checkpoint, completion: { ...rest,
       evidence: evidence.sort((a, b) => a.index - b.index).map((item) => item.text) } } };
   }
+}
+
+/** Native file evidence cannot attest to Hara management or scheduling state. */
+export function nativeEvidenceAllowedForTask(task: TaskExecution | undefined): boolean {
+  return task?.brief?.intent === "change" && !/(?:同事|委派|定时|定時|排程|colleague|delegate|schedule|permission tier|workspace membership|(?:create|rename|archive|invite|remove|delete)\s+(?:(?:a|an|the|new|existing|another)\s+){0,4}(?:agent|bot|member|workspace)\b)/iu.test(task.objective);
 }

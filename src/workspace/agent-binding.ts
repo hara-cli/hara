@@ -20,6 +20,7 @@ export interface WorkspaceAgentTaskBinding {
   configRevision: number;
   configHash: string;
   runtimeId: AgentRuntimeId;
+  permissionTier?: "full-protected" | "controlled";
   taskId: string;
 }
 
@@ -32,7 +33,8 @@ export function isWorkspaceAgentTaskBinding(value: unknown): value is WorkspaceA
   const row = value as Record<string, unknown>;
   const fields = ["schemaVersion", "resourceBinding", "workspaceId", "agentId", "agentEpoch",
     "configRevision", "configHash", "runtimeId", "taskId"];
-  return Object.keys(row).length === fields.length && fields.every(key => Object.hasOwn(row, key))
+  return Object.keys(row).every(key => fields.includes(key) || key === "permissionTier")
+    && (row.permissionTier === undefined || row.permissionTier === "full-protected" || row.permissionTier === "controlled") && fields.every(key => Object.hasOwn(row, key))
     && row.schemaVersion === 1 && isWorkspaceResourceBinding(row.resourceBinding)
     && isWorkspaceId(row.workspaceId) && isWorkspaceAgentId(row.agentId)
     && Number.isSafeInteger(row.agentEpoch) && Number(row.agentEpoch) > 0
