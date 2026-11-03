@@ -15,7 +15,7 @@ const run = args => { const result = spawnSync(binary, args, { cwd: root, env, e
   if (result.error || result.status !== 0) throw new Error("native distribution probe failed"); return result.stdout.trim(); };
 try {
   assert.equal(run(["--version"]), expectedVersion);
-  const manifest = JSON.parse(run(["--runtime-manifest"])); assert.deepEqual(manifest.preinstalled, ["pi"]); assert.equal(manifest.piSdkVersion, "1.5.0"); assert.deepEqual(manifest.optional, ["opencode", "codex", "claude", "agy"]);
+  const manifest = JSON.parse(run(["--runtime-manifest"])); assert.deepEqual(manifest.preinstalled, ["pi"]); assert.equal(manifest.piSdkVersion, "1.5.0"); assert.deepEqual(manifest.optional, ["opencode", "codex", "claude", "agy", "gemini", "kimi", "copilot", "cursor", "grok"]);
   const state = JSON.parse(run(["workspace", "init", "--root", workspace])); assert.equal(state.executionMode, "workspace"); assert.equal(state.workspaces.length, 0);
   const queue = [workspace]; while (queue.length) for (const entry of readdirSync(queue.pop(), { withFileTypes: true })) {
     assert.equal(entry.isSymbolicLink(), false); assert.doesNotMatch(entry.name, /^(?:opencode|codex|claude|agy|hara-code-runtime)(?:\.exe)?$/i, "no optional runtime may be materialized on startup");

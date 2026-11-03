@@ -5,6 +5,9 @@ import type { ToolResult } from "../providers/types.js";
 
 const CHANGE = /(?:请|帮我|把|将|please|can you|could you|let's)?\s*(?:创建|建立|新增|添加|写入|修改|编辑|删除|移除|重命名|发送|委派|安排|执行|部署|安装|更新|保存|同步|推送|合并|生成|设置|create|add|write|edit|change|delete|remove|rename|send|delegate|schedule|execute|deploy|install|update|save|sync|push|merge|generate|set up)/iu;
 const QUESTION = /[?？]|^(?:\s*(?:list|show|read|describe|explain|what|who|which|how|tell me|find|search|列出|查看|读取|说明|解释|告诉我|查找|搜索|有哪些|是什么|谁是))/iu;
+// Presentation-only prefixes do not change task authority. Keep mutation detection on the original request.
+const ANSWER_PREFIX = /^(?:请|請)?(?:用|以)(?:(?:简体|繁体|簡體|繁體)?中文)?(?:一句话|一句話)?(?:回答|回复|回覆)?[：:，,\s]*/u;
+const CJK_ANSWER = /^(?:请|請)?(?:简单|簡單)?(?:介绍|介紹|简述|簡述|请问|請問|什么|甚麼|如何|为什么|為什麼|怎样|怎樣|怎么|怎麼|多少|是否|能否)|^(?:你|您|这|這)(?:是|能|会|會|可以)|^(?:你好|您好|嗨|早上好|晚上好|晚安)(?:[，,。.！!\s]|$)/u;
 const MULTI_OUTCOME = /(?:并且|同时|另外|以及|之后还|然后再|和|and also|also|then|plus|[,，、;；])/iu;
 
 /** Direct engine completion is limited to one stated outcome; richer tasks use explicit checks. */
@@ -16,7 +19,8 @@ export function simpleChangeObjective(objective: string): boolean {
 /** User wording supplies authority; the first model response supplies only a bounded execution hint. */
 export function engineTaskBrief(task: TaskExecution, firstReply: { text: string; toolUses: readonly { name: string }[] }): TaskBriefInput {
   const objective = task.objective.trim();
-  const intent = CHANGE.test(objective) ? "change" : QUESTION.test(objective) ? "answer" : "investigate";
+  const question = objective.replace(ANSWER_PREFIX, "").trim();
+  const intent = CHANGE.test(objective) ? "change" : QUESTION.test(question) || CJK_ANSWER.test(question) ? "answer" : "investigate";
   const firstTool = firstReply.toolUses.find(item => item.name !== "task_intake")?.name;
   return {
     intent,

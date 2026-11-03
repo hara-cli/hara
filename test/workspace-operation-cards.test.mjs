@@ -91,7 +91,7 @@ before(async () => {
   sample = { ...scope, runtimeId: "codex", fingerprint: "a".repeat(64), approved: false, loginSource: "host",
     agentId: created.selectedAgentId, configRevision: snapshot.agents[0].configRevision, agentEpoch: snapshot.agents[0].agentEpoch,
     modelId: "fixture", expectedRevision: 0, effort: null, approvalId: randomUUID(), channelId: randomUUID(),
-    message: "你好", requestId: randomUUID(), recipientIds: [], source: "ui" };
+    permissionTier: "controlled", proxyUrl: null, expectedNativeRevision: 0, message: "你好", requestId: randomUUID(), recipientIds: [], source: "ui" };
 });
 after(async () => {
   if (client) await client.close();
@@ -118,7 +118,7 @@ async function checkRpcFacts(definition) {
 
 test("built-in cards use the existing bounded skill container with one compact prompt index", async () => {
   const bundle = validateWorkspaceSkill(workspaceOperationSkill());
-  assert.equal(WORKSPACE_OPERATION_CARDS.length, 8);
+  assert.equal(WORKSPACE_OPERATION_CARDS.length, 9);
   assert.equal(Object.keys(bundle.files).length, 9);
   assert.match(mainPrompt, /"id":"hara-operations"/);
   assert.equal(mainTools.find(row => row.name === "workspace_skill").input_schema.properties.file.type, "string");
@@ -176,6 +176,7 @@ test("creation card binds main-only tool schemas and a fresh, view-bound, single
 });
 
 test("channel card binds member mentions and tools supplied only inside the local channel", async () => {
+  for(const capability of ["workspace.channel-pass.v1","workspace.channel-queue.v1","workspace.channel-autonomy.v1"]) assert.ok(initialized.capabilities.includes(capability));
   const definition = card("channel-mentions"); checkTools(definition.tools, channelTools); await checkRpcFacts(definition);
   for (const tool of definition.tools) {
     assert.ok(!mainTools.some(row => row.name === tool.name)); assert.ok(!colleagueTools.some(row => row.name === tool.name));
@@ -189,16 +190,17 @@ test("recovery card binds read-only receipts and the no-task resume refusal with
   await assert.rejects(client.request(definition.rpcs[1].method, { ...scope, agentId: sample.agentId, message: "继续", requestId: randomUUID(), source: "ui" }), /resume|connection|interrupted|连接|provider/i);
 });
 
-test("proxy card's absence claim fails when the new proxy contract is admitted", async () => {
-  assert.equal(card("proxy-boundary").tools.length, 0);
-  assert.ok(!initialized.capabilities.includes("workspace.runtime-proxy.v1"), "update the proxy card when integrating the proxy capability");
-  for (const method of ["workspace.runtime.proxy.get", "workspace.runtime.proxy.set"]) {
-    await assert.rejects(client.request(method, scope), /unsupported Workspace method/, "update the card when a runtime proxy route exists");
-  }
+test("proxy card binds the admitted getter/setter and rejects stale revision and extra authority", async () => {
+  const definition=card("proxy-boundary");assert.equal(definition.tools.length,0);
+  assert.ok(initialized.capabilities.includes("workspace.runtime-proxy.v1"));await checkRpcFacts(definition);
+  const before=await client.request("workspace.runtime.proxy.get",scope);
+  const saved=await client.request("workspace.runtime.proxy.set",{...scope,proxyUrl:null,expectedRevision:before.revision});
+  assert.equal(saved.proxyUrl,null);assert.equal(saved.revision,before.revision+1);
+  await assert.rejects(client.request("workspace.runtime.proxy.set",{...scope,proxyUrl:null,expectedRevision:before.revision}),/revision|changed/i);
 });
 
 test("permission card binds real file schemas, tool kinds and path/permit rejection", async () => {
-  const definition = card("scope-permissions"); checkTools(definition.tools, mainTools);
+  const definition = card("scope-permissions"); await checkRpcFacts(definition); checkTools(definition.tools, mainTools);
   let current = true; const tools = localWorkspaceFileTools(dir(), () => { if (!current) throw new Error("revoked permit"); });
   assert.deepEqual(tools.map(tool => [tool.name, tool.kind]), [["workspace_read", "read"], ["workspace_write", "edit"], ["workspace_verify", "read"]]);
   const read = tools.find(tool => tool.name === definition.tools[0].name);
@@ -276,4 +278,12 @@ test("an ordinary formal Host can load just one built-in card through its govern
 test("RPC contract checker fails for a renamed documented route", async () => {
   const original = card("model-effort").rpcs[0];
   await assert.rejects(checkRpcFacts({ rpcs: [{ ...original, method: "workspace.runtime.inventedListModels" }] }), /must exist and reject extra fields/);
+});
+
+
+test("chat scheduling card binds actual scoped tools and documents original confirmation/receipt semantics",()=>{
+ const definition=card("chat-schedules");checkTools(definition.tools,mainTools);checkTools(definition.tools,colleagueTools);checkTools(definition.tools,channelTools);
+ for(const name of ["schedule_create","schedule_cancel"]) assert.equal(mainTools.find(tool=>tool.name===name).kind,"edit");
+ assert.equal(mainTools.find(tool=>tool.name==="schedule_list").kind,"read");
+ assert.match(definition.steps.join(" "),/15分钟/);assert.match(definition.steps.join(" "),/原Desk确认卡/);assert.match(definition.steps.join(" "),/created:true/);
 });
