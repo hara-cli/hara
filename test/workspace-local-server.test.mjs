@@ -57,7 +57,8 @@ test("formal startServe local branch boots without provider/global config and en
   await assert.rejects(client.request("workspace.session.send",{workspaceId:created.workspaceId,expectedGeneration:created.resourceGeneration,agentId:created.selectedAgentId+"\n",message:"hello",requestId:randomUUID()}),/invalid/);
   await assert.rejects(client.request("workspace.session.send",{workspaceId:created.workspaceId,expectedGeneration:created.resourceGeneration,agentId:created.selectedAgentId,message:"hello\x1bworld",requestId:randomUUID()}),/invalid/);
   const run=await client.request("workspace.session.send",{workspaceId:created.workspaceId,expectedGeneration:created.resourceGeneration,agentId:created.selectedAgentId,message:"hello\n你好\r\n第二行\t內容",requestId:randomUUID()});assert.equal(typeof run.runId,"string");
-  const snapshot=await until(async()=>{const view=await client.request("workspace.snapshot",{workspaceId:created.workspaceId,agentId:null});return view.conversation.state==="completed"?view:null;});
+  const snapshot=await until(async()=>{const view=await client.request("workspace.snapshot",{workspaceId:created.workspaceId,agentId:null});return view.conversation.state==="blocked"?view:null;});
+  assert.equal(snapshot.conversation.taskState,"paused");
   assert.equal(snapshot.conversation.usage.modelCalls,1);assert.equal(snapshot.syntheticOnly,true);
   assert.equal(snapshot.conversation.history[0].content,"hello\n你好\r\n第二行\t內容");
   const blocked=new WebSocket(`ws://127.0.0.1:${handle.port}`,{origin:"https://evil.example.invalid"});blocked.on("error",()=>{});
@@ -95,7 +96,7 @@ test("RPC acknowledges a slow mock task, records its source, and receipt lookup 
   for(let i=0;i<3;i++)await c.request("workspace.session.receipt",receiptParams);assert.equal(calls,1);
   await assert.rejects(c.request("workspace.session.send",{...params,requestId:randomUUID(),source:"delegation"}),/source/);
   await assert.rejects(c.request("workspace.session.receipt",{...receiptParams,expectedGeneration:randomUUID()}),/generation/);
-  release();await until(async()=>{const view=await c.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId});return view.conversation.state==="completed";});assert.equal(calls,1);
+  release();await until(async()=>{const view=await c.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId});return view.conversation.state==="blocked"&&view.conversation.taskState==="paused";});assert.equal(calls,1);
  }finally{release();await c.close();await handle.close();}
 });
 
@@ -122,7 +123,7 @@ test("two answer connections compete for one durable question; stale/cross-scope
   assert.equal(results.filter(row=>row.status==="fulfilled").length,1);assert.equal(results.filter(row=>row.status==="rejected").length,1);
   const index=results.findIndex(row=>row.status==="fulfilled"),accepted=results[index].value;
   assert.equal(accepted.runId,first.runId);
-  await until(async()=>{const view=await a.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId});return view.conversation.state==="completed";});
+  await until(async()=>{const view=await a.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId});return view.conversation.state==="blocked"&&view.conversation.taskState==="paused";});
   assert.equal(calls,2);
   const replay=await a.request("workspace.session.answer",requests[index]);assert.equal(replay.duplicate,true);assert.equal(calls,2);
   await assert.rejects(a.request("workspace.session.answer",{...requests[index],message:"Other answer"}),/another request/);

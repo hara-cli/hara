@@ -133,8 +133,8 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
       assert.doesNotMatch(JSON.stringify(history), /PRIVATE_ACCOUNT_DETAIL/);
     }
     const versionStatus = installer.list().options.find(row => row.runtimeId === runtimeId).versionStatus;
-    assert.equal(versionStatus.lastSuccessfulVersion, failure ? null : "1.2.3");
-    assert.equal(versionStatus.compatibility, failure ? "unverified" : "previously_succeeded");
+    assert.equal(versionStatus.lastSuccessfulVersion, expectedFailure ? null : "1.2.3");
+    assert.equal(versionStatus.compatibility, expectedFailure ? "unverified" : "previously_succeeded");
     const args = fs.readFileSync(argv, "utf8");
     assert.match(args, runtimeId === "codex" ? /read-only/ : /plan/);
     assert.equal(args.includes("--skip-git-repo-check"), runtimeId === "codex" && managed && !hasGit);
