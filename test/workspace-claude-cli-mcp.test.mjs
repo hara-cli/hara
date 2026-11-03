@@ -30,7 +30,8 @@ test("Claude final output cannot leak the per-attempt bearer", async t => {
   const f = await cliMcpFixture(t, "leak", "claude");
   await f.send("Hello.");
   const view = await until(f.read, done);
-  assert.equal(view.conversation.state, "completed");
+  assert.equal(view.conversation.state, "blocked");
+  assert.equal(view.conversation.taskState, "paused");
   assert(view.conversation.history.filter(row => row.role === "assistant").at(-1).text === "***", "Per-attempt bearer must be redacted");
   assert.equal(f.meta().tokenInArgv, false);
   await closed(f.meta().url);

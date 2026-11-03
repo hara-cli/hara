@@ -28,6 +28,9 @@ function claudeEffortArgs(effort: string | null): string[] { return effort ? ["-
 export function registeredCliArgs(input: {
   id: "codex" | "claude"; prompt: string; cwd: string; model: string | null; effort: string | null; skipGitRepoCheck: boolean;
   mcp?: { url: string; timeoutMs: number }; hostToolOverrides?: string[];
+  /** Full mode is explicit here; execution must attach its validated write protector first. */
+  claudePermissionMode?: "plan" | "bypassPermissions";
+  claudeCustomProvider?: boolean;
 }): string[] {
   const bridge = input.mcp;
   const mcp = !bridge ? [] : input.id === "codex" ? [
@@ -47,7 +50,10 @@ export function registeredCliArgs(input: {
       ...(input.model ? ["-m", input.model] : []), ...codexEffortArgs(input.effort), "--sandbox", "read-only",
       ...(bridge ? input.hostToolOverrides ?? [] : []), ...mcp]
     : ["-p", input.prompt, "--output-format", "text", ...(input.model ? ["--model", input.model] : []),
-      ...claudeEffortArgs(input.effort), "--permission-mode", "plan", ...mcp];
+      ...claudeEffortArgs(input.effort), "--permission-mode", input.claudePermissionMode ?? "plan",
+      ...(input.claudePermissionMode === "bypassPermissions" ? ["--disallowedTools", "EnterPlanMode", "ExitPlanMode", "ScheduleWakeup",
+        "CronCreate", "CronList", "CronDelete", "Cron*"] : []),
+      ...(input.claudeCustomProvider ? ["--setting-sources", "project,local"] : []), ...mcp];
 }
 
 /** Native CLIs own model inference. Hara owns the exact same tool/governor path as Pi. */
