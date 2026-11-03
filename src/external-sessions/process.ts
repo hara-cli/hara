@@ -555,6 +555,9 @@ export class ExternalJsonlRpcRequestError extends Error {
 }
 
 export interface JsonlRpcClientOptions extends ExternalCommandOptions {
+  cwd?: string;
+  signal?: AbortSignal;
+  jsonRpcVersion?: "2.0";
   maxOutputBytes?: number;
   /** Defaults to a private stdio App Server; Codex daemon clients use `app-server proxy`. */
   appServerArgs?: readonly string[];
@@ -602,6 +605,8 @@ export class JsonlRpcClient {
     this.processGroup = processGroup;
     this.requestTimeoutMs = Math.max(500, Math.min(options.timeoutMs ?? 30_000, 120_000));
     this.maxOutputBytes = Math.max(64 * 1024, Math.min(options.maxOutputBytes ?? 16 * 1024 * 1024, 64 * 1024 * 1024));
+    options.signal?.addEventListener("abort", this.abort, { once: true });
+    if (options.signal?.aborted) this.abort();
     child.stdout?.on("data", (chunk: Buffer) => this.consume(chunk));
     // Provider stderr may contain paths, native IDs or configuration data. Drain it without retaining it.
     child.stderr?.on("data", () => {});
@@ -612,7 +617,10 @@ export class JsonlRpcClient {
     });
   }
 
+  private readonly abort = (): void => { this.fail("external session adapter aborted"); };
+
   static start(options: JsonlRpcClientOptions): JsonlRpcClient {
+    if (options.signal?.aborted) throw new Error("external session adapter aborted");
     const spawnProcess = options.spawnProcess ?? defaultSpawn;
     const processGroup = platform() !== "win32";
     const launch = resolveExternalCommandLaunch(options.command, options.env ?? process.env);
@@ -627,6 +635,7 @@ export class JsonlRpcClient {
         env: externalLaunchEnv(options.env ?? process.env, launch.runtimeBin),
         detached: processGroup,
         windowsHide: true,
+        ...(options.cwd && isAbsolute(options.cwd) ? { cwd: options.cwd } : {}),
       });
     } catch {
       throw new Error("external session adapter could not start");
@@ -639,7 +648,8 @@ export class JsonlRpcClient {
 
   private write(value: unknown): void {
     if (this.closed || !this.child.stdin?.writable) throw new Error("external session adapter is closed");
-    this.child.stdin.write(`${JSON.stringify(value)}\n`);
+    const message = this.options.jsonRpcVersion ? { jsonrpc: this.options.jsonRpcVersion, ...(value as object) } : value;
+    this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
   private consume(chunk: Buffer): void {
@@ -733,6 +743,7 @@ export class JsonlRpcClient {
   private fail(message: string): void {
     if (this.closed) return;
     this.closed = true;
+    this.options.signal?.removeEventListener("abort", this.abort);
     const error = new Error(message);
     for (const request of this.pending.values()) {
       clearTimeout(request.timer);
@@ -783,6 +794,9 @@ export class JsonlRpcClient {
 
   /** Process completion, rather than logical cancellation, releases an owned execution lease. */
   async waitForClose(): Promise<void> { await this.exited; await this.options.drainProcess?.(); }
+
+  /** Compatibility wrapper: physical exit and the shared drain hook are both mandatory. */
+  async closeAndWait(): Promise<void> { this.close(); await this.waitForClose(); }
 }
 
 /**

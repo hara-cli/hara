@@ -1,3 +1,4 @@
+import { expandedExtensionsIsolation } from "./expanded-isolation.js";
 /** Stable evidence categories. Native output is inspected here, never returned or retained. */
 export const RUNTIME_FAILURE_KINDS = [
   "not_installed", "version_incompatible", "runtime_auth_required", "runtime_auth_rejected",
@@ -6,7 +7,7 @@ export const RUNTIME_FAILURE_KINDS = [
 ] as const;
 export type RuntimeFailureKind = typeof RUNTIME_FAILURE_KINDS[number];
 export interface RuntimeFailureContext {
-  runtime: "codex" | "claude" | "opencode" | "pi" | "gemini" | "kimi";
+  runtime: "codex" | "claude" | "opencode" | "pi" | "gemini" | "kimi" | "copilot" | "cursor" | "grok";
   version: string | null;
   loginSource: "host" | "isolated" | "unknown";
   homeMatchesAccount: boolean | null;
@@ -14,6 +15,7 @@ export interface RuntimeFailureContext {
   extensionsIsolation?: "inherited";
 }
 export interface RuntimeFailureDiagnostic extends RuntimeFailureContext {
+  extensionsIsolation?: "inherited";
   kind: RuntimeFailureKind;
   elapsedMs: number;
   retryAtMs: number;
@@ -75,10 +77,10 @@ const MAX_DATE_MS = 8_640_000_000_000_000;
 export function runtimeFailureMessage(input: RuntimeFailureContext & {
   kind: RuntimeFailureKind; elapsedMs: number; retryAtMs?: number; consecutiveFailures?: number;
 }): string {
-  if (!["codex", "claude", "opencode", "pi", "gemini", "kimi"].includes(input.runtime)) throw new Error("Invalid diagnostic runtime");
+  if (!["codex", "claude", "opencode", "pi", "gemini", "kimi", "copilot", "cursor", "grok"].includes(input.runtime)) throw new Error("Invalid diagnostic runtime");
   const diagnostic: RuntimeFailureDiagnostic = {
     runtime: input.runtime,
-    ...(input.runtime === "kimi" ? { extensionsIsolation: "inherited" as const } : {}),
+    ...(input.runtime === "kimi" || expandedExtensionsIsolation(input.runtime) ? { extensionsIsolation: "inherited" as const } : {}),
     kind: knownKind(input.kind) ? input.kind : "runtime_failed",
     version: safeRuntimeVersion(input.version),
     loginSource: input.loginSource === "host" || input.loginSource === "isolated" ? input.loginSource : "unknown",

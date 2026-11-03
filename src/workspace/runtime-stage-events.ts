@@ -1,3 +1,4 @@
+import { expandedExtensionsIsolation } from "../agent-runtime/expanded-isolation.js";
 // Observational metadata only. A record is provenance, never execution authority or a receipt
 // proving a tool's external effect. Only trusted Host composition supplies these identities.
 import { createHash, randomUUID } from "node:crypto";
@@ -38,6 +39,7 @@ export interface RuntimeStageIdentity {
   historyStart: number;
 }
 export interface RuntimeStageRuntime {
+  extensionsIsolation?: "inherited";
   id: AgentRuntimeId;
   version: string | null;
   loginSource: "host" | "isolated" | "unknown";
@@ -105,12 +107,14 @@ function safeEffort(value: unknown): string | null {
 export function projectRuntimeStageRuntime(input: RuntimeStageRuntime): RuntimeStageRuntime {
   if (!isAgentRuntimeId(input.id)) return invalid();
   return { id: input.id, version: safeVersion(input.version),
+    ...(expandedExtensionsIsolation(input.id) ? { extensionsIsolation: "inherited" as const } : {}),
     loginSource: input.loginSource === "host" || input.loginSource === "isolated" ? input.loginSource : "unknown",
     model: safeModel(input.model), effort: safeEffort(input.effort) };
 }
 function validRuntime(value: unknown): value is RuntimeStageRuntime {
-  if (!plain(value) || !exact(value, runtimeKeys) || !isAgentRuntimeId(value.id)) return false;
-  return (value.version === null || safeVersion(value.version) === value.version)
+  if (!plain(value) || !exact(value, [...runtimeKeys, ...(Object.hasOwn(value, "extensionsIsolation") ? ["extensionsIsolation"] : [])]) || !isAgentRuntimeId(value.id)) return false;
+  return (!Object.hasOwn(value, "extensionsIsolation") || value.extensionsIsolation === "inherited" && expandedExtensionsIsolation(value.id) === "inherited")
+    && (value.version === null || safeVersion(value.version) === value.version)
     && ["host", "isolated", "unknown"].includes(String(value.loginSource))
     && (value.model === null || safeModel(value.model) === value.model)
     && (value.effort === null || safeEffort(value.effort) === value.effort);

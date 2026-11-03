@@ -1,3 +1,6 @@
+import { captureExpandedMetadata, type ExpandedMetadataCapture } from "../agent-runtime/expanded-metadata.js";
+import { DOCUMENTED_EXPANDED_MODELS, EXPANDED_MODEL_SOURCES, copilotHelpEfforts, parseCursorModels } from "../agent-runtime/expanded-models.js";
+import { OPTIONAL_RUNTIMES } from "./runtime-catalog.js";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createRuntimeExecutionPolicy } from "../agent-runtime/execution-policy.js";
@@ -106,9 +109,14 @@ async function protectedInventory<T>(storage: WorkspaceResourceStorage, runtimes
     return await run(policy.wrap({ command: resolved.command, args: [...args, ...suffix], env: resolved.env }));
   } finally { await policy?.close(); rmSync(workRoot, { recursive: true, force: true }); }
 }
-async function liveModels(runtimeId: "codex" | "opencode", runtimes: WorkspaceRuntimeInstaller,
-  storage: WorkspaceResourceStorage): Promise<RuntimeModel[]> {
+async function liveModels(runtimeId: "codex" | "opencode" | "cursor", runtimes: WorkspaceRuntimeInstaller,
+  storage: WorkspaceResourceStorage, expandedMetadata: ExpandedMetadataCapture): Promise<RuntimeModel[]> {
   let { command, env, loginSource, proxyUrl } = await runtimes.prepareBound(runtimeId);
+  if (runtimeId === "cursor") {
+    const result = await expandedMetadata({ runtimeId, command, env, proxyUrl, ...runtimes.executionPolicyDirectories(runtimeId, { command, env, loginSource }) });
+    if (!result.ok) throw new Error(result.errorCode === "runtime_proxy_failed" ? result.errorCode : "cursor model inventory failed");
+    return parseCursorModels(result.stdout);
+  }
   const failures: string[] = [];
   const remember = (models: RuntimeModel[]): RuntimeModel[] => {
     // The private cache is Hara-owned state inside runtime-homes/<id>. A host login must not be
@@ -197,7 +205,8 @@ export class WorkspaceRuntimeModels {
   private readonly state: WorkspaceJsonState<RuntimeModelsState>;
   private readonly pending = new Map<string, Promise<RuntimeModel[]>>();
   private readonly launchDefaults = new Map<string, Promise<{ modelId: string | null; effort: string | null }>>();
-  constructor(private readonly storage: WorkspaceResourceStorage, private readonly runtimes: WorkspaceRuntimeInstaller) {
+  constructor(private readonly storage: WorkspaceResourceStorage, private readonly runtimes: WorkspaceRuntimeInstaller,
+    private readonly expandedMetadata: ExpandedMetadataCapture = captureExpandedMetadata) {
     this.state = new WorkspaceJsonState(storage, "runtime-models-v1.json", value => {
       if (!plain(value) || !exact(value, ["resourceBinding", "revision", "selections"])
         || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, this.state.binding())
@@ -243,7 +252,27 @@ export class WorkspaceRuntimeModels {
     this.claudeEfforts = { key, levels };
     return levels;
   }
+  private copilotEfforts: { key: string; levels: string[] } | null = null;
+  private async copilotEffortLevels(): Promise<string[]> {
+    const resolved = await this.runtimes.prepareBound("copilot");
+    const bound = this.runtimes.list().options.find(row => row.runtimeId === "copilot");
+    const key = JSON.stringify([resolved.command, bound?.fingerprint ?? bound?.version]);
+    if (this.copilotEfforts?.key === key) return this.copilotEfforts.levels;
+    let result;
+    try { result = await this.expandedMetadata({ runtimeId: "copilot", command: resolved.command, env: resolved.env, proxyUrl: resolved.proxyUrl,
+      ...this.runtimes.executionPolicyDirectories("copilot", resolved) }); }
+    catch { return []; } // A closed metadata gate must not claim live effort support.
+    const levels = result.ok ? copilotHelpEfforts(result.stdout) : [];
+    this.copilotEfforts = { key, levels }; return levels;
+  }
   private async catalogModels(runtimeId: OptionalRuntimeId): Promise<RuntimeModel[]> {
+    if (runtimeId === "copilot" || runtimeId === "grok") {
+      const models = DOCUMENTED_EXPANDED_MODELS[runtimeId]!.map(row => ({ ...row }));
+      if (runtimeId === "grok") return models;
+      const levels = await this.copilotEffortLevels();
+      return models.map(row => { const supported = levels.filter(level => level !== "max" || row.id.startsWith("claude-"));
+        return { ...row, ...(supported.length ? { supportedReasoningEfforts: supported } : {}) }; });
+    }
     const models = CATALOG[runtimeId]!.map(model => ({ ...model }));
     if (runtimeId !== "claude") return models;
     const levels = await this.claudeEffortLevels();
@@ -257,6 +286,7 @@ export class WorkspaceRuntimeModels {
   async effortLaunchable(runtimeId: OptionalRuntimeId): Promise<boolean> {
     this.bound(runtimeId);
     if (runtimeId === "codex") return true;
+    if (runtimeId === "copilot") return (await this.copilotEffortLevels()).length > 0;
     if (runtimeId !== "claude") return false;
     return (await this.claudeEffortLevels()).length > 0;
   }
@@ -295,12 +325,12 @@ export class WorkspaceRuntimeModels {
   warm(runtimeId: unknown): void {
     if (runtimeId === "codex") void this.list(runtimeId).catch(() => { /* listModels reports stage failures on demand. */ });
   }
-  private live(runtimeId: "codex" | "opencode"): Promise<RuntimeModel[]> {
+  private live(runtimeId: "codex" | "opencode" | "cursor"): Promise<RuntimeModel[]> {
     // Coalesce a registration/bind warm-up with an immediate list/select, but never retain stale results.
     const key = JSON.stringify([this.runtimes.list().options.find(row => row.runtimeId === runtimeId), this.runtimes.proxy.read().revision]);
     let pending = this.pending.get(key);
     if (!pending) {
-      pending = liveModels(runtimeId, this.runtimes, this.state.storage).finally(() => this.pending.delete(key));
+      pending = liveModels(runtimeId, this.runtimes, this.state.storage, this.expandedMetadata).finally(() => this.pending.delete(key));
       this.pending.set(key, pending);
     }
     return pending;
@@ -308,11 +338,11 @@ export class WorkspaceRuntimeModels {
   async list(runtimeId: unknown) {
     this.bound(runtimeId);
     const row = this.state.read().selections.find(row => row.runtimeId === runtimeId);
-    const models = runtimeId === "codex" || runtimeId === "opencode" ? await this.live(runtimeId) : await this.catalogModels(runtimeId);
+    const models = runtimeId === "codex" || runtimeId === "opencode" || runtimeId === "cursor" ? await this.live(runtimeId) : await this.catalogModels(runtimeId);
     this.bound(runtimeId);
     const selected = models.find(value => value.id === row?.selectedModelId);
     return { runtimeId, ...(runtimeId === "gemini" || runtimeId === "kimi" ? { source: "documented" as const, sourceURL: runtimeId === "gemini"
-      ? "https://geminicli.com/docs/cli/model/" : "https://github.com/MoonshotAI/kimi-cli/blob/main/docs/en/configuration/config-files.md" } : {}), revision: row?.revision ?? 0, selectedModelId: row?.selectedModelId ?? null,
+      ? "https://geminicli.com/docs/cli/model/" : "https://github.com/MoonshotAI/kimi-cli/blob/main/docs/en/configuration/config-files.md" } : {}), ...(["copilot", "cursor", "grok"].includes(runtimeId) ? { source: runtimeId === "cursor" ? "live" as const : "documented" as const, sourceUrl: EXPANDED_MODEL_SOURCES[runtimeId as keyof typeof EXPANDED_MODEL_SOURCES] } : {}), revision: row?.revision ?? 0, selectedModelId: row?.selectedModelId ?? null,
       selectedEffort: row && Object.hasOwn(row, "selectedEffort") ? row.selectedEffort ?? null
         : runtimeId === "opencode" ? null : defaultEffortForLevels(selected?.supportedReasoningEfforts), models };
   }
@@ -327,7 +357,7 @@ export class WorkspaceRuntimeModels {
     this.bound(runtimeId);
     if (!validModelId(modelId)) throw new Error("Invalid runtime modelId");
     if (effort !== undefined && effort !== null && !validEffort(effort)) throw new Error("Invalid runtime effort");
-    const models = runtimeId === "codex" || runtimeId === "opencode" ? await this.live(runtimeId) : await this.catalogModels(runtimeId);
+    const models = runtimeId === "codex" || runtimeId === "opencode" || runtimeId === "cursor" ? await this.live(runtimeId) : await this.catalogModels(runtimeId);
     const model = models.find(row => row.id === modelId);
     if (!model) throw new Error("Invalid runtime modelId");
     if (effort !== undefined && effort !== null) {

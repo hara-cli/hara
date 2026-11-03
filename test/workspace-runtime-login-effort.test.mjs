@@ -253,12 +253,12 @@ test("effort selection accepts only a level the model published and persists it"
 });
 
 test("the main Hara bot uses the same detect/register/bind/model/effort path as a colleague", async () => {
-  const data = root(), host = root(), command = join(host, ".local/bin/codex"); binary(command);
+  const data = root(), host = root(), command = join(host, ".codex/tmp/bin/codex"); binary(command);
   writeFakeCodex(command, { mode: "reply", recordHome: true, inventory: JSON.parse(fs.readFileSync(`${command}.appmodels`, "utf8")) });
   fs.mkdirSync(join(host, ".codex"), { recursive: true });
   fs.writeFileSync(join(host, ".codex", "auth.json"), '{"fixture":true}');
   const handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port: 0 }, { root: data, mode: "workspace", version: "fixture", credentialVault: new MemoryCredentialVault(),
-    runtimeInstallerOptions: { accountHome: () => host, discovery: { home: host, path: "/usr/bin:/bin", systemBins: [],
+    runtimeInstallerOptions: { accountHome: () => host, discovery: { home: host, path: dirname(command) + ":/usr/bin:/bin", systemBins: [],
       run: async (_command, args) => args[0] === "-lic" ? null : "codex 1.2.3" } } });
   const socket = new WebSocket(`ws://127.0.0.1:${handle.port}`); await once(socket, "open"); let nextId = 0;
   const request = (method, params = {}) => new Promise((resolve, reject) => {
@@ -319,6 +319,6 @@ test("the main Hara bot uses the same detect/register/bind/model/effort path as 
     assert.equal(thread.params.model, "gpt-5.6-sol", "selected model reaches the native thread");
     assert.equal(thread.params.config.model_reasoning_effort, "xhigh", "selected effort reaches the native thread");
     assert.equal(turn.params.model, "gpt-5.6-sol"); assert.equal(turn.params.effort, "xhigh");
-    assert.equal(thread.params.sandbox, "read-only"); assert.equal(thread.params.approvalPolicy, "on-request");
+    assert.equal(thread.params.sandbox, "danger-full-access"); assert.equal(thread.params.approvalPolicy, "never");
   } finally { const closed = once(socket, "close"); socket.close(); await closed; await handle.close(); }
 });

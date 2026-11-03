@@ -21,7 +21,7 @@ const observe = <T>(fn: () => T): T | undefined => { try { return fn(); } catch 
 /** Observe only protocol discriminators and content presence in a bounded temporary line
  * buffer. A lifecycle frame is never a token, and content is never retained in the report. */
 export function createRuntimeStageProcessObserver(recorder: RuntimeStageRecorder | undefined,
-  runtime: "codex" | "claude" | "opencode" | "gemini" | "kimi", signal: AbortSignal) {
+  runtime: "codex" | "claude" | "opencode" | "gemini" | "kimi" | "copilot" | "cursor" | "grok", signal: AbortSignal) {
   let closed = false, spawned = false, ready = false, sawOutput = false, sawToken = false;
   let line = "", dropping = false;
   const endSpawn = observe(() => recorder?.beginEvent("spawn"));
@@ -45,6 +45,16 @@ export function createRuntimeStageProcessObserver(recorder: RuntimeStageRecorder
     }
     if (runtime === "gemini" && value.type === "message" && value.role === "assistant" && typeof value.content === "string" && value.content.length) mark("first_output", "native_event");
     if (runtime === "kimi" && value.role === "assistant" && (typeof value.content === "string" ? value.content.length : Array.isArray(value.content) && value.content.some((part: any) => part?.type === "text" && typeof part.text === "string" && part.text.length))) mark("first_output", "native_event");
+    if (runtime === "copilot" && value.type === "assistant.message_delta" && typeof value.data?.deltaContent === "string" && value.data.deltaContent)
+      mark("first_token", "native_event");
+    if (runtime === "copilot" && value.type === "assistant.message" && typeof value.data?.content === "string" && value.data.content)
+      mark("first_output", "native_event");
+    if (runtime === "cursor" && value.type === "assistant" && Array.isArray(value.message?.content)
+      && value.message.content.some((part: any) => part?.type === "text" && typeof part.text === "string" && part.text)) mark("first_output", "native_event");
+    if (runtime === "grok" && value.method === "session/update" && value.params?.update?.sessionUpdate === "agent_message_chunk"
+      && value.params.update.content?.type === "text" && typeof value.params.update.content.text === "string" && value.params.update.content.text) {
+      mark("first_token", "native_event"); mark("first_output", "native_event");
+    }
     if (runtime === "opencode" && value.type === "text" && value.part?.type === "text" && typeof value.part.text === "string" && value.part.text.length)
       mark("first_output", "native_event");
   };

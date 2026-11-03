@@ -25,7 +25,8 @@ function binary(path) {
   fs.mkdirSync(dirname(path), { recursive: true });
   fs.writeFileSync(path, `#!/bin/sh
 if [ "$1" = "--version" ]; then echo 'codex 1.2.3'; exit 0; fi
-printf '%s\\n' "$*" >> '${path}.calls'
+mkdir -p "$CODEX_HOME/log"
+printf '%s\\n' "$*" >> "$CODEX_HOME/log/fixture.calls"
 if [ -f '${path}.require-home' ] && [ ! -d "$CODEX_HOME" ]; then exit 2; fi
 if [ "$1" = "app-server" ]; then
   if [ -f '${path}.appfail' ]; then echo 'DO_NOT_LEAK_NATIVE_DETAIL' >&2; exit 1; fi
@@ -198,9 +199,9 @@ test("a new Codex binding uses live model medium without changing an explicit sa
     fs.writeFileSync(`${f.command}.appmodels`, JSON.stringify({ data: [{ id: "fixture-model", displayName: "Fixture",
       isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "medium" }, { reasoningEffort: "high" }] }] }));
     assert.deepEqual(await f.models.launchSelection("codex"), { modelId: "fixture-model", effort: "medium" });
-    const firstLaunchCalls = fs.readFileSync(`${f.command}.calls`, "utf8");
+    const firstLaunchCalls = fs.readFileSync(join(f.env.CODEX_HOME, "log/fixture.calls"), "utf8");
     assert.deepEqual(await f.models.launchSelection("codex"), { modelId: "fixture-model", effort: "medium" });
-    assert.equal(fs.readFileSync(`${f.command}.calls`, "utf8"), firstLaunchCalls,
+    assert.equal(fs.readFileSync(join(f.env.CODEX_HOME, "log/fixture.calls"), "utf8"), firstLaunchCalls,
       "later turns reuse the live-backed default without spawning another model inventory process");
     await f.models.select("codex", "fixture-model", 0);
     assert.deepEqual(f.models.selection("codex"), { modelId: "fixture-model", effort: "medium" });
@@ -217,7 +218,7 @@ test("an empty private Codex home can list live models and retain a selectable i
     assert(!fs.existsSync(f.cache));
     const listed = await f.models.list("codex");
     assert.deepEqual(listed.models, [{ id: "fixture-app", label: "Fixture App", recommended: true }]);
-    assert(!fs.readFileSync(`${f.command}.calls`, "utf8").includes("debug models"), "app-server success short-circuits debug");
+    assert(!fs.readFileSync(join(f.env.CODEX_HOME, "log/fixture.calls"), "utf8").includes("debug models"), "app-server success short-circuits debug");
     assert.equal(fs.statSync(f.cache).mode & 0o777, 0o600);
     fs.writeFileSync(`${f.command}.appfail`, ""); fs.writeFileSync(`${f.command}.fail`, "");
     const reopened = new WorkspaceRuntimeModels(f.storage, f.runtimes);
