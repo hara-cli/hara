@@ -11115,3 +11115,25 @@ explicitly deferred with two alternatives. Earlier historical failures and stres
 - Keep raw-output retention opt-in for a documented JSON parser. A nonzero native exit otherwise discards stdout before the driver can classify its terminal error frame. Generic transport failure must not overwrite a specific structured error event.
 - Resolve files with `rg --files` in the intended repository before cross-repository reads. Guessed sibling filenames and reads at the task root produced harmless missing-file/not-a-repository errors during this run; no source or shared state changed from those reads.
 - Final focused and full results are recorded in the workspace inbox handoff. Preserve the initial failure logs separately from the final verification.
+
+## [ERR-20261103-PI-RPC-EMPTY-AUTH-LOCK] Pi RPC requires a narrow lock directory even for empty auth
+
+**Logged**: 2026-11-03T20:48:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: tests
+
+The isolated Pi 1.5.0 RPC process accepted get_state but refused prompt with a credential-store mkdir EPERM. Its file auth backend locks even an empty auth.json before looking up the loopback capability in models.json. The fixture now allows only its dedicated agentDir/auth.json.lock directory; auth.json, models.json and settings.json remain unwritable. Real Seatbelt/native tool, key-absence, token lifecycle, resume and MCP tests pass. This does not grant real Pi credentials, a broad agentDir write grant, or production admission. Shared policy must implement and test this exact empty-lock requirement before Pi integration.
+
+### Related fixture/tooling corrections
+
+- Node fetch did not transmit the deliberately overridden Host header. Use node:http for the Host-confusion negative test; retain the exact 403 assertion.
+- npm rejects a single /dev/null path serving as both userconfig and globalconfig. Two separate empty task-local files preserve isolation and allow the same install without reading user config.
+- Local official Pi reference fetch failed with an early EOF; freshness is unknown. The executed official npm 1.5.0 tarball is pinned and integrity-checked separately. Raft fetch succeeded at db5e399; do not claim that Pi's old source checkout was refreshed.
+
+### Resolution
+
+- Focused local prototype: 11/11 PASS; existing Pi tests: 23/23 PASS; Core build PASS.
+- Production/defaults/C-lite integration: HOLD pending design review and public-policy Pi support.
+- Related Files: scripts/pi-full-mode-prototype.mjs, scripts/pi-full-mode-prototype.test.mjs, ../inbox/2026-11-03-pi-full-mode-tip.md
+- Pattern-Key: pi_rpc.empty_auth_read_requires_exact_lock
