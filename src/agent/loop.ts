@@ -812,7 +812,7 @@ export interface RunOutcome {
   progress?: RunProgressEvent;
 }
 
-export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop" | "no_progress" | "strategy_stall" | "task_round_budget" | "completion_verification";
+export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop" | "no_progress" | "strategy_stall" | "task_round_budget" | "completion_verification" | "native_context_limit";
 
 export interface RunProgressEvent extends ProgressState {
   rounds: number;
@@ -2338,6 +2338,9 @@ async function runAgentInner(
     // A provider may ignore AbortSignal and return a perfectly valid-looking tool_use after cancellation.
     // The original run signal is authoritative: do not append/approve/execute any late response.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return stoppedOutcome();
+    // Host-owned native transport status, not a provider/model-authored success or a retry request.
+    if (opts.workspaceRun?.binding.agent.runtimeId === "codex" && r.errorMetadata?.code === "native_context_limit")
+      return { status: "halted", stopReason: "native_context_limit" };
     const responseCallIds = new Set<string>();
     const invalidToolIdentity = r.toolUses.some((toolUse) => {
       const id = toolUse.id;

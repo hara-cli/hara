@@ -54,6 +54,8 @@ import { WorkspaceLegacyBusiness } from "./legacy-business.js";
 import { WorkspaceLegacyResources } from "./legacy-resources.js";
 import { WorkspaceRuntimeUsageCache, planColleagueUsageDispatch, type WorkspaceUsageAccount, type WorkspaceUsageCollector } from "./runtime-account-usage.js";
 import { executeLegacyPrint } from "./legacy-print.js";
+import { codexSessionPool } from "../agent-runtime/codex-session.js";
+import { codexThreadState, codexThreadView } from "./codex-thread.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
 interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
@@ -574,6 +576,8 @@ export class LocalWorkspaceHost {
         pendingInteractions: this.pendingInteractions(context, value, [...this.pending.values()].filter(pending => pending.card.workspaceId === workspaceId
           && pending.card.agentId === selected && !pending.card.channelId && pending.clientId === clientId).map(pending => pending.card)),
         usage: value.usage, runUsage: value.runUsage, pastTaskCount: value.pastTasks.length,
+        ...(catalog.agents.find(agent => agent.agentId === selected)?.runtime.id === "codex"
+          ? { nativeSession: codexThreadView(codexThreadState(context.storage, selected, value.sessionId).read()) } : {}),
         resumeAdmission: this.resumeAdmission(context, value),
         history: value.history.map(message => message.role === "assistant" ? { role: message.role, text: message.text, tools: message.toolUses.map(tool => tool.name) }
           : message.role === "tool" ? { role: message.role, results: message.results.map(result => ({ id: result.id, name: result.name, content: result.content, isError: result.isError ?? false })) }
@@ -1017,6 +1021,38 @@ export class LocalWorkspaceHost {
     if (job.context.connections instanceof WorkspaceSecureConnections && /\b401\b|authentication_error|invalid.api.key/i.test(String(error))) {
       try { job.context.connections.markCredentialInvalid(job.binding.connection); } catch { /* Preserve uncertain metadata; no probe or retry. */ }
     }
+  }
+  /** Explicit UI action. Hara history, tasks and usage stay intact; reset and audit commit together. */
+  async newNativeSession(clientId: string, workspaceId: string, agentId: string, expectedRevision: number, expectedNativeRevision: number, requestId: string) {
+    const context = this.context(workspaceId), selection = this.clients.get(clientId);
+    const assertCurrent = () => {
+      if (this.closing || this.updateLease || !selection || selection.workspaceId !== workspaceId || selection.agentId !== agentId || selection.channelId
+        || this.clients.get(clientId) !== selection || context.resources.agents.get(agentId)?.runtime.id !== "codex") throw new Error("Native session view changed; refresh before resetting");
+      context.storage.run(() => {});
+      if ([...this.jobs.values()].some(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId && !job.channelId))
+        throw new Error("Agent is still running or draining; native reset refused");
+    };
+    if (!UUID.test(requestId)) throw new Error("Invalid native session reset request");
+    assertCurrent();
+    const store = new WorkspaceConversationStore(context.storage, agentId), lease = WorkspaceSessionLease.acquire(context.storage, store.sessionId);
+    try {
+      const native = codexThreadState(context.storage, agentId, store.sessionId), previous = native.read();
+      const duplicate = previous.resets.find(row => row.requestId === requestId);
+      if (duplicate) return { requestId, revision: duplicate.revision, duplicate: true };
+      const conversation = store.read();
+      if (conversation.revision !== expectedRevision || previous.revision !== expectedNativeRevision) throw new Error("Native session state changed; refresh before resetting");
+      if (["running", "draining"].includes(conversation.attempt?.state ?? "") || this.pendingUserQuestion(context, conversation)
+        || this.pendingInteractions(context, conversation, []).length) throw new Error("Recover or stop the pending task before resetting its native session");
+      if (previous.resets.length >= 1024) throw new Error("Native session audit is full; history was preserved");
+      await codexSessionPool(context.runtimes).forget(context.storage, agentId, store.sessionId);
+      assertCurrent(); lease.assertCurrent();
+      if (store.read().revision !== expectedRevision) throw new Error("Conversation changed; native reset refused");
+      const actorId = this.catalog.resolve(workspaceId).actorId;
+      const value = native.update(expectedNativeRevision, current => ({ ...current, threadId: null, input: 0, output: 0, cachedInput: 0,
+        contextTokens: null, modelContextWindow: null, phase: "idle", lastAttempt: { input: 0, output: 0, cachedInput: 0 },
+        resets: [...current.resets, { requestId, actorId, at: new Date().toISOString(), oldThreadId: current.threadId, revision: current.revision + 1 }] }));
+      this.changed(workspaceId, agentId); return { requestId, revision: value.revision, duplicate: false };
+    } finally { lease.release(); }
   }
   cancel(workspaceId: string, agentId: string, runId: string): void {
     const job = this.jobs.get(runId);

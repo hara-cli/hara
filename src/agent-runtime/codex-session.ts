@@ -3,8 +3,9 @@
 import { createHash, randomBytes } from "node:crypto";
 import { JsonlRpcClient, type ExternalCommandCaptureResult } from "../external-sessions/process.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
-import { canonical, exact, plain, WorkspaceJsonState } from "../workspace/local-state.js";
-import { sameWorkspaceResourceBinding, type WorkspaceResourceBinding } from "../workspace/resource-context.js";
+import { canonical, plain } from "../workspace/local-state.js";
+import type { WorkspaceResourceStorage } from "../workspace/resource-context.js";
+import { codexThreadState, codexConversationKey, nativeContextFull, nativeCodexId as nativeId, nativeTokenCount as count, type CodexThreadState } from "../workspace/codex-thread.js";
 import { assertWorkspaceRuntimeUsage, workspaceRuntimeStorage, type WorkspaceRunPermit } from "../workspace/execution.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import { inspectLocalRuntime } from "../workspace/runtime-detect.js";
@@ -13,17 +14,10 @@ import { WORKSPACE_MCP_TOKEN_ENV, type WorkspaceMcpEndpoint } from "./registered
 
 const hash = (value: unknown): string => createHash("sha256").update(canonical(value)).digest("hex");
 const object = (value: unknown): Record<string, unknown> => plain(value) ? value : {};
-const count = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
-const nativeId = (value: unknown): value is string => typeof value === "string" && /^[a-zA-Z0-9_-]{1,200}$/.test(value);
 const origin = (resolved: ReturnType<WorkspaceRuntimeInstaller["resolveBound"]>, project: unknown): string =>
   hash([resolved.command, inspectLocalRuntime(resolved.command)?.fingerprint ?? null, resolved.loginSource,
     resolved.env.HOME ?? null, resolved.env.CODEX_HOME ?? null, project]);
 const MAX_RESIDENT = 4, IDLE_MS = 5 * 60_000;
-interface ThreadState {
-  schemaVersion: 1; resourceBinding: WorkspaceResourceBinding; revision: number;
-  agentId: string; sessionId: string; origin: string; threadId: string | null;
-  input: number; output: number; phase: "idle" | "unknown";
-}
 interface ActiveTurn {
   id?: string; ready: Promise<string>; bind(id: string): void;
   finish(ok: boolean, code?: string): void; done: Promise<void>;
@@ -58,7 +52,7 @@ export class CodexSessionPool {
     assertCurrent();
     if (this.closed) throw new Error("Codex session pool is closed");
     const b = permit.binding, identity = b.agent.resourceBinding;
-    const key = hash([identity, b.agent.agentId, b.sessionId]);
+    const key = codexConversationKey(identity, b.agent.agentId, b.sessionId);
     let session = this.sessions.get(key);
     if (!session) {
       if (this.sessions.size >= MAX_RESIDENT) {
@@ -76,6 +70,13 @@ export class CodexSessionPool {
     this.closed = true;
     await Promise.all([...this.sessions.values()].map(session => session.dispose())); this.sessions.clear();
   }
+  /** Host holds this conversation's physical lease while retiring its idle native process. */
+  async forget(storage: WorkspaceResourceStorage, agentId: string, sessionId: string): Promise<void> {
+    const key = codexConversationKey(codexThreadState(storage, agentId, sessionId).binding(), agentId, sessionId);
+    const session = this.sessions.get(key);
+    if (session?.busy) throw new Error("Codex conversation is busy or draining; reset refused");
+    if (session) await session.dispose();
+  }
 }
 
 export class GovernedCodexSession {
@@ -89,9 +90,9 @@ export class GovernedCodexSession {
   private unload?: () => void;
   private loaded = false;
   private closing = false;
-  private readonly state: WorkspaceJsonState<ThreadState>;
-  private value: ThreadState;
-  private pendingUsage = { input: 0, output: 0 };
+  private readonly state: ReturnType<typeof codexThreadState>;
+  private value: CodexThreadState;
+  private pendingUsage = { input: 0, output: 0, cachedInput: 0 };
   private observedUsage = false;
   private firstUsage = true;
   private systemDigests = new Map<string, string>();
@@ -101,30 +102,23 @@ export class GovernedCodexSession {
     const b = permit.binding, resolved = installer.resolveBound("codex");
     this.project = { ...b.project };
     this.origin = origin(resolved, b.project);
-    const storage = workspaceRuntimeStorage(permit), binding = () => this.state.binding();
-    this.state = new WorkspaceJsonState(storage, "codex-thread-" + hash([b.agent.agentId, b.sessionId]).slice(0, 24) + ".json", raw => {
-      if (!plain(raw) || !exact(raw, ["schemaVersion", "resourceBinding", "revision", "agentId", "sessionId", "origin", "threadId", "input", "output", "phase"])
-        || raw.schemaVersion !== 1 || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 1
-        || !sameWorkspaceResourceBinding(raw.resourceBinding as WorkspaceResourceBinding, binding())
-        || raw.agentId !== b.agent.agentId || raw.sessionId !== b.sessionId || typeof raw.origin !== "string" || !/^[a-f0-9]{64}$/.test(raw.origin)
-        || !(raw.threadId === null || nativeId(raw.threadId)) || !count(raw.input) || !count(raw.output)
-        || !["idle", "unknown"].includes(String(raw.phase))) throw new Error("Saved Codex thread binding is invalid; history was preserved");
-      return structuredClone(raw) as unknown as ThreadState;
-    }, () => ({ schemaVersion: 1, resourceBinding: binding(), revision: 0, agentId: b.agent.agentId, sessionId: b.sessionId,
-      origin: this.origin, threadId: null, input: 0, output: 0, phase: "idle" }));
+    this.state = codexThreadState(workspaceRuntimeStorage(permit), b.agent.agentId, b.sessionId, this.origin);
     this.value = this.state.read();
-    if (this.value.origin !== this.origin) throw new Error("Saved Codex thread belongs to a different login or project origin; no fallback was selected");
+    if (this.value.threadId !== null && this.value.origin !== this.origin) throw new Error("Saved Codex thread belongs to a different login or project origin; no fallback was selected");
+    if (this.value.threadId === null) this.value.origin = this.origin;
   }
   claim(permit: WorkspaceRunPermit, assertCurrent: () => void): void {
     assertCurrent();
     if (this.busy || this.closing) throw new Error("Codex conversation is busy or draining; no second writer was started");
     this.permit = permit; this.busy = true; clearTimeout(this.idleTimer); this.idleTimer = undefined;
     if (!this.client) this.token = randomBytes(32).toString("hex");
-    this.pendingUsage = { input: 0, output: 0 }; this.observedUsage = false; this.firstUsage = true;
+    this.pendingUsage = { input: 0, output: 0, cachedInput: 0 }; this.observedUsage = false; this.firstUsage = true;
+    this.value.lastAttempt = { input: 0, output: 0, cachedInput: 0 };
   }
+  get needsNewSession(): boolean { return nativeContextFull(this.value); }
   takeUsage(): TurnResult["usage"] {
     if (!this.observedUsage || !this.pendingUsage.input && !this.pendingUsage.output) return undefined;
-    const usage = { ...this.pendingUsage }; this.pendingUsage = { input: 0, output: 0 }; return usage;
+    const usage = { ...this.pendingUsage }; this.pendingUsage = { input: 0, output: 0, cachedInput: 0 }; return usage;
   }
   decorateResult(result: ToolResult, args: TurnArgs): ToolResult {
     const parts = args.systemParts?.length ? args.systemParts : [{ id: "system", digest: hash(args.system), content: args.system }];
@@ -151,17 +145,41 @@ export class GovernedCodexSession {
         } else if (method === "thread/tokenUsage/updated") {
           const usage = object(params.tokenUsage), total = object(usage.total), last = object(usage.last);
           if (!count(total.inputTokens) || !count(total.outputTokens) || !count(last.inputTokens) || !count(last.outputTokens)) throw new Error("Invalid native usage");
-          // A restored/rate-limit snapshot can repeat the previous watermark. New-turn telemetry is
-          // attributed by native turn ID; debit its explicit first request, not a cross-attempt delta.
-          // This also handles native counters that restart above the saved watermark on cold resume.
-          if (this.firstUsage && total.inputTokens === this.value.input && total.outputTokens === this.value.output) return;
-          const reset = total.inputTokens < this.value.input || total.outputTokens < this.value.output;
+          const totalCache = total.cachedInputTokens, lastCache = last.cachedInputTokens;
+          if (totalCache !== undefined && (!count(totalCache) || totalCache > total.inputTokens)
+            || lastCache !== undefined && (!count(lastCache) || lastCache > last.inputTokens)) throw new Error("Invalid native cache usage");
+          if (total.inputTokens === this.value.input && total.outputTokens === this.value.output) return;
+          // A cold native counter epoch may restart just *above* the saved watermark. Its output
+          // delta cannot then contain even the explicitly reported current request. Do not debit a
+          // tiny cross-epoch difference: use that request's last counters, including its cache split.
+          const reset = total.inputTokens < this.value.input || total.outputTokens < this.value.output
+            || this.firstUsage && total.outputTokens - this.value.output < last.outputTokens;
           if (reset && !this.firstUsage) throw new Error("Native usage regressed");
-          this.pendingUsage.input += this.firstUsage ? last.inputTokens : total.inputTokens - this.value.input;
-          this.pendingUsage.output += this.firstUsage ? last.outputTokens : total.outputTokens - this.value.output;
+          const input = reset ? last.inputTokens : total.inputTokens - this.value.input;
+          const output = reset ? last.outputTokens : total.outputTokens - this.value.output;
+          // Per-attempt cumulative deltas, including its first observation. An explicit cold-counter
+          // reset uses the current native request; missing legacy cache baselines never earn credit.
+          const cachedInput = reset ? lastCache ?? 0 : count(totalCache) && this.value.cachedInput !== null
+            ? totalCache - this.value.cachedInput : input === last.inputTokens ? lastCache ?? 0 : 0;
+          if (!count(cachedInput) || cachedInput > input) throw new Error("Native cache usage regressed or exceeded input");
+          for (const [key, amount] of Object.entries({ input, output, cachedInput }) as ["input" | "output" | "cachedInput", number][]) {
+            if (!Number.isSafeInteger(this.pendingUsage[key] + amount) || !Number.isSafeInteger(this.value.lastAttempt[key] + amount)) throw new Error("Native usage overflow");
+            this.pendingUsage[key] += amount; this.value.lastAttempt[key] += amount;
+          }
           this.value.input = total.inputTokens; this.value.output = total.outputTokens;
+          this.value.cachedInput = count(totalCache) ? totalCache : null;
+          this.value.contextTokens = last.inputTokens + last.outputTokens;
+          if (!count(this.value.contextTokens)) throw new Error("Invalid native context usage");
+          if (usage.modelContextWindow !== undefined && usage.modelContextWindow !== null) {
+            if (!count(usage.modelContextWindow) || !usage.modelContextWindow) throw new Error("Invalid native context window");
+            this.value.modelContextWindow = usage.modelContextWindow;
+          }
           this.firstUsage = false; this.observedUsage = true;
           assertWorkspaceRuntimeUsage(this.permit, this.pendingUsage);
+          if (this.needsNewSession) {
+            this.value.phase = "new_session_required"; this.save();
+            active.finish(false, "codex_context_limit_open_new_session"); client.close();
+          }
         } else if (method === "turn/completed") {
           this.value.phase = turn.status === "completed" ? "idle" : "unknown"; this.save();
           active.finish(turn.status === "completed", turn.status === "interrupted" ? "interrupted" : "runtime_failed");
@@ -177,6 +195,7 @@ export class GovernedCodexSession {
   }): Promise<ExternalCommandCaptureResult> {
     input.assertCurrent();
     if (!this.busy || this.active || input.signal.aborted) throw new Error("Codex attempt unavailable");
+    if (this.needsNewSession) return { ok: false, code: 1, timedOut: false, stdout: "", errorCode: "codex_context_limit_open_new_session" };
     const resolved = this.installer.resolveBound("codex");
     if (input.cwd !== this.project.root || origin(resolved, this.project) !== this.origin) throw new Error("Codex login origin changed; no fallback was selected");
     const env = { ...resolved.env, [WORKSPACE_MCP_TOKEN_ENV]: this.token,
@@ -206,6 +225,7 @@ export class GovernedCodexSession {
       if (!this.client) {
         const client = JsonlRpcClient.start({ command: resolved.command, env, timeoutMs: 10_000, maxOutputBytes: 64 * 1024 * 1024,
           appServerArgs: ["app-server", "--stdio", "-c", "thread_unload_delay_secs=0", "-c", "mcp_servers={}",
+            "-c", "model_auto_compact_token_limit=9007199254740991", "-c", "model_post_turn_compact_threshold_percent=0",
             "-c", 'shell_environment_policy.set.HARA_WORKSPACE_MCP_TOKEN=""'],
           onNotification: (method, params) => this.notification(client, method, params),
           onServerRequest: (_request, _reply, reject) => reject(-32601, "Use Hara Workspace tools and its governed approval channel"),
@@ -221,6 +241,7 @@ export class GovernedCodexSession {
         // Only this immutable governed endpoint is trusted. Codex 0.166's `auto` can ask a second
         // native MCP approval before reaching Hara; `approve` changes no Hara tool/card authority.
         default_tools_approval_mode: "approve", required: true, tool_timeout_sec: 120 } },
+        model_auto_compact_token_limit: Number.MAX_SAFE_INTEGER, model_post_turn_compact_threshold_percent: 0,
         ...(input.effort ? { model_reasoning_effort: input.effort } : {}) };
       const resumed = Boolean(this.value.threadId);
       let response: Record<string, unknown>;
@@ -230,7 +251,10 @@ export class GovernedCodexSession {
           cwd: input.cwd, sandbox: "read-only", approvalPolicy: "on-request", approvalsReviewer: "user",
           developerInstructions: args.system, config, ...(input.model ? { model: input.model } : {}),
         });
-      } catch { active.finish(false, resumed ? "codex_resume_failed_history_preserved" : "codex_thread_start_failed"); client.close(); return await terminal; }
+      } catch {
+        if (resumed) { this.value.phase = "unknown"; this.save(); }
+        active.finish(false, resumed ? "codex_resume_failed_history_preserved" : "codex_thread_start_failed"); client.close(); return await terminal;
+      }
       const thread = object(response.thread);
       if (!nativeId(thread.id) || resumed && thread.id !== this.value.threadId || thread.cwd !== input.cwd
         || response.approvalPolicy !== "on-request" || response.approvalsReviewer !== "user"

@@ -88,8 +88,14 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
       },
     });
     try {
-      attachWorkspaceRuntimeModel(permit, options, id, args => native.turn(args));
-      return await runGovernedAgent(history, options, id, (provider, args) => provider.turn(args));
+      attachWorkspaceRuntimeModel(permit, options, id, async args => {
+        const result = await native.turn(args);
+        return session?.needsNewSession ? { ...result, errorMsg: "Native context limit reached. Open a new session to continue.",
+          errorMetadata: { code: "native_context_limit" } } : result;
+      });
+      const outcome = await runGovernedAgent(history, options, id, (provider, args) => provider.turn(args));
+      return session?.needsNewSession && !options.signal?.aborted
+        ? { status: "halted", stopReason: "native_context_limit", error: "Native context limit reached. Open a new session to continue." } : outcome;
     } finally {
       try { await native.close(history); }
       finally { if (session) { try { recordWorkspaceRuntimeUsage(permit, session.takeUsage()); } finally { await session.release(); } } }

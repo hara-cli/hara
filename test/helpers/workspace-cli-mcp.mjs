@@ -16,12 +16,12 @@ export function writeFakeCodex(command, settings = { mode: "list" }) {
   fs.writeFileSync(command + ".mode.json", JSON.stringify(settings));
 }
 
-export async function cliMcpFixture(t, mode = "list") {
+export async function cliMcpFixture(t, mode = "list", settings = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "hara-cli-mcp-")));
   const account = join(root, "account"), command = join(account, ".local/bin/codex");
   fs.mkdirSync(dirname(command), { recursive: true });
   writeFakeCodex(command, { mode });
-  fs.writeFileSync(command + ".mode.json", JSON.stringify({ mode }));
+  fs.writeFileSync(command + ".mode.json", JSON.stringify({ mode, ...settings }));
   fs.mkdirSync(join(root, "workspace"), { mode: 0o700 });
   const serveOptions = { root: join(root, "workspace"), mode: "workspace",
     version: "fixture", credentialVault: new MemoryCredentialVault(),
@@ -63,7 +63,7 @@ export async function cliMcpFixture(t, mode = "list") {
       const current = await request("workspace.list"); await request("workspace.select", { workspaceId: scope.workspaceId, expectedRevision: current.revision });
     },
     send: message => request("workspace.session.send", { ...scope, agentId: main.agentId, message, requestId: randomUUID(), source: "ui" }),
-    mode(value) { fs.writeFileSync(command + ".mode.json", JSON.stringify({ mode: value })); } };
+    mode(value) { fs.writeFileSync(command + ".mode.json", JSON.stringify(typeof value === "string" ? { mode: value } : value)); } };
 }
 export async function until(operation, accept, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;

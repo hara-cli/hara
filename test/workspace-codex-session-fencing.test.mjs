@@ -9,6 +9,8 @@ async function exchange(f, text) { await f.send(text); return until(f.read, done
 test("foreign thread and stale turn events cannot finish or overwrite the active Codex reply", async t => {
   const f = await cliMcpFixture(t, "wrong-events"); const view = await exchange(f, "Hello.");
   assert.equal(view.conversation.state, "completed");
+  assert.equal(view.conversation.usage.inputTokens, 100);
+  assert.equal(view.conversation.nativeSession.status, "ready");
   assert.doesNotMatch(JSON.stringify(view.conversation.history), /FOREIGN_THREAD/);
   assert.equal(view.conversation.history.filter(row => row.role === "assistant").at(-1).text, "Scoped CLI reply");
 });

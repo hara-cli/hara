@@ -73,6 +73,13 @@ function publishUsage(state: PermitState, delta: Partial<WorkspaceUsage>): void 
   if (state.updateUsage(Object.freeze({ ...next })) !== undefined) throw new Error("Workspace usage persistence must complete synchronously");
   state.usage = next;
 }
+/** Only native Codex has the approved non-cache run-budget policy. Preserve raw/cache counts in its
+ * private thread telemetry and context audit; other Runtime/provider budget semantics are unchanged. */
+function runtimeUsageDelta(usage: NonNullable<TurnResult["usage"]>, nativeCodex: boolean): Partial<WorkspaceUsage> {
+  const cached = nativeCodex ? usage.cachedInput ?? 0 : 0;
+  if (!Number.isSafeInteger(cached) || cached < 0 || cached > usage.input) throw new Error("invalid Workspace native cache telemetry");
+  return { inputTokens: usage.input - cached, outputTokens: usage.output };
+}
 
 /** A path-shaped string alone cannot opt a user project out of the CLI trust check. */
 export function workspaceRunHasManagedProject(permit: WorkspaceRunPermit): boolean {
@@ -177,7 +184,7 @@ export function createWorkspaceRunPermit(input: {
       try {
         const result: TurnResult = await track(state, operation);
         // Even a cancelled/late request consumes its recorded telemetry, but never releases more tools.
-        try { if (result.usage) publishUsage(state, { inputTokens: result.usage.input, outputTokens: result.usage.output }); }
+        try { if (result.usage) publishUsage(state, runtimeUsageDelta(result.usage, Boolean(state.runtimeModel) && binding.agent.runtimeId === "codex")); }
         finally { input.observeContext?.({ ...observation, input: result.usage?.input ?? null, output: result.usage?.output ?? null,
           inputWarning: (result.usage?.input ?? 0) > 12000 }); }
         assertLive();
@@ -269,14 +276,16 @@ export function workspaceRuntimeStorage(permit: WorkspaceRunPermit): WorkspaceRe
 }
 /** Charge observed native telemetry even when cancellation prevented another provider boundary. */
 export function recordWorkspaceRuntimeUsage(permit: WorkspaceRunPermit, usage: TurnResult["usage"]): void {
-  if (usage) publishUsage(stateOf(permit), { inputTokens: usage.input, outputTokens: usage.output });
+  const state = stateOf(permit);
+  if (usage) publishUsage(state, runtimeUsageDelta(usage, Boolean(state.runtimeModel) && permit.binding.agent.runtimeId === "codex"));
 }
 /** Native inference can make progress between virtual governor boundaries. Stop on observed overage
  * immediately; accounting still travels through the ordinary provider result or final drain. */
-export function assertWorkspaceRuntimeUsage(permit: WorkspaceRunPermit, pending: { input: number; output: number }): void {
+export function assertWorkspaceRuntimeUsage(permit: WorkspaceRunPermit, pending: { input: number; output: number; cachedInput?: number }): void {
   const state = stateOf(permit); state.assertLive();
+  const delta = runtimeUsageDelta(pending, permit.binding.agent.runtimeId === "codex");
   if (!Number.isSafeInteger(pending.input) || !Number.isSafeInteger(pending.output) || pending.input < 0 || pending.output < 0
-    || state.usage.inputTokens + state.usage.outputTokens + pending.input + pending.output > permit.binding.budget.maxTokens) {
+    || state.usage.inputTokens + state.usage.outputTokens + delta.inputTokens! + pending.output > permit.binding.budget.maxTokens) {
     throw new Error("Workspace native token telemetry safety ceiling reached");
   }
 }

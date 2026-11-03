@@ -25,6 +25,9 @@ export async function fakeCodexMain() {
     if (selected === "wrong-events") {
       note("item/completed", { threadId: "foreign", turnId: currentTurn, item: { type: "agentMessage", text: "FOREIGN_THREAD" } });
       note("turn/completed", { threadId: thread, turn: { id: "old-turn", status: "completed" } });
+      const tokenUsage = { total: { inputTokens: 500000, cachedInputTokens: 0, outputTokens: 20 }, last: { inputTokens: 500000, cachedInputTokens: 0, outputTokens: 20 } };
+      note("thread/tokenUsage/updated", { threadId: "foreign", turnId: currentTurn, tokenUsage });
+      note("thread/tokenUsage/updated", { threadId: thread, turnId: "old-turn", tokenUsage });
     }
     let serial = 0, session;
     async function request(method, parameters) {
@@ -42,7 +45,7 @@ export async function fakeCodexMain() {
       return { isError: Boolean(result.isError), text: result.content?.[0]?.text ?? "" };
     }
     function receiptText(text) { return text.split("\n\n<system-reminder>")[0]; }
-    if (!["reply", "usage-reset", "over-budget", "wrong-events"].includes(selected)) {
+    if (!["reply", "usage-reset", "over-budget", "wrong-events", "telemetry"].includes(selected)) {
       await request("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "fake-codex", version: "1" } });
       await request("notifications/initialized", {});
       meta.tools = (await request("tools/list", {})).tools.map(tool => tool.name); save();
@@ -65,9 +68,12 @@ export async function fakeCodexMain() {
     }
     if (stopped || turnId !== currentTurn) return;
     const inputTokens = selected === "over-budget" ? 300000 : 100;
-    total = { inputTokens: total.inputTokens + inputTokens, outputTokens: total.outputTokens + 20 };
-    const state = JSON.parse(fs.readFileSync(command + ".native.json", "utf8")); state.total = total; fs.writeFileSync(command + ".native.json", JSON.stringify(state));
-    rpc("thread/tokenUsage/updated", { tokenUsage: { total, last: { inputTokens, outputTokens: 20 } } });
+    const samples = mode().telemetry ?? [{ total: { inputTokens: total.inputTokens + inputTokens, outputTokens: total.outputTokens + 20 }, last: { inputTokens, outputTokens: 20 } }];
+    for (const sample of samples) {
+      total = sample.total;
+      const state = JSON.parse(fs.readFileSync(command + ".native.json", "utf8")); state.total = total; fs.writeFileSync(command + ".native.json", JSON.stringify(state));
+      rpc("thread/tokenUsage/updated", { tokenUsage: sample });
+    }
     rpc("item/completed", { item: { type: "agentMessage", text: selected === "leak" ? token : ["reply", "usage-reset"].includes(selected) ? "registered codex reply" : "Scoped CLI reply" } });
     note("turn/completed", { threadId: thread, turn: { id: currentTurn, status: "completed" } });
   }

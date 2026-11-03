@@ -104,6 +104,7 @@ export function pausedCloseoutText(task: TaskExecution, todos: readonly Todo[], 
     strategy_stall: zh ? "当前策略没有继续取得可核验进展。" : "The current strategy stopped making verifiable progress.",
     no_progress: zh ? "近期没有取得新的可核验进展。" : "Recent work produced no new verifiable progress.",
     repeat_loop: zh ? "检测到重复执行，已停止以避免再次操作。" : "Repeated execution was detected and stopped to avoid repeating actions.",
+    native_context_limit: zh ? "上下文已达上限，请开新会话。" : "The context limit was reached. Open a new session.",
   };
   const reason = outcome?.status === "error"
     ? zh ? "本次执行发生错误，已停止。" : "This run stopped after an error."
@@ -122,7 +123,10 @@ export function pausedCloseoutText(task: TaskExecution, todos: readonly Todo[], 
     + section(zh ? "已登记完成的步骤：" : "Steps recorded as done:", done)
     + section(zh ? "已保存的产物（不代表全部验收通过）：" : "Saved artifacts (not proof of full completion):", lines(checkpoint?.artifacts ?? []))
     + section(zh ? "尚待处理或核验：" : "Still to do or verify:", remaining)
-    + (blocked
+    + (outcome?.stopReason === "native_context_limit"
+      ? zh ? "\n\n请点击「开新会话」，由你明确重置会话后再发送新消息。原会话和已有结果会保留。"
+        : "\n\nChoose Open new session, then send a new message. The original session and recorded results are retained."
+      : blocked
       ? zh
         ? "\n\n请先核对已有回执并排查、解决上方错误或拦截原因，再请求重试。不要重复上传或发送；不能仅靠继续执行来消除该阻碍。"
         : "\n\nCheck existing receipts and diagnose and resolve the error or blocking condition above before requesting a retry. Do not repeat uploads or messages; resuming alone does not resolve this blocker."
