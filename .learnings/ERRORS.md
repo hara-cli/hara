@@ -11221,3 +11221,16 @@ Operation-card fixture follow-up: the first governed tool-use probe emitted stop
 The follow-up unknown-outcome fixture created a new WorkspaceResourceStorage wrapper without initialize(); the existing resource guard refused its journal read. Initialized that same isolated wrapper before the journal fixture. Original focused-verified.log retained. The input .sha256 files use inbox-relative names; an initial check from the workspace root failed to locate them, and checking from inbox passed both unchanged digests.
 
 Final verification: build-pass.log succeeded; focused-pass.log contains 27/27 pass, 0 fail/cancel/skip (13 new operation-card checks, 9 login/effort checks, 5 existing skills checks), Node 22.23.1, concurrency=1, original 120000ms test limit and isolated HOME/TMP. No full-suite run or external model request. Owned node_modules symlink removed after test completion; the shared dependency target was not modified.
+
+
+## [ERR-20261104-INTEGRATION-W2] Full native transport changes fixture contracts
+
+- Logged: 2026-11-04T02:30:00+08:00
+- Priority: high
+- Status: in_progress (focused/full verification pending)
+- Area: integration/tests
+- Summary: Complete slice merges built successfully but the first full run exposed stale controlled-only fixtures, missing compact built-in help context, and a legacy Pi tool-policy intersection.
+- Details: Default full Pi uses real namespaced MCP and Host receipt IDs; model ToolSpec omits authority kind. Keep exact in-process ledger/recovery tests explicitly controlled and retain real full/N1/token/permission negatives. Legacy role allow-lists must not gain a native shell. Pure greetings require both user-objective gating and Host proof of zero tool/native activity with an unchanged complete project snapshot. Changes still need actual write receipts. Synthetic completion must cite the working write plus verification; read verification alone fails N1. The default synthetic provider now uses C-lite's engine brief; only the dedicated multiple-acceptance fixture opts into explicit intake.
+- Verification: Original Core full failure logs retained; entire S3 permission/process file passed within unchanged120000ms. Actual full Pi Chinese four-question positives and hidden-native-write negative passed focused run. Remaining focused repairs are being rerun; no declared all-green status.
+- Follow-up: Run full Core/Desk serially under the load gate, preserve original deadlines, then backed-up local adhoc install. No Keychain entries, Feishu doctor, outward sends, main/push/tag/candidate/PEM. Native accepted/outcome-unknown sessions remain fail-closed.
+- Related: src/workspace/synthetic-provider.ts, src/agent/readonly-light.ts, src/agent-runtime/pi-full.ts, src/workspace/local-host.ts; shared local docs/ERROR-LOG.md and wave2 inbox reports.
