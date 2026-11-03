@@ -56,6 +56,8 @@ export interface ExternalCommandRunOptions {
   /** Preserve bounded stdout on a non-zero exit only for callers that parse a documented structured
    * response. It must never be forwarded to users or diagnostics because provider output may hold account data. */
   retainStdoutOnFailure?: boolean;
+  /** Protected launch owners must retain policy/tmp until the physical child has closed. */
+  waitForClose?: boolean;
   /** Opt-in, allowlisted classification. Raw stderr never crosses this boundary. */
   failureKind?: "registered-cli" | "runtime";
   /** Explicit Workspace proxy only; enables evidence-based proxy diagnostics without exposing stderr. */
@@ -118,7 +120,8 @@ export async function runExternalCommandCapture(
       return;
     }
 
-    let done = false;
+    let done = false, physicallyClosed = false;
+    let pendingClose: ExternalCommandCaptureResult | undefined;
     let stdout = "";
     let stderr = "";
     let outputBytes = 0;
@@ -127,10 +130,11 @@ export async function runExternalCommandCapture(
       finish({ ok: false, stdout: "", code: null, timedOut: false, errorCode: "interrupted" });
     };
     const finish = (result: ExternalCommandCaptureResult): void => {
-      if (done) return;
-      done = true;
+      if (done || pendingClose) return;
       clearTimeout(timer);
       run.signal?.removeEventListener("abort", abort);
+      if (run.waitForClose && !physicallyClosed) { pendingClose = result; return; }
+      done = true;
       resolve(result);
     };
     const timer = setTimeout(() => {
@@ -139,15 +143,11 @@ export async function runExternalCommandCapture(
     }, timeoutMs);
     timer.unref();
     run.signal?.addEventListener("abort", abort, { once: true });
-    if (run.signal?.aborted) {
-      abort();
-      return;
-    }
     child.once("spawn", () => {
       if (!done) { try { run.onSpawn?.(); } catch { /* Diagnostics cannot fail the command. */ } }
     });
     child.stdout?.on("data", (chunk: Buffer) => {
-      if (done) return;
+      if (done || pendingClose) return;
       outputBytes += chunk.length;
       if (outputBytes > maxOutputBytes) {
         terminateSubprocessTree(child, { force: true, processGroup });
@@ -177,6 +177,8 @@ export async function runExternalCommandCapture(
       });
     });
     child.once("close", (code, signal) => {
+      physicallyClosed = true;
+      if (pendingClose) { const result = pendingClose; pendingClose = undefined; finish(result); return; }
       finish({
         ok: code === 0,
         stdout: code === 0 || run.retainStdoutOnFailure === true ? stdout : "",
@@ -187,6 +189,8 @@ export async function runExternalCommandCapture(
             : (run.failureKind === "registered-cli" ? registeredCliFailureCode(stderr) : undefined) ?? safeExternalErrorCode(stderr) ?? "command_failed") }),
       });
     });
+    // Register close before a late abort: protected owners cannot release a still-live boundary.
+    if (run.signal?.aborted) abort();
   });
 }
 

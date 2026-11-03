@@ -266,6 +266,20 @@ export class WorkspaceRuntimeInstaller {
     if (!installed) return fail();
     return this.resolveUnproxied(runtimeId, installed.artifact.version, installed.artifact.sha256);
   }
+  /** Trusted launch roots for the outer process policy; no credential/config contents are read. */
+  executionPolicyDirectories(runtimeId: "codex" | "claude" | "opencode",
+    launched: { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource }) {
+    const current = this.resolveBoundUnproxied(runtimeId);
+    if (current.command !== launched.command || current.loginSource !== launched.loginSource
+      || current.env.HOME !== launched.env.HOME || current.env.CODEX_HOME !== launched.env.CODEX_HOME
+      || current.env.CLAUDE_CONFIG_DIR !== launched.env.CLAUDE_CONFIG_DIR) return fail();
+    const accountHome = this.accountHome(), home = current.env.HOME;
+    if (!home) return fail();
+    const runtimeHome = runtimeId === "claude" ? current.env.CLAUDE_CONFIG_DIR ?? join(home, ".claude")
+      : runtimeId === "codex" ? current.env.CODEX_HOME ?? join(home, ".codex") : join(home, ".local/share/opencode");
+    return Object.freeze({ accountHome, runtimeHome,
+      protectedStateRoots: Object.freeze([this.storage.runtimeProtectedStateRoot()]) });
+  }
   /** Diagnostic metadata only: no login files, environment dump, paths or version probe. */
   failureContext(runtimeId: "codex" | "claude" | "opencode",
     launched?: { env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource }): RuntimeFailureContext {

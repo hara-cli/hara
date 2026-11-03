@@ -1,6 +1,7 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -22,7 +23,7 @@ function root() { const path = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir
 after(() => roots.forEach(path => fs.rmSync(path, { recursive: true, force: true })));
 
 for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, null], ["claude", false, null],
-  ["codex", true, null], ["codex", true, null, true], ["codex", true, "project_not_trusted"], ["codex", true, "runtime_auth_required"], ["codex", true, "command_failed"], ["claude", true, "runtime_network"], ["claude", true, "runtime_proxy"], ["claude", true, "version_incompatible"], ["codex", true, "runtime_auth_event"], ["codex", true, "runtime_auth_event_nonzero"], ["codex", true, "runtime_auth_recovered"]]) test(`${runtimeId} managed=${managed} git=${hasGit} failure=${failure} stays confined with no fallback`, async () => {
+  ["codex", true, null], ["codex", true, null, true], ["codex", true, "project_not_trusted"], ["codex", true, "runtime_auth_required"], ["codex", true, "command_failed"], ["claude", true, "runtime_network"], ["claude", true, "runtime_proxy"], ["claude", true, "version_incompatible"], ["codex", true, "runtime_auth_event"], ["codex", true, "runtime_auth_event_nonzero"], ["codex", true, "runtime_auth_recovered"]]) test(`${runtimeId} managed=${managed} git=${hasGit} failure=${failure} stays confined with no fallback`, async t => {
   const expectedFailure = failure && failure !== "runtime_auth_recovered";
   const data = root(), home = managed ? join(data, "home") : data, account = root();
   fs.mkdirSync(home, { recursive: true });
@@ -33,8 +34,16 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
   const storage = new WorkspaceResourceStorage(home, row.scope); storage.initialize();
   const command = join(account, ".local", "bin", runtimeId), argv = join(account, "argv.txt");
   fs.mkdirSync(dirname(command), { recursive: true });
-  fs.writeFileSync(command, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${runtimeId} 1.2.3'; exit 0; fi\nif [ "$1" = "app-server" ]; then exit 1; fi\nif [ "$1" = "debug" ]; then echo '{"models":[{"slug":"fixture-model","display_name":"Fixture"}]}'; exit 0; fi\nprintf 'launch\\n' >> '${argv}.launches'\nprintf '%s\\n' "$@" > '${argv}'\n${runtimeId === "codex" && managed && !hasGit ? `case " $* " in *' --skip-git-repo-check '*) ;; *) echo 'Not inside a trusted directory and --skip-git-repo-check was not specified.' >&2; exit 1;; esac` : ''}\n${failure === 'runtime_auth_recovered' ? `echo '{"type":"error","message":"temporary network error PRIVATE_ACCOUNT_DETAIL"}'; echo '{"type":"item.completed","item":{"type":"agent_message","text":"registered codex reply"}}'; echo '{"type":"turn.completed"}'; exit 0` : failure?.startsWith('runtime_auth_event') ? `echo '{"type":"turn.failed","error":{"message":"401 Unauthorized PRIVATE_ACCOUNT_DETAIL"}}'; exit ${failure === 'runtime_auth_event' ? 0 : 1}` : failure ? `echo '${failure === 'project_not_trusted' ? 'Not inside a trusted directory' : failure === 'runtime_auth_required' ? 'websocket 401 Unauthorized PRIVATE_ACCOUNT_DETAIL' : failure === 'runtime_network' ? 'ECONNRESET PRIVATE_ACCOUNT_DETAIL' : failure === 'runtime_proxy' ? 'proxy connect failed PRIVATE_ACCOUNT_DETAIL' : failure === 'version_incompatible' ? 'unrecognized option --fixture PRIVATE_ACCOUNT_DETAIL' : 'PRIVATE_ACCOUNT_DETAIL'}' >&2; exit 1` : ''}\n${runtimeId === 'codex' ? `echo '{"type":"item.completed","item":{"type":"agent_message","text":"registered codex reply"}}'\necho '{"type":"turn.completed"}'` : `echo 'registered ${runtimeId} reply'`}\n`, { mode: 0o755 });
-  const installer = new WorkspaceRuntimeInstaller(storage, { discovery: { home: account, path: "/usr/bin:/bin", systemBins: [],
+  // Capture argv in the parent so the fake CLI never needs authority to write outside its policy.
+  const recorder = http.createServer(async (req, res) => {
+    let body = ""; for await (const chunk of req) { body += chunk; if (body.length > 256 * 1024) throw new Error("fixture argv limit"); }
+    fs.appendFileSync(argv + ".launches", "launch\n"); fs.writeFileSync(argv, body); res.writeHead(204); res.end();
+  });
+  await new Promise(resolve => recorder.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => recorder.close(resolve)));
+  const recordUrl = "http://127.0.0.1:" + recorder.address().port;
+  fs.writeFileSync(command, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${runtimeId} 1.2.3'; exit 0; fi\nif [ "$1" = "app-server" ]; then exit 1; fi\nif [ "$1" = "debug" ]; then echo '{"models":[{"slug":"fixture-model","display_name":"Fixture"}]}'; exit 0; fi\nprintf '%s\\n' "$@" | /usr/bin/curl --silent --fail --max-time 5 --data-binary @- '${recordUrl}' > /dev/null || exit 1\n${runtimeId === "codex" && managed && !hasGit ? `case " $* " in *' --skip-git-repo-check '*) ;; *) echo 'Not inside a trusted directory and --skip-git-repo-check was not specified.' >&2; exit 1;; esac` : ''}\n${failure === 'runtime_auth_recovered' ? `echo '{"type":"error","message":"temporary network error PRIVATE_ACCOUNT_DETAIL"}'; echo '{"type":"item.completed","item":{"type":"agent_message","text":"registered codex reply"}}'; echo '{"type":"turn.completed"}'; exit 0` : failure?.startsWith('runtime_auth_event') ? `echo '{"type":"turn.failed","error":{"message":"401 Unauthorized PRIVATE_ACCOUNT_DETAIL"}}'; exit ${failure === 'runtime_auth_event' ? 0 : 1}` : failure ? `echo '${failure === 'project_not_trusted' ? 'Not inside a trusted directory' : failure === 'runtime_auth_required' ? 'websocket 401 Unauthorized PRIVATE_ACCOUNT_DETAIL' : failure === 'runtime_network' ? 'ECONNRESET PRIVATE_ACCOUNT_DETAIL' : failure === 'runtime_proxy' ? 'proxy connect failed PRIVATE_ACCOUNT_DETAIL' : failure === 'version_incompatible' ? 'unrecognized option --fixture PRIVATE_ACCOUNT_DETAIL' : 'PRIVATE_ACCOUNT_DETAIL'}' >&2; exit 1` : ''}\n${runtimeId === 'codex' ? `echo '{"type":"item.completed","item":{"type":"agent_message","text":"registered codex reply"}}'\necho '{"type":"turn.completed"}'` : `echo '{"type":"result","subtype":"success","is_error":false,"result":"registered ${runtimeId} reply"}'`}\n`, { mode: 0o755 });
+  const installer = new WorkspaceRuntimeInstaller(storage, { accountHome: () => account, discovery: { home: account, path: "/usr/bin:/bin", systemBins: [],
     run: async (_command, args) => args[0] === "-lic" ? null : `${runtimeId} 1.2.3` } });
   const resources = new WorkspaceResources(home, row.scope, { runtimeInstaller: installer }); resources.initialize();
   const main = resources.agents.initializeMain();
@@ -165,7 +174,9 @@ test("registered CLI args project model and effort without widening write or she
     "-c", 'model_reasoning_effort="xhigh"', "--sandbox", "read-only"]);
   assert(!codex.includes("danger-full-access") && !codex.includes("--yolo"));
   const claude = registeredCliArgs({ id: "claude", prompt: "hi", cwd: "/fixture/project", model: "sonnet", effort: "high", skipGitRepoCheck: false });
-  assert.deepEqual(claude, ["-p", "hi", "--output-format", "text", "--model", "sonnet", "--effort", "high", "--permission-mode", "plan"]);
+  assert.deepEqual(claude.slice(0, 10), ["-p", "hi", "--output-format", "text", "--model", "sonnet", "--effort", "high", "--permission-mode", "plan"]);
+  assert.equal(claude[claude.indexOf("--setting-sources") + 1], "project,local");
+  assert.deepEqual(JSON.parse(claude[claude.indexOf("--settings") + 1]), { disableAllHooks: true, sandbox: { enabled: false } });
   assert(!claude.includes("bypassPermissions"));
   // No selected model and no effort must not invent either flag.
   const bare = registeredCliArgs({ id: "codex", prompt: "hi", cwd: "/fixture/project", model: null, effort: null, skipGitRepoCheck: false });

@@ -39,7 +39,8 @@ async function fakeCli() {
     tokenPresent: Boolean(token), tokenInArgv: args.some(value => token && value.includes(token)),
     readOnly: args.includes("read-only"), onRequest: args.includes('approval_policy="on-request"'),
     haraOnlyTrust: args.includes('mcp_servers.hara.default_tools_approval_mode="auto"') };
-  const save = () => { fs.writeFileSync(command + ".meta.next", JSON.stringify(meta)); fs.renameSync(command + ".meta.next", command + ".meta.json"); };
+  const metadata = runtimeId === "claude" ? process.env.HOME + "/.claude/debug/hara-fixture" : command + ".meta";
+  const save = () => { fs.writeFileSync(metadata + ".next", JSON.stringify(meta)); fs.renameSync(metadata + ".next", metadata + ".json"); };
   save();
   let serial = 0, session;
   async function request(method, params, credential = token) {
@@ -82,7 +83,7 @@ async function fakeCli() {
     }
   }
   const text = mode === "leak" ? token : "Scoped CLI reply";
-  if (runtimeId === "claude") console.log(text);
+  if (runtimeId === "claude") console.log(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: text }));
   else {
     console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text } }));
     console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 100, output_tokens: 20 } }));
@@ -93,6 +94,7 @@ export async function cliMcpFixture(t, mode = "list", runtimeId = "codex") {
   const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "hara-cli-mcp-")));
   const account = join(root, "account"), command = join(account, ".local/bin", runtimeId);
   fs.mkdirSync(dirname(command), { recursive: true });
+  if (runtimeId === "claude") fs.mkdirSync(join(account, ".claude/debug"), { recursive: true });
   fs.writeFileSync(command, "#!" + process.execPath + "\n(" + fakeCli.toString() + ")();\n", { mode: 0o755 });
   fs.writeFileSync(command + ".mode.json", JSON.stringify({ mode }));
   fs.mkdirSync(join(root, "workspace"), { mode: 0o700 });
@@ -124,7 +126,8 @@ export async function cliMcpFixture(t, mode = "list", runtimeId = "codex") {
   await request("workspace.runtime.selectModel", { ...scope, runtimeId, modelId: runtimeId === "claude" ? "sonnet" : "fixture-model", expectedRevision: 0, ...(runtimeId === "claude" ? { effort: "high" } : {}) });
   await request("workspace.agents.setRuntime", { ...scope, agentId: main.agentId, runtimeId, configRevision: main.configRevision, agentEpoch: main.agentEpoch });
   const read = () => request("workspace.snapshot", { workspaceId: scope.workspaceId, agentId: main.agentId });
-  const meta = () => fs.existsSync(command + ".meta.json") ? JSON.parse(fs.readFileSync(command + ".meta.json")) : null;
+  const metadata = runtimeId === "claude" ? join(account, ".claude/debug/hara-fixture.json") : command + ".meta.json";
+  const meta = () => fs.existsSync(metadata) ? JSON.parse(fs.readFileSync(metadata)) : null;
   return { root, command, scope, main, request, read, meta,
     send: message => request("workspace.session.send", { ...scope, agentId: main.agentId, message, requestId: randomUUID(), source: "ui" }),
     mode(value) { fs.writeFileSync(command + ".mode.json", JSON.stringify({ mode: value })); } };

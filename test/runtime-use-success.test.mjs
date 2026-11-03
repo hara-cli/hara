@@ -16,8 +16,9 @@ test("success history requires a real Codex completion, not partial output, a li
   for (const output of ['', 'plain old fixture output', '[]', 'null', '{', '{"type":"turn.completed"}\ntruncated-json', 'x'.repeat(2*1024*1024+1)])
     assert.equal(runtimeUseProtocolSucceeded("codex", output), false);
 });
-test("the configured Claude text protocol needs non-empty output while buffers remain bounded", () => {
-  assert.equal(runtimeUseProtocolSucceeded("claude", "buffered response"), true);
+test("Claude success history requires a bounded terminal success frame", () => {
+  assert.equal(runtimeUseProtocolSucceeded("claude", "buffered response"), false);
+  assert.equal(runtimeUseProtocolSucceeded("claude", JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "final reply" })), true);
   assert.equal(runtimeUseProtocolSucceeded("claude", " \n"), false);
   assert.equal(runtimeUseProtocolSucceeded("claude", "x".repeat(2*1024*1024+1)), false);
 });
