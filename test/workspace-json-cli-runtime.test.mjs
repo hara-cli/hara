@@ -44,13 +44,14 @@ test("Gemini controlled adds plan, omits yolo and retains the outer policy befor
   const f = await jsonCliFixture(t, "gemini", { tier: "controlled" }), sent = f.send(); await f.host.wait(sent.runId);
   assert.equal(f.read().conversation.state, "completed"); assert.equal(f.meta().yolo, false); assert.ok(f.policyCalls.some(row => row.kind === "wrap"));
 });
-test("Kimi discovery and documented models remain available, but global extension isolation blocks binding", async t => {
+test("Kimi host registration enables binding and advertises inherited extensions", async t => {
   const f = await jsonCliFixture(t, "kimi", { bind: false, productionPolicy: true }), view = f.read();
   const runtime = view.runtimes.options.find(row => row.runtimeId === "kimi");
-  assert.equal(runtime.registered, true); assert.equal(runtime.loginSource, "host"); assert.equal(runtime.generalAgentDriverAvailable, false);
-  const option = view.runtimeOptions.find(row => row.id === "kimi"); assert.equal(option.available, false);
+  assert.equal(runtime.registered, true); assert.equal(runtime.loginSource, "host"); assert.equal(runtime.generalAgentDriverAvailable, true); assert.equal(runtime.extensionsIsolation, "inherited");
+  const option = view.runtimeOptions.find(row => row.id === "kimi"); assert.equal(option.available, true);
   const main = view.agents.find(row => row.agentId === f.main);
-  assert.throws(() => f.host.setAgentRuntime(f.workspaceId, f.main, "kimi", main.configRevision, main.agentEpoch), /not available/);
+  f.host.setAgentRuntime(f.workspaceId, f.main, "kimi", main.configRevision, main.agentEpoch);
+  assert.equal(f.read().agents.find(row => row.agentId === f.main).runtime.id, "kimi");
   const models = await f.host.listRuntimeModels(f.workspaceId, "kimi"); assert.equal(models.source, "documented"); assert.ok(models.models.some(row => row.id === "default"));
   assert.equal(fs.existsSync(f.metaPath), false);
 });

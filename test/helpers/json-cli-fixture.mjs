@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { LocalWorkspaceHost } from "../../dist/workspace/local-host.js";
 import { MemoryCredentialVault } from "../../dist/workspace/credential-vault.js";
 import { SYNTHETIC_CONNECTION } from "../../dist/workspace/synthetic-provider.js";
@@ -10,6 +10,12 @@ export async function jsonCliFixture(t, id, { mode = "list", protectedFactory = 
   const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), `hara-${id}-fixture-`))), account = join(root, "account"); fs.mkdirSync(join(account, ".local/bin"), { recursive: true, mode: 0o700 });
   fs.mkdirSync(join(root, "data"), { mode: 0o700 });
   fs.mkdirSync(join(root, "probe"), { mode: 0o700 });
+  const fakeConfigPath = join(account, ".kimi/config.toml"), extensionMarker = join(account, ".kimi/logs/personal-extension-marker");
+  if (id === "kimi") {
+    fs.mkdirSync(join(account, ".kimi/logs"), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(fakeConfigPath, '# FAKE_USER_EXTENSION_FIXTURE\n[[hooks]]\nevent = "SessionStart"\ncommand = "fixture-only-not-executed"\n', { mode: 0o600 });
+  }
+  const configDigest = id === "kimi" ? createHash("sha256").update(fs.readFileSync(fakeConfigPath)).digest("hex") : null;
   const command = join(account, ".local/bin", id), policyCalls = [];
   fs.writeFileSync(command, `#!${process.execPath}
 const fs = require('node:fs'), path = require('node:path');
@@ -27,6 +33,12 @@ if (runtime === 'gemini') {
  if (config.hooksConfig?.enabled !== false || config.skills?.enabled !== false || config.tools?.discoveryCommand !== '' || config.tools?.callCommand !== '' || config.tools?.sandbox !== false
    || config.tools.core.some(name => /shell|background|cron|schedule|agent/i.test(name)) || args[args.indexOf('--extensions') + 1] !== 'none') throw Error('fixture isolation config absent');
  metadata.isolatedExtensions = true;
+} else {
+ // Native fixture reads its own fake config; Hara never copies it. No hook command is executed.
+ const personal = fs.readFileSync(path.join(process.env.HOME, '.kimi/config.toml'), 'utf8');
+ if (!personal.includes('FAKE_USER_EXTENSION_FIXTURE')) throw Error('fixture host extensions missing');
+ fs.writeFileSync(path.join(process.env.HOME, '.kimi/logs/personal-extension-marker'), 'fixture-loaded');
+ metadata.inheritedExtensions = true;
 }
 const save = () => { if (${JSON.stringify(recordReceipt)}) fs.writeFileSync(path.join(process.cwd(), '.native-fixture-receipt.json'), JSON.stringify(metadata)); };
 const emit = value => console.log(JSON.stringify(value));
@@ -80,7 +92,7 @@ const emit = value => console.log(JSON.stringify(value));
   const main = host.snapshot(workspaceId).agents[0]; if (bind) host.setAgentRuntime(workspaceId, main.agentId, id, main.configRevision, main.agentEpoch);
   const project = join(root, "data/project", workspaceId); fs.writeFileSync(join(project, ".fixture-mode"), mode);
   const metaPath = join(project, ".native-fixture-receipt.json");
-  return { root, account, host, workspaceId, main: main.agentId, project, policyCalls, metaPath,
+  return { root, account, host, workspaceId, main: main.agentId, project, policyCalls, metaPath, fakeConfigPath, configDigest, extensionMarker,
     send: () => host.start("fixture", workspaceId, main.agentId, "List the colleagues of this Workspace.", randomUUID()),
     read: () => host.snapshot(workspaceId, main.agentId, "fixture"), meta: () => JSON.parse(fs.readFileSync(metaPath, "utf8")) };
 }

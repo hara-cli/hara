@@ -41,9 +41,12 @@ test("new runtimes bind only the proven account HOME and refuse isolated sign-in
     assert.throws(() => runtime.executionPolicyRoots(id, { ...launch, env: { ...launch.env, HOME: tmpdir() } }));
   }
 });
-test("Kimi production policy refuses before any host credential/configuration can be loaded", async () => {
-  await assert.rejects(createJsonCliExecutionPolicy({ runtimeId: "kimi", installer: { executionPolicyRoots() { throw Error("must not inspect roots"); } } }), /runtime_isolation_unavailable/);
+test("Kimi inherited extensions do not bypass frozen Workspace permit admission", async () => {
+  let rootsCalled = false;
+  await assert.rejects(createJsonCliExecutionPolicy({ runtimeId: "kimi", permit: {}, installer: { executionPolicyRoots() { rootsCalled = true; throw Error("untrusted roots"); } } }));
+  assert.equal(rootsCalled, false);
 });
+
 for (const id of ["gemini", "kimi"]) test(`${id}: real Seatbelt enforces fake-home state and foreign credential boundaries`, { skip: process.platform !== "darwin" }, async t => {
   const root = temp(t), home = join(root, "account"), work = join(root, "work"), own = id === "gemini" ? ".gemini" : ".kimi";
   for (const dir of [work, join(root, "outside"), join(home, ".hara"), join(home, ".gemini/tmp"), join(home, ".gemini/history"), join(home, ".kimi/sessions"), join(home, ".kimi/logs"), join(home, ".kimi/credentials"), join(home, ".kimi-code/credentials")]) fs.mkdirSync(dir, { recursive: true });

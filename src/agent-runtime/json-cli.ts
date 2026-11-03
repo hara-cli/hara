@@ -81,7 +81,7 @@ export function jsonCliDriver(id: JsonCliRuntimeId, installer: WorkspaceRuntimeI
         } catch (error) {
           if (native.signal.aborted) return { ok: false, stdout: "", code: null, timedOut: false, errorCode: "interrupted" };
           const kind = runtimeProxyFailure(error) ? "runtime_proxy" : error instanceof Error && /runtime_(protection|controlled_mode)_unavailable/.test(error.message)
-            ? "runtime_permission_denied" : error instanceof Error && error.message === "runtime_isolation_unavailable" ? "version_incompatible" : "runtime_failed";
+            ? "runtime_permission_denied" : "runtime_failed";
           observer?.finish(false, kind);
           return { ok: false, stdout: "", code: null, timedOut: false, runtimeFailure: tracker ? tracker.failed(kind, Date.now() - started)
             : runtimeFailureMessage({ ...installer.failureContext(id), kind, elapsedMs: Date.now() - started }) };

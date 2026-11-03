@@ -291,7 +291,8 @@ export class WorkspaceRuntimeInstaller {
         homeMatchesAccount = comparable(launched.env.HOME) === comparable(this.accountHome());
       } catch { /* account lookup failure is not a mismatched home */ }
     }
-    return { runtime: runtimeId, version, loginSource, homeMatchesAccount };
+    return { runtime: runtimeId, version, loginSource, homeMatchesAccount,
+      ...(runtimeId === "kimi" ? { extensionsIsolation: "inherited" as const } : {}) };
   }
   /**
    * Read-only snapshot of the host's own Codex model cache, only while this binding launches with the
@@ -517,19 +518,19 @@ export class WorkspaceRuntimeInstaller {
         const selected = registered ? local! : discovered ? detected! : local ?? detected!;
         const inspected = registered ? localCheck : discovered ? detectedCheck : localCheck ?? detectedCheck;
         const valid = registered || discovered, version = valid ? selected.version : null;
-        return { runtimeId, label: RUNTIME_LABELS[runtimeId], ...(manualRuntimeInstallation(runtimeId) ? { manualInstallation: manualRuntimeInstallation(runtimeId)! } : {}), installed: valid, registered, version,
+        return { runtimeId, label: RUNTIME_LABELS[runtimeId], ...(runtimeId === "kimi" ? { extensionsIsolation: "inherited" as const } : {}), ...(manualRuntimeInstallation(runtimeId) ? { manualInstallation: manualRuntimeInstallation(runtimeId)! } : {}), installed: valid, registered, version,
           path: selected.path, fingerprint: valid ? selected.fingerprint : null, source: selected.source, loginSource,
           versionStatus: versionStatus(runtimeId, { version, fingerprint: inspected?.fingerprint ?? null,
             registered, requiresRetrust: !registered && Boolean(local || discovered) }),
-          generalAgentDriverAvailable: Boolean(registered && (runtimeId === "codex" || runtimeId === "claude" || ["opencode", "gemini"].includes(runtimeId) && loginSource === "host")), state: valid ? registered ? "local_registered" : "detected" : "integrity_failed" };
+          generalAgentDriverAvailable: Boolean(registered && (runtimeId === "codex" || runtimeId === "claude" || ["opencode", "gemini", "kimi"].includes(runtimeId) && loginSource === "host")), state: valid ? registered ? "local_registered" : "detected" : "integrity_failed" };
       }
       const installed = value.entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
       let verified = false; if (installed) try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* tampering revokes use, never repair or fallback */ }
       const version = verified ? installed!.artifact.version : null;
-      return { runtimeId, label: RUNTIME_LABELS[runtimeId], ...(manualRuntimeInstallation(runtimeId) ? { manualInstallation: manualRuntimeInstallation(runtimeId)! } : {}), installed: verified, registered: verified, version,
+      return { runtimeId, label: RUNTIME_LABELS[runtimeId], ...(runtimeId === "kimi" ? { extensionsIsolation: "inherited" as const } : {}), ...(manualRuntimeInstallation(runtimeId) ? { manualInstallation: manualRuntimeInstallation(runtimeId)! } : {}), installed: verified, registered: verified, version,
         versionStatus: versionStatus(runtimeId, { version, fingerprint: verified ? installed!.executableSha256 : null,
           registered: verified, requiresRetrust: Boolean(installed && !verified) }),
-        loginSource, generalAgentDriverAvailable: Boolean(verified && (runtimeId === "codex" || runtimeId === "claude" || ["opencode", "gemini"].includes(runtimeId) && loginSource === "host")), state: installed ? verified ? "registered" : "integrity_failed" : "not_installed" };
+        loginSource, generalAgentDriverAvailable: Boolean(verified && (runtimeId === "codex" || runtimeId === "claude" || ["opencode", "gemini", "kimi"].includes(runtimeId) && loginSource === "host")), state: installed ? verified ? "registered" : "integrity_failed" : "not_installed" };
     }), operations: [...this.operations.values()].slice(-64).map(({ controller: _c, ...row }) => row) };
   }
   private resolveUnproxied(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {

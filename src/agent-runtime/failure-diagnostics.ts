@@ -10,6 +10,8 @@ export interface RuntimeFailureContext {
   version: string | null;
   loginSource: "host" | "isolated" | "unknown";
   homeMatchesAccount: boolean | null;
+  /** Code-owned policy metadata. Absence preserves older diagnostic records. */
+  extensionsIsolation?: "inherited";
 }
 export interface RuntimeFailureDiagnostic extends RuntimeFailureContext {
   kind: RuntimeFailureKind;
@@ -76,6 +78,7 @@ export function runtimeFailureMessage(input: RuntimeFailureContext & {
   if (!["codex", "claude", "opencode", "gemini", "kimi"].includes(input.runtime)) throw new Error("Invalid diagnostic runtime");
   const diagnostic: RuntimeFailureDiagnostic = {
     runtime: input.runtime,
+    ...(input.runtime === "kimi" ? { extensionsIsolation: "inherited" as const } : {}),
     kind: knownKind(input.kind) ? input.kind : "runtime_failed",
     version: safeRuntimeVersion(input.version),
     loginSource: input.loginSource === "host" || input.loginSource === "isolated" ? input.loginSource : "unknown",

@@ -16,10 +16,8 @@ export type JsonCliPolicyFactory = (input: {
 }) => Promise<JsonCliPolicyHandle>;
 
 export const createJsonCliExecutionPolicy: JsonCliPolicyFactory = async input => {
-  // Classic Kimi has no documented way to disable global hooks/plugins while retaining the
-  // original login configuration. A custom config would replace that login. Do not read/copy it,
-  // silently inherit extensions, or invent unsupported flags. Keep production closed.
-  if (input.runtimeId === "kimi") throw new Error("runtime_isolation_unavailable");
+  // Jeff 2026-11-03 option A: classic Kimi inherits host extensions. This removes only
+  // the extension-isolation gate; the frozen permit and shared Seatbelt boundary stay mandatory.
   const tier = workspaceRunPermissionTier(input.permit);
   const roots = input.installer.executionPolicyRoots(input.runtimeId, input.resolved);
   const policy = createRuntimeExecutionPolicy({ runtimeId: input.runtimeId, tier,
