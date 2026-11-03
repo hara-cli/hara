@@ -7,7 +7,7 @@ export const SYNTHETIC_CONNECTION = Object.freeze({ label: "本機合成測試�
   baseURL: "http://127.0.0.1:1/v1", apiKey: "hara-synthetic-local-only", defaultModel: "hara-synthetic-v1" });
 /** Explicit Dev fixture, NOT an LLM and never a fallback for an unavailable real connection. */
 export function createWorkspaceSyntheticProvider(connection: ScopedConnection, binding: ScopedRunConnection,
-  context: { agent: WorkspaceAgentView; objective: string; colleagues: () => WorkspaceAgentView[] }): Provider {
+  context: { agent: WorkspaceAgentView; objective: string; colleagues: () => WorkspaceAgentView[] }, options: { explicitIntake?: boolean } = {}): Provider {
   if (connection.provider !== SYNTHETIC_CONNECTION.provider || connection.apiKey !== SYNTHETIC_CONNECTION.apiKey
     || connection.baseURL !== SYNTHETIC_CONNECTION.baseURL || binding.model !== SYNTHETIC_CONNECTION.defaultModel) {
     throw new Error("本 Dev 僅允許明確的合成 Provider。真實模型/Key 調用尚未批准；沒有發出請求。");
@@ -28,7 +28,8 @@ export function createWorkspaceSyntheticProvider(connection: ScopedConnection, b
     const delegation = context.agent.kind === "main" && /(?:委派|安排|交给|交給|delegate)/i.test(objective);
     const fileTask = /hello\.md|(?:生成|写|寫|create|write).*(?:文件|file)/i.test(objective);
     if (!creation && !delegation && !fileTask) return response("你好，我是 Hara。這是本機合成驗收模式，不會連接真實模型。可以請我「建立同事 Coder」，再「委派 Coder 生成 hello.md 並驗證」。");
-    if (!calls.some(call => call.name === "task_intake")) return response("", [tool("task_intake", { intent: "change", goal: objective.slice(0, 1500),
+    // The default fixture follows C-lite: Host creates the brief before the first action.
+    if (options.explicitIntake && !calls.some(call => call.name === "task_intake")) return response("", [tool("task_intake", { intent: "change", goal: objective.slice(0, 1500),
       constraints: ["僅本空間與已授權本機 fixture 項目；不連外、不發布、不調用真實模型"],
       acceptance: [creation ? "同事經使用者確認後建立" : delegation ? "同事任務有已驗證的完成回執" : "hello.md 內容與雜湊經工具驗證"], steps: ["執行", "驗證", "回覆結果"] })]);
     if (last?.isError || last?.content.startsWith("Error:")) return response("這一步未完成，已停止繼續嘗試；請查看執行詳情或重新確認。沒有宣稱成功。");
@@ -53,7 +54,11 @@ export function createWorkspaceSyntheticProvider(connection: ScopedConnection, b
     if (calls.some(call => call.name === "task_checkpoint")) return response(answer);
     let successId = success.id;
     try { const receipt = JSON.parse(success.content).receipt; if (typeof receipt?.toolCallId === "string") successId = receipt.toolCallId; } catch { /* Governor still verifies every proposed citation. */ }
+    const write = success.name === "workspace_verify" ? [...results].reverse().find(result => result.name === "workspace_write" && !result.isError) : undefined;
+    let writeId = write?.id;
+    if (write) try { const receipt = JSON.parse(write.content).receipt; if (typeof receipt?.toolCallId === "string") writeId = receipt.toolCallId; } catch { /* No invented write citation. */ }
+    const successIds = writeId && writeId !== successId ? [writeId, successId] : [successId];
     return response("", [tool("task_checkpoint", { artifacts: fileTask && !delegation ? ["hello.md"] : [],
-      completion: { state: "verified", evidence: ["已收到本次工具執行的成功回執"], checks: [{ acceptance_index: 0, evidence: "已收到本次工具執行的成功回執", tool_call_ids: [successId] }], final_answer: answer } })]);
+      completion: { state: "verified", evidence: ["已收到本次工具執行的成功回執"], checks: [{ acceptance_index: 0, evidence: "已收到本次工具執行的成功回執", tool_call_ids: successIds }], final_answer: answer } })]);
   } };
 }

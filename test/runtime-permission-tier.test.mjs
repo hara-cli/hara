@@ -86,7 +86,7 @@ test("OpenCode transient settings do not replace the host login data or import a
 
 test("conversation proof rejects unobserved writes, native calls and invalidated snapshots", t => {
  const dir=root(t),work=join(dir,"work"),home=join(dir,"account");fs.mkdirSync(work);fs.mkdirSync(home);
- const p=createRuntimeExecutionPolicy({runtimeId:"pi",tier:"full-protected",accountHome:home,workRoot:work});t.after(()=>p.close());
+ const p=createRuntimeExecutionPolicy({runtimeId:"codex",tier:"full-protected",accountHome:home,workRoot:work});t.after(()=>p.close());
  fs.writeFileSync(join(dir,"outside.txt"),"opaque fixture");fs.symlinkSync(join(dir,"outside.txt"),join(work,"unchanged-link"));
  p.beginAttempt("conversation");assert.equal(p.canCompleteConversation(),true);
  fs.writeFileSync(join(work,"native.txt"),"unexpected");assert.equal(p.canCompleteConversation(),false);

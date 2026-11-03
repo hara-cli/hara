@@ -59,7 +59,7 @@ async function clientFor(handle) {
     async close() { const closed = once(socket, "close"); socket.close(); await closed; },
   };
 }
-let host, handle, client, initialized, scope, sample, mainTools, channelTools, colleagueTools, mainPrompt;
+let host, handle, client, initialized, scope, sample, mainTools, channelTools, colleagueTools, mainPrompt, mainToolImplementations;
 before(async () => {
   const root = dir(), home = dir(), captures = [];
   host = new LocalWorkspaceHost(root, { mode: "workspace", hostHome: home, discoveryHome: home, credentialVault: new MemoryCredentialVault(),
@@ -68,6 +68,9 @@ before(async () => {
       return { text: "已查看。", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
     } }),
   });
+  // Observe real Host implementations: model-facing ToolSpec intentionally omits authority kinds.
+  const jobTools = host.jobTools.bind(host);
+  host.jobTools = (...args) => { const tools = jobTools(...args); if (args[1].kind === "main") mainToolImplementations = tools; return tools; };
   const workspace = host.createWorkspace("Operations", host.list().revision), id = workspace.workspaceId;
   host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("cards-client", id, host.list().revision);
   const resources = new WorkspaceResources(host.home, host.catalog.resolve(id).scope); resources.initialize();
@@ -287,7 +290,7 @@ test("RPC contract checker fails for a renamed documented route", async () => {
 
 test("chat scheduling card binds actual scoped tools and documents original confirmation/receipt semantics",()=>{
  const definition=card("chat-schedules");checkTools(definition.tools,mainTools);checkTools(definition.tools,colleagueTools);checkTools(definition.tools,channelTools);
- for(const name of ["schedule_create","schedule_cancel"]) assert.equal(mainTools.find(tool=>tool.name===name).kind,"edit");
- assert.equal(mainTools.find(tool=>tool.name==="schedule_list").kind,"read");
+ for(const name of ["schedule_create","schedule_cancel"]) assert.equal(mainToolImplementations.find(tool=>tool.name===name).kind,"edit");
+ assert.equal(mainToolImplementations.find(tool=>tool.name==="schedule_list").kind,"read");
  assert.match(definition.steps.join(" "),/15分钟/);assert.match(definition.steps.join(" "),/原Desk确认卡/);assert.match(definition.steps.join(" "),/created:true/);
 });
