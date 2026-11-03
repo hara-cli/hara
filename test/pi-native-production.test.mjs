@@ -345,7 +345,7 @@ for (const writeEffect of [true,false]) test("actual full Pi Workspace dispatch 
   });
   writeFileSync(join(f.project,"fixture.txt"),"read-only fixture");
   const outcome = await f.run();
-  assert.equal(f.calls,5,JSON.stringify(outcome));assert.equal(f.usage.modelCalls,5);assert.equal(f.binding.agent.permissionTier,"full-protected");
+  assert.equal(f.calls,5,JSON.stringify(outcome));assert.equal(f.usage.modelCalls,5);assert.equal(f.usage.toolCalls,4);assert.equal(f.binding.agent.permissionTier,"full-protected");
   if(writeEffect){assert.equal(outcome.status,"completed",JSON.stringify(outcome));assert.equal(readFileSync(join(f.project,"result.txt"),"utf8"),"verified native bytes");assert.equal(f.task.checkpoint.completion.state,"verified");}
   else {assert.notEqual(outcome.status,"completed");assert.notEqual(f.task.checkpoint?.completion?.state,"verified");}
 });

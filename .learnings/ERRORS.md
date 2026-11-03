@@ -11176,3 +11176,15 @@ The isolated Pi 1.5.0 RPC process accepted get_state but refused prompt with a c
 - Initial new TypeScript/narrowing and test syntax errors were corrected and the original build/failure logs retained. Do not treat a test file that failed to parse as a passed acceptance check.
 - Verification: production RPC, background descendant drain, resource traps, continuation restoration and request-local proxy tests pass with a hashed public-layer draft snapshot. Exact immutable public Pi/drain/N1 commits and Desk acceptance remain separate prerequisites.
 - Pattern-Key: pi_native.physical_close_and_per_attempt_capability
+
+
+## [ERR-20261103-PI-TIER-WIRING] Real SDK dependency code hit the credential basename mask
+
+- Status: resolved in Pi integration, pending coordinator integration
+- The actual full Workspace entry reached zero upstream model calls because the public generic credentials.* read mask also matched OpenAI SDK source resources/beta/agents/vaults/credentials.mjs. The hand-written prototype profile could not reveal this public-policy difference.
+- Keep the credential mask. Resolve the installed Pi SDK's OpenAI dependency from trusted Hara module identity and exempt only that exact single-link source file from the generic basename read mask. Do not exempt its directory, writes, Hara state, Keychain, or foreign credential roots. Its path participates in the policy key. Real Seatbelt verifies the SDK source is readable while a user's same-named SSH credential file is unreadable.
+- Native verified task_checkpoint requests are completion proposals until settled physical drain. They are queued to the real governor after drain, without claiming a successful receipt to the child. Real Workspace positive N1 passes and read-only/invented native proof is rejected; one physical model call is charged once.
+- Fixture corrections: checkpoint schema requires completion.evidence; omit empty optional tool_call_ids for native-only checks; durable completion lives in task.checkpoint.completion. Close the fixture's permit/installer before removing its private state. Existing controlled Pi fixtures must explicitly select controlled now that new bindings default full, and N1 checks must cite the observed write as well as the read verification.
+- Bun1.3.9 local file dependency install passes with the real Pi policy and (deny file-link), default backend, isolated HOME/cache and a loopback-only registry. This does not verify pnpm or arbitrary registry packages.
+- Public final 9c75b58 is merged with its S3 parent history; no rewrite/cherry-pick of its terminal fix. The accepted unobserved instantaneous daemon/reparent limitation remains; Pi uses only common ownership/drain.
+- A closeout call used an absolute task path and was held invalid_task_name, removed0. Use the registered task name at final closeout. Preserve original failure logs, without capabilities or real credentials.
