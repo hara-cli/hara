@@ -133,7 +133,7 @@ export class RuntimeExecutionPolicy {
     if (input.runtimeId === "cursor") writes.push(physical(join(home, ".cursor-agent/sessions")));
     const authNames: Record<RegisteredPolicyRuntime, string[]> = {
       codex: ["auth.json"], claude: [".credentials.json"], opencode: ["auth.json"], gemini: ["oauth_creds.json", "google_accounts.json"],
-      copilot: ["config.json"], cursor: ["cli-config.json"], kimi: ["config.toml"], grok: ["user-settings.json", "auth.json"],
+      copilot: ["config.json"], cursor: ["cli-config.json"], kimi: ["config.toml", "credentials/kimi-code.json"], grok: ["user-settings.json", "auth.json"],
     };
     const allCredentials = Object.entries(roots).flatMap(([id, root]) => authNames[id as RegisteredPolicyRuntime].map(name => physical(join(root, name))));
     const ownCredentials = authNames[input.runtimeId].map(name => physical(join(runtimeHome, name)));
@@ -149,7 +149,8 @@ export class RuntimeExecutionPolicy {
     const quotedSubpaths = (paths: readonly string[]) => paths.map(path => `(subpath ${quote(path)})`).join("\n  ");
     const literals = (paths: readonly string[]) => paths.map(path => `(literal ${quote(path)})`).join("\n  ");
     const keychains = [physical(join(home, "Library/Keychains"))];
-    const secretDirs = [".ssh", ".aws", ".azure", ".gnupg", ".config/gcloud"].map(name => physical(join(home, name)));
+    const secretDirs = [".ssh", ".aws", ".azure", ".gnupg", ".config/gcloud", ".kimi-code",
+      ...(input.runtimeId === "kimi" ? [] : [".kimi/credentials"])].map(name => physical(join(home, name)));
     const foreignCredentials = allCredentials.filter(path => !ownCredentials.includes(path));
     const generic = '#"(^|/)(auth[.]json|[.]credentials[.]json|oauth_creds[.]json|credentials([.][^/]*)?|[.]git-credentials|[.]netrc|[.]env([.][^/]*)?)$"';
     const readableExceptions = ownCredentials.map(path => `(require-not (literal ${quote(path)}))`).join(" ");

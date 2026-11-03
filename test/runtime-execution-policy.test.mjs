@@ -43,3 +43,13 @@ test("native diff evidence needs actual complete changes; a native event or pros
   assert.equal(p.collectWorkspaceEvidence().id,e.id);p.beginAttempt("next-attempt");assert.equal(p.collectWorkspaceEvidence(),null);
   p.observeNativeEvent({type:"command",status:"started",command:"git push with-sensitive-arguments"});assert.equal(p.risks.length,1);assert.equal(p.risks[0].state,"observed");assert.doesNotMatch(JSON.stringify(p.risks),/sensitive-arguments/);
 });
+
+test("foreign Kimi OAuth directories and the incompatible Kimi Code data root remain unreadable", {skip:process.platform!=="darwin"}, t=>{
+  const f=fixture(t), names=[".kimi/credentials/kimi-code.json",".kimi/credentials/custom.json",".kimi-code/config.toml",".kimi-code/credentials/kimi-code.json"];
+  for(const name of names){fs.mkdirSync(join(f.home,name.slice(0,name.lastIndexOf("/"))),{recursive:true});fs.writeFileSync(join(f.home,name),"FAKE_LOGIN_ONLY");}
+  for(const runtimeId of ["codex","claude","gemini"]){
+    const p=f.policy("full-protected",runtimeId);
+    const out=execute(p,`const fs=require('fs'),paths=${JSON.stringify(names.map(name=>join(f.home,name)))};console.log(JSON.stringify(paths.map(path=>{try{fs.readFileSync(path);return true}catch{return false}})));`,{HOME:f.home});
+    assert.equal(out.status,0,out.stderr);assert.deepEqual(JSON.parse(out.stdout),names.map(()=>false));
+  }
+});
