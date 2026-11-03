@@ -180,7 +180,7 @@ test("actual governed Host compacts at72% without an extra Provider or a usage r
         [{ id: "intake", name: "task_intake", input: { intent: "change", goal: "write hello.md", constraints: [], acceptance: ["exact bytes verified"], steps: ["write", "verify"] } }],
         [{ id: "write", name: "workspace_write", input: { path: "hello.md", content: "hello workspace\n" } }],
         [{ id: "verify", name: "workspace_verify", input: { path: "hello.md", expectedContent: "hello workspace\n" } }],
-        [{ id: "complete", name: "task_checkpoint", input: { completion: { state: "verified", checks: [{ acceptance_index: 0, evidence: "exact file bytes verified", tool_call_ids: ["verify"] }], final_answer: "verified" } } }],
+        [{ id: "complete", name: "task_checkpoint", input: { completion: { state: "verified", checks: [{ acceptance_index: 0, evidence: "exact file bytes verified", tool_call_ids: ["write", "verify"] }], final_answer: "verified" } } }],
       ];
       assert.ok(index < 4); return { text: "", toolUses: steps[index], stop: "tool_use", usage: { input: index < 2 ? burstInput : 10, output: 1 } };
     } };
