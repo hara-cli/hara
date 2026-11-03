@@ -58,7 +58,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, capabilities: [capability, "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, capabilities: [capability, "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
@@ -82,14 +82,17 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     }
     if (method === "workspace.channels.list") { fields(["workspaceId", "expectedGeneration"]); return host.listChannels(workspaceId); }
     if (method === "workspace.channels.create" || method === "workspace.channels.update") {
-      fields(["workspaceId", "expectedGeneration", "channelId", "name", "memberIds", "expectedRevision"]);
+      fields(["workspaceId", "expectedGeneration", "channelId", "name", "memberIds", "expectedRevision",
+        ...(method.endsWith(".update") && Object.hasOwn(params, "autonomy") ? ["autonomy"] : [])]);
       if (typeof params.channelId !== "string" || !UUID.test(params.channelId) || !text(params.name, 80)) throw new Error("invalid local channel");
       return method.endsWith(".create") ? host.createChannel(client.id, workspaceId, params.channelId, params.name, params.memberIds, params.expectedRevision as number)
-        : host.updateChannel(client.id, workspaceId, params.channelId, params.name, params.memberIds, params.expectedRevision as number);
+        : host.updateChannel(client.id, workspaceId, params.channelId, params.name, params.memberIds, params.expectedRevision as number, params.autonomy);
     }
-    if (["workspace.channels.select", "workspace.channels.snapshot", "workspace.channels.cancel"].includes(method)) {
+    if (["workspace.channels.select", "workspace.channels.snapshot", "workspace.channels.cancel", "workspace.channels.resumeQueue", "workspace.channels.clearQueue"].includes(method)) {
       fields(["workspaceId", "expectedGeneration", "channelId"]);
       if (typeof params.channelId !== "string" || !UUID.test(params.channelId)) throw new Error("invalid local channel");
+      if (method.endsWith(".resumeQueue")) return host.resumeChannelQueue(client.id, workspaceId, params.channelId);
+      if (method.endsWith(".clearQueue")) return host.clearChannelQueue(client.id, workspaceId, params.channelId);
       if (method.endsWith(".select")) return host.selectChannel(client.id, workspaceId, params.channelId);
       if (method.endsWith(".cancel")) { host.cancelChannel(client.id, workspaceId, params.channelId); return { state: "draining" }; }
       return host.channelSnapshot(workspaceId, params.channelId, client.id);

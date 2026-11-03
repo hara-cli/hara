@@ -46,6 +46,7 @@ import { WorkspacePreferences } from "./preferences.js";
 import { WorkspaceFeatures } from "./features.js";
 import { workspaceSkillTool } from "./skills.js";
 import { WorkspaceLocalChannels } from "./local-channels.js";
+import { assertChannelAutonomyProductionDispatch } from "./channel-autonomy.js";
 import { WorkspaceScheduler } from "./scheduler.js";
 import { legacyPolicyAllowsTool } from "./legacy-role-policy.js";
 import { workspaceMemorySearchTool } from "./memory-tool.js";
@@ -307,6 +308,7 @@ export class LocalWorkspaceHost {
     if (!rooms) {
       rooms = new WorkspaceLocalChannels(context.storage, {
         agents: () => context.resources.agents.list().agents,
+        prefilterProfiles: () => context.resources.agents.channelPrefilterProfiles(),
         accepting: () => !this.closing && !this.updateLease,
         changed: () => this.changed(workspaceId),
         start: (agentId, body, requestId, channelId, shared, clientId, questionId) => this.start(clientId, workspaceId, agentId, body, requestId, Boolean(questionId), undefined, undefined,
@@ -329,8 +331,8 @@ export class LocalWorkspaceHost {
   createChannel(clientId: string, workspaceId: string, channelId: string, name: string, memberIds: unknown, expectedRevision: number) {
     this.channelView(clientId, workspaceId); this.localChannels(workspaceId).create(channelId, name, memberIds, expectedRevision); return this.listChannels(workspaceId);
   }
-  updateChannel(clientId: string, workspaceId: string, channelId: string, name: string, memberIds: unknown, expectedRevision: number) {
-    this.channelView(clientId, workspaceId, channelId); this.localChannels(workspaceId).update(channelId, name, memberIds, expectedRevision); return this.listChannels(workspaceId);
+  updateChannel(clientId: string, workspaceId: string, channelId: string, name: string, memberIds: unknown, expectedRevision: number, autonomy?: unknown) {
+    this.channelView(clientId, workspaceId, channelId); this.localChannels(workspaceId).update(channelId, name, memberIds, expectedRevision, autonomy); return this.listChannels(workspaceId);
   }
   selectChannel(clientId: string, workspaceId: string, channelId: string) {
     const previous = this.channelView(clientId, workspaceId); this.localChannels(workspaceId).get(channelId);
@@ -339,7 +341,8 @@ export class LocalWorkspaceHost {
   }
   channelSnapshot(workspaceId: string, channelId: string, clientId: string) {
     const context = this.context(workspaceId), channel = this.localChannels(workspaceId).get(channelId), snapshot = this.localChannels(workspaceId).snapshot(channelId);
-    const participants = new Set(snapshot.turns.flatMap(turn => turn.replies.map(reply => reply.agentId)));
+    const participants = new Set(snapshot.turns.flatMap(turn => turn.replies
+      .filter(reply => reply.started).map(reply => reply.agentId)));
     const questions = channel.memberIds.filter(agentId => participants.has(agentId)).flatMap(agentId => {
       const value = new WorkspaceConversationStore(context.storage, agentId, channelId).read(), pendingQuestion = this.pendingUserQuestion(context, value);
       const pendingInteractions = this.pendingInteractions(context, value, []);
@@ -352,6 +355,8 @@ export class LocalWorkspaceHost {
     return { workspaceId, resourceGeneration: this.snapshotGeneration(workspaceId), ...snapshot, questions,
       approvals: [...this.pending.values()].filter(row => row.clientId === clientId && row.card.workspaceId === workspaceId && row.card.channelId === channelId).map(row => row.card) };
   }
+  /** Reserved engine boundary. No RPC, environment, persisted metadata or prompt can enable dispatch. */
+  startChannelAutonomy(): never { return assertChannelAutonomyProductionDispatch(); }
   sendChannel(clientId: string, workspaceId: string, channelId: string, message: string, requestId: string, recipientIds: unknown) {
     this.channelView(clientId, workspaceId, channelId);
     return { workspaceId, resourceGeneration: this.snapshotGeneration(workspaceId), ...this.localChannels(workspaceId).send(clientId, channelId, message, requestId, recipientIds) };
@@ -371,6 +376,14 @@ export class LocalWorkspaceHost {
   }
   cancelChannel(clientId: string, workspaceId: string, channelId: string) {
     this.channelView(clientId, workspaceId, channelId); this.localChannels(workspaceId).cancel(channelId);
+  }
+  resumeChannelQueue(clientId: string, workspaceId: string, channelId: string) {
+    this.channelView(clientId, workspaceId, channelId); this.localChannels(workspaceId).resumeQueue(clientId, channelId);
+    return this.channelSnapshot(workspaceId, channelId, clientId);
+  }
+  clearChannelQueue(clientId: string, workspaceId: string, channelId: string) {
+    this.channelView(clientId, workspaceId, channelId); this.localChannels(workspaceId).clearQueue(channelId);
+    return this.channelSnapshot(workspaceId, channelId, clientId);
   }
   async waitChannel(workspaceId: string, channelId: string) { await this.localChannels(workspaceId).wait(channelId); }
   activity() { return { running: [...this.jobs.values()].filter(job => !job.closed).length + [...this.channels.values()].reduce((sum, rooms) => sum + rooms.running(), 0) }; }
