@@ -54,6 +54,8 @@ import { workspaceSkillTool } from "./skills.js";
 import { WorkspaceLocalChannels } from "./local-channels.js";
 import { assertChannelAutonomyProductionDispatch } from "./channel-autonomy.js";
 import { WorkspaceScheduler } from "./scheduler.js";
+import { parseChatScheduleTime } from "./chat-schedule.js";
+import type { WorkspaceSchedule } from "./features.js";
 import { legacyPolicyAllowsTool } from "./legacy-role-policy.js";
 import { workspaceMemorySearchTool } from "./memory-tool.js";
 import { WorkspaceLegacyStartup, hasLegacyStartupSource, noLegacyStartup, type LegacyStartupStatus } from "./legacy-startup.js";
@@ -76,7 +78,7 @@ export interface LocalWorkspaceApproval {
   id: string; workspaceId: string; agentId: string; runId: string; expiresAt: string;
   resourceGeneration: string;
   channelId?: string;
-  kind: "agent_create"; draft: { username: string; displayName: string; title: string; instructions: string; runtimeId: "pi" };
+  kind: "agent_create" | "schedule_create"; draft: { username: string; displayName: string; title: string; instructions: string; runtimeId: "pi" } | { title: string; task: string; timing: string; tz: string };
 }
 type ApprovalSettleState = "declined" | "expired" | "aborted";
 type ApprovalDecision = { approved: true } | { approved: false; state: ApprovalSettleState };
@@ -231,13 +233,37 @@ export class LocalWorkspaceHost {
     context.legacyBusiness = this.options.legacyBusinessFactory?.({ storage, features: context.features, resources: folders })
       ?? new WorkspaceLegacyBusiness(storage, context.features, folders, { commands: { authorize: () => undefined,
         async launch() { throw new Error("Explicit legacy Host authority required"); } }, notifications: { authorize: () => undefined } });
+    const chatAnchorReason = (row: WorkspaceSchedule): string | null => {
+      if (row.source !== "chat") return null;
+      const anchor = row.definition.anchor;
+      if (!plain(anchor) || anchor.workspaceId !== workspaceId || anchor.agentId !== row.definition.agentId || typeof anchor.conversationId !== "string"
+        || typeof anchor.messageId !== "string" || typeof anchor.runtimeId !== "string") return "chat_anchor_unavailable";
+      const agent = resources.agents.get(anchor.agentId as string);
+      if (!agent || agent.state !== "active") return "chat_agent_missing";
+      if (agent.runtime.id !== anchor.runtimeId || agent.configRevision !== anchor.configRevision || agent.agentEpoch !== anchor.agentEpoch) return "chat_runtime_changed";
+      try {
+        const channelId = typeof anchor.channelId === "string" ? anchor.channelId : undefined;
+        if (channelId && !this.localChannels(workspaceId).get(channelId).memberIds.includes(agent.agentId)) return "chat_conversation_missing";
+        const store = new WorkspaceConversationStore(storage, agent.agentId, channelId);
+        if (store.sessionId !== anchor.conversationId || !store.read().requests.some(request => request.requestId === anchor.messageId)) return "chat_conversation_missing";
+        context.connections.resolve(anchor.connection as ScopedRunConnection);
+      } catch { return "chat_conversation_missing"; }
+      return null;
+    };
     context.scheduler = new WorkspaceScheduler(storage, context.features, {
+      validateAnchor: chatAnchorReason,
       available: agentId => !this.closing && !this.updateLease && Boolean(resources.agents.get(agentId)?.state === "active")
         && ![...this.jobs.values()].some(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId),
-      execute: async (agentId, task, requestId) => {
-        const accepted = this.start(`schedule:${workspaceId}`, workspaceId, agentId, task, requestId);
-        await this.wait(accepted.runId); const result = this.snapshot(workspaceId, agentId);
-        this.changed(workspaceId, agentId); return { runId: accepted.runId, completed: result.conversation.taskState === "completed" };
+      execute: async (agentId, task, requestId, row) => {
+        if (chatAnchorReason(row)) return { runId: "", completed: false };
+        const anchor = row.source === "chat" && plain(row.definition.anchor) ? row.definition.anchor : null;
+        const channelId = anchor && typeof anchor.channelId === "string" ? anchor.channelId : undefined;
+        const accepted = this.start(`schedule:${workspaceId}`, workspaceId, agentId, task, requestId, false, undefined, undefined,
+          { source: "host", channel: "internal", clientId: `schedule:${workspaceId}` }, channelId ? { id: channelId, context: "Scheduled continuation of this conversation." } : undefined,
+          undefined, anchor ? anchor.connection as ScopedRunConnection : undefined);
+        await this.wait(accepted.runId); const conversation = new WorkspaceConversationStore(storage, agentId, channelId).read();
+        this.changed(workspaceId, agentId); if (channelId) this.changed(workspaceId);
+        return { runId: accepted.runId, completed: conversation.task?.status === "completed" };
       },
       executeLegacy: async (row, requestId) => {
         if (row.definition.mode === "command") {
@@ -765,7 +791,7 @@ export class LocalWorkspaceHost {
     assertWorkspaceRunAdmission(pending.job.permit, pending.job.options!, pending.job.binding.agent.runtimeId);
     pending.finish(approved ? { approved: true } : { approved: false, state: "declined" });
   }
-  private approval(job: LocalJob, draft: LocalWorkspaceApproval["draft"]): Promise<ApprovalDecision> {
+  private approval(job: LocalJob, draft: LocalWorkspaceApproval["draft"], kind: LocalWorkspaceApproval["kind"] = "agent_create"): Promise<ApprovalDecision> {
     const selection = this.clients.get(job.clientId);
     if (this.options.interactiveApprovals === false || !selection || selection.workspaceId !== job.workspaceId
       || (job.channelId ? selection.channelId !== job.channelId : selection.channelId || selection.agentId !== job.agentId) || job.signal.aborted) {
@@ -773,7 +799,7 @@ export class LocalWorkspaceHost {
     }
     const card: LocalWorkspaceApproval = { id: randomUUID(), workspaceId: job.workspaceId, agentId: job.agentId,
       resourceGeneration: job.binding.agent.resourceBinding.generation, ...(job.channelId ? { channelId: job.channelId } : {}),
-      runId: job.binding.runId, kind: "agent_create", expiresAt: new Date(Date.parse(job.value.attempt!.startedAt) + (typeof this.options.approvalTimeoutMs === "number" && this.options.approvalTimeoutMs > 0 ? this.options.approvalTimeoutMs : job.binding.budget.timeoutMs)).toISOString(), draft: Object.freeze({ ...draft }) };
+      runId: job.binding.runId, kind, expiresAt: new Date(Date.parse(job.value.attempt!.startedAt) + (typeof this.options.approvalTimeoutMs === "number" && this.options.approvalTimeoutMs > 0 ? this.options.approvalTimeoutMs : job.binding.budget.timeoutMs)).toISOString(), draft: Object.freeze({ ...draft }) };
     return new Promise(resolve => {
       const onAbort = () => finish({ approved: false, state: "aborted" });
       const finish = (decision: ApprovalDecision) => {
@@ -843,7 +869,7 @@ export class LocalWorkspaceHost {
   private pendingInteractions(context: WorkspaceHostContext, value: WorkspaceConversation, cards: readonly LocalWorkspaceApproval[]): WorkspaceInteractionRequest[] {
     this.pendingUserQuestion(context, value); // reconcile/materialize the retained sync ask first
     const asks = this.interactionFor(context, value)?.pendingInteractions() ?? [];
-    return [...cards.map(workspacePermissionInteraction), ...asks];
+    return [...cards.map(card => workspacePermissionInteraction({ id: card.id, kind: card.kind, runId: card.runId, draft: { displayName: card.kind === "schedule_create" ? (card.draft as { title: string }).title : (card.draft as { displayName: string }).displayName } })), ...asks];
   }
   private questionCheckpoint(task: TaskExecution, question: WorkspaceUserQuestion): TaskExecution {
     if (task.status === "paused" && freshTaskCompletion(task)?.state === "awaiting_user"
@@ -884,7 +910,7 @@ export class LocalWorkspaceHost {
         assertCurrent(); const proof = workspaceRunNativeEvidence(job.permit!);
         return JSON.stringify(proof ? { verified: true, nativeEvidence: proof } : { verified: false, nativeEvidence: null });
       } });
-    const channelId = job.channelId, rooms = () => this.localChannels(job.workspaceId);
+    const channelId = job.channelId, rooms = () => this.localChannels(job.workspaceId), host = this;
     if (channelId) {
       tools.push({ name: "channel_sync", description: "Re-read this local channel now: members and every message so far, including replies written after your turn started. Read-only; same shape as your starting channel transcript.", kind: "read",
         input_schema: { type: "object", properties: {} }, async run(input) {
@@ -904,6 +930,41 @@ export class LocalWorkspaceHost {
           return JSON.stringify(rooms().peerWake(channelId, job.id, job.agentId, input.agentId, input.note as string | undefined));
         } });
     }
+    tools.push({ name: "schedule_create", description: "Schedule one task in this exact Workspace conversation. Choose exactly one: delay_seconds, fire_at (ISO UTC), or repeat (every:15m/h/d, daily@HH:MM, weekly:mon,fri@HH:MM). Repeating tasks require a Desk approval card before creation; minimum repeat interval is 15 minutes.", kind: "edit",
+      input_schema: { type: "object", properties: { title: { type: "string" }, task: { type: "string" }, delay_seconds: { type: "integer" }, fire_at: { type: "string" }, repeat: { type: "string" }, tz: { type: "string" } }, required: ["title", "task"] },
+      async run(input) {
+        if (!plain(input) || !text(input.title, 256) || !text(input.task, 8000) || !Object.keys(input).every(key => ["title", "task", "delay_seconds", "fire_at", "repeat", "tz"].includes(key))) throw new Error("Invalid schedule request");
+        assertCurrent(); const timing = parseChatScheduleTime(input);
+        const messageId = job.value.requests.at(-1)?.requestId;
+        if (!messageId) throw new Error("Schedule message anchor unavailable");
+        const anchor = { workspaceId: job.workspaceId, conversationId: job.store.sessionId, messageId, agentId: job.agentId,
+          ...(job.channelId ? { channelId: job.channelId } : {}), runtimeId: job.binding.agent.runtimeId,
+          configRevision: agent.configRevision, agentEpoch: agent.agentEpoch, connection: job.binding.connection };
+        if (timing.repeated) {
+          const decision = await host.approval(job, { title: input.title, task: input.task, timing: input.repeat as string, tz: timing.tz }, "schedule_create");
+          if (!decision.approved) return JSON.stringify({ created: false, approvalState: decision.state });
+        }
+        assertCurrent(); const id = job.context.features.createChatSchedule({ title: input.title, task: input.task, agentId: job.agentId, time: timing, anchor });
+        host.changed(job.workspaceId, job.agentId);
+        return JSON.stringify({ created: true, id, nextRunAt: job.context.scheduler!.list().schedules.find(row => row.id === id)?.nextRunAt ?? null });
+      } });
+    tools.push({ name: "schedule_list", description: "List this Workspace's schedules; a colleague sees only their own chat schedules, while main Hara sees all schedules.", kind: "read",
+      input_schema: { type: "object", properties: {} }, async run(input) {
+        if (!plain(input) || !exact(input, [])) throw new Error("Invalid schedule list request");
+        assertCurrent(); const rows = job.context.features.list().schedules.filter(row => agent.kind === "main" || row.source === "chat" && row.agentId === job.agentId);
+        const timings = new Map(job.context.scheduler!.list().schedules.map(row => [row.id, row.nextRunAt]));
+        return JSON.stringify({ schedules: rows.map(row => ({ ...row, nextRunAt: timings.get(row.id) ?? null })) });
+      } });
+    tools.push({ name: "schedule_cancel", description: "Cancel a schedule by exact ID. A colleague may cancel only their own chat schedules; main Hara may cancel any schedule in this Workspace.", kind: "edit",
+      input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] }, async run(input) {
+        if (!plain(input) || !exact(input, ["id"]) || !text(input.id)) throw new Error("Invalid schedule ID");
+        assertCurrent(); const row = job.context.features.schedules().find(item => item.id === input.id);
+        if (!row || agent.kind !== "main" && (row.source !== "chat" || row.definition.agentId !== job.agentId)) throw new Error("Schedule unavailable to this colleague");
+        if (row.source !== "chat" && row.source !== "workspace") throw new Error("Legacy schedule remains with its original scheduler");
+        if (job.context.scheduler!.list().runs.some(run => run.scheduleId === row.id && ["running", "unknown"].includes(run.state))) throw new Error("Schedule run is active or outcome-unknown");
+        job.context.features.deleteSchedule(row.id, job.context.features.list().revision); host.changed(job.workspaceId, job.agentId);
+        return JSON.stringify({ cancelled: true, id: row.id });
+      } });
     if (agent.kind !== "main") return withWorkspaceToolReceipts(tools);
     tools.push({ name: "agent_list", description: "Read the active colleagues of THIS Workspace only. Check existing names/IDs before creating or delegating; never recreate an already active colleague to repair a completion citation.", kind: "read",
       input_schema: { type: "object", properties: {} }, async run(input) {
@@ -937,7 +998,6 @@ export class LocalWorkspaceHost {
         host.changed(job.workspaceId, job.agentId);
         return JSON.stringify({ renamed: true, agentId: renamed.agentId, previousName: current.identity.displayName, displayName: renamed.identity.displayName });
       } });
-    const host = this;
     const handoff = (value: { completed: boolean; agentId: string; taskId: string; runId: string; completion: unknown;
       retainedReceipt?: boolean; usageAtDispatch?: { availability: "available" | "unknown"; fresh: boolean } }) => {
       const raw = JSON.stringify(value);
@@ -983,7 +1043,8 @@ export class LocalWorkspaceHost {
     return withWorkspaceToolReceipts(tools);
   }
   start(clientId: string, workspaceId: string, agentId: string, message: string, requestId: string, resume = false, parent?: LocalJob, parentSignal?: AbortSignal,
-    origin: WorkspaceRequestOrigin = { source: "host", channel: "internal", clientId }, channel?: { id: string; context: string }, questionId?: string) {
+    origin: WorkspaceRequestOrigin = { source: "host", channel: "internal", clientId }, channel?: { id: string; context: string }, questionId?: string,
+    scheduledConnection?: ScopedRunConnection) {
     if (this.closing || this.updateLease || !messageBody(message) || !UUID.test(requestId)) throw new Error("invalid Workspace message or closing/updating Host");
     const context = this.context(workspaceId), agent = context.resources.agents.get(agentId);
     if (!agent || agent.state !== "active" || !context.resources.agents.runtimeOptions().some(row => row.id === agent.runtime.id && row.available))
@@ -1049,7 +1110,7 @@ export class LocalWorkspaceHost {
         if (value.task) value.pastTasks.push({ task: value.task, usage: value.runUsage, endedAt: new Date().toISOString() });
         task = context.resources.agents.bindTask(createTaskExecution(message, randomUUID()), agentId, agent.configRevision, agent.agentEpoch);
         task.workspaceRunBinding = freezeWorkspaceRunBinding({ schemaVersion: 1, scope: row.scope, agent: task.workspaceAgentBinding!,
-          agentBindingHash: workspaceAgentBindingHash(task.workspaceAgentBinding!), connection: context.connections.capture(), runtimeContract: "hara-governed-runtime-v1",
+          agentBindingHash: workspaceAgentBindingHash(task.workspaceAgentBinding!), connection: scheduledConnection ?? context.connections.capture(), runtimeContract: "hara-governed-runtime-v1",
           project: captureWorkspaceProjectIdentity(context.project), sessionId: store.sessionId, runId: randomUUID(),
           lineage: parent ? { rootRunId: parent.binding.lineage.rootRunId ?? parent.id, parentRunId: parent.id, depth: 1 } : { rootRunId: null, parentRunId: null, depth: 0 },
           createdAt: new Date().toISOString(), host: { hostId: host.hostId, hostEpoch: host.hostEpoch, grantId: row.grantId, grantRevision: row.grantRevision, actorId: row.actorId, policyRevision: row.policyRevision },
