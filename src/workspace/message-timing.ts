@@ -30,7 +30,7 @@ export function parseMessageTimingReport(value: unknown): MessageTimingReport | 
     || !record(value.points) || !exact(value.points, MESSAGE_TIMING_POINTS) || value.points.T1 !== 0) return null;
   for (const point of MESSAGE_TIMING_POINTS) {
     const at = value.points[point];
-    if (at !== null && (!Number.isSafeInteger(at) || Number(at) < (point === "T0" ? -LIMIT : 0) || Number(at) > (point === "T0" ? 0 : LIMIT))) return null;
+    if (at !== null && (!Number.isSafeInteger(at) || Number(at) < (point === "T0" ? -LIMIT : 0) || Number(at) > (point === "T0" ? Number(value.clientClockErrorMs ?? 0) : LIMIT))) return null;
   }
   if ((value.points.T0 === null) !== (value.clientClockErrorMs === null) || value.points.T7 !== null && value.clientClockErrorMs === null) return null;
   return structuredClone(value) as unknown as MessageTimingReport;
@@ -45,7 +45,7 @@ export class MessageTimingRecorder {
     this.began = options.receivedAt ?? this.now();
     if (!Number.isFinite(this.began) || this.began < 0) throw new Error("Invalid message timing clock");
     const client = parseMessageTimingInput(options.client);
-    if (client && client.hostAtMs <= this.began && this.began - client.hostAtMs <= 60_000) {
+    if (client && client.hostAtMs <= this.began + Math.ceil(client.errorMs) && this.began - client.hostAtMs <= 60_000) {
       this.points.T0 = Math.floor(client.hostAtMs - this.began); this.errorMs = Math.ceil(client.errorMs);
     }
   }

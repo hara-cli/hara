@@ -24,6 +24,7 @@ test("closed metadata rejects raw content, foreign identity and malformed timing
  for(const value of [{...report,prompt:"private"},{...report,workspaceId:"wrong"},{...report,points:{...report.points,T4:-1}},{...report,points:{...report.points,T7:1}},{...report,historyStart:4001}])assert.equal(parseMessageTimingReport(value),null);
  for(const input of [{hostAtMs:1,errorMs:1001},{hostAtMs:"1",errorMs:0},{hostAtMs:1,errorMs:0,token:"x"}])assert.equal(parseMessageTimingInput(input),null);
  assert.equal(new MessageTimingRecorder({receivedAt:1000,client:{hostAtMs:1001,errorMs:0},now:()=>1000}).snapshot(identity()).points.T0,null);
+ assert.equal(new MessageTimingRecorder({receivedAt:1000,client:{hostAtMs:1001,errorMs:2},now:()=>1000}).snapshot(identity()).points.T0,1);
  assert.equal(r.paint({hostAtMs:1000,errorMs:0}),false);
 });
 test("late paint must match clock error and a bounded real-time window",()=>{
