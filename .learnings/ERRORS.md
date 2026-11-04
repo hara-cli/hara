@@ -11246,3 +11246,16 @@ Final verification: build-pass.log succeeded; focused-pass.log contains 27/27 pa
 - Evidence: native Codex 0.163.0 synthetic HOME initialize rejects disabled-only MCP tables; Seatbelt raw-string path escaping denies SQLite state; native thread creation also needs its writer-lock directory. Fake RPC fixtures alone did not exercise these contracts.
 - Fix: inert valid MCP replacement, correctly escaped closed SQLite/state paths, opt-in bounded redacted first-line diagnostics. Add actual CLI metadata-only initialize/thread-start positive and negative tests with synthetic credentials only. Final evidence in local project inbox/2026-11-04-wave2-codex-failed-fix.md. Native host 0.163.0 already completed one inference and returned a reply; a separate plain greeting closeout and prepared adhoc artifact remain under verification. Installation and Jeff acceptance are separate, pending states.
 - Execution corrections: exact registered binary first; create the fixture TMPDIR; metadata-only ENOENT/version mismatches consume no model budget; original probes retained and no accepted/unknown native turn is replayed.
+
+
+## [ERR-20261104-CODEX-RESIDUAL-DENIES] Keep model metadata writable without allowing global installers
+
+- Logged: 2026-11-04T16:49:19.028771+08:00
+- Priority: medium
+- Status: resolved locally; integration/installation held by the task
+- Area: runtime/security/tests
+- Summary: Codex 0.163.0 could refresh a model list in memory, but the protected host boundary rejected models_cache.json persistence. Its embedded-skills installer also tried to replace the user's global skills/.system.
+- Resolution: Allow only the literal models_cache.json in the common Codex execution policy. Version-matched save_file uses fs::write directly, so no speculative temporary basename is allowed. Pass skills.bundled.enabled=false through the shared launch override helper; keep global skills writes denied. No stderr filtering or process-tree lifecycle changes are needed.
+- Verification: Build and 74 focused tests pass serially, including native initialize/thread-start without turn-start. Synthetic HOME plus loopback catalog probes confirm new/updated metadata persistence, online refresh on restart, fail-closed explicit-catalog invalidation persisted to disk, expired-cache refresh, and unchanged auth/config/system-skill sentinels. Real model calls: 0.
+- Probe lessons: Built-in provider IDs cannot be overridden in 0.163.0; use a named synthetic provider with model_catalog_url for a local fixture. App Server's refresh worker fetches online on startup, and explicit-catalog failures invalidate rather than fall back; neither cache reuse nor offline fallback may be inferred from a successful write. Empty optional etag is omitted when serialized. Failed exploration logs were retained. A new protected-root negative initially omitted wrap.env; its unspawned ownership guard correctly failed close. Supply the fixture env; do not weaken the common drain boundary.
+- Related Files: src/agent-runtime/execution-policy.ts, src/agent-runtime/codex-host-config.ts, test/codex-host-startup.test.mjs, test/reply-latency-defaults.test.mjs
