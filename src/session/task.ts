@@ -938,8 +938,9 @@ export function recordTaskRoundUsage(
   const budget = taskRoundBudget(task);
   return {
     ...task,
-    roundsUsed: Math.min(budget.limit, budget.used + rounds),
-    roundBudgetLimit: budget.limit,
+    roundsUsed: task.workspaceRunBinding?.budget.mode === "interactive" ? budget.used + rounds : Math.min(budget.limit, budget.used + rounds),
+    roundBudgetLimit: task.workspaceRunBinding?.budget.mode === "interactive"
+      ? Math.max(budget.limit, Math.ceil((budget.used + rounds) / DEFAULT_TASK_ROUND_BUDGET) * DEFAULT_TASK_ROUND_BUDGET) : budget.limit,
     updatedAt: iso(at),
   };
 }
@@ -1624,8 +1625,8 @@ export function isTaskExecution(value: unknown): value is TaskExecution {
     (task.endedAt !== undefined && !validTimestamp(task.endedAt)) ||
     (task.lastOutcome !== undefined && task.lastOutcome !== "completed" && task.lastOutcome !== "error" && task.lastOutcome !== "empty" && task.lastOutcome !== "halted" && task.lastOutcome !== "interrupted")
     || ((task.roundsUsed === undefined) !== (task.roundBudgetLimit === undefined))
-    || (task.roundsUsed !== undefined && (!Number.isSafeInteger(task.roundsUsed) || (task.roundsUsed as number) < 0 || (task.roundsUsed as number) > MAX_TASK_ROUND_BUDGET))
-    || (task.roundBudgetLimit !== undefined && (!Number.isSafeInteger(task.roundBudgetLimit) || (task.roundBudgetLimit as number) < DEFAULT_TASK_ROUND_BUDGET || (task.roundBudgetLimit as number) > MAX_TASK_ROUND_BUDGET || (task.roundBudgetLimit as number) % DEFAULT_TASK_ROUND_BUDGET !== 0))
+    || (task.roundsUsed !== undefined && (!Number.isSafeInteger(task.roundsUsed) || (task.roundsUsed as number) < 0 || (task.workspaceRunBinding?.budget.mode !== "interactive" && (task.roundsUsed as number) > MAX_TASK_ROUND_BUDGET)))
+    || (task.roundBudgetLimit !== undefined && (!Number.isSafeInteger(task.roundBudgetLimit) || (task.roundBudgetLimit as number) < DEFAULT_TASK_ROUND_BUDGET || (task.workspaceRunBinding?.budget.mode !== "interactive" && (task.roundBudgetLimit as number) > MAX_TASK_ROUND_BUDGET) || (task.roundBudgetLimit as number) % DEFAULT_TASK_ROUND_BUDGET !== 0))
     || (typeof task.roundsUsed === "number" && typeof task.roundBudgetLimit === "number" && task.roundsUsed > task.roundBudgetLimit)
   ) return false;
   if (task.brief !== undefined) {

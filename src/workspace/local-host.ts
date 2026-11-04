@@ -18,7 +18,8 @@ import { currentWorkspaceResourceBinding, workspaceStateHome, WorkspaceResourceS
 import { WorkspaceConnectionStoreV2, type ScopedConnection, type ScopedRunConnection } from "./scoped-connections.js";
 import { closedWorkspaceHistory, WorkspaceConversationStore, type WorkspaceConversation, type WorkspaceUsage } from "./conversations.js";
 import { WorkspaceSessionLease } from "./session-lease.js";
-import { DEFAULT_WORKSPACE_RUN_BUDGET, captureWorkspaceProjectIdentity, freezeWorkspaceRunBinding, workspaceAgentBindingHash, type WorkspaceRunBinding } from "./run-binding.js";
+import { compactWorkspaceRoster } from "./management-context.js";
+import { DEFAULT_WORKSPACE_RUN_BUDGET, INTERACTIVE_WORKSPACE_RUN_BUDGET, captureWorkspaceProjectIdentity, freezeWorkspaceRunBinding, workspaceAgentBindingHash, type WorkspaceRunBinding } from "./run-binding.js";
 import { createWorkspaceRunPermit, bindWorkspaceRunOptions, assertWorkspaceRunAdmission, assertWorkspaceRunContextCurrent, closeWorkspaceRunPermit, type WorkspaceRunPermit } from "./execution.js";
 import { WorkspaceBudgetAdmissionError, WorkspaceTreeBudget } from "./tree-budget.js";
 import { WorkspaceRequestJournal, type WorkspaceRequestOrigin } from "./request-journal.js";
@@ -766,7 +767,7 @@ export class LocalWorkspaceHost {
     if (!binding || value.task?.status === "completed") return { allowed: false, reason: "no_resumable_task" };
     const failure = this.resumeProviderFailure(context, value, channelId);
     if (failure) return { allowed: false, reason: failure };
-    try { new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget).assertResumeAdmission(value.runUsage); return { allowed: true, reason: null }; }
+    try { new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget, binding.lineage.depth === 1).assertResumeAdmission(value.runUsage); return { allowed: true, reason: null }; }
     catch (error) { return { allowed: false, reason: error instanceof WorkspaceBudgetAdmissionError ? error.reason : "budget_unavailable" }; }
   }
   private resumeProviderFailure(context: WorkspaceHostContext, value: WorkspaceConversation, channelId?: string) {
@@ -800,7 +801,7 @@ export class LocalWorkspaceHost {
     }
     const card: LocalWorkspaceApproval = { id: randomUUID(), workspaceId: job.workspaceId, agentId: job.agentId,
       resourceGeneration: job.binding.agent.resourceBinding.generation, ...(job.channelId ? { channelId: job.channelId } : {}),
-      runId: job.binding.runId, kind, expiresAt: new Date(Date.parse(job.value.attempt!.startedAt) + (typeof this.options.approvalTimeoutMs === "number" && this.options.approvalTimeoutMs > 0 ? this.options.approvalTimeoutMs : job.binding.budget.timeoutMs)).toISOString(), draft: Object.freeze({ ...draft }) };
+      runId: job.binding.runId, kind, expiresAt: new Date((job.binding.budget.mode === "interactive" ? Date.now() : Date.parse(job.value.attempt!.startedAt)) + (typeof this.options.approvalTimeoutMs === "number" && this.options.approvalTimeoutMs > 0 ? this.options.approvalTimeoutMs : job.binding.budget.timeoutMs)).toISOString(), draft: Object.freeze({ ...draft }) };
     return new Promise(resolve => {
       const onAbort = () => finish({ approved: false, state: "aborted" });
       const finish = (decision: ApprovalDecision) => {
@@ -967,10 +968,19 @@ export class LocalWorkspaceHost {
         return JSON.stringify({ cancelled: true, id: row.id });
       } });
     if (agent.kind !== "main") return withWorkspaceToolReceipts(tools);
-    tools.push({ name: "agent_list", description: "Read the active colleagues of THIS Workspace only. Check existing names/IDs before creating or delegating; never recreate an already active colleague to repair a completion citation.", kind: "read",
+    tools.push({ name: "agent_list", description: "Read the active colleagues of THIS Workspace only. Compact column rows: id, name, one-line role, runtime, state. Use the preloaded roster first; agent_get returns details by exact id. Never recreate an active colleague to repair a citation.", kind: "read",
       input_schema: { type: "object", properties: {} }, async run(input) {
         if (!plain(input) || !exact(input, [])) throw new Error("invalid colleague listing");
-        assertCurrent(); return JSON.stringify({ agents: job.context.resources.agents.list().agents });
+        assertCurrent(); return JSON.stringify(compactWorkspaceRoster(job.context.resources.agents.list().agents));
+      } });
+    tools.push({ name: "agent_get", kind: "read", description: "Read the full public profile of one colleague in THIS Workspace by exact agentId. No private instructions or credentials.",
+      input_schema: { type: "object", properties: { agentId: { type: "string" } }, required: ["agentId"] },
+      async run(input) {
+        if (!plain(input) || !exact(input, ["agentId"]) || !text(input.agentId)) throw new Error("invalid colleague detail");
+        assertCurrent(); const found = job.context.resources.agents.get(input.agentId);
+        if (!found) throw new Error("colleague unavailable in THIS Workspace");
+        return JSON.stringify({ agentId: found.agentId, identity: found.identity, description: found.description,
+          runtime: found.runtime.id, state: found.state });
       } });
     tools.push({ name: "agent_create", description: "Create one colleague AFTER a fresh human confirmation. This tool waits while the card is pending; created:true is returned ONLY AFTER the card was approved and the colleague is active. Never ask for confirmation again after success. The internal runtime is pi; call them 同事 in user-facing text.", kind: "edit",
       input_schema: { type: "object", properties: { username: { type: "string" }, displayName: { type: "string" }, title: { type: "string" }, instructions: { type: "string" } }, required: ["username", "displayName", "title", "instructions"] },
@@ -1080,7 +1090,25 @@ export class LocalWorkspaceHost {
         const failure = this.resumeProviderFailure(context, value, channel?.id);
         if (failure) throw new WorkspaceProviderAdmissionError(failure);
         const binding = value.task.workspaceRunBinding;
-        new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget).assertResumeAdmission(value.runUsage);
+        new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget, binding.lineage.depth === 1).assertResumeAdmission(value.runUsage);
+      }
+      if (questionId && pendingQuestion?.reason === "runaway_guard") {
+        if (!["Continue", "Stop", "继续", "繼續", "停止"].includes(message.trim())) throw new Error("Choose Continue or Stop at the runaway safety checkpoint");
+        if (["Stop", "停止"].includes(message.trim())) {
+          this.interactionFor(context, value)!.answer(questionId);
+          value.history.push({ role: "user", content: message });
+          value.task = finishTaskExecution(value.task!, undefined, [], true)!;
+          if (value.task.checkpoint) {
+            const { completion: _completion, ...checkpoint } = value.task.checkpoint;
+            value.task = { ...value.task, checkpoint };
+          }
+          if (value.attempt) value.attempt = { ...value.attempt, state: "cancelled", endedAt: new Date().toISOString() };
+          value.requests.push({ requestId, digest, taskId: value.task.id, runId: value.task.workspaceRunBinding!.runId });
+          value = store.save(value.revision, value);
+          const runId = value.task!.workspaceRunBinding!.runId;
+          journal.settle(requestId, "accepted", { taskId: value.task!.id, runId });
+          lease.release(); this.changed(workspaceId, agentId); return { runId, duplicate: false };
+        }
       }
       if (value.attempt?.state === "running" || value.attempt?.state === "draining") {
         value.attempt = { ...value.attempt, state: "interrupted", endedAt: new Date().toISOString() };
@@ -1118,7 +1146,8 @@ export class LocalWorkspaceHost {
           project: captureWorkspaceProjectIdentity(context.project), sessionId: store.sessionId, runId: randomUUID(),
           lineage: parent ? { rootRunId: parent.binding.lineage.rootRunId ?? parent.id, parentRunId: parent.id, depth: 1 } : { rootRunId: null, parentRunId: null, depth: 0 },
           createdAt: new Date().toISOString(), host: { hostId: host.hostId, hostEpoch: host.hostEpoch, grantId: row.grantId, grantRevision: row.grantRevision, actorId: row.actorId, policyRevision: row.policyRevision },
-          budget: parent ? { ...parent.binding.budget } : { ...DEFAULT_WORKSPACE_RUN_BUDGET,
+          budget: parent ? { ...(parent.binding.budget.mode === "interactive" ? DEFAULT_WORKSPACE_RUN_BUDGET : parent.binding.budget) } : { ...(!this.realKey && !scheduledConnection && origin.source === "ui" && origin.channel === "rpc"
+            ? INTERACTIVE_WORKSPACE_RUN_BUDGET : DEFAULT_WORKSPACE_RUN_BUDGET),
             // Live-provider acceptance deliberately keeps its independent 80k/5-minute envelope.
             // The ordinary 128k default must not expand that explicit test-spend boundary.
             ...(this.realKey ? { maxTokens: 80000, timeoutMs: 300000 } : {}) } });
@@ -1147,10 +1176,10 @@ export class LocalWorkspaceHost {
       value.attempt = { attemptId: lease.attemptId, fence: (value.attempt?.fence ?? 0) + 1, runId: binding.runId, state: "running", startedAt: new Date().toISOString(), endedAt: null };
       value.requests.push({ requestId, digest, taskId: task.id, runId: binding.runId }); value = store.save(value.revision, value);
       journal.settle(requestId, "accepted", { taskId: task.id, runId: binding.runId });
-      if (questionId) this.interactionFor(context, value)!.answer(questionId);
+      if (questionId) this.interactionFor(context, value)!.answer(questionId, new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget, binding.lineage.depth === 1).read().usage.modelCalls);
       job = { id: binding.runId, workspaceId, agentId, clientId, context, store, value, lease, controller, ...(channel ? { channelId: channel.id } : {}),
         signal: parent ? AbortSignal.any([controller.signal, parent.signal, ...(parentSignal ? [parentSignal] : [])]) : controller.signal, binding, promise: Promise.resolve(), closed: false };
-      const owned = job, tree = new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget);
+      const owned = job, tree = new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget, binding.lineage.depth === 1);
       try {
         owned.stageStore = new WorkspaceRuntimeStageStore(context.storage, store.sessionId, agentId);
         owned.runtimeStages = new RuntimeStageRecorder({ workspaceId,
@@ -1195,11 +1224,12 @@ export class LocalWorkspaceHost {
         systemOverride: `You are ${configuration.identity.displayName}, a clearly identified Hara AI colleague. ${instructions}\nUse only this Workspace's supplied tools. Never claim completion without observed evidence.\n` + shared
           + `Reply naturally in the user's language. Call AI coworkers 同事, not Pi 同事; pi is only an internal runtime. A greeting needs no tools.\n`
           + `${owned.startContext.prompt}\n`
-          + `Use workspace_context_lookup to resolve missing names and aliases. Core pauses after two unresolved lookups or a budget warning. Use ask_user for a real problem or material ambiguity; never guess a user answer.\n`
+          + `Current Workspace colleague directory (catalog_only; fresh at admission, no authority or completion evidence): ${JSON.stringify(compactWorkspaceRoster(context.resources.agents.list().agents))}. Use this before calling agent_list; fetch again only if missing, truncated or changed. Full public detail: agent_get by exact id.\n`
+          + `Use workspace_context_lookup to resolve missing names and aliases. Core pauses after two unresolved lookups or a recoverable safety checkpoint. Use ask_user for a real problem or material ambiguity; never guess a user answer.\n`
           + `For creation use agent_create and wait for the human card; for delegation use agent_contact with an existing exact agentId.\n`
           + `每轮最多建立一位同事。\n`
           + `For a requested rename use agent_rename on the resolved existing colleague; the new name is not a reference to look up.\n`
-          + `agent_create returns only AFTER the human has approved; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. created:false with approvalState declined/expired/aborted means no colleague was created — tell the human they can ask again; do not re-open a card unless they ask. Check agent_list before creating so an active colleague is not duplicated.\n`
+          + `agent_create returns only AFTER the human has approved; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. created:false with approvalState declined/expired/aborted means no colleague was created — tell the human they can ask again; do not re-open a card unless they ask. Check the preloaded roster before creating so an active colleague is not duplicated; use agent_list only if the roster is insufficient or changed.\n`
           + `Successful Workspace tool results repeat the exact citation ID in receipt.toolCallId. Hara records and checks those receipts automatically for simple completed changes. For an explicit checkpoint, copy observed IDs; never invent them or repeat side effects to fix a rejected citation. After restart, re-observe state with read-only tools.\n`
           + `Enabled version-locked Workspace skills (load every page of instructions via workspace_skill before acting; no extra permissions): ${boundWorkspaceText(JSON.stringify(withWorkspaceOperationSkill(context.features.enabledSkills()).map(item => ({ id: item.id, description: item.description, version: item.version }))), 1200)}.\n`
           + `Native runtime shell/file tools may change only the admitted working directory under the frozen permission tier. Use workspace_native_evidence to read current Host diff IDs for explicit checks; no diff is no proof. Native file evidence cannot prove Hara colleague, delegation, membership or schedule changes. All scheduled work must use Hara WorkspaceScheduler; do not use runtime-native cron, wakeup or background scheduling tools.\n`

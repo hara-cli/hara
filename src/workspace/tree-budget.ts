@@ -11,13 +11,16 @@ export class WorkspaceBudgetAdmissionError extends Error {
 /** Reserve before effects. A failed downstream journal may conservatively overcount, never undercount. */
 export class WorkspaceTreeBudget {
   private readonly state: WorkspaceJsonState<TreeBudgetState>;
-  constructor(storage: WorkspaceResourceStorage, rootRunId: string, limits: WorkspaceRunBinding["budget"]) {
+  constructor(storage: WorkspaceResourceStorage, rootRunId: string, private readonly limits: WorkspaceRunBinding["budget"], sharedChild = false) {
     if (!UUID.test(rootRunId)) throw new Error("invalid Workspace budget root");
     this.state = new WorkspaceJsonState(storage, `tree-budget-${rootRunId}.json`, value => {
       if (!plain(value) || !exact(value, ["schemaVersion", "revision", "resourceBinding", "rootRunId", "limits", "usage"])
         || value.schemaVersion !== 1 || !positive(value.revision) || value.rootRunId !== rootRunId
         || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, this.state.binding())
-        || canonical(value.limits) !== canonical(limits) || !plain(value.usage)
+        || !(canonical(value.limits) === canonical(limits)
+          || (sharedChild && limits.mode === undefined && plain(value.limits) && value.limits.mode === "interactive"
+            && exact(value.limits, ["maxRounds", "maxToolCalls", "maxTokens", "timeoutMs", "mode"])
+            && value.limits.maxRounds === 100 && value.limits.maxToolCalls === 32 && value.limits.maxTokens === 128000 && value.limits.timeoutMs === 120000)) || !plain(value.usage)
         || !exact(value.usage, ["modelCalls", "toolCalls", "inputTokens", "outputTokens"])
         || !Object.values(value.usage).every(v => Number.isSafeInteger(v) && Number(v) >= 0)) throw new Error("invalid Workspace tree budget; execution refused");
       return structuredClone(value) as unknown as TreeBudgetState;
@@ -28,10 +31,11 @@ export class WorkspaceTreeBudget {
   /** Read-only admission BEFORE provider construction, continuation/fence or chat persistence. */
   assertResumeAdmission(runUsage: WorkspaceUsage): void {
     const tree = this.read();
-    for (const [scope, usage] of [["run", runUsage], ["tree", tree.usage]] as const) {
-      if (usage.modelCalls >= tree.limits.maxRounds) throw new WorkspaceBudgetAdmissionError(`${scope}_rounds`);
-      if (usage.toolCalls >= tree.limits.maxToolCalls) throw new WorkspaceBudgetAdmissionError(`${scope}_tools`);
-      if (usage.inputTokens + usage.outputTokens >= tree.limits.maxTokens) throw new WorkspaceBudgetAdmissionError(`${scope}_tokens`);
+    for (const [scope, usage, limits] of [["run", runUsage, this.limits], ["tree", tree.usage, tree.limits]] as const) {
+      if (limits.mode === "interactive") continue;
+      if (usage.modelCalls >= limits.maxRounds) throw new WorkspaceBudgetAdmissionError(`${scope}_rounds`);
+      if (usage.toolCalls >= limits.maxToolCalls) throw new WorkspaceBudgetAdmissionError(`${scope}_tools`);
+      if (usage.inputTokens + usage.outputTokens >= limits.maxTokens) throw new WorkspaceBudgetAdmissionError(`${scope}_tokens`);
     }
     if (tree.revision === 0 && Object.values(runUsage).some(value => value > 0)) throw new WorkspaceBudgetAdmissionError("missing_tree_receipt");
   }
@@ -39,7 +43,7 @@ export class WorkspaceTreeBudget {
     const before = this.state.read();
     this.state.update(before.revision, current => {
       if (Object.values(delta).some(value => !Number.isSafeInteger(value) || value < 0)) throw new Error("invalid Workspace budget delta");
-      if ((delta.modelCalls || delta.toolCalls) && (current.usage.modelCalls + delta.modelCalls > current.limits.maxRounds
+      if (current.limits.mode !== "interactive" && (delta.modelCalls || delta.toolCalls) && (current.usage.modelCalls + delta.modelCalls > current.limits.maxRounds
         || current.usage.toolCalls + delta.toolCalls > current.limits.maxToolCalls
         || current.usage.inputTokens + current.usage.outputTokens >= current.limits.maxTokens)) throw new Error("Workspace delegation-tree budget exhausted; no action started");
       for (const key of Object.keys(delta) as (keyof WorkspaceUsage)[]) {

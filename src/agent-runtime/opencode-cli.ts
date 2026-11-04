@@ -137,7 +137,7 @@ function createOpenCodeTurn(input: { installer: WorkspaceRuntimeInstaller; model
               const env = openCodeRunEnv(resolved.env, bridge!, workspaceRunPermissionTier(permit) === "full-protected", policy.tempRoot + "/config");
               const launch = policy.wrap({ command: resolved.command, env, args: openCodeRunArgs(input.options.ctx.cwd, input.model, prompt) });
               const result = await runExternalCommandCapture(launch, launch.args, {
-                  cwd: input.options.ctx.cwd, signal, waitForClose: true, timeoutMs: permit.binding.budget.timeoutMs,
+                  cwd: input.options.ctx.cwd, signal, waitForClose: true, governedDeadline: permit.binding.budget.mode === "interactive", timeoutMs: permit.binding.budget.timeoutMs,
                   maxOutputBytes: 4 * 1024 * 1024, retainStdoutOnFailure: true,
                   failureKind: "runtime", proxyUrl: resolved.proxyUrl,
                   onSpawn: observer.onSpawn, onStdout: chunk => { observer?.onStdout(chunk); args.onActivity?.(); },

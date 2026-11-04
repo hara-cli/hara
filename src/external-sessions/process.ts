@@ -51,6 +51,8 @@ export interface ExternalCommandCaptureResult {
 }
 
 export interface ExternalCommandRunOptions {
+  /** Internal governed runtimes only: the engine owns per-round deadlines and physical cancellation. */
+  governedDeadline?: boolean;
   timeoutMs?: number;
   maxOutputBytes?: number;
   cwd?: string;
@@ -157,11 +159,11 @@ export async function runExternalCommandCapture(
         catch { resolve({ ok: false, stdout: "", code: null, timedOut: false, errorCode: "runtime_process_cleanup_unverified" }); }
       })();
     };
-    const timer = setTimeout(() => {
+    const timer = run.governedDeadline && run.signal ? undefined : setTimeout(() => {
       terminateSubprocessTree(child, { force: true, processGroup });
       finish({ ok: false, stdout: "", code: null, timedOut: true, errorCode: "timeout" });
     }, timeoutMs);
-    timer.unref();
+    timer?.unref();
     void ownershipReady.catch(() => {
       ownershipFailed = true; terminateSubprocessTree(child, { force: true, processGroup });
       finish({ ok: false, stdout: "", code: null, timedOut: false, errorCode: "runtime_process_ownership_failed" });

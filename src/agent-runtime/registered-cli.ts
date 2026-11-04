@@ -132,7 +132,7 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
           const launch = policy.wrap({ command: resolved.command, env, args });
           if (id === "claude") launch.env = claudeRuntimeEnvironment(launch.env, policy.tempRoot);
           const result = await runExternalCommandCapture(launch, launch.args, {
-            cwd: options.ctx.cwd, signal: native.signal, waitForClose: true, failureKind: "runtime", captureErrorFirstLine: true, proxyUrl: resolved.proxyUrl, timeoutMs: Number(options.timeoutMs) || 120_000,
+            cwd: options.ctx.cwd, signal: native.signal, waitForClose: true, governedDeadline: permit.binding.budget.mode === "interactive", failureKind: "runtime", captureErrorFirstLine: true, proxyUrl: resolved.proxyUrl, timeoutMs: Number(options.timeoutMs) || 120_000,
             maxOutputBytes: 2 * 1024 * 1024, onSpawn: observer.onSpawn,
             onStdout: chunk => { observer.onStdout(chunk); activity(); }, retainStdoutOnFailure: true,
           });

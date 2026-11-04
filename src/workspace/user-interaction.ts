@@ -6,7 +6,7 @@ import { sameWorkspaceResourceBinding, type WorkspaceResourceBinding, type Works
 import type { WorkspaceRunBinding } from "./run-binding.js";
 import type { WorkspaceUsage } from "./conversations.js";
 
-export type WorkspaceQuestionReason = "lookup_missing" | "lookup_ambiguous" | "tool_problem" | "budget_warning" | "explicit";
+export type WorkspaceQuestionReason = "lookup_missing" | "lookup_ambiguous" | "tool_problem" | "budget_warning" | "runaway_guard" | "explicit";
 /** Optional purpose of a question. rename_target: choose which existing colleague receives a requested new name. */
 export type WorkspaceQuestionIntent = "rename_target";
 export interface WorkspaceUserQuestion {
@@ -60,7 +60,7 @@ export function workspacePlanReviewInteraction(): never {
 export interface WorkspaceAsyncAnswer { id: string; question: string; answer: string }
 type Decision = { id: string; outcome: "answered" | WorkspaceInteractionDismissReason };
 interface State {
-  revision: number; resourceBinding: WorkspaceResourceBinding; runId: string;
+  revision: number; resourceBinding: WorkspaceResourceBinding; runId: string; fuseNextAt: number;
   prepared: boolean; answeredQuestionIds: string[]; dismissed: boolean; referenceAcknowledged: boolean; misses: number; failures: number; budgetAcknowledged: boolean;
   question: WorkspaceUserQuestion | null;
   asyncQuestions: WorkspaceUserQuestion[]; asyncAnswers: WorkspaceAsyncAnswer[]; decisions: Decision[];
@@ -74,7 +74,7 @@ export const MAX_ASYNC_QUESTIONS = 3;
 // count as missing references: enumeration has no query-specific resolved/missing evidence.
 // Failed listings still enter observe()'s ordinary consecutive tool-failure counter.
 const LOOKUPS = new Set(["workspace_context_lookup", "workspace_memory_search", "agent_list"]);
-const REASONS = ["lookup_missing", "lookup_ambiguous", "tool_problem", "budget_warning", "explicit"];
+const REASONS = ["lookup_missing", "lookup_ambiguous", "tool_problem", "budget_warning", "runaway_guard", "explicit"];
 function safe(value: string, cap: number): string {
   const result = redactSensitiveText(value).text.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim().slice(0, cap);
   return scanMemory(result).ok ? result : "Please clarify the missing context.";
@@ -99,8 +99,10 @@ export class WorkspaceUserInteraction {
       && (delivery === "async" ? q.delivery === "async" : q.delivery === undefined);
     this.state = new WorkspaceJsonState(storage, `interaction-${binding.runId}.json`, raw => {
       // Pre-interaction-v2 files lack the async/decision fields; read them as empty, write the full shape.
-      const value = plain(raw) && exact(raw, LEGACY_KEYS) ? { ...raw, asyncQuestions: [], asyncAnswers: [], decisions: [] } : raw;
-      if (!plain(value) || !exact(value, [...LEGACY_KEYS, "asyncQuestions", "asyncAnswers", "decisions"])
+      const legacy = plain(raw) && exact(raw, LEGACY_KEYS) ? { ...raw, asyncQuestions: [], asyncAnswers: [], decisions: [] } : raw;
+      const value = plain(legacy) && !Object.hasOwn(legacy, "fuseNextAt") ? { ...legacy, fuseNextAt: 100 } : legacy;
+      if (!plain(value) || !exact(value, [...LEGACY_KEYS, "asyncQuestions", "asyncAnswers", "decisions", "fuseNextAt"])
+        || !Number.isSafeInteger(value.fuseNextAt) || Number(value.fuseNextAt) < 100
         || !Array.isArray(value.asyncQuestions) || value.asyncQuestions.length > MAX_ASYNC_QUESTIONS || !value.asyncQuestions.every(q => validQuestion(q, "async"))
         || !Array.isArray(value.asyncAnswers) || value.asyncAnswers.length > MAX_ASYNC_QUESTIONS
         || !value.asyncAnswers.every(row => plain(row) && exact(row, ["id", "question", "answer"]) && typeof row.id === "string" && UUID.test(row.id) && text(row.question, 800) && text(row.answer, 2000))
@@ -117,7 +119,7 @@ export class WorkspaceUserInteraction {
       if (value.question !== null && !validQuestion(value.question, "sync")) throw new Error("invalid Workspace pending question; execution refused");
       return value as unknown as State;
     }, () => ({ revision: 0, resourceBinding: this.state.binding(), runId: binding.runId,
-      prepared: false, answeredQuestionIds: [], dismissed: false, referenceAcknowledged: false, misses: 0, failures: 0, budgetAcknowledged: false, question: null,
+      fuseNextAt: 100, prepared: false, answeredQuestionIds: [], dismissed: false, referenceAcknowledged: false, misses: 0, failures: 0, budgetAcknowledged: false, question: null,
       asyncQuestions: [], asyncAnswers: [], decisions: [] }));
   }
   question(): WorkspaceUserQuestion | null { const s = this.state.read(); return s.dismissed ? null : s.question; }
@@ -190,17 +192,19 @@ export class WorkspaceUserInteraction {
       lookup_ambiguous: "找到了多个可能的对象。你指的是哪一个？",
       tool_problem: "当前步骤连续遇到问题，进度已保留。你希望先处理哪个卡点，或补充什么信息？",
       budget_warning: "本次任务快到预算上限，已保留当前位置。是否在原剩余额度内继续？回答不会重置预算。",
+      runaway_guard: "连续执行已达到防死循环熔断点，进度已保留。请检查是否仍在推进，再选择继续或停止。",
       explicit: "请补充继续当前步骤所需的信息。",
     } : {
       lookup_missing: "Two lookups did not identify the target. Which colleague or item do you mean? Please provide its name, former name or location.",
       lookup_ambiguous: "Several evidenced matches remain. Which one do you mean?",
       tool_problem: "This step failed twice. Progress is saved. What should be corrected or clarified before continuing?",
       budget_warning: "This task is near its budget limit. Continue from the saved point within the original remaining allowance? Your answer will not reset the budget.",
+      runaway_guard: "Execution reached the runaway-loop safety checkpoint. Progress is saved. Check whether it is advancing, then choose Continue or Stop.",
       explicit: "Please provide the information needed to continue this step.",
     };
     const label = meta.header ? safe(meta.header, 120) : "";
     const q: WorkspaceUserQuestion = { id: randomUUID(), reason, question: safe(question ?? copy[reason], 800),
-      options: options.slice(0, 8).map(option => safe(option, 300)).filter(Boolean), taskId: this.taskId, runId: this.binding.runId,
+      options: (reason === "runaway_guard" ? (this.chinese ? ["继续", "停止"] : ["Continue", "Stop"]) : options).slice(0, 8).map(option => safe(option, 300)).filter(Boolean), taskId: this.taskId, runId: this.binding.runId,
       ...(label ? { header: label } : {}), ...(meta.intent ? { intent: meta.intent } : {}) };
     const old = s.question;
     if (old && (old.reason !== "explicit" || reason !== "explicit"
@@ -209,7 +213,7 @@ export class WorkspaceUserInteraction {
       decisions: old ? [...value.decisions, { id: old.id, outcome: "superseded" as const }].slice(-64) : value.decisions }));
     return q;
   }
-  answer(questionId: string): void {
+  answer(questionId: string, observedCalls = 0): void {
     const s = this.state.read();
     if (s.answeredQuestionIds.includes(questionId)) return;
     if (!s.question || s.question.id !== questionId) throw new Error("Workspace question changed; refresh before answering");
@@ -219,7 +223,8 @@ export class WorkspaceUserInteraction {
       decisions: [...value.decisions, { id: questionId, outcome: "answered" as const }].slice(-64),
       misses: referenceAnswer ? 0 : value.misses, failures: reason === "tool_problem" ? 0 : value.failures,
       referenceAcknowledged: value.referenceAcknowledged || referenceAnswer,
-      budgetAcknowledged: value.budgetAcknowledged || reason === "budget_warning" }));
+      budgetAcknowledged: value.budgetAcknowledged || reason === "budget_warning",
+      fuseNextAt: reason === "runaway_guard" ? Math.max(value.fuseNextAt, observedCalls) + 100 : value.fuseNextAt }));
   }
   check(usage: Readonly<WorkspaceUsage>, elapsedMs: number): WorkspaceUserQuestion | null {
     const s = this.state.read();
@@ -231,6 +236,7 @@ export class WorkspaceUserInteraction {
     }
     if (!s.prepared) throw new Error("Workspace context preflight has not completed");
     const b = this.binding.budget;
+    if (b.mode === "interactive") return usage.modelCalls >= s.fuseNextAt ? this.request("runaway_guard") : null;
     if (!s.budgetAcknowledged && (usage.modelCalls >= Math.ceil(b.maxRounds * 0.8)
       || usage.toolCalls >= Math.ceil(b.maxToolCalls * 0.8)
       || usage.inputTokens + usage.outputTokens >= Math.ceil(b.maxTokens * 0.8)

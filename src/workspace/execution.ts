@@ -28,6 +28,7 @@ import type { WorkspaceUserInteraction, WorkspaceUserQuestion } from "./user-int
 
 export interface WorkspaceRunPermit { readonly binding: Readonly<WorkspaceRunBinding> }
 interface PermitState {
+  resetRoundClock?: () => void;
   completionEvidence: CompletionEvidenceLedger;
   storage: WorkspaceResourceStorage;
   assertLive(): void;
@@ -145,7 +146,7 @@ export function createWorkspaceRunPermit(input: {
   const stateHome = input.storage.run(() => workspaceStateHome());
   let state: PermitState;
   const assertLive = (): void => {
-    if (state?.retired || input.signal.aborted || Date.now() - started >= binding.budget.timeoutMs) throw new Error("Workspace attempt cancelled or expired");
+    if (state?.retired || input.signal.aborted || (binding.budget.mode !== "interactive" && Date.now() - started >= binding.budget.timeoutMs)) throw new Error("Workspace attempt cancelled or expired");
     input.lease.assertCurrent();
     const project = lstatSync(cwd, { bigint: true });
     if (!project.isDirectory() || project.isSymbolicLink() || realpathSync.native(cwd) !== cwd
@@ -181,9 +182,10 @@ export function createWorkspaceRunPermit(input: {
     async turn(args) {
       assertLive();
       if (!state.started) throw new Error("Workspace model requires the governed entry");
-      if (args.signal?.aborted || state.usage.modelCalls >= binding.budget.maxRounds
-        || state.usage.inputTokens + state.usage.outputTokens >= binding.budget.maxTokens) throw new Error("Workspace model budget exhausted or cancelled");
+      if (args.signal?.aborted || (binding.budget.mode !== "interactive" && (state.usage.modelCalls >= binding.budget.maxRounds
+        || state.usage.inputTokens + state.usage.outputTokens >= binding.budget.maxTokens))) throw new Error("Workspace model budget exhausted or cancelled");
       if (state.interaction?.check(state.interactionUsage?.() ?? state.usage, Date.now() - started)) throw new Error("Workspace is waiting for user input; model not dispatched");
+      state.resetRoundClock?.();
       publishUsage(state, { modelCalls: 1 });
       const auditIndex = state.audit.start("model", state.usage.modelCalls, "provider"), callStarted = performance.now();
       const endStage = runtimeStageObserve(state, () => state.runtimeStages?.beginEvent("model_roundtrip", { call: state.usage.modelCalls }));
@@ -216,7 +218,7 @@ export function createWorkspaceRunPermit(input: {
         finally { input.observeContext?.({ ...observation, input: result.usage?.input ?? null, output: result.usage?.output ?? null,
           inputWarning: (result.usage?.input ?? 0) > 12000 }); }
         assertLive();
-        if (state.usage.inputTokens + state.usage.outputTokens > binding.budget.maxTokens) {
+        if (binding.budget.mode !== "interactive" && state.usage.inputTokens + state.usage.outputTokens > binding.budget.maxTokens) {
           errorKind = "budget_exhausted"; throw new Error("Workspace token telemetry safety ceiling reached");
         }
         outcome = result.stop === "error" ? "error" : "completed"; errorKind = result.stop === "error" ? "provider_error" : null;
@@ -319,11 +321,21 @@ export function assertWorkspaceRuntimeUsage(permit: WorkspaceRunPermit, pending:
   const state = stateOf(permit); state.assertLive();
   const delta = runtimeUsageDelta(pending, permit.binding.agent.runtimeId === "codex");
   if (!Number.isSafeInteger(pending.input) || !Number.isSafeInteger(pending.output) || pending.input < 0 || pending.output < 0
-    || state.usage.inputTokens + state.usage.outputTokens + delta.inputTokens! + pending.output > permit.binding.budget.maxTokens) {
+    || (permit.binding.budget.mode !== "interactive" && state.usage.inputTokens + state.usage.outputTokens + delta.inputTokens! + pending.output > permit.binding.budget.maxTokens)) {
     throw new Error("Workspace native token telemetry safety ceiling reached");
   }
 }
 /** Trusted Host composition may retain a long instruction reference before options are pinned. */
+/** WeakMap-backed permit is required; an arbitrary option or renderer flag cannot enable this. */
+export function bindWorkspaceRoundClock(permit: WorkspaceRunPermit, reset: () => void): () => void {
+  const state = stateOf(permit); state.assertLive();
+  if (state.resetRoundClock) throw new Error("Workspace round clock already bound");
+  if (permit.binding.budget.mode === "interactive") state.resetRoundClock = reset;
+  return () => { if (state.resetRoundClock === reset) state.resetRoundClock = undefined; };
+}
+export function workspaceRunIsInteractive(permit: WorkspaceRunPermit): boolean {
+  const state = stateOf(permit); state.assertLive(); return permit.binding.budget.mode === "interactive";
+}
 export function assertWorkspaceRunContextCurrent(permit: WorkspaceRunPermit): void { stateOf(permit).assertLive(); }
 export function prepareWorkspaceRunHistory(permit: WorkspaceRunPermit, history: NeutralMsg[]): NeutralMsg[] {
   const state = stateOf(permit); state.assertLive();
@@ -384,7 +396,7 @@ export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string
   // sibling write cannot run past the second result that required a real user's answer.
   const operation = state.toolTail.then(async () => {
     state.assertLive();
-    if (!state.started || !state.tools.has(name) || state.usage.toolCalls >= permit.binding.budget.maxToolCalls) throw new Error("Workspace tool unavailable or budget exhausted");
+    if (!state.started || !state.tools.has(name) || (permit.binding.budget.mode !== "interactive" && state.usage.toolCalls >= permit.binding.budget.maxToolCalls)) throw new Error("Workspace tool unavailable or budget exhausted");
     if (name !== "ask_user" && state.interaction?.check(state.interactionUsage?.() ?? state.usage, Date.now() - state.startedAt)) throw new Error("Workspace is waiting for user input; tool not dispatched");
     state.interaction?.admit(name);
     publishUsage(state, { toolCalls: 1 });
@@ -470,7 +482,7 @@ export function recordWorkspacePiNativeCalls(permit: WorkspaceRunPermit, names: 
   const state = stateOf(permit); state.assertLive();
   const native = new Set(["read", "bash", "edit", "write"]);
   if (!state.started || !state.nativePolicy || permit.binding.agent.runtimeId !== "pi" || names.some(name => !native.has(name)) || names.length > 256
-    || state.usage.toolCalls + names.length > permit.binding.budget.maxToolCalls) throw new Error("Workspace native Pi tool budget exhausted");
+    || (permit.binding.budget.mode !== "interactive" && state.usage.toolCalls + names.length > permit.binding.budget.maxToolCalls)) throw new Error("Workspace native Pi tool budget exhausted");
   if (names.length) publishUsage(state, { toolCalls: names.length });
 }
 

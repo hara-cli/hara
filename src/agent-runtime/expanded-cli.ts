@@ -142,7 +142,7 @@ export function expandedCliDriver(id: ExpandedRuntimeId, installer: WorkspaceRun
           else {
             const wrapped = protection.wrap(current.command, args, env); protection.assertCurrent(); assertCurrent();
             result = await runExternalCommandCapture(wrapped, wrapped.args, {
-              cwd: options.ctx.cwd, signal: native.signal, timeoutMs: permit.binding.budget.timeoutMs, maxOutputBytes: 4 * 1024 * 1024,
+              cwd: options.ctx.cwd, signal: native.signal, timeoutMs: permit.binding.budget.timeoutMs, governedDeadline: permit.binding.budget.mode === "interactive", maxOutputBytes: 4 * 1024 * 1024,
               waitForClose: true, failureKind: "runtime", proxyUrl: current.proxyUrl, retainStdoutOnFailure: true,
               onSpawn: observer.onSpawn, onStdout(chunk) { observer.onStdout(chunk); activity(); },
             });
