@@ -11239,3 +11239,29 @@ Final verification: build-pass.log succeeded; focused-pass.log contains 27/27 pa
 - Follow-up fixes verified: Host-only protected same-binding dispatch journal carries a prior effect only alongside newly dispatched observation for every criterion. A pending-question answer must append exactly one matching interactive decision; defaults, changed history/scope, wrong question/turn cannot acquire that link. Actual crash/answer resume preserves inode and avoids repeating writes. Native diff stays attempt-local.
 - Two native bearer cases already masked their output as***; a real working read receipt bypassed the new placeholder check. Gate all read-only answer text, not just the zero-tool branch; numeric fact answers remain supported. Focus5 passes13/13 including both original bearer negatives. Focus4's other53 cases passed, covering question recovery, slow RPC source/nonce/receipt/call-count guards and private journal negatives.
 - Fixture contracts: a pure hello now expects completed+verified, with no extra Provider call. Do not stretch the bounded RPC wait to hide the old paused expectation. Desktop capture must compare localized safe diagnostics, and user-turn peer wakes use depth0; depth1 is reserved for autonomy.
+
+
+## [ERR-20261104-MANAGED-MCP-BOUNDARY] Protected stdio and actual runtime fixture contracts
+
+**Logged**: 2026-11-04
+**Priority**: high
+**Status**: resolved; local verification only
+**Area**: Workspace MCP admission, process boundary, tests
+
+### Summary
+
+A reviewed source must bind actual code and schema, then use the common guarded process owner and governor. Passing a scripted response or using a different guard label is insufficient.
+
+### Errors and corrections
+
+- Seatbelt rejects a numeric address in its `remote ip` host filter. Use its supported localhost/port filter while pinning the Workspace proxy URL to IPv4 loopback; retain kernel denial of every other outbound port and no direct fallback.
+- The common process boundary recognizes the canonical `hara-native-guard` and exact guard script. A new label caused a correctly unowned process rejection; reuse the common owner/drain rather than bypassing it.
+- A data-read allowlist needs a literal root-directory read for dyld startup. Missing it aborted Node before script execution. This grants no descendant file reads. Allow actual system libraries, never all `/System` including `/System/Volumes/Data`; deny other Workspace data, credential paths, Keychain services and hard links.
+- The review hasher rejects credential files/directories before content reads. A Host review record is separate from both Workspace grants and one-call approval; metadata, annotations or recomputed changed digests cannot grant execution.
+- Scripted Host fixtures must create the private root, use the bound model, cite observed toolCallId values and supply the full Pi RPC completion shape including evidence. Fix the fixture; preserve the completed-state assertion and external result `verified:false`.
+- Check actual inventory names for duplicates as well as count and digest. `tools/list_changed` freezes the connection. Recheck authorization after an awaited result, not only before dispatch.
+- Approval displays the entire redacted bounded input; an unseen truncated tail cannot be treated as an approved target. Unknown outcomes remain protected against replay after restart.
+
+### Verification and prevention
+
+Real task-owned stdio, proxy/direct and credential canaries, common drain, actual Pi SDK/RPC and synthetic Codex/Claude executables exercised the Host/governor path. Core focused 50/50 plus final admission/RPC 4/4; Desk focused 40/40 and both builds passed under serial low-priority execution. Synthetic executables do not establish authenticated vendor compatibility, release readiness or visual product acceptance. Keep unsupported platforms non-callable; never substitute an unprotected transport or real credentials after an isolated fixture error.

@@ -1,3 +1,4 @@
+import { createWorkspaceExtensionApproval, isWorkspaceExtensionTool, type WorkspaceExtensionApproval } from "../workspace/extension-binding.js";
 import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment, TurnArgs, TurnResult } from "../providers/types.js";
 import { isTaskRuntimeBinding } from "../agent-runtime/bindings.js";
 import { WORKSPACE_AGENT_EXECUTION_PENDING } from "../workspace/agent-binding.js";
@@ -674,7 +675,7 @@ export interface RunOpts {
   confirm: (
     q: string,
     signal?: AbortSignal,
-    options?: { allowAlways?: boolean; presentation?: AgentCreationApproval; taskApproval?: TaskApprovalOffer },
+    options?: { allowAlways?: boolean; presentation?: AgentCreationApproval; taskApproval?: TaskApprovalOffer; workspaceExtension?: WorkspaceExtensionApproval },
   ) => Promise<boolean | "always">;
   /** Opaque project-scope keys auto-approved for the rest of the attached session. */
   autoApprove?: Set<string>;
@@ -3257,7 +3258,7 @@ async function runAgentInner(
         });
         continue;
       }
-      if (tool.trustBoundary === "external" && !ctx.ask && process.env.HARA_ALLOW_TRUSTED_EXTENSIONS !== "1") {
+      if (tool.trustBoundary === "external" && !(opts.workspaceRun && isWorkspaceExtensionTool(tool)) && !ctx.ask && process.env.HARA_ALLOW_TRUSTED_EXTENSIONS !== "1") {
         plans.push({
           tu,
           tool,
@@ -3446,7 +3447,8 @@ async function runAgentInner(
             question,
             runSignal,
             { allowAlways: Boolean(approvalScope) && !actionGuardReviewReason && !alwaysGate && !organizationApprovalRequired,
-              ...(presentation ? { presentation } : {}), ...(taskApproval ? { taskApproval } : {}) },
+              ...(presentation ? { presentation } : {}), ...(taskApproval ? { taskApproval } : {}),
+              ...(opts.workspaceRun && isWorkspaceExtensionTool(tool) ? { workspaceExtension: createWorkspaceExtensionApproval(tool, tu.id, input) } : {}) },
           ))));
         } catch (error) {
           if (runSignal.aborted) return finalizeStoppedToolRound();
