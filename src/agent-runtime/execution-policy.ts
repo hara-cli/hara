@@ -238,6 +238,9 @@ export class RuntimeExecutionPolicy {
     // Scheme normal strings consume the JSON-escaped path once. A # raw string would
     // double-escape .codex and silently deny every SQLite file. Keep the basename set closed.
     if (input.runtimeId === "codex") lines.push(`(allow file-write* (regex ${quote("^" + runtimeHome.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "/((state|logs|memories|queue|goals)_[0-9]+)[.]sqlite(-wal|-shm|-journal)?$")}) (literal ${quote(join(runtimeHome, "installation_id"))}) (literal ${quote(join(runtimeHome, "history.jsonl"))}) (literal ${quote(join(runtimeHome, "session_index.jsonl"))}))`);
+    // Codex 0.163.0 caches model discovery/TTL here with a direct write (no atomic
+    // temporary basename). Keep this literal separate from all global config/skills.
+    if (input.runtimeId === "codex") lines.push(`(allow file-write* (literal ${quote(join(runtimeHome, "models_cache.json"))}))`);
     if (piAuth) lines.push(`(allow file-write* (require-all (literal ${quote(join(runtimeHome, "auth.json.lock"))}) (vnode-type DIRECTORY)))`,
       `(deny file-write* ${literals([piAuth, join(runtimeHome, "models.json"), join(runtimeHome, "settings.json")])})`);
     // Denials come last as well: no native state exception may open Hara or credential writes.
