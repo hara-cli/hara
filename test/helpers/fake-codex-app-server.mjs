@@ -12,6 +12,7 @@ export async function fakeCodexMain() {
   if (args[0] === "debug") { send({ models: [{ slug: "fixture-model" }] }); return; }
   if (args[0] !== "app-server") { process.exitCode = 2; return; }
   if (mode().startupStderr) { process.stderr.write(mode().startupStderr); process.exitCode = 1; return; }
+  let mcpSession, mcpURL, previousMarker;
   let thread, config, cwd, turnId, total = { inputTokens: 0, outputTokens: 0 }, meta, stopped = false;
   const save = () => { fs.writeFileSync(command + ".meta.next", JSON.stringify(meta)); fs.renameSync(command + ".meta.next", command + ".meta.json"); };
   async function execute(params) {
@@ -63,25 +64,34 @@ export async function fakeCodexMain() {
       note("thread/tokenUsage/updated", { threadId: "foreign", turnId: currentTurn, tokenUsage });
       note("thread/tokenUsage/updated", { threadId: thread, turnId: "old-turn", tokenUsage });
     }
-    let serial = 0, session;
+    const marker = params.input?.[0]?.text?.match(/"__hara_attempt": "([a-f0-9]{48})"/)?.[1];
+    const oldMarker = previousMarker; previousMarker = marker;
+    meta.attemptMarkerFingerprint = marker ? crypto.createHash("sha256").update(marker).digest("hex") : null; save();
+    let serial = 0, session = mcpURL === url ? mcpSession : undefined;
     async function request(method, parameters) {
       const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream",
         Authorization: "Bearer " + token, ...(session ? { "Mcp-Session-Id": session } : {}) },
         body: JSON.stringify({ jsonrpc: "2.0", ...(method.startsWith("notifications/") ? {} : { id: ++serial }), method, params: parameters }) });
-      session = response.headers.get("mcp-session-id") ?? session;
+      session = response.headers.get("mcp-session-id") ?? session; mcpSession = session; mcpURL = url;
       if (response.status === 202) return {};
       const body = await response.json();
       if (!response.ok || body.error) throw new Error("fixture MCP request refused");
       return body.result;
     }
     async function call(name, input) {
-      const result = await request("tools/call", { name, arguments: input });
+      const result = await request("tools/call", { name, arguments: { ...input, ...(marker ? { __hara_attempt: marker } : {}) } });
       return { isError: Boolean(result.isError), text: result.content?.[0]?.text ?? "" };
     }
     function receiptText(text) { return text.split("\n\n<system-reminder>")[0]; }
     if (!["reply", "over-budget", "native-write", "native-claim", "risk"].includes(selected)) {
-      await request("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "fake-codex", version: "1" } });
-      await request("notifications/initialized", {});
+      if (!session) {
+        await request("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "fake-codex", version: "1" } });
+        await request("notifications/initialized", {});
+      }
+      if (oldMarker && mode().probePreviousMarker) {
+        try { await request("tools/call", { name: "agent_list", arguments: { __hara_attempt: oldMarker } }); meta.oldMarkerRejected = false; }
+        catch { meta.oldMarkerRejected = true; } save();
+      }
       meta.tools = (await request("tools/list", {})).tools.map(tool => tool.name); save();
       if (selected === "create") {
         meta.intake = await call("task_intake", { intent: "change", goal: "Create one test colleague after confirmation",

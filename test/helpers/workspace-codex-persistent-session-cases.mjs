@@ -33,21 +33,23 @@ if (selected.includes(0)) test("standing hash covers rules, operation cards and 
   assert.notEqual(read(base, "model-A", "low", "controlled", 2).digest, original.digest);
 });
 
-if (selected.includes(1)) test("a second governed Codex message reuses one process/thread, rotates the endpoint, and sends only new input", async t => {
-  const f = await cliMcpFixture(t, "list");
+if (selected.includes(1)) test("a second governed Codex message reuses one loaded process/thread and transport with fresh immutable attempt markers", async t => {
+  const f = await cliMcpFixture(t, "list", { probePreviousMarker: true });
   const first = await exchange(f, "List colleagues S3-FIRST-UNIQUE?");
   assert.equal(first.conversation.state, "completed"); const a = f.meta();
   const second = await exchange(f, "List colleagues S3-SECOND-UNIQUE?");
   assert.equal(second.conversation.state, "completed"); const b = f.meta();
   const requests = starts(f), turns = f.native().filter(row => row.method === "turn/start");
-  assert.deepEqual(requests.map(row => row.method), ["thread/start", "thread/resume"]);
-  assert.equal(a.pid, b.pid); assert.equal(requests[0].pid, requests[1].pid);
-  assert.notEqual(a.url, b.url); assert.equal(a.tokenFingerprint, b.tokenFingerprint);
+  assert.deepEqual(requests.map(row => row.method), ["thread/start"]);
+  assert.equal(a.pid, b.pid); assert.equal(requests[0].pid, turns[1].pid);
+  assert.equal(a.url, b.url); assert.equal(a.tokenFingerprint, b.tokenFingerprint);
+  assert.notEqual(a.attemptMarkerFingerprint, b.attemptMarkerFingerprint); assert.equal(b.oldMarkerRejected, true);
+  assert.equal(f.native().some(row => row.method === "thread/unsubscribe"), false);
   assert.equal(turns.length, 2); assert.match(turns[1].params.input[0].text, /S3-SECOND-UNIQUE/);
   assert.doesNotMatch(turns[1].params.input[0].text, /S3-FIRST-UNIQUE|registered codex reply|You are/);
-  assert.equal(requests[1].params.excludeTurns, true); assert.equal("history" in requests[1].params, false);
+  assert.equal("history" in turns[1].params, false);
   assert.equal(second.conversation.usage.inputTokens, 200); assert.equal(second.conversation.usage.outputTokens, 40);
-  await assert.rejects(fetch(a.url));
+  assert.equal((await fetch(a.url)).status, 401);
   await f.request("workspace.runtime.selectModel", { ...f.scope, runtimeId: "codex", modelId: "fixture-model-2", effort: "high", expectedRevision: 1 });
   assert.equal((await exchange(f, "List colleagues using the selected model?" )).conversation.state, "completed");
   const switched = starts(f).at(-1), turn = f.native().filter(row => row.method === "turn/start").at(-1);

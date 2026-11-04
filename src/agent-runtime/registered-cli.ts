@@ -80,7 +80,7 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
     const session = id === "codex" ? await codexSessionPool(installer).acquire(permit, assertCurrent) : undefined;
     const native = createRegisteredCliMcpTurn({
       signal: options.signal!, assertCurrent, jsonEvents: id === "codex",
-      ...(session ? { bearerToken: session.token,
+      ...(session ? { bearerToken: session.token, createEndpoint: session.createEndpoint.bind(session),
         prompt: (args: import("../providers/types.js").TurnArgs) => args.history.flatMap(message => message.role === "user" ? [message.content] : []).join("\n\n"),
         takeUsage: () => session.takeUsage(), decorateResult: session.decorateResult.bind(session) } : {}),
       async launch(endpoint, prompt, activity, turnArgs) {

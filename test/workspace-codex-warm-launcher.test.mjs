@@ -18,8 +18,8 @@ test("initialized launcher child stays warm across fresh permits with one native
   assert.equal(next.conversation.sessionId,first.conversation.sessionId);assert.equal(cold(next),false);
  }
  const requests=starts(f),turns=f.native().filter(r=>r.method==="turn/start");
- assert.deepEqual(requests.map(r=>r.method),["thread/start","thread/resume","thread/resume"]);
- assert.equal(requests[1].params.threadId,requests[2].params.threadId);assert.equal(new Set(requests.map(r=>r.pid)).size,1);
+ assert.deepEqual(requests.map(r=>r.method),["thread/start"]);
+ assert.equal(turns[1].params.threadId,turns[2].params.threadId);assert.equal(new Set(requests.map(r=>r.pid)).size,1);
  assert.equal(turns.length,3);assert.doesNotMatch(turns[1].params.input[0].text,/WARM-FIRST/);assert.doesNotMatch(turns[2].params.input[0].text,/WARM-FIRST|WARM-SECOND/);
 });
 

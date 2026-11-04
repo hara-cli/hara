@@ -14,11 +14,12 @@ export const WORKSPACE_MCP_TOKEN_ENV = "HARA_WORKSPACE_MCP_TOKEN";
 export interface WorkspaceMcpEndpoint {
   readonly url: string;
   readonly env: NodeJS.ProcessEnv;
+  readonly attemptMarker?: string;
   close(): Promise<void>;
 }
 
 /** Host-only composition: the closures, never renderer arguments, choose audience and tools. */
-export async function createWorkspaceMcpEndpoint(input: {
+export interface WorkspaceMcpAttemptInput {
   signal: AbortSignal;
   assertCurrent(): void;
   tools(): readonly ToolSpec[];
@@ -27,7 +28,8 @@ export async function createWorkspaceMcpEndpoint(input: {
   bearerToken?: string;
   /** Host deadline; authentication never extends beyond the attempt. */
   expiresAt?: number;
-}): Promise<WorkspaceMcpEndpoint> {
+}
+export async function createWorkspaceMcpEndpoint(input: WorkspaceMcpAttemptInput): Promise<WorkspaceMcpEndpoint> {
   input.assertCurrent();
   if (input.expiresAt !== undefined && (!Number.isFinite(input.expiresAt) || input.expiresAt <= Date.now())) throw new Error("Workspace MCP attempt expired");
   if (input.signal.aborted) throw new Error("Workspace MCP attempt ended");
@@ -120,6 +122,7 @@ export function createRegisteredCliMcpTurn(input: {
   beforeTool?(): void;
   assertCurrent(): void;
   bearerToken?: string;
+  createEndpoint?(input: WorkspaceMcpAttemptInput): Promise<WorkspaceMcpEndpoint>;
   decorateResult?(result: ToolResult, args: TurnArgs): ToolResult;
   takeUsage?(): TurnResult["usage"];
   launch(endpoint: WorkspaceMcpEndpoint, prompt: string, activity: () => void, args: TurnArgs): Promise<ExternalCommandCaptureResult>;
@@ -154,7 +157,7 @@ export function createRegisteredCliMcpTurn(input: {
       if (closed || args.signal?.aborted) return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
       tools = args.tools; activity = args.onActivity; preview = args.onAssistantPreview; flush(args.history, args);
       if (!physical) {
-        endpoint = await createWorkspaceMcpEndpoint({ signal: AbortSignal.any([input.signal, stopped.signal]), assertCurrent: input.assertCurrent,
+        endpoint = await (input.createEndpoint ?? createWorkspaceMcpEndpoint)({ signal: AbortSignal.any([input.signal, stopped.signal]), assertCurrent: input.assertCurrent,
           bearerToken: input.bearerToken,
           tools: () => tools, call(name, parameters) {
             input.assertCurrent(); input.beforeTool?.();

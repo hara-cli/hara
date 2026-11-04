@@ -1,3 +1,4 @@
+import { ResidentWorkspaceMcp, residentMcpToolsSupported, WORKSPACE_ATTEMPT_MARKER } from "./registered-cli-resident-mcp.js";
 import { createAssistantPreview } from "./assistant-preview.js";
 import { observeWorkspaceMessageTiming } from "../workspace/execution.js";
 import { runtimeErrorFirstLine } from "../security/runtime-error.js";
@@ -6,8 +7,8 @@ import { createRuntimeExecutionPolicy, type RuntimeExecutionPolicy } from "./exe
 import { beginWorkspaceNativePolicy, endWorkspaceNativePolicy, observeWorkspaceNativeItem, workspaceRuntimePolicyInput, workspaceRuntimeProcessKey } from "./workspace-native-policy.js";
 import { codexHostToolOverrides } from "./codex-host-config.js";
 import { workspaceRunRuntimeStages } from "../workspace/execution.js";
-// Native context is reusable; Workspace execution capabilities are not. Each attempt has a fresh
-// immutable MCP endpoint, and an unloaded thread is resumed only after fresh Host admission.
+// Native protocol facts may persist. Tool capabilities always belong to one immutable attempt.
+// A loaded handle is not an authority grant; current policy preparation and Host fences remain mandatory.
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { JsonlRpcClient, ExternalJsonlRpcRequestError, ExternalJsonlRpcTransportError, type ExternalCommandCaptureResult } from "../external-sessions/process.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
@@ -18,7 +19,7 @@ import { assertWorkspaceRuntimeUsage, workspaceRuntimeStorage, type WorkspaceRun
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import { inspectLocalRuntime } from "../workspace/runtime-detect.js";
 import type { ToolResult, TurnArgs, TurnResult } from "../providers/types.js";
-import { WORKSPACE_MCP_TOKEN_ENV, type WorkspaceMcpEndpoint } from "./registered-cli-mcp.js";
+import { createWorkspaceMcpEndpoint, WORKSPACE_MCP_TOKEN_ENV, type WorkspaceMcpEndpoint, type WorkspaceMcpAttemptInput } from "./registered-cli-mcp.js";
 
 const hash = (value: unknown): string => createHash("sha256").update(canonical(value)).digest("hex");
 const object = (value: unknown): Record<string, unknown> => plain(value) ? value : {};
@@ -111,6 +112,14 @@ export class GovernedCodexSession {
   private unload?: () => void;
   private loaded = false;
   private closing = false;
+  private residentMcp?: ResidentWorkspaceMcp;
+  private residentToken?: string;
+  private attemptEndpoint?: WorkspaceMcpEndpoint;
+  private settling?: Promise<void>;
+  private nativeSucceeded = false;
+  private loadedContract?: string;
+  /** Created only after a real native start/resume response passes every existing check. */
+  private loadedHandle?: Readonly<{ id: string; cwd: string; client: JsonlRpcClient }>;
   private readonly state: ReturnType<typeof codexThreadState>;
   private value: CodexThreadState;
   private pendingUsage = { input: 0, output: 0, cachedInput: 0 };
@@ -133,10 +142,23 @@ export class GovernedCodexSession {
   claim(permit: WorkspaceRunPermit, assertCurrent: () => void): void {
     assertCurrent();
     if (this.busy || this.closing) throw new Error("Codex conversation is busy or draining; no second writer was started");
+    this.settling = undefined; this.attemptEndpoint = undefined; this.nativeSucceeded = false;
     this.permit = permit; this.busy = true; clearTimeout(this.idleTimer); this.idleTimer = undefined;
     if (!this.client) this.token = randomBytes(32).toString("hex");
     this.pendingUsage = { input: 0, output: 0, cachedInput: 0 }; this.observedUsage = false; this.firstUsage = true;
     this.value.lastAttempt = { input: 0, output: 0, cachedInput: 0 };
+  }
+  async createEndpoint(input: WorkspaceMcpAttemptInput): Promise<WorkspaceMcpEndpoint> {
+    input.assertCurrent();
+    if (!this.busy || this.closing) throw new Error("Codex attempt unavailable");
+    if (!residentMcpToolsSupported(input)) return createWorkspaceMcpEndpoint(input);
+    if (this.residentMcp && (this.residentToken !== this.token || !this.residentMcp.reusable)) {
+      await this.residentMcp.close(); this.residentMcp = undefined; this.loadedContract = undefined;
+    }
+    input.assertCurrent();
+    if (!this.residentMcp) { this.residentMcp = await ResidentWorkspaceMcp.create(this.token); this.residentToken = this.token; }
+    input.assertCurrent(); if (!this.busy || this.closing) throw new Error("Codex attempt unavailable");
+    return this.residentMcp.bind(input);
   }
   get needsNewSession(): boolean { return nativeContextFull(this.value); }
   takeUsage(): TurnResult["usage"] {
@@ -270,17 +292,19 @@ export class GovernedCodexSession {
     input.assertCurrent();
     if (!this.busy || this.active || input.signal.aborted) throw new Error("Codex attempt unavailable");
     if (this.needsNewSession) return { ok: false, code: 1, timedOut: false, stdout: "", errorCode: "codex_context_limit_open_new_session" };
+    this.attemptEndpoint = endpoint;
     const resolved = await this.installer.prepareBound("codex", input.signal);
     if (input.cwd !== this.project.root || origin(resolved, this.project) !== this.origin) throw new Error("Codex login origin changed; no fallback was selected");
     const policyInput = workspaceRuntimePolicyInput(this.permit, "codex", resolved, "resident", this.installer);
     const { standing, turnParts, digest: standingHash } = codexStandingContext(args, input.model, input.effort,
       policyInput.tier, this.permit.binding.agent.configRevision);
     const processKey = workspaceRuntimeProcessKey(policyInput, resolved);
+    const contract = hash([standingHash, args.tools, processKey]);
     // Retire an idle process before binding the new ActiveTurn, so its close event cannot settle it.
     if (this.processKey !== processKey || !this.client && this.policy) {
       const previous = this.client; previous?.close(); if (previous) await previous.waitForClose(); else await this.exit;
       if (this.policy) { await endWorkspaceNativePolicy(this.permit, this.policy); await this.policy.close(); }
-      this.policy = undefined; this.client = undefined; this.loaded = false;
+      this.policy = undefined; this.client = undefined; this.loaded = false; this.loadedContract = undefined; this.loadedHandle = undefined;
     }
     input.assertCurrent();
     if (!this.policy) this.policy = createRuntimeExecutionPolicy(policyInput);
@@ -289,19 +313,20 @@ export class GovernedCodexSession {
       loginSource: resolved.loginSource, model: input.model, effort: input.effort }); } catch { /* Observational metadata only. */ }
     const env = { ...resolved.env, [WORKSPACE_MCP_TOKEN_ENV]: this.token,
       HARA_SUBPROCESS_ENV_ALLOW: [resolved.env.HARA_SUBPROCESS_ENV_ALLOW, WORKSPACE_MCP_TOKEN_ENV].filter(Boolean).join(",") };
+    const visibleEnv = { ...env, ...(endpoint.attemptMarker ? { HARA_PREVIEW_ATTEMPT_TOKEN: endpoint.attemptMarker } : {}) };
     let finish!: ActiveTurn["finish"], bind!: ActiveTurn["bind"], done!: () => void;
     const terminal = new Promise<ExternalCommandCaptureResult>(resolve => {
       finish = (ok, code, kind, firstLine) => {
         if (active.settled) return;
         active.settled = true; active.preview?.stop();
         resolve({ ok, code: ok ? 0 : 1, timedOut: false, ...(!ok ? { errorCode: code ?? "runtime_failed", ...(firstLine ? { errorFirstLine: runtimeErrorFirstLine(firstLine, env) } : {}), ...(kind ? { nativeFailureKind: kind } : {}) } : {}),
-          stdout: ok ? JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: redactToolSubprocessOutput(active.text, env) } }) : "" });
+          stdout: ok ? JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: redactToolSubprocessOutput(active.text, visibleEnv) } }) : "" });
         done();
       };
     });
     const active: ActiveTurn = { ready: new Promise(resolve => { bind = resolve; }), bind: id => bind(id), finish,
       done: new Promise(resolve => { done = resolve; }), activity: input.activity, assertCurrent: input.assertCurrent, text: "", settled: false,
-      visibleItems: new Map(), previewOutput: args.onAssistantPreview, previewEnv: env,
+      visibleItems: new Map(), previewOutput: args.onAssistantPreview, previewEnv: visibleEnv,
       standingHash, compacted: false, partDigests: new Map((args.systemParts?.length ? args.systemParts : [{ id: "system", digest: hash(args.system) }]).map(part => [part.id, part.digest])) };
     this.active = active;
     const interrupt = () => {
@@ -346,6 +371,11 @@ export class GovernedCodexSession {
         model_auto_compact_token_limit: Number.MAX_SAFE_INTEGER, model_post_turn_compact_threshold_percent: 0,
         ...(input.effort ? { model_reasoning_effort: input.effort } : {}) };
       const resumed = Boolean(this.value.threadId);
+      const direct = Boolean(endpoint.attemptMarker && this.loaded && this.value.phase === "idle" && this.value.contextGeneration
+        && this.value.standingPromptHash === standingHash && this.loadedContract === contract
+        && this.loadedHandle?.client === client && this.loadedHandle.id === this.value.threadId && this.loadedHandle.cwd === input.cwd);
+      let threadId = this.loadedHandle?.id;
+      if (!direct) {
       let response: Record<string, unknown>;
       try {
         response = await client.call(resumed ? "thread/resume" : "thread/start", {
@@ -365,14 +395,19 @@ export class GovernedCodexSession {
         || object(thread.status).type !== "idle") {
         throw new Error("Codex thread confinement or idle origin was not confirmed");
       }
+      threadId = thread.id;
+      this.loadedHandle = Object.freeze({ id: thread.id, cwd: input.cwd, client });
+      }
+      if (!threadId) throw new Error("Codex loaded thread handle is unavailable");
       // npm's launcher remains the owned root; its initialized native app-server child is
       // resident too. Seal that baseline before turn/start, never after model tools can run.
       if (freshProcess) await this.policy.prepareResidentRoot();
-      this.value.threadId = thread.id; this.loaded = true;
+      this.value.threadId = threadId; this.loaded = true;
       if (!resumed || this.value.contextGeneration === null) this.value.contextGeneration = randomUUID();
       this.value.phase = "unknown"; this.save(); // Write ahead of an accepted or outcome-unknown turn.
       const refresh = resumed && this.value.standingPromptHash !== standingHash;
       const currentPrompt = [
+        ...(endpoint.attemptMarker ? [`<system-reminder>Current Hara attempt: every Hara Workspace MCP tool call MUST include the extra argument "${WORKSPACE_ATTEMPT_MARKER}": "${endpoint.attemptMarker}". Never use an earlier turn's marker. Hara removes this routing field before the governed tool; it grants no permission or approval.</system-reminder>`] : []),
         ...(refresh ? [`<system-reminder>Current Hara standing governance context for this resumed thread:\n${standing}\n</system-reminder>`] : []),
         ...(turnParts.length ? [`<system-reminder>Current Hara turn context:\n${turnParts.map(part => part.content).join("\n\n")}\n</system-reminder>`] : []),
         prompt,
@@ -380,17 +415,18 @@ export class GovernedCodexSession {
       if (Buffer.byteLength(currentPrompt) > 400_000) throw new Error("Codex native prompt context is too large");
       input.assertCurrent(); if (input.signal.aborted) throw new Error("interrupted");
       observeWorkspaceMessageTiming(this.permit, "T3");
-      const started = await client.call<Record<string, unknown>>("turn/start", { threadId: thread.id,
+      const started = await client.call<Record<string, unknown>>("turn/start", { threadId,
         input: [{ type: "text", text: currentPrompt, text_elements: [] }], cwd: input.cwd, approvalPolicy: "never", approvalsReviewer: "user",
         ...(input.model ? { model: input.model } : {}), ...(input.effort ? { effort: input.effort } : {}) });
       const turn = object(started.turn);
       if (!nativeId(turn.id)) throw new Error("Codex did not bind the accepted turn");
       active.id = turn.id; active.bind(turn.id);
-      const result = await terminal;
+      const result = await terminal; this.nativeSucceeded = result.ok;
       if (!result.ok) this.client?.close();
       // A native terminal frame is logical completion, not proof its tools have stopped.
       // Drain before the governor sees the final response or imports the final workspace diff.
       await this.settleNativeAttempt();
+      if (result.ok && this.loaded && this.residentMcp?.reusable) this.loadedContract = contract;
       return result;
     } catch (error) {
       active.bind(""); active.finish(false, "codex_delivery_unknown_no_replay", error instanceof ExternalJsonlRpcRequestError || error instanceof ExternalJsonlRpcTransportError ? error.runtimeFailureKind : undefined, error instanceof ExternalJsonlRpcRequestError || error instanceof ExternalJsonlRpcTransportError ? error.errorFirstLine : undefined); this.client?.close();
@@ -400,9 +436,14 @@ export class GovernedCodexSession {
     }
     finally { input.signal.removeEventListener("abort", interrupt); }
   }
-  private async settleNativeAttempt(): Promise<void> {
+  private settleNativeAttempt(): Promise<void> { return this.settling ??= this.settleCurrentAttempt(); }
+  private async settleCurrentAttempt(): Promise<void> {
+      const cleanMcp = this.residentMcp?.retireCurrent() ?? false;
+      const keepLoaded = Boolean(this.attemptEndpoint?.attemptMarker && cleanMcp && this.nativeSucceeded && this.active?.settled
+        && this.value.phase === "idle" && !this.active.compacted);
+      if (!keepLoaded) this.loadedContract = undefined;
       const client = this.client;
-      if (client && this.loaded && this.value.threadId) {
+      if (client && this.loaded && this.value.threadId && !keepLoaded) {
         let timer: ReturnType<typeof setTimeout> | undefined;
         const unloaded = new Promise<void>(resolve => { this.unload = resolve; });
         try {
@@ -415,10 +456,13 @@ export class GovernedCodexSession {
         finally { clearTimeout(timer); this.unload = undefined; }
       }
       if (!this.client) { await this.exit; if (this.policy) { await endWorkspaceNativePolicy(this.permit, this.policy); await this.policy.close(); this.policy = undefined; } }
-      else if (this.policy) { await endWorkspaceNativePolicy(this.permit, this.policy, { keepResidentRoot: true }); }
+      else if (this.policy) {
+        try { await endWorkspaceNativePolicy(this.permit, this.policy, { keepResidentRoot: true }); }
+        catch (error) { this.loadedContract = undefined; this.client?.close(); throw error; }
+      }
   }
   async release(): Promise<void> {
-    try { await this.settleNativeAttempt(); } finally {
+    try { if (this.active || this.attemptEndpoint) await this.settleNativeAttempt(); else this.residentMcp?.retireCurrent(); } finally {
       this.active = undefined; this.busy = false; this.lastUsed = Date.now();
       if (!this.closing) { this.idleTimer = setTimeout(() => { void this.dispose(); }, IDLE_MS); this.idleTimer.unref(); }
     }
@@ -427,6 +471,7 @@ export class GovernedCodexSession {
     this.closing = true; clearTimeout(this.idleTimer);
     const client = this.client; client?.close(); if (client) await client.waitForClose(); else await this.exit;
     if (this.policy) { await endWorkspaceNativePolicy(this.permit, this.policy); await this.policy.close(); this.policy = undefined; }
+    await this.residentMcp?.close(); this.residentMcp = undefined;
     this.evict();
   }
 }
