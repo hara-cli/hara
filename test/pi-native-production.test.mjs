@@ -391,7 +391,7 @@ test("interactive native Pi gateway has no aggregate call/token/tool cap, retain
     tools: [{ name: "read", description: "Native fixture read", input_schema: { type: "object" } }],
     provider: { id: "frozen", model: "frozen", async turn() { return { ...reply("observed"), toolUses: [{ id: randomUUID(), name: "read", input: {} }], stop: "tool_use" }; } } });
   await new Promise(resolve => setTimeout(resolve, 550));
-  for (let n = 0; n < 3; n++) assert.equal((await call(b, { body: body(["read"]) })).status, 200);
+  for (let n = 0; n < 3; n++) assert.equal((await call(b, { body: body([{ name: "read" }]) })).status, 200);
   assert.equal(b.host.metrics.providerRounds, 3); assert.equal(b.host.metrics.toolCalls, 3); assert.ok(b.host.metrics.totalTokens > 1);
   controller.abort(); assert.notEqual((await call(b)).status, 200);
   const timeoutController = new AbortController(); let providerSignal;
