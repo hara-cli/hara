@@ -12,7 +12,12 @@ import { fakeCodexMain } from "./fake-codex-app-server.mjs";
 
 export function writeFakeCodex(command, settings = { mode: "list" }) {
   fs.mkdirSync(dirname(command), { recursive: true });
-  fs.writeFileSync(command, "#!" + process.execPath + "\n(" + fakeCodexMain.toString() + ")();\n", { mode: 0o755 });
+  const body = "(" + fakeCodexMain.toString() + ")();\n";
+  if (settings.launcher) {
+    const native = command + ".fixture-native.mjs";
+    fs.writeFileSync(native, "process.argv[1]=" + JSON.stringify(command) + ";\n" + body);
+    fs.writeFileSync(command, "#!" + process.execPath + "\nconst fs=require('node:fs'),{spawn}=require('node:child_process');fs.writeFileSync(" + JSON.stringify(command + ".launcher.pid") + ",String(process.pid));const native=spawn(process.execPath,[" + JSON.stringify(native) + ",...process.argv.slice(2)],{stdio:'inherit'});native.once('exit',code=>process.exit(code??1));\n", { mode: 0o755 });
+  } else fs.writeFileSync(command, "#!" + process.execPath + "\n" + body, { mode: 0o755 });
   fs.writeFileSync(command + ".mode.json", JSON.stringify(settings));
 }
 
@@ -20,7 +25,7 @@ export async function cliMcpFixture(t, mode = "list", settings = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "hara-cli-mcp-")));
   const account = join(root, "account"), command = join(account, ".codex/tmp/bin/codex");
   fs.mkdirSync(dirname(command), { recursive: true });
-  writeFakeCodex(command, { mode });
+  writeFakeCodex(command, { mode, ...settings });
   fs.writeFileSync(command + ".mode.json", JSON.stringify({ mode, ...settings }));
   const workspaceRoot = settings.productionLayout ? join(account, ".hara", "workspaces-v1") : join(root, "workspace");
   fs.mkdirSync(workspaceRoot, { recursive: true, mode: 0o700 });

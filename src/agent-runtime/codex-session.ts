@@ -253,8 +253,10 @@ export class GovernedCodexSession {
       else { active.bind(""); active.finish(false, "interrupted"); client.close(); }
     };
     input.signal.addEventListener("abort", interrupt, { once: true });
+    let freshProcess = false;
     try {
       if (!this.client) {
+        freshProcess = true;
         const stages = workspaceRunRuntimeStages(this.permit);
         const endSpawn = stages?.beginEvent("spawn"), endCold = stages?.beginEvent("cold_start");
         const nativeArgs = ["app-server", "--stdio", "-c", "thread_unload_delay_secs=0", "-c", "mcp_servers={}",
@@ -300,9 +302,12 @@ export class GovernedCodexSession {
         || response.approvalPolicy !== "never" || response.approvalsReviewer !== "user"
         || object(response.sandbox).type !== "dangerFullAccess"
         || input.model !== null && response.model !== input.model || input.effort !== null && response.reasoningEffort !== input.effort
-        || ["active", "systemError"].includes(String(object(thread.status).type))) {
+        || object(thread.status).type !== "idle") {
         throw new Error("Codex thread confinement or idle origin was not confirmed");
       }
+      // npm's launcher remains the owned root; its initialized native app-server child is
+      // resident too. Seal that baseline before turn/start, never after model tools can run.
+      if (freshProcess) await this.policy.prepareResidentRoot();
       this.value.threadId = thread.id; this.loaded = true;
       this.value.phase = "unknown"; this.save(); // Write ahead of an accepted or outcome-unknown turn.
       this.systemDigests = new Map((args.systemParts?.length ? args.systemParts : [{ id: "system", digest: hash(args.system) }]).map(part => [part.id, part.digest]));

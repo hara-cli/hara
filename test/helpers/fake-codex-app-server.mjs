@@ -121,7 +121,7 @@ export async function fakeCodexMain() {
         thread = p.threadId; total = mode().mode === "usage-reset" ? { inputTokens: 1, outputTokens: 1 } : state.total;
       } else { thread = crypto.randomUUID(); fs.writeFileSync(command + ".native.json", JSON.stringify({ thread, total })); }
       cwd = p.cwd; config = p.config;
-      reply(message, { thread: { id: thread, cwd, status: { type: "idle" } }, approvalPolicy: p.approvalPolicy, approvalsReviewer: "user",
+      reply(message, { thread: { id: thread, cwd, status: { type: mode().threadStatus ?? "idle" } }, approvalPolicy: p.approvalPolicy, approvalsReviewer: "user",
         sandbox: { type: p.sandbox === "danger-full-access" ? "dangerFullAccess" : "readOnly", networkAccess: false }, model: p.model, reasoningEffort: p.config?.model_reasoning_effort ?? null }); continue;
     }
     if (message.method === "turn/start") {
