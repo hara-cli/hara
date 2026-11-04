@@ -115,12 +115,14 @@ function snapshot(root: string): { files: Map<string, FileStamp>; complete: bool
   }
   return { files, complete };
 }
-export function workspaceRunPermissionTier(permit: WorkspaceRunPermit): RuntimePermissionTier {
-  assertWorkspaceRunContextCurrent(permit);
+function frozenPermissionTier(permit: WorkspaceRunPermit): RuntimePermissionTier {
   const value = (permit.binding.agent as unknown as { permissionTier?: unknown }).permissionTier;
   if (value === undefined) return "controlled"; // a durable old task is never silently upgraded
   if (!isRuntimePermissionTier(value)) throw new Error("Invalid frozen runtime permission tier");
   return value;
+}
+export function workspaceRunPermissionTier(permit: WorkspaceRunPermit): RuntimePermissionTier {
+  assertWorkspaceRunContextCurrent(permit); return frozenPermissionTier(permit);
 }
 /** The native App stores user project files beneath .hara, beside (not inside) private Host state.
  * Only the existing unforgeable Host permit can distinguish this exact admitted project from state.
@@ -128,20 +130,23 @@ export function workspaceRunPermissionTier(permit: WorkspaceRunPermit): RuntimeP
 function managedDefaultProject(input: RuntimeExecutionPolicyInput): readonly [string, string, string] | null {
   const permit = input.managedProjectPermit;
   if (!permit) return null;
-  assertWorkspaceRunContextCurrent(permit);
+  // This WeakMap-backed access performs the full live fence once for this synchronous projection.
+  const managed = workspaceRunHasManagedProject(permit);
   const root = physical(input.workRoot);
   if (permit.binding.project.root !== root || permit.binding.agent.runtimeId !== input.runtimeId
-    || workspaceRunPermissionTier(permit) !== input.tier) throw new Error("Managed project policy differs from the admitted binding");
-  if (!workspaceRunHasManagedProject(permit)) return null;
+    || frozenPermissionTier(permit) !== input.tier) throw new Error("Managed project policy differs from the admitted binding");
+  if (!managed) return null;
   const id = permit.binding.scope.workspaceId;
   if (!/^ws_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u.test(id)
     || root !== join(physical(input.accountHome), ".hara", "workspaces-v1", "project", id)) return null;
   return [root, permit.binding.agent.resourceBinding.scopeKey, permit.binding.agent.resourceBinding.generation];
 }
-export function runtimeExecutionPolicyKey(input: RuntimeExecutionPolicyInput): string {
-  const managed = managedDefaultProject(input);
+function policyKey(input: RuntimeExecutionPolicyInput, managed: ReturnType<typeof managedDefaultProject>): string {
   return hash(JSON.stringify([input.runtimeId, input.tier, physical(input.workRoot), physical(input.accountHome),
     input.runtimeHome ? physical(input.runtimeHome) : null, input.protectedStateRoots?.map(physical) ?? [], input.loginSource ?? "host", input.lifetime ?? "attempt", input.runtimeId === "pi" ? piPackagedCodeReads() : [], ...(managed ? [managed] : [])]));
+}
+export function runtimeExecutionPolicyKey(input: RuntimeExecutionPolicyInput): string {
+  return policyKey(input, managedDefaultProject(input));
 }
 export class RuntimeExecutionPolicy {
   readonly key: string; readonly tempRoot: string; readonly profile: string;
@@ -157,7 +162,8 @@ export class RuntimeExecutionPolicy {
   private readonly input: RuntimeExecutionPolicyInput;
   constructor(input: RuntimeExecutionPolicyInput) {
     if (!RUNTIMES.includes(input.runtimeId) || !isRuntimePermissionTier(input.tier)) throw new Error("Invalid runtime execution policy");
-    this.input = { ...input }; this.key = runtimeExecutionPolicyKey(input);
+    const managed = managedDefaultProject(input);
+    this.input = { ...input }; this.key = policyKey(input, managed);
     this.workRoot = physical(input.workRoot); const home = physical(input.accountHome);
     if (!lstatSync(this.workRoot).isDirectory() || this.workRoot === sep || contains(this.workRoot, home)) throw new Error("Unsafe runtime working directory");
     const roots: Record<RegisteredPolicyRuntime, string> = {
@@ -191,7 +197,7 @@ export class RuntimeExecutionPolicy {
       if (!info.isFile() || info.nlink !== 1 || info.size > 3 || readFileSync(piAuth, "utf8").trim() !== "{}") throw new Error("Pi auth must be the dedicated empty object");
       allCredentials.push(piAuth);
     }
-    const haraRoot = physical(join(home, ".hara")), managedWorkRoot = managedDefaultProject(input)?.[0];
+    const haraRoot = physical(join(home, ".hara")), managedWorkRoot = managed?.[0];
     const stateRoots = (input.protectedStateRoots ?? []).map(physical), forbidden = [haraRoot, ...stateRoots];
     if (forbidden.some(root => contains(root, this.workRoot) && !(root === haraRoot && managedWorkRoot === this.workRoot))
       || managedWorkRoot && stateRoots.some(root => contains(managedWorkRoot, root))) throw new Error("Runtime working directory is protected Hara state");

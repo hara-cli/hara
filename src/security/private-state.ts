@@ -117,6 +117,16 @@ function verifyPrivateDirectory(identity: PrivateStateDirectoryIdentity): void {
   ) throw new Error(`private Hara state directory changed: '${identity.path}'`);
 }
 
+/** Revalidate a previously bound private namespace without creating or repairing directories. */
+export function assertPrivateStateDirectory(identity: PrivateStateDirectoryIdentity): void {
+  verifyPrivateDirectory(identity);
+  const info = lstatSync(identity.path);
+  if (!info.isDirectory() || info.isSymbolicLink() || info.dev !== identity.dev || info.ino !== identity.ino
+    || (process.platform !== "win32" && (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0))) {
+    throw new Error(`private Hara state directory identity or permissions changed: '${identity.path}'`);
+  }
+}
+
 /** Tighten one directory through a no-follow descriptor so a pre-existing link is never chmod'd. */
 function inspectPrivateDirectory(path: string): PrivateStateDirectoryIdentity {
   const before = lstatSync(path);

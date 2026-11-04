@@ -153,7 +153,9 @@ export function createWorkspaceRunPermit(input: {
     if (!project.isDirectory() || project.isSymbolicLink() || realpathSync.native(cwd) !== cwd
       || !workspaceFileIdMatches(binding.project.dev, project.dev) || !workspaceFileIdMatches(binding.project.ino, project.ino)) throw new Error("Workspace project grant identity changed");
     input.storage.run(() => {});
-    const catalog = input.catalog.read(), row = input.catalog.resolve(binding.scope.workspaceId);
+    // Use one freshly verified catalog snapshot so host epoch and grant come from the same revision.
+    const catalog = input.catalog.read(), row = catalog.workspaces.find(row => row.scope.workspaceId === binding.scope.workspaceId && row.active);
+    if (!row) throw new Error("Workspace is unavailable or revoked");
     if (canonical(row.scope) !== canonical(binding.scope) || catalog.hostId !== binding.host.hostId || catalog.hostEpoch !== binding.host.hostEpoch
       || row.actorId !== binding.host.actorId || row.policyRevision !== binding.host.policyRevision
       || row.grantId !== binding.host.grantId || row.grantRevision !== binding.host.grantRevision) throw new Error("Workspace Host authority was revoked");

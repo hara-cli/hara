@@ -24,7 +24,7 @@ import { currentWorkspaceResourceBinding, workspaceStateHome, WorkspaceResourceS
 import { WorkspaceConnectionStoreV2, type ScopedConnection, type ScopedRunConnection } from "./scoped-connections.js";
 import { closedWorkspaceHistory, WorkspaceConversationStore, type WorkspaceConversation, type WorkspaceUsage } from "./conversations.js";
 import { WorkspaceSessionLease } from "./session-lease.js";
-import { compactWorkspaceRoster } from "./management-context.js";
+import { compactWorkspaceRoster, prepareWorkspaceManagementContext } from "./management-context.js";
 import { DEFAULT_WORKSPACE_RUN_BUDGET, INTERACTIVE_WORKSPACE_RUN_BUDGET, captureWorkspaceProjectIdentity, freezeWorkspaceRunBinding, workspaceAgentBindingHash, type WorkspaceRunBinding } from "./run-binding.js";
 import { createWorkspaceRunPermit, bindWorkspaceRunOptions, assertWorkspaceRunAdmission, assertWorkspaceRunContextCurrent, closeWorkspaceRunPermit, type WorkspaceRunPermit } from "./execution.js";
 import { WorkspaceBudgetAdmissionError, WorkspaceTreeBudget } from "./tree-budget.js";
@@ -1353,6 +1353,7 @@ export class LocalWorkspaceHost {
       // The complete shipped card satisfies its read prerequisite without two native model turns.
       // This is documentation only; the existing approval and tool boundaries still decide authority.
       const preloadedCreationSkill = createColleagueRequest ? workspaceOperationSkill() : undefined;
+      const management = prepareWorkspaceManagementContext({ agents: context.resources.agents.list().agents, skills: withWorkspaceOperationSkill(context.features.enabledSkills()), objective: task.objective, preloadedCreationCard: Boolean(preloadedCreationSkill) });
       owned.options = bindWorkspaceRunOptions(owned.permit, { ctx: { cwd: context.project, sessionId: store.sessionId, todoScope: `workspace-${binding.runId}`, sandbox: "off" },
         signal: owned.signal, approval: "auto-edit", approvalChannel: true, confirm: async (_question, _signal, offer) => {
           if (!offer?.workspaceExtension || !owned.extensionAttempt) return false;
@@ -1365,7 +1366,7 @@ export class LocalWorkspaceHost {
         systemOverride: `You are ${configuration.identity.displayName}, a clearly identified Hara AI colleague. ${instructions}\nUse only this Workspace's supplied tools. Never claim completion without observed evidence.\n` + shared
           + `Reply naturally in the user's language. Call AI coworkers 同事, not Pi 同事; pi is only an internal runtime. A greeting needs no tools.\n`
           + `${owned.startContext.prompt}\n`
-          + `Current Workspace colleague directory (catalog_only; fresh at admission, no authority or completion evidence): ${JSON.stringify(compactWorkspaceRoster(context.resources.agents.list().agents))}. Use this before calling agent_list; fetch again only if missing, truncated or changed. Full public detail: agent_get by exact id.\n`
+          + `${management.prompt}\n`
           + `Use workspace_context_lookup to resolve missing names and aliases. Core pauses after two unresolved lookups or a recoverable safety checkpoint. Use ask_user for a real problem or material ambiguity; never guess a user answer.\n`
           + "For a genuinely ambiguous project/folder, reuse the evidenced projectLocations.options with its otherOption in ask_user. These catalog-only hints do not grant file access; never invent a path or ask for one already identified.\n"
           + `For an explicit new-colleague request, use the bounded startup roster and projectLocations candidates to call agent_create in your FIRST model response. Do not call workspace_skill, agent_list, workspace_receipt_read or ask_user first merely to fill name, role, project or runtime; the human edits missing fields on the card. A project candidate is only a label and does not grant file access. If an existing active colleague clearly matches, suggest reusing that colleague instead. For delegation use agent_contact with an existing exact agentId.\n`
@@ -1374,7 +1375,7 @@ export class LocalWorkspaceHost {
           + `agent_create returns only AFTER the human has edited and approved the card; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. created:false with approvalState declined/expired/aborted means no colleague was created — tell the human they can ask again; do not re-open a card unless they ask.\n`
           + `Successful Workspace tool results repeat the exact citation ID in receipt.toolCallId. Hara records and checks those receipts automatically for simple completed changes. For an explicit checkpoint, copy observed IDs; never invent them or repeat side effects to fix a rejected citation. After restart, re-observe state with read-only tools.\n`
           + (preloadedCreationSkill ? `Complete code-shipped help already loaded for this request: ${preloadedCreationSkill.id}@${preloadedCreationSkill.version}, cards/create-colleague.md. No workspace_skill prerequisite is needed for this creation proposal.\n${preloadedCreationSkill.files["cards/create-colleague.md"]}\n` : "")
-          + `Enabled version-locked Workspace skills (${preloadedCreationSkill ? "the complete creation card is preloaded above; read every page of other skill instructions via workspace_skill only when relevant to another operation" : "load every page of instructions via workspace_skill before acting"}; no extra permissions): ${boundWorkspaceText(JSON.stringify(withWorkspaceOperationSkill(context.features.enabledSkills()).map(item => ({ id: item.id, description: item.description, version: item.version }))), 1200)}.\n`
+          + `Hara records the initial brief automatically from the user request and first response BEFORE tools. Do not spend a model round solely on task_intake; use it for material revisions or unresolved intent. Use the startup catalog and preloaded built-in help when relevant.\n`
           + `Native runtime shell/file tools may change only the admitted working directory under the frozen permission tier. Use workspace_native_evidence to read current Host diff IDs for explicit checks; no diff is no proof. Native file evidence cannot prove Hara colleague, delegation, membership or schedule changes. All scheduled work must use Hara WorkspaceScheduler; do not use runtime-native cron, wakeup or background scheduling tools.\n`
           + `For file tasks read first; write only if necessary, then workspace_verify. Reply directly after the checks pass; Hara verifies actual tool receipts and records simple completion. Use task_checkpoint for complex acceptance or a typed human-only blocker.`,
         continuationSession: false, // Workspace recovery has its own bounded, fresh-observation wake brief.

@@ -6,7 +6,7 @@ import { lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, sep } from "node:path";
 import {
-  bindPrivateHaraStateFile, ensurePrivateStateSubdirectory, readPrivateStateFileSnapshotSync,
+  assertPrivateStateDirectory, bindPrivateHaraStateFile, ensurePrivateStateSubdirectory, readPrivateStateFileSnapshotSync,
   withPrivateStateLockSync, writePrivateStateFileSync, type PrivateStateDirectoryIdentity,
 } from "../security/private-state.js";
 
@@ -70,6 +70,7 @@ interface StorageContext {
   readonly home: string;
   readonly binding: WorkspaceResourceBinding;
   readonly scope: WorkspaceResourceScope;
+  readonly fileBindings: Map<string, ReturnType<typeof bindPrivateHaraStateFile>>;
   assertCurrent(): void;
   trackDirectory(directory: PrivateStateDirectoryIdentity): void;
 }
@@ -123,14 +124,25 @@ export function inspectWorkspaceResourceFile(path: string, maxBytes: number) {
 export function bindWorkspaceResourceFile(path: string) {
   const context = contexts.getStore();
   if (!context) throw new Error("no Workspace resource storage context");
-  const home = workspaceStateHome();
+  const home = context.home;
   const rel = relative(home, path);
   const components = rel.split(sep);
   if (isAbsolute(rel) || components.length < 2 || components[0] !== ".hara"
     || components.some(value => !value || value === "." || value === "..")) throw new Error("file is outside Workspace resource storage");
-  const binding = bindPrivateHaraStateFile(home, components.slice(1, -1), basename(path));
-  context.trackDirectory(binding.directory);
-  const assertCurrent = (): void => { context.assertCurrent(); verifyDirectory(binding.directory); };
+  // Reuse only this immutable directory/path proof. Every caller still reads fresh bytes and
+  // rechecks authority, generation, all tracked directories and final file identity around I/O.
+  let binding = context.fileBindings.get(path);
+  if (!binding) {
+    // A new binding may create private directories. Fence before that mutation; a cache hit
+    // only projects immutable path data and is fenced below before any caller can do I/O.
+    context.assertCurrent();
+    const fresh = bindPrivateHaraStateFile(home, components.slice(1, -1), basename(path));
+    binding = Object.freeze({ path: fresh.path, directory: Object.freeze({ ...fresh.directory }) });
+    context.trackDirectory(binding.directory);
+    if (context.fileBindings.size >= 256) context.fileBindings.clear();
+    context.fileBindings.set(path, binding);
+  }
+  const assertCurrent = (): void => { context.assertCurrent(); assertPrivateStateDirectory(binding.directory); };
   assertCurrent();
   return { path: binding.path, directory: binding.directory, assertCurrent };
 }
@@ -239,7 +251,7 @@ export class WorkspaceResourceStorage {
       }
       const frozenText = snapshot.text;
       const tracked = new Map<string, PrivateStateDirectoryIdentity>();
-      return Object.freeze({ home: state.path, binding, scope: this.scope, trackDirectory: (directory: PrivateStateDirectoryIdentity) => {
+      return Object.freeze({ home: state.path, binding, scope: this.scope, fileBindings: new Map<string, ReturnType<typeof bindPrivateHaraStateFile>>(), trackDirectory: (directory: PrivateStateDirectoryIdentity) => {
         const known = tracked.get(directory.path);
         if (known) { verifyDirectory(known); return; }
         if (tracked.size >= 10_000) throw new Error("Workspace resource directory tracking limit exceeded");

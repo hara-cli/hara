@@ -86,6 +86,17 @@ test("connection rotation, grant revocation and Agent lifecycle epoch changes in
   const a=fixture(async()=>reply("must not run"));try{revoke(a);assert.equal((await runConfiguredAgent([],a.options)).status,"error");assert.equal(a.requests,0);}finally{await a.close();}
  }
 });
+for (const authorityPart of ["hostEpoch", "grantRevision", "actorId"]) test(`fresh permit checks reject changed ${authorityPart} before any model request`, async () => {
+ const a=fixture(async()=>reply("must not run"));
+ try {
+  const target=join(a.home,".hara/workspace-local-dev/catalog-v2.json"), changed=JSON.parse(fs.readFileSync(target,"utf8"));
+  if(authorityPart==="hostEpoch") changed.hostEpoch++;
+  else if(authorityPart==="grantRevision") changed.workspaces[0].grantRevision++;
+  else changed.workspaces[0].actorId="replacement-owner";
+  fs.writeFileSync(target,JSON.stringify(changed)+"\n",{mode:0o600});
+  assert.equal((await runConfiguredAgent([],a.options)).status,"error"); assert.equal(a.requests,0);
+ } finally { await a.close(); }
+});
 test("initial/current task provenance cannot be changed by steering an active scoped run",async()=>{
  const a=fixture(async()=>reply("no"));try{
   a.task={...a.task,turnId:"forged-turn"};assert.equal((await runConfiguredAgent([],a.options)).status,"error");assert.equal(a.requests,0);
