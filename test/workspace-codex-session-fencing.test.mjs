@@ -25,3 +25,21 @@ test("busy Codex input is refused without a second writer and cancellation drain
   assert.equal(view.conversation.state, "completed"); assert.equal(starts(f).at(-1).method, "thread/resume");
   assert.equal(f.native().filter(row => row.method === "turn/start").length, 2);
 });
+
+test("unknown native thread status is refused before any model turn or tool endpoint can execute", async t => {
+  const f = await cliMcpFixture(t, "list", { threadStatus: "futureRunning" });
+  const view = await exchange(f, "List current colleagues?");
+  assert.equal(view.conversation.state, "blocked");
+  assert.equal(f.native().filter(row => row.method === "turn/start").length, 0);
+  assert.equal(f.native().filter(row => row.method === "thread/start").length, 1);
+});
+
+test("a delayed event from the previous turn cannot change the next turn's answer or usage", async t => {
+  const f = await cliMcpFixture(t, "list");
+  await exchange(f, "List current colleagues? First turn"); f.mode("wrong-events");
+  const view = await exchange(f, "List current colleagues? Second turn");
+  assert.equal(view.conversation.state, "completed", view.conversation.blockReason);
+  assert.equal(view.conversation.usage.inputTokens, 200);
+  assert.equal(view.conversation.history.filter(row => row.role === "assistant").at(-1).text, "Scoped CLI reply");
+  assert.doesNotMatch(JSON.stringify(view.conversation.history), /FOREIGN_THREAD/);
+});

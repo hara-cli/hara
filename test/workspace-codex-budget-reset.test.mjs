@@ -5,6 +5,9 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { cliMcpFixture, until } from "./helpers/workspace-cli-mcp.mjs";
 import { codexContextLimit, nativeContextLimit } from "../dist/workspace/codex-thread.js";
+import { codexThreadState } from "../dist/workspace/codex-thread.js";
+import { LocalWorkspaceCatalog } from "../dist/workspace/local-catalog.js";
+import { WorkspaceResourceStorage } from "../dist/workspace/resource-context.js";
 
 const done = view => ["completed", "blocked", "paused", "cancelled"].includes(view.conversation.state);
 const sample = (input, cached, output, lastInput = input, lastCached = cached) => ({
@@ -111,4 +114,18 @@ test("legacy saved counters migrate without granting cache credit from an unknow
   const view = await exchange(f, "List current colleagues after migration?"); assert.equal(view.conversation.state, "completed");
   assert.deepEqual(view.conversation.nativeSession.lastAttempt, { input: 6000, cachedInput: 0, output: 20 });
   assert.equal(view.conversation.runUsage.inputTokens, 6000); assert.equal(nativeState(f).value.schemaVersion, 2);
+});
+
+test("invalid native state union, unknown fields and unsupported old schema are refused without rewriting history", async t => {
+  const f = await cliMcpFixture(t, "list"); await exchange(f);
+  const saved = nativeState(f), original = fs.readFileSync(saved.file, "utf8");
+  const home = join(f.workspaceRoot, "home"), catalog = new LocalWorkspaceCatalog(home), row = catalog.read().workspaces.find(item => item.scope.workspaceId === f.scope.workspaceId);
+  assert(row); const storage = new WorkspaceResourceStorage(home, row.scope); storage.initialize();
+  const state = codexThreadState(storage, f.main.agentId, f.main.agentId.slice(3));
+  for (const altered of [{ ...saved.value, phase: "running" }, { ...saved.value, futureCapability: true }, { ...saved.value, schemaVersion: 0 }]) {
+    fs.writeFileSync(saved.file, JSON.stringify(altered) + "\n");
+    assert.throws(() => state.read(), /binding is invalid/);
+    assert.deepEqual(JSON.parse(fs.readFileSync(saved.file, "utf8")), altered, "unsupported state remains untouched for recovery");
+  }
+  fs.writeFileSync(saved.file, original); assert.equal(state.read().threadId, saved.value.threadId);
 });

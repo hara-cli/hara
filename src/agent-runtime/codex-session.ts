@@ -300,7 +300,7 @@ export class GovernedCodexSession {
         || response.approvalPolicy !== "never" || response.approvalsReviewer !== "user"
         || object(response.sandbox).type !== "dangerFullAccess"
         || input.model !== null && response.model !== input.model || input.effort !== null && response.reasoningEffort !== input.effort
-        || ["active", "systemError"].includes(String(object(thread.status).type))) {
+        || object(thread.status).type !== "idle") {
         throw new Error("Codex thread confinement or idle origin was not confirmed");
       }
       this.value.threadId = thread.id; this.loaded = true;
