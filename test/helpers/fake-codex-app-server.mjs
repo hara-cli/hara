@@ -31,7 +31,7 @@ export async function fakeCodexMain() {
     save();
     const rpc = (method, data) => note(method, { threadId: thread, turnId: currentTurn, ...data });
     if (mode().preview) {
-      const preview = mode().preview, item = { id: "preview-item", type: "agentMessage", phase: preview.phase ?? null };
+      const preview = mode().preview, item = { id: "preview-item", type: "agentMessage", phase: preview.phase ?? null, ...(preview.malformedStart ? {} : { text: "" }) };
       rpc("item/started", { item });
       note("item/agentMessage/delta", { threadId: "foreign", turnId: currentTurn, itemId: item.id, delta: "FOREIGN_PRIVATE_TEXT" });
       note("item/agentMessage/delta", { threadId: thread, turnId: "old-turn", itemId: item.id, delta: "OLD_PRIVATE_TEXT" });

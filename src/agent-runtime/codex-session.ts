@@ -23,6 +23,13 @@ import { createWorkspaceMcpEndpoint, WORKSPACE_MCP_TOKEN_ENV, type WorkspaceMcpE
 
 const hash = (value: unknown): string => createHash("sha256").update(canonical(value)).digest("hex");
 const object = (value: unknown): Record<string, unknown> => plain(value) ? value : {};
+/** Documented agentMessage is visible prose even when legacy providers omit its phase.
+ * Require its real typed item first; unknown future phases never become preview text. */
+export function codexVisibleAgentMessage(value: unknown): boolean {
+  const item = object(value);
+  return item.type === "agentMessage" && nativeId(item.id) && typeof item.text === "string"
+    && (item.phase === undefined || item.phase === null || item.phase === "partial_answer" || item.phase === "final_answer");
+}
 /** Stable policy changes refresh the native context; turn-clock/checkpoint text travels every turn. */
 export function codexStandingContext(args: Pick<TurnArgs, "system" | "systemParts">, model: string | null, effort: string | null,
   tier: string, configRevision: number) {
@@ -208,13 +215,14 @@ export class GovernedCodexSession {
         if (method === "turn/completed") observeWorkspaceMessageTiming(this.permit, "T8", observedAt);
         const previewItem = object(params.item);
         if (method === "item/started" && previewItem.type === "agentMessage" && nativeId(previewItem.id)) {
-          if (active.visibleItems.size < 32) active.visibleItems.set(previewItem.id, ["partial_answer", "final_answer"].includes(String(previewItem.phase)));
+          if (active.visibleItems.size < 32) active.visibleItems.set(previewItem.id, codexVisibleAgentMessage(previewItem));
           if (!active.previewItem && active.visibleItems.get(previewItem.id)) {
             active.previewItem = previewItem.id;
             active.preview = createAssistantPreview({ source: active.previewEnv, emit: text => {
               if (this.active === active && !active.settled && active.id && this.client === client)
                 active.previewOutput?.({ nativeTurnId: active.id, itemId: active.previewItem!, text });
             } });
+            if (previewItem.text) active.preview.push(previewItem.text as string);
           }
         }
         if (this.policy && (method === "item/started" || method === "item/completed")) observeWorkspaceNativeItem(this.permit, this.policy, object(params.item), method === "item/started" ? "started" : "completed");
@@ -222,8 +230,8 @@ export class GovernedCodexSession {
           const item = object(params.item);
           if (typeof item.text === "string") {
             if (item.id === active.previewItem) active.preview?.finish();
-            else if (!active.previewItem && nativeId(item.id) && item.phase !== "commentary") {
-              // Legacy/unknown phase: wait for the complete, documented agent-message item.
+            else if (!active.previewItem && codexVisibleAgentMessage(item)) {
+              // Missing/malformed start item: wait for this complete, documented agent message.
               active.previewItem = item.id;
               active.preview = createAssistantPreview({ source: active.previewEnv, emit: text => {
                 if (this.active === active && !active.settled && active.id && this.client === client)
