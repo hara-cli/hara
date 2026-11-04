@@ -25,7 +25,14 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
   constructor(storage: WorkspaceResourceStorage, private readonly vault: CredentialVault,
     private readonly resolveLegacy?: (id: string) => { input: ScopedConnectionInput; importId: string }) {
     super(storage);
-    const binding = () => storage.run(() => ({ ...currentWorkspaceResourceBinding()! }));
+    // These callbacks run only inside this document's VersionedSettings storage boundary.
+    // Reading its immutable provenance is structural work; the enclosing read/update performs
+    // the live authority checks, including after parsing and before committing a migration.
+    const binding = (): WorkspaceResourceBinding => {
+      const current = currentWorkspaceResourceBinding();
+      if (!current || current.scopeKey !== storage.scopeKey) throw new Error("Secure settings require their bound Workspace resource context");
+      return { ...current };
+    };
     const parse = (raw: unknown): Document => {
       // One immutable provenance value for this fresh document parse. The surrounding
       // VersionedSettings read/update still checks live storage authority before and after.

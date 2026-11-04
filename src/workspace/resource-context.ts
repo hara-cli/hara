@@ -124,7 +124,7 @@ export function inspectWorkspaceResourceFile(path: string, maxBytes: number) {
 export function bindWorkspaceResourceFile(path: string) {
   const context = contexts.getStore();
   if (!context) throw new Error("no Workspace resource storage context");
-  const home = workspaceStateHome();
+  const home = context.home;
   const rel = relative(home, path);
   const components = rel.split(sep);
   if (isAbsolute(rel) || components.length < 2 || components[0] !== ".hara"
@@ -133,6 +133,9 @@ export function bindWorkspaceResourceFile(path: string) {
   // rechecks authority, generation, all tracked directories and final file identity around I/O.
   let binding = context.fileBindings.get(path);
   if (!binding) {
+    // A new binding may create private directories. Fence before that mutation; a cache hit
+    // only projects immutable path data and is fenced below before any caller can do I/O.
+    context.assertCurrent();
     const fresh = bindPrivateHaraStateFile(home, components.slice(1, -1), basename(path));
     binding = Object.freeze({ path: fresh.path, directory: Object.freeze({ ...fresh.directory }) });
     context.trackDirectory(binding.directory);
