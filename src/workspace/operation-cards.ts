@@ -421,7 +421,7 @@ export const WORKSPACE_OPERATION_CARDS = [
       "先明确任务与时间，delay_seconds、未来UTC ISO fire_at、repeat三选一；repeat可用every:15m/h/d、daily@HH:MM、weekly:mon,fri@HH:MM，tz为IANA时区，默认Host时区。重复最短15分钟。",
       "用schedule_create提交；重复任务等待原Desk确认卡，拒绝/过期不创建，已消费成功不再重复确认。一次性创建沿当前授权执行。禁止用runtime原生Cron/ScheduleWakeup或后台常驻替代Hara调度。",
       "created:true/id/nextRunAt是已建立日程，和未来任务已执行不同；用真实receipt作创建结案检查，未来执行结果仍待原对话回写核验。每同事最多32个聊天任务、每空间最多256个日程，不自动重投未知执行。",
-      "同事用schedule_list/cancel只操作自己的聊天日程，主Hara可列空间日程；按精确id取消，不能借旧legacy任务或活动/unknown运行绕过边界。设置页的定时任务入口可查看修改删除，所有改动仍按当前版本和scope校验。",
+      "同事用schedule_list/cancel只操作自己的聊天日程，主Hara可列空间日程；按精确id取消，不能借旧legacy任务或活动/unknown运行绕过边界。Desk设置页可用日期/当地时间、每日、每周和每N分钟/小时选择器新建、修改、删除日程；重复任务保存前仍须用户确认。无法映射的旧节奏先只读显示原值，由用户明确改为选择器；人类设置页不是模型工具，所有改动仍按当前版本和scope校验。",
       "到点复用原同事、原会话、冻结runtime/connection；忙碌延后，原对话/消息/成员/绑定失效会blocked，不投递到别处。Hara未运行时不承诺离线准时执行。"
     ],
     "evidence": "分别报告日程已创建/已确认/下次时间、运行accepted/blocked/unknown和原会话真实结果，不能把定时条目存在当作任务已完成。"

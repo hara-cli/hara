@@ -293,4 +293,5 @@ test("chat scheduling card binds actual scoped tools and documents original conf
  for(const name of ["schedule_create","schedule_cancel"]) assert.equal(mainToolImplementations.find(tool=>tool.name===name).kind,"edit");
  assert.equal(mainToolImplementations.find(tool=>tool.name==="schedule_list").kind,"read");
  assert.match(definition.steps.join(" "),/15分钟/);assert.match(definition.steps.join(" "),/原Desk确认卡/);assert.match(definition.steps.join(" "),/created:true/);
+ assert.match(definition.steps.join(" "),/Desk设置页.*选择器/);assert.match(definition.steps.join(" "),/人类设置页不是模型工具/);
 });
