@@ -6,16 +6,17 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
+import { workspaceOperationSkill } from "../dist/workspace/operation-cards.js";
 import { SYNTHETIC_CONNECTION } from "../dist/workspace/synthetic-provider.js";
 import { planLegacyResources, WorkspaceLegacyResources } from "../dist/workspace/legacy-resources.js";
 
 async function fixture(t, count = 20, proposal = {
   username: "video-helper", displayName: "Video Helper", title: "Video project", instructions: "Manage video work." }) {
   const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-chat-create-")));
-  let calls = 0;
+  let calls = 0; const systems = [];
   const host = new LocalWorkspaceHost(root, { credentialVault: new MemoryCredentialVault(),
     providerFactory(_connection, binding) { return { id: "openai", model: binding.model, async turn(args) {
-      calls++;
+      calls++; systems.push(args.system);
       if (args.history.some(row => row.role === "tool" && row.results.some(result => result.name === "agent_create")))
         return { text: "已处理同事草稿。", stop: "end", toolUses: [] };
       assert.equal(args.tools.some(tool => tool.name === "agent_create"), true);
@@ -30,7 +31,7 @@ async function fixture(t, count = 20, proposal = {
   const rows = planLegacyResources({ jobs: [], projects: ["/known/video", "/known/design"].map(path => ({ path })), legacyWorkspacePath: "/known/resources" });
   await new WorkspaceLegacyResources(context.storage).domain("a".repeat(64), rows).apply();
   host.select("client", id, host.list().revision);
-  return { host, id, main, calls: () => calls };
+  return { host, id, main, calls: () => calls, systems: () => systems };
 }
 async function cardFor(f) {
   const run = f.host.start("client", f.id, f.main, "建一个负责 video 项目的同事", randomUUID());
@@ -111,3 +112,21 @@ test("project candidate revoked after card publication cannot be confirmed", asy
   assert.equal(f.host.snapshot(f.id, f.main, "client").agents.length, 2);
 });
 
+
+
+test("explicit colleague creation receives the complete version-locked card before its first model call", async t => {
+  const f = await fixture(t, 0), { run, card } = await cardFor(f);
+  const system = f.systems()[0], skill = workspaceOperationSkill(), file = "cards/create-colleague.md";
+  assert.equal(f.calls(), 1);
+  assert.equal(system.includes(skill.files[file]), true, "complete current card must already be available without index/card tool calls");
+  assert.equal(system.includes(skill.version), true, "preloaded help is bound to the shipped version");
+  assert.equal(system.includes(file), true);
+  assert.equal(system.includes("load every page of instructions via workspace_skill before acting"), false,
+    "generic preread must not contradict the first-response creation contract");
+  for (const name of Object.keys(skill.files).filter(name => name !== "SKILL.md" && name !== file))
+    assert.equal(system.includes(skill.files[name]), false, "unrelated operation cards remain on demand");
+  assert.equal(card.kind, "agent_create");
+  assert.equal(f.host.snapshot(f.id, f.main, "client").agents.length, 1, "preloaded instructions grant no creation authority");
+  f.host.answerApproval("client", f.id, card.id, false); await f.host.wait(run.runId);
+  assert.equal(f.host.snapshot(f.id, f.main, "client").agents.length, 1);
+});
