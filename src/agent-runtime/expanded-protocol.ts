@@ -1,4 +1,5 @@
 import { classifyRuntimeFailure, type RuntimeFailureKind } from "./failure-diagnostics.js";
+import { runtimeErrorFirstLine } from "../security/runtime-error.js";
 import type { ExpandedRuntimeId } from "./expanded-models.js";
 import type { ExternalCommandCaptureResult } from "../external-sessions/process.js";
 
@@ -36,12 +37,20 @@ export function isForbiddenNativeTool(name: unknown): boolean {
   return /^(?:cron|schedule|wakeup|background|spawnbackground|startbackground|persistentagent)/.test(canonical)
     || canonical === "task" || canonical === "spawnagent";
 }
-export interface ExpandedRunResult { text: string; completed: boolean; tools: NativeToolObservation[]; failure: RuntimeFailureKind | null }
+export interface ExpandedRunResult { text: string; completed: boolean; tools: NativeToolObservation[]; failure: RuntimeFailureKind | null; errorFirstLine?: string }
 /** Parse content-free tool observations separately from final response text. Exit zero alone is not success. */
-export function parseExpandedRun(id: "copilot" | "cursor", result: ExternalCommandCaptureResult): ExpandedRunResult {
+export function parseExpandedRun(id: "copilot" | "cursor", result: ExternalCommandCaptureResult, env?: NodeJS.ProcessEnv): ExpandedRunResult {
   let assembled = "", deltas = "", terminal = false, failure: RuntimeFailureKind | null = null, frames = 0;
   const tools: NativeToolObservation[] = [];
-  const fail = (): ExpandedRunResult => ({ text: "", completed: false, tools, failure: failure ?? classifyRuntimeFailure({ code: result.errorCode, timedOut: result.timedOut }) });
+  let errorFirstLine = runtimeErrorFirstLine(result.errorFirstLine, env);
+  // Only documented error-message fields cross this boundary, never whole frames or RPC data.
+  const observeError = (value: unknown): void => {
+    const message = typeof value === "string" ? value : object(value)?.message;
+    errorFirstLine ??= runtimeErrorFirstLine(message, env);
+  };
+  const fail = (): ExpandedRunResult => ({ text: "", completed: false, tools,
+    failure: failure ?? classifyRuntimeFailure({ code: result.errorCode, timedOut: result.timedOut }),
+    ...(errorFirstLine ? { errorFirstLine } : {}) });
   for (const line of result.stdout.split(/\r?\n/)) {
     if (!line.trim()) continue;
     if (Buffer.byteLength(line) > 1024 * 1024 || ++frames > 4096) return fail();
@@ -53,6 +62,7 @@ export function parseExpandedRun(id: "copilot" | "cursor", result: ExternalComma
     const data = object(frame.data) ?? {};
     if (frame.type === "error" || frame.type === "session.error" || frame.is_error === true) {
       failure = classifyRuntimeFailure({ stderr: JSON.stringify(frame.error ?? data ?? frame).slice(0, 65_536) });
+      observeError(frame.error ?? data.message ?? frame.message ?? frame.result);
       terminal = false;
     }
     if (id === "copilot") {
@@ -67,7 +77,7 @@ export function parseExpandedRun(id: "copilot" | "cursor", result: ExternalComma
       }
       if (frame.type === "result") {
         const code = frame.exitCode ?? data.exitCode;
-        if (typeof code === "number" && code !== 0) failure = "runtime_failed";
+        if (typeof code === "number" && code !== 0) { failure = "runtime_failed"; observeError(frame.error ?? data.message); }
         else terminal = true;
         if (typeof frame.result === "string") assembled = frame.result;
       }
@@ -87,8 +97,10 @@ export function parseExpandedRun(id: "copilot" | "cursor", result: ExternalComma
         tools.push(nativeToolObservation(name, frame.subtype === "completed" ? "completed" : "started", undefined, payload?.args ?? payload?.arguments));
       }
       if (frame.type === "result") {
-        if (frame.is_error === true || frame.subtype !== "success") failure = classifyRuntimeFailure({ stderr: JSON.stringify(frame.error ?? frame.result ?? "").slice(0, 65_536) });
-        else { terminal = true; if (typeof frame.result === "string") assembled = frame.result; }
+        if (frame.is_error === true || frame.subtype !== "success") {
+          failure = classifyRuntimeFailure({ stderr: JSON.stringify(frame.error ?? frame.result ?? "").slice(0, 65_536) });
+          observeError(frame.error ?? frame.result);
+        } else { terminal = true; if (typeof frame.result === "string") assembled = frame.result; }
       }
     }
     if (assembled.length + deltas.length > 200_000 || tools.length > 1024) return fail();

@@ -35,6 +35,7 @@ const id=${JSON.stringify(id)}, mode=${JSON.stringify(mode)}, full=${JSON.string
 if(args[0]==="--version"){console.log(id+" 1.2.3");process.exit(0);}
 if(args[0]==="--help"){console.log("--effort <level> (low, medium, high, xhigh, max)");process.exit(0);}
 if(args[0]==="models"){console.log("fixture-model - Synthetic model");process.exit(0);}
+if(mode==="startup-stderr"){process.stderr.write(["Error: native startup rejected /Users/private/config.json account=PRIVATE_ACCOUNT", "PRIVATE_SECOND_LINE"].join(String.fromCharCode(10)));process.exit(1);}
 if(process.env.HOME!==${JSON.stringify(account)}||args.includes("login")||args.includes("--reauth"))process.exit(9);
 fs.writeFileSync(${JSON.stringify(argv)},JSON.stringify({args,home:process.env.HOME}));
 if(mode==="background"){
@@ -72,11 +73,11 @@ if(id==="grok"){
  const lines=readline.createInterface({input:process.stdin});
  lines.on("line",async line=>{try{
   const request=JSON.parse(line);if(request.jsonrpc!=="2.0")process.exit(11);
-  if(request.method==="initialize"){output({jsonrpc:"2.0",id:request.id,result:{protocolVersion:1,agentCapabilities:{mcpCapabilities:{http:mode!=="no-mcp"}}}});}
+  if(request.method==="initialize"){if(mode==="initialize-error"){output({jsonrpc:"2.0",id:request.id,error:{code:-32000,message:["401 authentication rejected /Users/private/auth.json account=PRIVATE_ACCOUNT","PRIVATE_SECOND_LINE"].join(String.fromCharCode(10)),data:{private:"PRIVATE_RPC_DATA"}}});return;}output({jsonrpc:"2.0",id:request.id,result:{protocolVersion:1,agentCapabilities:{mcpCapabilities:{http:mode!=="no-mcp"}}}});}
   else if(request.method==="session/new"){remote=request.params.mcpServers[0];if(request.params.cwd!==process.cwd())process.exit(12);output({jsonrpc:"2.0",id:request.id,result:{sessionId:"fixture-session"}});}
   else if(request.method==="session/prompt"){promptId=request.id;if(mode==="cancel")return;if(!full){await finish();return;}output({jsonrpc:"2.0",id:99,method:"session/request_permission",params:{sessionId:mode==="foreign-permission"?"foreign":"fixture-session",toolCall:{title:mode==="native-schedule"?"CronCreate":"read_file"},options:[{kind:"allow_once",optionId:"once"}]}});}
   else if(request.id===99){
-    if(request.result?.outcome?.outcome!=="selected"){output({jsonrpc:"2.0",id:promptId,error:{code:-32000,message:"permission cancelled PRIVATE_ACCOUNT"}});return;}
+    if(request.result?.outcome?.outcome!=="selected"){output({jsonrpc:"2.0",id:promptId,error:{code:-32000,message:"permission cancelled account=PRIVATE_ACCOUNT"}});return;}
     await finish();
   }
  }catch{output({jsonrpc:"2.0",id:999,error:{code:-32000,message:"fixture failed"}});}});
@@ -88,7 +89,7 @@ if(id==="grok"){
   const configPath=id==="copilot"?args.find(arg=>arg.startsWith("--additional-mcp-config=@")).slice("--additional-mcp-config=@".length):require("node:path").join(process.cwd(),".cursor/mcp.json");
   const remote=JSON.parse(fs.readFileSync(configPath,"utf8")).mcpServers.hara;
   const text=await callMcp(remote);
-  if(mode==="terminal-error"){output({type:"session.error",data:{message:"401 PRIVATE_ACCOUNT"}});process.exit(0);}
+  if(mode==="terminal-error"){output({type:"session.error",data:{message:"401 account=PRIVATE_ACCOUNT"}});process.exit(0);}
   if(id==="copilot"){output({type:"tool.execution_complete",data:{toolName:mode==="native-write"?"write_file":"read_file",success:true}});output({type:"assistant.message",data:{content:text}});output({type:"session.idle"});}
   else{output({type:"tool_call",subtype:"completed",tool_call:{[mode==="native-write"?"writeToolCall":"readToolCall"]:{args:{path:mode==="native-write"?"native-result.txt":"README.md"}}}});output({type:"assistant",message:{content:[{type:"text",text}]}});output({type:"result",subtype:"success",is_error:false,result:text});}
  })().catch(()=>process.exit(13));
@@ -251,4 +252,31 @@ for (const id of ["copilot", "cursor", "grok"]) test(id + " public attempt clear
   const deadline = Date.now() + 5000; let state;
   do { state = inspect(pid); if (!state || state.startsWith("Z")) break; await new Promise(resolve => setTimeout(resolve, 25)); } while (Date.now() < deadline);
   assert.ok(!state || state.startsWith("Z"), "owned background child must no longer run");
+});
+
+for (const id of ["copilot", "cursor", "grok"]) test(id + " startup error first line reaches Host diagnostics with redaction", { skip: process.platform !== "darwin" }, async t => {
+  const f = await fixture(t, id, "main", "startup-stderr"), outcome = await f.run();
+  assert.equal(outcome.status, "error");
+  const dto = JSON.parse(outcome.error.slice(outcome.error.indexOf("hara_runtime_failure_v1=") + "hara_runtime_failure_v1=".length));
+  assert.match(dto.errorFirstLine, /Error: native startup rejected \[path\] account=\[redacted\]/);
+  assert.equal(dto.extensionsIsolation, "inherited");
+  assert.doesNotMatch(outcome.error, /Users\/private|PRIVATE_ACCOUNT|PRIVATE_SECOND_LINE/);
+  assert.equal(f.state().calls, 0); assert.equal(f.state().owned, 1); assert.equal(f.state().closed, 1);
+  assert.equal(f.installer.list().options.find(row => row.runtimeId === id).versionStatus.lastSuccessfulVersion, null);
+});
+for (const id of ["copilot", "cursor"]) test(id + " typed zero-exit error first line reaches Host diagnostics", { skip: process.platform !== "darwin" }, async t => {
+  const f = await fixture(t, id, "main", "terminal-error"), outcome = await f.run();
+  assert.equal(outcome.status, "error");
+  const dto = JSON.parse(outcome.error.slice(outcome.error.indexOf("hara_runtime_failure_v1=") + "hara_runtime_failure_v1=".length));
+  assert.equal(dto.errorFirstLine, "401 account=[redacted]"); assert.equal(dto.kind, "runtime_auth_rejected");
+  assert.doesNotMatch(outcome.error, /PRIVATE_ACCOUNT/); assert.equal(f.state().calls, 1);
+  assert.equal(f.installer.list().options.find(row => row.runtimeId === id).versionStatus.lastSuccessfulVersion, null);
+});
+test("grok ACP error first line preserves native classification without RPC data", { skip: process.platform !== "darwin" }, async t => {
+  const f = await fixture(t, "grok", "main", "initialize-error"), outcome = await f.run();
+  assert.equal(outcome.status, "error");
+  const dto = JSON.parse(outcome.error.slice(outcome.error.indexOf("hara_runtime_failure_v1=") + "hara_runtime_failure_v1=".length));
+  assert.equal(dto.kind, "runtime_auth_rejected"); assert.match(dto.errorFirstLine, /401 authentication rejected \[path\] account=\[redacted\]/);
+  assert.doesNotMatch(outcome.error, /PRIVATE_RPC_DATA|PRIVATE_ACCOUNT|PRIVATE_SECOND_LINE|Users\/private/);
+  assert.equal(f.state().calls, 0); assert.equal(f.state().owned, 1); assert.equal(f.state().closed, 1);
 });
