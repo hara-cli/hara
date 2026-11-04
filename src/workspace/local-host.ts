@@ -18,7 +18,7 @@ import { currentWorkspaceResourceBinding, workspaceStateHome, WorkspaceResourceS
 import { WorkspaceConnectionStoreV2, type ScopedConnection, type ScopedRunConnection } from "./scoped-connections.js";
 import { closedWorkspaceHistory, WorkspaceConversationStore, type WorkspaceConversation, type WorkspaceUsage } from "./conversations.js";
 import { WorkspaceSessionLease } from "./session-lease.js";
-import { compactWorkspaceRoster, prepareWorkspaceInitialBrief, prepareWorkspaceManagementContext } from "./management-context.js";
+import { compactWorkspaceRoster, prepareWorkspaceManagementContext } from "./management-context.js";
 import { DEFAULT_WORKSPACE_RUN_BUDGET, INTERACTIVE_WORKSPACE_RUN_BUDGET, captureWorkspaceProjectIdentity, freezeWorkspaceRunBinding, workspaceAgentBindingHash, type WorkspaceRunBinding } from "./run-binding.js";
 import { createWorkspaceRunPermit, bindWorkspaceRunOptions, assertWorkspaceRunAdmission, assertWorkspaceRunContextCurrent, closeWorkspaceRunPermit, type WorkspaceRunPermit } from "./execution.js";
 import { WorkspaceBudgetAdmissionError, WorkspaceTreeBudget } from "./tree-budget.js";
@@ -1152,7 +1152,6 @@ export class LocalWorkspaceHost {
             // Live-provider acceptance deliberately keeps its independent 80k/5-minute envelope.
             // The ordinary 128k default must not expand that explicit test-spend boundary.
             ...(this.realKey ? { maxTokens: 80000, timeoutMs: 300000 } : {}) } });
-        task = prepareWorkspaceInitialBrief(task);
         value.runUsage = ZERO_USAGE();
       }
       const binding = task.workspaceRunBinding!, controller = new AbortController();
@@ -1236,7 +1235,7 @@ export class LocalWorkspaceHost {
           + `For a requested rename use agent_rename on the resolved existing colleague; the new name is not a reference to look up.\n`
           + `agent_create returns only AFTER the human has approved; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. created:false with approvalState declined/expired/aborted means no colleague was created — tell the human they can ask again; do not re-open a card unless they ask. Check the preloaded roster before creating so an active colleague is not duplicated; use agent_list only if the roster is insufficient or changed.\n`
           + `Successful Workspace tool results repeat the exact citation ID in receipt.toolCallId. Hara records and checks those receipts automatically for simple completed changes. For an explicit checkpoint, copy observed IDs; never invent them or repeat side effects to fix a rejected citation. After restart, re-observe state with read-only tools.\n`
-          + `Hara has already accepted an initial brief when intent is clear. Use the supplied task brief and startup catalog; call task_intake only to revise material scope or missing understanding. Built-in help is preloaded when relevant.\n`
+          + `Hara records the initial brief automatically from the user request and first response BEFORE tools. Do not spend a model round solely on task_intake; use it for material revisions or unresolved intent. Use the startup catalog and preloaded built-in help when relevant.\n`
           + `Native runtime shell/file tools may change only the admitted working directory under the frozen permission tier. Use workspace_native_evidence to read current Host diff IDs for explicit checks; no diff is no proof. Native file evidence cannot prove Hara colleague, delegation, membership or schedule changes. All scheduled work must use Hara WorkspaceScheduler; do not use runtime-native cron, wakeup or background scheduling tools.\n`
           + `For file tasks read first; write only if necessary, then workspace_verify. Reply directly after the checks pass; Hara verifies actual tool receipts and records simple completion. Use task_checkpoint for complex acceptance or a typed human-only blocker.`,
         continuationSession: false, // Workspace recovery has its own bounded, fresh-observation wake brief.

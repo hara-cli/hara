@@ -7,8 +7,7 @@ import { hostFixture, storageFixture, tools } from "./helpers/workspace-user-int
 import { WorkspaceJsonState } from "../dist/workspace/local-state.js";
 import { WorkspaceConversationStore } from "../dist/workspace/conversations.js";
 import { WorkspaceResourceStorage, workspaceStateHome, bindWorkspaceResourceFile } from "../dist/workspace/resource-context.js";
-import { prepareWorkspaceManagementContext, prepareWorkspaceInitialBrief } from "../dist/workspace/management-context.js";
-import { createTaskExecution } from "../dist/session/task.js";
+import { prepareWorkspaceManagementContext } from "../dist/workspace/management-context.js";
 
 async function until(check) { for (let n = 0; n < 400; n++) { const value = check(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 10)); } throw new Error("synthetic state not reached"); }
 const origin = { source: "ui", channel: "rpc", clientId: "client" };
@@ -24,12 +23,10 @@ test("startup catalog bounds complete JSON and redacts metadata without loading 
   assert.match(prompt, /no authority or completion evidence/); assert.match(prompt, /version-locked/);
 });
 
-test("a clear user-owned greeting/create brief is prepared without inventing runtime authority", () => {
-  for (const [objective, intent] of [["你好", "answer"], ["建一個bot負責video項目", "change"], ["Create a colleague Video", "change"]]) {
-    const task = prepareWorkspaceInitialBrief(createTaskExecution(objective, randomUUID()));
-    assert.equal(task.brief.intent, intent); assert.equal(task.brief.goal, objective); assert.equal(task.workspaceRunBinding, undefined);
-  }
-  const ambiguous = createTaskExecution("Maybe take a look at something", randomUUID()); assert.equal(prepareWorkspaceInitialBrief(ambiguous), ambiguous);
+test("startup help never grants an execution binding or creates an accepted brief", () => {
+  const { packet } = prepareWorkspaceManagementContext({ agents: [], skills: [], objective: "你好" });
+  assert.equal(packet.catalog_only, true); assert.deepEqual(packet.operations, []);
+  assert.equal(packet.workspaceRunBinding, undefined); assert.equal(packet.brief, undefined);
 });
 
 test("preloaded roster/card/projects reach the original approval in one model round, without task_intake or lookup rounds", async t => {

@@ -1,7 +1,5 @@
 import { WORKSPACE_OPERATION_CARDS } from "./operation-cards.js";
 import type { WorkspaceSkillBundle } from "./skills.js";
-import { conversationalAnswerObjective, engineTaskBrief } from "../agent/governance-c-lite.js";
-import { applyTaskBrief, type TaskExecution } from "../session/task.js";
 import { sanitizeMemoryForPrompt } from "../memory/guard.js";
 import { redactSensitiveText } from "../security/secrets.js";
 import type { WorkspaceAgentView } from "./agents.js";
@@ -26,12 +24,6 @@ export function compactWorkspaceRoster(agents: readonly WorkspaceAgentView[], ma
 }
 
 const CREATE_COLLEAGUE = /(?:建[立个個]?|创建|創建|新增|create|add|set up).{0,80}(?:同事|bot|colleague|coworker|agent)/iu;
-/** Conservative Host understanding only; no tool/permission/confirmation is granted by a brief. */
-export function prepareWorkspaceInitialBrief(task: TaskExecution): TaskExecution {
-  if (task.brief || (!conversationalAnswerObjective(task.objective) && !CREATE_COLLEAGUE.test(task.objective))) return task;
-  const result = applyTaskBrief(task, engineTaskBrief(task, { text: "", toolUses: [] }));
-  return result.ok ? result.task : task;
-}
 /** Current Workspace metadata and code-shipped help only. Never loads global plugins/hooks or user skill instructions. */
 export function prepareWorkspaceManagementContext(input: { agents: readonly WorkspaceAgentView[]; skills: readonly WorkspaceSkillBundle[]; objective: string }) {
   const roster = compactWorkspaceRoster(input.agents), items = input.skills.filter(skill => skill.enabled).map(skill => ({
