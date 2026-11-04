@@ -54,6 +54,7 @@ if (selected.includes(1)) test("a second governed Codex message reuses one loade
   assert.equal((await exchange(f, "List colleagues using the selected model?" )).conversation.state, "completed");
   const switched = starts(f).at(-1), turn = f.native().filter(row => row.method === "turn/start").at(-1);
   assert.equal(switched.method, "thread/resume"); assert.equal(switched.pid, a.pid);
+  assert.notEqual(f.meta().url, b.url, "changed model contract gets a fresh MCP SDK session");
   assert.equal(switched.params.model, "fixture-model-2"); assert.equal(switched.params.config.model_reasoning_effort, "high");
   assert.equal(turn.params.model, "fixture-model-2"); assert.equal(turn.params.effort, "high");
 });

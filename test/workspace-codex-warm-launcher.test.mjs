@@ -29,7 +29,7 @@ test("launcher resident still recycles on frozen tier change and failed native p
  const v=await f.read(),a=v.agents.find(r=>r.agentId===f.main.agentId);
  await f.request("workspace.agents.setPermissionTier",{...f.scope,agentId:a.agentId,permissionTier:"controlled",configRevision:a.configRevision,agentEpoch:a.agentEpoch});
  assert.equal((await exchange(f,"List colleagues with controlled tier?")).conversation.state,"completed");const controlled=f.meta();
- assert.notEqual(controlled.pid,first.pid);assert.equal(starts(f).at(-1).params.threadId,starts(f)[1].params.threadId);
+ assert.notEqual(controlled.pid,first.pid);assert.notEqual(controlled.url,first.url,"a new profile must not reinitialize the old MCP SDK session");assert.equal(starts(f).at(-1).params.threadId,starts(f)[1].params.threadId);
  f.mode({mode:"crash",launcher:true});assert.equal((await exchange(f,"List colleagues with a failed process?")).conversation.state,"blocked");
  const before=f.native().filter(r=>r.method==="turn/start").length;assert.equal(before,3);
  f.mode({mode:"list",launcher:true});assert.equal((await exchange(f,"List colleagues after explicit recovery?")).conversation.state,"completed");

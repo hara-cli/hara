@@ -15,6 +15,8 @@ export interface WorkspaceMcpEndpoint {
   readonly url: string;
   readonly env: NodeJS.ProcessEnv;
   readonly attemptMarker?: string;
+  /** Host-only, once per immutable attempt; bind after the actual native contract is known. */
+  prepare?(contract: string): void | Promise<void>;
   close(): Promise<void>;
 }
 

@@ -159,13 +159,40 @@ export class GovernedCodexSession {
     input.assertCurrent();
     if (!this.busy || this.closing) throw new Error("Codex attempt unavailable");
     if (!residentMcpToolsSupported(input)) return createWorkspaceMcpEndpoint(input);
-    if (this.residentMcp && (this.residentToken !== this.token || !this.residentMcp.reusable)) {
-      await this.residentMcp.close(); this.residentMcp = undefined; this.loadedContract = undefined;
-    }
-    input.assertCurrent();
-    if (!this.residentMcp) { this.residentMcp = await ResidentWorkspaceMcp.create(this.token); this.residentToken = this.token; }
-    input.assertCurrent(); if (!this.busy || this.closing) throw new Error("Codex attempt unavailable");
-    return this.residentMcp.bind(input);
+    const attempt = Object.freeze({ ...input }), token = this.token;
+    const env: NodeJS.ProcessEnv = { [WORKSPACE_MCP_TOKEN_ENV]: token };
+    let inner: WorkspaceMcpEndpoint | undefined, preparedFor: string | undefined, preparing: Promise<void> | undefined, closed = false;
+    // One assignment for this immutable attempt, never a pointer to a later attempt's capability.
+    return Object.freeze({
+      get url() { if (!inner || closed) throw new Error("Codex MCP attempt is not prepared"); return inner.url; },
+      get attemptMarker() { return closed ? undefined : inner?.attemptMarker; }, env,
+      prepare: (contract: string): void | Promise<void> => {
+        attempt.assertCurrent();
+        if (closed || !this.busy || this.closing || token !== this.token || !/^[a-f0-9]{64}$/.test(contract)) throw new Error("Codex MCP attempt unavailable");
+        if (preparedFor !== undefined) { if (preparedFor !== contract) throw new Error("Codex MCP contract changed"); return preparing; }
+        preparedFor = contract;
+        const reusable = this.residentMcp?.reusable && this.residentToken === token && this.loadedContract === contract
+          && this.client && this.loadedHandle?.client === this.client && this.loadedHandle.id === this.value.threadId
+          && this.loadedHandle.cwd === this.project.root && this.loaded && this.value.phase === "idle"
+          && this.value.contextGeneration && this.value.standingPromptHash;
+        if (reusable) { inner = this.residentMcp!.bind(attempt); return; }
+        this.loadedContract = undefined;
+        preparing = (async () => {
+          // Native start/resume may construct a new MCP client. Never reinitialize an old SDK session.
+          const previous = this.residentMcp; if (previous) await previous.close();
+          if (this.residentMcp === previous) this.residentMcp = undefined;
+          attempt.assertCurrent(); if (closed || attempt.signal.aborted) throw new Error("Codex MCP attempt ended");
+          const created = await ResidentWorkspaceMcp.create(token);
+          try {
+            attempt.assertCurrent();
+            if (closed || attempt.signal.aborted || !this.busy || this.closing || token !== this.token) throw new Error("Codex MCP attempt ended");
+            inner = created.bind(attempt); this.residentMcp = created; this.residentToken = token;
+          } catch (error) { await created.close(); throw error; }
+        })();
+        return preparing;
+      },
+      close: async () => { closed = true; delete env[WORKSPACE_MCP_TOKEN_ENV]; await preparing?.catch(() => {}); await inner?.close(); },
+    });
   }
   get needsNewSession(): boolean { return nativeContextFull(this.value); }
   takeUsage(): TurnResult["usage"] {
@@ -381,8 +408,19 @@ export class GovernedCodexSession {
         client.notify("initialized");
         try { endCold?.("completed"); } catch { /* Diagnostic only. */ }
       }
+      const endpointReady = endpoint.prepare?.(contract);
+      if (endpointReady) {
+        await endpointReady;
+        input.assertCurrent();
+        // Async cold setup is never an authorization cache or a stale launch-profile grant.
+        const current = this.installer.resolveBound("codex");
+        const currentPolicy = workspaceRuntimePolicyInput(this.permit, "codex", current, "resident", this.installer);
+        if (origin(current, this.project) !== this.origin || workspaceRuntimeProcessKey(currentPolicy, current) !== processKey)
+          throw new Error("Codex launch profile changed during preparation; no turn was sent");
+      }
       input.assertCurrent(); if (input.signal.aborted) throw new Error("interrupted");
-      const client = this.client!;
+      const client = this.client;
+      if (!client) throw new Error("Codex native process changed during preparation; no turn was sent");
       const config = { mcp_servers: { [this.mcpName]: { enabled: true, url: endpoint.url, bearer_token_env_var: WORKSPACE_MCP_TOKEN_ENV,
         // Only this immutable governed endpoint is trusted. Codex 0.166's `auto` can ask a second
         // native MCP approval before reaching Hara; `approve` changes no Hara tool/card authority.
