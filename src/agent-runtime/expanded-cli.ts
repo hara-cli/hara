@@ -5,7 +5,7 @@ import type { GovernedAgentRuntimeDriver } from "./registry.js";
 import { assertWorkspaceRunAdmission, workspaceRunRuntimeStages } from "../workspace/execution.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
-import { runExternalCommandCapture, JsonlRpcClient, ExternalJsonlRpcRequestError, type ExternalCommandCaptureResult } from "../external-sessions/process.js";
+import { runExternalCommandCapture, JsonlRpcClient, ExternalJsonlRpcRequestError, ExternalJsonlRpcTransportError, type ExternalCommandCaptureResult } from "../external-sessions/process.js";
 import { createRegisteredCliMcpTurn, WORKSPACE_MCP_TOKEN_ENV, type WorkspaceMcpEndpoint } from "./registered-cli-mcp.js";
 import { classifyRuntimeFailure, runtimeFailureMessage } from "./failure-diagnostics.js";
 import { runtimeFailureTracker } from "./failure-tracker.js";
@@ -31,7 +31,7 @@ async function grokTurn(input: {
   try {
     input.assertCurrent();
     client = JsonlRpcClient.start({ ...wrapped, cwd: input.cwd, appServerArgs: wrapped.args,
-      timeoutMs: input.timeoutMs, maxOutputBytes: 4 * 1024 * 1024, signal: input.signal, jsonRpcVersion: "2.0", onSpawn: input.observer.onSpawn,
+      timeoutMs: input.timeoutMs, maxOutputBytes: 4 * 1024 * 1024, signal: input.signal, jsonRpcVersion: "2.0", captureErrorFirstLine: true, onSpawn: input.observer.onSpawn,
       onNotification(method, params) {
         if (method !== "session/update") return;
         if (!active || !sessionId || input.signal.aborted) { refusal(); return; }
@@ -80,9 +80,11 @@ async function grokTurn(input: {
     if (protocolFailure || input.signal.aborted || result?.stopReason !== "end_turn") throw new Error(input.signal.aborted ? "interrupted" : "runtime_failed");
     return { ok: true, stdout: text.trim(), code: 0, timedOut: false };
   } catch (error) {
-    const kind = input.signal.aborted ? "interrupted" : protocolFailure ? "runtime_failed" : error instanceof ExternalJsonlRpcRequestError
-      ? classifyRuntimeFailure({ status: error.code }) : classifyRuntimeFailure({ code: error instanceof Error ? error.message : undefined });
-    return { ok: false, stdout: "", code: null, timedOut: kind === "timeout", errorCode: kind };
+    const nativeError = error instanceof ExternalJsonlRpcRequestError || error instanceof ExternalJsonlRpcTransportError ? error : undefined;
+    const kind = input.signal.aborted ? "interrupted" : protocolFailure ? "runtime_failed" : nativeError?.runtimeFailureKind
+      ?? classifyRuntimeFailure({ code: error instanceof Error ? error.message : undefined });
+    return { ok: false, stdout: "", code: null, timedOut: kind === "timeout", errorCode: kind,
+      ...(!input.signal.aborted && nativeError?.errorFirstLine ? { errorFirstLine: nativeError.errorFirstLine } : {}) };
   } finally { active = false; await client?.closeAndWait(); }
 }
 /** Full permissions are unreachable without a trusted common-layer protector. A missing module,
@@ -143,17 +145,17 @@ export function expandedCliDriver(id: ExpandedRuntimeId, installer: WorkspaceRun
             const wrapped = protection.wrap(current.command, args, env); protection.assertCurrent(); assertCurrent();
             result = await runExternalCommandCapture(wrapped, wrapped.args, {
               cwd: options.ctx.cwd, signal: native.signal, timeoutMs: permit.binding.budget.timeoutMs, governedDeadline: permit.binding.budget.mode === "interactive", maxOutputBytes: 4 * 1024 * 1024,
-              waitForClose: true, failureKind: "runtime", proxyUrl: current.proxyUrl, retainStdoutOnFailure: true,
+              waitForClose: true, failureKind: "runtime", captureErrorFirstLine: true, proxyUrl: current.proxyUrl, retainStdoutOnFailure: true,
               onSpawn: observer.onSpawn, onStdout(chunk) { observer.onStdout(chunk); activity(); },
             });
-            const parsed = parseExpandedRun(id, result);
+            const parsed = parseExpandedRun(id, result, env);
             for (const event of parsed.tools) protection.observeNativeTool(event);
-            result = { ...result, ok: parsed.completed, stdout: parsed.text, ...(parsed.failure ? { errorCode: parsed.failure } : {}) };
+            result = { ...result, ok: parsed.completed, stdout: parsed.text, ...(parsed.failure ? { errorCode: parsed.failure } : {}), ...(parsed.errorFirstLine ? { errorFirstLine: parsed.errorFirstLine } : {}) };
           }
           observer.finish(result.ok, result.errorCode);
           if (!result.ok) {
             if (native.signal.aborted || result.errorCode === "interrupted") return { ...result, stdout: "", errorCode: "interrupted" };
-            return { ...result, stdout: "", runtimeFailure: tracker.failed(classifyRuntimeFailure({ code: result.errorCode, timedOut: result.timedOut }), Date.now() - started) };
+            return { ...result, stdout: "", runtimeFailure: tracker.failed(classifyRuntimeFailure({ code: result.errorCode, timedOut: result.timedOut }), Date.now() - started, result.errorFirstLine) };
           }
           assertCurrent(); protection.assertCurrent();
           await protection.collectEvidence?.();

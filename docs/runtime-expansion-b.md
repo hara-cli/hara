@@ -84,3 +84,13 @@ Official references: [Copilot CLI](https://docs.github.com/en/copilot/reference/
 [Cursor parameters](https://cursor.com/docs/cli/reference/parameters), [Cursor MCP](https://cursor.com/docs/mcp),
 [Grok ACP](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/15-agent-mode.md).
 Raft db5e399 was consulted only for mechanisms; no FSL implementation was copied.
+
+## Native error first line
+
+Expanded CLI execution opts into the shared bounded stderr/RPC error-message capture. Copilot and
+Cursor also accept only documented typed-error message fields; whole frames and RPC data are never
+copied into diagnostics. The shared redactor applies the actual launch environment before limiting
+the first nonblank line to 320 characters. Failure diagnostics and cooldown retain this optional
+`errorFirstLine`; successful runs clear it. Grok preserves the shared native failure classification.
+Desk's existing closed parser, localized recovery card and clipboard summary consume this field.
+No capture changes the public Seatbelt policy, frozen tier, MCP, confirmation or login behavior.

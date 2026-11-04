@@ -163,3 +163,15 @@ test("metadata accepts inherited fixture configuration while retaining real oute
     assert.deepEqual(JSON.parse(result.stdout), { marker: "SYNTHETIC_PERSONAL_EXTENSION", home, haraDenied: true, foreignDenied: true, args: id === "cursor" ? ["models"] : ["--help"] });
   }
 });
+
+test("typed native errors expose only a redacted message first line and never the error object", () => {
+  const env = { FIXTURE_API_KEY: "fixture-secret-value" };
+  for (const id of ["copilot", "cursor"]) {
+    const result = parseExpandedRun(id, { ok: true, code: 0, timedOut: false, stdout: JSON.stringify({ type: "error",
+      error: { message: "Error: startup /Users/private/settings.json key=fixture-secret-value account=owner@example.invalid\nPRIVATE_SECOND_LINE", data: { secret: "PRIVATE_ERROR_DATA" } } }) }, env);
+    assert.equal(result.completed, false); assert.match(result.errorFirstLine, /Error: startup \[path\]/);
+    assert.doesNotMatch(result.errorFirstLine, /fixture-secret-value|owner@|Users\/private|PRIVATE_SECOND_LINE|PRIVATE_ERROR_DATA/);
+    const noMessage = parseExpandedRun(id, { ok: true, code: 0, timedOut: false, stdout: JSON.stringify({ type: "error", error: { data: { secret: "PRIVATE_ERROR_DATA" } } }) }, env);
+    assert.equal(noMessage.errorFirstLine, undefined);
+  }
+});
