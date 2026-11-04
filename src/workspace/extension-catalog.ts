@@ -75,7 +75,7 @@ export function validateExtensionCatalog(input: readonly ExtensionSourceDescript
 }
 /** Select only non-secret configuration fields. Skipped JSON values are scanned, never decoded or
  * materialized; this includes env, args, URLs, headers and all other host configuration domains. */
-export function projectHostMcpConfig(text: string): unknown {
+export function projectHostMcpConfig(text: string, launch = false): unknown {
   let at = 0;
   const space = () => { while (/\s/u.test(text[at] ?? "") && at < text.length) at++; };
   const string = (keep: boolean): string | undefined => {
@@ -98,16 +98,32 @@ export function projectHostMcpConfig(text: string): unknown {
     if (char === '"') return string(keep);
     if (char === "{" || char === "[") {
       at++; space(); const object = char === "{", close = object ? "}" : "]";
-      const out: Record<string, unknown> = Object.create(null); const seen = new Set<string>();
-      if (text[at] === close) { at++; return keep ? out : undefined; }
+      const out: Record<string, unknown> | unknown[] = object ? Object.create(null) : []; const seen = new Set<string>();
+      let remote = false;
+      const finish = () => {
+        if (keep && object && path.length === 2) {
+          const server = out as Record<string, unknown>;
+          if (server.transport === undefined && (remote || server.type === "http" || server.type === "sse")) server.transport = server.type === "sse" ? "sse" : "streamable-http";
+          delete server.type;
+        }
+        return keep ? out : undefined;
+      };
+      if (text[at] === close) { at++; return finish(); }
       while (at < text.length) {
         space(); let key = "";
         if (object) { if (text[at] !== '"') throw new Error("Invalid host MCP metadata"); key = string(keep) ?? ""; space(); if (text[at++] !== ":") throw new Error("Invalid host MCP metadata"); }
         if (keep && object && seen.has(key)) throw new Error("Ambiguous host MCP metadata");
         seen.add(key);
-        const selected = keep && object && (path.length === 0 ? key === "mcpServers" : path.length === 1 ? true : path.length === 2 && ["command", "description", "transport"].includes(key));
-        const child = value([...path, key], selected, depth + 1); if (selected) out[key] = child;
-        space(); if (text[at] === close) { at++; return keep ? out : undefined; }
+        if (keep && object && path.length === 2) {
+          if (key === "url") remote = true;
+          if (launch && ["env", "headers", "authorization", "oauth", "auth", "credentials"].includes(key)) (out as Record<string, unknown>).requiresCredentials = true;
+        }
+        const selected = keep && (object ? (path.length === 0 ? key === "mcpServers" : path.length === 1 ? true
+          : path.length === 2 && ["command", "description", "transport", "type", ...(launch ? ["args", "packageRoot"] : [])].includes(key))
+          : launch && path.length === 3 && path[2] === "args");
+        const child = value([...path, key], selected, depth + 1);
+        if (selected) { if (object) (out as Record<string, unknown>)[key] = child; else (out as unknown[]).push(child); }
+        space(); if (text[at] === close) { at++; return finish(); }
         if (text[at++] !== ",") throw new Error("Invalid host MCP metadata");
       }
       throw new Error("Invalid host MCP metadata");

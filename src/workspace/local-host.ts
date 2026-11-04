@@ -1,5 +1,8 @@
+import { WorkspaceMcpOwnerReview, type McpOwnerContext } from "./extension-owner-review.js";
+import { McpOwnerReviewError } from "./extension-review-store.js";
+import { readHostWorkspaceMcpLaunch, type WorkspaceMcpLaunchProvider } from "./extension-candidate.js";
 import { WorkspaceMcpManager, type WorkspaceMcpAttempt } from "./extension-manager.js";
-import { readWorkspaceMcpReviews, type ReviewedMcpSource } from "./extension-review.js";
+import type { ReviewedMcpSource } from "./extension-review.js";
 import { approveWorkspaceExtension } from "./extension-binding.js";
 import { WorkspaceNativeRiskStore } from "./runtime-native-risks.js";
 import { workspaceRunNativeEvidence } from "./execution.js";
@@ -114,6 +117,8 @@ export class LocalWorkspaceHost {
   private readonly pending = new Map<string, PendingApproval>();
   private readonly extensionProposals = new Map<string, { clientId: string; workspaceId: string; generation: string; epoch: number; revision: number; expiresAt: number; change: ExtensionChange; catalogLock: string }>();
   private readonly extensionClients = new Set<string>();
+  private readonly ownerReviewClients = new Set<string>();
+  private readonly mcpOwnerReview: WorkspaceMcpOwnerReview;
   private readonly clients = new Map<string, { workspaceId: string | null; agentId: string | null; channelId?: string; epoch: number }>();
   private readonly channels = new Map<string, WorkspaceLocalChannels>();
   private closing = false;
@@ -146,6 +151,9 @@ export class LocalWorkspaceHost {
     extensionCatalog?: ExtensionCatalogProvider;
     /** Host/operator-reviewed binary/package/schema locks; never accepted from renderer/model JSON. */
     reviewedMcpSources?: () => readonly ReviewedMcpSource[];
+    /** Trusted Host launch projection; never a renderer/model path, command or environment. */
+    mcpLaunchCandidate?: WorkspaceMcpLaunchProvider;
+    mcpReviewHome?: string;
     realKeyFile?: string;
     realKeySlice?: ArkAcceptanceSlice;
     interactiveApprovals?: boolean;
@@ -165,6 +173,10 @@ export class LocalWorkspaceHost {
     if (options.mode && (options.realKeyFile || options.realKeySlice)) throw new Error("Workspace mode cannot inherit an acceptance Key lane");
     const opened = openLocalWorkspaceDevRoot(root, options.mode ?? "synthetic"); this.root = opened.root; this.home = opened.home; this.project = opened.project;
     this.catalog = new LocalWorkspaceCatalog(this.home);
+    const reviewHome = options.mcpReviewHome ?? (options.mode === "workspace" ? options.hostHome : undefined) ?? this.home;
+    this.mcpOwnerReview = new WorkspaceMcpOwnerReview({ home: reviewHome, sources: () => this.extensionCandidates(),
+      launch: options.mcpLaunchCandidate ?? (source => readHostWorkspaceMcpLaunch(reviewHome, this.catalog.read().hostId, source)),
+      changed: () => { for (const workspaceId of this.contexts.keys()) { try { this.refreshExtensions(workspaceId); } catch { /* fail-closed catalog already invalidated */ } this.changed(workspaceId); } } });
     const unavailable = () => { throw new Error("Host OS credential vault is unavailable; no plaintext fallback"); };
     this.vault = options.credentialVault ?? (options.hostHome ? new MacKeychainCredentialVault(options.hostHome) : { get: unavailable, set: unavailable, remove: unavailable });
     if (options.mode === "workspace" && (options.legacySourceHome ?? options.hostHome)) this.legacy = new LegacyConnectionCatalog((options.legacySourceHome ?? options.hostHome)!, this.vault);
@@ -235,7 +247,7 @@ export class LocalWorkspaceHost {
       ...this.options.runtimeInstallerOptions, onChange: () => this.changed(workspaceId) });
     const resources = new WorkspaceResources(this.home, row.scope, { assertCurrent: assertAuthority, runtimeInstaller: runtimes }); resources.initialize();
     const context: WorkspaceHostContext = { storage, resources, connections, project, extensions: new WorkspaceExtensions(storage),
-      mcp: new WorkspaceMcpManager(storage, { accountHome: this.options.hostHome ?? this.home, proxy: () => runtimes.proxy.read(), onChange: () => this.changed(workspaceId) }),
+      mcp: new WorkspaceMcpManager(storage, { accountHome: this.options.hostHome ?? this.home, invalidateReview: (sourceId, revision) => this.mcpOwnerReview.invalidate(sourceId, revision), proxy: () => runtimes.proxy.read(), onChange: () => this.changed(workspaceId) }),
       features: new WorkspaceFeatures(storage, project, workspaceId, this.options.mode === "workspace" ? this.options.hostHome : undefined),
       runtimes, runtimeModels: new WorkspaceRuntimeModels(storage, runtimes) };
     const folders = new WorkspaceLegacyResources(storage);
@@ -352,7 +364,10 @@ export class LocalWorkspaceHost {
   setExtensionClientCapability(clientId: string, supported: boolean): void {
     if (supported) this.extensionClients.add(clientId); else { this.extensionClients.delete(clientId); this.dismissApprovals(clientId); }
   }
-  disconnect(clientId: string): void { this.extensionClients.delete(clientId); this.dismissApprovals(clientId); this.clients.delete(clientId); if (this.updateLease?.clientId === clientId) this.updateLease = null; }
+  setExtensionOwnerReviewCapability(clientId: string, supported: boolean): void {
+    if (supported) this.ownerReviewClients.add(clientId); else { this.ownerReviewClients.delete(clientId); this.mcpOwnerReview.dismiss(clientId); }
+  }
+  disconnect(clientId: string): void { this.ownerReviewClients.delete(clientId); this.extensionClients.delete(clientId); this.dismissApprovals(clientId); this.clients.delete(clientId); if (this.updateLease?.clientId === clientId) this.updateLease = null; }
   private localChannels(workspaceId: string) {
     const context = this.context(workspaceId);
     let rooms = this.channels.get(workspaceId);
@@ -444,6 +459,7 @@ export class LocalWorkspaceHost {
   }
   releaseUpdate(clientId: string, id: string) { if (this.updateLease?.clientId !== clientId || this.updateLease.id !== id) throw new Error("Update lease changed"); this.updateLease = null; }
   private dismissApprovals(clientId: string): void {
+    this.mcpOwnerReview.dismiss(clientId);
     for (const [id, proposal] of this.extensionProposals) if (proposal.clientId === clientId) this.extensionProposals.delete(id);
     for (const pending of [...this.pending.values()]) if (pending.clientId === clientId) pending.finish({ approved: false, state: "aborted" });
     for (const context of this.contexts.values()) context.runtimes.dismiss(clientId);
@@ -461,17 +477,56 @@ export class LocalWorkspaceHost {
     return this.context(workspaceId).runtimes.approve(id, approved, clientId, loginSource);
   }
   cancelRuntime(workspaceId: string, operationId: string): void { this.context(workspaceId).runtimes.cancel(operationId); }
+  private extensionCandidates() {
+    const home = this.options.mcpReviewHome ?? (this.options.mode === "workspace" ? this.options.hostHome : undefined);
+    return this.options.extensionCatalog?.() ?? (home ? readHostWorkspaceExtensionCatalog(home, this.catalog.read().hostId) : []);
+  }
   private refreshExtensions(workspaceId: string) {
     const context = this.context(workspaceId), store = context.extensions;
     try {
-      const candidates = this.options.extensionCatalog?.() ?? (this.options.mode === "workspace" && this.options.hostHome
-        ? readHostWorkspaceExtensionCatalog(this.options.hostHome, this.catalog.read().hostId) : []);
-      const reviews = this.options.reviewedMcpSources?.() ?? (this.options.mode === "workspace" && this.options.hostHome
-        ? readWorkspaceMcpReviews(join(this.options.hostHome, ".hara/mcp-reviewed-v1.json")) : []);
+      const candidates = this.extensionCandidates();
+      const reviews = this.options.reviewedMcpSources?.() ?? this.mcpOwnerReview.valid(candidates);
       store.refreshCatalog(context.mcp.catalog(candidates, reviews));
     } catch { store.invalidateCatalog(); context.mcp.invalidate(); throw new Error("Extension source discovery unavailable"); }
     return store;
   }
+  private mcpOwnerContext(clientId: string, workspaceId: string): McpOwnerContext {
+    const selected = this.clients.get(clientId);
+    if (this.closing || !this.ownerReviewClients.has(clientId) || !selected || selected.workspaceId !== workspaceId || selected.channelId) throw new McpOwnerReviewError("owner_required");
+    const context = this.context(workspaceId), mainId = context.resources.agents.list().mainAgentId;
+    if (!mainId) throw new McpOwnerReviewError("owner_required");
+    const main = context.resources.agents.get(mainId);
+    if (context.storage.scope.authority.kind !== "local" || selected.agentId !== mainId || !main || main.state !== "active") throw new McpOwnerReviewError("owner_required");
+    const generation = this.snapshotGeneration(workspaceId), epoch = selected.epoch, agentEpoch = main.agentEpoch, proxy = context.runtimes.proxy.read();
+    const assertCurrent = () => {
+      const current = this.clients.get(clientId), actor = context.resources.agents.get(mainId);
+      if (this.closing || !this.ownerReviewClients.has(clientId) || !current || current.workspaceId !== workspaceId || current.agentId !== mainId
+        || current.channelId || current.epoch !== epoch || !actor || actor.state !== "active" || actor.agentEpoch !== agentEpoch) throw new McpOwnerReviewError("view_changed");
+      this.assertGeneration(workspaceId, generation); context.storage.run(() => {});
+      const network = context.runtimes.proxy.read();
+      if (network.revision !== proxy.revision) throw new McpOwnerReviewError("proxy_unavailable");
+    };
+    return { clientId, workspaceId, generation, key: canonical([clientId, workspaceId, generation, epoch, mainId, agentEpoch, proxy.revision]),
+      stateHome: context.storage.run(() => workspaceStateHome()), assertCurrent, proxy: () => context.runtimes.proxy.read() };
+  }
+  private mcpOwnerAction<T>(action: () => T): T {
+    try { return action(); } catch (error) { throw error instanceof McpOwnerReviewError ? error : new McpOwnerReviewError("inspection_failed"); }
+  }
+  mcpOwnerReviews(clientId: string, workspaceId: string) {
+    try { return this.mcpOwnerReview.list(this.mcpOwnerContext(clientId, workspaceId)); }
+    catch (error) {
+      if (error instanceof McpOwnerReviewError && ["owner_required", "view_changed"].includes(error.code)) return { workspaceId, resourceGeneration: this.snapshotGeneration(workspaceId), revision: 0, readOnly: true, allowed: false, reason: error.code, sources: [] };
+      throw new McpOwnerReviewError("inspection_failed");
+    }
+  }
+  describeMcpOwnerReview(clientId: string, workspaceId: string, id: string) { return this.mcpOwnerAction(() => this.mcpOwnerReview.describe(id, this.mcpOwnerContext(clientId, workspaceId))); }
+  async inspectMcpOwnerReview(clientId: string, workspaceId: string, id: string, confirmed: boolean) {
+    try { return await this.mcpOwnerReview.inspect(id, confirmed, this.mcpOwnerContext(clientId, workspaceId)); }
+    catch (error) { throw error instanceof McpOwnerReviewError ? error : new McpOwnerReviewError("inspection_failed"); }
+  }
+  cancelMcpOwnerReview(clientId: string, workspaceId: string, id: string) { return this.mcpOwnerAction(() => this.mcpOwnerReview.cancel(id, this.mcpOwnerContext(clientId, workspaceId))); }
+  approveMcpOwnerReview(clientId: string, workspaceId: string, id: string, confirmed: boolean) { return this.mcpOwnerAction(() => this.mcpOwnerReview.approve(id, confirmed, this.mcpOwnerContext(clientId, workspaceId))); }
+  revokeMcpOwnerReview(clientId: string, workspaceId: string, id: string, confirmed: boolean) { return this.mcpOwnerAction(() => this.mcpOwnerReview.revoke(id, confirmed, this.mcpOwnerContext(clientId, workspaceId))); }
   workspaceExtensions(workspaceId: string, sourceId?: string) {
     const store = this.refreshExtensions(workspaceId); return this.context(workspaceId).mcp.view(sourceId === undefined ? store.list() : store.describe(sourceId));
   }
@@ -1333,6 +1388,7 @@ export class LocalWorkspaceHost {
     for (const job of this.jobs.values()) if (!job.closed) job.controller.abort();
     await Promise.all([...this.channels.values()].map(rooms => rooms.close()));
     await Promise.all([...this.jobs.values()].map(job => job.promise));
+    await this.mcpOwnerReview.close();
     await Promise.all([...this.contexts.values()].map(async context => { await context.mcp.close(); await context.runtimes.close(); }));
   }
 }

@@ -14,7 +14,7 @@ import { extensionDigest, validateExtensionCatalog, type ExtensionSourceDescript
 import { WorkspaceExtensions, type ExtensionToolSnapshot } from "./extensions.js";
 import { bindWorkspaceExtensionTool } from "./extension-binding.js";
 import { ManagedMcpStdioTransport, managedMcpProxy } from "./extension-process.js";
-import { assertWorkspaceMcpReviewCurrent, workspaceMcpReviewPlan, WorkspaceMcpError, type ReviewedMcpSource } from "./extension-review.js";
+import { assertWorkspaceMcpReviewCurrent, workspaceMcpReviewPlan, workspaceMcpProtocolDigest, WorkspaceMcpError, type ReviewedMcpSource } from "./extension-review.js";
 
 type CallState = "dispatched" | "server_reported_success" | "tool_error" | "denied" | "outcome_unknown";
 interface CallRecord { operationId: string; runId: string; sourceId: string; toolId: string; inputDigest: string; at: string; durationMs: number; outcome: CallState; code: string | null }
@@ -29,7 +29,7 @@ export class WorkspaceMcpManager {
   private readonly attempts = new Set<WorkspaceMcpAttempt>();
   private children = 0;
   constructor(private readonly storage: WorkspaceResourceStorage, private readonly input: {
-    accountHome: string; proxy(): { revision: number; proxyUrl: string | null; readOnly: boolean }; onChange?(): void;
+    accountHome: string; invalidateReview?(sourceId: string, revision: string): void; proxy(): { revision: number; proxyUrl: string | null; readOnly: boolean }; onChange?(): void;
   }) {
     const binding = () => storage.run(() => ({ ...currentWorkspaceResourceBinding()! }));
     this.state = new VersionedSettings(() => storage.run(() => workspaceStateHome()), "workspace-extension-invocations-v1.json", 1,
@@ -111,15 +111,16 @@ export class WorkspaceMcpManager {
             stateHome: this.storage.run(() => workspaceStateHome()), proxy: proxyUrl, signal });
           const client = new Client({ name: "hara-workspace-mcp", version: "1.0.0" }, { capabilities: {} });
           const connection: Connection = { client, transport, stale: false };
-          client.setNotificationHandler(ToolListChangedNotificationSchema, () => { connection.stale = true; });
+          client.setNotificationHandler(ToolListChangedNotificationSchema, () => { connection.stale = true; this.input.invalidateReview?.(sourceId, reviewed.descriptor.sourceRevision); });
           await client.connect(transport, { signal, timeout: Math.max(1, Math.min(10_000, input.deadline - Date.now())) });
           const inventory = await client.listTools({}, { signal, timeout: Math.max(1, Math.min(10_000, input.deadline - Date.now())) });
           const plan = workspaceMcpReviewPlan(reviewed);
           if (inventory.nextCursor || inventory.tools.length !== plan.record.tools.length
             || new Set(inventory.tools.map(tool => tool.name)).size !== inventory.tools.length || inventory.tools.some(tool => {
             const trusted = plan.record.tools.find(row => row.remoteName === tool.name);
-            return !trusted || !exact(tool, ["name", "description", "inputSchema"].filter(key => key !== "description" || tool.description !== undefined)) || extensionDigest({ name: tool.name, description: tool.description ?? "", inputSchema: tool.inputSchema }) !== plan.schemaDigests.get(trusted.toolId);
-          })) { connection.stale = true; throw new WorkspaceMcpError("mcp_schema_stale"); }
+            try { return !trusted || workspaceMcpProtocolDigest(tool) !== plan.schemaDigests.get(trusted.toolId); }
+            catch { return true; }
+          })) { connection.stale = true; this.input.invalidateReview?.(sourceId, reviewed.descriptor.sourceRevision); throw new WorkspaceMcpError("mcp_schema_stale"); }
           return connection;
         } catch (error) {
           await transport?.close(); this.children--;

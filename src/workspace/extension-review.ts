@@ -1,6 +1,6 @@
 // Host-only admission. A discovered name or an upstream annotation is never a code/tool grant.
 import { createHash } from "node:crypto";
-import { constants, openSync, closeSync, readFileSync, fstatSync, lstatSync, readdirSync, realpathSync } from "node:fs";
+import { constants, openSync, closeSync, readFileSync, fstatSync, lstatSync, opendirSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv-provider.js";
@@ -17,10 +17,11 @@ export interface ReviewedMcpTool {
   toolId: string; remoteName: string; description: string; inputSchema: Tool["input_schema"];
   /** Trusted Host review, never inferred from readOnlyHint. External confirmation still applies. */
   effect: "read" | "exec";
+  protocolMetadata?: Record<string, unknown>;
 }
 export interface McpReviewRecord {
   schemaVersion: 1; source: ExtensionSourceDescriptor; command: string; args: string[]; packageRoot: string;
-  binaryDigest: string; packageDigest: string; tools: ReviewedMcpTool[];
+  binaryDigest: string; packageDigest: string; tools: ReviewedMcpTool[]; reviewNonce?: string;
 }
 interface Stamp { path: string; dev: number; ino: number; size: number; mtime: number; ctime: number }
 export interface ReviewedMcpSource { readonly descriptor: ExtensionSourceDescriptor }
@@ -52,11 +53,13 @@ function hashFile(path: string, max: number): { digest: string; stamp: Stamp } {
 function packageTree(root: string): { digest: string; stamps: Stamp[] } {
   physical(root);
   if (secretPath.test(root) || root === sep || contains(root, homedir()) || !lstatSync(root).isDirectory()) throw new WorkspaceMcpError("mcp_source_unreviewed");
-  const hashes: [string, string][] = [], stamps: Stamp[] = []; let total = 0;
+  const hashes: [string, string][] = [], stamps: Stamp[] = []; let total = 0, entries = 0;
   const visit = (directory: string, depth: number) => {
     const info = lstatSync(directory);
     if (depth > 12 || info.isSymbolicLink() || info.mode & 0o022) throw new WorkspaceMcpError("mcp_source_unreviewed");
-    for (const row of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    const handle = opendirSync(directory), rows = [];
+    try { for (;;) { const entry = handle.readSync(); if (!entry) break; if (++entries > 1024) throw new WorkspaceMcpError("mcp_source_unreviewed"); rows.push(entry); } } finally { handle.closeSync(); }
+    for (const row of rows.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
       const path = join(directory, row.name), name = relative(root, path);
       if (row.isSymbolicLink() || secretPath.test(name) || name.split(sep).includes(".git")) throw new WorkspaceMcpError("mcp_source_unreviewed");
       if (row.isDirectory()) { visit(path, depth + 1); continue; }
@@ -70,12 +73,12 @@ function packageTree(root: string): { digest: string; stamps: Stamp[] } {
   return { digest: extensionDigest(hashes), stamps };
 }
 function schema(tool: ReviewedMcpTool) {
-  if (!plain(tool) || !exact(tool, ["toolId", "remoteName", "description", "inputSchema", "effect"])
+  if (!plain(tool) || !exact(tool, ["toolId", "remoteName", "description", "inputSchema", "effect", ...(tool.protocolMetadata === undefined ? [] : ["protocolMetadata"])])
     || typeof tool.toolId !== "string" || !ID.test(tool.toolId) || typeof tool.remoteName !== "string" || !/^[A-Za-z0-9_.:-]{1,128}$/u.test(tool.remoteName)
     || typeof tool.description !== "string" || tool.description.length > 1000 || redactSensitiveText(tool.description).redactions.length
     || !["read", "exec"].includes(tool.effect) || !plain(tool.inputSchema) || tool.inputSchema.type !== "object" || !plain(tool.inputSchema.properties)) throw new WorkspaceMcpError("mcp_source_unreviewed");
   const raw = canonical(tool.inputSchema);
-  if (Buffer.byteLength(raw) > 8 * 1024) throw new WorkspaceMcpError("mcp_source_unreviewed");
+  if (Buffer.byteLength(raw) > 8 * 1024 || redactSensitiveText(raw).redactions.length) throw new WorkspaceMcpError("mcp_source_unreviewed");
   const walk = (value: unknown, depth: number) => {
     if (depth > 16) throw new WorkspaceMcpError("mcp_source_unreviewed");
     if (Array.isArray(value)) { value.forEach(item => walk(item, depth + 1)); return; }
@@ -84,12 +87,52 @@ function schema(tool: ReviewedMcpTool) {
     }
   };
   walk(tool.inputSchema, 0);
+  if (tool.protocolMetadata !== undefined) {
+    if (!plain(tool.protocolMetadata) || !Object.keys(tool.protocolMetadata).every(key => PROTOCOL_METADATA.has(key))
+      || Buffer.byteLength(canonical(tool.protocolMetadata)) > 8192 || redactSensitiveText(canonical(tool.protocolMetadata)).redactions.length) throw new WorkspaceMcpError("mcp_source_unreviewed");
+    walk(tool.protocolMetadata, 0);
+  }
   const validate = new AjvJsonSchemaValidator().getValidator(tool.inputSchema as Parameters<AjvJsonSchemaValidator["getValidator"]>[0]);
-  return { digest: extensionDigest({ name: tool.remoteName, description: tool.description, inputSchema: tool.inputSchema }), validate: (input: unknown) => validate(input).valid };
+  return { digest: workspaceMcpProtocolDigest({ name: tool.remoteName, description: tool.description, inputSchema: tool.inputSchema, ...tool.protocolMetadata }), validate: (input: unknown) => validate(input).valid };
+}
+const PROTOCOL_METADATA = new Set(["annotations", "title", "outputSchema", "execution", "icons", "_meta"]);
+export function workspaceMcpProtocolMetadata(tool: Record<string, unknown>): Record<string, unknown> {
+  if (!Object.keys(tool).every(key => ["name", "description", "inputSchema"].includes(key) || PROTOCOL_METADATA.has(key))) throw new WorkspaceMcpError("mcp_schema_stale");
+  return Object.fromEntries(Object.entries(tool).filter(([key]) => PROTOCOL_METADATA.has(key)));
+}
+export function workspaceMcpProtocolDigest(tool: { name: string; description?: string; inputSchema: unknown } & Record<string, unknown>): string {
+  return extensionDigest({ name: tool.name, description: tool.description ?? "", inputSchema: tool.inputSchema, ...workspaceMcpProtocolMetadata(tool) });
+}
+/** Structural validation only: safe to read a library whose code may have changed or disappeared. */
+export function checkWorkspaceMcpReviewRecord(value: unknown): McpReviewRecord {
+  const raw = value as McpReviewRecord;
+  if (!plain(raw) || !exact(raw, ["schemaVersion", "source", "command", "args", "packageRoot", "binaryDigest", "packageDigest", "tools", ...(raw.reviewNonce === undefined ? [] : ["reviewNonce"])])
+    || raw.schemaVersion !== 1 || !HASH.test(raw.binaryDigest) || !HASH.test(raw.packageDigest)
+    || typeof raw.command !== "string" || !isAbsolute(raw.command) || typeof raw.packageRoot !== "string" || !isAbsolute(raw.packageRoot)
+    || raw.reviewNonce !== undefined && (typeof raw.reviewNonce !== "string" || !/^[a-f0-9-]{36}$/u.test(raw.reviewNonce))
+    || !Array.isArray(raw.args) || raw.args.length > 64 || !raw.args.every(arg => typeof arg === "string" && arg.length <= 4096 && !/[\x00-\x1f\x7f]/u.test(arg))
+    || Buffer.byteLength(canonical(raw.args)) > 16 * 1024 || redactSensitiveText(canonical(raw.args)).redactions.length
+    || raw.args.some(arg => /(?:^|--)(?:token|password|secret|api[-_]?key|authorization|cookie)(?:=|$)/iu.test(arg))
+    || !Array.isArray(raw.tools) || raw.tools.length > 64) throw new WorkspaceMcpError("mcp_source_unreviewed");
+  const source = validateExtensionCatalog([raw.source])[0]!;
+  if (source.transport !== "stdio" || raw.args.some(arg => isAbsolute(arg) && !contains(raw.packageRoot, arg))) throw new WorkspaceMcpError("mcp_source_unreviewed");
+  raw.tools.forEach(schema);
+  if (new Set(raw.tools.map(tool => tool.remoteName)).size !== raw.tools.length || new Set(raw.tools.map(tool => tool.toolId)).size !== raw.tools.length) throw new WorkspaceMcpError("mcp_source_unreviewed");
+  return structuredClone({ ...raw, source });
+}
+export interface WorkspaceMcpReviewLibraryState { schemaVersion: 1; revision: number; records: McpReviewRecord[]; invalidated: Record<string, string> }
+export function parseWorkspaceMcpReviewLibrary(raw: unknown): WorkspaceMcpReviewLibraryState {
+  if (!plain(raw) || !exact(raw, ["schemaVersion", "records", ...(raw.revision === undefined ? [] : ["revision"]), ...(raw.invalidated === undefined ? [] : ["invalidated"])])
+    || raw.schemaVersion !== 1 || raw.revision !== undefined && (!Number.isSafeInteger(raw.revision) || Number(raw.revision) < 0)
+    || !Array.isArray(raw.records) || raw.records.length > 64 || raw.invalidated !== undefined && !plain(raw.invalidated)) throw new WorkspaceMcpError("mcp_source_unreviewed");
+  const records = raw.records.map(checkWorkspaceMcpReviewRecord), invalidated = (raw.invalidated ?? {}) as Record<string, string>;
+  if (new Set(records.map(record => record.source.sourceId)).size !== records.length || Object.keys(invalidated).length > 64
+    || Object.entries(invalidated).some(([key, value]) => !records.some(record => record.source.sourceId === key) || typeof value !== "string" || !HASH.test(value))) throw new WorkspaceMcpError("mcp_source_unreviewed");
+  return { schemaVersion: 1, revision: Number(raw.revision ?? 0), records, invalidated: structuredClone(invalidated) };
 }
 /** Produces a review record without starting code. Only trusted owner/Host composition may approve it.
  * No environment or credential field is accepted, persisted or forwarded. */
-export function prepareWorkspaceMcpReview(input: { source: ExtensionSourceDescriptor; command: string; args: string[]; packageRoot: string; tools: ReviewedMcpTool[] }): McpReviewRecord {
+export function prepareWorkspaceMcpReview(input: { source: ExtensionSourceDescriptor; command: string; args: string[]; packageRoot: string; tools: ReviewedMcpTool[]; reviewNonce?: string }): McpReviewRecord {
   const binary = hashFile(input.command, 256 * 1024 * 1024), pack = packageTree(input.packageRoot);
   const record: McpReviewRecord = { schemaVersion: 1, ...input, binaryDigest: binary.digest, packageDigest: pack.digest };
   restoreWorkspaceMcpReview(record); return structuredClone(record);
@@ -97,14 +140,8 @@ export function prepareWorkspaceMcpReview(input: { source: ExtensionSourceDescri
 /** Restore exact previously approved digests; never recompute a changed input into a new approval. */
 export function restoreWorkspaceMcpReview(raw: McpReviewRecord): ReviewedMcpSource {
   try {
-    if (!plain(raw) || !exact(raw, ["schemaVersion", "source", "command", "args", "packageRoot", "binaryDigest", "packageDigest", "tools"])
-      || raw.schemaVersion !== 1 || !HASH.test(raw.binaryDigest) || !HASH.test(raw.packageDigest)
-      || !Array.isArray(raw.args) || raw.args.length > 64 || !raw.args.every(arg => typeof arg === "string" && arg.length <= 4096 && !/[\x00-\x1f\x7f]/u.test(arg))
-      || Buffer.byteLength(canonical(raw.args)) > 16 * 1024 || redactSensitiveText(canonical(raw.args)).redactions.length
-      || raw.args.some(arg => /(?:^|--)(?:token|password|secret|api[-_]?key|authorization|cookie)(?:=|$)/iu.test(arg))
-      || !Array.isArray(raw.tools) || raw.tools.length > 64) throw new WorkspaceMcpError("mcp_source_unreviewed");
-    const source = validateExtensionCatalog([raw.source])[0]!;
-    if (source.transport !== "stdio") throw new WorkspaceMcpError("mcp_source_unreviewed");
+    raw = checkWorkspaceMcpReviewRecord(raw);
+    const source = raw.source;
     physical(raw.command); physical(raw.packageRoot);
     if (raw.args.some(arg => isAbsolute(arg) && !contains(raw.packageRoot, arg))) throw new WorkspaceMcpError("mcp_source_unreviewed");
     const binary = hashFile(raw.command, 256 * 1024 * 1024), pack = packageTree(raw.packageRoot);
@@ -112,7 +149,7 @@ export function restoreWorkspaceMcpReview(raw: McpReviewRecord): ReviewedMcpSour
     const schemaDigests = new Map<string, string>(), validators = new Map<string, (value: unknown) => boolean>();
     for (const tool of raw.tools) { const checked = schema(tool); schemaDigests.set(tool.toolId, checked.digest); validators.set(tool.toolId, checked.validate); }
     if (new Set(raw.tools.map(tool => tool.remoteName)).size !== raw.tools.length || schemaDigests.size !== raw.tools.length) throw new WorkspaceMcpError("mcp_source_unreviewed");
-    const descriptor = validateExtensionCatalog([{ ...source, sourceRevision: extensionDigest({ sourceRevision: source.sourceRevision, binary: binary.digest, package: pack.digest, schemas: [...schemaDigests] }),
+    const descriptor = validateExtensionCatalog([{ ...source, sourceRevision: extensionDigest({ sourceRevision: source.sourceRevision, binary: binary.digest, package: pack.digest, schemas: [...schemaDigests], ...(raw.reviewNonce === undefined ? {} : { reviewNonce: raw.reviewNonce }) }),
       tools: raw.tools.map(tool => ({ toolId: tool.toolId, name: tool.remoteName, description: tool.description })) }])[0]!;
     const reviewed = Object.freeze({ descriptor: deepFreeze(descriptor) });
     plans.set(reviewed, { record: deepFreeze(structuredClone(raw)), binary: binary.stamp, files: pack.stamps, schemaDigests, validators }); return reviewed;
@@ -136,8 +173,7 @@ export function assertWorkspaceMcpReviewCurrent(source: ReviewedMcpSource): void
 export function readWorkspaceMcpReviews(path: string): ReviewedMcpSource[] {
   try {
     const snapshot = readPrivateStateFileSnapshotSync(path, 1024 * 1024); if (!snapshot) return [];
-    const raw: unknown = JSON.parse(snapshot.text);
-    if (!plain(raw) || !exact(raw, ["schemaVersion", "records"]) || raw.schemaVersion !== 1 || !Array.isArray(raw.records) || raw.records.length > 64) throw new Error();
-    return raw.records.map(record => restoreWorkspaceMcpReview(record as McpReviewRecord));
+    const raw = parseWorkspaceMcpReviewLibrary(JSON.parse(snapshot.text));
+    return raw.records.filter(record => raw.invalidated[record.source.sourceId] !== extensionDigest(record)).map(restoreWorkspaceMcpReview);
   } catch { throw new WorkspaceMcpError("mcp_source_unreviewed"); }
 }
