@@ -25,7 +25,7 @@ const hash = (value: unknown): string => createHash("sha256").update(canonical(v
 const object = (value: unknown): Record<string, unknown> => plain(value) ? value : {};
 /** Documented agentMessage is visible prose even when legacy providers omit its phase.
  * Require its real typed item first; unknown future phases never become preview text. */
-export function codexVisibleAgentMessage(value: unknown): boolean {
+export function codexVisibleAgentMessage(value: unknown): value is { type: "agentMessage"; id: string; text: string; phase?: null | "partial_answer" | "final_answer" } {
   const item = object(value);
   return item.type === "agentMessage" && nativeId(item.id) && typeof item.text === "string"
     && (item.phase === undefined || item.phase === null || item.phase === "partial_answer" || item.phase === "final_answer");
