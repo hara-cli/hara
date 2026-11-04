@@ -6,7 +6,7 @@ import { lstatSync } from "node:fs";
 import { join } from "node:path";
 import { runConfiguredAgent } from "../agent-runtime/dispatch.js";
 import { AgentRuntimeRegistry } from "../agent-runtime/registry.js";
-import { applyTaskCheckpoint, continueTaskExecution, createTaskExecution, finishTaskExecution, freshTaskCompletion, recordAwaitingTaskDecision, requestsTaskContinuation, type TaskExecution } from "../session/task.js";
+import { applyTaskBrief, applyTaskCheckpoint, continueTaskExecution, createTaskExecution, finishTaskExecution, freshTaskCompletion, recordAwaitingTaskDecision, requestsTaskContinuation, type TaskExecution } from "../session/task.js";
 import type { RunOpts, RunOutcome } from "../agent/loop.js";
 import type { Provider } from "../providers/types.js";
 import type { Tool } from "../tools/registry.js";
@@ -73,6 +73,10 @@ import { codexSessionPool } from "../agent-runtime/codex-session.js";
 import { codexThreadState, codexThreadView } from "./codex-thread.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
+/** Only an explicit new-colleague request gets a Host-understood change brief; the card still needs one human confirmation. */
+export const colleagueCreateIntent = (message: string): boolean =>
+  !/(?:不要|别|別|不必|无需|無需|do not|don't|never|without)\s*.{0,12}?(?:建立|建一?[个個位]?|创建|創建|新增|create|add)/iu.test(message)
+  && /(?:建立|建一?[个個位]?|创建|創建|新增|create|add)\s*.{0,30}?(?:同事|bot|agent|colleague)/iu.test(message);
 interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; extensions: WorkspaceExtensions; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
 type WorkspaceConnectionSnapshot = ReturnType<WorkspaceConnectionStoreV2["list"]> & {
   readOnly?: boolean; recovered?: boolean; migrationPending?: boolean; unavailable?: boolean; activeConnectionId?: string | null;
@@ -81,10 +85,14 @@ export interface LocalWorkspaceApproval {
   id: string; workspaceId: string; agentId: string; runId: string; expiresAt: string;
   resourceGeneration: string;
   channelId?: string;
-  kind: "agent_create" | "schedule_create"; draft: { username: string; displayName: string; title: string; instructions: string; runtimeId: "pi" } | { title: string; task: string; timing: string; tz: string };
+  kind: "agent_create" | "schedule_create"; draft: ColleagueCreateDraft | { title: string; task: string; timing: string; tz: string };
+  projectOptions?: string[];
+  catalogRevision?: number;
 }
+export interface ColleagueCreateDraft { username: string; displayName: string; title: string; instructions: string;
+  project: string; runtimeId: AgentRuntimeId; permissionTier: RuntimePermissionTier }
 type ApprovalSettleState = "declined" | "expired" | "aborted";
-type ApprovalDecision = { approved: true } | { approved: false; state: ApprovalSettleState };
+type ApprovalDecision = { approved: true; draft: ColleagueCreateDraft | LocalWorkspaceApproval["draft"]; catalogRevision?: number } | { approved: false; state: ApprovalSettleState };
 interface PendingApproval { card: LocalWorkspaceApproval; clientId: string; selectionEpoch: number; job: LocalJob;
   finish(decision: ApprovalDecision): void; timer: ReturnType<typeof setTimeout> }
 interface LocalJob {
@@ -786,13 +794,31 @@ export class LocalWorkspaceHost {
       runId: accepted?.runId ?? null, reason: entry?.reason ?? null,
       source: entry?.source ?? "unknown_legacy", sourceAssurance: entry?.channel === "rpc" ? "client_declared" : entry ? "host_recorded" : "unrecorded" };
   }
-  answerApproval(clientId: string, workspaceId: string, id: string, approved: boolean): void {
+  answerApproval(clientId: string, workspaceId: string, id: string, approved: boolean, editedDraft?: unknown): void {
     const pending = this.pending.get(id), selection = this.clients.get(clientId);
     if (!pending || pending.card.workspaceId !== workspaceId || pending.clientId !== clientId || !selection || selection.workspaceId !== pending.card.workspaceId
       || (pending.card.channelId ? selection.channelId !== pending.card.channelId : selection.channelId || selection.agentId !== pending.card.agentId)
       || selection.epoch !== pending.selectionEpoch || pending.job.signal.aborted || Date.parse(pending.card.expiresAt) <= Date.now()) throw new Error("approval expired or belongs to another view");
     assertWorkspaceRunAdmission(pending.job.permit, pending.job.options!, pending.job.binding.agent.runtimeId);
-    pending.finish(approved ? { approved: true } : { approved: false, state: "declined" });
+    if (!approved) { pending.finish({ approved: false, state: "declined" }); return; }
+    if (pending.card.kind !== "agent_create") {
+      if (editedDraft !== undefined) throw new Error("Schedule approval cannot edit its frozen draft");
+      pending.finish({ approved: true, draft: pending.card.draft }); return;
+    }
+    const draft = editedDraft ?? pending.card.draft;
+    const context = this.context(workspaceId);
+    if (pending.card.catalogRevision !== context.resources.agents.list().revision) throw new Error("Colleague roster changed; review a fresh draft");
+    if (!plain(draft) || !exact(draft, ["username", "displayName", "title", "instructions", "project", "runtimeId", "permissionTier"])
+      || typeof draft.username !== "string" || !/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(draft.username)
+      || !text(draft.displayName, 80) || !text(draft.title, 180) || typeof draft.instructions !== "string" || draft.instructions.length > 8000
+      || typeof draft.project !== "string" || draft.project.length > 240 || /[\u0000-\u001f\u007f-\u009f]/u.test(draft.project)
+      || !isRuntimePermissionTier(draft.permissionTier) || !this.context(workspaceId).resources.agents.runtimeOptions().some(row => row.id === draft.runtimeId && row.id !== "hara" && row.available))
+      throw new Error("Invalid or unavailable colleague draft; review current options");
+    const currentProjects = prepareWorkspaceProjectLocations({ storage: context.storage, project: context.project,
+      history: pending.job.value.history, objective: pending.job.value.task?.objective ?? "" });
+    if (pending.card.projectOptions?.includes(draft.project as string) && !currentProjects.options.includes(draft.project as string))
+      throw new Error("Project candidate changed; review the current Workspace catalog");
+    pending.finish({ approved: true, draft: draft as unknown as ColleagueCreateDraft, catalogRevision: pending.card.catalogRevision });
   }
   private approval(job: LocalJob, draft: LocalWorkspaceApproval["draft"], kind: LocalWorkspaceApproval["kind"] = "agent_create"): Promise<ApprovalDecision> {
     const selection = this.clients.get(job.clientId);
@@ -802,7 +828,9 @@ export class LocalWorkspaceHost {
     }
     const card: LocalWorkspaceApproval = { id: randomUUID(), workspaceId: job.workspaceId, agentId: job.agentId,
       resourceGeneration: job.binding.agent.resourceBinding.generation, ...(job.channelId ? { channelId: job.channelId } : {}),
-      runId: job.binding.runId, kind, expiresAt: new Date((job.binding.budget.mode === "interactive" ? Date.now() : Date.parse(job.value.attempt!.startedAt)) + (typeof this.options.approvalTimeoutMs === "number" && this.options.approvalTimeoutMs > 0 ? this.options.approvalTimeoutMs : job.binding.budget.timeoutMs)).toISOString(), draft: Object.freeze({ ...draft }) };
+      runId: job.binding.runId, kind, expiresAt: new Date((job.binding.budget.mode === "interactive" ? Date.now() : Date.parse(job.value.attempt!.startedAt)) + (typeof this.options.approvalTimeoutMs === "number" && this.options.approvalTimeoutMs > 0 ? this.options.approvalTimeoutMs : job.binding.budget.timeoutMs)).toISOString(), draft: Object.freeze({ ...draft }),
+      ...(kind === "agent_create" ? { projectOptions: job.startContext?.projectLocations?.options ?? [],
+        catalogRevision: job.context.resources.agents.list().revision } : {}) };
     return new Promise(resolve => {
       const onAbort = () => finish({ approved: false, state: "aborted" });
       const finish = (decision: ApprovalDecision) => {
@@ -983,20 +1011,32 @@ export class LocalWorkspaceHost {
         return JSON.stringify({ agentId: found.agentId, identity: found.identity, description: found.description,
           runtime: found.runtime.id, state: found.state });
       } });
-    tools.push({ name: "agent_create", description: "Create one colleague AFTER a fresh human confirmation. This tool waits while the card is pending; created:true is returned ONLY AFTER the card was approved and the colleague is active. Never ask for confirmation again after success. The internal runtime is pi; call them 同事 in user-facing text.", kind: "edit",
-      input_schema: { type: "object", properties: { username: { type: "string" }, displayName: { type: "string" }, title: { type: "string" }, instructions: { type: "string" } }, required: ["username", "displayName", "title", "instructions"] },
+    tools.push({ name: "agent_create", description: "Propose one editable colleague card immediately. The human edits project, runtime and permission tier on the card, then confirms once; the Host creates the colleague. Use the bounded startup roster and project candidates, without extra list/receipt calls or an ask_user question for missing fields. Runtime and permission choices belong to the human, not this tool. Never ask for confirmation again after success.", kind: "edit",
+      input_schema: { type: "object", properties: { username: { type: "string" }, displayName: { type: "string" }, title: { type: "string" }, instructions: { type: "string" }, project: { type: "string" } }, required: [] },
       async run(input) {
-        if (!plain(input) || !exact(input, ["username", "displayName", "title", "instructions"]) || !text(input.username, 64)
-          || !text(input.displayName, 80) || !text(input.title, 180) || typeof input.instructions !== "string" || input.instructions.length > 8000) throw new Error("invalid colleague proposal");
+        const validProposal = plain(input) && exact(input, ["username", "displayName", "title", "instructions", ...(Object.hasOwn(input, "project") ? ["project"] : [])])
+          && text(input.username, 64) && text(input.displayName, 80) && text(input.title, 180)
+          && typeof input.instructions === "string" && input.instructions.length <= 8000
+          && (input.project === undefined || typeof input.project === "string" && input.project.length <= 240);
+        if (!validProposal && !colleagueCreateIntent(job.value.task?.objective ?? "")) throw new Error("invalid colleague proposal");
+        const proposed = validProposal ? input : { username: "", displayName: "", title: "", instructions: job.value.task?.objective ?? "", project: "" };
         assertCurrent();
         if (agentCreateAttempts >= 1) return JSON.stringify({ created: false, refused: "turn_limit", humanConfirmed: false, limit: 1 });
         agentCreateAttempts += 1; // Reserve before approval yields so parallel tool uses cannot show two cards.
-        const decision = await host.approval(job, { username: input.username, displayName: input.displayName, title: input.title, instructions: input.instructions, runtimeId: "pi" });
+        const options = job.context.resources.agents.runtimeOptions().filter(row => row.available && row.id !== "hara");
+        const defaultRuntime = options.some(row => row.id === agent.runtime.id) ? agent.runtime.id : options.some(row => row.id === "pi") ? "pi" : options[0]?.id;
+        if (!defaultRuntime) return JSON.stringify({ created: false, refused: "runtime_unavailable", humanConfirmed: false });
+        const decision = await host.approval(job, { username: proposed.username as string, displayName: proposed.displayName as string, title: proposed.title as string, instructions: proposed.instructions as string,
+          project: typeof proposed.project === "string" ? proposed.project : "", runtimeId: defaultRuntime, permissionTier: "full-protected" });
         if (!decision.approved) {
-          return JSON.stringify({ created: false, humanConfirmed: false, approvalState: decision.state, displayName: input.displayName });
+          return JSON.stringify({ created: false, humanConfirmed: false, approvalState: decision.state, displayName: proposed.displayName });
         }
         assertCurrent();
-        const created = job.context.resources.agents.create({ username: input.username, profile: { displayName: input.displayName, title: input.title }, instructions: input.instructions, runtimeId: "pi" }, job.context.resources.agents.list().revision);
+        const edited = decision.draft as ColleagueCreateDraft;
+        if (typeof decision.catalogRevision !== "number") throw new Error("Colleague roster revision missing");
+        const instructions = edited.instructions + (edited.project.trim() ? `\n\nResponsible project (label only; no file access grant): ${edited.project.trim()}` : "");
+        const created = job.context.resources.agents.create({ username: edited.username, profile: { displayName: edited.displayName, title: edited.title }, instructions,
+          runtimeId: edited.runtimeId, permissionTier: edited.permissionTier }, decision.catalogRevision);
         host.changed(job.workspaceId, job.agentId); return JSON.stringify({ created: true, humanConfirmed: true, approvalState: "consumed", agent: created });
       } });
     tools.push({ name: "agent_rename", description: "Change an existing colleague's display name when the human asked for it and supplied the new name. Resolve the current colleague first (exact name, alias or roster title); never look up the new name. The former name stays a resolvable alias. Use ask_user instead if more than one colleague matches.", kind: "edit",
@@ -1142,6 +1182,14 @@ export class LocalWorkspaceHost {
       } else {
         if (value.task) value.pastTasks.push({ task: value.task, usage: value.runUsage, endedAt: new Date().toISOString() });
         task = context.resources.agents.bindTask(createTaskExecution(message, randomUUID()), agentId, agent.configRevision, agent.agentEpoch);
+        if (agent.kind === "main" && !channel && !parent && colleagueCreateIntent(message)) {
+          const prepared = applyTaskBrief(task, { intent: "change", goal: message,
+            constraints: ["Only this Workspace; create no colleague before the human edits and confirms one card"],
+            acceptance: ["The Host confirms one new colleague in the same Workspace roster with the exact human-edited configuration"],
+            steps: ["Prepare one editable colleague card", "Wait for the human's confirmation", "Verify the Host roster result"] });
+          if (!prepared.ok) throw new Error(prepared.reason);
+          task = prepared.task;
+        }
         task.workspaceRunBinding = freezeWorkspaceRunBinding({ schemaVersion: 1, scope: row.scope, agent: task.workspaceAgentBinding!,
           agentBindingHash: workspaceAgentBindingHash(task.workspaceAgentBinding!), connection: scheduledConnection ?? context.connections.capture(), runtimeContract: "hara-governed-runtime-v1",
           project: captureWorkspaceProjectIdentity(context.project), sessionId: store.sessionId, runId: randomUUID(),
@@ -1223,16 +1271,17 @@ export class LocalWorkspaceHost {
         + (channel.context.length > 5000 ? `Full channel context: ${owned.receipts.retain({ id: channel.id, name: "channel_context", content: channel.context })}; use workspace_receipt_read to read omitted context.\n` : "") : "";
       owned.options = bindWorkspaceRunOptions(owned.permit, { ctx: { cwd: context.project, sessionId: store.sessionId, todoScope: `workspace-${binding.runId}`, sandbox: "off" },
         signal: owned.signal, approval: "auto-edit", approvalChannel: true, confirm: async () => false, quiet: true, hooks: false, extraTools: tools,
+        finishOnConfirmedColleagueCreate: agent.kind === "main" && !channel && !parent && colleagueCreateIntent(task.objective),
         systemOverride: `You are ${configuration.identity.displayName}, a clearly identified Hara AI colleague. ${instructions}\nUse only this Workspace's supplied tools. Never claim completion without observed evidence.\n` + shared
           + `Reply naturally in the user's language. Call AI coworkers 同事, not Pi 同事; pi is only an internal runtime. A greeting needs no tools.\n`
           + `${owned.startContext.prompt}\n`
           + `Current Workspace colleague directory (catalog_only; fresh at admission, no authority or completion evidence): ${JSON.stringify(compactWorkspaceRoster(context.resources.agents.list().agents))}. Use this before calling agent_list; fetch again only if missing, truncated or changed. Full public detail: agent_get by exact id.\n`
           + `Use workspace_context_lookup to resolve missing names and aliases. Core pauses after two unresolved lookups or a recoverable safety checkpoint. Use ask_user for a real problem or material ambiguity; never guess a user answer.\n`
           + "For a genuinely ambiguous project/folder, reuse the evidenced projectLocations.options with its otherOption in ask_user. These catalog-only hints do not grant file access; never invent a path or ask for one already identified.\n"
-          + `For creation use agent_create and wait for the human card; for delegation use agent_contact with an existing exact agentId.\n`
+          + `For an explicit new-colleague request, use the bounded startup roster and projectLocations candidates to call agent_create in your FIRST model response. Do not call agent_list, workspace_receipt_read or ask_user first merely to fill name, role, project or runtime; the human edits missing fields on the card. A project candidate is only a label and does not grant file access. If an existing active colleague clearly matches, suggest reusing that colleague instead. For delegation use agent_contact with an existing exact agentId.\n`
           + `每轮最多建立一位同事。\n`
           + `For a requested rename use agent_rename on the resolved existing colleague; the new name is not a reference to look up.\n`
-          + `agent_create returns only AFTER the human has approved; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. created:false with approvalState declined/expired/aborted means no colleague was created — tell the human they can ask again; do not re-open a card unless they ask. Check the preloaded roster before creating so an active colleague is not duplicated; use agent_list only if the roster is insufficient or changed.\n`
+          + `agent_create returns only AFTER the human has edited and approved the card; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. created:false with approvalState declined/expired/aborted means no colleague was created — tell the human they can ask again; do not re-open a card unless they ask.\n`
           + `Successful Workspace tool results repeat the exact citation ID in receipt.toolCallId. Hara records and checks those receipts automatically for simple completed changes. For an explicit checkpoint, copy observed IDs; never invent them or repeat side effects to fix a rejected citation. After restart, re-observe state with read-only tools.\n`
           + `Enabled version-locked Workspace skills (load every page of instructions via workspace_skill before acting; no extra permissions): ${boundWorkspaceText(JSON.stringify(withWorkspaceOperationSkill(context.features.enabledSkills()).map(item => ({ id: item.id, description: item.description, version: item.version }))), 1200)}.\n`
           + `Native runtime shell/file tools may change only the admitted working directory under the frozen permission tier. Use workspace_native_evidence to read current Host diff IDs for explicit checks; no diff is no proof. Native file evidence cannot prove Hara colleague, delegation, membership or schedule changes. All scheduled work must use Hara WorkspaceScheduler; do not use runtime-native cron, wakeup or background scheduling tools.\n`

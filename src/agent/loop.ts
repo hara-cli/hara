@@ -734,6 +734,8 @@ export interface RunOpts {
    *  filter can't accidentally drop them) and resolved BEFORE the registry on dispatch. Never
    *  registered globally, so other runs/modes can't see or call them. */
   extraTools?: Tool[];
+  /** Workspace Host-only: a single confirmed colleague receipt closes an explicit creation request without another model call. */
+  finishOnConfirmedColleagueCreate?: boolean;
   /** abort the in-flight LLM request (user interrupt) */
   signal?: AbortSignal;
   /** Total active provider/tool execution ceiling for this run. Engine-owned human question/approval waits
@@ -3911,6 +3913,25 @@ async function runAgentInner(
     }
     if (decisionRetentionError) {
       return interactionFailure("user-decision retention", decisionRetentionError);
+    }
+    if (opts.workspaceRun && opts.finishOnConfirmedColleagueCreate && intakeTask?.brief?.intent === "change"
+      && r.toolUses.filter(call => call.name === "agent_create").length === 1
+      && results.every(result => result.isError !== true && !looksFailed(result.content, result.name))) {
+      const created = results.find(result => result.name === "agent_create");
+      let value: Record<string, unknown> | null = null;
+      try { const raw: unknown = JSON.parse(created?.content ?? ""); if (raw && typeof raw === "object" && !Array.isArray(raw)) value = raw as Record<string, unknown>; } catch { /* Fail closed. */ }
+      const evidence = value?.created === true && value.humanConfirmed === true && value.approvalState === "consumed" ? changeEvidence() : null;
+      if (value && evidence && !workspaceRunHasPendingInteraction(opts.workspaceRun)) {
+        const applied = applyTaskCheckpoint(intakeTask, { completion: { state: "verified", evidence } });
+        if (!applied.ok) return interactionFailure("colleague creation checkpoint", new Error(applied.reason));
+        try { intakeTask = applied.task; opts.taskIntake?.onUpdate?.(intakeTask); opts.taskIntake?.onCheckpoint?.(intakeTask); }
+        catch (error) { return interactionFailure("colleague creation checkpoint", error); }
+        const name = typeof value.agent === "object" && value.agent !== null && !Array.isArray(value.agent)
+          && typeof (value.agent as { identity?: { displayName?: unknown } }).identity?.displayName === "string"
+          ? (value.agent as { identity: { displayName: string } }).identity.displayName : "";
+        history.push({ role: "assistant", text: name ? `已建立同事 ${name}。` : "同事已建立。", toolUses: [] });
+        return { status: "completed" };
+      }
     }
     const successfulTaskCheckpoint = r.toolUses.some((toolUse, index) => {
       const result = results[index];
