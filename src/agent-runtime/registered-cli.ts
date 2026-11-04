@@ -94,7 +94,7 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
           try {
             const result = await session.launch(endpoint, prompt, turnArgs, { model, effort, cwd: options.ctx.cwd, signal: native.signal, assertCurrent, activity });
             if (!result.ok) return native.signal.aborted || result.errorCode === "interrupted" ? result : { ...result,
-              runtimeFailure: tracker.failed(result.nativeFailureKind ?? classifyRuntimeFailure({ code: result.errorCode }), Date.now() - started, result.errorFirstLine) };
+              runtimeFailure: tracker.failed(result.nativeFailureKind ?? classifyRuntimeFailure({ code: result.errorCode }), Date.now() - started, result.errorFirstLine, result.nativeRpc) };
             tracker.succeeded();
             if (!native.signal.aborted) successfulUse = installer.captureSuccessfulUse(id, resolved.command);
             return result;

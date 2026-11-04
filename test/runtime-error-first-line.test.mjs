@@ -62,3 +62,21 @@ test('native startup stderr reaches the real Hara recovery diagnostic without a 
  assert.match(text,/errorFirstLine/);assert.match(text,/Error: invalid transport \[path\]/);
  assert.doesNotMatch(text,/Users\/private|PRIVATE_SECOND_LINE/);
 });
+
+
+test('RPC timeout keeps its closed method/deadline and safe stderr despite synchronous onClose preceding rejection catch',async()=>{
+ for(const stderr of ['',raw]){
+  const child=rpcChild(),events=[];let closeError;
+  const client=JsonlRpcClient.start({command:process.execPath,env,captureErrorFirstLine:true,timeoutMs:500,spawnProcess:()=>child,
+   onClose(error){events.push('close');closeError=error;child.emit('close',1);}});
+  const keepAlive=setTimeout(()=>{},1500);
+  try {
+   const pending=client.call('thread/resume',{threadId:'PRIVATE_THREAD',prompt:'PRIVATE_PROMPT'}).catch(error=>{events.push('reject');throw error;});
+   if(stderr)child.stderr.write(stderr);
+   await assert.rejects(pending,error=>error instanceof ExternalJsonlRpcTransportError&&error.runtimeFailureKind==='timeout'&&error.rpc.rpcMethod==='thread/resume'&&error.rpc.rpcTimeoutMs===500);
+   await client.waitForClose();assert.deepEqual(events,['close','reject']);
+   assert.equal(Boolean(closeError.errorFirstLine),Boolean(stderr));
+   assert.doesNotMatch(JSON.stringify(closeError),/PRIVATE_THREAD|PRIVATE_PROMPT|opaque-native|Users|example|SECOND_LINE/);
+  } finally {clearTimeout(keepAlive);client.close();child.emit('close',0);}
+ }
+});

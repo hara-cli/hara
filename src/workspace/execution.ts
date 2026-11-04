@@ -1,3 +1,4 @@
+import { runtimeStageErrorKind } from "../agent-runtime/stage-observer.js";
 import { decorateWorkspaceExtensionTool, isWorkspaceExtensionTool } from "./extension-binding.js";
 import type { CompletionEvidenceLedger } from "../agent/completion-evidence.js";
 import { createWorkspaceCompletionEvidence } from "./completion-evidence-store.js";
@@ -191,6 +192,7 @@ export function createWorkspaceRunPermit(input: {
       const auditIndex = state.audit.start("model", state.usage.modelCalls, "provider"), callStarted = performance.now();
       const endStage = runtimeStageObserve(state, () => state.runtimeStages?.beginEvent("model_roundtrip", { call: state.usage.modelCalls }));
       let outcome: "completed" | "error" | "cancelled" = "error", errorKind: WorkspaceExecutionError = "thrown", status: number | null = null;
+      let stageError = runtimeStageErrorKind(undefined);
       const observation = { modelCall: state.usage.modelCalls, systemChars: args.system.length, toolSchemaChars: JSON.stringify(args.tools).length,
         systemAndToolsUtf8Bytes: Buffer.byteLength(args.system + JSON.stringify(args.tools)), modelHistoryChars: historyChars(args.history), wakeChars: state.wakeChars,
         ...(state.contextStats ?? { compacted: false, originalChars: historyChars(args.history), recentChars: historyChars(args.history), summaryChars: 0, toolMaxChars: 0, agedToolMaxChars: 0 }) };
@@ -223,11 +225,12 @@ export function createWorkspaceRunPermit(input: {
           errorKind = "budget_exhausted"; throw new Error("Workspace token telemetry safety ceiling reached");
         }
         outcome = result.stop === "error" ? "error" : "completed"; errorKind = result.stop === "error" ? "provider_error" : null;
+        stageError = runtimeStageErrorKind(result.errorMetadata?.code ?? result.errorMsg);
         status = result.errorMetadata?.status ?? null;
         return result;
       } finally {
         if (input.signal.aborted || args.signal?.aborted || revoked.signal.aborted) { outcome = "cancelled"; errorKind = "cancelled"; }
-        runtimeStageObserve(state, () => endStage?.(outcome, outcome === "error" ? "runtime_failed" : undefined));
+        runtimeStageObserve(state, () => endStage?.(outcome, outcome === "error" ? stageError : undefined));
         state.audit.finish(auditIndex, performance.now() - callStarted, outcome, errorKind, status);
       }
     },

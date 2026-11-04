@@ -58,7 +58,15 @@ export interface RuntimeStageEvent {
   source: RuntimeStageSource;
   errorKind: RuntimeStageErrorKind | null;
 }
+export interface RuntimeStageProvenance { startedAt: string; coreInstanceId: string }
+const validProvenance = (value: unknown): value is RuntimeStageProvenance => plain(value)
+  && exact(value, ["startedAt", "coreInstanceId"]) && typeof value.startedAt === "string"
+  && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value.startedAt)
+  && Number.isFinite(Date.parse(value.startedAt)) && new Date(value.startedAt).toISOString() === value.startedAt
+  && typeof value.coreInstanceId === "string" && UUID.test(value.coreInstanceId);
 export interface RuntimeStageReport extends RuntimeStageIdentity {
+  /** Absent on older records; never infer the current Core or time for legacy history. */
+  provenance?: RuntimeStageProvenance;
   schemaVersion: 1;
   runtime: RuntimeStageRuntime;
   state: RuntimeStageState;
@@ -139,7 +147,8 @@ function validEvent(value: unknown): value is RuntimeStageEvent {
 }
 /** Exact wire validation also applies on disk reads and again before exporting. */
 export function parseRuntimeStageReport(value: unknown): RuntimeStageReport {
-  if (!plain(value) || !exact(value, reportKeys) || value.schemaVersion !== 1 || !validIdentity(value)
+  if (!plain(value) || !exact(value, [...reportKeys, ...(Object.hasOwn(value, "provenance") ? ["provenance"] : [])])
+    || Object.hasOwn(value, "provenance") && !validProvenance(value.provenance) || value.schemaVersion !== 1 || !validIdentity(value)
     || !validRuntime(value.runtime) || !states.includes(String(value.state))
     || !(value.durationMs === null || duration(value.durationMs)) || !nullableError(value.errorKind)
     || !integer(value.droppedEvents) || !Array.isArray(value.events) || value.events.length > MAX_RUNTIME_STAGE_EVENTS
@@ -173,12 +182,14 @@ export class RuntimeStageRecorder {
   private nextSeq = 1;
   private closed = false;
   private readonly firstMarks = new Set<"first_token" | "first_output">();
-  constructor(identity: RuntimeStageIdentity, runtime: RuntimeStageRuntime, private readonly options: { now?: () => number } = {}) {
+  constructor(identity: RuntimeStageIdentity, runtime: RuntimeStageRuntime, private readonly options: { now?: () => number; provenance?: RuntimeStageProvenance } = {}) {
     if (!plain(identity) || !exact(identity as unknown as Record<string, unknown>, identityKeys) || !validIdentity(identity as unknown as Record<string, unknown>)) invalid();
     const now = (options.now ?? performance.now.bind(performance))();
     if (!Number.isFinite(now)) invalid();
+    if (options.provenance !== undefined && !validProvenance(options.provenance)) invalid();
     this.began = now;
-    this.report = { schemaVersion: 1, ...structuredClone(identity), runtime: projectRuntimeStageRuntime(runtime),
+    this.report = { schemaVersion: 1, ...structuredClone(identity),
+      ...(options.provenance ? { provenance: { ...options.provenance } } : {}), runtime: projectRuntimeStageRuntime(runtime),
       state: "running", durationMs: null, errorKind: null, events: [], droppedEvents: 0 };
   }
   private offset(): number {

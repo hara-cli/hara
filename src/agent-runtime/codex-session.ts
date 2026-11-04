@@ -1,5 +1,5 @@
 import { runtimeErrorFirstLine } from "../security/runtime-error.js";
-import { classifyRuntimeFailure, type RuntimeFailureKind } from "./failure-diagnostics.js";
+import { classifyRuntimeFailure, type RuntimeFailureKind, type RuntimeRpcDiagnostic } from "./failure-diagnostics.js";
 import { createRuntimeExecutionPolicy, type RuntimeExecutionPolicy } from "./execution-policy.js";
 import { beginWorkspaceNativePolicy, endWorkspaceNativePolicy, observeWorkspaceNativeItem, workspaceRuntimePolicyInput, workspaceRuntimeProcessKey } from "./workspace-native-policy.js";
 import { codexHostToolOverrides } from "./codex-host-config.js";
@@ -34,7 +34,7 @@ const origin = (resolved: ReturnType<WorkspaceRuntimeInstaller["resolveBound"]>,
 const MAX_RESIDENT = 4, IDLE_MS = 5 * 60_000;
 interface ActiveTurn {
   id?: string; ready: Promise<string>; bind(id: string): void;
-  finish(ok: boolean, code?: string, kind?: RuntimeFailureKind, firstLine?: string): void; done: Promise<void>;
+  finish(ok: boolean, code?: string, kind?: RuntimeFailureKind, firstLine?: string, rpc?: RuntimeRpcDiagnostic): void; done: Promise<void>;
   activity(): void; assertCurrent(): void;
   text: string; settled: boolean;
   standingHash: string | null; compacted: boolean; partDigests: Map<string, string>;
@@ -257,10 +257,10 @@ export class GovernedCodexSession {
       HARA_SUBPROCESS_ENV_ALLOW: [resolved.env.HARA_SUBPROCESS_ENV_ALLOW, WORKSPACE_MCP_TOKEN_ENV].filter(Boolean).join(",") };
     let finish!: ActiveTurn["finish"], bind!: ActiveTurn["bind"], done!: () => void;
     const terminal = new Promise<ExternalCommandCaptureResult>(resolve => {
-      finish = (ok, code, kind, firstLine) => {
+      finish = (ok, code, kind, firstLine, rpc) => {
         if (active.settled) return;
         active.settled = true;
-        resolve({ ok, code: ok ? 0 : 1, timedOut: false, ...(!ok ? { errorCode: code ?? "runtime_failed", ...(firstLine ? { errorFirstLine: runtimeErrorFirstLine(firstLine, env) } : {}), ...(kind ? { nativeFailureKind: kind } : {}) } : {}),
+        resolve({ ok, code: ok ? 0 : 1, timedOut: false, ...(!ok ? { errorCode: code ?? "runtime_failed", ...(firstLine ? { errorFirstLine: runtimeErrorFirstLine(firstLine, env) } : {}), ...(kind ? { nativeFailureKind: kind } : {}), ...(rpc ? { nativeRpc: rpc } : {}) } : {}),
           stdout: ok ? JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: redactToolSubprocessOutput(active.text, env) } }) : "" });
         done();
       };
@@ -294,7 +294,16 @@ export class GovernedCodexSession {
           onSpawn: () => { try { endSpawn?.("completed"); } catch { /* Diagnostic only. */ } },
           onNotification: (method, params) => this.notification(client, method, params),
           onServerRequest: (_request, _reply, reject) => reject(-32601, "Use Hara Workspace tools and its governed approval channel"),
-          onClose: error => { if (this.client === client) { this.client = undefined; this.loaded = false; this.unload?.(); this.active?.finish(false, "runtime_failed", error instanceof ExternalJsonlRpcTransportError ? error.runtimeFailureKind : undefined, error instanceof ExternalJsonlRpcTransportError ? error.errorFirstLine : undefined); } },
+          onClose: error => {
+            if (this.client !== client) return;
+            this.client = undefined; this.loaded = false; this.unload?.();
+            // During a control RPC, its rejected promise owns the precise terminal reason. onClose
+            // runs synchronously before that catch; settling here would hide restore timeouts.
+            if (this.active?.id) this.active.finish(false, "codex_delivery_unknown_no_replay",
+              error instanceof ExternalJsonlRpcTransportError ? error.runtimeFailureKind : undefined,
+              error instanceof ExternalJsonlRpcTransportError ? error.errorFirstLine : undefined,
+              error instanceof ExternalJsonlRpcTransportError ? error.rpc : undefined);
+          },
         });
         this.client = client; this.exit = client.waitForClose(); void this.exit.catch(() => {});
         await client.call("initialize", { clientInfo: { name: "hara", version: "1.0.2" }, capabilities: { experimentalApi: true } });
@@ -317,22 +326,29 @@ export class GovernedCodexSession {
           cwd: input.cwd, sandbox: "danger-full-access", approvalPolicy: "never", approvalsReviewer: "user",
           developerInstructions: standing, config, ...(input.model ? { model: input.model } : {}),
         });
+        const thread = object(response.thread);
+        if (!nativeId(thread.id) || resumed && thread.id !== this.value.threadId || thread.cwd !== input.cwd
+          || response.approvalPolicy !== "never" || response.approvalsReviewer !== "user"
+          || object(response.sandbox).type !== "dangerFullAccess"
+          || input.model !== null && response.model !== input.model || input.effort !== null && response.reasoningEffort !== input.effort
+          || object(thread.status).type !== "idle") {
+          throw new Error("Codex thread confinement or idle origin was not confirmed");
+        }
       } catch (error) {
         if (resumed) { this.value.phase = "unknown"; this.save(); }
-        active.finish(false, resumed ? "codex_resume_failed_history_preserved" : "codex_thread_start_failed", error instanceof ExternalJsonlRpcRequestError || error instanceof ExternalJsonlRpcTransportError ? error.runtimeFailureKind : "runtime_failed", error instanceof ExternalJsonlRpcRequestError || error instanceof ExternalJsonlRpcTransportError ? error.errorFirstLine : undefined); client.close(); return await terminal;
+        active.bind("");
+        const typed = error instanceof ExternalJsonlRpcRequestError || error instanceof ExternalJsonlRpcTransportError ? error : undefined;
+        active.finish(false, resumed ? "codex_resume_failed_history_preserved" : "codex_thread_start_failed",
+          typed?.runtimeFailureKind ?? "runtime_failed", typed?.errorFirstLine, typed?.rpc);
+        client.close();
+        await this.settleNativeAttempt();
+        return await terminal;
       }
       const thread = object(response.thread);
-      if (!nativeId(thread.id) || resumed && thread.id !== this.value.threadId || thread.cwd !== input.cwd
-        || response.approvalPolicy !== "never" || response.approvalsReviewer !== "user"
-        || object(response.sandbox).type !== "dangerFullAccess"
-        || input.model !== null && response.model !== input.model || input.effort !== null && response.reasoningEffort !== input.effort
-        || object(thread.status).type !== "idle") {
-        throw new Error("Codex thread confinement or idle origin was not confirmed");
-      }
       // npm's launcher remains the owned root; its initialized native app-server child is
       // resident too. Seal that baseline before turn/start, never after model tools can run.
       if (freshProcess) await this.policy.prepareResidentRoot();
-      this.value.threadId = thread.id; this.loaded = true;
+      this.value.threadId = thread.id as string; this.loaded = true;
       if (!resumed || this.value.contextGeneration === null) this.value.contextGeneration = randomUUID();
       this.value.phase = "unknown"; this.save(); // Write ahead of an accepted or outcome-unknown turn.
       input.assertCurrent(); if (input.signal.aborted) throw new Error("interrupted");
@@ -356,7 +372,7 @@ export class GovernedCodexSession {
       await this.settleNativeAttempt();
       return result;
     } catch (error) {
-      active.bind(""); active.finish(false, "codex_delivery_unknown_no_replay", error instanceof ExternalJsonlRpcRequestError || error instanceof ExternalJsonlRpcTransportError ? error.runtimeFailureKind : undefined, error instanceof ExternalJsonlRpcRequestError || error instanceof ExternalJsonlRpcTransportError ? error.errorFirstLine : undefined); this.client?.close();
+      active.bind(""); active.finish(false, "codex_delivery_unknown_no_replay", error instanceof ExternalJsonlRpcRequestError || error instanceof ExternalJsonlRpcTransportError ? error.runtimeFailureKind : undefined, error instanceof ExternalJsonlRpcRequestError || error instanceof ExternalJsonlRpcTransportError ? error.errorFirstLine : undefined, error instanceof ExternalJsonlRpcRequestError || error instanceof ExternalJsonlRpcTransportError ? error.rpc : undefined); this.client?.close();
       await this.settleNativeAttempt();
       const result = await terminal;
       return result.ok ? { ok: false, code: 1, timedOut: false, stdout: "", errorCode: "runtime_process_cleanup_unverified" } : result;

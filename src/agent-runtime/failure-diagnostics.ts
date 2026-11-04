@@ -15,7 +15,17 @@ export interface RuntimeFailureContext {
   /** Code-owned policy metadata. Absence preserves older diagnostic records. */
   extensionsIsolation?: "inherited";
 }
-export interface RuntimeFailureDiagnostic extends RuntimeFailureContext {
+export const RUNTIME_RPC_METHODS = ["initialize", "thread/start", "thread/resume", "turn/start", "turn/interrupt", "thread/unsubscribe"] as const;
+export interface RuntimeRpcDiagnostic { rpcMethod: typeof RUNTIME_RPC_METHODS[number]; rpcTimeoutMs: number }
+/** Code-owned RPC metadata only; never forward method parameters or native error data. */
+export function runtimeRpcDiagnostic(value: unknown): RuntimeRpcDiagnostic | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const row = value as Record<string, unknown>;
+  return typeof row.rpcMethod === "string" && (RUNTIME_RPC_METHODS as readonly string[]).includes(row.rpcMethod)
+    && Number.isSafeInteger(row.rpcTimeoutMs) && Number(row.rpcTimeoutMs) >= 500 && Number(row.rpcTimeoutMs) <= 120_000
+    ? { rpcMethod: row.rpcMethod as RuntimeRpcDiagnostic["rpcMethod"], rpcTimeoutMs: Number(row.rpcTimeoutMs) } : undefined;
+}
+export interface RuntimeFailureDiagnostic extends RuntimeFailureContext, Partial<RuntimeRpcDiagnostic> {
   extensionsIsolation?: "inherited";
   errorFirstLine?: string;
   kind: RuntimeFailureKind;
@@ -77,11 +87,12 @@ const MAX_DATE_MS = 8_640_000_000_000_000;
 
 /** Whitelist projection: only closed metadata and a redacted first native error line may be copied. */
 export function runtimeFailureMessage(input: RuntimeFailureContext & {
-  kind: RuntimeFailureKind; elapsedMs: number; retryAtMs?: number; consecutiveFailures?: number; errorFirstLine?: string;
+  kind: RuntimeFailureKind; elapsedMs: number; retryAtMs?: number; consecutiveFailures?: number; errorFirstLine?: string; rpc?: RuntimeRpcDiagnostic;
 }): string {
   if (!["codex", "claude", "opencode", "pi", "gemini", "kimi", "copilot", "cursor", "grok"].includes(input.runtime)) throw new Error("Invalid diagnostic runtime");
   const diagnostic: RuntimeFailureDiagnostic = {
     runtime: input.runtime,
+    ...(input.runtime === "codex" ? runtimeRpcDiagnostic(input.rpc) : {}),
     ...(runtimeErrorFirstLine(input.errorFirstLine) ? { errorFirstLine: runtimeErrorFirstLine(input.errorFirstLine) } : {}),
     ...(input.runtime === "kimi" || expandedExtensionsIsolation(input.runtime) ? { extensionsIsolation: "inherited" as const } : {}),
     kind: knownKind(input.kind) ? input.kind : "runtime_failed",

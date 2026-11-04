@@ -236,3 +236,16 @@ test("metadata whitelist rejects trailing line/control whitespace rather than tr
     assert.throws(() => parseRuntimeStageReport({ ...valid, runtime: { ...valid.runtime, version: "1.2.3" + suffix } }), /Invalid Runtime stage/);
   }
 });
+
+
+test("attempt provenance survives snapshots while legacy records remain unknown and arbitrary source metadata is rejected", () => {
+  const provenance = { startedAt: "2026-11-04T15:30:25.000Z", coreInstanceId: randomUUID() };
+  const value = new RuntimeStageRecorder(identity(), runtime(), { provenance });
+  assert.deepEqual(parseRuntimeStageReport(value.snapshot()).provenance, provenance);
+  assert.equal(recorder().value.snapshot().provenance, undefined);
+  for (const bad of [{ ...provenance, startedAt: "PRIVATE_TIME" }, { ...provenance, startedAt: "2026-02-30T00:00:00.000Z" },
+    { ...provenance, coreInstanceId: "/Users/PRIVATE" }, { ...provenance, source: "PRIVATE_PROMPT" }]) {
+    assert.throws(() => new RuntimeStageRecorder(identity(), runtime(), { provenance: bad }), /Invalid Runtime stage/);
+    assert.throws(() => parseRuntimeStageReport({ ...value.snapshot(), provenance: bad }), /Invalid Runtime stage/);
+  }
+});
