@@ -47,7 +47,7 @@ test("interactive chat passes twelve rounds and aggregate token/tool sizing with
   const project = a.host.context(a.workspace.workspaceId).project;
   for (let n = 1; n <= 14; n++) for (const part of [1, 2, 3]) fs.writeFileSync(join(project, `report-${n}-${part}.txt`),
     `Report ${n}: ${Array.from({ length: 100 }, () => randomBytes(5).toString("hex")).join(" ")}`);
-  const run = start(a, "Read the numbered reports and summarize them"); await a.host.wait(run.runId);
+  const run = start(a, "What do the numbered reports say?"); await a.host.wait(run.runId);
   assert.equal(a.turns.length, 15, snapshot(a).conversation.blockReason); assert.equal(snapshot(a).conversation.pendingQuestion, null);
   assert.equal(snapshot(a).conversation.runUsage.toolCalls, 42);
   assert.equal(snapshot(a).conversation.runUsage.modelCalls, 15); assert.ok(snapshot(a).conversation.runUsage.inputTokens > 128000);
