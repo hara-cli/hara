@@ -11300,3 +11300,13 @@ Real task-owned stdio, proxy/direct and credential canaries, common drain, actua
 - New synthetic fixtures initially omitted the private Host root and then returned a provider model different from the frozen connection model. These were fixture errors, corrected without loosening Host admission. Cleanup hooks must be registered before later setup can fail. One failed runner's exact owned process/cwd was verified and terminated; unrelated compile sessions were untouched. Retain failure logs.
 - Proxy changes may reject an old opaque record as view_changed before the proxy-specific fence; assert the actual fail-closed contract. Unsupported credential/header/environment/OAuth/HTTP sources and shell/install/inline launchers explain refusal without starting a child. A read-only/unavailable proxy cannot prevent fresh permission removal.
 - Final source builds and owner tests passed (12/12, including actual full native read/write/replace/delete denial on the review library). The earlier combined run was 61/62: all 51 existing regression cases passed; its one owner assertion was corrected and the full owner file passed separately. Desk focused 48/48 and real Desk handler/model/socket-to-Host stdio smoke passed. No real user MCP config, model keys, Keychain, install, Feishu, merge, push or release was used. Headless handlers/static markup do not establish native visual acceptance.
+
+
+## [ERR-20261104-INTEGRATION-W3-CAPABILITIES] Advertised MCP APIs update exact protocol fixtures
+
+- Status: resolved locally; final integration gates tracked in the task evidence
+- Priority: medium
+- Area: integration/tests
+- Evidence: First merged hotspot run passed 62/63. The formal protocol's strict capability list lacked the reviewed manager/owner-review APIs. The equivalent local-dev list was also stale for owner-review.
+- Resolution: Keep deep equality and update both exact lists to the intentional advertised API union. Client opt-in and authenticated owner checks remain independent; no production permission or protocol check was weakened. One-round draft, edited confirmation, scoped candidates, warm launcher PID/thread, context generation and owner-review cases passed in that first run.
+- Merge rules: preserve compact roster and interactive deadlines from round-burn, official project candidates from ask-user-options, the first-response editable colleague contract, strict Raft capability validation plus MCP client declarations, and the real per-call MCP confirmation callback. Both sides of the previous error history remain.
