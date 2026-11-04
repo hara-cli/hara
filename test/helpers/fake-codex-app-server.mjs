@@ -29,6 +29,15 @@ export async function fakeCodexMain() {
     meta.boundaryReads = boundary(mode().boundaryReadProbes, false);
     save();
     const rpc = (method, data) => note(method, { threadId: thread, turnId: currentTurn, ...data });
+    if (mode().preview) {
+      const preview = mode().preview, item = { id: "preview-item", type: "agentMessage", phase: preview.phase ?? null };
+      rpc("item/started", { item });
+      note("item/agentMessage/delta", { threadId: "foreign", turnId: currentTurn, itemId: item.id, delta: "FOREIGN_PRIVATE_TEXT" });
+      note("item/agentMessage/delta", { threadId: thread, turnId: "old-turn", itemId: item.id, delta: "OLD_PRIVATE_TEXT" });
+      for (const delta of preview.chunks ?? ["你好！"]) { rpc("item/agentMessage/delta", { itemId: item.id, delta }); await new Promise(resolve => setTimeout(resolve, 25)); }
+      await new Promise(resolve => setTimeout(resolve, preview.holdMs ?? 300));
+      rpc("item/completed", { item: { ...item, text: (preview.chunks ?? ["你好！"]).join("") } });
+    }
     if (selected === "hang") return;
     if (selected === "native-write" || selected === "native-claim") {
       rpc("item/started", { item: { type: "fileChange", changes: [{ path: "native-result.txt", kind: { type: "add" } }] } });

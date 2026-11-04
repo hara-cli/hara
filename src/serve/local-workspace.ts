@@ -31,6 +31,13 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
   const capability = input.mode === "workspace" ? "workspace.v1" : CAPABILITY;
   const host = new LocalWorkspaceHost(input.root, { mode: input.mode, hostHome: input.hostHome, discoveryHome: input.discoveryHome, legacySourceHome: input.legacySourceHome, credentialVault: input.credentialVault, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, extensionCatalog: input.extensionCatalog, reviewedMcpSources: input.reviewedMcpSources, mcpReviewHome: input.mcpReviewHome, mcpLaunchCandidate: input.mcpLaunchCandidate, runtimeInstallerOptions: input.runtimeInstallerOptions, onChange(event) {
     for (const [client, state] of clients) if (state.initialized && client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ jsonrpc: "2.0", method: "workspace.changed", params: event }));
+  }, onAssistantPreview(clientId, frame) {
+    for (const [client, state] of clients) if (state.id === clientId && state.initialized && client.readyState === WebSocket.OPEN) {
+      // Only the originating opted-in view; preview is never an initialized-client broadcast.
+      if (client.bufferedAmount > 256 * 1024) return false;
+      client.send(JSON.stringify({ jsonrpc: "2.0", method: "workspace.assistant.preview", params: frame })); return true;
+    }
+    return false;
   } });
   await host.initialize();
   const wss = new WebSocketServer({ host: opts.host, port: opts.port, maxPayload: 128 * 1024,
@@ -61,13 +68,14 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       if (!tokenMatches(params.token, token)) throw new Error("unauthorized");
       if (params.clientCapabilities !== undefined && (!Array.isArray(params.clientCapabilities) || params.clientCapabilities.length > 32
         || !params.clientCapabilities.every(value => typeof value === "string" && value.length <= 100))) throw new Error("invalid client capabilities");
+      host.setAssistantPreviewCapability(client.id, Array.isArray(params.clientCapabilities) && params.clientCapabilities.includes("workspace.assistant-preview.v1"));
       host.setExtensionClientCapability(client.id, Array.isArray(params.clientCapabilities) && params.clientCapabilities.includes("workspace.extensions.manager.v1"));
       host.setExtensionOwnerReviewCapability(client.id, Array.isArray(params.clientCapabilities) && params.clientCapabilities.includes("workspace.extensions.owner-review.v1"));
       client.initialized = true;
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, capabilities: [capability, "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, capabilities: [capability, "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };

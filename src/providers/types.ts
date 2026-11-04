@@ -123,6 +123,8 @@ export interface ProviderRetryEvent {
   status?: number;
 }
 
+export interface AssistantPreviewDelta { nativeTurnId: string; itemId: string; text: string }
+
 export interface TurnArgs {
   system: string;
   /** Optional structured boundaries for cache-aware providers. `system` is always authoritative; a
@@ -131,6 +133,8 @@ export interface TurnArgs {
   history: NeutralMsg[];
   tools: ToolSpec[];
   onText: (delta: string) => void;
+  /** Draft-only local prose, separate from governed/canonical completion output. */
+  onAssistantPreview?: (value: AssistantPreviewDelta) => void;
   /** stream reasoning/thinking deltas (shown dimmed); optional, provider-dependent */
   onReasoning?: (delta: string) => void;
   /** ANY stream activity (a content/reasoning/tool-call chunk arrived) — resets the stall watchdog even

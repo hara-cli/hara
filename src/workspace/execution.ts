@@ -213,6 +213,7 @@ export function createWorkspaceRunPermit(input: {
         }
         args.onText?.(chunk);
       }),
+        onAssistantPreview: forward(args.onAssistantPreview),
         onReasoning: forward(args.onReasoning), onActivity: forward(args.onActivity), onRetry: forward((event: ProviderRetryEvent) => {
           state.audit.retry(auditIndex, event); args.onRetry?.(event);
         }) };

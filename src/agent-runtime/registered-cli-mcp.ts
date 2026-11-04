@@ -128,6 +128,7 @@ export function createRegisteredCliMcpTurn(input: {
   const pending = new Map<string, PendingCall>(), queue: PendingCall[] = [];
   let endpoint: WorkspaceMcpEndpoint | undefined, physical: Promise<void> | undefined;
   let tools: readonly ToolSpec[] = [], finished: TurnResult | undefined, wake: (() => void) | undefined;
+  let preview: TurnArgs["onAssistantPreview"];
   let activity: (() => void) | undefined, closed = false, ended = false;
   let closing: Promise<void> | undefined, deferredCompletion: PendingCall | undefined;
   const notify = () => { wake?.(); wake = undefined; };
@@ -151,7 +152,7 @@ export function createRegisteredCliMcpTurn(input: {
     async turn(args: TurnArgs): Promise<TurnResult> {
       input.assertCurrent();
       if (closed || args.signal?.aborted) return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
-      tools = args.tools; activity = args.onActivity; flush(args.history, args);
+      tools = args.tools; activity = args.onActivity; preview = args.onAssistantPreview; flush(args.history, args);
       if (!physical) {
         endpoint = await createWorkspaceMcpEndpoint({ signal: AbortSignal.any([input.signal, stopped.signal]), assertCurrent: input.assertCurrent,
           bearerToken: input.bearerToken,
@@ -179,7 +180,7 @@ export function createRegisteredCliMcpTurn(input: {
         }
         physical = (async () => {
           try {
-            const result = await input.launch(endpoint!, prompt, () => activity?.(), args);
+            const result = await input.launch(endpoint!, prompt, () => activity?.(), { ...args, onAssistantPreview: value => preview?.(value) });
             if (!result.ok) finished = { text: "", toolUses: [], stop: "error",
               errorMsg: result.runtimeFailure ?? "registered Runtime failed (" + (result.errorCode ?? (result.timedOut ? "timeout" : "exit")) + "); no fallback was selected" };
             else if (input.parseOutput) finished = input.parseOutput(result.stdout);

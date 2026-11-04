@@ -1,3 +1,4 @@
+import { createAssistantPreview } from "./assistant-preview.js";
 import { observeWorkspaceMessageTiming } from "../workspace/execution.js";
 import { runtimeErrorFirstLine } from "../security/runtime-error.js";
 import { classifyRuntimeFailure, type RuntimeFailureKind } from "./failure-diagnostics.js";
@@ -38,6 +39,8 @@ interface ActiveTurn {
   finish(ok: boolean, code?: string, kind?: RuntimeFailureKind, firstLine?: string): void; done: Promise<void>;
   activity(): void; assertCurrent(): void;
   text: string; settled: boolean;
+  rawTokenObserved?: boolean; visibleItems: Map<string, boolean>; previewItem?: string; preview?: ReturnType<typeof createAssistantPreview>;
+  previewOutput?: TurnArgs["onAssistantPreview"]; previewEnv: NodeJS.ProcessEnv;
   standingHash: string | null; compacted: boolean; partDigests: Map<string, string>;
 }
 const pools = new WeakMap<WorkspaceRuntimeInstaller, CodexSessionPool>();
@@ -162,20 +165,47 @@ export class GovernedCodexSession {
     }
     const active = this.active;
     if (!active || active.settled) return;
+    if (!["turn/completed", "thread/tokenUsage/updated", "item/started", "item/completed", "item/agentMessage/delta"].includes(method)) return;
     const turn = object(params.turn), turnId = method === "turn/completed" ? turn.id : params.turnId;
     void active.ready.then(expected => {
       if (!expected || expected !== turnId || this.client !== client || this.active !== active || active.settled) return;
       try {
-        active.assertCurrent(); active.activity();
-        if (method === "turn/completed") observeWorkspaceMessageTiming(this.permit, "T8", observedAt);
-        if (this.policy && (method === "item/started" || method === "item/completed")) observeWorkspaceNativeItem(this.permit, this.policy, object(params.item), method === "item/started" ? "started" : "completed");
-        if (method === "item/agentMessage/delta" && typeof params.delta === "string" && params.delta.length) {
+        active.activity();
+        if (method === "item/agentMessage/delta") {
+          if (!active.rawTokenObserved && typeof params.delta === "string" && params.delta.length) {
+            active.rawTokenObserved = true;
+            try { workspaceRunRuntimeStages(this.permit)?.mark("first_token", "native_event"); } catch { /* Optional diagnostic only. */ }
+          }
+          if (typeof params.delta !== "string" || !params.delta.length || params.itemId !== active.previewItem || active.visibleItems.get(String(params.itemId)) !== true) return;
           observeWorkspaceMessageTiming(this.permit, "T5", observedAt);
-          try { workspaceRunRuntimeStages(this.permit)?.mark("first_token", "native_event"); } catch { /* Diagnostic only. */ }
+          active.preview?.push(params.delta); return;
         }
+        active.assertCurrent();
+        if (method === "turn/completed") observeWorkspaceMessageTiming(this.permit, "T8", observedAt);
+        const previewItem = object(params.item);
+        if (method === "item/started" && previewItem.type === "agentMessage" && nativeId(previewItem.id)) {
+          if (active.visibleItems.size < 32) active.visibleItems.set(previewItem.id, ["partial_answer", "final_answer"].includes(String(previewItem.phase)));
+          if (!active.previewItem && active.visibleItems.get(previewItem.id)) {
+            active.previewItem = previewItem.id;
+            active.preview = createAssistantPreview({ source: active.previewEnv, emit: text => {
+              if (this.active === active && !active.settled && active.id && this.client === client)
+                active.previewOutput?.({ nativeTurnId: active.id, itemId: active.previewItem!, text });
+            } });
+          }
+        }
+        if (this.policy && (method === "item/started" || method === "item/completed")) observeWorkspaceNativeItem(this.permit, this.policy, object(params.item), method === "item/started" ? "started" : "completed");
         if (method === "item/completed" && object(params.item).type === "agentMessage") {
           const item = object(params.item);
           if (typeof item.text === "string") {
+            if (item.id === active.previewItem) active.preview?.finish();
+            else if (!active.previewItem && nativeId(item.id) && item.phase !== "commentary") {
+              // Legacy/unknown phase: wait for the complete, documented agent-message item.
+              active.previewItem = item.id;
+              active.preview = createAssistantPreview({ source: active.previewEnv, emit: text => {
+                if (this.active === active && !active.settled && active.id && this.client === client)
+                  active.previewOutput?.({ nativeTurnId: active.id, itemId: item.id as string, text });
+              } }); active.preview.push(item.text); active.preview.finish();
+            }
             active.text = item.text.slice(0, 200_000);
             if (item.text.length) try { workspaceRunRuntimeStages(this.permit)?.mark("first_output", "native_event"); } catch { /* Diagnostic only. */ }
           }
@@ -263,7 +293,7 @@ export class GovernedCodexSession {
     const terminal = new Promise<ExternalCommandCaptureResult>(resolve => {
       finish = (ok, code, kind, firstLine) => {
         if (active.settled) return;
-        active.settled = true;
+        active.settled = true; active.preview?.stop();
         resolve({ ok, code: ok ? 0 : 1, timedOut: false, ...(!ok ? { errorCode: code ?? "runtime_failed", ...(firstLine ? { errorFirstLine: runtimeErrorFirstLine(firstLine, env) } : {}), ...(kind ? { nativeFailureKind: kind } : {}) } : {}),
           stdout: ok ? JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: redactToolSubprocessOutput(active.text, env) } }) : "" });
         done();
@@ -271,6 +301,7 @@ export class GovernedCodexSession {
     });
     const active: ActiveTurn = { ready: new Promise(resolve => { bind = resolve; }), bind: id => bind(id), finish,
       done: new Promise(resolve => { done = resolve; }), activity: input.activity, assertCurrent: input.assertCurrent, text: "", settled: false,
+      visibleItems: new Map(), previewOutput: args.onAssistantPreview, previewEnv: env,
       standingHash, compacted: false, partDigests: new Map((args.systemParts?.length ? args.systemParts : [{ id: "system", digest: hash(args.system) }]).map(part => [part.id, part.digest])) };
     this.active = active;
     const interrupt = () => {
@@ -297,7 +328,7 @@ export class GovernedCodexSession {
           appServerArgs: launch.args,
           onSpawn: () => { try { endSpawn?.("completed"); } catch { /* Diagnostic only. */ } },
           onRequestSent: method => { if (method === "turn/start") observeWorkspaceMessageTiming(this.permit, "T4"); },
-        onNotification: (method, params) => this.notification(client, method, params),
+          onNotification: (method, params) => this.notification(client, method, params),
           onServerRequest: (_request, _reply, reject) => reject(-32601, "Use Hara Workspace tools and its governed approval channel"),
           onClose: error => { if (this.client === client) { this.client = undefined; this.loaded = false; this.unload?.(); this.active?.finish(false, "runtime_failed", error instanceof ExternalJsonlRpcTransportError ? error.runtimeFailureKind : undefined, error instanceof ExternalJsonlRpcTransportError ? error.errorFirstLine : undefined); } },
         });

@@ -1,3 +1,4 @@
+import { parseWorkspaceAssistantPreview, type WorkspaceAssistantPreview } from "./assistant-preview.js";
 import { MessageTimingRecorder, type MessageTimingIdentity, type MessageTimingInput, type MessageTimingReport } from "./message-timing.js";
 import { WorkspaceMessageTimingStore } from "./message-timing-store.js";
 import { WorkspaceMcpOwnerReview, type McpOwnerContext } from "./extension-owner-review.js";
@@ -103,13 +104,14 @@ type ApprovalSettleState = "declined" | "expired" | "aborted";
 type ApprovalDecision = { approved: true; draft: ColleagueCreateDraft | LocalWorkspaceApproval["draft"]; catalogRevision?: number } | { approved: false; state: ApprovalSettleState };
 interface PendingApproval { card: LocalWorkspaceApproval; clientId: string; selectionEpoch: number; job: LocalJob;
   finish(decision: ApprovalDecision): void; timer: ReturnType<typeof setTimeout> }
-interface MessageTimingEntry { recorder: MessageTimingRecorder; identity: MessageTimingIdentity; clientId: string; storage: WorkspaceResourceStorage; store: WorkspaceMessageTimingStore; endedAt?: number }
+interface MessageTimingEntry { selectionEpoch?: number; recorder: MessageTimingRecorder; identity: MessageTimingIdentity; clientId: string; storage: WorkspaceResourceStorage; store: WorkspaceMessageTimingStore; endedAt?: number }
 interface LocalJob {
   id: string; workspaceId: string; agentId: string; clientId: string;
   context: WorkspaceHostContext; store: WorkspaceConversationStore; value: WorkspaceConversation;
   lease: WorkspaceSessionLease; controller: AbortController; signal: AbortSignal; binding: Readonly<WorkspaceRunBinding>;
   permit?: WorkspaceRunPermit; options?: RunOpts; promise: Promise<void>; outcome?: RunOutcome; error?: string; closed: boolean;
   extensionAttempt?: WorkspaceMcpAttempt;
+  requestId?: string; selectionEpoch?: number; previewSeq?: number; previewText?: string;
   receipts?: WorkspaceContextReceipts;
   messageTiming?: MessageTimingRecorder;
   runtimeStages?: RuntimeStageRecorder; stageStore?: WorkspaceRuntimeStageStore; stageSavedAt?: number;
@@ -132,6 +134,7 @@ export class LocalWorkspaceHost {
   private readonly pending = new Map<string, PendingApproval>();
   private readonly extensionProposals = new Map<string, { clientId: string; workspaceId: string; generation: string; epoch: number; revision: number; expiresAt: number; change: ExtensionChange; catalogLock: string }>();
   private readonly extensionClients = new Set<string>();
+  private readonly previewClients = new Set<string>();
   private readonly ownerReviewClients = new Set<string>();
   private readonly mcpOwnerReview: WorkspaceMcpOwnerReview;
   private readonly clients = new Map<string, { workspaceId: string | null; agentId: string | null; channelId?: string; epoch: number }>();
@@ -175,6 +178,7 @@ export class LocalWorkspaceHost {
     /** Test/dev only: shorten agent_create confirmation card lifetime without changing run budget. */
     approvalTimeoutMs?: number;
     onChange?: (event: { workspaceId: string; agentId?: string }) => void;
+    onAssistantPreview?: (clientId: string, frame: WorkspaceAssistantPreview) => boolean;
     /** Trusted native/owner composition only; never supplied by an RPC or imported instructions. */
     legacyBusinessFactory?: (input: { storage: WorkspaceResourceStorage; features: WorkspaceFeatures; resources: WorkspaceLegacyResources }) => WorkspaceLegacyBusiness;
   } = {}) {
@@ -376,13 +380,14 @@ export class LocalWorkspaceHost {
     if (!selection || selection.workspaceId !== workspaceId || !this.context(workspaceId).resources.agents.get(agentId)) throw new Error("Agent selection belongs to another Workspace view");
     this.clients.set(clientId, { workspaceId, agentId, epoch: selection.epoch + 1 }); this.dismissApprovals(clientId);
   }
+  setAssistantPreviewCapability(clientId: string, supported: boolean): void { if (supported) this.previewClients.add(clientId); else this.previewClients.delete(clientId); }
   setExtensionClientCapability(clientId: string, supported: boolean): void {
     if (supported) this.extensionClients.add(clientId); else { this.extensionClients.delete(clientId); this.dismissApprovals(clientId); }
   }
   setExtensionOwnerReviewCapability(clientId: string, supported: boolean): void {
     if (supported) this.ownerReviewClients.add(clientId); else { this.ownerReviewClients.delete(clientId); this.mcpOwnerReview.dismiss(clientId); }
   }
-  disconnect(clientId: string): void { this.ownerReviewClients.delete(clientId); this.extensionClients.delete(clientId); this.dismissApprovals(clientId); this.clients.delete(clientId); if (this.updateLease?.clientId === clientId) this.updateLease = null; }
+  disconnect(clientId: string): void { this.previewClients.delete(clientId); this.ownerReviewClients.delete(clientId); this.extensionClients.delete(clientId); this.dismissApprovals(clientId); this.clients.delete(clientId); if (this.updateLease?.clientId === clientId) this.updateLease = null; }
   private localChannels(workspaceId: string) {
     const context = this.context(workspaceId);
     let rooms = this.channels.get(workspaceId);
@@ -816,7 +821,7 @@ export class LocalWorkspaceHost {
   recordMessagePaint(clientId: string, workspaceId: string, agentId: string, sessionId: string, runId: string, attemptId: string, timing: MessageTimingInput): { recorded: boolean } {
     const entry = this.messageTimingEntries.get(attemptId), selection = this.clients.get(clientId);
     if (!entry || entry.clientId !== clientId || entry.identity.workspaceId !== workspaceId || entry.identity.agentId !== agentId
-      || entry.identity.sessionId !== sessionId || entry.identity.runId !== runId || selection?.workspaceId !== workspaceId || selection.agentId !== agentId
+      || entry.identity.sessionId !== sessionId || entry.identity.runId !== runId || selection?.workspaceId !== workspaceId || selection.agentId !== agentId || selection.epoch !== entry.selectionEpoch
       || entry.endedAt !== undefined && performance.now() - entry.endedAt > 30_000) return { recorded: false };
     try { return entry.storage.run(() => {
       const recorded = entry.recorder.paint(timing);
@@ -1337,11 +1342,11 @@ export class LocalWorkspaceHost {
       job = { id: binding.runId, workspaceId, agentId, clientId, context, store, value, lease, controller, ...(channel ? { channelId: channel.id } : {}),
         signal: parent ? AbortSignal.any([controller.signal, parent.signal, ...(parentSignal ? [parentSignal] : [])]) : controller.signal, binding, promise: Promise.resolve(), closed: false };
       const owned = job, tree = new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget, binding.lineage.depth === 1);
-      owned.messageTiming = messageTiming;
+      owned.messageTiming = messageTiming; owned.requestId = requestId; owned.selectionEpoch = this.clients.get(clientId)?.epoch;
       try {
         const identity: MessageTimingIdentity = { workspaceId, resourceGeneration: context.storage.run(() => currentWorkspaceResourceBinding()!.generation),
           agentId, sessionId: store.sessionId, runId: binding.runId, attemptId: lease.attemptId, historyStart: modelHistoryStart };
-        this.messageTimingEntries.set(lease.attemptId, { recorder: messageTiming, identity, clientId, storage: context.storage,
+        this.messageTimingEntries.set(lease.attemptId, { recorder: messageTiming, identity, clientId, selectionEpoch: owned.selectionEpoch, storage: context.storage,
           store: new WorkspaceMessageTimingStore(context.storage, store.sessionId, agentId) });
         while (this.messageTimingEntries.size > 32) this.messageTimingEntries.delete(this.messageTimingEntries.keys().next().value!);
       } catch { /* Timing never changes admission. */ }
@@ -1397,6 +1402,20 @@ export class LocalWorkspaceHost {
           if (decision.approved) approveWorkspaceExtension(offer.workspaceExtension, owned.binding.runId);
           return decision.approved;
         }, quiet: true, hooks: false, extraTools: tools,
+        onAssistantPreview: value => {
+          const selected = this.clients.get(clientId), timing = this.messageTimingEntries.get(owned.lease.attemptId);
+          if (owned.signal.aborted || owned.closed || parent || channel || origin.source !== "ui" || origin.channel !== "rpc"
+            || owned.binding.budget.mode !== "interactive" || !this.previewClients.has(clientId) || !timing || !selected
+            || selected.workspaceId !== workspaceId || selected.agentId !== agentId || selected.epoch !== owned.selectionEpoch
+            || !(owned.value.task?.brief?.intent === "answer" || /^(?:你好|您好|嗨|hello|hi|hey)[！!。.,，?？\s]*$/iu.test(task.objective.trim()))
+            || owned.previewText && !value.text.startsWith(owned.previewText)) return;
+          const frame = parseWorkspaceAssistantPreview({ schemaVersion: 1, ...timing.identity, requestId, nativeTurnId: value.nativeTurnId, itemId: value.itemId, text: value.text,
+            seq: (owned.previewSeq ?? 0) + 1, draft: true, evidenceVerified: false });
+          if (!frame) return;
+          try { if (this.options.onAssistantPreview?.(clientId, frame)) {
+            owned.previewSeq = frame.seq; owned.previewText = frame.text; owned.messageTiming?.mark("T6");
+          } } catch { /* An optional disconnected view cannot change the run. */ }
+        },
         finishOnConfirmedColleagueCreate: createColleagueRequest,
         systemOverride: `You are ${configuration.identity.displayName}, a clearly identified Hara AI colleague. ${instructions}\nUse only this Workspace's supplied tools. Never claim completion without observed evidence.\n` + shared
           + `Reply naturally in the user's language. Call AI coworkers 同事, not Pi 同事; pi is only an internal runtime. A greeting needs no tools.\n`

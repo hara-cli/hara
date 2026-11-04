@@ -35,6 +35,8 @@ export async function cliMcpFixture(t, mode = "list", settings = {}) {
       run: async (_command, args) => args[0] === "-lic" ? null : "codex 1.2.3" } } };
   let handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port: 0 }, serveOptions);
   let socket = new WebSocket("ws://127.0.0.1:" + handle.port); await once(socket, "open");
+  const previews = [];
+  socket.on("message", raw => { const value = JSON.parse(String(raw)); if (value.method === "workspace.assistant.preview") previews.push(value.params); });
   let serial = 0;
   const request = (method, params = {}) => new Promise((resolve, reject) => {
     const id = ++serial, timeout = setTimeout(() => { socket.off("message", receive); reject(new Error("bounded fixture RPC wait: " + method)); }, 10000);
@@ -46,7 +48,7 @@ export async function cliMcpFixture(t, mode = "list", settings = {}) {
     socket.on("message", receive); socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
   });
   t.after(async () => { socket.terminate(); await handle.close(); fs.rmSync(root, { recursive: true, force: true }); });
-  const init = await request("initialize", { token: handle.token });
+  const init = await request("initialize", { token: handle.token, ...(settings.previewOptIn ? { clientCapabilities: ["workspace.assistant-preview.v1"] } : {}) });
   const workspace = await request("workspace.create", { label: "MCP fixture", expectedRevision: init.workspace.revision });
   const scope = { workspaceId: workspace.workspaceId, expectedGeneration: workspace.resourceGeneration };
   await request("workspace.connection.add", { ...scope, input: { ...SYNTHETIC_CONNECTION }, expectedRevision: 0 });
@@ -59,7 +61,7 @@ export async function cliMcpFixture(t, mode = "list", settings = {}) {
   await request("workspace.agents.setRuntime", { ...scope, agentId: main.agentId, runtimeId: "codex", configRevision: main.configRevision, agentEpoch: main.agentEpoch });
   const read = () => request("workspace.snapshot", { workspaceId: scope.workspaceId, agentId: main.agentId });
   const meta = () => fs.existsSync(command + ".meta.json") ? JSON.parse(fs.readFileSync(command + ".meta.json")) : null;
-  return { root, account, workspaceRoot, project: join(workspaceRoot, "project", scope.workspaceId), command, scope, main, request, read, meta,
+  return { root, account, workspaceRoot, previews, project: join(workspaceRoot, "project", scope.workspaceId), command, scope, main, request, read, meta,
     native: () => fs.readFileSync(command + ".rpc.jsonl", "utf8").trim().split("\n").map(line => JSON.parse(line)),
     async restart() {
       socket.terminate(); await handle.close();

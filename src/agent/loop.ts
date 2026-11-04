@@ -761,6 +761,7 @@ export interface RunOpts {
   /** Credential-free transport retry telemetry. Persistent hosts may journal/log this without request
    * bodies, prompts, URLs, or authorization material. */
   onProviderRetry?: (event: ProviderRetryEvent) => void;
+  onAssistantPreview?: TurnArgs["onAssistantPreview"];
   /** Content-free lifecycle events for deterministic host replay. No prompt, reasoning, tool input/result,
    * path, diff body, endpoint, provider error text, or credential is included. */
   onRuntimeItem?: (event: RunRuntimeItemEvent) => void;
@@ -2262,6 +2263,7 @@ async function runAgentInner(
         else if (hasPendingToolMedia) deferredMediaProse += visible;
         else emitVisibleText(visible);
       },
+      onAssistantPreview: opts.onAssistantPreview,
       onReasoning: () => {
         if (attempt.signal.aborted) return;
         observableProviderActivity = true;
