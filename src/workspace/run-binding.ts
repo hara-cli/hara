@@ -25,7 +25,8 @@ export interface WorkspaceRunBinding {
  * rounds: 12 x 8k input + 12 x 2k output = 120k, with 8k headroom. This is a sizing example,
  * not a token-price estimate or a guarantee that every task reaches twelve rounds. Retain raw usage.
  * The possible token ceiling is 4x the former 32k; actual spend depends on measured use and rates.
- * Only new ordinary tasks use this default. Existing bindings and acceptance slices stay frozen. */
+ * New budgeted background/external tasks use this default. Interactive chats use a recoverable fuse;
+ * existing bindings and acceptance slices stay frozen. */
 export const DEFAULT_WORKSPACE_RUN_BUDGET: Readonly<WorkspaceRunBinding["budget"]> = Object.freeze({
   maxRounds: 12, maxToolCalls: 32, maxTokens: 128_000, timeoutMs: 120_000,
 });

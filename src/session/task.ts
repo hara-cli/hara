@@ -867,9 +867,9 @@ export function continueTaskExecution(
   }
   const now = iso(at);
   const budget = taskRoundBudget(task);
-  const roundBudgetLimit = budget.used >= budget.limit
-    ? nextTaskRoundBudgetLimit(budget.limit)
-    : budget.limit;
+  const roundBudgetLimit = task.workspaceRunBinding?.budget.mode === "interactive"
+    ? Math.max(budget.limit, Math.ceil((budget.used + 1) / DEFAULT_TASK_ROUND_BUDGET) * DEFAULT_TASK_ROUND_BUDGET)
+    : budget.used >= budget.limit ? nextTaskRoundBudgetLimit(budget.limit) : budget.limit;
   const { progress: _previousProgress, ...taskWithoutProgress } = task;
   return {
     ok: true,

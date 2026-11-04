@@ -93,7 +93,7 @@ test("a read-only answer that attempts a later write returns to the full intent 
 });
 
 test("the engine allowlist excludes state-changing tools despite read-like classifications", () => {
-  assert.deepEqual([...READONLY_ANSWER_TOOLS].sort(), ["agent_list", "channel_sync", "workspace_context_lookup",
+  assert.deepEqual([...READONLY_ANSWER_TOOLS].sort(), ["agent_get", "agent_list", "channel_sync", "workspace_context_lookup",
     "workspace_memory_search", "workspace_read", "workspace_receipt_read", "workspace_skill", "workspace_verify"].sort());
   assert.equal(readOnlyAnswerObjective("列出同事"), true);
   assert.equal(readOnlyAnswerObjective("创建同事并列出同事"), false);
@@ -156,4 +156,15 @@ test("working read receipts cannot verify a placeholder-only reply; a numeric fa
   for (const answer of ["", "***", "*** ***", "..."]) assert.equal(
     trace.evidence(task, false, false, false, { answer, noTools: false }), null);
   assert.equal(trace.evidence(task, false, false, false, { answer: "0", noTools: false }).length, 1);
+});
+
+
+test("complete 12k receipt pages resolve read-only references without granting compacted summaries evidence", () => {
+  const id = "d".repeat(64), trace = new ReadOnlyAnswerTrace(), task = { status: "running", objective: "列出同事", brief: { intent: "answer" }, decisions: [] };
+  trace.observeModelView(`receipt-${id}.json`, []);
+  trace.observe("agent_get", "profile", "read", { id: "profile", name: "agent_get", content: "{}" }, false);
+  const page = { file: `receipt-${id}.json`, offset: 0, nextOffset: null, totalChars: 12000, content: "x".repeat(12000) };
+  trace.observe("workspace_receipt_read", "page", "state", { id: "page", name: "workspace_receipt_read", content: JSON.stringify(page) }, false);
+  assert.equal(trace.evidence(task, false, false, false).length, 2);
+  trace.observeModelView("<workspace-compact-summary>reference only", []); assert.equal(trace.evidence(task, false, false, false), null);
 });

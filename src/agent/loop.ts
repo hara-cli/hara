@@ -1796,7 +1796,7 @@ async function runAgentInner(
   // The engine owns this ledger rather than trusting reminder prose. It retains only digests/shingles and
   // credential-free counters, while treating same-evidence checkpoints/todo rewrites as no progress.
   const progressWatchdog = new AgentProgressWatchdog({
-    unattended: unattendedRun,
+    unattended: life.interactiveWorkspace ? false : unattendedRun, interactive: life.interactiveWorkspace,
     task: intakeTask,
     todos: currentTodos(ctx.todoScope),
     usage: opts.stats,

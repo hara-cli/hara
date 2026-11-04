@@ -42,17 +42,20 @@ test("twenty colleagues with long public bios fit a compact directory and reach 
 });
 
 test("interactive chat passes twelve rounds and aggregate token/tool sizing without budget cards; raw usage and compaction remain", async t => {
-  const a = hostFixture(t, n => n <= 14 ? { ...tools(...[1, 2, 3].map(part => ["workspace_read", { path: `report-${n}-${part}.txt` }])), usage: { input: 12000, output: 20 } }
-    : { text: "The fourteen reports were read.", toolUses: [], stop: "end" });
+  const a = hostFixture(t, (n, args) => n <= 14 ? { ...tools(...[1, 2, 3].map(part => ["workspace_read", { path: `report-${n}-${part}.txt` }])), usage: { input: 20000, output: 20 } }
+    : n === 15 ? tools(["task_checkpoint", { completion: { state: "verified", final_answer: "The forty-two reports were read.", checks: [{ acceptance_index: 0,
+      evidence: "All numbered reports were read; the final three observations confirm the last batch.",
+      tool_call_ids: args.history.filter(message => message.role === "tool").flatMap(message => message.results).filter(result => result.name.endsWith("workspace_read")).slice(-3).map(result => result.id) }] } }])
+    : { text: "The forty-two reports were read.", toolUses: [], stop: "end" });
   const project = a.host.context(a.workspace.workspaceId).project;
   for (let n = 1; n <= 14; n++) for (const part of [1, 2, 3]) fs.writeFileSync(join(project, `report-${n}-${part}.txt`),
     `Report ${n}: ${Array.from({ length: 100 }, () => randomBytes(5).toString("hex")).join(" ")}`);
   const run = start(a, "What do the numbered reports say?"); await a.host.wait(run.runId);
-  assert.equal(a.turns.length, 15, snapshot(a).conversation.blockReason); assert.equal(snapshot(a).conversation.pendingQuestion, null);
-  assert.equal(snapshot(a).conversation.runUsage.toolCalls, 42);
-  assert.equal(snapshot(a).conversation.runUsage.modelCalls, 15); assert.ok(snapshot(a).conversation.runUsage.inputTokens > 128000);
+  assert.ok(a.turns.length >= 15 && a.turns.length <= 16, snapshot(a).conversation.blockReason); assert.equal(snapshot(a).conversation.pendingQuestion, null);
+  assert.equal(snapshot(a).conversation.runUsage.toolCalls, 43);
+  assert.equal(snapshot(a).conversation.runUsage.modelCalls, a.turns.length); assert.ok(snapshot(a).conversation.runUsage.inputTokens > 128000);
   assert.equal(snapshot(a).conversation.state, "completed", snapshot(a).conversation.blockReason);
-  assert.equal(store(a).read().task.roundsUsed, 15);
+  assert.equal(store(a).read().task.roundsUsed, a.turns.length);
 });
 
 for (const source of ["host", "delegation", "cli", "legacy_rpc", "automatic_retry"]) test(`${source} requests keep the original budget`, async t => {

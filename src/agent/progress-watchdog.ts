@@ -215,6 +215,7 @@ function nonNegative(value: unknown): number {
 /** Engine-owned rolling progress ledger. It retains no raw arguments, output, prompts, paths, or secrets. */
 export class AgentProgressWatchdog {
   private readonly unattended: boolean;
+  private readonly interactive: boolean;
   private readonly baselineUsage: ProgressUsage;
   private readonly observations: StoredObservation[] = [];
   private readonly callStreaks = new Map<string, CallStreak>();
@@ -230,11 +231,13 @@ export class AgentProgressWatchdog {
 
   constructor(options: {
     unattended: boolean;
+    interactive?: boolean;
     task?: TaskExecution;
     todos?: readonly Todo[];
     usage?: ProgressUsage;
   }) {
     this.unattended = options.unattended;
+    this.interactive = options.interactive === true;
     this.knownCheckpointEvidence = checkpointEvidence(options.task);
     this.knownCompletedTodos = completedTodoEvidence(options.todos ?? []);
     this.baselineUsage = {
@@ -345,7 +348,7 @@ export class AgentProgressWatchdog {
     } else if (this.similarEvidenceRounds >= SIMILAR_EVIDENCE_STOP_ROUNDS) {
       trigger = "similar_tool_evidence";
     } else if (
-      totalTokens >= UNATTENDED_NO_PROGRESS_TOKEN_LIMIT
+      !this.interactive && totalTokens >= UNATTENDED_NO_PROGRESS_TOKEN_LIMIT
       && this.checkpointStaleRounds >= TOKEN_BUDGET_STALE_ROUNDS
     ) {
       trigger = "unattended_token_budget";
@@ -365,7 +368,7 @@ export class AgentProgressWatchdog {
       || ((this.unattended || total > done)
         && this.unattendedRounds >= UNATTENDED_PROGRESS_NUDGE_ROUNDS
         && this.checkpointStaleRounds >= UNATTENDED_PROGRESS_NUDGE_ROUNDS)
-      || (totalTokens >= Math.floor(UNATTENDED_NO_PROGRESS_TOKEN_LIMIT * 0.8)
+      || (!this.interactive && totalTokens >= Math.floor(UNATTENDED_NO_PROGRESS_TOKEN_LIMIT * 0.8)
         && this.checkpointStaleRounds >= 2);
     const state: ProgressState = {
       state: trigger ? "stopped" : warn ? "warning" : "working",
