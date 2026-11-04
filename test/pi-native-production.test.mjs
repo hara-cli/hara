@@ -393,7 +393,7 @@ test("interactive native Pi gateway has no aggregate call/token/tool cap, retain
   await new Promise(resolve => setTimeout(resolve, 550));
   for (let n = 0; n < 3; n++) assert.equal((await call(b, { body: body([{ name: "read" }]) })).status, 200);
   assert.equal(b.host.metrics.providerRounds, 3); assert.equal(b.host.metrics.toolCalls, 3); assert.ok(b.host.metrics.totalTokens > 1);
-  controller.abort(); assert.notEqual((await call(b)).status, 200);
+  controller.abort(); await assert.rejects(call(b)); assert.equal(b.host.metrics.providerRounds, 3);
   const timeoutController = new AbortController(); let providerSignal;
   const hung = await bridge(t, { signal: timeoutController.signal, budget: { ...budget, mode: "interactive", timeoutMs: 100 },
     provider: { id: "frozen", model: "frozen", turn({ signal }) { providerSignal = signal; return new Promise(resolve => signal.addEventListener("abort", () => resolve({ ...reply("cancelled"), stop: "error" }), { once: true })); } } });
