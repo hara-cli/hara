@@ -220,7 +220,8 @@ test("verification card binds the real receipt reader to run-local, paged refere
   const receipts = new WorkspaceContextReceipts(storage, randomUUID(), "ag_fixture", () => {}), tool = receipts.tool();
   const file = receipts.retain({ id: "original", name: "fixture", content: "a".repeat(2200) }), id = file.slice(8, -5);
   const result = JSON.parse(await tool.run({ id, offset: 0 }, {}));
-  assert.equal(result.referenceOnly, true); assert.equal(result.nextOffset, 1000);
+  assert.equal(result.referenceOnly, true); assert.equal(result.nextOffset, null);
+  assert.equal(JSON.parse(result.content).content, "a".repeat(2200));
   await assert.rejects(tool.run({ id: "../state", offset: 0 }, {}), /invalid Workspace receipt id/);
   const other = new WorkspaceContextReceipts(storage, randomUUID(), "ag_fixture", () => {});
   await assert.rejects(other.tool().run({ id, offset: 0 }, {}), /ownership or content changed/);
