@@ -90,5 +90,6 @@ test("a question-card answer that sounds like a new creation stays in its origin
   assert.equal(after.runUsage.modelCalls, before.runUsage.modelCalls + 1);
   assert.equal(after.pastTasks.length, 0);
   assert.equal(f.host.snapshot(w.workspaceId).conversation.pendingQuestion, null);
-  assert.doesNotMatch(f.turns.at(-1).system, /FIRST model response.*agent_create/);
+  assert.equal(f.turns.at(-1).system.includes(workspaceOperationSkill().files["cards/create-colleague.md"]), false,
+    "an answer stays in its prior objective and does not preload a new-creation card");
 });
