@@ -1,3 +1,4 @@
+import { observeWorkspaceMessageTiming } from "../workspace/execution.js";
 import { runtimeErrorFirstLine } from "../security/runtime-error.js";
 import { classifyRuntimeFailure, type RuntimeFailureKind } from "./failure-diagnostics.js";
 import { createRuntimeExecutionPolicy, type RuntimeExecutionPolicy } from "./execution-policy.js";
@@ -149,6 +150,7 @@ export class GovernedCodexSession {
   private save(): void { this.value = this.state.update(this.value.revision, () => this.value); }
   private notification(client: JsonlRpcClient, method: string, params: Record<string, unknown>): void {
     if (this.client !== client || params.threadId !== this.value.threadId) return;
+    const observedAt = performance.now();
     if (method === "thread/closed") { this.loaded = false; this.unload?.(); return; }
     if (method === "thread/compacted") {
       // The native model may have forgotten earlier instructions; no previous seen hash survives.
@@ -165,8 +167,10 @@ export class GovernedCodexSession {
       if (!expected || expected !== turnId || this.client !== client || this.active !== active || active.settled) return;
       try {
         active.assertCurrent(); active.activity();
+        if (method === "turn/completed") observeWorkspaceMessageTiming(this.permit, "T8", observedAt);
         if (this.policy && (method === "item/started" || method === "item/completed")) observeWorkspaceNativeItem(this.permit, this.policy, object(params.item), method === "item/started" ? "started" : "completed");
         if (method === "item/agentMessage/delta" && typeof params.delta === "string" && params.delta.length) {
+          observeWorkspaceMessageTiming(this.permit, "T5", observedAt);
           try { workspaceRunRuntimeStages(this.permit)?.mark("first_token", "native_event"); } catch { /* Diagnostic only. */ }
         }
         if (method === "item/completed" && object(params.item).type === "agentMessage") {
@@ -292,7 +296,8 @@ export class GovernedCodexSession {
         const client = JsonlRpcClient.start({ ...launch, captureErrorFirstLine: true, timeoutMs: 10_000, maxOutputBytes: 64 * 1024 * 1024,
           appServerArgs: launch.args,
           onSpawn: () => { try { endSpawn?.("completed"); } catch { /* Diagnostic only. */ } },
-          onNotification: (method, params) => this.notification(client, method, params),
+          onRequestSent: method => { if (method === "turn/start") observeWorkspaceMessageTiming(this.permit, "T4"); },
+        onNotification: (method, params) => this.notification(client, method, params),
           onServerRequest: (_request, _reply, reject) => reject(-32601, "Use Hara Workspace tools and its governed approval channel"),
           onClose: error => { if (this.client === client) { this.client = undefined; this.loaded = false; this.unload?.(); this.active?.finish(false, "runtime_failed", error instanceof ExternalJsonlRpcTransportError ? error.runtimeFailureKind : undefined, error instanceof ExternalJsonlRpcTransportError ? error.errorFirstLine : undefined); } },
         });
@@ -335,7 +340,6 @@ export class GovernedCodexSession {
       this.value.threadId = thread.id; this.loaded = true;
       if (!resumed || this.value.contextGeneration === null) this.value.contextGeneration = randomUUID();
       this.value.phase = "unknown"; this.save(); // Write ahead of an accepted or outcome-unknown turn.
-      input.assertCurrent(); if (input.signal.aborted) throw new Error("interrupted");
       const refresh = resumed && this.value.standingPromptHash !== standingHash;
       const currentPrompt = [
         ...(refresh ? [`<system-reminder>Current Hara standing governance context for this resumed thread:\n${standing}\n</system-reminder>`] : []),
@@ -343,6 +347,8 @@ export class GovernedCodexSession {
         prompt,
       ].join("\n\n");
       if (Buffer.byteLength(currentPrompt) > 400_000) throw new Error("Codex native prompt context is too large");
+      input.assertCurrent(); if (input.signal.aborted) throw new Error("interrupted");
+      observeWorkspaceMessageTiming(this.permit, "T3");
       const started = await client.call<Record<string, unknown>>("turn/start", { threadId: thread.id,
         input: [{ type: "text", text: currentPrompt, text_elements: [] }], cwd: input.cwd, approvalPolicy: "never", approvalsReviewer: "user",
         ...(input.model ? { model: input.model } : {}), ...(input.effort ? { effort: input.effort } : {}) });

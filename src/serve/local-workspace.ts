@@ -1,3 +1,4 @@
+import { parseMessageTimingInput } from "../workspace/message-timing.js";
 import type { WorkspaceMcpLaunchProvider } from "../workspace/extension-candidate.js";
 import type { ReviewedMcpSource } from "../workspace/extension-review.js";
 import { isRuntimePermissionTier } from "../agent-runtime/execution-policy.js";
@@ -54,7 +55,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
   try { writePrivateStateFileSync(receiptFile, JSON.stringify(receipt) + "\n", { expectedMissing: true }); }
   catch (error) { wss.close(); await host.close(); throw error; }
   const ownedReceipt = readPrivateStateFileSnapshotSync(receiptFile.path, 4096)!;
-  const dispatch = async (client: { id: string; initialized: boolean }, method: string, params: unknown, rpcId: string | number): Promise<unknown> => {
+  const dispatch = async (client: { id: string; initialized: boolean }, method: string, params: unknown, rpcId: string | number, receivedAt: number): Promise<unknown> => {
     if (!plain(params)) throw new Error("invalid Workspace RPC parameters");
     if (method === "initialize") {
       if (!tokenMatches(params.token, token)) throw new Error("unauthorized");
@@ -66,10 +67,11 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, capabilities: [capability, "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, capabilities: [capability, "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
+    if (method === "workspace.message-timing.clock") { fields([]); return { hostAtMs: performance.now() }; }
     if (method === "workspace.list") { fields([]); return host.list(); }
     if (method === "workspace.create") { fields(["label", "expectedRevision"]); if (!text(params.label, 80) || !positive(params.expectedRevision)) throw new Error("invalid Workspace creation"); return host.createWorkspace(params.label, params.expectedRevision); }
     if (method === "workspace.preferences.get") { fields([]); return host.getPreferences(); }
@@ -82,6 +84,12 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (method === "workspace.select" || method === "workspace.settings.select") { fields(["workspaceId", "expectedRevision"]); if (!positive(params.expectedRevision)) throw new Error("invalid Workspace selection"); host.select(client.id, workspaceId, params.expectedRevision, method === "workspace.settings.select"); return host.snapshot(workspaceId, undefined, client.id); }
     if (method === "workspace.snapshot") { fields(["workspaceId", "agentId"]); if (params.agentId !== null && !text(params.agentId)) throw new Error("invalid Agent selection"); return host.snapshot(workspaceId, typeof params.agentId === "string" ? params.agentId : undefined, client.id); }
     host.assertGeneration(workspaceId, params.expectedGeneration);
+    if (method === "workspace.session.paint") {
+      fields(["workspaceId", "expectedGeneration", "agentId", "sessionId", "runId", "attemptId", "timing"]);
+      const timing = parseMessageTimingInput(params.timing);
+      if (!text(params.agentId) || ![params.sessionId, params.runId, params.attemptId].every(value => typeof value === "string" && UUID.test(value)) || !timing) throw new Error("Invalid message paint metadata");
+      return host.recordMessagePaint(client.id, workspaceId, params.agentId, params.sessionId as string, params.runId as string, params.attemptId as string, timing);
+    }
     if (method === "workspace.runtime.diagnostics.export") {
       fields(["workspaceId", "expectedGeneration", "agentId", "sessionId", "runId", "attemptId"]);
       if (!text(params.agentId) || ![params.sessionId, params.runId, params.attemptId].every(value => typeof value === "string" && UUID.test(value)))
@@ -243,18 +251,22 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (method === "workspace.connection.revoke") { fields(["workspaceId", "expectedGeneration", "connectionId", "expectedRevision"]); if (!text(params.connectionId)) throw new Error("invalid connection"); host.revokeConnection(workspaceId, params.connectionId, params.expectedRevision as number); return { revoked: true }; }
     if (method === "workspace.approval.respond") { fields(["workspaceId", "expectedGeneration", "approvalId", "approved", ...(Object.hasOwn(params, "draft") ? ["draft"] : [])]); if (!text(params.approvalId) || typeof params.approved !== "boolean") throw new Error("invalid approval"); host.answerApproval(client.id, workspaceId, params.approvalId, params.approved, params.draft); return { accepted: true }; }
     if (method === "workspace.session.answer") {
-      fields(["workspaceId", "expectedGeneration", "agentId", "message", "requestId", "questionId"]);
+      const clientTiming = Object.hasOwn(params, "timing") ? parseMessageTimingInput(params.timing) : undefined;
+      if (clientTiming === null) throw new Error("Invalid message timing metadata");
+      fields(["workspaceId", "expectedGeneration", "agentId", "message", "requestId", "questionId", ...(Object.hasOwn(params, "timing") ? ["timing"] : [])]);
       if (!text(params.agentId) || !messageBody(params.message) || typeof params.requestId !== "string" || !UUID.test(params.requestId)
         || typeof params.questionId !== "string" || !UUID.test(params.questionId)) throw new Error("invalid Workspace user answer");
       return host.start(client.id, workspaceId, params.agentId, params.message, params.requestId, true, undefined, undefined,
-        { source: "ui", channel: "rpc", clientId: client.id, rpcIdHash: createHash("sha256").update(JSON.stringify(rpcId)).digest("hex") }, undefined, params.questionId);
+        { source: "ui", channel: "rpc", clientId: client.id, rpcIdHash: createHash("sha256").update(JSON.stringify(rpcId)).digest("hex") }, undefined, params.questionId, undefined, { receivedAt, client: clientTiming });
     }
     if (method === "workspace.session.send" || method === "workspace.session.resume") {
-      fields(["workspaceId", "expectedGeneration", "agentId", "message", "requestId", ...(Object.hasOwn(params, "source") ? ["source"] : [])]);
+      const clientTiming = Object.hasOwn(params, "timing") ? parseMessageTimingInput(params.timing) : undefined;
+      if (clientTiming === null) throw new Error("Invalid message timing metadata");
+      fields(["workspaceId", "expectedGeneration", "agentId", "message", "requestId", ...(Object.hasOwn(params, "source") ? ["source"] : []), ...(Object.hasOwn(params, "timing") ? ["timing"] : [])]);
       if (!text(params.agentId) || !messageBody(params.message) || typeof params.requestId !== "string" || !UUID.test(params.requestId)) throw new Error("invalid Workspace message");
       if (params.source !== undefined && (!workspaceRequestSource(params.source) || !["ui", "cli", "automatic_retry"].includes(params.source))) throw new Error("invalid Workspace request source");
       return host.start(client.id, workspaceId, params.agentId, params.message, params.requestId, method.endsWith(".resume"), undefined, undefined,
-        { source: params.source ?? "legacy_rpc", channel: "rpc", clientId: client.id, rpcIdHash: createHash("sha256").update(JSON.stringify(rpcId)).digest("hex") });
+        { source: params.source ?? "legacy_rpc", channel: "rpc", clientId: client.id, rpcIdHash: createHash("sha256").update(JSON.stringify(rpcId)).digest("hex") }, undefined, undefined, undefined, { receivedAt, client: clientTiming });
     }
     if (method === "workspace.session.receipt") {
       fields(["workspaceId", "expectedGeneration", "agentId", "requestId"]);
@@ -276,13 +288,14 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     ws.on("error", () => {});
     ws.on("close", () => { host.disconnect(client.id); clients.delete(ws); });
     ws.on("message", raw => {
+      const receivedAt = performance.now();
       void (async () => {
         let id: string | number | null = null;
         try {
           const request: unknown = JSON.parse(raw.toString());
           if (closing || !plain(request) || !exact(request, ["jsonrpc", "id", "method", "params"]) || request.jsonrpc !== "2.0"
             || (typeof request.id !== "string" && typeof request.id !== "number") || !text(request.method, 100)) throw new Error("invalid Workspace RPC request");
-          id = request.id; const result = await dispatch(client, request.method, request.params, request.id);
+          id = request.id; const result = await dispatch(client, request.method, request.params, request.id, receivedAt);
           if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: "2.0", id, result }));
         } catch (error) {
           const message = error instanceof Error ? error.message : "Workspace request failed";

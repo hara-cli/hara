@@ -1,3 +1,4 @@
+import type { MessageTimingPoint, MessageTimingRecorder } from "./message-timing.js";
 import { decorateWorkspaceExtensionTool, isWorkspaceExtensionTool } from "./extension-binding.js";
 import type { CompletionEvidenceLedger } from "../agent/completion-evidence.js";
 import { createWorkspaceCompletionEvidence } from "./completion-evidence-store.js";
@@ -58,6 +59,7 @@ interface PermitState {
   wakeChars: number;
   audit: WorkspaceExecutionAudit;
   runtimeStages?: RuntimeStageRecorder;
+  messageTiming?: MessageTimingRecorder;
   firstStageToken: boolean;
   onRuntimeStageChanged?: () => void;
   interaction?: WorkspaceUserInteraction;
@@ -123,6 +125,7 @@ export function createWorkspaceRunPermit(input: {
   observeContext?(value: WorkspaceContextObservation): void;
   /** Host-created diagnostic recorder, never accepted from model/RPC data. */
   runtimeStages?: RuntimeStageRecorder;
+  messageTiming?: MessageTimingRecorder;
   onRuntimeStageChanged?(): void;
   onNativeRisks?(risks: readonly RuntimeRiskEvent[]): void;
   interaction?: WorkspaceUserInteraction;
@@ -238,7 +241,7 @@ export function createWorkspaceRunPermit(input: {
     updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false, wakeChars: 0,
     interaction: input.interaction, onQuestion: input.onQuestion, onInteractionChanged: input.onInteractionChanged, interactionUsage: input.interactionUsage, startedAt: started, toolTail: Promise.resolve(),
     audit: new WorkspaceExecutionAudit(input.storage, binding.runId, binding.agent.agentId),
-    runtimeStages: input.runtimeStages, firstStageToken: false, onRuntimeStageChanged: input.onRuntimeStageChanged,
+    runtimeStages: input.runtimeStages, messageTiming: input.messageTiming, firstStageToken: false, onRuntimeStageChanged: input.onRuntimeStageChanged,
     ...(input.modelHistory ? { modelHistory: { ...input.modelHistory,
       prefixDigest: createHash("sha256").update(canonical(input.modelHistory.history.slice(0, input.modelHistory.start))).digest("hex") } } : {}) };
   for (const value of Object.values(state.usage)) if (!Number.isSafeInteger(value) || value < 0) throw new Error("invalid Workspace persisted usage");
@@ -434,6 +437,12 @@ export async function closeWorkspaceRunPermit(permit: WorkspaceRunPermit): Promi
     state.lease.setDraining(false);
   }
   state.lease.release();
+}
+
+/** Observation only. Callers retain the original live checks at protected boundaries. */
+export function observeWorkspaceMessageTiming(permit: WorkspaceRunPermit, point: Exclude<MessageTimingPoint, "T0" | "T1" | "T7">, at?: number): void {
+  const state = stateOf(permit);
+  if (!state.retired && !state.signal.aborted) try { state.messageTiming?.mark(point, at); } catch { /* Optional diagnostics. */ }
 }
 
 /** Diagnostics never confer execution authority or make an observer failure a task failure. */

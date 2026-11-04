@@ -567,6 +567,8 @@ export class ExternalJsonlRpcTransportError extends Error {
 }
 
 export interface JsonlRpcClientOptions extends ExternalCommandOptions {
+  /** Payload-free diagnostic hook after a request is written to the owned transport. */
+  onRequestSent?: (method: string) => void;
   captureErrorFirstLine?: boolean;
   cwd?: string;
   signal?: AbortSignal;
@@ -792,6 +794,7 @@ export class JsonlRpcClient {
       });
       try {
         this.write({ id, method, params });
+        try { this.options.onRequestSent?.(method); } catch { /* Diagnostics never change delivery. */ }
       } catch (error) {
         clearTimeout(timer);
         this.pending.delete(id);

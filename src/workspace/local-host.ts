@@ -1,3 +1,5 @@
+import { MessageTimingRecorder, type MessageTimingIdentity, type MessageTimingInput, type MessageTimingReport } from "./message-timing.js";
+import { WorkspaceMessageTimingStore } from "./message-timing-store.js";
 import { WorkspaceMcpOwnerReview, type McpOwnerContext } from "./extension-owner-review.js";
 import { McpOwnerReviewError } from "./extension-review-store.js";
 import { readHostWorkspaceMcpLaunch, type WorkspaceMcpLaunchProvider } from "./extension-candidate.js";
@@ -101,6 +103,7 @@ type ApprovalSettleState = "declined" | "expired" | "aborted";
 type ApprovalDecision = { approved: true; draft: ColleagueCreateDraft | LocalWorkspaceApproval["draft"]; catalogRevision?: number } | { approved: false; state: ApprovalSettleState };
 interface PendingApproval { card: LocalWorkspaceApproval; clientId: string; selectionEpoch: number; job: LocalJob;
   finish(decision: ApprovalDecision): void; timer: ReturnType<typeof setTimeout> }
+interface MessageTimingEntry { recorder: MessageTimingRecorder; identity: MessageTimingIdentity; clientId: string; storage: WorkspaceResourceStorage; store: WorkspaceMessageTimingStore; endedAt?: number }
 interface LocalJob {
   id: string; workspaceId: string; agentId: string; clientId: string;
   context: WorkspaceHostContext; store: WorkspaceConversationStore; value: WorkspaceConversation;
@@ -108,6 +111,7 @@ interface LocalJob {
   permit?: WorkspaceRunPermit; options?: RunOpts; promise: Promise<void>; outcome?: RunOutcome; error?: string; closed: boolean;
   extensionAttempt?: WorkspaceMcpAttempt;
   receipts?: WorkspaceContextReceipts;
+  messageTiming?: MessageTimingRecorder;
   runtimeStages?: RuntimeStageRecorder; stageStore?: WorkspaceRuntimeStageStore; stageSavedAt?: number;
   interaction?: WorkspaceUserInteraction;
   startContext?: ReturnType<typeof prepareWorkspaceStartContext>;
@@ -124,6 +128,7 @@ export class LocalWorkspaceHost {
   readonly catalog: LocalWorkspaceCatalog;
   private readonly contexts = new Map<string, WorkspaceHostContext>();
   private readonly jobs = new Map<string, LocalJob>();
+  private readonly messageTimingEntries = new Map<string, MessageTimingEntry>();
   private readonly pending = new Map<string, PendingApproval>();
   private readonly extensionProposals = new Map<string, { clientId: string; workspaceId: string; generation: string; epoch: number; revision: number; expiresAt: number; change: ExtensionChange; catalogLock: string }>();
   private readonly extensionClients = new Set<string>();
@@ -789,6 +794,7 @@ export class LocalWorkspaceHost {
           && pending.card.agentId === selected && !pending.card.channelId && pending.clientId === clientId).map(pending => pending.card)),
         usage: value.usage, runUsage: value.runUsage, pastTaskCount: value.pastTasks.length,
         runtimeStages: this.runtimeStageReports(context, selected, value.sessionId),
+        messageTimings: this.messageTimingReports(context, selected, value.sessionId),
         nativeRisks: new WorkspaceNativeRiskStore(context.storage, selected, value.sessionId).read(),
         ...(catalog.agents.find(agent => agent.agentId === selected)?.runtime.id === "codex"
           ? { nativeSession: codexThreadView(codexThreadState(context.storage, selected, value.sessionId).read()) } : {}),
@@ -798,6 +804,25 @@ export class LocalWorkspaceHost {
           : { role: message.role, content: message.content }) },
       approvals: [...this.pending.values()].filter(pending => pending.card.workspaceId === workspaceId && pending.card.agentId === selected && !pending.card.channelId && pending.clientId === clientId).map(pending => pending.card),
       ...this.modelMode() };
+  }
+  private messageTimingReports(context: WorkspaceHostContext, agentId: string, sessionId: string): MessageTimingReport[] {
+    const reports = new Map<string, MessageTimingReport>();
+    try { for (const report of new WorkspaceMessageTimingStore(context.storage, sessionId, agentId).list()) reports.set(report.attemptId, report); } catch { /* Optional diagnostics. */ }
+    for (const entry of this.messageTimingEntries.values()) if (entry.storage === context.storage && entry.identity.agentId === agentId && entry.identity.sessionId === sessionId) {
+      try { reports.set(entry.identity.attemptId, entry.recorder.snapshot(entry.identity)); } catch { /* Optional diagnostics. */ }
+    }
+    return [...reports.values()].slice(-16);
+  }
+  recordMessagePaint(clientId: string, workspaceId: string, agentId: string, sessionId: string, runId: string, attemptId: string, timing: MessageTimingInput): { recorded: boolean } {
+    const entry = this.messageTimingEntries.get(attemptId), selection = this.clients.get(clientId);
+    if (!entry || entry.clientId !== clientId || entry.identity.workspaceId !== workspaceId || entry.identity.agentId !== agentId
+      || entry.identity.sessionId !== sessionId || entry.identity.runId !== runId || selection?.workspaceId !== workspaceId || selection.agentId !== agentId
+      || entry.endedAt !== undefined && performance.now() - entry.endedAt > 30_000) return { recorded: false };
+    try { return entry.storage.run(() => {
+      const recorded = entry.recorder.paint(timing);
+      if (recorded && entry.endedAt !== undefined) entry.store.save(entry.recorder.snapshot(entry.identity));
+      return { recorded };
+    }); } catch { return { recorded: false }; }
   }
   private saveRuntimeStages(job: LocalJob, force = false): void {
     if (!job.runtimeStages || !job.stageStore || !force && Date.now() - (job.stageSavedAt ?? 0) < 1000) return;
@@ -1176,8 +1201,9 @@ export class LocalWorkspaceHost {
   }
   start(clientId: string, workspaceId: string, agentId: string, message: string, requestId: string, resume = false, parent?: LocalJob, parentSignal?: AbortSignal,
     origin: WorkspaceRequestOrigin = { source: "host", channel: "internal", clientId }, channel?: { id: string; context: string }, questionId?: string,
-    scheduledConnection?: ScopedRunConnection) {
+    scheduledConnection?: ScopedRunConnection, timing?: { receivedAt: number; client?: MessageTimingInput }) {
     if (this.closing || this.updateLease || !messageBody(message) || !UUID.test(requestId)) throw new Error("invalid Workspace message or closing/updating Host");
+    const messageTiming = new MessageTimingRecorder({ receivedAt: timing?.receivedAt, client: timing?.client });
     const context = this.context(workspaceId), agent = context.resources.agents.get(agentId);
     if (!agent || agent.state !== "active" || !context.resources.agents.runtimeOptions().some(row => row.id === agent.runtime.id && row.available))
       throw new Error("Agent Runtime unavailable; no fallback selected");
@@ -1306,10 +1332,19 @@ export class LocalWorkspaceHost {
       value.attempt = { attemptId: lease.attemptId, fence: (value.attempt?.fence ?? 0) + 1, runId: binding.runId, state: "running", startedAt: new Date().toISOString(), endedAt: null };
       value.requests.push({ requestId, digest, taskId: task.id, runId: binding.runId }); value = store.save(value.revision, value);
       journal.settle(requestId, "accepted", { taskId: task.id, runId: binding.runId });
+      messageTiming.mark("T2");
       if (questionId) this.interactionFor(context, value)!.answer(questionId, new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget, binding.lineage.depth === 1).read().usage.modelCalls);
       job = { id: binding.runId, workspaceId, agentId, clientId, context, store, value, lease, controller, ...(channel ? { channelId: channel.id } : {}),
         signal: parent ? AbortSignal.any([controller.signal, parent.signal, ...(parentSignal ? [parentSignal] : [])]) : controller.signal, binding, promise: Promise.resolve(), closed: false };
       const owned = job, tree = new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget, binding.lineage.depth === 1);
+      owned.messageTiming = messageTiming;
+      try {
+        const identity: MessageTimingIdentity = { workspaceId, resourceGeneration: context.storage.run(() => currentWorkspaceResourceBinding()!.generation),
+          agentId, sessionId: store.sessionId, runId: binding.runId, attemptId: lease.attemptId, historyStart: modelHistoryStart };
+        this.messageTimingEntries.set(lease.attemptId, { recorder: messageTiming, identity, clientId, storage: context.storage,
+          store: new WorkspaceMessageTimingStore(context.storage, store.sessionId, agentId) });
+        while (this.messageTimingEntries.size > 32) this.messageTimingEntries.delete(this.messageTimingEntries.keys().next().value!);
+      } catch { /* Timing never changes admission. */ }
       try {
         owned.stageStore = new WorkspaceRuntimeStageStore(context.storage, store.sessionId, agentId);
         owned.runtimeStages = new RuntimeStageRecorder({ workspaceId,
@@ -1329,7 +1364,7 @@ export class LocalWorkspaceHost {
         modelHistory: { history: value.history, start: modelHistoryStart, retain: result => owned.receipts!.retain(result),
           usedTokens: () => { const usage = tree.read().usage; return usage.inputTokens + usage.outputTokens; } },
         observeContext: observation => { owned.lease.assertCurrent(); audit.append(observation); },
-        runtimeStages: owned.runtimeStages,
+        runtimeStages: owned.runtimeStages, messageTiming: owned.messageTiming,
         onNativeRisks: events => {
           owned.lease.assertCurrent();
           new WorkspaceNativeRiskStore(context.storage, agentId, store.sessionId).save(binding.runId, events);
@@ -1413,7 +1448,14 @@ export class LocalWorkspaceHost {
       try { job.value.task = finishTaskExecution(job.value.task!, job.outcome, [], job.signal.aborted)!;
         job.value.attempt = { ...job.value.attempt!, state: job.signal.aborted ? "cancelled" : "blocked", endedAt: new Date().toISOString() }; this.commit(job); } catch { /* original checkpoint retained; no stale business authority */ }
     } finally {
-      try { await job.extensionAttempt?.close(); await closeWorkspaceRunPermit(job.permit!); } catch { job.lease.setDraining(true); job.error = "原執行鎖的身份無法確認；已保留，請診斷後再恢復。"; }
+      let drained = false;
+      try { await job.extensionAttempt?.close(); await closeWorkspaceRunPermit(job.permit!); drained = true; } catch { job.lease.setDraining(true); job.error = "原執行鎖的身份無法確認；已保留，請診斷後再恢復。"; }
+      const timingEntry = this.messageTimingEntries.get(job.lease.attemptId);
+      if (timingEntry) {
+        if (drained) timingEntry.recorder.finish();
+        timingEntry.endedAt = performance.now();
+        try { timingEntry.store.save(timingEntry.recorder.snapshot(timingEntry.identity)); } catch { /* Optional diagnostics. */ }
+      }
       try {
         const state = job.signal.aborted ? "cancelled" : job.outcome?.status === "error" ? "error"
           : job.value.task?.status === "completed" ? "completed" : "blocked";
