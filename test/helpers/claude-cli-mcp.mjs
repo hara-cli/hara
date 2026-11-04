@@ -31,6 +31,7 @@ async function fakeCli() {
     throw new Error("fixture expected an environment-only MCP bearer");
   const url = config ? config.mcpServers.hara.url : JSON.parse(raw.slice(raw.indexOf("=") + 1)), token = process.env.HARA_WORKSPACE_MCP_TOKEN;
   const meta = { pid: process.pid, url, mode, runtimeId,
+    freshSystemPrompt: args[1]?.includes("Working directory:") === true,
     home: process.env.HOME, userProfile: process.env.USERPROFILE, privateClaudeConfig: process.env.CLAUDE_CONFIG_DIR ?? null,
     model: runtimeId === "claude" ? args[args.indexOf("--model") + 1] : null,
     effort: runtimeId === "claude" ? args[args.indexOf("--effort") + 1] : null,

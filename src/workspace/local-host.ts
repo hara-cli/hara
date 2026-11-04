@@ -1283,7 +1283,8 @@ export class LocalWorkspaceHost {
       if (store.read().revision !== expectedRevision) throw new Error("Conversation changed; native reset refused");
       const actorId = this.catalog.resolve(workspaceId).actorId;
       const value = native.update(expectedNativeRevision, current => ({ ...current, threadId: null, input: 0, output: 0, cachedInput: 0,
-        contextTokens: null, modelContextWindow: null, phase: "idle", lastAttempt: { input: 0, output: 0, cachedInput: 0 },
+        contextTokens: null, modelContextWindow: null, phase: "idle", contextGeneration: null, standingPromptHash: null,
+        lastAttempt: { input: 0, output: 0, cachedInput: 0 },
         resets: [...current.resets, { requestId, actorId, at: new Date().toISOString(), oldThreadId: current.threadId, revision: current.revision + 1 }] }));
       this.changed(workspaceId, agentId); return { requestId, revision: value.revision, duplicate: false };
     } finally { lease.release(); }

@@ -108,12 +108,12 @@ test("reset rejects busy/draining turns without interrupting them or clearing th
 test("legacy saved counters migrate without granting cache credit from an unknown historical watermark", async t => {
   const f = await cliMcpFixture(t, "telemetry", { telemetry: [sample(41000, 40000, 20)] }); await exchange(f);
   const saved = nativeState(f), legacy = { ...saved.value, schemaVersion: 1 };
-  for (const key of ["cachedInput", "contextTokens", "modelContextWindow", "lastAttempt", "resets"]) delete legacy[key];
+  for (const key of ["cachedInput", "contextTokens", "modelContextWindow", "lastAttempt", "resets", "contextGeneration", "standingPromptHash"]) delete legacy[key];
   fs.writeFileSync(saved.file, JSON.stringify(legacy)); await f.restart();
   f.mode({ mode: "telemetry", telemetry: [sample(47000, 45000, 40, 47000, 41000)] });
   const view = await exchange(f, "List current colleagues after migration?"); assert.equal(view.conversation.state, "completed");
   assert.deepEqual(view.conversation.nativeSession.lastAttempt, { input: 6000, cachedInput: 0, output: 20 });
-  assert.equal(view.conversation.runUsage.inputTokens, 6000); assert.equal(nativeState(f).value.schemaVersion, 2);
+  assert.equal(view.conversation.runUsage.inputTokens, 6000); assert.equal(nativeState(f).value.schemaVersion, 3);
 });
 
 test("invalid native state union, unknown fields and unsupported old schema are refused without rewriting history", async t => {
@@ -128,4 +128,7 @@ test("invalid native state union, unknown fields and unsupported old schema are 
     assert.deepEqual(JSON.parse(fs.readFileSync(saved.file, "utf8")), altered, "unsupported state remains untouched for recovery");
   }
   fs.writeFileSync(saved.file, original); assert.equal(state.read().threadId, saved.value.threadId);
+  const before = state.read();
+  assert.throws(() => state.update(before.revision - 1, value => ({ ...value, standingPromptHash: "f".repeat(64) })), /changed/);
+  assert.equal(state.read().standingPromptHash, before.standingPromptHash, "a failed CAS cannot claim the model saw a new prompt");
 });

@@ -16,36 +16,42 @@ export function codexContextLimit(): number {
   return Number(raw);
 }
 export interface CodexThreadState {
-  schemaVersion: 2; resourceBinding: WorkspaceResourceBinding; revision: number;
+  schemaVersion: 3; resourceBinding: WorkspaceResourceBinding; revision: number;
   agentId: string; sessionId: string; origin: string; threadId: string | null;
   input: number; output: number; cachedInput: number | null;
   contextTokens: number | null; modelContextWindow: number | null;
   phase: "idle" | "unknown" | "new_session_required";
   lastAttempt: { input: number; output: number; cachedInput: number };
   resets: { requestId: string; actorId: string; at: string; oldThreadId: string | null; revision: number }[];
+  /** Host-private model memory epoch; separate from Workspace resource authority generation. */
+  contextGeneration: string | null; standingPromptHash: string | null;
 }
 const LEGACY_FIELDS = ["schemaVersion", "resourceBinding", "revision", "agentId", "sessionId", "origin", "threadId", "input", "output", "phase"];
 const FIELDS = [...LEGACY_FIELDS, "cachedInput", "contextTokens", "modelContextWindow", "lastAttempt", "resets"];
+const V3_FIELDS = [...FIELDS, "contextGeneration", "standingPromptHash"];
 const hash = (value: unknown) => createHash("sha256").update(canonical(value)).digest("hex");
 export const codexConversationKey = (binding: WorkspaceResourceBinding, agentId: string, sessionId: string): string => hash([binding, agentId, sessionId]);
 export function codexThreadState(storage: WorkspaceResourceStorage, agentId: string, sessionId: string, origin = hash("uninitialized")): WorkspaceJsonState<CodexThreadState> {
   const state: WorkspaceJsonState<CodexThreadState> = new WorkspaceJsonState(storage, "codex-thread-" + hash([agentId, sessionId]).slice(0, 24) + ".json", raw => {
     const fail = (): never => { throw new Error("Saved Codex thread binding is invalid; history was preserved"); };
-    if (!plain(raw) || raw.schemaVersion !== 1 && raw.schemaVersion !== 2 || !exact(raw, raw.schemaVersion === 1 ? LEGACY_FIELDS : FIELDS)
+    if (!plain(raw) || ![1, 2, 3].includes(Number(raw.schemaVersion)) || !exact(raw, raw.schemaVersion === 1 ? LEGACY_FIELDS : raw.schemaVersion === 2 ? FIELDS : V3_FIELDS)
       || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 1
       || !sameWorkspaceResourceBinding(raw.resourceBinding as WorkspaceResourceBinding, state.binding())
       || raw.agentId !== agentId || raw.sessionId !== sessionId || typeof raw.origin !== "string" || !/^[a-f0-9]{64}$/.test(raw.origin)
       || !(raw.threadId === null || nativeCodexId(raw.threadId)) || !nativeTokenCount(raw.input) || !nativeTokenCount(raw.output)
-      || !["idle", "unknown", ...(raw.schemaVersion === 2 ? ["new_session_required"] : [])].includes(String(raw.phase))) return fail();
+      || !["idle", "unknown", ...(raw.schemaVersion !== 1 ? ["new_session_required"] : [])].includes(String(raw.phase))) return fail();
     // Legacy cache watermarks are unknown. Never subtract a historical cache total from fresh input.
-    const value = raw.schemaVersion === 1 ? { ...raw, schemaVersion: 2, cachedInput: null, contextTokens: null, modelContextWindow: null,
+    const v2 = raw.schemaVersion === 1 ? { ...raw, cachedInput: null, contextTokens: null, modelContextWindow: null,
       lastAttempt: { input: 0, output: 0, cachedInput: 0 }, resets: [] } : raw;
+    const value = raw.schemaVersion === 3 ? raw : { ...v2, schemaVersion: 3, contextGeneration: null, standingPromptHash: null };
     if (!(value.cachedInput === null || nativeTokenCount(value.cachedInput) && value.cachedInput <= Number(value.input))
       || !(value.contextTokens === null || nativeTokenCount(value.contextTokens))
       || !(value.modelContextWindow === null || nativeTokenCount(value.modelContextWindow) && value.modelContextWindow > 0)
       || !plain(value.lastAttempt) || !exact(value.lastAttempt, ["input", "output", "cachedInput"])
       || !Object.values(value.lastAttempt).every(nativeTokenCount) || Number(value.lastAttempt.cachedInput) > Number(value.lastAttempt.input)
-      || !Array.isArray(value.resets) || value.resets.length > 1024) return fail();
+      || !Array.isArray(value.resets) || value.resets.length > 1024
+      || !(value.contextGeneration === null || typeof value.contextGeneration === "string" && UUID.test(value.contextGeneration))
+      || !(value.standingPromptHash === null || typeof value.standingPromptHash === "string" && /^[a-f0-9]{64}$/.test(value.standingPromptHash))) return fail();
     const seen = new Set<string>();
     for (const row of value.resets) {
       if (!plain(row) || !exact(row, ["requestId", "actorId", "at", "oldThreadId", "revision"])
@@ -56,9 +62,9 @@ export function codexThreadState(storage: WorkspaceResourceStorage, agentId: str
       seen.add(row.requestId);
     }
     return structuredClone(value) as unknown as CodexThreadState;
-  }, () => ({ schemaVersion: 2, resourceBinding: state.binding(), revision: 0, agentId, sessionId, origin, threadId: null,
+  }, () => ({ schemaVersion: 3, resourceBinding: state.binding(), revision: 0, agentId, sessionId, origin, threadId: null,
     input: 0, output: 0, cachedInput: 0, contextTokens: null, modelContextWindow: null, phase: "idle",
-    lastAttempt: { input: 0, output: 0, cachedInput: 0 }, resets: [] }));
+    lastAttempt: { input: 0, output: 0, cachedInput: 0 }, resets: [], contextGeneration: null, standingPromptHash: null }));
   return state;
 }
 export function nativeContextLimit(value: CodexThreadState): number {

@@ -100,6 +100,8 @@ export async function fakeCodexMain() {
       rpc("thread/tokenUsage/updated", { tokenUsage: sample });
     }
     rpc("item/completed", { item: { type: "agentMessage", text: ["native-write", "native-claim"].includes(selected) ? "The file change is ready." : selected === "leak" ? token : ["reply", "usage-reset"].includes(selected) ? "registered codex reply" : "Scoped CLI reply" } });
+    if (mode().emitCompaction) note("thread/compacted", { threadId: thread });
+    if (mode().foreignCompaction) note("thread/compacted", { threadId: "foreign-thread" });
     note("turn/completed", { threadId: thread, turn: { id: currentTurn, status: "completed" } });
   }
   for await (const line of readline.createInterface({ input: process.stdin })) {
