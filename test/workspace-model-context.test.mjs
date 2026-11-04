@@ -83,7 +83,7 @@ test("wake brief is below8k total and each data item below2k; full long checkpoi
   assert.match(brief, /workspace_receipt_read/); assert.equal(WORKSPACE_CONTEXT_LIMITS.compactAt, 0.72);
 });
 
-test("retained full-output files are scoped to Workspace/Agent/run, survive reopen, and paginate below8k without global HOME access", async () => {
+test("retained full-output files are scoped to Workspace/Agent/run, survive reopen, and paginate in 12k pages without global HOME access", async () => {
   const path = root(), host = new LocalWorkspaceHost(path);
   try {
     const ws = host.createWorkspace("Receipts", host.list().revision), row = host.catalog.resolve(ws.workspaceId), storage = new WorkspaceResourceStorage(host.home, row.scope); storage.initialize();
@@ -92,7 +92,7 @@ test("retained full-output files are scoped to Workspace/Agent/run, survive reop
     const file = receipts.retain(result), id = file.slice(8, -5), tool = receipts.tool();
     assert.equal(tool.classify().effect, "state"); assert.match(file, /^receipt-[a-f0-9]{64}\.json$/);
     const pieces = []; let offset = 0;
-    while (offset !== null) { const pageRaw = await tool.run({ id, offset }, {}); assert.ok(pageRaw.length <= 8000);
+    while (offset !== null) { const pageRaw = await tool.run({ id, offset }, {}); assert.ok(pageRaw.length <= 32000);
       const page = JSON.parse(pageRaw); pieces.push(page.content); offset = page.nextOffset; }
     assert.deepEqual(JSON.parse(pieces.join("")), result);
     assert.equal(new WorkspaceContextReceipts(storage, runId, ws.selectedAgentId, () => {}).retain(result), file);

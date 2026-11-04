@@ -64,7 +64,7 @@ export function jsonCliDriver(id: JsonCliRuntimeId, installer: WorkspaceRuntimeI
           const nativeEvents = createJsonCliNativeObserver(id, event => { policy!.policy.observeNativeEvent(event); publishWorkspaceNativeRisks(permit); });
           const wrapped = policy.policy.wrap({ command: resolved.command, args, env }); assertCurrent();
           const result = await runExternalCommandCapture(wrapped, wrapped.args, {
-            cwd: permit.binding.project.root, signal: native.signal, timeoutMs: permit.binding.budget.timeoutMs,
+            cwd: permit.binding.project.root, signal: native.signal, timeoutMs: permit.binding.budget.timeoutMs, governedDeadline: permit.binding.budget.mode === "interactive",
             waitForClose: true, failureKind: "runtime", proxyUrl: resolved.proxyUrl, maxOutputBytes: 4 * 1024 * 1024, retainStdoutOnFailure: true,
             onSpawn: observer.onSpawn, onStdout: chunk => { observer?.onStdout(chunk); nativeEvents.onStdout(chunk); activity(); },
           });

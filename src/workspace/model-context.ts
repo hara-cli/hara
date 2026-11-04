@@ -30,6 +30,9 @@ export function workspaceWakeBrief(task: Pick<TaskExecution, "objective" | "brie
 }
 function resultPreview(result: ToolResult, cap: number, retain?: Retain): string {
   const error = result.isError || result.content.startsWith("Error:");
+  // Keep a fresh complete receipt page intact; do not recursively retain another truncated page.
+  if (!error && result.name === "workspace_receipt_read" && cap === WORKSPACE_CONTEXT_LIMITS.toolChars
+    && result.content.length <= 32_000) return result.content;
   if (!error && result.content.length <= cap) return result.content;
   const file = retain?.(result), reference = file ? ` Full receipt: ${file}; use workspace_receipt_read.` : " Full output remains in the durable transcript.";
   if (error) return `Error receipt ${result.name}/${result.id}: ${result.content.replace(/[\r\n\t]+/g, " ").slice(0, 180)}.${reference}`;

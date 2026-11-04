@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { WORKSPACE_RECEIPT_PAGE_CHARS } from "../workspace/context-receipts.js";
 import { answerQuestionObjective, conversationalAnswerObjective } from "./governance-c-lite.js";
 import type { NeutralMsg, ToolResult } from "../providers/types.js";
 import type { TaskExecution } from "../session/task.js";
@@ -7,7 +8,7 @@ import type { ToolEffect } from "../tools/registry.js";
 /** Exact Workspace tools whose implementation only observes run-scoped state or safe project bytes.
  * A kind:read label alone is insufficient: channel_peer_wake, task state and external tools are excluded. */
 export const READONLY_ANSWER_TOOLS = new Set([
-  "agent_list", "workspace_read", "workspace_verify", "workspace_context_lookup",
+  "agent_list", "agent_get", "workspace_read", "workspace_verify", "workspace_context_lookup",
   "workspace_memory_search", "workspace_receipt_read", "workspace_skill", "channel_sync",
 ]);
 const REFERENCE = /receipt-([a-f0-9]{64})\.json/gu;
@@ -55,7 +56,7 @@ export class ReadOnlyAnswerTrace {
         const page = JSON.parse(result.content) as { file?: unknown; offset?: unknown; nextOffset?: unknown; totalChars?: unknown; content?: unknown };
         const match = typeof page.file === "string" ? /^receipt-([a-f0-9]{64})\.json$/u.exec(page.file) : null;
         if (!match || !Number.isSafeInteger(page.offset) || !Number.isSafeInteger(page.totalChars)
-          || typeof page.content !== "string" || page.content.length > 1000
+          || typeof page.content !== "string" || page.content.length > WORKSPACE_RECEIPT_PAGE_CHARS
           || (page.nextOffset !== null && !Number.isSafeInteger(page.nextOffset))) throw new Error("invalid page");
         const key = match[1]!, offset = Number(page.offset), total = Number(page.totalChars);
         const end = offset + page.content.length;

@@ -383,3 +383,19 @@ test("a legacy-constrained Pi model gateway cannot request an unadvertised nativ
   assert.equal((await call(b)).status, 502);
   assert.equal(issued, 0, "an unadvertised native call never receives authority");
 });
+
+
+test("interactive native Pi gateway has no aggregate call/token/tool cap, retains per-model timeout and explicit cancellation", async t => {
+  const controller = new AbortController();
+  const b = await bridge(t, { signal: controller.signal, budget: { mode: "interactive", maxProviderRounds: 1, maxToolCalls: 1, maxTokens: 1, timeoutMs: 500 },
+    tools: [{ name: "read", description: "Native fixture read", input_schema: { type: "object" } }],
+    provider: { id: "frozen", model: "frozen", async turn() { return { ...reply("observed"), toolUses: [{ id: randomUUID(), name: "read", input: {} }], stop: "tool_use" }; } } });
+  await new Promise(resolve => setTimeout(resolve, 550));
+  for (let n = 0; n < 3; n++) assert.equal((await call(b, { body: body([{ name: "read" }]) })).status, 200);
+  assert.equal(b.host.metrics.providerRounds, 3); assert.equal(b.host.metrics.toolCalls, 3); assert.ok(b.host.metrics.totalTokens > 1);
+  controller.abort(); await assert.rejects(call(b)); assert.equal(b.host.metrics.providerRounds, 3);
+  const timeoutController = new AbortController(); let providerSignal;
+  const hung = await bridge(t, { signal: timeoutController.signal, budget: { ...budget, mode: "interactive", timeoutMs: 100 },
+    provider: { id: "frozen", model: "frozen", turn({ signal }) { providerSignal = signal; return new Promise(resolve => signal.addEventListener("abort", () => resolve({ ...reply("cancelled"), stop: "error" }), { once: true })); } } });
+  assert.notEqual((await call(hung)).status, 200); assert.equal(providerSignal.aborted, true);
+});

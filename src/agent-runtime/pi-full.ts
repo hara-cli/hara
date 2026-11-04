@@ -114,7 +114,7 @@ export async function runFullProtectedPi(history: NeutralMsg[], options: RunOpts
             if (result.stop === "error") modelFailure = classifyRuntimeFailure({ stderr: result.errorMsg, status: result.errorMetadata?.status });
             return result;
           } }, tools: piNativeModelTools(options.ctx.cwd, activeArgs!.tools, nativeTools),
-          nativeModel: { audience, onNativeTools: noteIssued }, budget: { maxProviderRounds: permit.binding.budget.maxRounds,
+          nativeModel: { audience, onNativeTools: noteIssued }, budget: { ...(permit.binding.budget.mode === "interactive" ? { mode: "interactive" as const } : {}), maxProviderRounds: permit.binding.budget.maxRounds,
             maxToolCalls: permit.binding.budget.maxToolCalls, maxTokens: permit.binding.budget.maxTokens, timeoutMs: permit.binding.budget.timeoutMs },
           assertCurrent, signal: native.signal, executeTool: async () => { throw new Error("The model capability cannot execute Hara tools"); } });
         const modelOptions = gateway.provider.hara!.options as { baseURL: string; apiKey: string };
@@ -130,7 +130,7 @@ export async function runFullProtectedPi(history: NeutralMsg[], options: RunOpts
         safe(() => stages?.setRuntime({ id: "pi", version: "1.5.0", loginSource: "isolated", model: permit.binding.connection.model, effort: null }));
         endSpawn = safe(() => stages?.beginEvent("spawn")); endCold = safe(() => stages?.beginEvent("cold_start", { source: "native_event" }));
         rpc = new PiRpcProcess({ ...launch, env, configuration: config, cwd: options.ctx.cwd, boundary: processBoundary(policy, launch, env, options.ctx.cwd),
-          timeoutMs: permit.binding.budget.timeoutMs, signal: native.signal, onAccepted: () => sessionStore!.accepted(),
+          timeoutMs: permit.binding.budget.timeoutMs, governedPrompt: permit.binding.budget.mode === "interactive", signal: native.signal, onAccepted: () => sessionStore!.accepted(),
           onFrame(frame) {
             assertCurrent(); activity();
             if (frame.type === "message_update" && frame.assistantMessageEvent?.type === "text_delta" && typeof frame.assistantMessageEvent.delta === "string") {

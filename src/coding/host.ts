@@ -6,6 +6,7 @@ import type { AssistantContinuation, NeutralMsg, Provider, ToolSpec, ToolUse } f
 import { validateCodingContinuation, type CodingContinuationStore } from "./continuations.js";
 
 export interface CodingHostBudget {
+  mode?: "interactive";
   maxProviderRounds: number;
   maxToolCalls: number;
   maxTokens: number;
@@ -142,6 +143,7 @@ function json(response: ServerResponse, status: number, value: unknown): void {
 /** Session-scoped local transport only. All model and tool authority remains in the supplied Hara host. */
 export async function createCodingHostBridge(options: CodingHostOptions): Promise<CodingHostBridge> {
   const budget = { ...options.budget };
+  if (budget.mode !== undefined && (budget.mode !== "interactive" || !options.nativeModel || !options.signal)) throw new Error("invalid interactive coding host budget");
   for (const name of ["maxProviderRounds", "maxToolCalls", "maxTokens", "timeoutMs"] as const) {
     if (!Number.isSafeInteger(budget[name]) || budget[name] <= 0) throw new Error("invalid coding host budget");
   }
@@ -205,8 +207,8 @@ export async function createCodingHostBridge(options: CodingHostOptions): Promis
     let permitted = true;
     try { permitted = options.onProgress?.({ ...counters }) !== false; }
     catch { lifecycle.abort(); throw new HostError(409, "host_binding_changed"); }
-    if (counters.providerRounds > budget.maxProviderRounds || counters.toolCalls > budget.maxToolCalls
-      || counters.totalTokens > budget.maxTokens || !permitted) {
+    if ((budget.mode !== "interactive" && (counters.providerRounds > budget.maxProviderRounds || counters.toolCalls > budget.maxToolCalls
+      || counters.totalTokens > budget.maxTokens)) || !permitted) {
       lifecycle.abort();
       throw new HostError(429, "host_budget_exhausted");
     }
@@ -299,6 +301,7 @@ export async function createCodingHostBridge(options: CodingHostOptions): Promis
   }
 
   async function completion(body: JsonRecord, response: ServerResponse, signal: AbortSignal): Promise<void> {
+    if (budget.mode === "interactive") signal = AbortSignal.any([signal, AbortSignal.timeout(budget.timeoutMs)]);
     keys(body, ["model", "messages", "tools", "stream", "stream_options", "temperature", "top_p", "max_tokens", "max_completion_tokens", "frequency_penalty", "presence_penalty", "seed", "stop", "parallel_tool_calls", "tool_choice", "reasoning_effort"]);
     if (body.model !== "coding" && body.model !== "hara/coding") throw new HostError(400, "unsupported_model");
     if (body.stream !== undefined && typeof body.stream !== "boolean") throw new HostError(400, "unsupported_stream");
@@ -313,7 +316,7 @@ export async function createCodingHostBridge(options: CodingHostOptions): Promis
     let accounted = false;
     try {
       await assertCurrent(signal);
-      if (counters.providerRounds >= budget.maxProviderRounds || counters.totalTokens + inputEstimate > budget.maxTokens) throw new HostError(429, "host_budget_exhausted");
+      if (budget.mode !== "interactive" && (counters.providerRounds >= budget.maxProviderRounds || counters.totalTokens + inputEstimate > budget.maxTokens)) throw new HostError(429, "host_budget_exhausted");
       counters.providerRounds += 1;
       progress();
       const prepared = await abortable(track(Promise.resolve(options.provider.prepareTurn?.(history, signal))), signal);
@@ -352,7 +355,7 @@ export async function createCodingHostBridge(options: CodingHostOptions): Promis
         if (!inputValidators.get(aliases.get(tool.name)!.name)!(tool.input).valid) throw new HostError(502, "unsupported_provider_tool_arguments");
       }
       if (options.nativeModel) {
-        if (counters.toolCalls + result.toolUses.length > budget.maxToolCalls) throw new HostError(429, "host_budget_exhausted");
+        if (budget.mode !== "interactive" && counters.toolCalls + result.toolUses.length > budget.maxToolCalls) throw new HostError(429, "host_budget_exhausted");
         counters.toolCalls += result.toolUses.length;
         options.nativeModel.onNativeTools?.(result.toolUses);
         progress();
@@ -505,8 +508,8 @@ export async function createCodingHostBridge(options: CodingHostOptions): Promis
   server.headersTimeout = Math.min(budget.timeoutMs, 30_000);
   const externalAbort = (): void => lifecycle.abort();
   options.signal?.addEventListener("abort", externalAbort, { once: true });
-  const timer = setTimeout(() => lifecycle.abort(), budget.timeoutMs);
-  timer.unref();
+  const timer = budget.mode === "interactive" ? undefined : setTimeout(() => lifecycle.abort(), budget.timeoutMs);
+  timer?.unref();
   const close = (): Promise<void> => {
     if (closed) return closed;
     lifecycle.abort();

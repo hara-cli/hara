@@ -35,3 +35,18 @@ test("late abort inside spawn cannot release protection before close listeners e
   await new Promise(resolve => setImmediate(resolve)); assert.equal(finished, false);
   child.emit("close", null, "SIGKILL"); assert.equal((await pending).errorCode, "interrupted");
 });
+
+
+test("governed native lifetime follows engine cancellation rather than the old whole-task timer", async () => {
+  const controller = new AbortController();
+  const completed = await runExternalCommandCapture({ command: process.execPath }, ["-e", "setTimeout(() => process.stdout.write('fixture complete'), 400)"], {
+    signal: controller.signal, governedDeadline: true, waitForClose: true, timeoutMs: 250,
+  });
+  assert.equal(completed.ok, true); assert.match(completed.stdout, /fixture complete/);
+  const stop = new AbortController();
+  const pending = runExternalCommandCapture({ command: process.execPath }, ["-e", "setTimeout(() => {}, 5000)"], {
+    signal: stop.signal, governedDeadline: true, waitForClose: true, timeoutMs: 250,
+  });
+  setTimeout(() => stop.abort(), 350);
+  assert.equal((await pending).errorCode, "interrupted");
+});

@@ -1,7 +1,7 @@
 import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment, TurnArgs, TurnResult } from "../providers/types.js";
 import { isTaskRuntimeBinding } from "../agent-runtime/bindings.js";
 import { WORKSPACE_AGENT_EXECUTION_PENDING } from "../workspace/agent-binding.js";
-import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, workspaceRunQuestion, workspaceRunHasPendingInteraction, workspaceRunBeginToolBatch, workspaceRunAsk, workspaceRunAsyncAnswers, workspaceRunNativeEvidence, workspaceRunCanCompleteConversation, workspaceRunCompletionEvidence, type WorkspaceRunPermit } from "../workspace/execution.js";
+import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, workspaceRunQuestion, workspaceRunIsInteractive, bindWorkspaceRoundClock, workspaceRunHasPendingInteraction, workspaceRunBeginToolBatch, workspaceRunAsk, workspaceRunAsyncAnswers, workspaceRunNativeEvidence, workspaceRunCanCompleteConversation, workspaceRunCompletionEvidence, type WorkspaceRunPermit } from "../workspace/execution.js";
 import { createToolImageStore, redactOwnedToolImageText } from "../tools/tool-images.js";
 import { redactOwnedToolImageValue } from "../security/tool-media-redaction.js";
 import { createComputerRunScope, closeComputerRunScope } from "../tools/computer-run.js";
@@ -842,6 +842,8 @@ function recoverableMalformedToolCall(error: string | undefined): boolean {
 }
 
 interface RunLifecycle {
+  interactiveWorkspace: boolean;
+  releaseRoundClock?: () => void;
   language: RuntimeCopyLanguage;
   signal: AbortSignal;
   timeoutController: AbortController;
@@ -984,6 +986,7 @@ function armRunTimers(opts: RunOpts, life: RunLifecycle): void {
   }, timeoutDelay);
   // The hard timer stays referenced while the agent is actively executing. Human prompts have their own
   // visible UI plus Esc/shutdown cancellation and deliberately do not keep this active budget running.
+  if (life.interactiveWorkspace) return; // Per-round timeout remains armed; chat has no near-budget warning.
   const warningAt = Math.min(5 * 60_000, Math.max(250, Math.floor(life.timeoutMs * 0.8)));
   if (!life.warned) {
     life.warningTimer = setTimeout(() => warnRun(opts, life), Math.max(0, warningAt - elapsedMs));
@@ -1071,6 +1074,7 @@ function createRunLifecycle(opts: RunOpts, language: RuntimeCopyLanguage): RunLi
     else signal.addEventListener("abort", stopped, { once: true });
   });
   const life: RunLifecycle = {
+    interactiveWorkspace: !!opts.workspaceRun && workspaceRunIsInteractive(opts.workspaceRun),
     language,
     signal,
     timeoutController,
@@ -1100,11 +1104,16 @@ function createRunLifecycle(opts: RunOpts, language: RuntimeCopyLanguage): RunLi
     } : {}),
     taskRoundCheckpointInjected: false,
   };
+  if (opts.workspaceRun && life.interactiveWorkspace) life.releaseRoundClock = bindWorkspaceRoundClock(opts.workspaceRun, () => {
+    if (expireRunBudgetIfNeeded(life)) throw new Error("Workspace model round expired");
+    if (life.pauseDepth === 0) { life.activeElapsedMs = 0; life.activeStartedAt = Date.now(); armRunTimers(opts, life); }
+  });
   armRunTimers(opts, life);
   return life;
 }
 
 function disposeRunLifecycle(life: RunLifecycle): void {
+  life.releaseRoundClock?.();
   life.disposed = true;
   clearRunTimers(life);
   life.removeStopListener();
@@ -1787,7 +1796,7 @@ async function runAgentInner(
   // The engine owns this ledger rather than trusting reminder prose. It retains only digests/shingles and
   // credential-free counters, while treating same-evidence checkpoints/todo rewrites as no progress.
   const progressWatchdog = new AgentProgressWatchdog({
-    unattended: unattendedRun,
+    unattended: life.interactiveWorkspace ? false : unattendedRun, interactive: life.interactiveWorkspace,
     task: intakeTask,
     todos: currentTodos(ctx.todoScope),
     usage: opts.stats,
@@ -1863,9 +1872,12 @@ async function runAgentInner(
     // A cancellation that already happened is authoritative: do not start pending-input work, a provider
     // request, or any later tool round merely to give it an already-aborted signal.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return stoppedOutcome();
-    const taskBoundary = life.taskRoundLimit !== undefined
+    if (life.interactiveWorkspace) {
+      life.activeElapsedMs = 0; life.activeStartedAt = Date.now(); armRunTimers(opts, life);
+    }
+    const taskBoundary = !life.interactiveWorkspace && life.taskRoundLimit !== undefined
       && life.taskRoundsUsed + life.rounds >= life.taskRoundLimit;
-    const runBoundary = life.rounds >= life.maxRounds;
+    const runBoundary = !life.interactiveWorkspace && life.rounds >= life.maxRounds;
     if (taskBoundary || runBoundary) {
       const runCanExtend = !runBoundary || life.maxRounds < MAX_AGENT_MAX_ROUNDS;
       if (runCanExtend && canAutoContinue()) {
@@ -1902,7 +1914,7 @@ async function runAgentInner(
     life.rounds += 1;
     const cumulativeTaskRounds = life.taskRoundsUsed + life.rounds;
     if (
-      life.taskRoundCheckpointAt !== undefined
+      !life.interactiveWorkspace && life.taskRoundCheckpointAt !== undefined
       && life.taskRoundsUsed < life.taskRoundCheckpointAt
       && cumulativeTaskRounds >= life.taskRoundCheckpointAt
       && !life.taskRoundCheckpointInjected
@@ -1917,8 +1929,8 @@ async function runAgentInner(
         content: wrapReminders([taskRoundCheckpointReminder(cumulativeTaskRounds, life.taskRoundLimit!)]),
       });
     }
-    if (life.rounds >= Math.ceil(life.maxRounds * 0.75)) warnRun(opts, life);
-    if (runActiveElapsedMs(life) >= Math.floor(life.timeoutMs * 0.8)) requestRunCheckpoint(opts, life);
+    if (!life.interactiveWorkspace && life.rounds >= Math.ceil(life.maxRounds * 0.75)) warnRun(opts, life);
+    if (!life.interactiveWorkspace && runActiveElapsedMs(life) >= Math.floor(life.timeoutMs * 0.8)) requestRunCheckpoint(opts, life);
     if (!opts.quiet && life.checkpointDue && !life.checkpointInjected) {
       life.checkpointInjected = true;
       history.push({

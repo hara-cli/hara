@@ -301,3 +301,13 @@ test("the token boundary does not spend a third stale context replay", () => {
   assert.equal(decision.state.tokens.total, 251_318);
   assert.equal(decision.state.checkpointStaleRounds, 5);
 });
+
+
+test("interactive chat records large token usage without a token ceiling while repeated evidence still stops", () => {
+  const healthy = new AgentProgressWatchdog({ unattended: false, interactive: true });
+  for (let n = 1; n <= 15; n++) assert.equal(healthy.recordRound(round({ observations: [{ name: "workspace_read", input: { path: `report-${n}` }, content: `row-${n}` }],
+    usage: { input: n * 50000, output: n * 100 } })).warn, false);
+  const stalled = new AgentProgressWatchdog({ unattended: false, interactive: true }); let decision;
+  for (let n = 0; n < 6; n++) decision = stalled.recordRound(round({ observations: [{ name: "workspace_read", input: { path: "same" }, content: "same result" }], usage: { input: n * 50000, output: 0 } }));
+  assert.equal(decision.stop, true); assert.equal(decision.state.trigger, "repeated_tool_call");
+});

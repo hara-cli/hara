@@ -7,7 +7,7 @@ export interface PiProtectedProcessBoundary {
   drain(): Promise<void>;
 }
 type Frame = Record<string, any>;
-interface Pending { command?: string; resolve(value: any): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }
+interface Pending { command?: string; resolve(value: any): void; reject(error: Error): void; timer?: ReturnType<typeof setTimeout> }
 export class PiRpcProcess {
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly pending = new Map<string, Pending>();
@@ -23,7 +23,7 @@ export class PiRpcProcess {
   private protocolFailed = false;
   private stderr = "";
   constructor(private readonly input: { command: string; args: string[]; env: NodeJS.ProcessEnv; cwd: string;
-    boundary: PiProtectedProcessBoundary; configuration?: unknown; timeoutMs: number; signal: AbortSignal; onFrame(frame: Frame): void; onAccepted(): void }) {
+    boundary: PiProtectedProcessBoundary; configuration?: unknown; timeoutMs: number; governedPrompt?: boolean; signal: AbortSignal; onFrame(frame: Frame): void; onAccepted(): void }) {
     if (input.signal.aborted) throw new Error("interrupted");
     const owned = input.boundary.spawn(input);
     this.child = owned.child; this.ready = owned.ready;
@@ -102,7 +102,7 @@ export class PiRpcProcess {
     if (this.settled || this.input.signal.aborted || Buffer.byteLength(message) > 256 * 1024) throw new Error("Pi RPC prompt refused");
     this.lastAssistant = undefined;
     const done = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.reject(new Error("Pi RPC turn timeout")); void this.close().catch(() => {}); }, this.input.timeoutMs);
+      const timer = this.input.governedPrompt ? undefined : setTimeout(() => { this.reject(new Error("Pi RPC turn timeout")); void this.close().catch(() => {}); }, this.input.timeoutMs);
       this.settled = { resolve, reject, timer };
     });
     void done.catch(() => {});
