@@ -25,8 +25,11 @@ export async function createWorkspaceMcpEndpoint(input: {
   call(name: string, args: Record<string, unknown>): Promise<ToolResult>;
   /** Host-owned process secret. Each endpoint still has an immutable attempt/lease closure. */
   bearerToken?: string;
+  /** Host deadline; authentication never extends beyond the attempt. */
+  expiresAt?: number;
 }): Promise<WorkspaceMcpEndpoint> {
   input.assertCurrent();
+  if (input.expiresAt !== undefined && (!Number.isFinite(input.expiresAt) || input.expiresAt <= Date.now())) throw new Error("Workspace MCP attempt expired");
   if (input.signal.aborted) throw new Error("Workspace MCP attempt ended");
   if (input.bearerToken !== undefined && !/^[a-f0-9]{64}$/.test(input.bearerToken)) throw new Error("Invalid Workspace MCP bearer");
   let token = input.bearerToken ?? randomBytes(32).toString("hex"), closed = false, closing: Promise<void> | undefined;
@@ -38,7 +41,7 @@ export async function createWorkspaceMcpEndpoint(input: {
   const server = new Server({ name: "hara", version: "1.0.0" }, { capabilities: { tools: { listChanged: true } },
     instructions: "These are the frozen tools of this Hara Workspace attempt. Hara governs every call, including task understanding, budgets, evidence and Desk confirmation. Never infer approval from MCP connectivity. " + CLI_TOOL_GUIDANCE });
   const assertLive = () => {
-    if (closed || input.signal.aborted) throw new Error("Workspace MCP attempt ended");
+    if (closed || input.signal.aborted || input.expiresAt !== undefined && Date.now() >= input.expiresAt) throw new Error("Workspace MCP attempt ended");
     input.assertCurrent();
   };
   const safeRequest = async <T>(operation: () => Promise<T>): Promise<T> => {

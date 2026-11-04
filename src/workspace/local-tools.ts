@@ -1,3 +1,4 @@
+import { decorateWorkspaceExtensionTool } from "./extension-binding.js";
 import { createHash } from "node:crypto";
 import { lstatSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
@@ -9,7 +10,7 @@ import { exact, plain, text } from "./local-state.js";
 /** Transport IDs are easy for a model to miscopy. Repeat the actual host-owned ID inside a successful
  * structured result; this is a citation hint, NOT evidence authority. The engine ledger still checks it. */
 export function withWorkspaceToolReceipts(tools: Tool[]): Tool[] {
-  return tools.map(tool => ({ ...tool, async run(input, ctx) {
+  return tools.map(tool => decorateWorkspaceExtensionTool(tool, { ...tool, async run(input, ctx) {
     if (ctx.toolCallId !== undefined && !text(ctx.toolCallId, 240)) throw new Error("invalid Workspace tool receipt id");
     const result = await tool.run(input, ctx);
     if (!ctx.toolCallId) return result;

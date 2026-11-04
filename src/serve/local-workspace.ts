@@ -1,3 +1,5 @@
+import type { WorkspaceMcpLaunchProvider } from "../workspace/extension-candidate.js";
+import type { ReviewedMcpSource } from "../workspace/extension-review.js";
 import { isRuntimePermissionTier } from "../agent-runtime/execution-policy.js";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
@@ -18,7 +20,7 @@ function tokenMatches(actual: unknown, expected: string): boolean {
   if (typeof actual !== "string" || !/^[a-f0-9]{64}$/.test(actual) || actual.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
 }
-export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; hostHome?: string; discoveryHome?: string; legacySourceHome?: string; credentialVault?: CredentialVault; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; extensionCatalog?: ExtensionCatalogProvider; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1] }): Promise<ServeHandle> {
+export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; hostHome?: string; discoveryHome?: string; legacySourceHome?: string; credentialVault?: CredentialVault; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; extensionCatalog?: ExtensionCatalogProvider; reviewedMcpSources?: () => readonly ReviewedMcpSource[]; mcpReviewHome?: string; mcpLaunchCandidate?: WorkspaceMcpLaunchProvider; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1] }): Promise<ServeHandle> {
   if (opts.host !== "127.0.0.1" || !Number.isSafeInteger(opts.port) || opts.port < 0 || opts.port > 65535) throw new Error("Workspace Dev listens only on explicit IPv4 loopback");
   const token = opts.token ?? randomBytes(32).toString("hex");
   if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("invalid Workspace Dev transport token");
@@ -26,7 +28,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
   const clients = new Map<WebSocket, { id: string; initialized: boolean }>();
   let closing = false;
   const capability = input.mode === "workspace" ? "workspace.v1" : CAPABILITY;
-  const host = new LocalWorkspaceHost(input.root, { mode: input.mode, hostHome: input.hostHome, discoveryHome: input.discoveryHome, legacySourceHome: input.legacySourceHome, credentialVault: input.credentialVault, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, extensionCatalog: input.extensionCatalog, runtimeInstallerOptions: input.runtimeInstallerOptions, onChange(event) {
+  const host = new LocalWorkspaceHost(input.root, { mode: input.mode, hostHome: input.hostHome, discoveryHome: input.discoveryHome, legacySourceHome: input.legacySourceHome, credentialVault: input.credentialVault, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, extensionCatalog: input.extensionCatalog, reviewedMcpSources: input.reviewedMcpSources, mcpReviewHome: input.mcpReviewHome, mcpLaunchCandidate: input.mcpLaunchCandidate, runtimeInstallerOptions: input.runtimeInstallerOptions, onChange(event) {
     for (const [client, state] of clients) if (state.initialized && client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ jsonrpc: "2.0", method: "workspace.changed", params: event }));
   } });
   await host.initialize();
@@ -56,11 +58,15 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (!plain(params)) throw new Error("invalid Workspace RPC parameters");
     if (method === "initialize") {
       if (!tokenMatches(params.token, token)) throw new Error("unauthorized");
+      if (params.clientCapabilities !== undefined && (!Array.isArray(params.clientCapabilities) || params.clientCapabilities.length > 32
+        || !params.clientCapabilities.every(value => typeof value === "string" && value.length <= 100))) throw new Error("invalid client capabilities");
+      host.setExtensionClientCapability(client.id, Array.isArray(params.clientCapabilities) && params.clientCapabilities.includes("workspace.extensions.manager.v1"));
+      host.setExtensionOwnerReviewCapability(client.id, Array.isArray(params.clientCapabilities) && params.clientCapabilities.includes("workspace.extensions.owner-review.v1"));
       client.initialized = true;
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, capabilities: [capability, "workspace.extensions.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, capabilities: [capability, "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
@@ -129,6 +135,22 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       fields(["workspaceId", "expectedGeneration", "channelId", "requestId"]);
       if (typeof params.channelId !== "string" || !UUID.test(params.channelId) || typeof params.requestId !== "string" || !UUID.test(params.requestId)) throw new Error("invalid local channel receipt");
       return host.channelReceipt(workspaceId, params.channelId, params.requestId);
+    }
+    if (method === "workspace.extensions.review.list") { fields(["workspaceId", "expectedGeneration"]); return host.mcpOwnerReviews(client.id, workspaceId); }
+    if (method === "workspace.extensions.review.cancel") {
+      fields(["workspaceId", "expectedGeneration", "recordId"]); if (!text(params.recordId, 80)) throw new Error("Invalid review record");
+      return host.cancelMcpOwnerReview(client.id, workspaceId, params.recordId);
+    }
+    if (method === "workspace.extensions.review.describe") {
+      fields(["workspaceId", "expectedGeneration", "recordId"]); if (!text(params.recordId, 80)) throw new Error("Invalid review record");
+      return host.describeMcpOwnerReview(client.id, workspaceId, params.recordId);
+    }
+    if (["workspace.extensions.review.inspect", "workspace.extensions.review.approve", "workspace.extensions.review.revoke"].includes(method)) {
+      fields(["workspaceId", "expectedGeneration", "recordId", "confirmed"]);
+      if (!text(params.recordId, 80) || typeof params.confirmed !== "boolean") throw new Error("Invalid review decision");
+      if (method.endsWith(".inspect")) return host.inspectMcpOwnerReview(client.id, workspaceId, params.recordId, params.confirmed);
+      if (method.endsWith(".approve")) return host.approveMcpOwnerReview(client.id, workspaceId, params.recordId, params.confirmed);
+      return host.revokeMcpOwnerReview(client.id, workspaceId, params.recordId, params.confirmed);
     }
     if (method === "workspace.extensions.list") {
       fields(["workspaceId", "expectedGeneration"]); return host.workspaceExtensions(workspaceId);

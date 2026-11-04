@@ -11259,3 +11259,44 @@ Final verification: build-pass.log succeeded; focused-pass.log contains 27/27 pa
 - Verification: Build and 74 focused tests pass serially, including native initialize/thread-start without turn-start. Synthetic HOME plus loopback catalog probes confirm new/updated metadata persistence, online refresh on restart, fail-closed explicit-catalog invalidation persisted to disk, expired-cache refresh, and unchanged auth/config/system-skill sentinels. Real model calls: 0.
 - Probe lessons: Built-in provider IDs cannot be overridden in 0.163.0; use a named synthetic provider with model_catalog_url for a local fixture. App Server's refresh worker fetches online on startup, and explicit-catalog failures invalidate rather than fall back; neither cache reuse nor offline fallback may be inferred from a successful write. Empty optional etag is omitted when serialized. Failed exploration logs were retained. A new protected-root negative initially omitted wrap.env; its unspawned ownership guard correctly failed close. Supply the fixture env; do not weaken the common drain boundary.
 - Related Files: src/agent-runtime/execution-policy.ts, src/agent-runtime/codex-host-config.ts, test/codex-host-startup.test.mjs, test/reply-latency-defaults.test.mjs
+
+
+## [ERR-20261104-MANAGED-MCP-BOUNDARY] Protected stdio and actual runtime fixture contracts
+
+**Logged**: 2026-11-04
+**Priority**: high
+**Status**: resolved; local verification only
+**Area**: Workspace MCP admission, process boundary, tests
+
+### Summary
+
+A reviewed source must bind actual code and schema, then use the common guarded process owner and governor. Passing a scripted response or using a different guard label is insufficient.
+
+### Errors and corrections
+
+- Seatbelt rejects a numeric address in its `remote ip` host filter. Use its supported localhost/port filter while pinning the Workspace proxy URL to IPv4 loopback; retain kernel denial of every other outbound port and no direct fallback.
+- The common process boundary recognizes the canonical `hara-native-guard` and exact guard script. A new label caused a correctly unowned process rejection; reuse the common owner/drain rather than bypassing it.
+- A data-read allowlist needs a literal root-directory read for dyld startup. Missing it aborted Node before script execution. This grants no descendant file reads. Allow actual system libraries, never all `/System` including `/System/Volumes/Data`; deny other Workspace data, credential paths, Keychain services and hard links.
+- The review hasher rejects non-regular files before opening and uses O_NONBLOCK against FIFO replacement races; a real synthetic named pipe proves bounded rejection. It rejects credential files/directories before content reads. A Host review record is separate from both Workspace grants and one-call approval; metadata, annotations or recomputed changed digests cannot grant execution.
+- Scripted Host fixtures must create the private root, use the bound model, cite observed toolCallId values and supply the full Pi RPC completion shape including evidence. Fix the fixture; preserve the completed-state assertion and external result `verified:false`.
+- Optional catalog failure must invalidate every extension tool while keeping the ordinary governed core usable; never let a stale review library block all conversations. A real Host greeting verifies this without an MCP spawn.
+- Check actual inventory names for duplicates as well as count and digest. `tools/list_changed` freezes the connection. Recheck authorization after an awaited result, not only before dispatch.
+- Approval displays the entire redacted bounded input; an unseen truncated tail cannot be treated as an approved target. Unknown outcomes remain protected against replay after restart.
+
+### Verification and prevention
+
+Real task-owned stdio, proxy/direct and credential canaries, common drain, actual Pi SDK/RPC and synthetic Codex/Claude executables exercised the Host/governor path. Core focused 50/50 plus final admission/RPC/availability guards 5/5; Desk focused 40/40 and both builds passed under serial low-priority execution. Synthetic executables do not establish authenticated vendor compatibility, release readiness or visual product acceptance. Keep unsupported platforms non-callable; never substitute an unprotected transport or real credentials after an isolated fixture error.
+
+
+## [ERR-20261104-MCP-OWNER-REVIEW] Frozen human review and stale renderer callbacks
+
+- Logged: 2026-11-04
+- Status: resolved in local owner-review branch; integration/release remain HOLD
+- Area: Workspace MCP admission, renderer lifecycle and synthetic fixtures
+- Owner review is separate from executable discovery, Workspace/agent grants and individual calls. Freeze code before an explicitly confirmed bounded startup; inspect only initialize/tools/list, drain, then approve the same code and exact observed schema. Keep optional protocol metadata in the fingerprint without trusting readOnlyHint; inspected tools default to exec.
+- A catalog reload initially reused a prior proposal after its code changed. Reload now cancels/discards the client's previous records and issues new opaque IDs. Changed code/config/library/proxy cannot be rebased into an approval. New review nonces prevent identical-code reapproval from reviving old two-level grants; persisted invalidation checks the original revision so a late notification cannot revoke a newer record.
+- Disabled controls alone did not stop a retained pre-error renderer callback from retrying an unknown inspection. A mutable halted/pending/scope fence now makes that callback inert until explicit read-back. Closing or switching cancels the record and discards late results. Keep user permission drafts behind an independent edit/review lock.
+- Main agent IDs/rows are nullable; narrow both before creating a trusted owner context. Channel identity belongs to the Core session selection, not the renderer's agent DTO. Server-side authenticated local Main ownership remains authoritative.
+- New synthetic fixtures initially omitted the private Host root and then returned a provider model different from the frozen connection model. These were fixture errors, corrected without loosening Host admission. Cleanup hooks must be registered before later setup can fail. One failed runner's exact owned process/cwd was verified and terminated; unrelated compile sessions were untouched. Retain failure logs.
+- Proxy changes may reject an old opaque record as view_changed before the proxy-specific fence; assert the actual fail-closed contract. Unsupported credential/header/environment/OAuth/HTTP sources and shell/install/inline launchers explain refusal without starting a child. A read-only/unavailable proxy cannot prevent fresh permission removal.
+- Final source builds and owner tests passed (12/12, including actual full native read/write/replace/delete denial on the review library). The earlier combined run was 61/62: all 51 existing regression cases passed; its one owner assertion was corrected and the full owner file passed separately. Desk focused 48/48 and real Desk handler/model/socket-to-Host stdio smoke passed. No real user MCP config, model keys, Keychain, install, Feishu, merge, push or release was used. Headless handlers/static markup do not establish native visual acceptance.

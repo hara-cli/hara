@@ -1,3 +1,4 @@
+import { decorateWorkspaceExtensionTool, isWorkspaceExtensionTool } from "./extension-binding.js";
 import type { CompletionEvidenceLedger } from "../agent/completion-evidence.js";
 import { createWorkspaceCompletionEvidence } from "./completion-evidence-store.js";
 import type { RuntimeExecutionPolicy, NativeWorkspaceEvidence, RuntimeRiskEvent } from "../agent-runtime/execution-policy.js";
@@ -255,8 +256,8 @@ export function bindWorkspaceRunOptions(permit: WorkspaceRunPermit, input: Omit<
     || input.signal !== state.signal || !input.taskIntake) throw new Error("Workspace run contains unscoped dependencies");
   const extraTools = input.extraTools?.map(tool => {
     if (!state.tools.has(tool.name) || ["task_intake", "task_checkpoint", "todo_write"].includes(tool.name)
-      || tool.kind === "exec" || tool.kind === "computer") throw new Error("unscoped Workspace extra tool");
-    return Object.freeze({ ...tool });
+      || (tool.kind === "exec" || tool.kind === "computer") && !isWorkspaceExtensionTool(tool)) throw new Error("unscoped Workspace extra tool");
+    return Object.freeze(decorateWorkspaceExtensionTool(tool, { ...tool }));
   }) ?? [];
   const options: RunOpts = { ...input, ctx: Object.freeze({ ...input.ctx, stateHome: state.stateHome, writeBoundary: state.cwd,
     ...(input.ctx.ui ? { ui: Object.freeze({ ...input.ctx.ui }) } : {}) }),
