@@ -51,7 +51,7 @@ test("formal six-step Host flow uses an explicit mock Provider; no DEV flags, la
     assert.throws(() => new LocalWorkspaceHost(dir(), { mode: "workspace", realKeyFile: "/not-read" }), /cannot inherit/);
   } finally { await restored?.close(); await host.close(); }
 });
-test("one LocalJob offers only one agent_create confirmation and softly refuses a second attempt", async t => {
+test("confirmed colleague creation finishes the LocalJob before a second model proposal", async t => {
   const events = new EventEmitter(), root = dir();
   const host = new LocalWorkspaceHost(root, { mode: "workspace", credentialVault: new MemoryCredentialVault(),
     onChange: event => events.emit("change", event), providerFactory(connection, binding, context) {
@@ -77,10 +77,8 @@ test("one LocalJob offers only one agent_create confirmation and softly refuses 
     const view = host.snapshot(id, main, "client");
     const receipts = view.conversation.history.filter(row => row.role === "tool").flatMap(row => row.results).filter(row => row.name === "agent_create");
     assert.equal(view.approvals.length, 0); assert.equal(view.agents.length, 2);
-    assert.equal(receipts.length, 2); assert.equal(receipts[0].isError, false); assert.equal(receipts[1].isError, false);
-    const refusal = JSON.parse(receipts[1].content);
-    assert.equal(refusal.created, false); assert.equal(refusal.refused, "turn_limit");
-    assert.equal(refusal.humanConfirmed, false); assert.equal(refusal.limit, 1);
+    assert.equal(receipts.length, 1); assert.equal(receipts[0].isError, false);
+    assert.equal(JSON.parse(receipts[0].content).approvalState, "consumed");
   } finally { await host.close(); }
 });
 

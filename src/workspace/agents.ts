@@ -40,6 +40,7 @@ export interface WorkspaceAgentPersonaInput {
 export interface WorkspaceAgentCreateInput extends WorkspaceAgentPersonaInput {
   username: string;
   runtimeId?: AgentRuntimeId;
+  permissionTier?: RuntimePermissionTier;
 }
 /** Private immutable configuration, never a renderer/catalog DTO. */
 export interface WorkspaceAgentConfiguration {
@@ -277,10 +278,11 @@ export class WorkspaceAgentStore {
   }
   create(input: WorkspaceAgentCreateInput, expectedCatalogRevision: number): WorkspaceAgentView {
     this.binding();
-    if (!object(input) || !keys(input, ["username", "profile"], ["description", "instructions", "runtimeId"])
+    if (!object(input) || !keys(input, ["username", "profile"], ["description", "instructions", "runtimeId", "permissionTier"])
       || typeof input.username !== "string" || !USERNAME.test(input.username) || ["main", "hara"].includes(input.username)
       || !positive(expectedCatalogRevision)) throw new Error("invalid Workspace Agent creation");
-    const { username, runtimeId = "pi", ...fields } = input;
+    if (input.permissionTier !== undefined && !isRuntimePermissionTier(input.permissionTier)) throw new Error("invalid Workspace Agent permission tier");
+    const { username, runtimeId = "pi", permissionTier = "full-protected", ...fields } = input;
     const normalized = persona(fields, username);
     if (!isAgentRuntimeId(runtimeId)) throw new Error("invalid Workspace Agent Runtime");
     this.runtimes.assertAvailable(runtimeId);
@@ -289,7 +291,7 @@ export class WorkspaceAgentStore {
       if (!value || value.revision !== expectedCatalogRevision) throw new Error("Workspace Agent catalog changed; reload before creating");
       if (value.agents.some(row => row.username === username)) throw new Error("Workspace Agent username is retained; restore the exact archived colleague or choose another");
       const row: AgentRecord = { agentId: `ag_${randomUUID()}`, username, kind: "colleague", state: "active", epoch: 1,
-        currentConfigRevision: 1, configurations: [configuration(normalized, 1, runtimeId)] };
+        currentConfigRevision: 1, configurations: [configuration(normalized, 1, runtimeId, undefined, permissionTier)] };
       value.agents.push(row); this.advance(value); this.persist(loaded, value);
       return this.view(row);
     });
