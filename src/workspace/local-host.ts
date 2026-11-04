@@ -33,6 +33,7 @@ import { WorkspaceContextReceipts } from "./context-receipts.js";
 import { WorkspaceContextAudit } from "./context-audit.js";
 import { pruneWorkspaceExecutionAudits } from "./execution-audit.js";
 import { prepareWorkspaceStartContext } from "./start-context.js";
+import { prepareWorkspaceProjectLocations } from "./project-locations.js";
 import { WorkspaceColleagueReferences } from "./colleague-references.js";
 import { WorkspaceUserInteraction, workspacePermissionInteraction, type WorkspaceInteractionRequest, type WorkspaceUserQuestion } from "./user-interaction.js";
 import { boundWorkspaceText } from "./model-context.js";
@@ -1137,6 +1138,7 @@ export class LocalWorkspaceHost {
       const startContext = prepareWorkspaceStartContext({ storage: context.storage,
         personalHome: this.options.mode === "workspace" ? this.options.hostHome : undefined,
         workspaceRoots: context.resources.memory.roots(context.project),
+        projectLocations: prepareWorkspaceProjectLocations({ storage: context.storage, project: context.project, history: value.history, objective: task.objective }),
         references: new WorkspaceColleagueReferences(context.storage, () => context.resources.agents.references()).read(), objective: task.objective });
       interaction.prepared();
       if (startContext.initialQuestion && !interaction.hasReferenceAnswer()) {
@@ -1196,6 +1198,7 @@ export class LocalWorkspaceHost {
           + `Reply naturally in the user's language. Call AI coworkers 同事, not Pi 同事; pi is only an internal runtime. A greeting needs no tools.\n`
           + `${owned.startContext.prompt}\n`
           + `Use workspace_context_lookup to resolve missing names and aliases. Core pauses after two unresolved lookups or a budget warning. Use ask_user for a real problem or material ambiguity; never guess a user answer.\n`
+          + "For a genuinely ambiguous project/folder, reuse the evidenced projectLocations.options with its otherOption in ask_user. These catalog-only hints do not grant file access; never invent a path or ask for one already identified.\n"
           + `For creation use agent_create and wait for the human card; for delegation use agent_contact with an existing exact agentId.\n`
           + `每轮最多建立一位同事。\n`
           + `For a requested rename use agent_rename on the resolved existing colleague; the new name is not a reference to look up.\n`

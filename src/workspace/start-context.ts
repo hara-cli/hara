@@ -8,6 +8,7 @@ import { readWorkspaceResourceText, type WorkspaceResourceStorage } from "./reso
 import type { Tool } from "../tools/registry.js";
 import { exact, plain, text } from "./local-state.js";
 import { workspaceRenameTargetQuestion } from "./user-interaction.js";
+import type { WorkspaceProjectLocations } from "./project-locations.js";
 
 export interface WorkspaceColleagueReference { agentId: string; name: string; aliases: string[]; state: string; title?: string; mergedInto?: string }
 interface Note { source: "personal_global" | "workspace"; ref: string; snippet: string }
@@ -67,7 +68,7 @@ export function readPersonalContext(home: string | undefined): { text: string; a
  * not a reason to pause a greeting. Only observed unresolved lookups enter the interaction gate. */
 export function prepareWorkspaceStartContext(input: {
   storage: WorkspaceResourceStorage; personalHome?: string; workspaceRoots: readonly string[];
-  references: WorkspaceColleagueReference[]; objective: string;
+  references: WorkspaceColleagueReference[]; objective: string; projectLocations?: WorkspaceProjectLocations;
 }) {
   const personal = input.storage.scope.authority.kind === "local" ? readPersonalContext(input.personalHome) : { text: "", available: false };
   const notes: Note[] = [];
@@ -105,7 +106,7 @@ export function prepareWorkspaceStartContext(input: {
     // The requested new name is not a missing reference. Report that explicitly so it never counts
     // toward the unresolved-lookup gate; the existing colleague still needs its own evidence.
     if (rename && needle === normalize(rename.newName) && !references.some(row => [row.name, ...row.aliases].some(value => normalize(value) === needle)))
-      return { status: "rename_new_name", historicalContextOnly: true, candidates: [], hits: [], personalGlobalAvailable: personal.available, truncated,
+      return { status: "rename_new_name", historicalContextOnly: true, ...(input.projectLocations ? { projectLocations: input.projectLocations } : {}), candidates: [], hits: [], personalGlobalAvailable: personal.available, truncated,
         note: "This is the requested new display name, not an existing colleague. Resolve only the current colleague, then use agent_rename." };
     let matches = references.filter(row => [row.name, ...row.aliases, row.agentId, label(row)].some(value => normalize(value) === needle));
     const role = needle.replace(ROLE_FILLER, " ").replace(/\s+/g, " ").trim();
@@ -124,7 +125,7 @@ export function prepareWorkspaceStartContext(input: {
     const status = ids.size > 1 ? "ambiguous" : missingTarget || (rosterTruncated && !exactIdentity) ? "unavailable"
       : ids.size === 1 || hits.length ? "resolved" : unavailable || truncated || !personal.available ? "unavailable" : "missing";
     // During a rename request an ambiguous current colleague becomes a rename-target choice card.
-    return { status, historicalContextOnly: true, candidates, hits, personalGlobalAvailable: personal.available, truncated,
+    return { status, historicalContextOnly: true, ...(input.projectLocations ? { projectLocations: input.projectLocations } : {}), candidates, hits, personalGlobalAvailable: personal.available, truncated,
       ...(rename && status === "ambiguous" ? { renameTo: clean(rename.newName, 120) } : {}) };
   };
   const objective = normalize(input.objective);
@@ -156,7 +157,7 @@ export function prepareWorkspaceStartContext(input: {
     .some(name => normalize(name).length >= 2 && objective.includes(normalize(name))));
   const roster = [...references].sort((a, b) => mentioned(b) - mentioned(a));
   const personalNotes = selected.filter(row => row.source === "personal_global").slice(0, 4), workspaceNotes = selected.filter(row => row.source === "workspace").slice(0, 4);
-  const packet = { untrustedContextOnly: true, personalGlobalAvailable: personal.available, workspaceAvailable: !unavailable,
+  const packet = { untrustedContextOnly: true, ...(input.projectLocations ? { projectLocations: input.projectLocations } : {}), personalGlobalAvailable: personal.available, workspaceAvailable: !unavailable,
     truncated: truncated || roster.some(row => row.aliases.length > 4 || Buffer.byteLength(row.name) > 120 || row.aliases.some(alias => Buffer.byteLength(alias) > 120)),
     ...(rename ? { renameRequest: { target: boundContextUtf8(rename.target, 120), newName: boundContextUtf8(rename.newName, 120) } } : {}),
     colleagues: roster.map(({ name, aliases, state, agentId, title, mergedInto }) => ({ name: boundContextUtf8(name, 120), ...(title ? { title: boundContextUtf8(title, 80) } : {}),
