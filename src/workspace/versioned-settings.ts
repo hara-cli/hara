@@ -95,6 +95,14 @@ export class VersionedSettings<T extends State> {
           return { value: structuredClone(value), readOnly: false, recovered: false, migrationPending: false };
         } catch { /* Re-read and apply the existing recovery/pending rules under the lock. */ }
       }
+    } else {
+      // A never-configured default is also read-only work. Missing primary WITH a backup still
+      // takes the recovery lock; I/O/identity errors are never converted into absence.
+      const backup = this.file(this.backupName());
+      if (!backup.snapshot && !this.file().snapshot) {
+        file.assertCurrent(); backup.assertCurrent();
+        return { value: structuredClone(this.empty()), readOnly: false, recovered: false, migrationPending: false };
+      }
     }
     return withPrivateStateLockSync(this.home(), [], this.filename.slice(0, -5), () => {
       const { value, readOnly, recovered, migrationPending } = this.load(); return { value: structuredClone(value), readOnly, recovered, migrationPending };
