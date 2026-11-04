@@ -29,7 +29,10 @@ export function codexHostToolOverrides(home: string, runtimeHome = join(home, ".
       names.add(name);
     }
   }
-  return [...names].sort().flatMap(name => ["-c", `mcp_servers.${JSON.stringify(name)}.enabled=false`]).concat([
+  // Codex CLI overrides replace each named table rather than merging its transport. An
+  // enabled=false-only table fails validation before initialize (0.163.0). Replace the
+  // whole entry with a valid, inert disabled transport; never inherit its command/env/URL.
+  return [...names].sort().flatMap(name => ["-c", `mcp_servers.${JSON.stringify(name)}={enabled=false,command="hara-disabled-global-mcp"}`]).concat([
     "-c", "features.plugins=false", "-c", "features.hooks=false", "-c", "features.codex_hooks=false",
     "-c", "hooks={}", "-c", "notify=[]", "-c", "features.multi_agent=false", "-c", "features.in_app_local_automation=false", "-c", "features.remote_control=false", "-c", "features.unified_exec=false",
   ]);

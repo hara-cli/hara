@@ -94,7 +94,7 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
           try {
             const result = await session.launch(endpoint, prompt, turnArgs, { model, effort, cwd: options.ctx.cwd, signal: native.signal, assertCurrent, activity });
             if (!result.ok) return native.signal.aborted || result.errorCode === "interrupted" ? result : { ...result,
-              runtimeFailure: tracker.failed(result.nativeFailureKind ?? classifyRuntimeFailure({ code: result.errorCode }), Date.now() - started) };
+              runtimeFailure: tracker.failed(result.nativeFailureKind ?? classifyRuntimeFailure({ code: result.errorCode }), Date.now() - started, result.errorFirstLine) };
             tracker.succeeded();
             if (!native.signal.aborted) successfulUse = installer.captureSuccessfulUse(id, resolved.command);
             return result;
@@ -132,7 +132,7 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
           const launch = policy.wrap({ command: resolved.command, env, args });
           if (id === "claude") launch.env = claudeRuntimeEnvironment(launch.env, policy.tempRoot);
           const result = await runExternalCommandCapture(launch, launch.args, {
-            cwd: options.ctx.cwd, signal: native.signal, waitForClose: true, failureKind: "runtime", proxyUrl: resolved.proxyUrl, timeoutMs: Number(options.timeoutMs) || 120_000,
+            cwd: options.ctx.cwd, signal: native.signal, waitForClose: true, failureKind: "runtime", captureErrorFirstLine: true, proxyUrl: resolved.proxyUrl, timeoutMs: Number(options.timeoutMs) || 120_000,
             maxOutputBytes: 2 * 1024 * 1024, onSpawn: observer.onSpawn,
             onStdout: chunk => { observer.onStdout(chunk); activity(); }, retainStdoutOnFailure: true,
           });
@@ -157,7 +157,7 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
             if (native.signal.aborted || result.errorCode === "interrupted") return { ...result, ok: false, stdout: "", errorCode: "interrupted" };
             const kind = classifyRuntimeFailure({ code: eventFailure !== undefined && result.errorCode === "runtime_failed" ? undefined : result.errorCode,
               stderr: eventFailure, timedOut: result.timedOut });
-            return { ...result, ok: false, stdout: "", runtimeFailure: tracker.failed(kind, Date.now() - started) };
+            return { ...result, ok: false, stdout: "", runtimeFailure: tracker.failed(kind, Date.now() - started, result.errorFirstLine) };
           }
           tracker.succeeded();
           if (result.ok && !native.signal.aborted && runtimeUseProtocolSucceeded(id, result.stdout)) successfulUse = recordSuccessfulUse;

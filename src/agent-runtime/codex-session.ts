@@ -1,3 +1,4 @@
+import { runtimeErrorFirstLine } from "../security/runtime-error.js";
 import { classifyRuntimeFailure, type RuntimeFailureKind } from "./failure-diagnostics.js";
 import { createRuntimeExecutionPolicy, type RuntimeExecutionPolicy } from "./execution-policy.js";
 import { beginWorkspaceNativePolicy, endWorkspaceNativePolicy, observeWorkspaceNativeItem, workspaceRuntimePolicyInput, workspaceRuntimeProcessKey } from "./workspace-native-policy.js";
@@ -6,7 +7,7 @@ import { workspaceRunRuntimeStages } from "../workspace/execution.js";
 // Native context is reusable; Workspace execution capabilities are not. Each attempt has a fresh
 // immutable MCP endpoint, and an unloaded thread is resumed only after fresh Host admission.
 import { createHash, randomBytes } from "node:crypto";
-import { JsonlRpcClient, ExternalJsonlRpcRequestError, type ExternalCommandCaptureResult } from "../external-sessions/process.js";
+import { JsonlRpcClient, ExternalJsonlRpcRequestError, ExternalJsonlRpcTransportError, type ExternalCommandCaptureResult } from "../external-sessions/process.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { canonical, plain } from "../workspace/local-state.js";
 import type { WorkspaceResourceStorage } from "../workspace/resource-context.js";
@@ -25,7 +26,7 @@ const origin = (resolved: ReturnType<WorkspaceRuntimeInstaller["resolveBound"]>,
 const MAX_RESIDENT = 4, IDLE_MS = 5 * 60_000;
 interface ActiveTurn {
   id?: string; ready: Promise<string>; bind(id: string): void;
-  finish(ok: boolean, code?: string, kind?: RuntimeFailureKind): void; done: Promise<void>;
+  finish(ok: boolean, code?: string, kind?: RuntimeFailureKind, firstLine?: string): void; done: Promise<void>;
   activity(): void; assertCurrent(): void;
   text: string; settled: boolean;
 }
@@ -199,7 +200,8 @@ export class GovernedCodexSession {
         } else if (method === "turn/completed") {
           this.value.phase = turn.status === "completed" ? "idle" : "unknown"; this.save();
           active.finish(turn.status === "completed", turn.status === "interrupted" ? "interrupted" : "runtime_failed",
-            turn.status === "completed" ? undefined : classifyRuntimeFailure({ stderr: JSON.stringify(turn.error ?? {}).slice(0, 65_536) }));
+            turn.status === "completed" ? undefined : classifyRuntimeFailure({ stderr: JSON.stringify(turn.error ?? {}).slice(0, 65_536) }),
+            runtimeErrorFirstLine(object(turn.error).message, this.installer.resolveBound("codex").env));
         }
       } catch (error) {
         active.finish(false, error instanceof Error && error.message === "Workspace native token telemetry safety ceiling reached"
@@ -232,10 +234,10 @@ export class GovernedCodexSession {
       HARA_SUBPROCESS_ENV_ALLOW: [resolved.env.HARA_SUBPROCESS_ENV_ALLOW, WORKSPACE_MCP_TOKEN_ENV].filter(Boolean).join(",") };
     let finish!: ActiveTurn["finish"], bind!: ActiveTurn["bind"], done!: () => void;
     const terminal = new Promise<ExternalCommandCaptureResult>(resolve => {
-      finish = (ok, code, kind) => {
+      finish = (ok, code, kind, firstLine) => {
         if (active.settled) return;
         active.settled = true;
-        resolve({ ok, code: ok ? 0 : 1, timedOut: false, ...(!ok ? { errorCode: code ?? "runtime_failed", ...(kind ? { nativeFailureKind: kind } : {}) } : {}),
+        resolve({ ok, code: ok ? 0 : 1, timedOut: false, ...(!ok ? { errorCode: code ?? "runtime_failed", ...(firstLine ? { errorFirstLine: runtimeErrorFirstLine(firstLine, env) } : {}), ...(kind ? { nativeFailureKind: kind } : {}) } : {}),
           stdout: ok ? JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: redactToolSubprocessOutput(active.text, env) } }) : "" });
         done();
       };
@@ -261,12 +263,12 @@ export class GovernedCodexSession {
             "-c", 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="never"',
             ...codexHostToolOverrides(resolved.env.HOME!, resolved.env.CODEX_HOME, input.cwd, this.mcpName)];
         const launch = this.policy.wrap({ command: resolved.command, env, args: nativeArgs });
-        const client = JsonlRpcClient.start({ ...launch, timeoutMs: 10_000, maxOutputBytes: 64 * 1024 * 1024,
+        const client = JsonlRpcClient.start({ ...launch, captureErrorFirstLine: true, timeoutMs: 10_000, maxOutputBytes: 64 * 1024 * 1024,
           appServerArgs: launch.args,
           onSpawn: () => { try { endSpawn?.("completed"); } catch { /* Diagnostic only. */ } },
           onNotification: (method, params) => this.notification(client, method, params),
           onServerRequest: (_request, _reply, reject) => reject(-32601, "Use Hara Workspace tools and its governed approval channel"),
-          onClose: () => { if (this.client === client) { this.client = undefined; this.loaded = false; this.unload?.(); this.active?.finish(false, "runtime_failed"); } },
+          onClose: error => { if (this.client === client) { this.client = undefined; this.loaded = false; this.unload?.(); this.active?.finish(false, "runtime_failed", error instanceof ExternalJsonlRpcTransportError ? error.runtimeFailureKind : undefined, error instanceof ExternalJsonlRpcTransportError ? error.errorFirstLine : undefined); } },
         });
         this.client = client; this.exit = client.waitForClose(); void this.exit.catch(() => {});
         await client.call("initialize", { clientInfo: { name: "hara", version: "1.0.2" }, capabilities: { experimentalApi: true } });
@@ -291,7 +293,7 @@ export class GovernedCodexSession {
         });
       } catch (error) {
         if (resumed) { this.value.phase = "unknown"; this.save(); }
-        active.finish(false, resumed ? "codex_resume_failed_history_preserved" : "codex_thread_start_failed", error instanceof ExternalJsonlRpcRequestError ? error.runtimeFailureKind : "runtime_failed"); client.close(); return await terminal;
+        active.finish(false, resumed ? "codex_resume_failed_history_preserved" : "codex_thread_start_failed", error instanceof ExternalJsonlRpcRequestError || error instanceof ExternalJsonlRpcTransportError ? error.runtimeFailureKind : "runtime_failed", error instanceof ExternalJsonlRpcRequestError || error instanceof ExternalJsonlRpcTransportError ? error.errorFirstLine : undefined); client.close(); return await terminal;
       }
       const thread = object(response.thread);
       if (!nativeId(thread.id) || resumed && thread.id !== this.value.threadId || thread.cwd !== input.cwd
@@ -317,8 +319,8 @@ export class GovernedCodexSession {
       // Drain before the governor sees the final response or imports the final workspace diff.
       await this.settleNativeAttempt();
       return result;
-    } catch {
-      active.bind(""); active.finish(false, "codex_delivery_unknown_no_replay"); this.client?.close();
+    } catch (error) {
+      active.bind(""); active.finish(false, "codex_delivery_unknown_no_replay", error instanceof ExternalJsonlRpcRequestError || error instanceof ExternalJsonlRpcTransportError ? error.runtimeFailureKind : undefined, error instanceof ExternalJsonlRpcRequestError || error instanceof ExternalJsonlRpcTransportError ? error.errorFirstLine : undefined); this.client?.close();
       await this.settleNativeAttempt();
       const result = await terminal;
       return result.ok ? { ok: false, code: 1, timedOut: false, stdout: "", errorCode: "runtime_process_cleanup_unverified" } : result;

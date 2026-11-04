@@ -166,7 +166,7 @@ export class RuntimeExecutionPolicy {
     };
     const runtimeHome = input.runtimeHome ? physical(input.runtimeHome) : physical(roots[input.runtimeId]);
     const dirs: Record<RegisteredPolicyRuntime, string[]> = {
-      pi: ["sessions", "log", "tmp"], codex: ["sessions", "archived_sessions", "log", "tmp", "shell_snapshots"],
+      pi: ["sessions", "log", "tmp"], codex: ["sessions", "archived_sessions", "log", "tmp", "shell_snapshots", "thread-writer-locks"],
       claude: ["projects", "todos", "debug", "session-env", "shell-snapshots", "file-history", "cache", "plans", "paste-cache"],
       opencode: ["."], gemini: ["tmp", "history"], copilot: ["session-state", "logs"], cursor: ["chats"], kimi: ["sessions", "logs"], grok: ["sessions", "logs"],
     };
@@ -235,7 +235,9 @@ export class RuntimeExecutionPolicy {
       ...(input.runtimeId === "pi" ? [`(deny file-read-data ${quotedSubpaths(keychains)})`] : []),
     ];
     for (const root of forbidden) lines.push(`(deny file-read-data (require-all (subpath ${quote(root)}) ${isolated ? `(require-not (subpath ${quote(isolated)}))` : ""} ${root === haraRoot && managedWorkRoot ? `(require-not (subpath ${quote(managedWorkRoot)}))` : ""} ${readableExceptions}))`);
-    if (input.runtimeId === "codex") lines.push(`(allow file-write* (regex #${quote("^" + runtimeHome.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "/(state_[0-9]+|logs_[0-9]+)[.]sqlite(-wal|-shm)?$")}) (literal ${quote(join(runtimeHome, "history.jsonl"))}) (literal ${quote(join(runtimeHome, "session_index.jsonl"))}))`);
+    // Scheme normal strings consume the JSON-escaped path once. A # raw string would
+    // double-escape .codex and silently deny every SQLite file. Keep the basename set closed.
+    if (input.runtimeId === "codex") lines.push(`(allow file-write* (regex ${quote("^" + runtimeHome.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "/((state|logs|memories|queue|goals)_[0-9]+)[.]sqlite(-wal|-shm|-journal)?$")}) (literal ${quote(join(runtimeHome, "installation_id"))}) (literal ${quote(join(runtimeHome, "history.jsonl"))}) (literal ${quote(join(runtimeHome, "session_index.jsonl"))}))`);
     if (piAuth) lines.push(`(allow file-write* (require-all (literal ${quote(join(runtimeHome, "auth.json.lock"))}) (vnode-type DIRECTORY)))`,
       `(deny file-write* ${literals([piAuth, join(runtimeHome, "models.json"), join(runtimeHome, "settings.json")])})`);
     // Denials come last as well: no native state exception may open Hara or credential writes.

@@ -1,3 +1,4 @@
+import { runtimeErrorFirstLine } from "../security/runtime-error.js";
 import { runtimeProxyFailureFromText } from "../security/runtime-proxy.js";
 import { classifyRuntimeFailure } from "../agent-runtime/failure-diagnostics.js";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
@@ -42,7 +43,9 @@ export interface ExternalCommandCaptureResult {
   timedOut: boolean;
   /** A bounded machine-readable code only. Provider stderr is never returned. */
   errorCode?: string;
-  /** Fixed-field runtime diagnostic; never contains provider output. */
+  /** Redacted, bounded first native error line, only for runtime diagnostics. */
+  errorFirstLine?: string;
+  /** Fixed-field runtime diagnostic plus an optional redacted first line. */
   runtimeFailure?: string;
   nativeFailureKind?: ReturnType<typeof classifyRuntimeFailure>;
 }
@@ -64,6 +67,8 @@ export interface ExternalCommandRunOptions {
   retainStdoutOnFailure?: boolean;
   /** Opt-in, allowlisted classification. Raw stderr never crosses this boundary. */
   failureKind?: "registered-cli" | "runtime";
+  /** Host runtime adapters opt in to the redacted first-line diagnostic. */
+  captureErrorFirstLine?: boolean;
   /** Explicit Workspace proxy only; enables evidence-based proxy diagnostics without exposing stderr. */
   proxyUrl?: string | null;
 }
@@ -205,7 +210,7 @@ export async function runExternalCommandCapture(
         stdout: code === 0 || run.retainStdoutOnFailure === true ? stdout : "",
         code,
         timedOut: false,
-        ...(code === 0 ? {} : { errorCode: runtimeProxyFailureFromText(stderr, Boolean(run.proxyUrl))
+        ...(code === 0 ? {} : { ...(run.captureErrorFirstLine ? { errorFirstLine: runtimeErrorFirstLine(stderr, options.env) } : {}), errorCode: runtimeProxyFailureFromText(stderr, Boolean(run.proxyUrl))
           ?? (run.failureKind === "runtime" ? classifyRuntimeFailure({ stderr, code: safeExternalErrorCode(stderr), ...(signal ? { signal } : {}) })
             : (run.failureKind === "registered-cli" ? registeredCliFailureCode(stderr) : undefined) ?? safeExternalErrorCode(stderr) ?? "command_failed") }),
       });
@@ -548,13 +553,19 @@ export interface JsonlRpcRequest {
 
 /** Sanitized provider RPC failure. The numeric code is safe for capability fallback; raw data stays local. */
 export class ExternalJsonlRpcRequestError extends Error {
-  constructor(readonly code: number, readonly runtimeFailureKind: ReturnType<typeof classifyRuntimeFailure> = "runtime_failed") {
+  constructor(readonly code: number, readonly runtimeFailureKind: ReturnType<typeof classifyRuntimeFailure> = "runtime_failed", readonly errorFirstLine?: string) {
     super("external session adapter request failed");
     this.name = "ExternalJsonlRpcRequestError";
   }
 }
 
+/** Transport failure retains only a safe diagnostic; raw stderr never leaves its client. */
+export class ExternalJsonlRpcTransportError extends Error {
+  constructor(message: string, readonly runtimeFailureKind: ReturnType<typeof classifyRuntimeFailure>, readonly errorFirstLine?: string) { super(message); }
+}
+
 export interface JsonlRpcClientOptions extends ExternalCommandOptions {
+  captureErrorFirstLine?: boolean;
   cwd?: string;
   signal?: AbortSignal;
   jsonRpcVersion?: "2.0";
@@ -589,6 +600,7 @@ export class JsonlRpcClient {
   private readonly requestTimeoutMs: number;
   private readonly maxOutputBytes: number;
   private readonly pending = new Map<number, PendingJsonlRequest>();
+  private stderr = "";
   private pendingText = "";
   private outputBytes = 0;
   private nextId = 1;
@@ -608,8 +620,8 @@ export class JsonlRpcClient {
     options.signal?.addEventListener("abort", this.abort, { once: true });
     if (options.signal?.aborted) this.abort();
     child.stdout?.on("data", (chunk: Buffer) => this.consume(chunk));
-    // Provider stderr may contain paths, native IDs or configuration data. Drain it without retaining it.
-    child.stderr?.on("data", () => {});
+    // Hold bounded native evidence locally, then expose only its redacted first line on failure.
+    child.stderr?.on("data", (chunk: Buffer) => { if (options.captureErrorFirstLine) this.stderr = boundedAppend(this.stderr, chunk.toString(), 65_536); });
     child.stdin?.on("error", () => this.fail("external session adapter input closed"));
     child.once("error", () => this.fail("external session adapter process failed"));
     child.once("close", (code) => {
@@ -723,6 +735,7 @@ export class JsonlRpcClient {
         pending.reject(new ExternalJsonlRpcRequestError(
           typeof providerCode === "number" && Number.isSafeInteger(providerCode) ? providerCode : -32_000,
           classifyRuntimeFailure({ stderr: JSON.stringify(record.error).slice(0, 65_536) }),
+          this.options.captureErrorFirstLine ? runtimeErrorFirstLine((record.error as Record<string, unknown>).message, this.options.env) : undefined,
         ));
       }
       else pending.resolve(record.result);
@@ -744,7 +757,8 @@ export class JsonlRpcClient {
     if (this.closed) return;
     this.closed = true;
     this.options.signal?.removeEventListener("abort", this.abort);
-    const error = new Error(message);
+    const error = new ExternalJsonlRpcTransportError(message, classifyRuntimeFailure({ stderr: this.stderr, timedOut: message.endsWith("timed out") }), this.options.captureErrorFirstLine ? runtimeErrorFirstLine(this.stderr, this.options.env) : undefined);
+    this.stderr = "";
     for (const request of this.pending.values()) {
       clearTimeout(request.timer);
       request.reject(error);

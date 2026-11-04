@@ -1,3 +1,4 @@
+import { runtimeErrorFirstLine } from "../security/runtime-error.js";
 import { expandedExtensionsIsolation } from "./expanded-isolation.js";
 /** Stable evidence categories. Native output is inspected here, never returned or retained. */
 export const RUNTIME_FAILURE_KINDS = [
@@ -16,6 +17,7 @@ export interface RuntimeFailureContext {
 }
 export interface RuntimeFailureDiagnostic extends RuntimeFailureContext {
   extensionsIsolation?: "inherited";
+  errorFirstLine?: string;
   kind: RuntimeFailureKind;
   elapsedMs: number;
   retryAtMs: number;
@@ -73,13 +75,14 @@ const integer = (value: unknown, max: number): number =>
   typeof value === "number" && Number.isFinite(value) ? Math.min(max, Math.max(0, Math.floor(value))) : 0;
 const MAX_DATE_MS = 8_640_000_000_000_000;
 
-/** Whitelist projection: no native output, environment value, path, prompt or account data is copied. */
+/** Whitelist projection: only closed metadata and a redacted first native error line may be copied. */
 export function runtimeFailureMessage(input: RuntimeFailureContext & {
-  kind: RuntimeFailureKind; elapsedMs: number; retryAtMs?: number; consecutiveFailures?: number;
+  kind: RuntimeFailureKind; elapsedMs: number; retryAtMs?: number; consecutiveFailures?: number; errorFirstLine?: string;
 }): string {
   if (!["codex", "claude", "opencode", "pi", "gemini", "kimi", "copilot", "cursor", "grok"].includes(input.runtime)) throw new Error("Invalid diagnostic runtime");
   const diagnostic: RuntimeFailureDiagnostic = {
     runtime: input.runtime,
+    ...(runtimeErrorFirstLine(input.errorFirstLine) ? { errorFirstLine: runtimeErrorFirstLine(input.errorFirstLine) } : {}),
     ...(input.runtime === "kimi" || expandedExtensionsIsolation(input.runtime) ? { extensionsIsolation: "inherited" as const } : {}),
     kind: knownKind(input.kind) ? input.kind : "runtime_failed",
     version: safeRuntimeVersion(input.version),

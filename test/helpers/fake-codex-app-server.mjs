@@ -11,6 +11,7 @@ export async function fakeCodexMain() {
   if (args[0] === "--version") { console.log("codex 1.2.3"); return; }
   if (args[0] === "debug") { send({ models: [{ slug: "fixture-model" }] }); return; }
   if (args[0] !== "app-server") { process.exitCode = 2; return; }
+  if (mode().startupStderr) { process.stderr.write(mode().startupStderr); process.exitCode = 1; return; }
   let thread, config, cwd, turnId, total = { inputTokens: 0, outputTokens: 0 }, meta, stopped = false;
   const save = () => { fs.writeFileSync(command + ".meta.next", JSON.stringify(meta)); fs.renameSync(command + ".meta.next", command + ".meta.json"); };
   async function execute(params) {
