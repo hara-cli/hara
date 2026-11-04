@@ -1,6 +1,7 @@
 // Hara-owned adapters for documented Gemini stream events and Kimi CLI print messages.
 // Native tool events are observations, never Hara tool calls, grants or completion receipts.
 import { writeFileSync } from "node:fs";
+import { runtimeErrorFirstLine } from "../security/runtime-error.js";
 import { redactSensitiveText } from "../security/secrets.js";
 import type { NormalizedNativeRuntimeEvent } from "./execution-policy.js";
 import { join } from "node:path";
@@ -10,13 +11,13 @@ import { WORKSPACE_MCP_TOKEN_ENV, type WorkspaceMcpEndpoint } from "./registered
 
 export type JsonCliRuntimeId = "gemini" | "kimi";
 export interface JsonCliEvent { kind: "text" | "tool" | "completed" | "error"; text?: string; tool?: string }
-export interface JsonCliResult { turn: TurnResult; events: JsonCliEvent[]; failure?: RuntimeFailureKind }
+export interface JsonCliResult { turn: TurnResult; events: JsonCliEvent[]; failure?: RuntimeFailureKind; errorFirstLine?: string }
 const object = (value: unknown): value is Record<string, any> => !!value && typeof value === "object" && !Array.isArray(value);
 const count = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
 const callId = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9_.:/-]{1,200}$/u.test(value);
 const toolName = (value: unknown): string | undefined => typeof value === "string" && /^[A-Za-z][A-Za-z0-9_.:/-]{0,119}$/.test(value) ? value : undefined;
-const invalid = (events: JsonCliEvent[], failure: RuntimeFailureKind = "version_incompatible"): JsonCliResult => ({
-  turn: { text: "", toolUses: [], stop: "error", errorMsg: failure }, events: [...events.slice(0, 2047).map(event => ({ kind: event.kind, ...(event.tool ? { tool: event.tool } : {}) })), { kind: "error" }], failure,
+const invalid = (events: JsonCliEvent[], failure: RuntimeFailureKind = "version_incompatible", errorFirstLine?: string): JsonCliResult => ({
+  turn: { text: "", toolUses: [], stop: "error", errorMsg: failure }, events: [...events.slice(0, 2047).map(event => ({ kind: event.kind, ...(event.tool ? { tool: event.tool } : {}) })), { kind: "error" }], failure, ...(errorFirstLine ? { errorFirstLine } : {}),
 });
 function textContent(value: unknown): string {
   if (typeof value === "string") return value;
@@ -25,10 +26,14 @@ function textContent(value: unknown): string {
 /** Bounded, terminal-aware parsing. Unknown/malformed output cannot record a successful version.
  * Kimi print has no TurnEnd frame: success requires exit zero (checked by caller) and a final
  * assistant message with text and no outstanding native tool call. */
-export function normalizeJsonCliOutput(runtime: JsonCliRuntimeId, output: string): JsonCliResult {
+export function normalizeJsonCliOutput(runtime: JsonCliRuntimeId, output: string, diagnosticEnv?: NodeJS.ProcessEnv): JsonCliResult {
   const events: JsonCliEvent[] = []; let text = "", completed = false, finalAssistant = false;
   const pendingCalls = new Set<string>();
-  let usage: TurnResult["usage"], warning: RuntimeFailureKind | undefined;
+  let usage: TurnResult["usage"], warning: RuntimeFailureKind | undefined, firstErrorLine: string | undefined;
+  // Only trusted Host opt-in projects a documented message field. Never serialize error.data,
+  // arbitrary JSON frames or later lines into diagnostics.
+  const errorLine = (value: Record<string, any>) => diagnosticEnv ? runtimeErrorFirstLine(
+    object(value.error) ? value.error.message : typeof value.error === "string" ? value.error : value.message, diagnosticEnv) : undefined;
   if (!output.trim() || Buffer.byteLength(output) > 4 * 1024 * 1024) return invalid(events);
   const lines = output.split(/\r?\n/u).filter(line => line.trim());
   if (lines.length > 8192) return invalid(events);
@@ -51,10 +56,10 @@ export function normalizeJsonCliOutput(runtime: JsonCliRuntimeId, output: string
         if (completed || !callId(value.tool_id) || !pendingCalls.delete(value.tool_id) || !["success", "error"].includes(value.status)) return invalid(events);
       } else if (value.type === "error") {
         warning = classifyRuntimeFailure({ stderr: JSON.stringify(value.error ?? value.message ?? value).slice(0, 64 * 1024) });
-        events.push({ kind: "error" });
-        if (completed) return invalid(events, warning);
+        firstErrorLine ??= errorLine(value); events.push({ kind: "error" });
+        if (completed) return invalid(events, warning, firstErrorLine);
       } else if (value.type === "result") {
-        if (completed || pendingCalls.size || value.status !== "success") return invalid(events, warning ?? classifyRuntimeFailure({ stderr: JSON.stringify(value.error ?? {}).slice(0, 64 * 1024) }));
+        if (completed || pendingCalls.size || value.status !== "success") return invalid(events, warning ?? classifyRuntimeFailure({ stderr: JSON.stringify(value.error ?? {}).slice(0, 64 * 1024) }), firstErrorLine ?? errorLine(value));
         completed = true;
         const stats = value.stats;
         if (object(stats) && count(stats.input_tokens) && count(stats.output_tokens)) usage = { input: stats.input_tokens, output: stats.output_tokens,
@@ -62,7 +67,7 @@ export function normalizeJsonCliOutput(runtime: JsonCliRuntimeId, output: string
         events.push({ kind: "completed" });
       }
     } else {
-      if (value.error !== undefined || value.type === "error") return invalid(events, classifyRuntimeFailure({ stderr: JSON.stringify(value.error ?? value).slice(0, 64 * 1024) }));
+      if (value.error !== undefined || value.type === "error") return invalid(events, classifyRuntimeFailure({ stderr: JSON.stringify(value.error ?? value).slice(0, 64 * 1024) }), errorLine(value));
       if (value.role === "assistant") {
         const content = textContent(value.content), calls = Array.isArray(value.tool_calls) ? value.tool_calls : [];
         for (const call of calls) {
@@ -79,7 +84,7 @@ export function normalizeJsonCliOutput(runtime: JsonCliRuntimeId, output: string
     if (text.length > 512 * 1024) return invalid(events);
   }
   if (runtime === "kimi") { completed = finalAssistant; if (completed) events.push({ kind: "completed" }); }
-  if (!completed || !text.trim()) return invalid(events, warning ?? "runtime_failed");
+  if (!completed || !text.trim()) return invalid(events, warning ?? "runtime_failed", firstErrorLine);
   return { turn: { text, toolUses: [], stop: "end", ...(usage ? { usage } : {}) }, events };
 }
 
@@ -142,14 +147,15 @@ export function writeJsonCliMcp(runtime: JsonCliRuntimeId, endpoint: WorkspaceMc
   if (!token || !/^[a-f0-9]{64}$/.test(token)) throw new Error("Invalid Workspace MCP attempt token");
   const server = { ...(runtime === "gemini" ? { httpUrl: endpoint.url, trust: true, timeout: timeoutMs } : { url: endpoint.url }),
     headers: { Authorization: runtime === "gemini" ? "Bearer ${" + WORKSPACE_MCP_TOKEN_ENV + "}" : "Bearer " + token } };
-  const config = runtime === "gemini" ? { mcpServers: { hara: server }, mcp: { allowed: ["hara"] },
+  const config = runtime === "gemini" ? { mcpServers: { hara: server }, mcp: { allowed: ["hara"], serverCommand: "" },
     telemetry: { enabled: false, logPrompts: false },
     hooksConfig: { enabled: false }, skills: { enabled: false },
     tools: { core: [...GEMINI_NATIVE_TOOLS], discoveryCommand: "", callCommand: "", sandbox: false },
     advanced: { ignoreLocalEnv: true } }
     : { mcpServers: { hara: server } };
-  writeFileSync(path, JSON.stringify(config) + "\n", { mode: 0o600, flag: "wx" });
-  return { path, env: runtime === "gemini" ? { GEMINI_CLI_SYSTEM_SETTINGS_PATH: path,
+  const contents = JSON.stringify(config) + "\n";
+  writeFileSync(path, contents, { mode: 0o600, flag: "wx" });
+  return { path, contents, env: runtime === "gemini" ? {
     GEMINI_CLI_TRUSTED_FOLDERS_PATH: join(directory, "trusted-folders.json"), GEMINI_CLI_TRUST_WORKSPACE: "true" } : {} };
 }
 export function jsonCliArgs(input: { runtime: JsonCliRuntimeId; prompt: string; cwd: string; model: string | null; mcpPath: string; tier?: "full-protected" | "controlled" }): string[] {

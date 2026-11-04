@@ -238,8 +238,19 @@ export class RuntimeExecutionPolicy {
     // Scheme normal strings consume the JSON-escaped path once. A # raw string would
     // double-escape .codex and silently deny every SQLite file. Keep the basename set closed.
     if (input.runtimeId === "codex") lines.push(`(allow file-write* (regex ${quote("^" + runtimeHome.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "/((state|logs|memories|queue|goals)_[0-9]+)[.]sqlite(-wal|-shm|-journal)?$")}) (literal ${quote(join(runtimeHome, "installation_id"))}) (literal ${quote(join(runtimeHome, "history.jsonl"))}) (literal ${quote(join(runtimeHome, "session_index.jsonl"))}))`);
+    // Gemini 0.66 initializes its project registry before auth or JSON output. Its lock retries
+    // otherwise look like a silent startup hang. Admit only this state transaction, not the home.
+    if (input.runtimeId === "gemini") {
+      const prefix = runtimeHome.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const hex = (length: number) => "[0-9a-f]".repeat(length);
+      const registryTemp = "^" + prefix + "/projects[.]json[.]" + hex(8) + "-" + hex(4) + "-4" + hex(3) + "-[89ab]" + hex(3) + "-" + hex(12) + "[.]tmp$";
+      lines.push(`(allow file-write* (literal ${quote(join(runtimeHome, "projects.json"))}) (literal ${quote(join(runtimeHome, "installation_id"))}) (regex ${quote(registryTemp)}))`,
+        `(allow file-write* (require-all (literal ${quote(join(runtimeHome, "projects.json.lock"))}) (vnode-type DIRECTORY)))`);
+    }
     if (piAuth) lines.push(`(allow file-write* (require-all (literal ${quote(join(runtimeHome, "auth.json.lock"))}) (vnode-type DIRECTORY)))`,
       `(deny file-write* ${literals([piAuth, join(runtimeHome, "models.json"), join(runtimeHome, "settings.json")])})`);
+    // Host's Gemini injection is immutable during this attempt, including its parent rename path.
+    if (input.runtimeId === "gemini") lines.push(`(deny file-write* ${literals([join(this.workRoot, ".gemini"), join(this.workRoot, ".gemini/settings.json"), join(this.workRoot, ".gemini/.hara-settings.lock")])})`);
     // Denials come last as well: no native state exception may open Hara or credential writes.
     lines.push(`(deny file-write*\n  ${protectedPaths}\n  ${quotedSubpaths([...secretDirs, ...keychains])}\n  ${literals([...allCredentials, ...ownCredentials])}\n  (regex ${generic}))`);
     this.profile = lines.join("\n") + "\n";
