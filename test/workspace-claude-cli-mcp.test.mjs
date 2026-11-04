@@ -1,3 +1,4 @@
+import { governedToolResult, compactRosterIds } from "./helpers/governed-tool-result.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
@@ -18,8 +19,8 @@ test("main Hara Claude uses host home, alias, effort and scoped MCP through sess
   assert.equal(meta.tokenInArgv, false); assert.equal(meta.tokenPresent, true);
   assert(meta.tools.includes("agent_create") && meta.tools.includes("agent_list"));
   assert.equal(meta.tools.includes("bash"), false);
-  const listed = JSON.parse(meta.listed.text);
-  assert.deepEqual(listed.agents.map(row => row.agentId), [f.main.agentId]);
+  const listed = governedToolResult(meta.listed.text);
+  assert.deepEqual(compactRosterIds(listed), [f.main.agentId]);
   const calls = view.conversation.history.flatMap(row => row.role === "tool" ? row.results : []);
   assert(calls.some(row => row.name === "agent_list" && row.id === listed.receipt.toolCallId && !row.isError));
   assert(view.conversation.usage.modelCalls > 0 && view.conversation.usage.toolCalls > 0);

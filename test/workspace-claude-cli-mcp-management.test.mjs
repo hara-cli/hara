@@ -1,3 +1,4 @@
+import { governedToolResult } from "./helpers/governed-tool-result.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -7,8 +8,8 @@ const done = view => ["completed", "blocked", "paused", "cancelled"].includes(vi
 async function closed(url) {
   await until(async () => { try { await fetch(url); return false; } catch { return true; } }, Boolean);
 }
-test("Claude agent_create waits for the exact Desk card, creates once, and ordinary colleagues lack management tools", async t => {
-  const f = await cliMcpFixture(t, "create", "claude"); await f.send("Create one test colleague after confirmation.");
+test("Claude generic creation keeps the native turn-limit guard after the exact Desk card, creates once, and ordinary colleagues lack management tools", async t => {
+  const f = await cliMcpFixture(t, "create", "claude"); await f.send("Create one test assistant after confirmation.");
   const pending = await until(f.read, view => view.approvals.length === 1);
   assert.equal(pending.agents.length, 1, "no persisted colleague before confirmation");
   assert.equal(f.meta().created, undefined);
@@ -19,7 +20,7 @@ test("Claude agent_create waits for the exact Desk card, creates once, and ordin
   const view = await until(f.read, done), meta = f.meta();
   assert.equal(view.conversation.state, "completed");
   assert.equal(view.agents.length, 2); assert.equal(view.approvals.length, 0);
-  const created = JSON.parse(meta.created.text), refusal = JSON.parse(meta.second.text);
+  const created = governedToolResult(meta.created.text), refusal = governedToolResult(meta.second.text);
   assert.equal(created.created, true); assert.equal(created.humanConfirmed, true);
   assert.equal(refusal.refused, "turn_limit"); assert.equal(refusal.created, false);
   assert.equal(view.conversation.completion.state, "verified");
@@ -47,6 +48,6 @@ for (const action of ["decline", "cancel"]) test("a " + action + "d Claude confi
   else await f.request("workspace.session.cancel", { ...f.scope, agentId: f.main.agentId, runId: sent.runId });
   const view = await until(f.read, view => done(view) && view.approvals.length === 0);
   assert.equal(view.agents.length, 1);
-  if (action === "decline") assert.equal(JSON.parse(f.meta().created.text).approvalState, "declined");
+  if (action === "decline") assert.equal(governedToolResult(f.meta().created.text).approvalState, "declined");
   await closed(url);
 });

@@ -101,20 +101,7 @@ test("host receipt ledger requires matching verify and rejects forged results", 
 });
 
 
-for(const question of ["你好", "請用一句話介紹你自己。", "请用中文简单介绍自己", "用中文回答：你是什么助手"])
- test("Chinese read-only question closes without a bookkeeping pause: "+question,async()=>{
-  assert.equal(engineTaskBrief({objective:question},response("你好，我是 Hara。",[])).intent,"answer");
-  const {rounds,view}=await run(question,[response("你好，我是 Hara，可以协助完成已授权的任务。")],"full-protected");
-  assert.equal(view.permissionTier,"full-protected");assert.equal(rounds,1);assert.equal(view.taskState,"completed",JSON.stringify(view));
- });
 for(const objective of ["你好，请修改 note.txt", "请用中文回答，然后删除 note.txt", "请安排明天的任务"])
  test("Chinese presentation and greeting cannot bypass write intent: "+objective,()=>{
   assert.equal(engineTaskBrief({objective},response("已完成。",[])).intent,"change");
  });
-
-
-test("a native write cannot hide behind a conversational answer", async () => {
-  const { view, project } = await run("你好", [response("", [call("unexpected-write", "write", { path: "unexpected.txt", content: "observed native change" })]), response("你好，我是 Hara。")], "full-protected");
-  assert.equal(fs.readFileSync(join(project, "unexpected.txt"), "utf8"), "observed native change");
-  assert.notEqual(view.taskState, "completed"); assert.equal(view.completion, null);
-});

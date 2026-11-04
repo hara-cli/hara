@@ -16,7 +16,7 @@ test("local channels support more than ten colleagues, one user turn and ordered
   const timing = localChannelTiming();
   let f;
   try {
-    f = await timing.async("setup", () => setup(13)); timing.observe(f);
+    f = await timing.async("setup", () => setup(13, undefined, "controlled")); timing.observe(f);
     const channel = timing.sync("create", () => f.create());
     timing.sync("send", () => f.host.sendChannel("client", f.id, channel, "hello group", randomUUID(), f.members));
     await timing.async("wait", () => f.host.waitChannel(f.id, channel)); timing.emit("commit", { event: "room-settled" });

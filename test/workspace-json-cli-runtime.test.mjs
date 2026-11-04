@@ -1,3 +1,4 @@
+import { governedToolResult, compactRosterIds } from "./helpers/governed-tool-result.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -13,7 +14,7 @@ for (const runtime of ["gemini"]) {
     const sent = f.send(); await f.host.wait(sent.runId); const view = f.read(), meta = f.meta();
     assert.equal(view.conversation.state, "completed", JSON.stringify(view.conversation));
     assert.equal(meta.home, f.account); assert.equal(meta.yolo, true); assert.equal(meta.wrapped, true); assert.equal(meta.tokenInArgv, false); assert.deepEqual(meta.mcpNames, ["hara"]);
-    const listed = JSON.parse(meta.listed.content[0].text); assert.deepEqual(listed.agents.map(row => row.agentId), [f.main]);
+    const listed = governedToolResult(meta.listed.content[0].text); assert.deepEqual(compactRosterIds(listed), [f.main]);
     assert.ok(view.conversation.history.some(row => row.role === "tool" && row.results.some(result => result.name === "agent_list" && result.id === listed.receipt.toolCallId)));
     assert.equal(meta.isolatedExtensions, true); assert.ok(f.policyCalls.some(row => row.kind === "begin" && row.attemptKey === sent.runId));
     assert.ok(f.policyCalls.some(row => row.kind === "wrap")); assert.ok(f.policyCalls.some(row => row.kind === "on-process")); assert.ok(f.policyCalls.some(row => row.kind === "drain-process")); assert.ok(f.policyCalls.filter(row => row.kind === "collect").length >= 2); assert.equal(f.policyCalls.at(-1).kind, "close");

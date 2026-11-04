@@ -218,9 +218,13 @@ test("verification card binds the real receipt reader to run-local, paged refere
   const definition = card("verification-handoff"); checkTools(definition.tools, mainTools);
   const storage = new WorkspaceResourceStorage(dir(), { schemaVersion: 1, workspaceId: `ws_${randomUUID()}`, authority: { kind: "local", localAuthorityId: randomUUID() } }); storage.initialize();
   const receipts = new WorkspaceContextReceipts(storage, randomUUID(), "ag_fixture", () => {}), tool = receipts.tool();
-  const file = receipts.retain({ id: "original", name: "fixture", content: "a".repeat(2200) }), id = file.slice(8, -5);
+  const original = { id: "original", name: "fixture", content: "a".repeat(15000) };
+  const file = receipts.retain(original), id = file.slice(8, -5);
   const result = JSON.parse(await tool.run({ id, offset: 0 }, {}));
-  assert.equal(result.referenceOnly, true); assert.equal(result.nextOffset, 1000);
+  assert.equal(result.referenceOnly, true); assert.equal(result.nextOffset, 12000); assert.equal(result.content.length, 12000);
+  const last = JSON.parse(await tool.run({ id, offset: result.nextOffset }, {}));
+  assert.equal(last.referenceOnly, true); assert.equal(last.nextOffset, null);
+  assert.deepEqual(JSON.parse(result.content + last.content), original);
   await assert.rejects(tool.run({ id: "../state", offset: 0 }, {}), /invalid Workspace receipt id/);
   const other = new WorkspaceContextReceipts(storage, randomUUID(), "ag_fixture", () => {});
   await assert.rejects(other.tool().run({ id, offset: 0 }, {}), /ownership or content changed/);
@@ -243,7 +247,7 @@ test("card loading preserves the current-permit guard and reserved identity with
 test("contract checker detects renamed tools and schema drift rather than accepting documentation strings", () => {
   const documented = card("create-colleague").tools;
   assert.throws(() => checkTools([{ ...documented[0], name: "invented_agent_list" }], mainTools), /documented tool missing/);
-  assert.throws(() => checkTools([{ ...documented[1], required: [] }], mainTools), /required/);
+  assert.throws(() => checkTools([{ ...documented[1], required: ["username"] }], mainTools), /required/);
   assert.throws(() => checkTools([{ ...documented[1], fields: ["approved"] }], mainTools), /fields/);
 });
 

@@ -1,3 +1,4 @@
+import { governedToolResult, compactRosterIds } from "./helpers/governed-tool-result.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { cliMcpFixture, until } from "./helpers/workspace-cli-mcp.mjs";
@@ -16,8 +17,8 @@ test("session.send reaches registered Codex MCP and lists only this Workspace wi
   assert.equal(meta.tokenPresent, true); assert.equal(meta.tokenInArgv, false);
   assert.equal(meta.readOnly, false); assert.equal(meta.onRequest, false); assert.equal(meta.nativeSandboxDisabled,true); assert.equal(meta.nativeApprovalDisabled,true); assert.equal(meta.haraOnlyTrust, true);
   const thread=f.native().find(row=>row.method==="thread/start");assert.equal(thread.params.sandbox,"danger-full-access");assert.equal(thread.params.approvalPolicy,"never");assert.equal(view.conversation.permissionTier,"full-protected");
-  const result = JSON.parse(meta.listed.text);
-  assert.deepEqual(result.agents.map(row => row.agentId), [f.main.agentId]);
+  const result = governedToolResult(meta.listed.text);
+  assert.deepEqual(compactRosterIds(result), [f.main.agentId]);
   assert.equal(typeof result.receipt.toolCallId, "string");
   const calls = view.conversation.history.flatMap(row => row.role === "tool" ? row.results : []);
   assert(calls.some(row => row.name === "agent_list" && row.id === result.receipt.toolCallId));
