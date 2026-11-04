@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { realpathSync } from "node:fs";
 import {
-  bindPrivateHaraStateFile, ensurePrivateStateSubdirectory, verifyPrivateDirectory, readPrivateStateFileSnapshotSync, withPrivateStateLockSync, writePrivateStateFileSync,
+  bindPrivateHaraStateFile, ensurePrivateStateSubdirectory, assertPrivateStateDirectory, readPrivateStateFileSnapshotSync, withPrivateStateLockSync, writePrivateStateFileSync,
 } from "../security/private-state.js";
 import { parseWorkspaceResourceScope, type WorkspaceResourceScope } from "./resource-context.js";
 import { exact, plain, positive, text, UUID } from "./local-state.js";
@@ -76,14 +76,14 @@ export class LocalWorkspaceCatalog {
       this.privateRoot = Object.freeze({ ...ensurePrivateStateSubdirectory(this.home, [".hara"]) });
       this.boundFile = Object.freeze({ path: file.path, directory: Object.freeze({ ...file.directory }) });
     }
-    verifyPrivateDirectory(this.privateRoot); verifyPrivateDirectory(this.boundFile.directory);
+    assertPrivateStateDirectory(this.privateRoot); assertPrivateStateDirectory(this.boundFile.directory);
     return this.boundFile;
   }
   private decode(body: string) { try { return parse(JSON.parse(body)); } catch { throw new Error("invalid local Workspace catalog; existing state was preserved"); } }
   read(): LocalWorkspaceCatalogState {
     const file = this.file(), snapshot = readPrivateStateFileSnapshotSync(file.path, 128 * 1024);
     if (!snapshot) throw new Error("local Workspace registration disappeared; no identity was recreated");
-    verifyPrivateDirectory(this.privateRoot!); verifyPrivateDirectory(file.directory);
+    assertPrivateStateDirectory(this.privateRoot!); assertPrivateStateDirectory(file.directory);
     const state = this.decode(snapshot.text);
     if (state.localAuthorityId !== this.registration.localAuthorityId || state.hostId !== this.registration.hostId) throw new Error("local Workspace registration changed");
     return state;

@@ -63,10 +63,11 @@ test("cached directory proofs still read fresh bytes and cannot be poisoned by c
   assert.equal(a.storage.run(() => bindWorkspaceResourceFile(a.file)).path, a.file);
   fs.writeFileSync(a.file, JSON.stringify({ revision: 2, value: "changed" }), { mode: 0o600 }); assert.equal(a.state.read().value, "changed");
 });
-for (const kind of ["symbolic", "hard", "directory"]) test(`cached file proof refuses ${kind} replacement without changing the foreign file`, t => {
+for (const kind of ["symbolic", "hard", "directory", "permissions"]) test(`cached file proof refuses ${kind} replacement without changing the foreign file`, t => {
   const a = stateFixture(t); a.state.read();
   const foreign = join(a.root, "foreign.json"), text = JSON.stringify({ revision: 1, value: "foreign" }); fs.writeFileSync(foreign, text, { mode: 0o600 });
-  if (kind === "directory") { const dir = dirname(a.file); fs.renameSync(dir, dir + "-held"); fs.mkdirSync(dir, { mode: 0o700 }); fs.writeFileSync(a.file, text, { mode: 0o600 }); }
+  if (kind === "permissions") fs.chmodSync(dirname(a.file), 0o755);
+  else if (kind === "directory") { const dir = dirname(a.file); fs.renameSync(dir, dir + "-held"); fs.mkdirSync(dir, { mode: 0o700 }); fs.writeFileSync(a.file, text, { mode: 0o600 }); }
   else { fs.unlinkSync(a.file); if (kind === "symbolic") fs.symlinkSync(foreign, a.file); else fs.linkSync(foreign, a.file); }
   assert.throws(() => a.state.read(), /link|identity|changed|private|directory/i); assert.equal(fs.readFileSync(foreign, "utf8"), text);
 });

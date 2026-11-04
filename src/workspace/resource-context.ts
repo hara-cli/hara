@@ -6,7 +6,7 @@ import { lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, sep } from "node:path";
 import {
-  bindPrivateHaraStateFile, ensurePrivateStateSubdirectory, readPrivateStateFileSnapshotSync,
+  assertPrivateStateDirectory, bindPrivateHaraStateFile, ensurePrivateStateSubdirectory, readPrivateStateFileSnapshotSync,
   withPrivateStateLockSync, writePrivateStateFileSync, type PrivateStateDirectoryIdentity,
 } from "../security/private-state.js";
 
@@ -139,7 +139,7 @@ export function bindWorkspaceResourceFile(path: string) {
     if (context.fileBindings.size >= 256) context.fileBindings.clear();
     context.fileBindings.set(path, binding);
   }
-  const assertCurrent = (): void => { context.assertCurrent(); verifyDirectory(binding.directory); };
+  const assertCurrent = (): void => { context.assertCurrent(); assertPrivateStateDirectory(binding.directory); };
   assertCurrent();
   return { path: binding.path, directory: binding.directory, assertCurrent };
 }
