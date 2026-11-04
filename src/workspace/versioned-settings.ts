@@ -80,9 +80,26 @@ export class VersionedSettings<T extends State> {
     writePrivateStateFileSync(target, JSON.stringify(value) + "\n", {
       ...(target.snapshot ? { expectedText: target.snapshot.text } : { expectedMissing: true }), assertCurrent: workspaceResourceCommitGuard() });
   }
-  read() { return this.run(() => withPrivateStateLockSync(this.home(), [], this.filename.slice(0, -5), () => {
-    const { value, readOnly, recovered, migrationPending } = this.load(); return { value: structuredClone(value), readOnly, recovered, migrationPending };
-  })); }
+  read() { return this.run(() => {
+    // Current-schema primary commits are atomic. A fresh, verified read needs no writer/backup
+    // lock (and its three fsyncs) merely to validate authority again. Never cache setting values.
+    // Migration, corruption, missing/newer primaries and pending side effects retain the locked path.
+    const file = this.file();
+    if (file.snapshot) {
+      let raw: unknown;
+      try { raw = JSON.parse(file.snapshot.text); } catch { /* Recover under the writer lock below. */ }
+      if (plain(raw) && raw.schemaVersion === this.version
+        && this.blockedSource !== createHash("sha256").update(file.snapshot.text).digest("hex")) {
+        try {
+          const value = this.parse(raw); file.assertCurrent(); this.blockedSource = undefined;
+          return { value: structuredClone(value), readOnly: false, recovered: false, migrationPending: false };
+        } catch { /* Re-read and apply the existing recovery/pending rules under the lock. */ }
+      }
+    }
+    return withPrivateStateLockSync(this.home(), [], this.filename.slice(0, -5), () => {
+      const { value, readOnly, recovered, migrationPending } = this.load(); return { value: structuredClone(value), readOnly, recovered, migrationPending };
+    });
+  }); }
   retryMigration() { this.blockedSource = undefined; }
   update(expected: number, change: (value: T) => T): T {
     return this.run(() => withPrivateStateLockSync(this.home(), [], this.filename.slice(0, -5), () => {
