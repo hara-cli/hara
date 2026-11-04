@@ -27,17 +27,20 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     super(storage);
     const binding = () => storage.run(() => ({ ...currentWorkspaceResourceBinding()! }));
     const parse = (raw: unknown): Document => {
-      if (!plain(raw) || raw.schemaVersion !== 3 || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 0 || !sameWorkspaceResourceBinding(raw.resourceBinding as WorkspaceResourceBinding, binding())
+      // One immutable provenance value for this fresh document parse. The surrounding
+      // VersionedSettings read/update still checks live storage authority before and after.
+      const resourceBinding = binding();
+      if (!plain(raw) || raw.schemaVersion !== 3 || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 0 || !sameWorkspaceResourceBinding(raw.resourceBinding as WorkspaceResourceBinding, resourceBinding)
         || !Array.isArray(raw.connections) || raw.connections.length > 256) throw new Error("Invalid secure model settings");
       const ids = new Set<string>(), connections: Metadata[] = raw.connections.map(row => {
         if (!plain(row) || Object.hasOwn(row, "apiKey") || Object.hasOwn(row, "credentialFile") || !isConnectionId(row.id) || ids.has(row.id) || !isCredentialGeneration(row.credentialGeneration)
-          || !positive(row.revision) || !["active", "revoked"].includes(String(row.status)) || typeof row.keyRef !== "string" || !row.keyRef.startsWith(`${binding().scopeKey}:${row.id}:`)
-          || row.status === "active" && row.keyRef !== `${binding().scopeKey}:${row.id}:${row.credentialGeneration}`
+          || !positive(row.revision) || !["active", "revoked"].includes(String(row.status)) || typeof row.keyRef !== "string" || !row.keyRef.startsWith(`${resourceBinding.scopeKey}:${row.id}:`)
+          || row.status === "active" && row.keyRef !== `${resourceBinding.scopeKey}:${row.id}:${row.credentialGeneration}`
           || row.credentialInvalid !== undefined && typeof row.credentialInvalid !== "boolean"
           || row.credentialMissing !== undefined && typeof row.credentialMissing !== "boolean"
           || typeof row.createdAt !== "string" || !Number.isFinite(Date.parse(row.createdAt)) || typeof row.updatedAt !== "string" || !Number.isFinite(Date.parse(row.updatedAt))) throw new Error("Invalid secure connection");
         const retiredKeyRefs = row.retiredKeyRefs ?? [];
-        if (!Array.isArray(retiredKeyRefs) || retiredKeyRefs.length > 256 || retiredKeyRefs.some(ref => typeof ref !== "string" || !ref.startsWith(`${binding().scopeKey}:${row.id}:`) || !isCredentialGeneration(ref.slice(ref.lastIndexOf(":") + 1)))) throw new Error("Invalid credential cleanup record");
+        if (!Array.isArray(retiredKeyRefs) || retiredKeyRefs.length > 256 || retiredKeyRefs.some(ref => typeof ref !== "string" || !ref.startsWith(`${resourceBinding.scopeKey}:${row.id}:`) || !isCredentialGeneration(ref.slice(ref.lastIndexOf(":") + 1)))) throw new Error("Invalid credential cleanup record");
         ids.add(row.id); return { ...checked(row), id: row.id, keyRef: row.keyRef, credentialGeneration: row.credentialGeneration, revision: row.revision,
           status: row.status as "active" | "revoked", createdAt: row.createdAt, updatedAt: row.updatedAt, retiredKeyRefs, credentialInvalid: row.credentialInvalid === true, credentialMissing: row.credentialMissing === true, ...(typeof row.importId === "string" ? { importId: row.importId } : {}) };
       });
@@ -46,7 +49,7 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
       if (legacy !== undefined && (!plain(legacy) || !["pending", "complete"].includes(String(legacy.state)) || !Array.isArray(legacy.rows) || legacy.rows.length > 256
         || legacy.rows.some(row => !plain(row) || typeof row.sourceId !== "string" || !/^[a-f0-9]{64}$/.test(row.sourceId) || !connections.some(item => item.id === row.connectionId))
         || new Set(legacy.rows.map(row => row.connectionId)).size !== legacy.rows.length)) throw new Error("Invalid legacy import marker");
-      return { schemaVersion: 3, resourceBinding: binding(), revision: Number(raw.revision), activeConnectionId: raw.activeConnectionId as string | null, connections,
+      return { schemaVersion: 3, resourceBinding: resourceBinding, revision: Number(raw.revision), activeConnectionId: raw.activeConnectionId as string | null, connections,
         ...(legacy ? { legacyImport: structuredClone(legacy) as unknown as LegacyImport } : {}) };
     };
     this.document = new VersionedSettings<Document>(() => storage.run(() => workspaceStateHome()), "workspace-connections-v2.json", 3,
