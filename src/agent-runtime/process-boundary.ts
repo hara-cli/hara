@@ -46,6 +46,7 @@ export class RuntimeProcessBoundary {
   private timer?: ReturnType<typeof setTimeout>;
   private ready: Promise<void> = Promise.resolve();
   private needsBaseline = false;
+  private residentRootPrepared = false;
   private active = false;
   private draining?: Promise<RuntimeDrainReport>;
   private wrapped = false;
@@ -68,11 +69,24 @@ export class RuntimeProcessBoundary {
     }
     this.watch();
   }
+  /** Host-only: after runtime initialization, before its first turn. A launcher may own the
+   * actual app-server child. Preserve those already-owned processes, never caller-supplied PIDs. */
+  async prepareResidentRoot(): Promise<void> {
+    if (this.closed || this.draining || !this.active || this.residentRootPrepared) throw new Error("Resident root initialization is unavailable or already prepared");
+    await this.ready;
+    const live = this.observe(await processes());
+    const roots = this.roots.filter(root => !root.retired && !root.closed);
+    if (this.closed || this.draining || !this.active || roots.length !== 1 || !roots[0]!.armed
+      || !same(roots[0]!.stamp, live.get(roots[0]!.child.pid!))) throw new Error("Initialized resident process ownership could not be verified");
+    for (const row of this.descendants(live)) this.baseline.add(this.key(row));
+    this.needsBaseline = false; this.residentRootPrepared = true; this.watch();
+  }
   /** Called synchronously by the trusted spawn primitive, before its result can reach any adapter. */
   own(child: ChildProcess, processGroup: boolean): Promise<void> {
     if (this.closed || this.draining || !(child instanceof ChildProcess) || !processGroup || this.roots.some(root => !root.closed)) throw new Error("Native process requires one owned detached root");
     const root: Root = { child, retired: false, armed: false, exited: false, closed: false, close: Promise.resolve() };
     root.close = new Promise(resolve => child.once("close", () => { root.closed = true; resolve(); }));
+    this.residentRootPrepared = false;
     this.roots.push(root);
     child.once("exit", () => {
       root.exited = true;
@@ -153,10 +167,16 @@ export class RuntimeProcessBoundary {
     const observationGap = this.inventoryFailed;
     const deadline = Date.now() + 8000; let signalled = 0, observedDescendants = 0, stable = 0;
     let success = false, certified = false;
+    const retained: ProcessStamp[] = [];
     try {
       let live = this.observe(await processes());
-      // Stop the resident's own fork source while draining its attempt's tools. Never signal its group.
-      if (keepRoot) for (const root of this.roots) if (!root.retired && root.stamp) signal(root.stamp, live, "SIGSTOP");
+      // Freeze the launcher and initialized runtime children while draining this attempt's tools.
+      // Signalling the whole group would also kill the resident app-server we are preserving.
+      if (keepRoot) {
+        retained.push(...this.roots.flatMap(root => !root.retired && root.stamp ? [root.stamp] : []),
+          ...this.descendants(live).filter(row => this.baseline.has(this.key(row))));
+        for (const row of retained) signal(row, live, "SIGSTOP");
+      }
       for (let pass = 0; pass < 32 && Date.now() < deadline; pass++) {
         live = this.observe(await processes());
         const descendants = this.descendants(live).filter(row => !keepRoot || !this.baseline.has(this.key(row)));
@@ -190,7 +210,7 @@ export class RuntimeProcessBoundary {
       return { rootRetained: keepRoot, observedDescendants, signalled, remaining: 0 };
     } finally {
       if (keepRoot && certified) {
-        const live = await processes(); for (const root of this.roots) if (root.stamp) signal(root.stamp, live, "SIGCONT");
+        const live = await processes(); for (const row of retained) signal(row, live, "SIGCONT");
       }
     }
   }

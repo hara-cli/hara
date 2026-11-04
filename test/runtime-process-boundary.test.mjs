@@ -42,3 +42,21 @@ test("resident baseline descendants survive a later attempt but whole-resident c
  await f.policy.drainAttempt({keepResidentRoot:true});assert.equal(live(current),false);assert.equal(live(baseline),true);assert.equal(live(p.child.pid),true);
  await f.policy.close();assert.equal(live(baseline),false);assert.equal(live(p.child.pid),false);
 });
+
+test("initialized resident launcher children survive the first attempt while later tools are drained",{skip:process.platform!=="darwin"},async t=>{
+ const f=await fixture(t,"resident");
+ const native=`const{spawn}=require('child_process');console.log(JSON.stringify({native:process.pid}));require('readline').createInterface({input:process.stdin}).on('line',line=>{if(line==='tool'){const tool=spawn('/bin/sleep',['300'],{detached:true,stdio:'ignore'});console.log(JSON.stringify({tool:tool.pid}));}else console.log(JSON.stringify({pong:process.pid}));});`;
+ const wrapper=`const{spawn}=require('child_process');const native=spawn(process.execPath,['-e',${JSON.stringify(native)}],{stdio:['pipe','pipe','inherit']});process.stdin.pipe(native.stdin);native.stdout.pipe(process.stdout);native.on('exit',code=>process.exit(code??1));`;
+ const p=start(f,wrapper),ids=await p.next();assert.notEqual(ids.native,p.child.pid);
+ await f.policy.prepareResidentRoot();
+ p.child.stdin.write('tool\n');const tool=(await p.next()).tool;assert.equal(live(tool),true);
+ await assert.rejects(f.policy.prepareResidentRoot(),/already prepared/);
+ const report=await f.policy.drainAttempt({keepResidentRoot:true});assert.equal(report.remaining,0);assert.equal(report.rootRetained,true);
+ assert.equal(live(tool),false);assert.equal(live(ids.native),true);assert.equal(live(p.child.pid),true);
+ f.policy.beginAttempt('two');await f.policy.prepareAttempt();p.child.stdin.write('ping\n');assert.equal((await p.next()).pong,ids.native);
+ await f.policy.drainAttempt({keepResidentRoot:true});assert.equal(live(ids.native),true);
+ await f.policy.close();assert.equal(live(ids.native),false);assert.equal(live(p.child.pid),false);
+});
+test("single-attempt policies cannot promote initialized children to resident state",{skip:process.platform!=="darwin"},async t=>{
+ const f=await fixture(t);await assert.rejects(f.policy.prepareResidentRoot(),/Only a resident policy/);
+});

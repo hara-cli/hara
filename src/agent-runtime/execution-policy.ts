@@ -309,6 +309,11 @@ export class RuntimeExecutionPolicy {
       attemptKey: this.attemptKey, nativeEventCount: this.nativeEventCount };
   }
   async prepareAttempt(): Promise<void> { await this.processes.prepareAttempt(); }
+  /** Only the Host may seal initialized runtime children before the first resident model turn. */
+  async prepareResidentRoot(): Promise<void> {
+    if (this.closed || this.input.lifetime !== "resident") throw new Error("Only a resident policy may prepare its runtime root");
+    await this.processes.prepareResidentRoot();
+  }
   /** Single exec: drain the whole tree. Resident: only this attempt's descendants; keep its root. */
   async drainAttempt(input: { keepResidentRoot?: boolean } = {}): Promise<RuntimeDrainReport> {
     if (input.keepResidentRoot && this.input.lifetime !== "resident") throw new Error("Only a resident policy may retain its native root");
