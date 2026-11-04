@@ -205,6 +205,8 @@ export function createWorkspaceRunPermit(input: {
         if (!fn || revoked.signal.aborted || args.signal?.aborted) return;
         try { assertLive(); fn(...values); } catch { revoked.abort(); }
       };
+      let lastActivityAt = -Infinity;
+      const forwardActivity = forward(args.onActivity);
       const guardedArgs = { ...args, signal: AbortSignal.any(signals), onText: forward((chunk: string) => {
         // A native MCP handoff is a governor wait, not proof of a model token. Native
         // output is observed by its driver from documented structured events only.
@@ -214,7 +216,13 @@ export function createWorkspaceRunPermit(input: {
         args.onText?.(chunk);
       }),
         onAssistantPreview: forward(args.onAssistantPreview),
-        onReasoning: forward(args.onReasoning), onActivity: forward(args.onActivity), onRetry: forward((event: ProviderRetryEvent) => {
+        onReasoning: forward(args.onReasoning), onActivity: () => {
+          const now = performance.now();
+          // Drop redundant payload-free watchdog ticks. Every delivered tick still runs the
+          // original fresh check; no cached allow is reused for text, tools or side effects.
+          if (now - lastActivityAt < 50) return;
+          lastActivityAt = now; forwardActivity();
+        }, onRetry: forward((event: ProviderRetryEvent) => {
           state.audit.retry(auditIndex, event); args.onRetry?.(event);
         }) };
       const operation = Promise.resolve().then(() => { assertLive(); if (guardedArgs.signal.aborted) throw new Error("Workspace model cancelled"); return state.runtimeModel ? state.runtimeModel(guardedArgs) : input.provider.turn(guardedArgs); });

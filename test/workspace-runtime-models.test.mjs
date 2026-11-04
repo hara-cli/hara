@@ -200,6 +200,9 @@ test("a new Codex binding uses live model medium without changing an explicit sa
       isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "medium" }, { reasoningEffort: "high" }] }] }));
     assert.deepEqual(await f.models.launchSelection("codex"), { modelId: "fixture-model", effort: "medium" });
     const firstLaunchCalls = fs.readFileSync(join(f.env.CODEX_HOME, "log/fixture.calls"), "utf8");
+    const beforeUse = f.runtimes.list().options.find(row => row.runtimeId === "codex").versionStatus;
+    f.runtimes.captureSuccessfulUse("codex", f.command)();
+    assert.notDeepEqual(f.runtimes.list().options.find(row => row.runtimeId === "codex").versionStatus, beforeUse);
     assert.deepEqual(await f.models.launchSelection("codex"), { modelId: "fixture-model", effort: "medium" });
     assert.equal(fs.readFileSync(join(f.env.CODEX_HOME, "log/fixture.calls"), "utf8"), firstLaunchCalls,
       "later turns reuse the live-backed default without spawning another model inventory process");

@@ -187,12 +187,14 @@ export class GovernedCodexSession {
     }
     const active = this.active;
     if (!active || active.settled) return;
-    if (!["turn/completed", "thread/tokenUsage/updated", "item/started", "item/completed", "item/agentMessage/delta"].includes(method)) return;
+    const businessEvent = ["turn/completed", "thread/tokenUsage/updated", "item/started", "item/completed", "item/agentMessage/delta"].includes(method);
+    if (!businessEvent && !method.startsWith("item/reasoning/") && method !== "item/commandExecution/outputDelta") return;
     const turn = object(params.turn), turnId = method === "turn/completed" ? turn.id : params.turnId;
     void active.ready.then(expected => {
       if (!expected || expected !== turnId || this.client !== client || this.active !== active || active.settled) return;
       try {
         active.activity();
+        if (!businessEvent) return; // Payload-free watchdog only; no raw reasoning/tool output leaves this adapter.
         if (method === "item/agentMessage/delta") {
           if (!active.rawTokenObserved && typeof params.delta === "string" && params.delta.length) {
             active.rawTokenObserved = true;

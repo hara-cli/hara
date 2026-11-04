@@ -304,12 +304,18 @@ export class WorkspaceRuntimeModels {
   async launchSelection(runtimeId: OptionalRuntimeId): Promise<{ modelId: string | null; effort: string | null }> {
     this.bound(runtimeId);
     const row = this.state.read().selections.find(value => value.runtimeId === runtimeId);
-    if (row && Object.hasOwn(row, "selectedEffort")) return this.selection(runtimeId);
+    if (row && Object.hasOwn(row, "selectedEffort")) return { modelId: row.selectedModelId ?? null, effort: row.selectedEffort ?? null };
     // The first lookup needs the live inventory; repeating app-server model/list on every chat
     // would add a second native process to the latency path. Reuse only for this bound runtime
     // identity and state revision. A failed lookup is retried on the next attempt.
+    const runtime = this.runtimes.list().options.find(value => value.runtimeId === runtimeId);
+    // Display-only successful-use history changes after every message. It is not model-source
+    // identity and must not force a new native inventory process. Registration, binary, login
+    // and proxy changes still invalidate the non-authoritative model/effort default.
     const key = JSON.stringify([runtimeId, row?.revision ?? 0, row?.selectedModelId ?? null,
-      this.runtimes.list().options.find(value => value.runtimeId === runtimeId)]);
+      runtime ? { path: runtime.path, fingerprint: runtime.fingerprint, version: runtime.version,
+        registered: runtime.registered, state: runtime.state, loginSource: runtime.loginSource } : null,
+      this.runtimes.proxy.read().revision]);
     let choice = this.launchDefaults.get(key);
     if (!choice) {
       choice = this.list(runtimeId).then(inventory => {
