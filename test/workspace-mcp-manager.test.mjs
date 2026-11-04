@@ -2,6 +2,7 @@ import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { createServer } from "node:net";
+import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { writeManagedMcpCli } from "./helpers/managed-mcp-clis.mjs";
 import { tmpdir } from "node:os";
@@ -64,6 +65,11 @@ function allCalls(host, workspaceId) {
 test("Host review binds actual binary/package/schema digests; metadata alone, secrets and changed files cannot become executable", async t => {
   const f = await fixture(t);
   assertWorkspaceMcpReviewCurrent(f.reviewed);
+  if (process.platform !== "win32") {
+    const pipe = join(f.packageRoot, "synthetic-pipe"); execFileSync("/usr/bin/mkfifo", [pipe], { env: { PATH: "/usr/bin:/bin" } });
+    assert.throws(() => prepareWorkspaceMcpReview({ source: f.source, command: fs.realpathSync(process.execPath), args: [], packageRoot: f.packageRoot, tools: f.tools }), /unreviewed/);
+    fs.unlinkSync(pipe);
+  }
   assert.throws(() => prepareWorkspaceMcpReview({ source: f.source, command: join(f.account, ".codex/auth.json"), args: [], packageRoot: f.packageRoot, tools: f.tools }), /unreviewed/);
   const secretRoot = join(f.root, ".aws"); fs.mkdirSync(secretRoot); fs.writeFileSync(join(secretRoot, "config"), "synthetic-only");
   assert.throws(() => prepareWorkspaceMcpReview({ source: f.source, command: fs.realpathSync(process.execPath), args: [], packageRoot: secretRoot, tools: f.tools }), /unreviewed/);
@@ -101,9 +107,10 @@ async function hostFixture(t, f, { tier = "controlled", key = "one", afterIntake
   const command = runtime === "pi" ? null : join(f.account, runtime === "codex" ? ".codex/tmp/bin/codex" : ".claude/projects/bin/claude");
   if (command) writeManagedMcpCli(command, runtime, workspaceMcpToolName(f.source.sourceId, "read"));
   const host = new LocalWorkspaceHost(join(f.root, "host"), { ...(command ? { runtimeInstallerOptions: { accountHome: () => f.account,
-    discovery: { home: f.account, path: dirname(command) + ":" + dirname(process.execPath) + ":/usr/bin:/bin", systemBins: [], run: async (_command, args) => args[0] === "-lic" ? null : `${runtime} 1.2.3` } } } : {}), extensionCatalog: () => [f.source], reviewedMcpSources: () => [f.reviewed],
+    discovery: { home: f.account, path: dirname(command) + ":" + dirname(process.execPath) + ":/usr/bin:/bin", systemBins: [], run: async (_command, args) => args[0] === "-lic" ? null : `${runtime} 1.2.3` } } } : {}), extensionCatalog: () => { if (f.catalogFailure) throw Error("synthetic catalog failure"); return [f.source]; }, reviewedMcpSources: () => [f.reviewed],
     providerFactory: (_connection, binding) => { let step = 0; return { id: "openai", model: binding.model, async turn(args) {
       if (runtime !== "pi") throw Error("Unexpected native provider fallback");
+      if (f.catalogFailure && f.greetingOnly) return reply("Hello from the governed core.");
       const named = name => args.tools.find(tool => tool.name === name || tool.name === "mcp__hara__" + name)?.name ?? name;
       (f.nativeTrace ??= []).push({ step: step + 1, results: args.history.flatMap(row => row.role === "tool" ? row.results.map(result => ({ name: result.name, isError: result.isError, content: result.content.slice(0, 1200) })) : []).slice(-3) });
       if (++step === 1) return call(named("task_intake"), intake);
@@ -299,4 +306,13 @@ managedTest("revocation during an in-flight call suppresses its late response an
   await until(() => m.calls().length === 1); m.extensions.apply({ ...m.assignment, enabled: false }, m.extensions.list().revision);
   m.release(); await rejected; await attempt.close();
   assert.equal(m.calls().length, 1); assert.equal(m.manager.view(m.extensions.list()).sources[0].lastCall.outcome, "outcome_unknown");
+});
+
+
+test("failed optional catalog removes every extension tool while the ordinary governed core remains usable", { skip: process.platform === "win32" }, async t => {
+  const f = await fixture(t), h = await hostFixture(t, f); f.catalogFailure = true; f.greetingOnly = true;
+  const started = h.host.start("client", h.id, h.main.agentId, "hello", randomUUID()); await h.host.wait(started.runId);
+  assert.equal(h.read().conversation.state, "completed"); assert.equal(h.read().conversation.usage.modelCalls, 1);
+  assert.equal(h.read().approvals.length, 0); assert.equal(allCalls(h.host, h.id).length, 0);
+  assert.deepEqual(h.host.context(h.id).extensions.snapshot(h.main.agentId, h.main.agentEpoch).tools, []);
 });

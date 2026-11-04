@@ -37,7 +37,9 @@ function physical(path: string): string {
 }
 function hashFile(path: string, max: number): { digest: string; stamp: Stamp } {
   if (typeof path !== "string" || secretPath.test(path)) throw new WorkspaceMcpError("mcp_source_unreviewed");
-  physical(path); const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  physical(path);
+  if (!lstatSync(path).isFile()) throw new WorkspaceMcpError("mcp_source_unreviewed");
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   try {
     const before = fstatSync(fd);
     if (!before.isFile() || before.nlink !== 1 || before.size > max || before.mode & 0o022) throw new WorkspaceMcpError("mcp_source_unreviewed");

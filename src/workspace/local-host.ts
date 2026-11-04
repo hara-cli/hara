@@ -917,7 +917,13 @@ export class LocalWorkspaceHost {
     const assertCurrent = () => { assertWorkspaceRunAdmission(job.permit, job.options!, job.binding.agent.runtimeId); };
     let agentCreateAttempts = 0;
     const bundles = job.context.features.enabledSkills();
-    const snapshot = this.extensionToolSnapshot(job.workspaceId, agent.agentId, agent.agentEpoch);
+    let snapshot: ExtensionToolSnapshot;
+    try { snapshot = this.extensionToolSnapshot(job.workspaceId, agent.agentId, agent.agentEpoch); }
+    catch {
+      // An unavailable optional catalog grants no tools; the normal governed core remains usable.
+      job.context.extensions.invalidateCatalog(); job.context.mcp.invalidate();
+      snapshot = job.context.extensions.snapshot(agent.agentId, agent.agentEpoch);
+    }
     if (snapshot.tools.length && this.extensionClients.has(job.clientId)) job.extensionAttempt = job.context.mcp.createAttempt({ snapshot, extensions: job.context.extensions,
       runId: job.binding.runId, deadline: Date.parse(job.value.attempt!.startedAt) + job.binding.budget.timeoutMs,
       signal: job.signal, assertCurrent: () => { assertCurrent(); if (!this.extensionClients.has(job.clientId)) throw new Error("Extension confirmation client unavailable"); } });
