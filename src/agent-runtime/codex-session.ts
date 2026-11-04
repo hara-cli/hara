@@ -350,7 +350,7 @@ export class GovernedCodexSession {
       loginSource: resolved.loginSource, model: input.model, effort: input.effort }); } catch { /* Observational metadata only. */ }
     const env = { ...resolved.env, [WORKSPACE_MCP_TOKEN_ENV]: this.token,
       HARA_SUBPROCESS_ENV_ALLOW: [resolved.env.HARA_SUBPROCESS_ENV_ALLOW, WORKSPACE_MCP_TOKEN_ENV].filter(Boolean).join(",") };
-    const visibleEnv = { ...env, ...(endpoint.attemptMarker ? { HARA_PREVIEW_ATTEMPT_TOKEN: endpoint.attemptMarker } : {}) };
+    const visibleEnv: NodeJS.ProcessEnv = { ...env, ...(endpoint.attemptMarker ? { HARA_PREVIEW_ATTEMPT_TOKEN: endpoint.attemptMarker } : {}) };
     let finish!: ActiveTurn["finish"], bind!: ActiveTurn["bind"], done!: () => void;
     const terminal = new Promise<ExternalCommandCaptureResult>(resolve => {
       finish = (ok, code, kind, firstLine, rpc) => {
@@ -418,6 +418,7 @@ export class GovernedCodexSession {
         if (origin(current, this.project) !== this.origin || workspaceRuntimeProcessKey(currentPolicy, current) !== processKey)
           throw new Error("Codex launch profile changed during preparation; no turn was sent");
       }
+      if (endpoint.attemptMarker) visibleEnv.HARA_PREVIEW_ATTEMPT_TOKEN = endpoint.attemptMarker;
       input.assertCurrent(); if (input.signal.aborted) throw new Error("interrupted");
       const client = this.client;
       if (!client) throw new Error("Codex native process changed during preparation; no turn was sent");
