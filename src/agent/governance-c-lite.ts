@@ -3,7 +3,11 @@ import { createHash } from "node:crypto";
 import type { TaskBriefInput, TaskExecution } from "../session/task.js";
 import type { ToolResult } from "../providers/types.js";
 
-const CHANGE = /(?:请|帮我|把|将|please|can you|could you|let's)?\s*(?:创建|建立|新增|添加|写入|修改|编辑|删除|移除|重命名|发送|委派|安排|执行|部署|安装|更新|保存|同步|推送|合并|生成|设置|create|add|write|edit|change|delete|remove|rename|send|delegate|schedule|execute|deploy|install|update|save|sync|push|merge|generate|set up)/iu;
+// Mutation signals stay on the original user request, before question/presentation normalization.
+// Like route.ts, include CJK action words without relying on whitespace word boundaries.
+const CHANGE = /(?:创建|創建|建立|新建|新增|添加|写入|寫入|修改|编辑|編輯|删除|刪除|移除|重命名|重新命名|发送|發送|委派|安排|定时|定時|执行|執行|部署|安装|安裝|更新|保存|儲存|存储|存儲|同步|推送|合并|合併|生成|设置|設置|設定|关闭|關閉|开启|開啟|修复|修復|实现|實現|开发|開發|编写|編寫|重构|重構|优化|優化|发布|發佈|回滚|回滾|迁移|遷移|导入|導入|导出|導出|匯出|建(?:立)?(?:\s*(?:一|两|兩|几|幾|[0-9]+)?[个個位])?\s*(?:新(?:的)?\s*)?(?:bot|agent|同事|机器人|機器人)|create|add|write|edit|change|delete|remove|rename|send|delegate|schedule|execute|deploy|install|update|save|sync|push|merge|generate|set up|turn on|turn off)/iu;
+
+export function changeTaskObjective(objective: string): boolean { return CHANGE.test(objective); }
 const QUESTION = /[?？]|^(?:\s*(?:list|show|read|describe|explain|what|who|which|how|tell me|find|search|列出|查看|读取|说明|解释|告诉我|查找|搜索|有哪些|是什么|谁是))/iu;
 // Presentation-only prefixes do not change task authority. Keep mutation detection on the original request.
 const ANSWER_PREFIX = /^(?:请|請)?(?:用|以)(?:(?:简体|繁体|簡體|繁體)?中文)?(?:一句话|一句話)?(?:回答|回复|回覆)?[：:，,\s]*/u;
@@ -18,7 +22,8 @@ export function simpleChangeObjective(objective: string): boolean {
 
 /** Presentation prefixes never add action authority. */
 export function answerQuestionText(objective: string): string {
-  return objective.trim().replace(/^(?:你好|您好|嗨)[，,\s]+/u, "").replace(ANSWER_PREFIX, "").trim();
+  return objective.trim().replace(/^(?:你好|您好|嗨)[，,\s]+/u, "").replace(ANSWER_PREFIX, "")
+    .replace(/^(?:(?:请问|請問|请|請|麻烦|麻煩|烦请|煩請|帮我|幫我|please)\s*)+/iu, "").trim();
 }
 /** Tool-free closeout is limited to greetings and the assistant's own identity/capabilities. */
 export function conversationalAnswerObjective(objective: string): boolean {
@@ -26,9 +31,24 @@ export function conversationalAnswerObjective(objective: string): boolean {
   const value = answerQuestionText(objective);
   return /^(?:(?:请|請)?(?:简单|簡單)?(?:自我介绍|自我介紹|(?:介绍|介紹)(?:一下)?(?:你自己|自己|你|您))|(?:你|您)(?:是(?:谁|誰|什么助手|什麼助手)|叫什么(?:名字)?|叫什麼(?:名字)?|能做(?:什么|什麼)|可以做(?:什么|什麼))|你好|您好|嗨|hello|hi|(?:please\s+)?(?:introduce yourself|who are you|what(?:'s| is) your name))[。.！!?？\s]*$/iu.test(value);
 }
+/** The user supplied the entire reply; this is an echo, never proof of external facts. */
+export function requestedReplyText(objective: string): string | null {
+  if (objective.length > 2000 || changeTaskObjective(objective)) return null;
+  const match = /^(?:(?:请|請|please)\s*)?(?:(?:直接|只需|只|仅|僅|just|only)\s*)?(?:回答|回复|回覆|reply|respond|say)\s*[：:]?\s*(?:“([^”\r\n]{1,160})”|「([^」\r\n]{1,160})」|『([^』\r\n]{1,160})』|"([^"\r\n]{1,160})"|'([^'\r\n]{1,160})')/iu.exec(objective.trim());
+  if (!match) return null;
+  const text = match.slice(1).find(value => value !== undefined)?.trim();
+  const suffix = objective.trim().slice(match[0].length);
+  // Only presentation/termination instructions may follow the quote; another question/work item is not an echo.
+  const rest = suffix.replace(/(?:这是|這是)?(?:无需|無需)工具的(?:简单|簡單)?(?:问候|問候)/gu, "")
+    .replace(/(?:请|請)?(?:不要|勿)调用任何工具|(?:请|請)?(?:不要|勿)調用任何工具/gu, "")
+    .replace(/(?:回复|回覆|回答)后结束|(?:回复|回覆|回答)後結束|即可/gu, "")
+    .replace(/[。.!！,，;；\s]/gu, "");
+  return text && rest.length === 0 ? text : null;
+}
+
 export function answerQuestionObjective(objective: string): boolean {
   const question = answerQuestionText(objective);
-  return QUESTION.test(question) || CJK_ANSWER.test(question) || conversationalAnswerObjective(objective);
+  return QUESTION.test(question) || CJK_ANSWER.test(question) || conversationalAnswerObjective(objective) || requestedReplyText(objective) !== null;
 }
 
 /** User wording supplies authority; the first model response supplies only a bounded execution hint. */

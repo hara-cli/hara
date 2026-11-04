@@ -67,7 +67,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (method === "workspace.list") { fields([]); return host.list(); }
     if (method === "workspace.create") { fields(["label", "expectedRevision"]); if (!text(params.label, 80) || !positive(params.expectedRevision)) throw new Error("invalid Workspace creation"); return host.createWorkspace(params.label, params.expectedRevision); }
     if (method === "workspace.preferences.get") { fields([]); return host.getPreferences(); }
-    if (method === "workspace.preferences.set") { fields(["theme", "expectedRevision", ...["executionDetails", "collapseDetails", "updates"].filter(key => Object.hasOwn(params, key))]); return host.setPreferences(params.theme, params.expectedRevision as number, params); }
+    if (method === "workspace.preferences.set") { fields(["theme", "expectedRevision", ...["executionDetails", "collapseDetails", "alwaysShowTimingDiagnostics", "updates"].filter(key => Object.hasOwn(params, key))]); return host.setPreferences(params.theme, params.expectedRevision as number, params); }
     if (method === "workspace.activity") { fields([]); return host.activity(); }
     if (method === "workspace.update.prepare") { fields(["approved"]); if (params.approved !== true) throw new Error("Explicit restart approval required"); return host.prepareUpdate(client.id); }
     if (method === "workspace.update.release") { fields(["id"]); if (!text(params.id)) throw new Error("Invalid update lease"); host.releaseUpdate(client.id, params.id); return { released: true }; }
