@@ -93,7 +93,9 @@ export async function runFullProtectedPi(history: NeutralMsg[], options: RunOpts
       try {
         assertCurrent();
         const context = await installer.prepareBuiltinPi(native.signal); assertCurrent();
-        sessionStore = new PiNativeSessionStore(workspaceRuntimeStorage(permit), permit.binding, history);
+        const standing = activeArgs!.systemParts?.filter(part => part.stability !== "turn").map(part => part.content).join("\n\n") || activeArgs!.system;
+        const standingHash = createHash("sha256").update(canonical([standing, permit.binding.agent.configRevision, permit.binding.connection.model])).digest("hex");
+        sessionStore = new PiNativeSessionStore(workspaceRuntimeStorage(permit), permit.binding, history, standingHash);
         const root = sessionStore.root, agentDir = join(root, "agent");
         for (const name of ["auth.json", "models.json", "models-store.json"]) writeConfig(root, name, {});
         policy = newPiWorkspaceNativePolicy(permit, context.accountHome, agentDir);
@@ -154,8 +156,10 @@ export async function runFullProtectedPi(history: NeutralMsg[], options: RunOpts
         endSpawn?.("completed"); endSpawn = undefined;
         await rpc.state(); endCold?.("completed"); endCold = undefined;
         const continuation = history.slice(sessionStore.promptHistoryStart);
-        const actualPrompt = sessionStore.resumed ? "Continue the same frozen Hara task without replaying completed actions.\n" +
-          (continuation.length ? JSON.stringify(continuation) : "No new human message; continue only unfinished work.") : prompt;
+        const actualPrompt = sessionStore.resumed ? (sessionStore.needsPromptRefresh
+          ? `<system-reminder>Current Hara standing governance context for this resumed Pi session:\n${standing}\n</system-reminder>\n\n` : "")
+          + "Continue the same frozen Hara task without replaying completed actions.\n"
+          + (continuation.length ? JSON.stringify(continuation) : "No new human message; continue only unfinished work.") : prompt;
         const result = await rpc.prompt(actualPrompt);
         if (typeof result.state.sessionFile !== "string") throw new Error("Pi native session receipt missing");
         finalSession = result.state.sessionFile;

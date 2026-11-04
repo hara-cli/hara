@@ -99,6 +99,30 @@ test("Host-private Pi session receipts resume only idle same-binding same-histor
   writeFileSync(file, "changed outside the original attempt\n");
   assert.throws(() => new PiNativeSessionStore(f.storage, f.binding, f.history), /no prompt was replayed/);
 });
+test("Pi full records standing prompt hash and model epoch only after an accepted, drained session", t => {
+  const f = sessionFixture(t), oldHash = "a".repeat(64), newHash = "b".repeat(64);
+  const first = new PiNativeSessionStore(f.storage, f.binding, f.history, oldHash);
+  t.after(() => rmSync(first.root, { recursive: true, force: true }));
+  assert.equal(first.contextGeneration, null); assert.equal(first.needsPromptRefresh, false);
+  const file = join(first.root, "agent/sessions/fixture.jsonl"); writeFileSync(file, "synthetic session contents\n");
+  first.accepted(); const generation = first.contextGeneration; assert.match(generation, /^[a-f0-9-]{36}$/);
+  first.finished(file, f.history);
+  const same = new PiNativeSessionStore(f.storage, f.binding, f.history, oldHash);
+  assert.equal(same.resumed, true); assert.equal(same.needsPromptRefresh, false); assert.equal(same.contextGeneration, generation);
+  same.accepted(); same.finished(file, f.history);
+  const changed = new PiNativeSessionStore(f.storage, f.binding, f.history, newHash);
+  assert.equal(changed.needsPromptRefresh, true); assert.equal(changed.contextGeneration, generation);
+  changed.accepted(); assert.throws(() => new PiNativeSessionStore(f.storage, f.binding, f.history, newHash), /no prompt was replayed/);
+  changed.finished(file, f.history);
+  const nowCurrent = new PiNativeSessionStore(f.storage, f.binding, f.history, newHash); assert.equal(nowCurrent.needsPromptRefresh, false);
+});
+test("Pi full does not mark a changed prompt seen when the session receipt cannot be written", t => {
+  const f = sessionFixture(t), first = new PiNativeSessionStore(f.storage, f.binding, f.history, "a".repeat(64));
+  t.after(() => rmSync(first.root, { recursive: true, force: true }));
+  first.accepted();
+  assert.throws(() => first.finished(join(first.root, "agent/sessions/missing.jsonl"), f.history));
+  assert.throws(() => new PiNativeSessionStore(f.storage, f.binding, f.history, "b".repeat(64)), /no prompt was replayed/);
+});
 
 test("Pi scheduling names cannot become native tools and long Workspace tool aliases remain deterministic", () => {
   assert.equal(piWorkspaceToolName("schedule_workspace_task"), "mcp__hara__schedule_workspace_task");

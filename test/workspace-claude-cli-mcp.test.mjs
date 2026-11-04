@@ -25,6 +25,13 @@ test("main Hara Claude uses host home, alias, effort and scoped MCP through sess
   assert(view.conversation.usage.modelCalls > 0 && view.conversation.usage.toolCalls > 0);
   await closed(meta.url);
 });
+test("Claude one-shot attempts receive the current Hara system context anew on every turn", async t => {
+  const f = await cliMcpFixture(t, "list", "claude");
+  await f.send("List the colleagues in this Workspace."); await until(f.read, done);
+  const first = f.meta(); assert.equal(first.freshSystemPrompt, true);
+  await f.send("List the colleagues in this Workspace again."); await until(f.read, done);
+  const second = f.meta(); assert.equal(second.freshSystemPrompt, true); assert.notEqual(second.pid, first.pid);
+});
 
 test("Claude final output cannot leak the per-attempt bearer", async t => {
   const f = await cliMcpFixture(t, "leak", "claude");

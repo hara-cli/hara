@@ -6,7 +6,7 @@ import { codexHostToolOverrides } from "./codex-host-config.js";
 import { workspaceRunRuntimeStages } from "../workspace/execution.js";
 // Native context is reusable; Workspace execution capabilities are not. Each attempt has a fresh
 // immutable MCP endpoint, and an unloaded thread is resumed only after fresh Host admission.
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { JsonlRpcClient, ExternalJsonlRpcRequestError, ExternalJsonlRpcTransportError, type ExternalCommandCaptureResult } from "../external-sessions/process.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { canonical, plain } from "../workspace/local-state.js";
@@ -20,6 +20,14 @@ import { WORKSPACE_MCP_TOKEN_ENV, type WorkspaceMcpEndpoint } from "./registered
 
 const hash = (value: unknown): string => createHash("sha256").update(canonical(value)).digest("hex");
 const object = (value: unknown): Record<string, unknown> => plain(value) ? value : {};
+/** Stable policy changes refresh the native context; turn-clock/checkpoint text travels every turn. */
+export function codexStandingContext(args: Pick<TurnArgs, "system" | "systemParts">, model: string | null, effort: string | null,
+  tier: string, configRevision: number) {
+  const standingParts = args.systemParts?.filter(part => part.stability !== "turn") ?? [];
+  const turnParts = args.systemParts?.filter(part => part.stability === "turn") ?? [];
+  const standing = standingParts.length ? standingParts.map(part => part.content).join("\n\n") : args.system;
+  return { standing, turnParts, digest: hash([standing, model, effort, tier, configRevision]) };
+}
 const origin = (resolved: ReturnType<WorkspaceRuntimeInstaller["resolveBound"]>, project: unknown): string =>
   hash([resolved.command, inspectLocalRuntime(resolved.command)?.fingerprint ?? null, resolved.loginSource,
     resolved.env.HOME ?? null, resolved.env.CODEX_HOME ?? null, project]);
@@ -29,6 +37,7 @@ interface ActiveTurn {
   finish(ok: boolean, code?: string, kind?: RuntimeFailureKind, firstLine?: string): void; done: Promise<void>;
   activity(): void; assertCurrent(): void;
   text: string; settled: boolean;
+  standingHash: string | null; compacted: boolean; partDigests: Map<string, string>;
 }
 const pools = new WeakMap<WorkspaceRuntimeInstaller, CodexSessionPool>();
 
@@ -133,7 +142,6 @@ export class GovernedCodexSession {
   decorateResult(result: ToolResult, args: TurnArgs): ToolResult {
     const parts = args.systemParts?.length ? args.systemParts : [{ id: "system", digest: hash(args.system), content: args.system }];
     const changed = parts.filter(part => this.systemDigests.get(part.id) !== part.digest);
-    for (const part of parts) this.systemDigests.set(part.id, part.digest);
     const update = changed.map(part => part.content).join("\n\n");
     return update ? { ...result, content: result.content + "\n\n<system-reminder>\nCurrent Hara governance context (the receipt above is unchanged):\n"
       + update + "\nAvailable tools at this boundary: " + args.tools.map(tool => tool.name).join(", ") + "\n</system-reminder>" } : result;
@@ -142,6 +150,14 @@ export class GovernedCodexSession {
   private notification(client: JsonlRpcClient, method: string, params: Record<string, unknown>): void {
     if (this.client !== client || params.threadId !== this.value.threadId) return;
     if (method === "thread/closed") { this.loaded = false; this.unload?.(); return; }
+    if (method === "thread/compacted") {
+      // The native model may have forgotten earlier instructions; no previous seen hash survives.
+      this.value.contextGeneration = randomUUID(); this.value.standingPromptHash = null;
+      this.systemDigests.clear();
+      if (this.active) this.active.compacted = true;
+      try { this.save(); } catch { client.close(); }
+      return;
+    }
     const active = this.active;
     if (!active || active.settled) return;
     const turn = object(params.turn), turnId = method === "turn/completed" ? turn.id : params.turnId;
@@ -198,7 +214,12 @@ export class GovernedCodexSession {
             active.finish(false, "codex_context_limit_open_new_session"); client.close();
           }
         } else if (method === "turn/completed") {
-          this.value.phase = turn.status === "completed" ? "idle" : "unknown"; this.save();
+          this.value.phase = turn.status === "completed" ? "idle" : "unknown";
+          if (turn.status === "completed" && !active.compacted) {
+            this.value.standingPromptHash = active.standingHash;
+          } else this.value.standingPromptHash = null;
+          this.save();
+          if (turn.status === "completed" && !active.compacted) this.systemDigests = new Map(active.partDigests);
           active.finish(turn.status === "completed", turn.status === "interrupted" ? "interrupted" : "runtime_failed",
             turn.status === "completed" ? undefined : classifyRuntimeFailure({ stderr: JSON.stringify(turn.error ?? {}).slice(0, 65_536) }),
             runtimeErrorFirstLine(object(turn.error).message, this.installer.resolveBound("codex").env));
@@ -218,6 +239,8 @@ export class GovernedCodexSession {
     const resolved = await this.installer.prepareBound("codex", input.signal);
     if (input.cwd !== this.project.root || origin(resolved, this.project) !== this.origin) throw new Error("Codex login origin changed; no fallback was selected");
     const policyInput = workspaceRuntimePolicyInput(this.permit, "codex", resolved, "resident", this.installer);
+    const { standing, turnParts, digest: standingHash } = codexStandingContext(args, input.model, input.effort,
+      policyInput.tier, this.permit.binding.agent.configRevision);
     const processKey = workspaceRuntimeProcessKey(policyInput, resolved);
     // Retire an idle process before binding the new ActiveTurn, so its close event cannot settle it.
     if (this.processKey !== processKey || !this.client && this.policy) {
@@ -243,7 +266,8 @@ export class GovernedCodexSession {
       };
     });
     const active: ActiveTurn = { ready: new Promise(resolve => { bind = resolve; }), bind: id => bind(id), finish,
-      done: new Promise(resolve => { done = resolve; }), activity: input.activity, assertCurrent: input.assertCurrent, text: "", settled: false };
+      done: new Promise(resolve => { done = resolve; }), activity: input.activity, assertCurrent: input.assertCurrent, text: "", settled: false,
+      standingHash, compacted: false, partDigests: new Map((args.systemParts?.length ? args.systemParts : [{ id: "system", digest: hash(args.system) }]).map(part => [part.id, part.digest])) };
     this.active = active;
     const interrupt = () => {
       const client = this.client;
@@ -291,7 +315,7 @@ export class GovernedCodexSession {
         response = await client.call(resumed ? "thread/resume" : "thread/start", {
           ...(resumed ? { threadId: this.value.threadId, excludeTurns: true } : { ephemeral: false }),
           cwd: input.cwd, sandbox: "danger-full-access", approvalPolicy: "never", approvalsReviewer: "user",
-          developerInstructions: args.system, config, ...(input.model ? { model: input.model } : {}),
+          developerInstructions: standing, config, ...(input.model ? { model: input.model } : {}),
         });
       } catch (error) {
         if (resumed) { this.value.phase = "unknown"; this.save(); }
@@ -309,11 +333,18 @@ export class GovernedCodexSession {
       // resident too. Seal that baseline before turn/start, never after model tools can run.
       if (freshProcess) await this.policy.prepareResidentRoot();
       this.value.threadId = thread.id; this.loaded = true;
+      if (!resumed || this.value.contextGeneration === null) this.value.contextGeneration = randomUUID();
       this.value.phase = "unknown"; this.save(); // Write ahead of an accepted or outcome-unknown turn.
-      this.systemDigests = new Map((args.systemParts?.length ? args.systemParts : [{ id: "system", digest: hash(args.system) }]).map(part => [part.id, part.digest]));
       input.assertCurrent(); if (input.signal.aborted) throw new Error("interrupted");
+      const refresh = resumed && this.value.standingPromptHash !== standingHash;
+      const currentPrompt = [
+        ...(refresh ? [`<system-reminder>Current Hara standing governance context for this resumed thread:\n${standing}\n</system-reminder>`] : []),
+        ...(turnParts.length ? [`<system-reminder>Current Hara turn context:\n${turnParts.map(part => part.content).join("\n\n")}\n</system-reminder>`] : []),
+        prompt,
+      ].join("\n\n");
+      if (Buffer.byteLength(currentPrompt) > 400_000) throw new Error("Codex native prompt context is too large");
       const started = await client.call<Record<string, unknown>>("turn/start", { threadId: thread.id,
-        input: [{ type: "text", text: prompt, text_elements: [] }], cwd: input.cwd, approvalPolicy: "never", approvalsReviewer: "user",
+        input: [{ type: "text", text: currentPrompt, text_elements: [] }], cwd: input.cwd, approvalPolicy: "never", approvalsReviewer: "user",
         ...(input.model ? { model: input.model } : {}), ...(input.effort ? { effort: input.effort } : {}) });
       const turn = object(started.turn);
       if (!nativeId(turn.id)) throw new Error("Codex did not bind the accepted turn");
