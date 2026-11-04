@@ -4,6 +4,7 @@ import fs from "node:fs";
 import { join, dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { hostFixture, storageFixture, tools } from "./helpers/workspace-user-interaction.mjs";
+import { LocalWorkspaceCatalog } from "../dist/workspace/local-catalog.js";
 import { WorkspaceJsonState } from "../dist/workspace/local-state.js";
 import { WorkspaceConversationStore } from "../dist/workspace/conversations.js";
 import { WorkspaceResourceStorage, workspaceStateHome, bindWorkspaceResourceFile } from "../dist/workspace/resource-context.js";
@@ -74,4 +75,21 @@ test("cached bindings still consult the live authority fence", t => {
   const storage = new WorkspaceResourceStorage(a.root, a.storage.scope, () => { if (revoked) throw new Error("revoked authority"); }); storage.initialize();
   const state = new WorkspaceJsonState(storage, "cache-proof.json", value => value, () => ({ revision: 0 })); assert.equal(state.read().value, "first");
   revoked = true; assert.throws(() => state.read(), /revoked authority/);
+});
+
+
+test("catalog directory proofs keep grant data live rather than caching authority", t => {
+  const a = storageFixture(t), catalog = new LocalWorkspaceCatalog(a.root); catalog.resolve(a.storage.scope.workspaceId);
+  const file = join(a.root, ".hara/workspace-local-dev/catalog-v2.json"), raw = JSON.parse(fs.readFileSync(file)); raw.workspaces[0].grantRevision++;
+  fs.writeFileSync(file, JSON.stringify(raw), { mode: 0o600 });
+  assert.equal(catalog.resolve(a.storage.scope.workspaceId).grantRevision, raw.workspaces[0].grantRevision);
+  catalog.revoke(a.storage.scope.workspaceId, catalog.read().revision); assert.throws(() => catalog.resolve(a.storage.scope.workspaceId), /unavailable|revoked/);
+});
+for (const target of ["private-root", "catalog-directory", "permissions"]) test(`catalog proof rejects ${target} replacement after warm reads`, t => {
+  const a = storageFixture(t), catalog = new LocalWorkspaceCatalog(a.root); catalog.read();
+  const root = join(a.root, ".hara"), directory = join(root, "workspace-local-dev"), file = join(directory, "catalog-v2.json"), original = fs.readFileSync(file);
+  if (target === "permissions") fs.chmodSync(root, 0o755);
+  else if (target === "private-root") { fs.renameSync(root, root + "-held"); fs.mkdirSync(root, { mode: 0o700 }); fs.mkdirSync(directory, { mode: 0o700 }); fs.writeFileSync(file, original, { mode: 0o600 }); }
+  else { fs.renameSync(directory, directory + "-held"); fs.mkdirSync(directory, { mode: 0o700 }); fs.writeFileSync(file, original, { mode: 0o600 }); }
+  assert.throws(() => catalog.read(), /private|identity|changed|unsafe|directory/i);
 });
