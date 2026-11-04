@@ -185,6 +185,7 @@ export function createRegisteredCliMcpTurn(input: {
           try {
             const result = await input.launch(endpoint!, prompt, () => activity?.(), { ...args, onAssistantPreview: value => preview?.(value) });
             if (!result.ok) finished = { text: "", toolUses: [], stop: "error",
+              ...(result.nativeFailureKind ? { errorMetadata: { code: result.nativeFailureKind } } : {}),
               errorMsg: result.runtimeFailure ?? "registered Runtime failed (" + (result.errorCode ?? (result.timedOut ? "timeout" : "exit")) + "); no fallback was selected" };
             else if (input.parseOutput) finished = input.parseOutput(result.stdout);
             else if (input.jsonEvents === false) finished = { text: result.stdout.trim(), toolUses: [], stop: "end" };

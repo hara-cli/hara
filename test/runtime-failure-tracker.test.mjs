@@ -25,3 +25,15 @@ test("cooldown survives per-turn registries but stays within installer, colleagu
   assert.equal(changed.blocked(), null, "a successful launch clears failure state");
   assert.equal(read(changed.failed("runtime_network", 16000)).retryAtMs, 0, "long-running failures do not become startup cooldowns");
 });
+
+
+test("restore RPC metadata is route-owned, closed, available during cooldown and cleared on success or a different failure", () => {
+  const tracker = runtimeFailureTracker(installer(), "codex", "agent", "route", context);
+  const rpc = { rpcMethod: "thread/resume", rpcTimeoutMs: 10000, prompt: "PRIVATE" };
+  assert.equal(read(tracker.failed("timeout", 10000, undefined, rpc)).rpcMethod, "thread/resume");
+  assert.equal(read(tracker.blocked()).rpcTimeoutMs, 10000);
+  assert.doesNotMatch(tracker.blocked(), /PRIVATE/);
+  tracker.succeeded();
+  assert.equal(read(tracker.failed("runtime_failed", 1)).rpcMethod, undefined);
+  assert.equal(read(tracker.failed("timeout", 1, undefined, { rpcMethod: "PRIVATE_METHOD", rpcTimeoutMs: 10000 })).rpcMethod, undefined);
+});

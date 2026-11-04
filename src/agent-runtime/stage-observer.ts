@@ -9,7 +9,32 @@ export function runtimeStageErrorKind(value: unknown): RuntimeStageErrorKind {
   if (KINDS.has(message)) return message as RuntimeStageErrorKind;
   const marker = message.indexOf(FAILURE_MARKER);
   if (marker >= 0 && message.length < 4096) {
-    try { const data = JSON.parse(message.slice(marker + FAILURE_MARKER.length)); if (KINDS.has(data?.kind)) return data.kind; } catch { /* Unknown stays unknown. */ }
+    // The governor may append a human hint after the envelope. Scan the single flat object,
+    // respecting quoted braces, rather than parsing that hint or guessing from arbitrary prose.
+    const source = message.slice(marker + FAILURE_MARKER.length);
+    let quoted = false, escaped = false, start = 0;
+    const keys = new Set<string>();
+    if (source[0] !== "{" || message.indexOf(FAILURE_MARKER, marker + FAILURE_MARKER.length) >= 0) return "runtime_failed";
+    for (let i = 1; i < source.length; i++) {
+      const c = source[i];
+      if (c === "\n" || c === "\r") break;
+      if (quoted) {
+        if (escaped) { escaped = false; continue; }
+        if (c === "\\") { escaped = true; continue; }
+        if (c === '"') {
+          quoted = false;
+          if (/^\s*:/.test(source.slice(i + 1))) {
+            try { const key: string = JSON.parse(source.slice(start, i + 1)); if (keys.has(key)) return "runtime_failed"; keys.add(key); }
+            catch { return "runtime_failed"; }
+          }
+        }
+      } else if (c === '"') { quoted = true; start = i; }
+      else if (c === "{" || c === "[") break;
+      else if (c === "}") {
+        try { const data = JSON.parse(source.slice(0, i + 1)); if (KINDS.has(data?.kind)) return data.kind; } catch { /* Unknown stays unknown. */ }
+        break;
+      }
+    }
   }
   const code = /registered Runtime failed \(([a-z_]{1,64})\)/.exec(message)?.[1];
   if (code && KINDS.has(code)) return code as RuntimeStageErrorKind;

@@ -42,3 +42,10 @@ test("OS spawn observer is optional and its failure cannot change command succes
   {onSpawn(){calls++;throw new Error("synthetic observer failure");},timeoutMs:5000});
  assert.equal(result.ok,true);assert.equal(calls,1);
 });
+
+
+test("typed diagnostic categories survive governor hints and quoted braces without accepting duplicate/nested envelopes", () => {
+  assert.equal(runtimeStageErrorKind('[openai error] hara_runtime_failure_v1={"kind":"timeout","errorFirstLine":"restore } failed"} \u2014 network timeout; check connectivity'), "timeout");
+  assert.equal(runtimeStageErrorKind('hara_runtime_failure_v1={"kind":"timeout","kind":"runtime_auth_required"}'), "runtime_failed");
+  assert.equal(runtimeStageErrorKind('hara_runtime_failure_v1={"private":{"kind":"timeout"}}'), "runtime_failed");
+});

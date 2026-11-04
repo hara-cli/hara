@@ -124,6 +124,7 @@ export type LocalWorkspaceProviderFactory = (connection: ScopedConnection, bindi
 
 /** Opt-in local synthetic Host. No Account, global profiles, legacy SessionHub, discovery or installed Dev. */
 export class LocalWorkspaceHost {
+  private readonly runtimeStageCoreInstance = randomUUID();
   readonly root: string;
   readonly home: string;
   readonly project: string;
@@ -1356,7 +1357,8 @@ export class LocalWorkspaceHost {
           resourceGeneration: context.storage.run(() => currentWorkspaceResourceBinding()!.generation),
           agentId, sessionId: store.sessionId, runId: binding.runId, attemptId: lease.attemptId, historyStart: modelHistoryStart },
         { id: binding.agent.runtimeId, version: null, loginSource: "unknown",
-          model: binding.agent.runtimeId === "pi" ? binding.connection.model : null, effort: null });
+          model: binding.agent.runtimeId === "pi" ? binding.connection.model : null, effort: null },
+        { provenance: { startedAt: value.attempt!.startedAt, coreInstanceId: this.runtimeStageCoreInstance } });
         this.saveRuntimeStages(owned, true);
       } catch { /* No diagnostic initialization may change a durably accepted execution. */ }
       owned.interaction = interaction; owned.startContext = startContext;

@@ -98,8 +98,8 @@ export async function fakeCodexMain() {
           constraints: ["Only this Workspace"], acceptance: ["The colleague is active after human confirmation"],
           steps: ["Check colleagues", "Wait for the human card", "Verify creation"] }); save();
       }
-      meta.listed = await call("agent_list", {}); save();
-      if (selected === "create") {
+      if (selected !== "create-direct") { meta.listed = await call("agent_list", {}); save(); }
+      if (selected === "create" || selected === "create-direct") {
         meta.created = await call("agent_create", { username: "fixture-colleague", displayName: "Fixture Colleague", title: "Test", instructions: "Only the assigned Workspace task." }); save();
         const value = JSON.parse(receiptText(meta.created.text));
         if (value.created) {
@@ -136,6 +136,11 @@ export async function fakeCodexMain() {
         fs.writeFileSync(command + ".codexhome", (process.env.CODEX_HOME ?? "unset") + "\n");
       }
       if (mode().failure && mode().failure !== "runtime_auth_recovered" || mode().mode === "resume-fail" && message.method === "thread/resume") { error(message); continue; }
+      if (message.method === "thread/resume" && mode().resumeHang) {
+        if (mode().resumeStderr) process.stderr.write(mode().resumeStderr);
+        continue;
+      }
+      if (message.method === "thread/resume" && mode().resumeDelayMs) await new Promise(resolve => setTimeout(resolve, mode().resumeDelayMs));
       if (message.method === "thread/resume") {
         const state = JSON.parse(fs.readFileSync(command + ".native.json", "utf8"));
         if (state.thread !== p.threadId) { error(message); continue; }

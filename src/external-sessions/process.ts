@@ -1,6 +1,6 @@
 import { runtimeErrorFirstLine } from "../security/runtime-error.js";
 import { runtimeProxyFailureFromText } from "../security/runtime-proxy.js";
-import { classifyRuntimeFailure } from "../agent-runtime/failure-diagnostics.js";
+import { classifyRuntimeFailure, runtimeRpcDiagnostic, type RuntimeRpcDiagnostic } from "../agent-runtime/failure-diagnostics.js";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir, platform } from "node:os";
@@ -48,6 +48,7 @@ export interface ExternalCommandCaptureResult {
   /** Fixed-field runtime diagnostic plus an optional redacted first line. */
   runtimeFailure?: string;
   nativeFailureKind?: ReturnType<typeof classifyRuntimeFailure>;
+  nativeRpc?: RuntimeRpcDiagnostic;
 }
 
 export interface ExternalCommandRunOptions {
@@ -555,7 +556,7 @@ export interface JsonlRpcRequest {
 
 /** Sanitized provider RPC failure. The numeric code is safe for capability fallback; raw data stays local. */
 export class ExternalJsonlRpcRequestError extends Error {
-  constructor(readonly code: number, readonly runtimeFailureKind: ReturnType<typeof classifyRuntimeFailure> = "runtime_failed", readonly errorFirstLine?: string) {
+  constructor(readonly code: number, readonly runtimeFailureKind: ReturnType<typeof classifyRuntimeFailure> = "runtime_failed", readonly errorFirstLine?: string, readonly rpc?: RuntimeRpcDiagnostic) {
     super("external session adapter request failed");
     this.name = "ExternalJsonlRpcRequestError";
   }
@@ -563,7 +564,7 @@ export class ExternalJsonlRpcRequestError extends Error {
 
 /** Transport failure retains only a safe diagnostic; raw stderr never leaves its client. */
 export class ExternalJsonlRpcTransportError extends Error {
-  constructor(message: string, readonly runtimeFailureKind: ReturnType<typeof classifyRuntimeFailure>, readonly errorFirstLine?: string) { super(message); }
+  constructor(message: string, readonly runtimeFailureKind: ReturnType<typeof classifyRuntimeFailure>, readonly errorFirstLine?: string, readonly rpc?: RuntimeRpcDiagnostic) { super(message); }
 }
 
 export interface JsonlRpcClientOptions extends ExternalCommandOptions {
@@ -587,6 +588,7 @@ export interface JsonlRpcClientOptions extends ExternalCommandOptions {
 }
 
 interface PendingJsonlRequest {
+  method: string;
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -740,6 +742,7 @@ export class JsonlRpcClient {
           typeof providerCode === "number" && Number.isSafeInteger(providerCode) ? providerCode : -32_000,
           classifyRuntimeFailure({ stderr: JSON.stringify(record.error).slice(0, 65_536) }),
           this.options.captureErrorFirstLine ? runtimeErrorFirstLine((record.error as Record<string, unknown>).message, this.options.env) : undefined,
+          runtimeRpcDiagnostic({ rpcMethod: pending.method, rpcTimeoutMs: this.requestTimeoutMs }),
         ));
       }
       else pending.resolve(record.result);
@@ -757,11 +760,14 @@ export class JsonlRpcClient {
     this.write({ id, error: { code, message } });
   }
 
-  private fail(message: string): void {
+  private fail(message: string, timedOutMethod?: string): void {
     if (this.closed) return;
     this.closed = true;
     this.options.signal?.removeEventListener("abort", this.abort);
-    const error = new ExternalJsonlRpcTransportError(message, classifyRuntimeFailure({ stderr: this.stderr, timedOut: message.endsWith("timed out") }), this.options.captureErrorFirstLine ? runtimeErrorFirstLine(this.stderr, this.options.env) : undefined);
+    const method = timedOutMethod ?? (this.pending.size === 1 ? this.pending.values().next().value?.method : undefined);
+    const error = new ExternalJsonlRpcTransportError(message, classifyRuntimeFailure({ stderr: this.stderr, timedOut: message.endsWith("timed out") }),
+      this.options.captureErrorFirstLine ? runtimeErrorFirstLine(this.stderr, this.options.env) : undefined,
+      runtimeRpcDiagnostic({ rpcMethod: method, rpcTimeoutMs: this.requestTimeoutMs }));
     this.stderr = "";
     for (const request of this.pending.values()) {
       clearTimeout(request.timer);
@@ -784,10 +790,11 @@ export class JsonlRpcClient {
         // A provider may have accepted a turn even when its reply was lost. Once the request deadline
         // passes, the transport is no longer safe to reuse: terminate the owned process tree and reject
         // every in-flight request rather than leaving unobserved work running behind a live adapter.
-        this.fail("external session adapter request timed out");
+        this.fail("external session adapter request timed out", method);
       }, this.requestTimeoutMs);
       timer.unref();
       this.pending.set(id, {
+        method,
         resolve: (value) => resolve(value as T),
         reject,
         timer,
