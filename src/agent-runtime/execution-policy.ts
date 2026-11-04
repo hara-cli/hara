@@ -162,13 +162,13 @@ export class RuntimeExecutionPolicy {
     if (!lstatSync(this.workRoot).isDirectory() || this.workRoot === sep || contains(this.workRoot, home)) throw new Error("Unsafe runtime working directory");
     const roots: Record<RegisteredPolicyRuntime, string> = {
       pi: join(home, ".pi/agent"), codex: join(home, ".codex"), claude: join(home, ".claude"), opencode: join(home, ".local/share/opencode"),
-      gemini: join(home, ".gemini"), copilot: join(home, ".copilot"), cursor: join(home, ".cursor"), kimi: join(home, ".kimi"), grok: join(home, ".grok"),
+      gemini: join(home, ".gemini"), copilot: join(home, ".copilot"), cursor: join(home, ".cursor"), kimi: join(home, ".kimi-code"), grok: join(home, ".grok"),
     };
     const runtimeHome = input.runtimeHome ? physical(input.runtimeHome) : physical(roots[input.runtimeId]);
     const dirs: Record<RegisteredPolicyRuntime, string[]> = {
       pi: ["sessions", "log", "tmp"], codex: ["sessions", "archived_sessions", "log", "tmp", "shell_snapshots", "thread-writer-locks"],
       claude: ["projects", "todos", "debug", "session-env", "shell-snapshots", "file-history", "cache", "plans", "paste-cache"],
-      opencode: ["."], gemini: ["tmp", "history"], copilot: ["session-state", "logs"], cursor: ["chats"], kimi: ["sessions", "logs"], grok: ["sessions", "logs"],
+      opencode: ["."], gemini: ["tmp", "history"], copilot: ["session-state", "logs"], cursor: ["chats"], kimi: ["sessions", "logs", "locks/sessions"], grok: ["sessions", "logs"],
     };
     const writes = dirs[input.runtimeId].map(name => physical(join(runtimeHome, name)));
     if (input.runtimeId === "opencode") writes.push(physical(join(home, ".cache/opencode")), physical(join(home, ".local/state/opencode")));
@@ -201,8 +201,8 @@ export class RuntimeExecutionPolicy {
     const quotedSubpaths = (paths: readonly string[]) => paths.map(path => `(subpath ${quote(path)})`).join("\n  ");
     const literals = (paths: readonly string[]) => paths.map(path => `(literal ${quote(path)})`).join("\n  ");
     const keychains = [physical(join(home, "Library/Keychains"))];
-    const secretDirs = [".ssh", ".aws", ".azure", ".gnupg", ".config/gcloud", ".pi", ".kimi-code",
-      ...(input.runtimeId === "kimi" ? [] : [".kimi/credentials"])].map(name => physical(join(home, name)));
+    const secretDirs = [".ssh", ".aws", ".azure", ".gnupg", ".config/gcloud", ".pi", ".kimi",
+      ...(input.runtimeId === "kimi" ? [] : [".kimi-code"])].map(name => physical(join(home, name)));
     const pluginRoots: string[] = [];
     if (input.runtimeId === "codex") pluginRoots.push(physical(join(runtimeHome, "plugins")), physical(join(home, ".agents/plugins")));
     if (input.runtimeId === "opencode") {
@@ -240,6 +240,13 @@ export class RuntimeExecutionPolicy {
     if (input.runtimeId === "codex") lines.push(`(allow file-write* (regex ${quote("^" + runtimeHome.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "/((state|logs|memories|queue|goals)_[0-9]+)[.]sqlite(-wal|-shm|-journal)?$")}) (literal ${quote(join(runtimeHome, "installation_id"))}) (literal ${quote(join(runtimeHome, "history.jsonl"))}) (literal ${quote(join(runtimeHome, "session_index.jsonl"))}))`);
     // Gemini 0.66 initializes its project registry before auth or JSON output. Its lock retries
     // otherwise look like a silent startup hang. Admit only this state transaction, not the home.
+    if (input.runtimeId === "kimi") {
+      const prefix = runtimeHome.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const workspaceTemp = "^" + prefix + "/workspaces[.]json[.]tmp[.][0-9]+[.]" + "[0-9a-f]".repeat(8) + "$";
+      lines.push(`(allow file-write-create (require-all (literal ${quote(runtimeHome)}) (vnode-type DIRECTORY)))`,
+        `(allow file-write* (literal ${quote(join(runtimeHome, "session_index.jsonl"))}) (literal ${quote(join(runtimeHome, "workspaces.json"))}) (regex ${quote(workspaceTemp)}))`,
+        `(allow file-write* (require-all (literal ${quote(join(runtimeHome, "locks"))}) (vnode-type DIRECTORY)))`);
+    }
     if (input.runtimeId === "gemini") {
       const prefix = runtimeHome.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const hex = (length: number) => "[0-9a-f]".repeat(length);

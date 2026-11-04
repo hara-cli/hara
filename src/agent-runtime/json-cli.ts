@@ -8,6 +8,7 @@ import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js"
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
 import type { GovernedAgentRuntimeDriver } from "./registry.js";
 import { createRegisteredCliMcpTurn, WORKSPACE_MCP_TOKEN_ENV } from "./registered-cli-mcp.js";
+import { runKimiCodeAcp, KIMI_CODE_ENV } from "./kimi-code-acp.js";
 import { overlayGeminiProjectSettings } from "./gemini-project-settings.js";
 import { beginWorkspaceNativePolicy, endWorkspaceNativePolicy } from "./workspace-native-policy.js";
 import { createJsonCliExecutionPolicy, type JsonCliPolicyFactory, type JsonCliPolicyHandle } from "./json-cli-policy.js";
@@ -49,16 +50,16 @@ export function jsonCliDriver(id: JsonCliRuntimeId, installer: WorkspaceRuntimeI
             { cwd: directory, signal: native.signal, timeoutMs: 10_000, maxOutputBytes: 256 * 1024, failureKind: "runtime", captureErrorFirstLine: true });
           if (!help.ok || !jsonCliHelpCompatible(id, help.stdout)) return { ok: false, stdout: "", code: help.code, timedOut: help.timedOut,
             runtimeFailure: tracker.failed(help.timedOut ? "timeout" : "version_incompatible", Date.now() - started, help.errorFirstLine) };
-          const mcp = writeJsonCliMcp(id, endpoint, directory, permit.binding.budget.timeoutMs);
+          const mcp = id === "gemini" ? writeJsonCliMcp(id, endpoint, directory, permit.binding.budget.timeoutMs) : { path: "", contents: "", env: {} };
           if (id === "gemini") projectSettings = overlayGeminiProjectSettings(permit.binding.project.root, mcp.contents);
           policy = await policyFactory({ runtimeId: id, permit, options, installer, resolved }); assertCurrent();
           beginWorkspaceNativePolicy(permit, policy.policy);
           // Print alone is AFK. Controlled must add its documented plan flag and outer read-only policy.
           if (policy.tier !== "full-protected" && policy.tier !== "controlled") throw new Error("runtime_protection_unavailable");
-          if (policy.tier === "controlled" && !(id === "gemini" ? /--approval-mode(?=[\s,=]|$)/ : /--plan(?=[\s,=]|$)/).test(help.stdout)) throw new Error("runtime_controlled_mode_unavailable");
+          if (policy.tier === "controlled" && id === "gemini" && !/--approval-mode(?=[\s,=]|$)/.test(help.stdout)) throw new Error("runtime_controlled_mode_unavailable");
           const args = jsonCliArgs({ runtime: id, prompt, cwd: permit.binding.project.root, model: selection?.modelId ?? null, mcpPath: mcp.path,
             tier: policy.tier });
-          env = { ...resolved.env, ...endpoint.env, ...mcp.env,
+          env = { ...resolved.env, ...endpoint.env, ...mcp.env, ...(id === "kimi" ? KIMI_CODE_ENV : {}),
             HARA_SUBPROCESS_ENV_ALLOW: [resolved.env.HARA_SUBPROCESS_ENV_ALLOW, WORKSPACE_MCP_TOKEN_ENV].filter(Boolean).join(",") };
           const record = installer.captureSuccessfulUse(id, resolved.command), stages = workspaceRunRuntimeStages(permit);
           stages?.setRuntime({ id, version: installer.list().options.find(row => row.runtimeId === id)?.version ?? null, loginSource: resolved.loginSource,
@@ -66,7 +67,9 @@ export function jsonCliDriver(id: JsonCliRuntimeId, installer: WorkspaceRuntimeI
           observer = createRuntimeStageProcessObserver(stages, id, native.signal);
           const nativeEvents = createJsonCliNativeObserver(id, event => { policy!.policy.observeNativeEvent(event); publishWorkspaceNativeRisks(permit); });
           const wrapped = policy.policy.wrap({ command: resolved.command, args, env }); assertCurrent();
-          const result = await runExternalCommandCapture(wrapped, wrapped.args, {
+          const result = id === "kimi" ? await runKimiCodeAcp({ launch: wrapped, cwd: permit.binding.project.root, endpoint, prompt, tier: policy.tier,
+            model: selection?.modelId ?? null, signal: native.signal, timeoutMs: permit.binding.budget.timeoutMs, onSpawn: observer.onSpawn, assertCurrent,
+            onStdout: chunk => { observer?.onStdout(chunk); nativeEvents.onStdout(chunk); activity(); } }) : await runExternalCommandCapture(wrapped, wrapped.args, {
             cwd: permit.binding.project.root, signal: native.signal, timeoutMs: permit.binding.budget.timeoutMs,
             waitForClose: true, failureKind: "runtime", captureErrorFirstLine: true, proxyUrl: resolved.proxyUrl, maxOutputBytes: 4 * 1024 * 1024, retainStdoutOnFailure: true,
             onSpawn: observer.onSpawn, onStdout: chunk => { observer?.onStdout(chunk); nativeEvents.onStdout(chunk); activity(); },

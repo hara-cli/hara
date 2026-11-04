@@ -30,6 +30,7 @@ test("absent Gemini and Kimi are not_installed with manual guides and never acqu
 test("new runtimes bind only the proven account HOME and refuse isolated sign-in", async t => {
   const account = temp(t), bin = join(account, ".local/bin"); fs.mkdirSync(bin, { recursive: true });
   for (const id of ["gemini", "kimi"]) fs.writeFileSync(join(bin, id), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  fs.writeFileSync(join(account, ".local/package.json"), JSON.stringify({ name: "@moonshot-ai/kimi-code", version: "1.2.3", bin: { kimi: "bin/kimi" } }));
   const runtime = installer(t, account, async (_command, args) => args[0] === "--version" ? "1.2.3" : null); await runtime.discover();
   for (const id of ["gemini", "kimi"]) {
     const row = runtime.list().options.find(row => row.runtimeId === id);
@@ -37,7 +38,7 @@ test("new runtimes bind only the proven account HOME and refuse isolated sign-in
     runtime.registerLocal(id, row.fingerprint, "host");
     assert.throws(() => runtime.setLoginSource(id, "isolated"), /Invalid runtime login source/);
     const launch = runtime.resolveBound(id); assert.equal(launch.env.HOME, account); assert.equal(launch.loginSource, "host");
-    assert.equal(runtime.executionPolicyDirectories(id, launch).runtimeHome, join(account, id === "gemini" ? ".gemini" : ".kimi"));
+    assert.equal(runtime.executionPolicyDirectories(id, launch).runtimeHome, join(account, id === "gemini" ? ".gemini" : ".kimi-code"));
     assert.throws(() => runtime.executionPolicyDirectories(id, { ...launch, env: { ...launch.env, HOME: tmpdir() } }));
   }
 });
@@ -48,9 +49,9 @@ test("Kimi inherited extensions do not bypass frozen Workspace permit admission"
 });
 
 for (const id of ["gemini", "kimi"]) test(`${id}: real Seatbelt enforces fake-home state and foreign credential boundaries`, { skip: process.platform !== "darwin" }, async t => {
-  const root = temp(t), home = join(root, "account"), work = join(root, "work"), own = id === "gemini" ? ".gemini" : ".kimi";
-  for (const dir of [work, join(root, "outside"), join(home, ".hara"), join(home, ".gemini/tmp"), join(home, ".gemini/history"), join(home, ".kimi/sessions"), join(home, ".kimi/logs"), join(home, ".kimi/credentials"), join(home, ".kimi-code/credentials")]) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(join(home, ".gemini/oauth_creds.json"), "FAKE_GEMINI"); fs.writeFileSync(join(home, ".kimi/config.toml"), "FAKE_KIMI"); fs.writeFileSync(join(home, ".kimi/credentials/kimi-code.json"), "FAKE_KIMI_OAUTH"); fs.writeFileSync(join(home, ".kimi/credentials/custom.json"), "FAKE_CUSTOM_OAUTH"); fs.writeFileSync(join(home, ".kimi-code/credentials/kimi-code.json"), "FAKE_NEW_DIALECT");
+  const root = temp(t), home = join(root, "account"), work = join(root, "work"), own = id === "gemini" ? ".gemini" : ".kimi-code";
+  for (const dir of [work, join(root, "outside"), join(home, ".hara"), join(home, ".gemini/tmp"), join(home, ".gemini/history"), join(home, ".kimi-code/sessions"), join(home, ".kimi-code/logs"), join(home, ".kimi/credentials"), join(home, ".kimi-code/credentials")]) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(join(home, ".gemini/oauth_creds.json"), "FAKE_GEMINI"); fs.writeFileSync(join(home, ".kimi/config.toml"), "FAKE_KIMI"); fs.writeFileSync(join(home, ".kimi-code/config.toml"), "FAKE_NEW_CONFIG"); fs.writeFileSync(join(home, ".kimi/credentials/kimi-code.json"), "FAKE_KIMI_OAUTH"); fs.writeFileSync(join(home, ".kimi/credentials/custom.json"), "FAKE_CUSTOM_OAUTH"); fs.writeFileSync(join(home, ".kimi-code/credentials/kimi-code.json"), "FAKE_NEW_DIALECT");
   const policy = createRuntimeExecutionPolicy({ runtimeId: id, tier: "full-protected", workRoot: work, accountHome: home, loginSource: "host" });
   try {
     policy.beginAttempt("fixture-attempt");
@@ -59,7 +60,7 @@ for (const id of ["gemini", "kimi"]) test(`${id}: real Seatbelt enforces fake-ho
     const script = `const f=require('fs'),p=${JSON.stringify(paths)},out={}; for(const k of ['work','state','hara','outside']) {try {f.writeFileSync(p[k],'fixture');out[k]=true}catch{out[k]=false}} for(const k of ['ownAuth','foreign','kimiOAuth','kimiCustom','kimiCode']) {try {f.readFileSync(p[k]);out[k]=true}catch{out[k]=false}} try{f.writeFileSync(p.ownAuth,'no');out.authWrite=true}catch{out.authWrite=false} console.log(JSON.stringify(out));`;
     const launch = policy.wrap({ command: process.execPath, args: ["-e", script], env: { ...process.env, HOME: home } });
     const out = await runExternalCommandCapture(launch, launch.args, { cwd: work, timeoutMs: 5000, waitForClose: true }); assert.equal(out.ok, true, JSON.stringify(out));
-    assert.deepEqual(JSON.parse(out.stdout), { work: true, state: true, hara: false, outside: false, ownAuth: true, foreign: false, kimiOAuth: id === "kimi", kimiCustom: id === "kimi", kimiCode: false, authWrite: false });
+    assert.deepEqual(JSON.parse(out.stdout), { work: true, state: true, hara: false, outside: false, ownAuth: true, foreign: false, kimiOAuth: false, kimiCustom: false, kimiCode: id === "kimi", authWrite: false });
     const evidence = policy.collectWorkspaceEvidence(); assert.equal(evidence.attemptKey, "fixture-attempt"); assert.equal(evidence.changes[0].path, "yes.txt");
     assert.ok(policy.profile.includes('global-name "com.apple.securityd"')); // Profile text only, never a service call.
   } finally { const path = policy.tempRoot; await policy.close(); assert.equal(fs.existsSync(path), false); }

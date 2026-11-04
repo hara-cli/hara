@@ -14,7 +14,7 @@ test("Kimi inherited diagnostics are code-owned even when callers omit or forge 
     assert.equal(row.extensionsIsolation, runtime === "kimi" ? "inherited" : undefined); assert.ok(!raw.includes("forged-private-value"));
   }
 });
-test("Kimi classic full contract preserves host extensions, Hara receipts and protected launch", async t => {
+test("Kimi Code ACP full contract preserves host extensions, Hara receipts and protected launch", async t => {
   const f = await jsonCliFixture(t, "kimi"), sent = f.send(); await f.host.wait(sent.runId); const view = f.read(), meta = f.meta();
   assert.equal(view.conversation.state, "completed", JSON.stringify(view.conversation));
   assert.equal(meta.home, f.account); assert.equal(meta.yolo, true); assert.equal(meta.plan, false); assert.equal(meta.inheritedExtensions, true);
@@ -49,4 +49,11 @@ test("Kimi cancellation closes the physical model transport before policy and MC
   const f = await jsonCliFixture(t, "kimi", { mode: "cancel" }), sent = f.send(); await until(() => fs.existsSync(f.metaPath)); const url = f.meta().url;
   f.host.cancel(f.workspaceId, f.main, sent.runId); await f.host.wait(sent.runId);
   assert.equal(f.policyCalls.at(-1).kind, "close"); assert.notEqual(f.read().conversation.state, "running"); await assert.rejects(fetch(url));
+});
+
+for(const mode of ["native-pending","foreign-session"])test(`Kimi Code ACP ${mode} cannot publish completion or successful version`,async t=>{
+ const f=await jsonCliFixture(t,"kimi",{mode}),sent=f.send();await f.host.wait(sent.runId);const view=f.read();assert.notEqual(view.conversation.state,"completed");assert.equal(view.runtimes.options.find(x=>x.runtimeId==="kimi").versionStatus.lastSuccessfulVersion,null);await assert.rejects(fetch(f.meta().url));
+});
+test("Kimi Code ACP completed argument updates retain redacted native publication risk",async t=>{
+ const f=await jsonCliFixture(t,"kimi",{mode:"risk-update",productionPolicy:true}),sent=f.send();await f.host.wait(sent.runId);const view=f.read();assert.equal(view.conversation.state,"completed",view.conversation.blockReason);assert.equal(view.conversation.nativeRisks.length,1);assert.equal(view.conversation.nativeRisks[0].kind,"external-publish");assert.ok(!JSON.stringify(view).includes("PRIVATE_ARGUMENT"));
 });

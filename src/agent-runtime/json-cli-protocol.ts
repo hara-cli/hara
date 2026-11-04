@@ -130,13 +130,11 @@ export function createJsonCliNativeObserver(runtime: JsonCliRuntimeId, observe: 
   }, finish() { if (!stopped && pending.trim()) line(pending); pending = ""; stopped = true; } };
 }
 
-export function jsonCliRequiredFlags(runtime: JsonCliRuntimeId): readonly string[] {
-  return runtime === "gemini"
-    ? ["--output-format", "--yolo", "--prompt", "--allowed-mcp-server-names", "--extensions"]
-    : ["--print", "--yolo", "--output-format", "--mcp-config-file", "--prompt", "--work-dir"];
+export function jsonCliRequiredFlags(runtime: JsonCliRuntimeId): string[] {
+  return runtime === "gemini" ? ["--yolo", "--output-format", "--allowed-mcp-server-names", "--extensions", "--prompt"] : ["--prompt", "--output-format", "--auto", "--plan"];
 }
 export function jsonCliHelpCompatible(runtime: JsonCliRuntimeId, help: string): boolean {
-  return help.length <= 256 * 1024 && jsonCliRequiredFlags(runtime).every(flag => new RegExp(`(?:^|[\\s,])${flag}(?=[\\s,=]|$)`, "m").test(help));
+  return help.length <= 256 * 1024 && (runtime !== "kimi" || /(?:^|\n)\s*acp(?:\s|$)/.test(help)) && jsonCliRequiredFlags(runtime).every(flag => new RegExp(`(?:^|[\\s,])${flag}(?=[\\s,=]|$)`, "m").test(help));
 }
 
 /** `directory` is an exclusive, mode-0700 attempt directory created by trusted Host composition.
@@ -161,5 +159,5 @@ export function writeJsonCliMcp(runtime: JsonCliRuntimeId, endpoint: WorkspaceMc
 export function jsonCliArgs(input: { runtime: JsonCliRuntimeId; prompt: string; cwd: string; model: string | null; mcpPath: string; tier?: "full-protected" | "controlled" }): string[] {
   const model = input.model && input.model !== "default" ? ["--model", input.model] : [];
   return input.runtime === "gemini" ? ["--output-format", "stream-json", ...(input.tier === "controlled" ? ["--approval-mode", "plan"] : ["--yolo"]), "--allowed-mcp-server-names", "hara", "--extensions", "none", ...model, "--prompt", input.prompt]
-    : ["--print", ...(input.tier === "controlled" ? ["--plan"] : ["--yolo"]), "--output-format", "stream-json", "--mcp-config-file", input.mcpPath, "--work-dir", input.cwd, ...model, "--prompt", input.prompt];
+    : ["acp"];
 }
