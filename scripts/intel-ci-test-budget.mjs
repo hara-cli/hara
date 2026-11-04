@@ -12,6 +12,14 @@ export const INTEL_SLOW_FILES = Object.freeze([
   "legacy-copy-roundtrip.test.mjs", "legacy-copy-roundtrip-manual-a.test.mjs", "legacy-copy-roundtrip-manual-b.test.mjs",
   "legacy-startup.test.mjs", "legacy-startup-pi.test.mjs", "legacy-startup-rollback.test.mjs",
   "session-profile-cli.test.mjs", "workspace-local-host.test.mjs", "workspace-model-context.test.mjs", "workspace-production-entry.test.mjs",
+  // Partitions inherit the original measured parent suite classification.
+  "workspace-model-context-flow.test.mjs",
+  "workspace-model-context-handoff.test.mjs",
+  "workspace-model-context-ledger.test.mjs",
+  "workspace-production-flow.test.mjs",
+  "workspace-production-create.test.mjs",
+  "workspace-production-create-refusal.test.mjs",
+  "workspace-production-loopback.test.mjs",
 ]);
 // These fixtures compete for the hosted Mac's durable disk, browser or process-start capacity.
 // Isolate them without increasing their original 120s file deadline or any product/case deadline.
@@ -19,6 +27,24 @@ export const NATIVE_CONTENTION_FILES = Object.freeze([
   "jobs.test.mjs", "presentations.test.mjs", "provider-connections-cli.test.mjs",
   "workspace-local-channels.test.mjs", "workspace-local-channels-sessions.test.mjs",
   "workspace-local-channels-recovery.test.mjs", "workspace-provider-recovery.test.mjs",
+  // Keep split native cases serial instead of introducing parallel process/disk contention.
+  "agent-runtime-expanded-integration.test.mjs",
+  "agent-runtime-expanded-cursor-integration.test.mjs",
+  "agent-runtime-expanded-grok-integration.test.mjs",
+  "runtime-permission-process.test.mjs",
+  "runtime-permission-process-enforcement.test.mjs",
+  "workspace-codex-budget-reset.test.mjs",
+  "workspace-codex-budget-usage.test.mjs",
+  "workspace-codex-budget-ceiling.test.mjs",
+  "workspace-codex-budget-recovery.test.mjs",
+  "workspace-codex-budget-busy.test.mjs",
+  "workspace-codex-persistent-session.test.mjs",
+  "workspace-codex-standing-context.test.mjs",
+  "workspace-codex-colleague-fastpath.test.mjs",
+  "workspace-governance-c-lite-native-a.test.mjs",
+  "workspace-governance-c-lite-native-b.test.mjs",
+  "workspace-governance-c-lite-native-write.test.mjs",
+  "workspace-local-channels-native.test.mjs",
 ]);
 export function usesIntelBudget({ platform = process.platform, arch = process.arch, env = process.env, release = version } = {}) {
   return ["1.0.1", "1.0.2"].includes(release) && platform === "darwin" && arch === "x64"
