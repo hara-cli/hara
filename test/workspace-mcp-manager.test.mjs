@@ -1,3 +1,4 @@
+import { observeCodexAttempts } from "./helpers/codex-attempt-probe.mjs";
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -160,15 +161,24 @@ for (const tier of ["controlled", "full-protected"]) managedTest(`actual governe
 });
 
 for (const runtime of ["codex", "claude"]) managedTest(`registered ${runtime} adapter calls the same real stdio through its attempt token and governor`, async t => {
+  const revoked = runtime === "codex" ? observeCodexAttempts(t) : undefined;
   const f = await fixture(t), h = await hostFixture(t, f, { runtime, tier: "full-protected" });
   const started = h.host.start("client", h.id, h.main.agentId, "Read the synthetic plugin data.", randomUUID());
-  const card = await until(() => h.read().approvals.find(row => row.kind === "extension_call"), runtime + " external card");
+  const card = await until(() => h.read().approvals.find(row => row.kind === "extension_call"), runtime + " external card").catch(error => {
+    const snapshot = h.read(), file = h.command + ".meta.json";
+    const meta = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+    throw Error(error.message + " " + JSON.stringify({ state: snapshot.conversation.state, taskState: snapshot.conversation.taskState,
+      blockReason: snapshot.conversation.blockReason, toolsListed: Boolean(meta.tools), intake: meta.intake, plugin: meta.plugin }));
+  });
   assert.equal(allCalls(h.host, h.id).length, 0); h.host.answerApproval("client", h.id, card.id, true); await h.host.wait(started.runId);
   const snapshot = h.read(), meta = JSON.parse(fs.readFileSync(h.command + ".meta.json", "utf8"));
   assert.equal(snapshot.conversation.state, "completed", JSON.stringify({ error: snapshot.conversation.error, taskState: snapshot.conversation.taskState })); assert.equal(allCalls(h.host, h.id).length, 1);
   assert.equal(meta.tokenPresent, true); assert.equal(meta.tokenInArgv, false); assert.ok(meta.tools.includes(workspaceMcpToolName(f.source.sourceId, "read")));
   assert.ok(snapshot.conversation.history.flatMap(row => row.role === "tool" ? row.results : []).some(result => result.name === workspaceMcpToolName(f.source.sourceId, "read") && !result.isError));
-  await until(async () => { try { await fetch(meta.url); return false; } catch { return true; } }, "revoked native attempt endpoint");
+  if (revoked) {
+    await revoked(meta, { resident: true });
+    assert.equal(allCalls(h.host, h.id).length, 1, "revoked capability cannot dispatch another upstream call");
+  } else await until(async () => { try { await fetch(meta.url); return false; } catch { return true; } }, "closed per-attempt Claude endpoint");
 });
 
 managedTest("revoking a Workspace switch while its external confirmation is pending dispatches zero stdio calls", async t => {

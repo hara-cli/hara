@@ -1,13 +1,12 @@
+import { observeCodexAttempts } from "./helpers/codex-attempt-probe.mjs";
 import { governedToolResult, compactRosterIds } from "./helpers/governed-tool-result.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { cliMcpFixture, until } from "./helpers/workspace-cli-mcp.mjs";
 
 const done = view => ["completed", "blocked", "paused", "cancelled"].includes(view.conversation.state);
-async function closed(url) {
-  await until(async () => { try { await fetch(url); return false; } catch { return true; } }, Boolean);
-}
 test("session.send reaches registered Codex MCP and lists only this Workspace with governed receipts", async t => {
+  const revoked = observeCodexAttempts(t);
   const f = await cliMcpFixture(t); await f.send("List the colleagues of this Workspace.");
   const view = await until(f.read, done), meta = f.meta();
   assert.equal(view.conversation.state, "completed");
@@ -23,20 +22,23 @@ test("session.send reaches registered Codex MCP and lists only this Workspace wi
   const calls = view.conversation.history.flatMap(row => row.role === "tool" ? row.results : []);
   assert(calls.some(row => row.name === "agent_list" && row.id === result.receipt.toolCallId));
   assert(view.conversation.usage.modelCalls > 0 && view.conversation.usage.toolCalls > 0);
-  await closed(meta.url);
+  await revoked(meta, { resident: true });
 });
 
-test("registered CLI crash closes the per-attempt endpoint and records no fabricated success", async t => {
+test("registered CLI crash revokes the per-attempt capability and records no fabricated success", async t => {
+  const revoked = observeCodexAttempts(t);
   const f = await cliMcpFixture(t, "crash"); await f.send("Hello.");
   const view = await until(f.read, done), meta = f.meta();
   assert.equal(view.conversation.state, "blocked"); assert.equal(view.agents.length, 1);
-  await closed(meta.url);
+  await revoked(meta);
 });
 test("a native CLI cannot leak the per-turn bearer through its final text", async t => {
+  const revoked = observeCodexAttempts(t);
   const f = await cliMcpFixture(t, "leak"); await f.send("Hello.");
   const view = await until(f.read, done);
   assert.equal(view.conversation.state, "blocked");
   assert.equal(view.conversation.taskState, "paused");
   assert.equal(view.conversation.history.filter(row => row.role === "assistant").at(-1).text, "***");
   assert.equal(f.meta().tokenInArgv, false);
+  await revoked(f.meta());
 });

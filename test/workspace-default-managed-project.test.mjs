@@ -76,8 +76,11 @@ test("default App Hara project is granted only by the live opaque Host permit; S
   assert.deepEqual(f.meta().boundaryReads.map(row => row.allowed), [true, ...protectedPaths.map(() => false)]);
   assert.equal(fs.existsSync(controlledFile), false);
   const threads = f.native().filter(row => ["thread/start", "thread/resume"].includes(row.method));
-  assert.deepEqual(threads.map(row => row.method), ["thread/start", "thread/resume", "thread/resume"]);
-  assert.equal(threads[1].params.threadId, threads[2].params.threadId);
+  assert.deepEqual(threads.map(row => row.method), ["thread/start", "thread/resume"]);
+  const turns = f.native().filter(row => row.method === "turn/start");
+  assert.equal(turns.length, 3);
+  assert.ok(turns.every(row => row.params.threadId === turns[0].params.threadId));
+  assert.equal(threads.at(-1).params.threadId, turns[0].params.threadId);
   assert.ok(captured.length >= 2);
   await until(async () => { try { runtimeExecutionPolicyKey(captured[0]); return false; } catch { return true; } }, Boolean);
   assert.throws(() => runtimeExecutionPolicyKey(captured[0]), /cancelled|expired/);

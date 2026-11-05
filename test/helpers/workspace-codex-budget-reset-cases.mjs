@@ -78,7 +78,7 @@ if (selected.includes(3)) test("context ceiling pauses with open-new-session gui
 
 if (selected.includes(4)) test("resume-failed recovery requires explicit reset; audit, history and usage survive, nonce replay does not reset twice", async t => {
   const f = await cliMcpFixture(t, "list"); await exchange(f, "List current colleagues? Retain this history.");
-  f.mode("resume-fail"); let view = await exchange(f, "List current colleagues again?");
+  await f.restart(); f.mode("resume-fail"); let view = await exchange(f, "List current colleagues again?");
   assert.equal(view.conversation.nativeSession.status, "recovery_needed");
   const prior = nativeState(f).value, before = structuredClone(view.conversation), params = resetParams(f, view);
   await assert.rejects(f.request("workspace.session.new", { ...params, approved: false }), /approval/);

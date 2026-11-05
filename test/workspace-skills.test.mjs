@@ -48,7 +48,7 @@ test("formal Pi host exposes enabled workspace skill/tool but no global credenti
   const agent=host.context(id).resources.agents.get(view.selectedAgentId);host.context(id).resources.agents.setPermissionTier(agent.agentId,"controlled",agent.configRevision,agent.agentEpoch);
   const skills=host.workspaceFeatures(id);host.updateFeature(id,"skill","fixture",true,skills.revision,skills.skills[0].version);
   const receipt=host.start("fixture-client",id,view.selectedAgentId,"Hello",randomUUID());await host.wait(receipt.runId);
-  assert.equal(turns.length,1,JSON.stringify(host.snapshot(id).conversation));assert.match(turns[0].system,/Enabled version-locked Workspace skills/);assert.match(turns[0].system,/"id":"fixture"/);
+  assert.equal(turns.length,1,JSON.stringify(host.snapshot(id).conversation));assert.match(turns[0].system,/Current Workspace startup catalog/);assert.match(turns[0].system,/"id":"fixture"/);assert.match(turns[0].system,/retrieve the exact enabled user skill instructions when that user skill is relevant/);
   assert(turns[0].tools.some(tool=>tool.name==="workspace_skill"));assert(!JSON.stringify({system:turns[0].system,tools:turns[0].tools}).includes(home));assert(!turns[0].tools.some(tool=>["bash","skill","exec"].includes(tool.name)));
  }finally{await host.close();}
 });
