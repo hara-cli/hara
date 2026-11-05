@@ -129,7 +129,7 @@ export async function runFullProtectedPi(history: NeutralMsg[], options: RunOpts
           PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", HARA_UPDATE_CHECK: "0", NO_COLOR: "1", NODE_DISABLE_COMPILE_CACHE: "1",
           PATH: dirname(launch.command) + ":/usr/bin:/bin:/usr/sbin:/sbin", XDG_CONFIG_HOME: join(root, "home/.config"), XDG_CACHE_HOME: join(root, "home/.cache"),
           XDG_DATA_HOME: join(root, "home/.local/share") };
-        safe(() => stages?.setRuntime({ id: "pi", version: "1.5.0", loginSource: "isolated", model: permit.binding.connection.model, effort: null }));
+        safe(() => stages?.setRuntime({ id: "pi", version: "1.5.0", loginSource: "isolated", model: permit.binding.connection.model }));
         endSpawn = safe(() => stages?.beginEvent("spawn")); endCold = safe(() => stages?.beginEvent("cold_start", { source: "native_event" }));
         rpc = new PiRpcProcess({ ...launch, env, configuration: config, cwd: options.ctx.cwd, boundary: processBoundary(policy, launch, env, options.ctx.cwd),
           timeoutMs: permit.binding.budget.timeoutMs, governedPrompt: permit.binding.budget.mode === "interactive", signal: native.signal, onAccepted: () => sessionStore!.accepted(),

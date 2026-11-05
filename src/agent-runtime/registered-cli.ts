@@ -71,8 +71,9 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
     const assertCurrent = () => assertWorkspaceRunAdmission(permit, options, id);
     assertCurrent();
     if (options.signal?.aborted) return { status: "error", error: "Agent Runtime execution cancelled" };
-    const selection = models ? await models.launchSelection(id).catch(() => models.selection(id)) : null;
+    const selection = models ? await models.launchSelection(id).catch(() => { const saved = models.selection(id); return { ...saved, effortSource: saved.effort != null && saved.effort !== "auto" ? "user" as const : "auto" as const }; }) : null;
     const model = selection?.modelId ?? null, effort = selection?.effort ?? null;
+    try { workspaceRunRuntimeStages(permit)?.setRuntime({ effortSource: selection?.effortSource ?? "default" }); } catch { /* Observation only. */ }
     if (effort && models && !(await models.effortLaunchable(id))) {
       return { status: "error", error: "Agent Runtime '" + id + "' does not support reasoning effort; no level was applied" };
     }

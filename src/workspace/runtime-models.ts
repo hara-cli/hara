@@ -301,10 +301,11 @@ export class WorkspaceRuntimeModels {
   }
   /** New/legacy unchosen strength gets a live-model-backed default at launch. Explicit saved
    * string or null is never changed. The returned choice is not persisted behind the user's back. */
-  async launchSelection(runtimeId: OptionalRuntimeId): Promise<{ modelId: string | null; effort: string | null }> {
+  async launchSelection(runtimeId: OptionalRuntimeId): Promise<{ modelId: string | null; effort: string | null; effortSource: "auto" | "user" | "default" }> {
     this.bound(runtimeId);
     const row = this.state.read().selections.find(value => value.runtimeId === runtimeId);
-    if (row && Object.hasOwn(row, "selectedEffort")) return { modelId: row.selectedModelId ?? null, effort: row.selectedEffort ?? null };
+    const effortSource = ["codex", "claude", "copilot"].includes(runtimeId) ? row?.selectedEffort != null && row.selectedEffort !== "auto" ? "user" as const : "auto" as const : "default" as const;
+    if (row && Object.hasOwn(row, "selectedEffort")) return { modelId: row.selectedModelId ?? null, effort: row.selectedEffort ?? null, effortSource };
     // The first lookup needs the live inventory; repeating app-server model/list on every chat
     // would add a second native process to the latency path. Reuse only for this bound runtime
     // identity and state revision. A failed lookup is retried on the next attempt.
@@ -327,7 +328,7 @@ export class WorkspaceRuntimeModels {
       if (this.launchDefaults.size >= 8) this.launchDefaults.clear();
       this.launchDefaults.set(key, choice);
     }
-    return choice;
+    return { ...await choice, effortSource };
   }
   selected(runtimeId: OptionalRuntimeId): string | null { return this.selection(runtimeId).modelId; }
   selectedEffort(runtimeId: OptionalRuntimeId): string | null { return this.selection(runtimeId).effort; }
