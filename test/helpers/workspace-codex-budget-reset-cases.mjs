@@ -39,7 +39,9 @@ if (selected.includes(0)) test("context configuration is independent of run allo
 });
 
 if (selected.includes(1)) test("41k to 47k native totals debit only this attempt's 6k delta, with cached tokens separate and duplicate snapshots ignored", async t => {
-  const first = sample(41000, 40000, 20);
+  // Lifetime counters can be large while the last request stays below compaction pressure.
+  // Native maintenance has its own end-to-end billing test; keep this duplicate/delta case isolated.
+  const first = sample(41000, 40000, 20, 8000, 7000);
   const f = await cliMcpFixture(t, "telemetry", { telemetry: [first, first] });
   let view = await exchange(f); assert.equal(view.conversation.state, "completed");
   assert.equal(view.conversation.runUsage.inputTokens, 1000);
@@ -49,6 +51,8 @@ if (selected.includes(1)) test("41k to 47k native totals debit only this attempt
   assert.deepEqual(view.conversation.nativeSession.lastAttempt, { input: 6000, cachedInput: 5000, output: 20 });
   assert.equal(view.conversation.runUsage.inputTokens, 1000); assert.equal(view.conversation.usage.inputTokens, 2000);
   assert.equal(view.conversation.usage.outputTokens, 40);
+  assert.equal(view.conversation.contextCompactions.length, 0, "the counter-delta fixture does not request maintenance");
+  assert.equal(f.native().filter(row => row.method === "thread/compact/start").length, 0);
   assert.equal(f.native().filter(row => row.method === "thread/start").length, 1);
 });
 

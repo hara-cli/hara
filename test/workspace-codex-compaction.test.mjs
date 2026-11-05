@@ -19,6 +19,11 @@ test("idle native compaction rotates MCP markers, charges maintenance, preserves
   const record = second.conversation.contextCompactions[0]; assert.equal(record.method, "codex-native"); assert.equal(record.status, "completed");
   assert.equal(record.usage.requests, 1); assert.equal(record.usage.inputTokens, 18020); assert.equal(record.usage.cachedInputTokens, 17000); assert.equal(record.usage.outputTokens, 300);
   assert.equal(record.afterTokens, 120); assert.equal(record.beforeTokens, 18020);
+  assert.deepEqual(second.conversation.nativeSession.lastAttempt, { input: 18120, cachedInput: 17000, output: 320 });
+  assert.equal(second.conversation.runUsage.inputTokens, 1120, "maintenance and user request each debit only non-cache input");
+  assert.equal(second.conversation.runUsage.outputTokens, 320);
+  assert.equal(second.conversation.usage.inputTokens, first.conversation.usage.inputTokens + 1120);
+  assert.equal(second.conversation.usage.outputTokens, first.conversation.usage.outputTokens + 320);
   assert.deepEqual(second.conversation.history.slice(0, first.conversation.history.length), first.conversation.history);
   assert.match(turns(f)[1].params.input[0].text, /hara-context-summary/);
   assert.equal(second.conversation.usage.modelCalls > first.conversation.usage.modelCalls + 1, true);
