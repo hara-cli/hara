@@ -6,8 +6,8 @@ import { lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, sep } from "node:path";
 import {
-  assertPrivateStateDirectory, bindPrivateHaraStateFile, ensurePrivateStateSubdirectory, readPrivateStateFileSnapshotSync,
-  withPrivateStateLockSync, writePrivateStateFileSync, type PrivateStateDirectoryIdentity,
+  assertPrivateStateDirectory, bindPrivateHaraStateFile, ensurePrivateStateSubdirectory, privateStateMutationCount,
+  readPrivateStateFileSnapshotSync, withPrivateStateLockSync, writePrivateStateFileSync, type PrivateStateDirectoryIdentity,
 } from "../security/private-state.js";
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -71,15 +71,37 @@ interface StorageContext {
   readonly binding: WorkspaceResourceBinding;
   readonly scope: WorkspaceResourceScope;
   readonly fileBindings: Map<string, ReturnType<typeof bindPrivateHaraStateFile>>;
+  /** Full fence. This exact function is the commit guard and is never deduplicated. */
   assertCurrent(): void;
+  /** Read-side fence: skipped only inside a verified synchronous frame (see below), else full. */
+  assertFramed(): void;
   trackDirectory(directory: PrivateStateDirectoryIdentity): void;
 }
 const contexts = new AsyncLocalStorage<StorageContext>();
 
+/**
+ * A8 synchronous fence frame. Opened by WorkspaceResourceStorage.run immediately after a full
+ * assertCurrent and closed by `finally` when operation() returns, i.e. before any await, promise
+ * continuation, timer or I/O callback can run. It is a plain module variable on purpose: AsyncLocalStorage
+ * would propagate it into continuations, and clearing it from a microtask would let earlier-queued
+ * continuations observe it (FIFO). Inside the frame read-side fences skip the repeated scope/marker/
+ * tracked-directory checks while no in-process private-state data mutation happened since the last full
+ * fence. Never skipped: the commit guard (assertCurrent), every run() entry, directory creation, leaf
+ * directory/file identity checks, and every check after an await (no frame exists then).
+ */
+interface VerifiedFrame { readonly context: StorageContext; mutations: number }
+let verifiedFrame: VerifiedFrame | undefined;
+
+function withVerifiedFrame<T>(context: StorageContext, operation: () => T): T {
+  const previous = verifiedFrame;
+  verifiedFrame = { context, mutations: privateStateMutationCount() };
+  try { return operation(); } finally { verifiedFrame = previous; }
+}
+
 /** @internal Only the explicitly bound stores use this; process HOME/USERPROFILE never changes. */
 export function workspaceStateHome(): string {
   const context = contexts.getStore();
-  context?.assertCurrent();
+  context?.assertFramed();
   return context?.home ?? homedir();
 }
 export function currentWorkspaceResourceBinding(): WorkspaceResourceBinding | undefined {
@@ -100,7 +122,9 @@ export function workspaceResourceCommitGuard(): (() => void) | undefined {
 export function workspaceResourceDirectory(components: readonly string[]): string {
   const context = contexts.getStore();
   if (!context) throw new Error("no Workspace resource storage context");
-  const directory = ensurePrivateStateSubdirectory(workspaceStateHome(), [".hara", ...components]);
+  // May create directories: full fence before the namespace mutation, never framed.
+  context.assertCurrent();
+  const directory = ensurePrivateStateSubdirectory(context.home, [".hara", ...components]);
   context.trackDirectory(directory);
   return directory.path;
 }
@@ -114,14 +138,20 @@ export function readWorkspaceResourceText(path: string, maxBytes: number): strin
 /** @internal Capture the original private directory and snapshot before any asynchronous preparation.
  * Callers must retain assertCurrent through commit, not canonicalize a late alias into a new target. */
 export function inspectWorkspaceResourceFile(path: string, maxBytes: number) {
-  const binding = bindWorkspaceResourceFile(path);
+  const { assertFramed, ...binding } = bindResourceFile(path);
   const snapshot = readPrivateStateFileSnapshotSync(binding.path, maxBytes);
-  binding.assertCurrent();
+  assertFramed();
   return { ...binding, snapshot };
 }
 
-/** @internal File identity/namespace operations can bind without allocating the entire transcript. */
+/** @internal File identity/namespace operations can bind without allocating the entire transcript.
+ * The returned assertCurrent is always the full fence; callers use it as a commit guard. */
 export function bindWorkspaceResourceFile(path: string) {
+  const { assertFramed: _framed, ...binding } = bindResourceFile(path);
+  return binding;
+}
+
+function bindResourceFile(path: string) {
   const context = contexts.getStore();
   if (!context) throw new Error("no Workspace resource storage context");
   const home = context.home;
@@ -142,9 +172,12 @@ export function bindWorkspaceResourceFile(path: string) {
     if (context.fileBindings.size >= 256) context.fileBindings.clear();
     context.fileBindings.set(path, binding);
   }
-  const assertCurrent = (): void => { context.assertCurrent(); assertPrivateStateDirectory(binding.directory); };
-  assertCurrent();
-  return { path: binding.path, directory: binding.directory, assertCurrent };
+  const directory = binding.directory;
+  const assertCurrent = (): void => { context.assertCurrent(); assertPrivateStateDirectory(directory); };
+  // The leaf directory identity is always re-verified; only the context-wide part may be framed.
+  const assertFramed = (): void => { context.assertFramed(); assertPrivateStateDirectory(directory); };
+  assertFramed();
+  return { path: binding.path, directory, assertCurrent, assertFramed };
 }
 
 /** @internal A narrow read-only inventory permit for one exact memory bucket. Never a generic
@@ -251,7 +284,13 @@ export class WorkspaceResourceStorage {
       }
       const frozenText = snapshot.text;
       const tracked = new Map<string, PrivateStateDirectoryIdentity>();
-      return Object.freeze({ home: state.path, binding, scope: this.scope, fileBindings: new Map<string, ReturnType<typeof bindPrivateHaraStateFile>>(), trackDirectory: (directory: PrivateStateDirectoryIdentity) => {
+      const assertFramed = (): void => {
+        const frame = verifiedFrame;
+        if (frame?.context === created && frame.mutations === privateStateMutationCount()) return;
+        created.assertCurrent();
+        if (frame?.context === created) frame.mutations = privateStateMutationCount();
+      };
+      const created: StorageContext = Object.freeze({ home: state.path, binding, scope: this.scope, fileBindings: new Map<string, ReturnType<typeof bindPrivateHaraStateFile>>(), assertFramed, trackDirectory: (directory: PrivateStateDirectoryIdentity) => {
         const known = tracked.get(directory.path);
         if (known) { verifyDirectory(known); return; }
         if (tracked.size >= 10_000) throw new Error("Workspace resource directory tracking limit exceeded");
@@ -269,6 +308,7 @@ export class WorkspaceResourceStorage {
         if (!currentData || currentData.text !== dataText) throw new Error("Workspace resource data binding changed; state was preserved");
         for (const directory of tracked.values()) verifyDirectory(directory);
       } }) satisfies StorageContext;
+      return created;
     });
     this.context = context;
   }
@@ -289,7 +329,9 @@ export class WorkspaceResourceStorage {
     return contexts.run(context, () => {
       // The binder performs the full fresh scope/authority fence immediately before I/O and
       // verifies the original private parent. Cache hits reuse path identity only, never allow.
-      const file = bindWorkspaceResourceFile(join(context.home, ".hara", filename));
+      // Standalone this is two full fences. Nested inside a verified frame of this context both are
+      // framed: the enclosing run() fences fully before it returns anything to its own caller.
+      const file = bindResourceFile(join(context.home, ".hara", filename));
       try {
         const snapshot = readPrivateStateFileSnapshotSync(file.path, 4 * 1024 * 1024);
         assertPrivateStateDirectory(file.directory);
@@ -297,23 +339,26 @@ export class WorkspaceResourceStorage {
         if (result !== null && (typeof result === "object" || typeof result === "function")
           && typeof (result as { then?: unknown }).then === "function") throw new Error("Workspace JSON validation must be synchronous");
         return result;
-      } finally { context.assertCurrent(); }
+      } finally { context.assertFramed(); }
     });
   }
 
   run<T>(operation: () => T): T {
     const context = this.context;
     if (!context) throw new Error("Workspace resources are not initialized");
+    // Entry is always a full fence, even when nested: run(() => {}) is used as a freshness guard.
     context.assertCurrent();
     return contexts.run(context, () => {
       let result: T;
-      try { result = operation(); } catch (error) { context.assertCurrent(); throw error; }
+      // Exit fences run after the frame closed: full unless an enclosing verified frame of this same
+      // context will fence before returning. Promise settlement is always a full, fresh fence.
+      try { result = withVerifiedFrame(context, operation); } catch (error) { context.assertFramed(); throw error; }
       if (result instanceof Promise) {
         return result.then(value => { context.assertCurrent(); return value; }, error => {
           context.assertCurrent(); throw error;
         }) as T;
       }
-      context.assertCurrent();
+      context.assertFramed();
       return result;
     });
   }

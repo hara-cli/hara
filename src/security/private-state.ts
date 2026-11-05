@@ -88,6 +88,18 @@ export class PrivateStateConflictError extends Error {
   }
 }
 
+// Bumped on entry to every exported in-process private-state data mutation (text/binary write, file
+// removal, tree tightening), whether or not it later succeeds. Lock entries and new empty directories
+// are not data and do not count. Never an authority, identity or ordering proof: a synchronous fence
+// frame only uses "unchanged" to learn that THIS process cannot have revoked authority, replaced a
+// marker or rewritten the catalog since its last full fence. Cross-process changes are not counted.
+let privateStateMutations = 0;
+
+/** @internal In-process private-state data mutation counter for synchronous fence frames only. */
+export function privateStateMutationCount(): number {
+  return privateStateMutations;
+}
+
 function isMissing(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
 }
@@ -486,7 +498,11 @@ function createPrivateStateLock(
         /* already removed, still published for dead-owner recovery, or an unexpected replacement */
       }
     }
-    if (published) syncPrivateDirectory(binding.directory.path);
+    // No directory fsync for lock entries (A8). A lock entry is mutual exclusion, not data: every
+    // process that could hold it dies with a power loss, so whichever of {absent, complete dead-owner
+    // record, record + companion, orphan companion} reaches disk is reclaimable or free. The record
+    // bytes ARE fsynced above before link(): a durable name with torn bytes would parse as malformed
+    // and fail closed (busy) forever, which dead-owner recovery deliberately never reclaims.
   }
 }
 
@@ -513,7 +529,8 @@ function removePrivateStateLock(
       || alias.nlink !== 2
     ) throw new Error(`private Hara state lock changed while releasing: '${binding.path}'`);
     unlinkSync(current.companion);
-    syncPrivateDirectory(binding.directory.path);
+    // Release is not fsynced either (A8): a release lost to power failure leaves a complete record
+    // whose owner is dead, which the reclaim guard below removes on the next acquisition.
     const remaining = readPrivateStateLock(binding);
     if (!remaining) return;
     if (
@@ -800,6 +817,7 @@ export function writePrivateStateBytesOnceSync(
   binding: PrivateStateFileBinding,
   bytes: Uint8Array,
 ): void {
+  privateStateMutations++;
   const { directory, path } = binding;
   if (currentPrivateWriteObserver()) throw new Error("Binary writes are not part of a text inheritance transaction");
   verifyPrivateDirectory(directory);
@@ -885,6 +903,7 @@ export function writePrivateStateFileSync(
   text: string,
   options: PrivateStateWriteOptions = {},
 ): void {
+  privateStateMutations++;
   const { directory, path } = binding;
   const observer = currentPrivateWriteObserver();
   const observe = (action: () => unknown): void => {
@@ -1115,6 +1134,7 @@ export function removePrivateStateFile(
   expected: PrivateStateFileSnapshot,
   directory: PrivateStateDirectoryIdentity,
 ): void {
+  privateStateMutations++;
   if (currentPrivateWriteObserver()) throw new Error("File deletion is not part of a text inheritance transaction");
   removeVerifiedPrivateStateFile(path, expected, directory);
 }
@@ -1263,6 +1283,7 @@ function tightenTree(root: string, budget: MigrationBudget): void {
 
 /** Repair one Hara home. Exported with an injected path for offline tests. */
 export function tightenPrivateHaraState(home = homedir(), cap = DEFAULT_MIGRATION_CAP): void {
+  privateStateMutations++;
   if (!Number.isSafeInteger(cap) || cap < 1) throw new TypeError("private Hara state migration cap must be a positive integer");
   const root = join(home, ".hara");
   let rootInfo;
