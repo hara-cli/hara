@@ -11381,3 +11381,6 @@ Also correct the unknown-schema isolated endpoint fallback to use the same proce
 Diagnostics-only helper initially overescaped its regex before execution; corrected and node --check passed. Its instrumented failing sample is diagnosis only, not acceptance. Original failed receipts are retained.
 
 The first proxy-identity build at06b2fdf caught two inventory adapters rebuilding a partial resolved descriptor without the newly required proxyUrl. Carry the already-frozen prepared proxy identity through both protected inventory calls; do not loosen the resolved type or remove launch checks. Retain handoff-core-build-1 failure; no focused tests ran from that failed build.
+
+### Same-conversation cooldown retry fixture
+The second full suite at99f6542 naturally ended with exactly one failed legacy fixture: its supposed retry changed sessionId, so the now-isolated new conversation correctly did not inherit another conversation's cooldown. Retire the completed old physical permit, then create a new attempt with the SAME original conversation and a fresh runId. Preserve exact retryAtMs/consecutiveFailures and zero extra thread/start assertions. Original channel/DM isolation regression remains unchanged. No production source change; retain failed full2 and rerun the corrected direct fixture plus final full3 under original load/worker/timeout gates.

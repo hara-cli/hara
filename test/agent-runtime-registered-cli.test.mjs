@@ -116,8 +116,10 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
         "a failed native run leaves no fabricated text or tool result; the common governor may retain an empty assistant boundary");
       assert.doesNotMatch(JSON.stringify(history), /PRIVATE_ACCOUNT_DETAIL/);
       if (failure === "runtime_auth_required") {
-        // New registry + new attempt permit must still observe the same colleague's cooldown.
-        const retryBinding = freezeWorkspaceRunBinding({ ...binding, sessionId: randomUUID(), runId: randomUUID() });
+        // A new registry and attempt in this same conversation must retain its cooldown.
+        // Production retires the old attempt's physical lease before accepting the next one.
+        await closeWorkspaceRunPermit(permit);
+        const retryBinding = freezeWorkspaceRunBinding({ ...binding, runId: randomUUID() });
         const retryTask = { ...task, workspaceRunBinding: retryBinding };
         const retryLease = WorkspaceSessionLease.acquire(storage, retryBinding.sessionId);
         const retryPermit = createWorkspaceRunPermit({ ...permitInput, binding: retryBinding, lease: retryLease });
