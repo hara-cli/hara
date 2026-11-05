@@ -106,6 +106,8 @@ export interface TurnResult {
 }
 
 export interface ProviderErrorMetadata {
+  /** Host native adapter only: the control RPC failed before any model input was submitted. */
+  nativeControlFailure?: "codex_thread_start_failed" | "codex_resume_failed_history_preserved";
   status?: number;
   retryAfterMs?: number;
   code?: string;

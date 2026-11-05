@@ -11331,3 +11331,11 @@ The two authorized native Codex turns completed hello and an unconfirmed editabl
 - Area: runtime model inventory cache
 - First resident build at Core735b937 failed TS2339 because the installed/not-installed runtime option union does not guarantee a path. Narrow with the in operator and represent absent paths as null in the non-authoritative inventory identity. Registration, binary fingerprint, login source, proxy revision and all fresh launch checks remain in the key/path. No permission cache was added.
 - Original receipt: resident-core-build-1.result.json and log in the admitted speed-parity task. The queue naturally exited on the build error before any focused test. Retain that receipt and use a new label for the corrected build; do not overwrite or claim tests ran.
+
+
+## [ERR-20261105-NATIVE-CONTROL-CONTINUE] Successful restore retained an obsolete transient blocker
+
+- Diagnostic: native focused50/52; independent synthetic resume-probe-1 reproduced with a new attempt, same thread, fresh native turn, ready native status, and successful tools, while task stayed paused under the previous control-timeout blocker. Not a new network failure or a snapshot race.
+- Fix: carry a closed Host-only native control-failure code (only thread/start or thread/resume before model input) through the governed error outcome, persist same-turn/checkpoint-digest provenance, and consume only that matching transient block on explicit continuation. Model-authored prose, business/approval blockers and accepted/unknown native deliveries do not qualify. No completion/permission is granted; fresh C-lite evidence, frozen binding, prior usage and process drain remain required. Old failure history and stage receipts remain unchanged.
+- The other failure expected every healthy message to resume. Force Core restart before injecting resume-fail so the test still exercises a real failed restore and preserves all no-replay/history assertions. New task tests cover persistence, matching provenance, changed blocker, native-looking prose and retained business blockers.
+- Status: committed verification pending; original failure/diagnostic receipts retained.

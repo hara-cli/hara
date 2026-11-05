@@ -20,7 +20,8 @@ test("Host restart resumes the saved Codex thread in a new process without repla
 
 test("resume failure preserves history, reports explicit failure, and never starts a replacement thread or exec", async t => {
   const f = await cliMcpFixture(t, "list"); await exchange(f, "List current colleagues?");
-  f.mode("resume-fail"); const view = await exchange(f, "List current colleagues again?");
+  f.mode("resume-fail"); await f.restart();
+  const view = await exchange(f, "List current colleagues again?");
   assert.equal(view.conversation.state, "blocked");
   assert.equal(starts(f).filter(row => row.method === "thread/start").length, 1);
   assert.equal(f.native().filter(row => row.method === "turn/start").length, 1);

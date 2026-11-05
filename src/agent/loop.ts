@@ -814,6 +814,8 @@ function emitRuntimeItem(opts: RunOpts, event: Omit<RunRuntimeItemEvent, "at"> &
 export interface RunOutcome {
   status: "completed" | "error" | "empty" | "halted";
   error?: string;
+  /** Host-only control failure provenance; not a completion, permission or retry grant. */
+  nativeControlFailure?: "codex_thread_start_failed" | "codex_resume_failed_history_preserved";
   stopReason?: RunStopReason;
   /** Present for Engine-owned progress/repeat pauses so task snapshots can restore the safe metrics. */
   progress?: RunProgressEvent;
@@ -2584,7 +2586,9 @@ async function runAgentInner(
         if (sink) sink.notice(msg);
         else out(kind === "interrupted" ? c.dim(`\n${msg}\n`) : c.red(`${msg}\n`));
       }
-      return { status: "error", error: msg };
+      return { status: "error", error: msg,
+        ...(opts.workspaceRun?.binding.agent.runtimeId === "codex" && replaySafe && r.errorMetadata?.nativeControlFailure
+          ? { nativeControlFailure: r.errorMetadata.nativeControlFailure } : {}) };
     }
 
     // Empty-turn guard. The model returned nothing actionable — no text AND no tool calls (a blank

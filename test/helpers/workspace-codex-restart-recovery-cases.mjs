@@ -60,6 +60,8 @@ if (selected.includes(1)) test("silent thread/resume timeout after Core restart 
   const recovered = await until(f.read, done);
   assert.equal(receipt.runId, failed.conversation.runId);
   assert.equal(recovered.conversation.state, "completed", recovered.conversation.blockReason);
+  assert.equal(recovered.conversation.runUsage.modelCalls, failed.conversation.runUsage.modelCalls + 2, "manual recovery retains the frozen run budget and prior usage");
+  assert.equal(recovered.conversation.runtimeStages.find(row => row.attemptId === stage.attemptId).errorKind, "timeout", "historical failure is never rewritten");
   assert.equal(threadState(f).threadId, saved.threadId);
   assert.equal(starts(f).filter(row => row.method === "thread/start").length, 1);
   assert.equal(f.native().filter(row => row.method === "turn/start").length, 2);

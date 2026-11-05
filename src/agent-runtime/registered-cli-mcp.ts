@@ -186,8 +186,13 @@ export function createRegisteredCliMcpTurn(input: {
         physical = (async () => {
           try {
             const result = await input.launch(endpoint!, prompt, () => activity?.(), { ...args, onAssistantPreview: value => preview?.(value) });
+            const nativeControlFailure = result.errorCode === "codex_thread_start_failed" || result.errorCode === "codex_resume_failed_history_preserved"
+              ? result.errorCode : undefined;
             if (!result.ok) finished = { text: "", toolUses: [], stop: "error",
-              ...(result.nativeFailureKind ? { errorMetadata: { code: result.nativeFailureKind } } : {}),
+              ...(result.nativeFailureKind || nativeControlFailure ? { errorMetadata: {
+                ...(result.nativeFailureKind ? { code: result.nativeFailureKind } : {}),
+                ...(nativeControlFailure ? { nativeControlFailure } : {}),
+              } } : {}),
               errorMsg: result.runtimeFailure ?? "registered Runtime failed (" + (result.errorCode ?? (result.timedOut ? "timeout" : "exit")) + "); no fallback was selected" };
             else if (input.parseOutput) finished = input.parseOutput(result.stdout);
             else if (input.jsonEvents === false) finished = { text: result.stdout.trim(), toolUses: [], stop: "end" };

@@ -187,6 +187,8 @@ export interface TaskExecution {
   startedAt: string;
   endedAt?: string;
   lastOutcome?: RunOutcome["status"] | "interrupted";
+  /** Host-only provenance for an error before native model submission. Tool checkpoints cannot set it. */
+  nativeControlFailure?: { kind: NonNullable<RunOutcome["nativeControlFailure"]>; turnId: string; blockReasonHash: string };
   /** Cumulative provider rounds across every run/continue within this execution. */
   roundsUsed?: number;
   /** Extended in bounded 100-round tranches after a healthy durable checkpoint or an explicit resume. */
@@ -870,14 +872,20 @@ export function continueTaskExecution(
   const roundBudgetLimit = task.workspaceRunBinding?.budget.mode === "interactive"
     ? Math.max(budget.limit, Math.ceil((budget.used + 1) / DEFAULT_TASK_ROUND_BUDGET) * DEFAULT_TASK_ROUND_BUDGET)
     : budget.used >= budget.limit ? nextTaskRoundBudgetLimit(budget.limit) : budget.limit;
-  const { progress: _previousProgress, ...taskWithoutProgress } = task;
+  const { progress: _previousProgress, nativeControlFailure: previousControlFailure, ...taskWithoutProgress } = task;
+  const checkpoint = task.checkpoint ? { ...task.checkpoint, completion: undefined, updatedAt: now } : undefined;
+  // A user continuation retries the preparation, not an accepted model input. Consume only the
+  // exact Host-recorded transient blocker; unrelated business/approval blockers remain intact.
+  if (checkpoint?.blockReason && task.lastOutcome === "error" && previousControlFailure?.turnId === task.turnId
+    && (previousControlFailure.kind === "codex_thread_start_failed" || previousControlFailure.kind === "codex_resume_failed_history_preserved")
+    && previousControlFailure.blockReasonHash === createHash("sha256").update(checkpoint.blockReason).digest("hex")) {
+    delete checkpoint.blockedStep; delete checkpoint.blockReason;
+  }
   return {
     ok: true,
     task: {
       ...taskWithoutProgress,
-      ...(task.checkpoint
-        ? { checkpoint: { ...task.checkpoint, completion: undefined, updatedAt: now } }
-        : {}),
+      ...(checkpoint ? { checkpoint } : {}),
       status: "running",
       turnId: interaction.turnId,
       updatedAt: now,
@@ -1265,9 +1273,15 @@ export function finishTaskExecution(
       );
     }
   }
-  const { progress: _previousProgress, ...taskWithoutProgress } = task;
+  const { progress: _previousProgress, nativeControlFailure: _previousControlFailure, ...taskWithoutProgress } = task;
+  const controlFailure = status === "blocked" && outcome?.status === "error"
+    && (outcome.nativeControlFailure === "codex_thread_start_failed" || outcome.nativeControlFailure === "codex_resume_failed_history_preserved")
+    && checkpoint.blockReason === boundedText(outcome.error ?? "", MAX_TASK_CHECKPOINT_STEP_CHARS)
+    ? { kind: outcome.nativeControlFailure, turnId: task.turnId,
+      blockReasonHash: createHash("sha256").update(checkpoint.blockReason).digest("hex") } : undefined;
   return {
     ...taskWithoutProgress,
+    ...(controlFailure ? { nativeControlFailure: controlFailure } : {}),
     status,
     lastOutcome,
     checkpoint,
@@ -1294,6 +1308,7 @@ export function forkTaskExecution(task: TaskExecution | undefined, at: Date | st
     ...task,
     // A fork is a new task identity, not a second owner of a native Runtime session.
     runtimeBinding: undefined,
+    nativeControlFailure: undefined,
     id: randomUUID(),
     status: "paused",
     turnId: randomUUID(),
@@ -1643,6 +1658,14 @@ export function isTaskExecution(value: unknown): value is TaskExecution {
     ) return false;
   }
   if (task.checkpoint !== undefined && !validTaskCheckpoint(task.checkpoint)) return false;
+  if (task.nativeControlFailure !== undefined) {
+    const failure = task.nativeControlFailure as Record<string, unknown>;
+    const checkpoint = task.checkpoint as TaskCheckpoint | undefined;
+    if (!failure || typeof failure !== "object" || Array.isArray(failure) || Object.keys(failure).length !== 3
+      || (failure.kind !== "codex_thread_start_failed" && failure.kind !== "codex_resume_failed_history_preserved")
+      || failure.turnId !== task.turnId || task.status !== "blocked" || task.lastOutcome !== "error"
+      || !checkpoint?.blockReason || failure.blockReasonHash !== createHash("sha256").update(checkpoint.blockReason).digest("hex")) return false;
+  }
   if (task.progress !== undefined && !validTaskProgress(task.progress)) return false;
   if (task.decisions !== undefined) {
     if (!Array.isArray(task.decisions) || task.decisions.length > MAX_TASK_DECISIONS) return false;
