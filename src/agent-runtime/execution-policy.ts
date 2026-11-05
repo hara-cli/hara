@@ -2,7 +2,7 @@ import type { ChildProcess } from "node:child_process";
 import { RuntimeProcessBoundary, RUNTIME_GUARD_SCRIPT, type RuntimeDrainReport } from "./process-boundary.js";
 // Host-owned outer process boundary. Native permission switches cannot relax this Seatbelt profile.
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, type BigIntStats } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -47,7 +47,7 @@ export interface RuntimeRiskEvent {
   id: string; kind: "outside-workspace-delete" | "external-publish"; state: "observed"; summary: string; at: string;
   nodeId?: string; channelId?: string;
 }
-interface FileStamp { kind: "file" | "link" | "unsafe"; digest: string }
+interface FileStamp { kind: "file" | "link" | "unsafe"; digest: string; metadata: string; access: string }
 export interface NativeWorkspaceEvidence {
   id: string; source: "native-workspace-diff"; digest: string; verified: true; attemptKey: string;
   changes: { path: string; change: "created" | "changed" | "deleted"; before: string | null; after: string | null }[];
@@ -83,8 +83,14 @@ function physical(path: string): string {
     }
   }
 }
+/** Metadata supplements the content witness; it is never a content-version cache key.
+ * A persistent writable mmap can change bytes without changing even nanosecond ctime.
+ * Keep reading/hashing every admitted file until a stronger change witness is available. */
+function snapshotMetadata(info: BigIntStats): string {
+  return [info.dev, info.ino, info.size, info.mode, info.nlink, info.uid, info.gid, info.ctimeNs, info.mtimeNs].join(":");
+}
 function snapshot(root: string): { files: Map<string, FileStamp>; complete: boolean } {
-  const files = new Map<string, FileStamp>(), pending = [root]; let bytes = 0, complete = true;
+  const files = new Map<string, FileStamp>(), pending = [root]; let bytes = 0n, complete = true;
   while (pending.length) {
     const directory = pending.pop()!;
     let rows; try { rows = readdirSync(directory, { withFileTypes: true }); } catch { complete = false; continue; }
@@ -94,22 +100,25 @@ function snapshot(root: string): { files: Map<string, FileStamp>; complete: bool
       if (files.size >= 4000) { complete = false; break; }
       try {
         if (!contains(root, realpathSync.native(dirname(path)))) { complete = false; continue; }
-        const stat = lstatSync(path);
-        if (stat.isSymbolicLink()) { files.set(name, { kind: "link", digest: String(stat.ino) + ":" + stat.mtimeMs }); continue; }
+        const stat = lstatSync(path, { bigint: true }), metadata = snapshotMetadata(stat);
+        const access = [stat.mode, stat.uid, stat.gid].join(":");
+        if (stat.isSymbolicLink()) { files.set(name, { kind: "link", digest: metadata, metadata, access }); continue; }
         if (stat.isDirectory()) { pending.push(path); continue; }
-        if (!stat.isFile() || stat.nlink !== 1) { files.set(name, { kind: "unsafe", digest: String(stat.ino) + ":" + stat.mtimeMs }); continue; }
+        if (!stat.isFile() || stat.nlink !== 1n) { files.set(name, { kind: "unsafe", digest: metadata, metadata, access }); continue; }
         if (/(?:^|\/)(?:\.env(?:\.[^/]*)?|auth\.json|\.credentials\.json|credentials(?:\.[^/]*)?|oauth_creds\.json)$/u.test(name)) continue;
-        bytes += stat.size; if (stat.size > 4 * 1024 * 1024 || bytes > 32 * 1024 * 1024) { complete = false; continue; }
+        bytes += stat.size; if (stat.size > 4n * 1024n * 1024n || bytes > 32n * 1024n * 1024n) { complete = false; continue; }
         const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-        let data: Buffer, after;
+        let data: Buffer, after: BigIntStats;
         try {
-          const opened = fstatSync(fd), named = lstatSync(path);
-          if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.nlink !== 1 || !opened.isFile()
-            || named.dev !== opened.dev || named.ino !== opened.ino || realpathSync.native(path) !== path) { complete = false; continue; }
-          data = readFileSync(fd); after = fstatSync(fd);
+          const opened = fstatSync(fd, { bigint: true }), named = lstatSync(path, { bigint: true });
+          if (!opened.isFile() || snapshotMetadata(opened) !== metadata || snapshotMetadata(named) !== metadata
+            || realpathSync.native(path) !== path) { complete = false; continue; }
+          data = readFileSync(fd); after = fstatSync(fd, { bigint: true });
+          // A renamed-open inode may still have nlink=1: revalidate the name as well as the descriptor.
+          if (snapshotMetadata(lstatSync(path, { bigint: true })) !== metadata || realpathSync.native(path) !== path) { complete = false; continue; }
         } finally { closeSync(fd); }
-        if (stat.dev !== after.dev || stat.ino !== after.ino || stat.size !== after.size || stat.mtimeMs !== after.mtimeMs || after.nlink !== 1) { complete = false; continue; }
-        files.set(name, { kind: "file", digest: hash(data) });
+        if (BigInt(data.byteLength) !== stat.size || snapshotMetadata(after) !== metadata) { complete = false; continue; }
+        files.set(name, { kind: "file", digest: hash(data), metadata, access });
       } catch { complete = false; }
     }
   }
@@ -299,7 +308,8 @@ export class RuntimeExecutionPolicy {
     const current = snapshot(this.workRoot);
     if (!current.complete || current.files.size !== this.baseline.files.size) return false;
     return [...this.baseline.files].every(([path, before]) => before.kind !== "unsafe"
-      && current.files.get(path)?.kind === before.kind && current.files.get(path)?.digest === before.digest);
+      && current.files.get(path)?.kind === before.kind && current.files.get(path)?.digest === before.digest
+      && current.files.get(path)?.metadata === before.metadata);
   }
   collectWorkspaceEvidence(): NativeWorkspaceEvidence | null {
     if (this.closed || this.ambiguous || this.input.tier !== "full-protected" || !this.baseline.complete) return null;
@@ -307,8 +317,13 @@ export class RuntimeExecutionPolicy {
     const changes: NativeWorkspaceEvidence["changes"] = [];
     for (const path of [...new Set([...this.baseline.files.keys(), ...current.files.keys()])].sort()) {
       const before = this.baseline.files.get(path), after = current.files.get(path);
-      if (before?.digest === after?.digest && before?.kind === after?.kind) continue;
+      if (before?.digest === after?.digest && before?.kind === after?.kind) {
+        // Metadata-only effects cannot be represented by the content-hash evidence DTO.
+        if (before?.metadata !== after?.metadata) return null;
+        continue;
+      }
       if (before && before.kind !== "file" || after && after.kind !== "file") return null;
+      if (before && after && before.access !== after.access) return null;
       changes.push({ path: redactSensitiveText(path).text, change: !before ? "created" : !after ? "deleted" : "changed", before: before?.digest ?? null, after: after?.digest ?? null });
     }
     if (!changes.length || changes.length > 256) return null;
