@@ -115,6 +115,7 @@ interface LocalJob {
   receipts?: WorkspaceContextReceipts;
   messageTiming?: MessageTimingRecorder;
   runtimeStages?: RuntimeStageRecorder; stageStore?: WorkspaceRuntimeStageStore; stageSavedAt?: number;
+  stageSavePending?: { report: RuntimeStageReport; handle: ReturnType<typeof setImmediate> };
   interaction?: WorkspaceUserInteraction;
   startContext?: ReturnType<typeof prepareWorkspaceStartContext>;
   channelId?: string;
@@ -832,8 +833,24 @@ export class LocalWorkspaceHost {
   }
   private saveRuntimeStages(job: LocalJob, force = false): void {
     if (!job.runtimeStages || !job.stageStore || !force && Date.now() - (job.stageSavedAt ?? 0) < 1000) return;
-    try { job.stageStore.save(job.runtimeStages.snapshot()); job.stageSavedAt = Date.now(); }
-    catch { /* Diagnostics are optional; corrupt/changed private state is preserved. */ }
+    if (force && job.stageSavePending) { clearImmediate(job.stageSavePending.handle); job.stageSavePending = undefined; }
+    const store = job.stageStore;
+    let report: RuntimeStageReport;
+    try { report = job.runtimeStages.snapshot(); } catch { return; }
+    const save = (value: RuntimeStageReport): void => {
+      try { store.save(value); job.stageSavedAt = Date.now(); }
+      catch { /* Diagnostics are optional; corrupt/changed private state is preserved. */ }
+    };
+    if (force) { save(report); return; }
+    if (job.stageSavePending) { job.stageSavePending.report = report; return; }
+    // Only optional running diagnostics coalesce. A forced start/terminal stays synchronous;
+    // store.save rechecks the original scope/authority when this own callback actually executes.
+    let pending: NonNullable<LocalJob["stageSavePending"]>;
+    const handle = setImmediate(() => {
+      if (job.stageSavePending !== pending) return;
+      job.stageSavePending = undefined; save(pending.report);
+    });
+    pending = { report, handle }; job.stageSavePending = pending; handle.unref();
   }
   private runtimeStageReports(context: WorkspaceHostContext, agentId: string, sessionId: string): RuntimeStageReport[] {
     const reports = new Map<string, RuntimeStageReport>();
@@ -1025,7 +1042,7 @@ export class LocalWorkspaceHost {
       job.interaction?.request("explicit", completion.dependency.detail, completion.dependency.options);
     }
     const liveHistory = job.value.history;
-    job.value = job.store.save(job.value.revision, { ...job.value, history: closedWorkspaceHistory(liveHistory) });
+    job.value = job.store.saveIfChanged(job.value.revision, { ...job.value, history: closedWorkspaceHistory(liveHistory) });
     job.value.history = liveHistory; // governor owns this mutable transcript; persistence returns a redacted copy
     this.changed(job.workspaceId, job.agentId);
   }

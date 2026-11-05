@@ -100,7 +100,9 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
       assert.ok(diagnostic.elapsedMs >= 0 && diagnostic.elapsedMs <= 600000);
       assert.equal(diagnostic.consecutiveFailures, 1);
       assert.ok(diagnostic.retryAtMs > Date.now() - 1000);
-      assert.deepEqual(Object.keys(diagnostic).sort(), ["runtime", "kind", "version", "loginSource", "homeMatchesAccount", "elapsedMs", "retryAtMs", "consecutiveFailures", "errorFirstLine"].sort());
+      assert.deepEqual(Object.keys(diagnostic).sort(), ["runtime", "kind", "version", "loginSource", "homeMatchesAccount", "elapsedMs", "retryAtMs", "consecutiveFailures", "errorFirstLine",
+        ...(runtimeId === "codex" ? ["rpcMethod", "rpcTimeoutMs"] : [])].sort());
+      if (runtimeId === "codex") { assert.equal(diagnostic.rpcMethod,"thread/start"); assert.equal(diagnostic.rpcTimeoutMs,10000); }
       assert.equal(typeof diagnostic.errorFirstLine, "string");
       assert.ok(diagnostic.errorFirstLine.length > 0 && [...diagnostic.errorFirstLine].length <= 320);
       assert.doesNotMatch(diagnostic.errorFirstLine, /[\r\n]/);

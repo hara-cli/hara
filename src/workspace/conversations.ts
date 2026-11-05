@@ -110,7 +110,7 @@ export class WorkspaceConversationStore {
       runUsage: { modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 }, pastTasks: [], requests: [] }));
   }
   read(): WorkspaceConversation { return this.state.read(); }
-  save(expectedRevision: number, value: WorkspaceConversation): WorkspaceConversation {
+  private prepare(value: WorkspaceConversation): WorkspaceConversation {
     if (value.sessionId !== this.sessionId || value.agentId !== this.agentId) throw new Error("conversation ownership cannot change");
     const safe = redactSensitiveValue(value).value;
     safe.resourceBinding = structuredClone(value.resourceBinding);
@@ -121,6 +121,20 @@ export class WorkspaceConversationStore {
       if (task.workspaceAgentBinding) target.workspaceAgentBinding = structuredClone(task.workspaceAgentBinding);
       if (task.workspaceRunBinding) target.workspaceRunBinding = structuredClone(task.workspaceRunBinding);
     }
+    return safe;
+  }
+  /** Skip only an already durable, content-equivalent projection after a fresh verified read.
+   * A changed request/checkpoint still takes the original writer lock, CAS and fsync path. */
+  saveIfChanged(expectedRevision: number, value: WorkspaceConversation): WorkspaceConversation {
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new Error("invalid expected Workspace revision");
+    const current = this.state.read();
+    if (current.revision !== expectedRevision) throw new Error("Workspace state changed; refresh before writing");
+    const safe = this.prepare(value);
+    if (current.revision > 0 && canonical({ ...safe, revision: current.revision }) === canonical(current)) return current;
+    return this.save(expectedRevision, value);
+  }
+  save(expectedRevision: number, value: WorkspaceConversation): WorkspaceConversation {
+    const safe = this.prepare(value);
     return this.state.update(expectedRevision, previous => {
       if (canonical(value.requests.slice(0, previous.requests.length)) !== canonical(previous.requests)
         || value.requests.length < previous.requests.length || value.requests.length > previous.requests.length + 1) throw new Error("Workspace request receipts cannot be rewritten");
