@@ -173,7 +173,7 @@ for (const runtime of ["codex", "claude"]) managedTest(`registered ${runtime} ad
     const meta = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
     throw Error(error.message + " " + JSON.stringify({ state: snapshot.conversation.state, taskState: snapshot.conversation.taskState,
       blockReason: snapshot.conversation.blockReason, toolsListed: Boolean(meta.tools), mcpMethod: meta.mcpMethod, mcpStatus: meta.mcpStatus, refusedMcp: meta.refusedMcp, intake: meta.intake, plugin: meta.plugin,
-      nativeMethods: fs.existsSync(h.command + ".rpc.jsonl") ? fs.readFileSync(h.command + ".rpc.jsonl", "utf8").trim().split("\\n").filter(Boolean).map(line => JSON.parse(line).method) : [],
+      nativeMethods: fs.existsSync(h.command + ".rpc.jsonl") ? fs.readFileSync(h.command + ".rpc.jsonl", "utf8").trim().split(/\r?\n/u).filter(Boolean).map(line => JSON.parse(line).method) : [],
       nativeStateWritten: fs.existsSync(h.command + ".native.json"), metaWritten: fs.existsSync(file),
       stages: snapshot.conversation.runtimeStages?.at(-1) }));
   });
