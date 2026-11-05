@@ -19,6 +19,7 @@ test("target metadata is basename-only, bounded in Unicode and never invokes get
  for(const name of ["workspace_read","workspace_write","workspace_verify","read_file","edit_file","ls"])assert.equal(runtimeToolTargetLabel(name,{path:"src/index.ts"}),"index.ts");
  assert.equal(runtimeToolTargetLabel("workspace_read",{path:"目录/"+"文".repeat(60)+".ts"}),"文".repeat(39)+"…");
  for(const path of [".env",".hara/config.json","/Users/jeff/.ssh/id_rsa","secret.pem","auth.json","src/ghp_abcdefghijklmnopqrstuvwxyz","src/a\u202eb.ts","src/token=private.txt"])assert.equal(runtimeToolTargetLabel("read_file",{path}),undefined,path);
+ for(const length of [24,32,64,128,256]) for(const suffix of ["",".txt",".json"]) assert.equal(runtimeToolTargetLabel("workspace_read",{path:"src/"+"a".repeat(length)+suffix}),undefined,`opaque ${length}${suffix}`);
  assert.equal(runtimeToolTargetLabel("bash",{path:"index.ts"}),undefined);
  assert.equal(runtimeToolTargetLabel("read_file",{get path(){throw Error("getter must not run");}}),undefined);
  assert.equal(runtimeToolTargetLabel("read_file",new Proxy({},{getOwnPropertyDescriptor(){throw Error("observation fault");}})),undefined);
