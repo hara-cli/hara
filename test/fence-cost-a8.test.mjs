@@ -248,3 +248,51 @@ test("A8-2 leaf directory identity is still checked on every framed read (inode,
 });
 
 // ---------------------------------------------------------------- 3. pinned component chain
+
+test("A8-3 full-fence realpath work no longer grows with the number of tracked directories", () => {
+  const f = fixture();
+  f.storage.run(() => workspaceResourceDirectory(["chain", "d0"]));
+  const one = counting(fs.realpathSync, "native", () => f.storage.run(() => {}));
+  f.storage.run(() => { for (let i = 1; i < 30; i++) workspaceResourceDirectory(["chain", `d${i}`]); });
+  const many = counting(fs.realpathSync, "native", () => f.storage.run(() => {}));
+  assert.equal(many, one, "tracked directories are verified by lstat chain, not realpath");
+  const lstats = counting(fs, "lstatSync", () => f.storage.run(() => {}));
+  const lstatsOne = (() => {
+    const g = fixture(); g.storage.run(() => workspaceResourceDirectory(["chain", "d0"]));
+    return counting(fs, "lstatSync", () => g.storage.run(() => {}));
+  })();
+  assert.ok(lstats - lstatsOne <= 2 * 29, `shared ancestors are checked once per fence (delta ${lstats - lstatsOne})`);
+});
+
+const chainCases = {
+  "ancestor replaced by a symlink": (ancestor) => { renameSync(ancestor, `${ancestor}.moved`); symlinkSync(`${ancestor}.moved`, ancestor); },
+  // realpath(leaf) === leaf and the leaf inode are both unchanged here; the pinned ancestor catches it.
+  "ancestor replaced by another real directory holding the moved leaf": (ancestor, leaf) => {
+    renameSync(ancestor, `${ancestor}.old`); mkdirSync(ancestor, { mode: 0o700 }); renameSync(join(`${ancestor}.old`, "leaf"), leaf);
+  },
+  "leaf inode replaced": (_ancestor, leaf) => { renameSync(leaf, `${leaf}.moved`); mkdirSync(leaf, { mode: 0o700 }); },
+  "leaf replaced by a symlink": (_ancestor, leaf) => { renameSync(leaf, `${leaf}.moved`); symlinkSync(`${leaf}.moved`, leaf); },
+};
+for (const [name, mutate] of Object.entries(chainCases)) {
+  test(`A8-3 ${name} is rejected by the next full fence`, () => {
+    const f = fixture();
+    const leaf = f.storage.run(() => workspaceResourceDirectory(["anc", "leaf"]));
+    f.storage.run(() => workspaceResourceDirectory(["other"])); // a sibling keeps the shared prefix in use
+    mutate(dirname(leaf), leaf);
+    assert.throws(() => f.storage.run(() => {}), /directory identity changed/);
+  });
+}
+
+test("A8-3 documented difference: a case-only rename keeps pinned inodes and file access still rejects it", (t) => {
+  const f = fixture();
+  const leaf = f.storage.run(() => workspaceResourceDirectory(["anc", "leaf"]));
+  const path = join(leaf, "file.json");
+  f.storage.run(() => writePrivateStateFileSync(bindWorkspaceResourceFile(path), "{}\n", { expectedMissing: true }));
+  const ancestor = dirname(leaf);
+  let insensitive = false;
+  try { fs.lstatSync(join(dirname(ancestor), "ANC")); insensitive = true; } catch { /* case-sensitive volume */ }
+  if (!insensitive) { t.skip("case-sensitive volume: the rename makes the path disappear and is rejected"); return; }
+  renameSync(ancestor, join(dirname(ancestor), "ANC"));
+  f.storage.run(() => {}); // same inodes, no symlink: accepted by the context-wide chain fence
+  assert.throws(() => f.storage.run(() => inspectWorkspaceResourceFile(path, 4096)), "leaf realpath identity still refuses the renamed spelling");
+});

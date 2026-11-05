@@ -4,7 +4,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import {
   assertPrivateStateDirectory, bindPrivateHaraStateFile, ensurePrivateStateSubdirectory, privateStateMutationCount,
   readPrivateStateFileSnapshotSync, withPrivateStateLockSync, writePrivateStateFileSync, type PrivateStateDirectoryIdentity,
@@ -216,6 +216,66 @@ function verifyDirectory(identity: PrivateStateDirectoryIdentity): void {
     || realpathSync.native(identity.path) !== identity.path) throw new Error("Workspace resource directory identity changed");
 }
 
+/** Every component of a canonical absolute path from the first below the root down to the path itself. */
+function directoryChain(path: string): string[] {
+  const chain: string[] = [];
+  for (let current = path, parent = dirname(current); parent !== current; current = parent, parent = dirname(current)) chain.push(current);
+  return chain.reverse();
+}
+
+/**
+ * A8 tracked-directory fence. `verifyDirectory` proves "leaf dev/ino unchanged and realpath(T) === T"; for a
+ * canonical absolute T the realpath half is exactly "no component of T is a symlink" (POSIX realpath walks
+ * and lstats each component). This fence instead lstats every component itself, requiring a real directory
+ * whose dev/ino equals the identity pinned when the directory was first tracked, and shares components
+ * between directories within ONE full fence (N dirs x depth D realpath walks become about N + D lstats).
+ * Replacement strength is never lower: symlink insertion is rejected at the component, any ancestor or
+ * leaf inode/device replacement (including a mount over an ancestor) is rejected, and the original leaf
+ * identity check is unchanged. The only accepted difference: a case- or Unicode-normalization-only rename
+ * of an existing component on an insensitive volume keeps every pinned inode and is no longer rejected;
+ * it cannot redirect to other data. Windows keeps realpath (reparse points/8.3 names are not lstat-shaped).
+ */
+class DirectoryChainFence {
+  private readonly pinned = new Map<string, { dev: number; ino: number }>();
+  private readonly enabled = process.platform !== "win32";
+
+  /** Pin a directory that is not yet known, between two full realpath proofs of it. */
+  track(identity: PrivateStateDirectoryIdentity): void {
+    verifyDirectory(identity);
+    if (!this.enabled) return;
+    const recorded: [string, { dev: number; ino: number }][] = [];
+    for (const path of directoryChain(identity.path)) {
+      const info = lstatSync(path);
+      if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Workspace resource directory identity changed");
+      const known = this.pinned.get(path);
+      if (known && (known.dev !== info.dev || known.ino !== info.ino)) throw new Error("Workspace resource directory identity changed");
+      recorded.push([path, { dev: info.dev, ino: info.ino }]);
+    }
+    verifyDirectory(identity);
+    const leaf = recorded.at(-1)?.[1];
+    if (!leaf || leaf.dev !== identity.dev || leaf.ino !== identity.ino) throw new Error("Workspace resource directory identity changed");
+    for (const [path, pin] of recorded) this.pinned.set(path, pin);
+  }
+
+  /** One full-fence pass. `checked` lives for a single synchronous assertCurrent call only. */
+  verify(identity: PrivateStateDirectoryIdentity, checked: Set<string>): void {
+    if (!this.enabled) { verifyDirectory(identity); return; }
+    const chain = directoryChain(identity.path);
+    if (!chain.every(path => this.pinned.has(path))) { verifyDirectory(identity); return; }
+    for (const path of chain) {
+      if (checked.has(path)) continue;
+      const pin = this.pinned.get(path)!;
+      const info = lstatSync(path);
+      if (!info.isDirectory() || info.isSymbolicLink() || info.dev !== pin.dev || info.ino !== pin.ino) {
+        throw new Error("Workspace resource directory identity changed");
+      }
+      checked.add(path);
+    }
+    const leaf = this.pinned.get(identity.path)!;
+    if (leaf.dev !== identity.dev || leaf.ino !== identity.ino) throw new Error("Workspace resource directory identity changed");
+  }
+}
+
 /** @internal Constructed only by the host-side WorkspaceResources facade. Not an RPC or execution
  * context: other stores/tools/Host grants have NOT been partitioned by entering this storage context. */
 export class WorkspaceResourceStorage {
@@ -284,6 +344,8 @@ export class WorkspaceResourceStorage {
       }
       const frozenText = snapshot.text;
       const tracked = new Map<string, PrivateStateDirectoryIdentity>();
+      const fence = new DirectoryChainFence();
+      for (const directory of [this.host, marker.directory, state, dataMarker.directory]) fence.track(directory);
       const assertFramed = (): void => {
         const frame = verifiedFrame;
         if (frame?.context === created && frame.mutations === privateStateMutationCount()) return;
@@ -294,19 +356,20 @@ export class WorkspaceResourceStorage {
         const known = tracked.get(directory.path);
         if (known) { verifyDirectory(known); return; }
         if (tracked.size >= 10_000) throw new Error("Workspace resource directory tracking limit exceeded");
-        verifyDirectory(directory);
+        fence.track(directory);
         tracked.set(directory.path, { ...directory });
       }, assertCurrent: () => {
         this.checkAuthority();
-        verifyDirectory(this.host);
-        verifyDirectory(marker.directory);
-        verifyDirectory(state);
-        verifyDirectory(dataMarker.directory);
+        const checked = new Set<string>();
+        fence.verify(this.host, checked);
+        fence.verify(marker.directory, checked);
+        fence.verify(state, checked);
+        fence.verify(dataMarker.directory, checked);
         const current = readPrivateStateFileSnapshotSync(marker.path, 4096);
         if (!current || current.text !== frozenText) throw new Error("Workspace resource scope marker changed; reopen is required");
         const currentData = readPrivateStateFileSnapshotSync(dataMarker.path, 4096);
         if (!currentData || currentData.text !== dataText) throw new Error("Workspace resource data binding changed; state was preserved");
-        for (const directory of tracked.values()) verifyDirectory(directory);
+        for (const directory of tracked.values()) fence.verify(directory, checked);
       } }) satisfies StorageContext;
       return created;
     });
