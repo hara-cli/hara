@@ -56,8 +56,11 @@ test("discovery and explicitly approved local registration are separate and reva
  const registry=new WorkspaceRuntimeInstaller(storage,{discovery:options(home)});
  const fetchBefore=globalThis.fetch;globalThis.fetch=()=>{throw new Error("network forbidden in discovery/registration");};
  try { await registry.discover();let row=registry.list().options.find(r=>r.runtimeId==="opencode");assert.equal(row.state,"detected");assert.equal(row.registered,false);
+   assert.deepEqual(registry.availability("opencode"),{state:row.state,generalAgentDriverAvailable:row.generalAgentDriverAvailable});
    registry.registerLocal("opencode",row.fingerprint);row=registry.list().options.find(r=>r.runtimeId==="opencode");assert.equal(row.state,"local_registered");assert.equal(registry.resolveLocal("opencode").command,path);
+   for(const option of registry.list().options)assert.deepEqual(registry.availability(option.runtimeId),{state:option.state,generalAgentDriverAvailable:option.generalAgentDriverAvailable});
    binary(path,"echo 'changed 9.9.9'");assert.equal(registry.list().options.find(r=>r.runtimeId==="opencode").state,"integrity_failed");assert.throws(()=>registry.resolveLocal("opencode"));
+   assert.deepEqual(registry.availability("opencode"),{state:"integrity_failed",generalAgentDriverAvailable:false});
  } finally {globalThis.fetch=fetchBefore;await registry.close();}
 });
 test("actual subprocess timeout kills only its own command group; broken version exits are ignored",async()=>{

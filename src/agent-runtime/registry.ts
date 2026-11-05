@@ -49,23 +49,29 @@ export class AgentRuntimeRegistry {
     }
   }
 
+  private option(id: AgentRuntimeId, row?: { state: string; generalAgentDriverAvailable: boolean }): AgentRuntimeOption {
+    const driver = this.drivers.has(id);
+    const available = id === "agy" ? false
+      : id === "codex" || id === "claude" || id === "opencode" || id === "gemini" || id === "kimi" || id === "copilot" || id === "cursor" || id === "grok" ? Boolean(driver && row?.generalAgentDriverAvailable) : driver;
+    const reason = available ? undefined : id === "agy" ? "general_agent_adapter_pending"
+      : row?.state === "integrity_failed" ? "integrity_failed"
+      : row?.state === "not_installed" ? "not_installed"
+      : row?.state === "detected" || !row ? "not_registered" : "general_agent_adapter_pending";
+    return { id, label: LABELS[id], available, ...(reason ? { reason: reason as AgentRuntimeOption["reason"] } : {}), recommended: id === "pi" };
+  }
   options(): AgentRuntimeOption[] {
     const installed = this.installer?.list().options;
-    return AGENT_RUNTIME_IDS.map(id => {
-      const row = installed?.find(option => option.runtimeId === id);
-      const driver = this.drivers.has(id);
-      const available = id === "agy" ? false
-        : id === "codex" || id === "claude" || id === "opencode" || id === "gemini" || id === "kimi" || id === "copilot" || id === "cursor" || id === "grok" ? Boolean(driver && row?.generalAgentDriverAvailable) : driver;
-      const reason = available ? undefined : id === "agy" ? "general_agent_adapter_pending"
-        : row?.state === "integrity_failed" ? "integrity_failed"
-        : row?.state === "not_installed" ? "not_installed"
-        : row?.state === "detected" || !row ? "not_registered" : "general_agent_adapter_pending";
-      return { id, label: LABELS[id], available, ...(reason ? { reason: reason as AgentRuntimeOption["reason"] } : {}), recommended: id === "pi" };
-    });
+    return AGENT_RUNTIME_IDS.map(id => this.option(id, installed?.find(option => option.runtimeId === id)));
+  }
+  private selectedOption(id: AgentRuntimeId): AgentRuntimeOption {
+    if (id === "hara" || id === "pi" || id === "agy") return this.option(id);
+    const row = typeof this.installer?.availability === "function" ? this.installer.availability(id)
+      : this.installer?.list().options.find(option => option.runtimeId === id);
+    return this.option(id, row);
   }
 
   assertAvailable(id: AgentRuntimeId): void {
-    if (!this.options().some(row => row.id === id && row.available)) throw new Error(`Agent Runtime '${id}' is not available for general Agents; no fallback was selected`);
+    if (!this.selectedOption(id).available) throw new Error(`Agent Runtime '${id}' is not available for general Agents; no fallback was selected`);
   }
 
   /** Separate trusted entry: no legacy TaskRuntimeBinding or personal/org Space substitution. */
@@ -73,7 +79,7 @@ export class AgentRuntimeRegistry {
     if (!options.workspaceRun) throw new Error(WORKSPACE_AGENT_EXECUTION_PENDING);
     const runtimeId = options.workspaceRun.binding.agent.runtimeId;
     assertWorkspaceRunAdmission(options.workspaceRun, options, runtimeId);
-    const availability = this.options().find(row => row.id === runtimeId);
+    const availability = this.selectedOption(runtimeId);
     if (!availability?.available) {
       if (this.installer && (runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode" || runtimeId === "gemini" || runtimeId === "kimi" || runtimeId === "copilot" || runtimeId === "cursor" || runtimeId === "grok")) {
         return Promise.resolve({ status: "error", error: runtimeFailureMessage({ ...this.installer.failureContext(runtimeId),

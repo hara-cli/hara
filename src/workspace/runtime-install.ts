@@ -33,6 +33,8 @@ interface Registration { artifact: RuntimeArtifact; executableSha256: string; by
  */
 export type RuntimeLoginSource = "host" | "isolated";
 export interface RuntimeLoginBinding { runtimeId: OptionalRuntimeId; source: RuntimeLoginSource; confirmedAt: string }
+const generalAgentAvailable = (runtimeId: OptionalRuntimeId, registered: boolean, loginSource: RuntimeLoginSource): boolean =>
+  registered && (runtimeId === "codex" || runtimeId === "claude" || HOST_LOGIN_ONLY_RUNTIMES.includes(runtimeId) && loginSource === "host");
 interface InstallState { resourceBinding: WorkspaceResourceBinding; revision: number; entries: Registration[]; loginSources: RuntimeLoginBinding[] }
 interface LocalState { resourceBinding: WorkspaceResourceBinding; revision: number; entries: DetectedRuntime[]; loginSources: RuntimeLoginBinding[] }
 export interface RuntimeInstallCard { id: string; runtimeId: OptionalRuntimeId; label: string; version: string;
@@ -518,6 +520,29 @@ export class WorkspaceRuntimeInstaller {
       return history === null ? { ...projected, change: "unknown" as const, compatibility: "unknown" as const } : projected;
     };
   }
+  /** Fresh launch availability for one selected runtime. Display history and unrelated binaries
+   * are not authority for this launch; physical dispatch still resolves its original bound origin. */
+  availability(runtimeId: OptionalRuntimeId): { state: string; generalAgentDriverAvailable: boolean } {
+    if (!optionalRuntimeId(runtimeId)) return fail();
+    const locals = this.locals.read(), local = locals.entries.find(row => row.runtimeId === runtimeId);
+    const detected = this.detected.find(row => row.runtimeId === runtimeId);
+    if (local || detected) {
+      const checked = local && inspectLocalRuntime(local.path);
+      const registered = Boolean(local && checked && checked.realPath === local.realPath && checked.fingerprint === local.fingerprint);
+      const discovered = !registered && detected && inspectLocalRuntime(detected.path);
+      const valid = registered || Boolean(detected && discovered && discovered.realPath === detected.realPath && discovered.fingerprint === detected.fingerprint);
+      if (!registered) return { state: valid ? "detected" : "integrity_failed", generalAgentDriverAvailable: false };
+      const loginSource = locals.loginSources.find(row => row.runtimeId === runtimeId)?.source
+        ?? this.state.read().loginSources.find(row => row.runtimeId === runtimeId)?.source ?? "isolated";
+      return { state: "local_registered", generalAgentDriverAvailable: generalAgentAvailable(runtimeId, true, loginSource) };
+    }
+    const value = this.state.read(), installed = value.entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
+    let verified = false; if (installed) try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* fail closed, no fallback */ }
+    const loginSource = locals.loginSources.find(row => row.runtimeId === runtimeId)?.source
+      ?? value.loginSources.find(row => row.runtimeId === runtimeId)?.source ?? "isolated";
+    return { state: installed ? verified ? "registered" : "integrity_failed" : "not_installed",
+      generalAgentDriverAvailable: generalAgentAvailable(runtimeId, verified, loginSource) };
+  }
   list() {
     const value = this.state.read(), locals = this.locals.read(), versionStatus = this.versionProjection();
     // Local registrations win over an older downloaded install, so their recorded source is the
@@ -540,7 +565,7 @@ export class WorkspaceRuntimeInstaller {
           path: selected.path, fingerprint: valid ? selected.fingerprint : null, source: selected.source, loginSource,
           versionStatus: versionStatus(runtimeId, { version, fingerprint: inspected?.fingerprint ?? null,
             registered, requiresRetrust: !registered && Boolean(local || discovered) }),
-          generalAgentDriverAvailable: Boolean(registered && (runtimeId === "codex" || runtimeId === "claude" || HOST_LOGIN_ONLY_RUNTIMES.includes(runtimeId) && loginSource === "host")), state: valid ? registered ? "local_registered" : "detected" : "integrity_failed" };
+          generalAgentDriverAvailable: generalAgentAvailable(runtimeId, registered, loginSource), state: valid ? registered ? "local_registered" : "detected" : "integrity_failed" };
       }
       const installed = value.entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
       let verified = false; if (installed) try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* tampering revokes use, never repair or fallback */ }
@@ -548,7 +573,7 @@ export class WorkspaceRuntimeInstaller {
       return { runtimeId, label: RUNTIME_LABELS[runtimeId], ...(["kimi", "copilot", "cursor", "grok"].includes(runtimeId) ? { extensionsIsolation: "inherited" as const } : {}), ...(manualRuntimeInstallation(runtimeId) ? { manualInstallation: manualRuntimeInstallation(runtimeId)! } : {}), ...(MANUAL_RUNTIME_INSTALL_URLS[runtimeId] ? { installUrl: MANUAL_RUNTIME_INSTALL_URLS[runtimeId] } : {}), installed: verified, registered: verified, version, fingerprint: verified ? installed!.executableSha256 : null,
         versionStatus: versionStatus(runtimeId, { version, fingerprint: verified ? installed!.executableSha256 : null,
           registered: verified, requiresRetrust: Boolean(installed && !verified) }),
-        loginSource, generalAgentDriverAvailable: Boolean(verified && (runtimeId === "codex" || runtimeId === "claude" || HOST_LOGIN_ONLY_RUNTIMES.includes(runtimeId) && loginSource === "host")), state: installed ? verified ? "registered" : "integrity_failed" : "not_installed" };
+        loginSource, generalAgentDriverAvailable: generalAgentAvailable(runtimeId, verified, loginSource), state: installed ? verified ? "registered" : "integrity_failed" : "not_installed" };
     }), operations: [...this.operations.values()].slice(-64).map(({ controller: _c, ...row }) => row) };
   }
   private resolveUnproxied(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
