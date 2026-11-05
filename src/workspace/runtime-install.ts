@@ -259,7 +259,7 @@ export class WorkspaceRuntimeInstaller {
   }
   resolveLocal(runtimeId: OptionalRuntimeId) {
     const resolved = this.resolveLocalUnproxied(runtimeId);
-    return { ...resolved, env: this.proxy.apply(resolved.env) };
+    return { ...resolved, ...this.proxy.applyWithEndpoint(resolved.env) };
   }
   /** Check only an explicit Workspace proxy, then revalidate the registered binary at physical launch. */
   /** The bundled Pi has no external login and never receives this account's credentials. */
@@ -273,7 +273,7 @@ export class WorkspaceRuntimeInstaller {
   }
   resolveBound(runtimeId: OptionalRuntimeId) {
     const resolved = this.resolveBoundUnproxied(runtimeId);
-    return { ...resolved, env: this.proxy.apply(resolved.env) };
+    return { ...resolved, ...this.proxy.applyWithEndpoint(resolved.env) };
   }
   private resolveBoundUnproxied(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
     if (this.locals.read().entries.some(row => row.runtimeId === runtimeId)) return this.resolveLocalUnproxied(runtimeId);
@@ -590,7 +590,7 @@ export class WorkspaceRuntimeInstaller {
   }
   resolve(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string) {
     const resolved = this.resolveUnproxied(runtimeId, version, artifactSha256);
-    return { ...resolved, env: this.proxy.apply(resolved.env) };
+    return { ...resolved, ...this.proxy.applyWithEndpoint(resolved.env) };
   }
   async close(): Promise<void> {
     this.closed = true; this.proposals.clear(); for (const operation of this.active.values()) operation.controller.abort();

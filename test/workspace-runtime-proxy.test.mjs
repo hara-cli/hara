@@ -73,6 +73,7 @@ for (const mode of ["damaged-source-null-backup", "future-schema", "missing-sour
   else fs.unlinkSync(file);
   assert.equal(settings.read().readOnly, true);
   assert.throws(() => settings.apply({ KEEP: "yes" }), error => error.message === "runtime_proxy_invalid");
+  assert.throws(() => settings.applyWithEndpoint({ KEEP: "yes" }), error => error.message === "runtime_proxy_invalid");
   await assert.rejects(settings.check(), error => error.message === "runtime_proxy_invalid");
 });
 
@@ -173,4 +174,20 @@ test("proxy RPC enforces explicit Workspace generation and revision without chan
     await assert.rejects(request("workspace.runtime.proxy.set", { ...scope, proxyUrl: "http://secret:credential@127.0.0.1", expectedRevision: 1 }), error => error.message === "runtime_proxy_invalid");
     assert.equal((await request("workspace.runtime.proxy.get", { workspaceId: b.workspaceId, expectedGeneration: b.resourceGeneration })).proxyUrl, null);
   } finally { socket.close(); await once(socket, "close"); await handle.close(); }
+});
+
+test("fresh proxy environment and endpoint identity come from the same guarded read", () => {
+  const settings = new WorkspaceRuntimeProxy(storage()), input = { KEEP: "owned", HTTP_PROXY: "http://old.invalid:1" };
+  assert.deepEqual(settings.applyWithEndpoint(input), { env: input, proxyUrl: null });
+  settings.save("http://127.0.0.1:18888", 0);
+  const current = settings.applyWithEndpoint(input);
+  assert.equal(current.proxyUrl, "http://127.0.0.1:18888");
+  assert.equal(current.env.HTTP_PROXY, current.proxyUrl);
+  assert.equal(current.env.HTTPS_PROXY, current.proxyUrl);
+  assert.equal(input.HTTP_PROXY, "http://old.invalid:1");
+  settings.save("http://127.0.0.1:18889", 1);
+  const changed = settings.applyWithEndpoint(input);
+  assert.equal(changed.proxyUrl, "http://127.0.0.1:18889");
+  assert.equal(changed.env.HTTP_PROXY, changed.proxyUrl);
+  assert.equal(current.proxyUrl, "http://127.0.0.1:18888", "a previous result cannot silently become a new configuration");
 });

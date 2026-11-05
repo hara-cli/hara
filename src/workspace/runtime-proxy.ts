@@ -29,10 +29,12 @@ export class WorkspaceRuntimeProxy {
     this.state.update(expectedRevision, value => ({ ...value, proxyUrl: endpoint }));
     return this.read();
   }
-  apply(env: NodeJS.ProcessEnv) {
+  apply(env: NodeJS.ProcessEnv) { return this.applyWithEndpoint(env).env; }
+  /** One fresh read supplies both the effective environment and its matching endpoint identity. */
+  applyWithEndpoint(env: NodeJS.ProcessEnv) {
     const current = this.read();
     if (current.readOnly) throw new RuntimeProxyError("runtime_proxy_invalid");
-    return runtimeProxyEnv(env, current.proxyUrl);
+    return { env: runtimeProxyEnv(env, current.proxyUrl), proxyUrl: current.proxyUrl };
   }
   applyChecked(env: NodeJS.ProcessEnv, checked: { revision: number; proxyUrl: string | null }) {
     const latest = this.read();

@@ -1,3 +1,4 @@
+import { GovernedCodexSession } from "../dist/agent-runtime/codex-session.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -44,4 +45,25 @@ test("foreign HTTP authority and schemas that cannot carry a routing marker fail
   assert.equal((await fetch(a.url,{headers:{Authorization:"Bearer "+token,Origin:"https://foreign.invalid"}})).status,403);
   assert.equal((await fetch(a.url,{headers:{Authorization:"Bearer "+"b".repeat(64)}})).status,401);
  }finally{await a.close();await resident.close();}
+});
+
+test("unsupported schema keeps the isolated attempt transport and its real native bearer", async () => {
+  // Exercise transport selection only. No native permission response or execution permit is fabricated.
+  let revoked = false, calls = 0;
+  const controller = new AbortController(), original = {
+    signal: controller.signal,
+    assertCurrent() { if (revoked) throw Error("owned revocation"); },
+    tools: () => [{ ...tool, input_schema: { type: "array" } }],
+    call: async () => { calls++; throw Error("not called"); }
+  };
+  const endpoint = await GovernedCodexSession.prototype.createEndpoint.call({ busy: true, closing: false, token }, original);
+  try {
+    assert.equal(endpoint.prepare, undefined);
+    assert.equal(endpoint.attemptMarker, undefined);
+    assert.equal(endpoint.env.HARA_WORKSPACE_MCP_TOKEN, token);
+    const c = await initialized(endpoint);
+    revoked = true;
+    assert.equal((await c.request("tools/list")).status, 403);
+    assert.equal(calls, 0);
+  } finally { await endpoint.close(); }
 });

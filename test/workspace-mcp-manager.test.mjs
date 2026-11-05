@@ -1,3 +1,4 @@
+import { ResidentWorkspaceMcp } from "../dist/agent-runtime/registered-cli-resident-mcp.js";
 import { observeCodexAttempts } from "./helpers/codex-attempt-probe.mjs";
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
@@ -332,4 +333,27 @@ test("failed optional catalog removes every extension tool while the ordinary go
   assert.equal(h.read().conversation.state, "completed"); assert.equal(h.read().conversation.usage.modelCalls, 1);
   assert.equal(h.read().approvals.length, 0); assert.equal(allCalls(h.host, h.id).length, 0);
   assert.deepEqual(h.host.context(h.id).extensions.snapshot(h.main.agentId, h.main.agentEpoch).tools, []);
+});
+
+managedTest("Codex rejects a proxy changed during asynchronous MCP preparation before sending a thread or model input", async t => {
+  const f = await fixture(t), h = await hostFixture(t, f, { runtime: "codex", tier: "full-protected" });
+  let enter, release;
+  const entered = new Promise(resolve => { enter = resolve; }), released = new Promise(resolve => { release = resolve; });
+  const create = ResidentWorkspaceMcp.create;
+  t.mock.method(ResidentWorkspaceMcp, "create", async function (...args) {
+    const resident = await create.apply(this, args); enter(); await released; return resident;
+  });
+  const started = h.host.start("client", h.id, h.main.agentId, "Read the synthetic plugin data.", randomUUID());
+  try {
+    await Promise.race([entered, sleep(10000).then(() => { throw Error("owned preparation was not entered"); })]);
+    const proxy = h.host.context(h.id).runtimes.proxy, current = proxy.read();
+    proxy.save("http://127.0.0.1:9", current.revision);
+  } finally { release(); }
+  await h.host.wait(started.runId);
+  assert.equal(h.read().conversation.state, "blocked");
+  assert.equal(h.read().approvals.length, 0);
+  assert.equal(allCalls(h.host, h.id).length, 0);
+  const requests = fs.readFileSync(h.command + ".rpc.jsonl", "utf8").trim().split(/\r?\n/u).map(line => JSON.parse(line));
+  assert.ok(requests.some(row => row.method === "initialize"));
+  assert.equal(requests.some(row => ["thread/start", "thread/resume", "turn/start"].includes(row.method)), false);
 });

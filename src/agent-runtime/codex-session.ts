@@ -158,7 +158,7 @@ export class GovernedCodexSession {
   async createEndpoint(input: WorkspaceMcpAttemptInput): Promise<WorkspaceMcpEndpoint> {
     input.assertCurrent();
     if (!this.busy || this.closing) throw new Error("Codex attempt unavailable");
-    if (!residentMcpToolsSupported(input)) return createWorkspaceMcpEndpoint(input);
+    if (!residentMcpToolsSupported(input)) return createWorkspaceMcpEndpoint({ ...input, bearerToken: this.token });
     const attempt = Object.freeze({ ...input }), token = this.token;
     const env: NodeJS.ProcessEnv = { [WORKSPACE_MCP_TOKEN_ENV]: token };
     let inner: WorkspaceMcpEndpoint | undefined, preparedFor: string | undefined, preparing: Promise<void> | undefined, closed = false;
