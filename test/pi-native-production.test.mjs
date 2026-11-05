@@ -423,3 +423,15 @@ test("interactive native Pi gateway has no aggregate call/token/tool cap, retain
     provider: { id: "frozen", model: "frozen", turn({ signal }) { providerSignal = signal; return new Promise(resolve => signal.addEventListener("abort", () => resolve({ ...reply("cancelled"), stop: "error" }), { once: true })); } } });
   assert.notEqual((await call(hung)).status, 200); assert.equal(providerSignal.aborted, true);
 });
+test("confirmed Pi compaction rotates model-memory generation without marking history or governance seen before physical drain", t => {
+  const f = sessionFixture(t), first = new PiNativeSessionStore(f.storage, f.binding, f.history, "a".repeat(64));
+  t.after(() => rmSync(first.root, { recursive: true, force: true }));
+  assert.throws(() => first.compacted(), /no prompt was replayed/);
+  first.accepted(); const original = first.contextGeneration; first.compacted(); const compacted = first.contextGeneration;
+  assert.notEqual(compacted, original); assert.match(compacted, /^[a-f0-9-]{36}$/);
+  assert.throws(() => new PiNativeSessionStore(f.storage, f.binding, f.history, "a".repeat(64)), /no prompt was replayed/);
+  const file = join(first.root, "agent/sessions/fixture.jsonl"); writeFileSync(file, "append-only synthetic native journal\n");
+  first.finished(file, f.history);
+  const resumed = new PiNativeSessionStore(f.storage, f.binding, f.history, "a".repeat(64));
+  assert.equal(resumed.contextGeneration, compacted); assert.equal(resumed.needsPromptRefresh, false); assert.equal(resumed.promptHistoryStart, f.history.length);
+});

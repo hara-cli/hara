@@ -1,3 +1,6 @@
+import { CodexContextCompaction, NativeCompactionError } from "./context-compaction.js";
+import { WorkspaceContextCompactions, compactionSourceKey, contextSummaryPrompt } from "../workspace/context-compaction.js";
+import { workspaceCompactionSource, reserveWorkspaceCompaction, recordWorkspaceRuntimeUsage } from "../workspace/execution.js";
 import { ResidentWorkspaceMcp, residentMcpToolsSupported, WORKSPACE_ATTEMPT_MARKER } from "./registered-cli-resident-mcp.js";
 import { createAssistantPreview } from "./assistant-preview.js";
 import { observeWorkspaceMessageTiming } from "../workspace/execution.js";
@@ -49,6 +52,7 @@ interface ActiveTurn {
   text: string; settled: boolean;
   rawTokenObserved?: boolean; visibleItems: Map<string, boolean>; previewItem?: string; preview?: ReturnType<typeof createAssistantPreview>;
   previewOutput?: TurnArgs["onAssistantPreview"]; previewEnv: NodeJS.ProcessEnv;
+  seedRecord?: string;
   standingHash: string | null; compacted: boolean; partDigests: Map<string, string>;
 }
 const pools = new WeakMap<WorkspaceRuntimeInstaller, CodexSessionPool>();
@@ -115,6 +119,9 @@ export class GovernedCodexSession {
   private processKey?: string;
   private exit?: Promise<void>;
   private active?: ActiveTurn;
+  private maintenance?: CodexContextCompaction;
+  private readonly endpointMaintenance = new WeakMap<WorkspaceMcpEndpoint, { suspend(): Promise<boolean>; resume(): void }>();
+  private readonly compactions: WorkspaceContextCompactions;
   private idleTimer?: ReturnType<typeof setTimeout>;
   private unload?: () => void;
   private loaded = false;
@@ -143,6 +150,7 @@ export class GovernedCodexSession {
     this.origin = origin(resolved, b.project);
     this.state = codexThreadState(workspaceRuntimeStorage(permit), b.agent.agentId, b.sessionId, this.origin);
     this.value = this.state.read();
+    this.compactions = new WorkspaceContextCompactions(workspaceRuntimeStorage(permit), b.agent.agentId, b.sessionId);
     if (this.value.threadId !== null && this.value.origin !== this.origin) throw new Error("Saved Codex thread belongs to a different login or project origin; no fallback was selected");
     if (this.value.threadId === null) this.value.origin = this.origin;
   }
@@ -163,7 +171,7 @@ export class GovernedCodexSession {
     const env: NodeJS.ProcessEnv = { [WORKSPACE_MCP_TOKEN_ENV]: token };
     let inner: WorkspaceMcpEndpoint | undefined, preparedFor: string | undefined, preparing: Promise<void> | undefined, closed = false;
     // One assignment for this immutable attempt, never a pointer to a later attempt's capability.
-    return Object.freeze({
+    const endpoint: WorkspaceMcpEndpoint = Object.freeze({
       get url() { if (!inner || closed) throw new Error("Codex MCP attempt is not prepared"); return inner.url; },
       get attemptMarker() { return closed ? undefined : inner?.attemptMarker; }, env,
       prepare: (contract: string): void | Promise<void> => {
@@ -193,7 +201,23 @@ export class GovernedCodexSession {
       },
       close: async () => { closed = true; delete env[WORKSPACE_MCP_TOKEN_ENV]; await preparing?.catch(() => {}); await inner?.close(); },
     });
+    this.endpointMaintenance.set(endpoint, {
+      suspend: async () => {
+        attempt.assertCurrent();
+        if (closed || !inner || !this.residentMcp) return false;
+        if (!this.residentMcp.retireCurrent()) return false;
+        const prior = inner; inner = undefined; await prior.close();
+        attempt.assertCurrent(); return !closed && this.residentMcp.reusable;
+      },
+      resume: () => {
+        attempt.assertCurrent();
+        if (closed || !this.residentMcp?.reusable || attempt.signal.aborted) throw new Error("Codex compaction binding changed");
+        inner = this.residentMcp.bind(attempt);
+      },
+    });
+    return endpoint;
   }
+
   get needsNewSession(): boolean { return nativeContextFull(this.value); }
   takeUsage(): TurnResult["usage"] {
     if (!this.observedUsage || !this.pendingUsage.input && !this.pendingUsage.output) return undefined;
@@ -207,9 +231,53 @@ export class GovernedCodexSession {
       + update + "\nAvailable tools at this boundary: " + args.tools.map(tool => tool.name).join(", ") + "\n</system-reminder>" } : result;
   }
   private save(): void { this.value = this.state.update(this.value.revision, () => this.value); }
+  private observeUsage(params: Record<string, unknown>, maintenance = false): void {
+    const usage = object(params.tokenUsage), total = object(usage.total), last = object(usage.last);
+    if (!count(total.inputTokens) || !count(total.outputTokens) || !count(last.inputTokens) || !count(last.outputTokens)) throw new Error("Invalid native usage");
+    const totalCache = total.cachedInputTokens, lastCache = last.cachedInputTokens;
+    if (totalCache !== undefined && (!count(totalCache) || totalCache > total.inputTokens)
+      || lastCache !== undefined && (!count(lastCache) || lastCache > last.inputTokens)) throw new Error("Invalid native cache usage");
+    if (total.inputTokens === this.value.input && total.outputTokens === this.value.output) return;
+    // A cold native counter epoch may restart just *above* the saved watermark. Its output
+    // delta cannot then contain even the explicitly reported current request. Do not debit a
+    // tiny cross-epoch difference: use that request's last counters, including its cache split.
+    const reset = total.inputTokens < this.value.input || total.outputTokens < this.value.output
+      || this.firstUsage && total.outputTokens - this.value.output < last.outputTokens;
+    if (reset && !this.firstUsage) throw new Error("Native usage regressed");
+    const input = reset ? last.inputTokens : total.inputTokens - this.value.input;
+    const output = reset ? last.outputTokens : total.outputTokens - this.value.output;
+    // Per-attempt cumulative deltas, including its first observation. An explicit cold-counter
+    // reset uses the current native request; missing legacy cache baselines never earn credit.
+    const cachedInput = reset ? lastCache ?? 0 : count(totalCache) && this.value.cachedInput !== null
+      ? totalCache - this.value.cachedInput : input === last.inputTokens ? lastCache ?? 0 : 0;
+    if (!count(cachedInput) || cachedInput > input) throw new Error("Native cache usage regressed or exceeded input");
+    for (const [key, amount] of Object.entries({ input, output, cachedInput }) as ["input" | "output" | "cachedInput", number][]) {
+      if (!Number.isSafeInteger(this.pendingUsage[key] + amount) || !Number.isSafeInteger(this.value.lastAttempt[key] + amount)) throw new Error("Native usage overflow");
+      this.pendingUsage[key] += amount; this.value.lastAttempt[key] += amount;
+    }
+    this.value.input = total.inputTokens; this.value.output = total.outputTokens;
+    this.value.cachedInput = count(totalCache) ? totalCache : null;
+    const contextTokens = last.inputTokens + last.outputTokens;
+    if (!count(contextTokens)) throw new Error("Invalid native context usage");
+    if (!maintenance) this.value.contextTokens = contextTokens;
+    if (usage.modelContextWindow !== undefined && usage.modelContextWindow !== null) {
+      if (!count(usage.modelContextWindow) || !usage.modelContextWindow) throw new Error("Invalid native context window");
+      this.value.modelContextWindow = usage.modelContextWindow;
+    }
+    this.firstUsage = false; this.observedUsage = true;
+    assertWorkspaceRuntimeUsage(this.permit, this.pendingUsage);
+    if (!maintenance && this.needsNewSession) {
+      this.value.phase = "new_session_required"; this.save();
+      this.active?.finish(false, "codex_context_limit_open_new_session"); this.client?.close();
+    }
+  }
   private notification(client: JsonlRpcClient, method: string, params: Record<string, unknown>): void {
     if (this.client !== client || params.threadId !== this.value.threadId) return;
     const observedAt = performance.now();
+    if (this.maintenance) {
+      try { this.maintenance.observe(method, params); } catch (error) { this.maintenance.fail(new NativeCompactionError("unknown", error)); }
+      return;
+    }
     if (method === "thread/closed") { this.loaded = false; this.unload?.(); return; }
     if (method === "thread/compacted") {
       // The native model may have forgotten earlier instructions; no previous seen hash survives.
@@ -269,49 +337,17 @@ export class GovernedCodexSession {
             if (item.text.length) try { workspaceRunRuntimeStages(this.permit)?.mark("first_output", "native_event"); } catch { /* Diagnostic only. */ }
           }
         } else if (method === "thread/tokenUsage/updated") {
-          const usage = object(params.tokenUsage), total = object(usage.total), last = object(usage.last);
-          if (!count(total.inputTokens) || !count(total.outputTokens) || !count(last.inputTokens) || !count(last.outputTokens)) throw new Error("Invalid native usage");
-          const totalCache = total.cachedInputTokens, lastCache = last.cachedInputTokens;
-          if (totalCache !== undefined && (!count(totalCache) || totalCache > total.inputTokens)
-            || lastCache !== undefined && (!count(lastCache) || lastCache > last.inputTokens)) throw new Error("Invalid native cache usage");
-          if (total.inputTokens === this.value.input && total.outputTokens === this.value.output) return;
-          // A cold native counter epoch may restart just *above* the saved watermark. Its output
-          // delta cannot then contain even the explicitly reported current request. Do not debit a
-          // tiny cross-epoch difference: use that request's last counters, including its cache split.
-          const reset = total.inputTokens < this.value.input || total.outputTokens < this.value.output
-            || this.firstUsage && total.outputTokens - this.value.output < last.outputTokens;
-          if (reset && !this.firstUsage) throw new Error("Native usage regressed");
-          const input = reset ? last.inputTokens : total.inputTokens - this.value.input;
-          const output = reset ? last.outputTokens : total.outputTokens - this.value.output;
-          // Per-attempt cumulative deltas, including its first observation. An explicit cold-counter
-          // reset uses the current native request; missing legacy cache baselines never earn credit.
-          const cachedInput = reset ? lastCache ?? 0 : count(totalCache) && this.value.cachedInput !== null
-            ? totalCache - this.value.cachedInput : input === last.inputTokens ? lastCache ?? 0 : 0;
-          if (!count(cachedInput) || cachedInput > input) throw new Error("Native cache usage regressed or exceeded input");
-          for (const [key, amount] of Object.entries({ input, output, cachedInput }) as ["input" | "output" | "cachedInput", number][]) {
-            if (!Number.isSafeInteger(this.pendingUsage[key] + amount) || !Number.isSafeInteger(this.value.lastAttempt[key] + amount)) throw new Error("Native usage overflow");
-            this.pendingUsage[key] += amount; this.value.lastAttempt[key] += amount;
-          }
-          this.value.input = total.inputTokens; this.value.output = total.outputTokens;
-          this.value.cachedInput = count(totalCache) ? totalCache : null;
-          this.value.contextTokens = last.inputTokens + last.outputTokens;
-          if (!count(this.value.contextTokens)) throw new Error("Invalid native context usage");
-          if (usage.modelContextWindow !== undefined && usage.modelContextWindow !== null) {
-            if (!count(usage.modelContextWindow) || !usage.modelContextWindow) throw new Error("Invalid native context window");
-            this.value.modelContextWindow = usage.modelContextWindow;
-          }
-          this.firstUsage = false; this.observedUsage = true;
-          assertWorkspaceRuntimeUsage(this.permit, this.pendingUsage);
-          if (this.needsNewSession) {
-            this.value.phase = "new_session_required"; this.save();
-            active.finish(false, "codex_context_limit_open_new_session"); client.close();
-          }
+          this.observeUsage(params);
         } else if (method === "turn/completed") {
           this.value.phase = turn.status === "completed" ? "idle" : "unknown";
           if (turn.status === "completed" && !active.compacted) {
             this.value.standingPromptHash = active.standingHash;
           } else this.value.standingPromptHash = null;
           this.save();
+          if (active.seedRecord) this.compactions.recordOutcome(active.seedRecord, turn.status === "completed" ? "completed" : "failed",
+            { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 });
+          if (turn.status === "completed" && this.value.contextTokens !== null && this.value.threadId)
+            this.compactions.observeAfter(compactionSourceKey("codex", this.value.threadId), this.value.contextTokens);
           if (turn.status === "completed" && !active.compacted) this.systemDigests = new Map(active.partDigests);
           active.finish(turn.status === "completed", turn.status === "interrupted" ? "interrupted" : "runtime_failed",
             turn.status === "completed" ? undefined : classifyRuntimeFailure({ stderr: JSON.stringify(turn.error ?? {}).slice(0, 65_536) }),
@@ -395,6 +431,7 @@ export class GovernedCodexSession {
           onClose: error => {
             if (this.client !== client) return;
             this.client = undefined; this.loaded = false; this.unload?.();
+            this.maintenance?.fail(new NativeCompactionError("unknown", error));
             // During a control RPC, its rejected promise owns the precise terminal reason. onClose
             // runs synchronously before that catch; settling here would hide restore timeouts.
             if (this.active?.id) this.active.finish(false, "codex_delivery_unknown_no_replay",
@@ -469,9 +506,18 @@ export class GovernedCodexSession {
       if (freshProcess) await this.policy.prepareResidentRoot();
       this.value.threadId = threadId; this.loaded = true;
       if (!resumed || this.value.contextGeneration === null) this.value.contextGeneration = randomUUID();
+      const compacted = await this.compactIdle({ client, endpoint, resumed, standing, config, model: input.model, effort: input.effort,
+        cwd: input.cwd, signal: input.signal, assertCurrent: input.assertCurrent, activity: input.activity });
+      threadId = this.value.threadId!;
+      if (compacted.seedRecord) active.seedRecord = compacted.seedRecord;
+      if (endpoint.attemptMarker) {
+        visibleEnv.HARA_PREVIEW_PRE_COMPACT_TOKEN = visibleEnv.HARA_PREVIEW_ATTEMPT_TOKEN;
+        visibleEnv.HARA_PREVIEW_ATTEMPT_TOKEN = endpoint.attemptMarker;
+      }
       this.value.phase = "unknown"; this.save(); // Write ahead of an accepted or outcome-unknown turn.
       const refresh = resumed && this.value.standingPromptHash !== standingHash;
       const currentPrompt = [
+        ...(compacted.seed ? [compacted.seed] : []),
         ...(endpoint.attemptMarker ? [`<system-reminder>Current Hara attempt: every Hara Workspace MCP tool call MUST include the extra argument "${WORKSPACE_ATTEMPT_MARKER}": "${endpoint.attemptMarker}". Never use an earlier turn's marker. Hara removes this routing field before the governed tool; it grants no permission or approval.</system-reminder>`] : []),
         ...(refresh ? [`<system-reminder>Current Hara standing governance context for this resumed thread:\n${standing}\n</system-reminder>`] : []),
         ...(turnParts.length ? [`<system-reminder>Current Hara turn context:\n${turnParts.map(part => part.content).join("\n\n")}\n</system-reminder>`] : []),
@@ -500,6 +546,78 @@ export class GovernedCodexSession {
       return result.ok ? { ok: false, code: 1, timedOut: false, stdout: "", errorCode: "runtime_process_cleanup_unverified" } : result;
     }
     finally { input.signal.removeEventListener("abort", interrupt); }
+  }
+  private async compactIdle(input: { client: JsonlRpcClient; endpoint: WorkspaceMcpEndpoint; resumed: boolean; standing: string;
+    config: Record<string, unknown>; model: string | null; effort: string | null; cwd: string; signal: AbortSignal;
+    assertCurrent(): void; activity(): void }): Promise<{ seed?: string; seedRecord?: string }> {
+    input.assertCurrent();
+    const source = workspaceCompactionSource(this.permit), threadId = this.value.threadId;
+    if (!source || !threadId || !this.loaded || this.maintenance) return {};
+    const key = compactionSourceKey("codex", threadId);
+    const summary = this.compactions.plan(source, { runtimeId: "codex", sourceKey: key, tokens: this.value.contextTokens, idle: true });
+    if (!summary) return {};
+    const control = this.endpointMaintenance.get(input.endpoint);
+    const makeSeed = async (record?: string): Promise<{ seed: string; seedRecord: string }> => {
+      input.assertCurrent();
+      const original = this.value.threadId, beforeTokens = this.value.contextTokens;
+      if (input.resumed) {
+        const response = await input.client.call<Record<string, unknown>>("thread/start", { ephemeral: false, cwd: input.cwd,
+          sandbox: "danger-full-access", approvalPolicy: "never", approvalsReviewer: "user", developerInstructions: input.standing,
+          config: input.config, ...(input.model ? { model: input.model } : {}) });
+        const thread = object(response.thread);
+        if (!nativeId(thread.id) || thread.cwd !== input.cwd || object(thread.status).type !== "idle" || response.approvalPolicy !== "never"
+          || response.approvalsReviewer !== "user" || object(response.sandbox).type !== "dangerFullAccess"
+          || input.model !== null && response.model !== input.model || input.effort !== null && response.reasoningEffort !== input.effort)
+          throw new Error("Compacted seed thread confinement was not confirmed");
+        input.assertCurrent(); this.value.threadId = thread.id; this.loaded = true;
+        this.loadedHandle = Object.freeze({ id: thread.id, cwd: input.cwd, client: input.client });
+        this.value.contextGeneration = randomUUID(); this.value.standingPromptHash = null; this.value.contextTokens = null;
+        this.systemDigests.clear(); this.loadedContract = undefined;
+      }
+      if (record) this.compactions.recordOutcome(record, "failed");
+      const seedRecord = this.compactions.begin(source, { runtimeId: "codex", method: "host-seed",
+        sourceKey: compactionSourceKey("codex", this.value.threadId!), tokens: beforeTokens, requests: 0, summary, priorThreadId: original });
+      this.firstUsage = true;
+      return { seed: contextSummaryPrompt(summary), seedRecord };
+    };
+    if (!input.resumed || !control) return makeSeed();
+    const endCost = reserveWorkspaceCompaction(this.permit);
+    if (!endCost) return {}; // Preserve the frozen budget; compaction is optional, the admitted user turn is not.
+    const record = this.compactions.begin(source, { runtimeId: "codex", method: "codex-native", sourceKey: key,
+      tokens: this.value.contextTokens, requests: 1, summary });
+    let suspended = false, success = false, failure: NativeCompactionError | undefined;
+    try {
+      suspended = await control.suspend();
+      if (!suspended) throw new NativeCompactionError("unknown");
+      input.assertCurrent();
+      const operation = new CodexContextCompaction({ threadId, signal: input.signal, assertCurrent: input.assertCurrent, activity: input.activity,
+        usage: params => this.observeUsage(params, true) });
+      this.maintenance = operation;
+      await operation.run(input.client); success = true;
+    } catch (error) { failure = error instanceof NativeCompactionError ? error : new NativeCompactionError("unknown", error); }
+    finally {
+      this.maintenance = undefined;
+      const usage = this.takeUsage(); recordWorkspaceRuntimeUsage(this.permit, usage);
+      this.compactions.recordOutcome(record, success ? "completed" : failure?.outcome === "unknown" ? "running" : "failed", { inputTokens: usage?.input ?? null,
+        outputTokens: usage?.output ?? null, cachedInputTokens: usage ? usage.cachedInput ?? 0 : null });
+      endCost(success, failure?.cause instanceof ExternalJsonlRpcTransportError ? failure.cause.runtimeFailureKind : "runtime_failed");
+      this.firstUsage = true;
+    }
+    if (failure?.outcome === "unknown" || input.signal.aborted || this.client !== input.client) {
+      this.value.phase = "unknown"; this.save(); input.client.close();
+      throw failure?.cause instanceof ExternalJsonlRpcTransportError || failure?.cause instanceof ExternalJsonlRpcRequestError
+        ? failure.cause : failure ?? new NativeCompactionError("unknown");
+    }
+    // Shared ownership proves physical cleanup; no private drain implementation or reused capability.
+    await endWorkspaceNativePolicy(this.permit, this.policy!, { keepResidentRoot: true });
+    input.assertCurrent(); beginWorkspaceNativePolicy(this.permit, this.policy!); await this.policy!.prepareAttempt(); input.assertCurrent();
+    if (suspended) control.resume();
+    if (failure?.outcome === "unsupported") return makeSeed();
+    this.value.contextGeneration = randomUUID(); this.value.standingPromptHash = null;
+    this.systemDigests.clear(); this.loadedContract = undefined;
+    if (success) this.value.contextTokens = null;
+    this.value.phase = "idle"; this.save();
+    return success ? { seed: contextSummaryPrompt(summary, false) } : {};
   }
   private settleNativeAttempt(): Promise<void> { return this.settling ??= this.settleCurrentAttempt(); }
   private async settleCurrentAttempt(): Promise<void> {

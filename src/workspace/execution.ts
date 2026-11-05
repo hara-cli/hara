@@ -20,7 +20,7 @@ import type { WorkspaceSessionLease } from "./session-lease.js";
 import { canonical } from "./local-state.js";
 import { workspaceStateHome, type WorkspaceResourceStorage } from "./resource-context.js";
 import { freezeWorkspaceRunBinding, workspaceFileIdMatches, workspaceRunBindingsEqual, workspaceRunMatchesTask, type WorkspaceRunBinding } from "./run-binding.js";
-import type { WorkspaceUsage } from "./conversations.js";
+import type { WorkspaceUsage, WorkspaceConversation } from "./conversations.js";
 import { workspaceTaskHistory, workspaceTaskProjection, workspaceWakeData, type WorkspaceContextStats } from "./model-context.js";
 import { historyChars } from "../agent/context-budget.js";
 import type { ToolResult } from "../providers/types.js";
@@ -54,6 +54,7 @@ interface PermitState {
   nativeEvidence?: NativeWorkspaceEvidence;
   nativeRisks?: RuntimeRiskEvent[];
   onNativeRisks?(risks: readonly RuntimeRiskEvent[]): void;
+  compactionSource?(): WorkspaceConversation;
   runtimeModel?: (args: TurnArgs) => Promise<TurnResult>;
   modelHistory?: { history: NeutralMsg[]; start: number; prefixDigest: string; retain?: (result: ToolResult) => string; usedTokens?: () => number };
   contextStats?: WorkspaceContextStats;
@@ -129,6 +130,7 @@ export function createWorkspaceRunPermit(input: {
   messageTiming?: MessageTimingRecorder;
   onRuntimeStageChanged?(): void;
   onNativeRisks?(risks: readonly RuntimeRiskEvent[]): void;
+  compactionSource?(): WorkspaceConversation;
   interaction?: WorkspaceUserInteraction;
   onQuestion?(question: WorkspaceUserQuestion): void;
   /** Host view refresh after an ask card is posted (async cards do not pass through a checkpoint). */
@@ -249,7 +251,7 @@ export function createWorkspaceRunPermit(input: {
       }
     },
   };
-  state = { completionEvidence: createWorkspaceCompletionEvidence(input.storage, binding, input.completionRecovery), nativeConversationSafe: true, onNativeRisks: input.onNativeRisks, storage: input.storage, assertLive, provider, cwd, managedProject, hasLegacyToolPolicy: Boolean(input.resources.agents.resolveTask(binding.agent).toolPolicy), stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
+  state = { completionEvidence: createWorkspaceCompletionEvidence(input.storage, binding, input.completionRecovery), nativeConversationSafe: true, compactionSource: input.compactionSource, onNativeRisks: input.onNativeRisks, storage: input.storage, assertLive, provider, cwd, managedProject, hasLegacyToolPolicy: Boolean(input.resources.agents.resolveTask(binding.agent).toolPolicy), stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
     updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false, wakeChars: 0,
     interaction: input.interaction, onQuestion: input.onQuestion, onInteractionChanged: input.onInteractionChanged, interactionUsage: input.interactionUsage, startedAt: started, toolTail: Promise.resolve(),
     audit: new WorkspaceExecutionAudit(input.storage, binding.runId, binding.agent.agentId),
@@ -330,6 +332,29 @@ export function workspaceRunHasLegacyToolPolicy(permit: WorkspaceRunPermit): boo
 /** Trusted native transport composition; never derived from a renderer path or the foreground scope. */
 export function workspaceRuntimeStorage(permit: WorkspaceRunPermit): WorkspaceResourceStorage {
   const state = stateOf(permit); state.assertLive(); return state.storage;
+}
+/** Trusted Host facts, rechecked at use. Never exposed as a model/renderer capability. */
+export function workspaceCompactionSource(permit: WorkspaceRunPermit): WorkspaceConversation | null {
+  const state = stateOf(permit); state.assertLive(); return state.compactionSource?.() ?? null;
+}
+/** Reserve the separate native maintenance dispatch before effects; the ordinary turn is already reserved. */
+export function reserveWorkspaceCompaction(permit: WorkspaceRunPermit): ((ok: boolean, kind?: import("../agent-runtime/failure-diagnostics.js").RuntimeFailureKind) => void) | null {
+  const state = stateOf(permit); state.assertLive();
+  const limits = permit.binding.budget;
+  if (!state.started || state.signal.aborted) throw new Error("Workspace compaction is not admitted");
+  if (limits.mode !== "interactive" && (state.usage.modelCalls >= limits.maxRounds
+    || state.usage.inputTokens + state.usage.outputTokens >= limits.maxTokens)) return null;
+  if (state.interaction?.check(state.interactionUsage?.() ?? state.usage, Date.now() - state.startedAt)) return null;
+  state.resetRoundClock?.();
+  publishUsage(state, { modelCalls: 1 });
+  const index = state.audit.start("model", state.usage.modelCalls, "context_compaction"), began = performance.now();
+  const end = runtimeStageObserve(state, () => state.runtimeStages?.beginEvent("model_roundtrip", { call: state.usage.modelCalls }));
+  let ended = false;
+  return (ok, kind) => {
+    if (ended) return; ended = true;
+    runtimeStageObserve(state, () => end?.(ok ? "completed" : "error", ok ? undefined : kind ?? "runtime_failed"));
+    state.audit.finish(index, performance.now() - began, ok ? "completed" : "error", ok ? null : "provider_error", null);
+  };
 }
 /** Charge observed native telemetry even when cancellation prevented another provider boundary. */
 export function recordWorkspaceRuntimeUsage(permit: WorkspaceRunPermit, usage: TurnResult["usage"]): void {

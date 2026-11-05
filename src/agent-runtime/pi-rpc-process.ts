@@ -82,7 +82,7 @@ export class PiRpcProcess {
       } catch { return this.protocolError(); }
     }
   }
-  private async command(type: "get_state" | "prompt" | "abort", fields: Record<string, unknown> = {}): Promise<any> {
+  private async command(type: "get_state" | "get_session_stats" | "compact" | "prompt" | "abort", fields: Record<string, unknown> = {}): Promise<any> {
     await this.ready;
     if (this.stopped || this.protocolFailed) return Promise.reject(new Error("Pi RPC unavailable"));
     const id = "hara-pi-" + ++this.sequence;
@@ -97,6 +97,29 @@ export class PiRpcProcess {
     const state = await this.command("get_state");
     if (state?.model?.provider !== "hara" || state.model.id !== "coding" || state.autoCompactionEnabled !== false) throw new Error("Pi RPC model authority changed");
     return state;
+  }
+  async contextTokens(): Promise<number | null> {
+    const stats = await this.command("get_session_stats");
+    const tokens = stats?.contextUsage?.tokens;
+    if (tokens === null || tokens === undefined) return null;
+    if (!Number.isSafeInteger(tokens) || tokens < 0) throw new Error("Pi context telemetry refused");
+    return tokens;
+  }
+  /** SDK manual compact aborts first: never issue it while a stream, queue or another compact is active. */
+  async compact(customInstructions: string): Promise<{ tokensBefore: number; estimatedTokensAfter: number | null }> {
+    const state = await this.state();
+    if (this.settled || state.isStreaming !== false || state.isCompacting !== false || state.pendingMessageCount !== 0
+      || this.input.signal.aborted || Buffer.byteLength(customInstructions) > 16_000) throw new Error("Pi compaction requires idle");
+    const result = await this.command("compact", { customInstructions });
+    if (typeof result?.summary !== "string" || Buffer.byteLength(result.summary) > 256 * 1024 || !result.summary.trim()
+      || typeof result.firstKeptEntryId !== "string" || !result.firstKeptEntryId.length || result.firstKeptEntryId.length > 200
+      || !Number.isSafeInteger(result.tokensBefore) || result.tokensBefore < 0
+      || result.estimatedTokensAfter !== undefined && (!Number.isSafeInteger(result.estimatedTokensAfter) || result.estimatedTokensAfter < 0))
+      throw new Error("Pi compaction receipt refused");
+    const after = await this.state();
+    if (after.isStreaming !== false || after.isCompacting !== false || after.pendingMessageCount !== 0) throw new Error("Pi compaction did not settle");
+    // The opaque SDK summary remains in its append-only native session, never in Hara view/log data.
+    return { tokensBefore: result.tokensBefore, estimatedTokensAfter: result.estimatedTokensAfter ?? null };
   }
   async prompt(message: string): Promise<{ text: string; state: Frame }> {
     if (this.settled || this.input.signal.aborted || Buffer.byteLength(message) > 256 * 1024) throw new Error("Pi RPC prompt refused");
