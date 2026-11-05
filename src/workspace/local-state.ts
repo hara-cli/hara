@@ -56,14 +56,17 @@ export class WorkspaceJsonState<T> {
     this.validationBinding = binding;
     try { return operation(); } finally { this.validationBinding = previous; }
   }
+  private decode(snapshot: ReturnType<typeof inspectWorkspaceResourceFile>["snapshot"]): T {
+    if (!snapshot) return this.validate(() => this.empty());
+    let raw: unknown;
+    try { raw = JSON.parse(snapshot.text); } catch { throw new Error("invalid private Workspace JSON; state was preserved"); }
+    return this.validate(() => this.parse(raw));
+  }
   private load() {
     const file = this.file();
-    if (!file.snapshot) return { file, value: this.validate(() => this.empty()) };
-    let raw: unknown;
-    try { raw = JSON.parse(file.snapshot.text); } catch { throw new Error("invalid private Workspace JSON; state was preserved"); }
-    return { file, value: this.validate(() => this.parse(raw)) };
+    return { file, value: this.decode(file.snapshot) };
   }
-  read(): T { return this.storage.run(() => structuredClone(this.load().value)); }
+  read(): T { return this.storage.readJson(this.filename, snapshot => structuredClone(this.decode(snapshot))); }
   update(expectedRevision: number, change: (value: T) => T): T {
     if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new Error("invalid expected Workspace revision");
     return this.storage.run(() => withPrivateStateLockSync(workspaceStateHome(), [], this.filename.slice(0, -5), () => {

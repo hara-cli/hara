@@ -17,7 +17,7 @@ function fixture(t){
  },()=>({revision:0,resourceBinding:state.binding(),count:0}));
  state.update(0,value=>({...value,count:1}));
  const file=storage.run(()=>path.join(workspaceStateHome(),".hara","validation.json"));
- return{root,scope,state,file,revoke(){live=false;},hook(value){hook=value;}};
+ return{root,scope,state,storage,file,revoke(){live=false;},hook(value){hook=value;}};
 }
 test("JSON validation projects the original binding but cannot return data after authority changes",t=>{
  const f=fixture(t);const original=f.state.binding();f.hook(()=>{assert.deepEqual(f.state.binding(),original);f.revoke();});
@@ -40,4 +40,11 @@ test("generation replacement during validation and final file aliases remain rej
   if(kind==="symlink")fs.symlinkSync(alias,g.file);else fs.linkSync(alias,g.file);
   assert.throws(()=>g.state.read(),/symbolic link|hard.link|multiple hard links/);
  }
+});
+
+test("single JSON reader refuses async decoders and arbitrary file selectors",t=>{
+ const f=fixture(t);
+ assert.throws(()=>f.storage.readJson("validation.json",()=>Promise.resolve("not synchronous")),/must be synchronous/);
+ for(const name of ["../scope.json","/tmp/state.json","scope.lock","AUTH.json"])assert.throws(()=>f.storage.readJson(name,()=>null),/filename/);
+ f.revoke();assert.throws(()=>f.storage.readJson("validation.json",()=>"not released"),/authority revoked/);
 });

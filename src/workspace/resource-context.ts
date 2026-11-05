@@ -279,6 +279,28 @@ export class WorkspaceResourceStorage {
     }
   }
 
+  /** Host-private single JSON read. The mapper is synchronous validation only: return data only
+   * after fresh scope/authority checks around the verified open/read and mapper. This avoids
+   * re-entering the whole scope merely to project a path inside another read wrapper. */
+  readJson<T>(filename: string, decode: (snapshot: ReturnType<typeof readPrivateStateFileSnapshotSync>) => T): T {
+    if (!/^[a-z][a-z0-9-]{0,79}\.json$/.test(filename)) throw new Error("invalid private Workspace state filename");
+    const context = this.context;
+    if (!context) throw new Error("Workspace resources are not initialized");
+    return contexts.run(context, () => {
+      // The binder performs the full fresh scope/authority fence immediately before I/O and
+      // verifies the original private parent. Cache hits reuse path identity only, never allow.
+      const file = bindWorkspaceResourceFile(join(context.home, ".hara", filename));
+      try {
+        const snapshot = readPrivateStateFileSnapshotSync(file.path, 4 * 1024 * 1024);
+        assertPrivateStateDirectory(file.directory);
+        const result = decode(snapshot);
+        if (result !== null && (typeof result === "object" || typeof result === "function")
+          && typeof (result as { then?: unknown }).then === "function") throw new Error("Workspace JSON validation must be synchronous");
+        return result;
+      } finally { context.assertCurrent(); }
+    });
+  }
+
   run<T>(operation: () => T): T {
     const context = this.context;
     if (!context) throw new Error("Workspace resources are not initialized");
