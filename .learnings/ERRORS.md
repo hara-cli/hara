@@ -11395,3 +11395,13 @@ Initial A1 focus:63/64; diagnostic reproduced message1 (project context question
 Tooling: nested JS raw templates containing TypeScript backticks or dollar-brace regex can fail before execution. Use non-interpolated placeholders or simple includes assertions, JSON-stringify Python payload only inside a quoted heredoc, and syntax-check fixtures. Discover filenames with rg --files/rg before reading; use the registered task root for evidence and source/core only for code to avoid guessed-path noise. No source or native process was changed by parse-only failures.
 
 After preserving both failures: unified focus2 passed91/91. Further reduced project hints to actual lexical hits, keeping explicit creation candidates. Build4 and final seven-file focus53/53 passed. Native five-message counts:1PID/1thread/1standingHash,0resume/0standing refresh, input1113/1177/1113/1614/4002bytes, complete current card once, original human approval/refusal enforced. Fixed-SHA final full still required; no real model calls.
+
+
+## 2026-11-05 — A1 full harness and inherited-memory contract migration
+
+The first A1 full command omitted the repository-required isolated-home preload and feedback evaluation. Its parent HOME was task-private, but six durable Serve fixtures correctly refused without the per-file hara-test-home guard before persistence. Preserve that result; run the repository preload, feedback check, original120000ms/file and one worker at the final cleanSHA. Check package.json and the last actual passing receipt before reconstructing full commands.
+
+A seventh failure exposed an old Pi Host fixture expecting unrelated inherited memory during Hello. The new A1 contract deliberately omits unmatched data. Migrate the real Host fixture to four requests: greeting and a matching reporting-period question in both owning and another Workspace. Assert the owner note reaches the matching question, both greetings omit it, the other Workspace omits it, private memory paths stay hidden, and the bounded projection/tools remain. Product src tree stays byte-identical; no completion, permission, memory isolation or revocation guard is relaxed.
+
+
+The completed first full retained3938pass/8fail/3skip/0cancel at unchanged21dfa4c: six preload guards and two old Hello-memory expectations. The second fixture covers personal-global plus Workspace notes; now it explicitly checks Hello omits both, a matching question receives both complete note snippets, and private source paths stay hidden. Product src is unchanged by both fixture migrations. All original queues ended naturally; none were stopped.

@@ -11,21 +11,27 @@ import { WorkspaceConversationStore } from "../dist/workspace/conversations.js";
 
 import { hostFixture, tools } from "./helpers/workspace-user-interaction.mjs";
 
-test("real personal mode prepares both personal-global and Workspace memory before the first provider request", async t => {
+test("real personal mode sends matched personal-global and Workspace memory while greetings omit unrelated notes", async t => {
   const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-personal-context-host-"))), home = join(root, "owner"), source = join(root, "application");
   fs.mkdirSync(join(home, ".hara", "memory"), { recursive: true, mode: 0o700 }); fs.mkdirSync(source, { mode: 0o700 });
   fs.writeFileSync(join(home, ".hara", "memory", "MEMORY.md"), "PersonalAnchor: prefer concise weekly reports.\n", { mode: 0o600 });
-  let observed;
+  const observed = [];
   const host = new LocalWorkspaceHost(source, { mode: "workspace", hostHome: home, credentialVault: new MemoryCredentialVault(), providerFactory(_c, binding) { return {
-    id: "openai", model: binding.model, async turn(args) { observed = args; return { text: "Hello", toolUses: [], stop: "end" }; } }; } });
+    id: "openai", model: binding.model, async turn(args) { observed.push(args); return { text: "Hello", toolUses: [], stop: "end" }; } }; } });
   t.after(async () => { await host.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const w = host.createWorkspace("Synthetic", host.list().revision);
   const resources = new WorkspaceResources(host.home, host.catalog.resolve(w.workspaceId).scope); resources.initialize();
   await resources.memory.append("project", "memory", "ScopedAnchor: retain this Workspace's reporting period.", join(source, "project", w.workspaceId));
   host.configureConnection(w.workspaceId, { label: "Synthetic", provider: "openai", baseURL: "https://example.invalid/v1", defaultModel: "synthetic", apiKey: "fixture-only-key" }, 0);
-  const run = host.start("client", w.workspaceId, w.selectedAgentId, "Hello", randomUUID()); await host.wait(run.runId);
-  assert(observed); assert(observed.system.includes("PersonalAnchor")); assert(observed.system.includes("ScopedAnchor"));
-  assert.equal(observed.system.includes(join(home, ".hara", "memory")), false);
+  for (const objective of ["Hello", "What is known about PersonalAnchor and ScopedAnchor?"]) {
+    const run = host.start("client", w.workspaceId, w.selectedAgentId, objective, randomUUID()); await host.wait(run.runId);
+  }
+  assert.equal(observed.length, 2);
+  assert.equal(observed[0].system.includes("PersonalAnchor"), false);
+  assert.equal(observed[0].system.includes("ScopedAnchor"), false);
+  assert(observed[1].system.includes("PersonalAnchor: prefer concise weekly reports."));
+  assert(observed[1].system.includes("ScopedAnchor: retain this Workspace's reporting period."));
+  for (const request of observed) assert.equal(request.system.includes(join(home, ".hara", "memory")), false);
 });
 
 test("an explicit question resumes after the saved write instead of repeating it", async t => {
