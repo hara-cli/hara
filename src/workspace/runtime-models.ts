@@ -313,7 +313,7 @@ export class WorkspaceRuntimeModels {
     // identity and must not force a new native inventory process. Registration, binary, login
     // and proxy changes still invalidate the non-authoritative model/effort default.
     const key = JSON.stringify([runtimeId, row?.revision ?? 0, row?.selectedModelId ?? null,
-      runtime ? { path: runtime.path, fingerprint: runtime.fingerprint, version: runtime.version,
+      runtime ? { path: "path" in runtime ? runtime.path : null, fingerprint: runtime.fingerprint, version: runtime.version,
         registered: runtime.registered, state: runtime.state, loginSource: runtime.loginSource } : null,
       this.runtimes.proxy.read().revision]);
     let choice = this.launchDefaults.get(key);

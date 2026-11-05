@@ -11322,3 +11322,12 @@ The two authorized native Codex turns completed hello and an unconfirmed editabl
 - Verification mistakes: one load gate command lacked set-e and build continued after exit75; excluded that build from valid evidence. A broad replacement touched a tool-stage scope and caused TS2552; narrowed to model stage and rebuilt. Multiple native scenarios in one file exhausted original120000ms; split new cases into independent helper registrations, no higher deadlines. Native baseline/inventory also failed during machine load220+; retain all failures and rerun only after load<30. No real provider substitution.
 - Operations: writes under the admitted external task need the scoped filesystem permission; a metadata-only read/write script hit EPERM before saving its receipt, no source/user-data mutation. Cross-repository reads must use rg --files and exact roots; unquoted zsh globs were rejected before execution. Reuse the existing prevention entries about fail-fast gate scripts and exact paths.
 - Status: implementation committed locally; final focused/build currently waiting on external machine load. No actual model invocation, installation or real state mutation.
+
+
+## [ERR-20261105-SPEED-MODEL-IDENTITY] Narrow optional detected-runtime path
+
+- Logged: 2026-11-05
+- Status: fixed locally; build/focused verification pending
+- Area: runtime model inventory cache
+- First resident build at Core735b937 failed TS2339 because the installed/not-installed runtime option union does not guarantee a path. Narrow with the in operator and represent absent paths as null in the non-authoritative inventory identity. Registration, binary fingerprint, login source, proxy revision and all fresh launch checks remain in the key/path. No permission cache was added.
+- Original receipt: resident-core-build-1.result.json and log in the admitted speed-parity task. The queue naturally exited on the build error before any focused test. Retain that receipt and use a new label for the corrected build; do not overwrite or claim tests ran.
