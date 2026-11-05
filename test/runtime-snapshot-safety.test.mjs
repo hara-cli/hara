@@ -72,10 +72,10 @@ test("unchanged stat tuples never substitute for reading content (persistent mma
 });
 
 for (const mutation of ["mode", "inode"]) test(`snapshot rejects ${mutation}-only mutation and cannot credit a mixed diff`, t => {
-  const f = fixture(t), file = join(f.work, "unchanged.txt"); fs.writeFileSync(file, "same", { mode: 0o644 });
+  const f = fixture(t), file = join(f.work, "unchanged.txt"); fs.writeFileSync(file, "same", { mode: 0o644 }); fs.chmodSync(file, 0o644);
   const original = fs.statSync(file, { bigint: true }), policy = f.policy();
   if (mutation === "mode") fs.chmodSync(file, 0o600);
-  else { const replacement = join(f.work, "replacement"); fs.writeFileSync(replacement, "same", { mode: 0o644 }); fs.renameSync(replacement, file); }
+  else { const replacement = join(f.work, "replacement"); fs.writeFileSync(replacement, "same", { mode: 0o644 }); fs.chmodSync(replacement, 0o644); fs.renameSync(replacement, file); }
   const changed = fs.statSync(file, { bigint: true });
   assert.notEqual(mutation === "mode" ? changed.mode : changed.ino, mutation === "mode" ? original.mode : original.ino);
   assert.equal(policy.canCompleteConversation(), false);
@@ -88,12 +88,12 @@ for (const mutation of ["mode", "inode"]) test(`snapshot rejects ${mutation}-onl
 });
 
 test("content plus permission mutation is unknown; an atomic content replacement with unchanged access remains a real effect", t => {
-  const f = fixture(t), file = join(f.work, "answer.txt"); fs.writeFileSync(file, "before", { mode: 0o644 });
+  const f = fixture(t), file = join(f.work, "answer.txt"); fs.writeFileSync(file, "before", { mode: 0o644 }); fs.chmodSync(file, 0o644);
   const policy = f.policy();
   fs.writeFileSync(file, "after!"); fs.chmodSync(file, 0o600);
   assert.equal(policy.collectWorkspaceEvidence(), null);
   policy.beginAttempt("atomic-attempt");
-  const replacement = join(f.work, "replacement"); fs.writeFileSync(replacement, "atomic", { mode: 0o600 }); fs.renameSync(replacement, file);
+  const replacement = join(f.work, "replacement"); fs.writeFileSync(replacement, "atomic", { mode: 0o600 }); fs.chmodSync(replacement, 0o600); fs.renameSync(replacement, file);
   assert.deepEqual(policy.collectWorkspaceEvidence().changes, [{ path: "answer.txt", change: "changed", before: sha("after!"), after: sha("atomic") }]);
 });
 
@@ -110,7 +110,7 @@ for (const link of ["symbolic", "hard"]) test(`snapshot refuses a ${link} replac
 });
 
 for (const mutation of ["mode", "inode"]) test(`snapshot invalidates ${mutation} change during content observation`, t => {
-  const f = fixture(t), file = join(f.work, "answer.txt"); fs.writeFileSync(file, "before", { mode: 0o644 });
+  const f = fixture(t), file = join(f.work, "answer.txt"); fs.writeFileSync(file, "before", { mode: 0o644 }); fs.chmodSync(file, 0o644);
   const policy = f.policy(), expectedInode = fs.statSync(file).ino;
   fs.writeFileSync(file, "after!");
   const originalRead = fs.readFileSync, originalFstat = fs.fstatSync;
@@ -120,7 +120,7 @@ for (const mutation of ["mode", "inode"]) test(`snapshot invalidates ${mutation}
     if (!injected && typeof fd === "number" && originalFstat(fd).ino === expectedInode) {
       injected = true;
       if (mutation === "mode") fs.chmodSync(file, 0o600);
-      else { const replacement = join(f.outside, "replacement"); fs.writeFileSync(replacement, "after!", { mode: 0o644 }); fs.renameSync(file, join(f.outside, "saved-before")); fs.renameSync(replacement, file); }
+      else { const replacement = join(f.outside, "replacement"); fs.writeFileSync(replacement, "after!", { mode: 0o644 }); fs.chmodSync(replacement, 0o644); fs.renameSync(file, join(f.outside, "saved-before")); fs.renameSync(replacement, file); }
     }
     return data;
   } });
