@@ -1,3 +1,5 @@
+import { WorkspaceContextCompactions, compactionSourceKey, contextSummaryPrompt } from "../workspace/context-compaction.js";
+import { workspaceCompactionSource } from "../workspace/execution.js";
 import { withWorkspaceModelProxy } from "../network/model-fetch.js";
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -71,6 +73,7 @@ export async function runFullProtectedPi(history: NeutralMsg[], options: RunOpts
   let modelFailure: RuntimeFailureKind | undefined, activeArgs: TurnArgs | undefined, policy: RuntimeExecutionPolicy | undefined;
   let sessionStore: PiNativeSessionStore | undefined, finalSession: string | undefined, drained = false, sawOutput = false;
   let gateway: Awaited<ReturnType<typeof createCodingHostBridge>> | undefined, rpc: PiRpcProcess | undefined;
+  let maintenance: { requests: number; input: number; output: number; cached: number; known: boolean } | undefined;
   const tools = new Map<string, (failed: boolean) => void>();
   const stages = workspaceRunRuntimeStages(permit);
   const nativeTools = workspaceRunHasLegacyToolPolicy(permit) ? [] : [...PI_NATIVE_TOOL_NAMES];
@@ -111,8 +114,13 @@ export async function runFullProtectedPi(history: NeutralMsg[], options: RunOpts
           prepareTurn: async (messages, signal) => withWorkspaceModelProxy(context.proxyUrl, async () => options.provider.prepareTurn?.(messages, signal)), async turn(args) {
             assertCurrent(); sessionStore!.accepted();
             const current = activeArgs!;
+            if (maintenance) maintenance.requests++;
             const result = await withWorkspaceModelProxy(context.proxyUrl, () => options.provider.turn({ ...args, system: current.system + "\n\n" + args.system,
               onActivity: () => { activity(); }, onText: () => {}, onReasoning: () => {} }));
+            if (maintenance) {
+              if (result.usage) { maintenance.input += result.usage.input; maintenance.output += result.usage.output;
+                maintenance.cached += result.usage.cachedInput ?? 0; } else maintenance.known = false;
+            }
             if (result.stop === "error") modelFailure = classifyRuntimeFailure({ stderr: result.errorMsg, status: result.errorMetadata?.status });
             return result;
           } }, tools: piNativeModelTools(options.ctx.cwd, activeArgs!.tools, nativeTools),
@@ -135,6 +143,10 @@ export async function runFullProtectedPi(history: NeutralMsg[], options: RunOpts
           timeoutMs: permit.binding.budget.timeoutMs, governedPrompt: permit.binding.budget.mode === "interactive", signal: native.signal, onAccepted: () => sessionStore!.accepted(),
           onFrame(frame) {
             assertCurrent(); activity();
+            if (maintenance) {
+              if (frame.type === "tool_execution_start") throw new Error("Pi compaction cannot execute tools");
+              return; // Maintenance output is not user prose, a first-token event or task evidence.
+            }
             if (frame.type === "message_update" && frame.assistantMessageEvent?.type === "text_delta" && typeof frame.assistantMessageEvent.delta === "string") {
               if (!sawOutput) { sawOutput = true; safe(() => stages?.mark("first_output", "native_event")); }
             }
@@ -154,13 +166,45 @@ export async function runFullProtectedPi(history: NeutralMsg[], options: RunOpts
             }
           } });
         endSpawn?.("completed"); endSpawn = undefined;
-        await rpc.state(); endCold?.("completed"); endCold = undefined;
+        const idle = await rpc.state(); endCold?.("completed"); endCold = undefined;
+        let compactedSeed = "";
+        if (sessionStore.resumed) {
+          const source = workspaceCompactionSource(permit), tokens = await rpc.contextTokens();
+          const key = compactionSourceKey("pi", sessionStore.sessionFile!);
+          const ledger = new WorkspaceContextCompactions(storage, permit.binding.agent.agentId, permit.binding.sessionId);
+          const summary = source && ledger.plan(source, { runtimeId: "pi", sourceKey: key, tokens,
+            idle: idle.isStreaming === false && idle.isCompacting === false && idle.pendingMessageCount === 0 });
+          if (source && summary) {
+            const record = ledger.begin(source, { runtimeId: "pi", method: "pi-native", sourceKey: key, tokens, requests: 0, summary });
+            maintenance = { requests: 0, input: 0, output: 0, cached: 0, known: true };
+            let compacted = false;
+            try {
+              assertCurrent();
+              const receipt = await rpc.compact(contextSummaryPrompt(summary, false));
+              assertCurrent(); sessionStore.compacted(); compacted = true;
+              ledger.recordOutcome(record, "completed", { requests: maintenance.requests,
+                inputTokens: maintenance.known ? maintenance.input : null, outputTokens: maintenance.known ? maintenance.output : null,
+                cachedInputTokens: maintenance.known ? maintenance.cached : null }, { afterTokens: receipt.estimatedTokensAfter });
+              compactedSeed = contextSummaryPrompt(summary, false) + "\n\n";
+            } catch (error) {
+              ledger.recordOutcome(record, maintenance.requests || native.signal.aborted ? "running" : "failed", { requests: maintenance.requests,
+                inputTokens: maintenance.known && maintenance.requests === 0 ? 0 : null,
+                outputTokens: maintenance.known && maintenance.requests === 0 ? 0 : null,
+                cachedInputTokens: maintenance.known && maintenance.requests === 0 ? 0 : null });
+              // A summary request may have been accepted. Preserve the receipt and never replay it automatically.
+              if (maintenance.requests || native.signal.aborted) throw error;
+              const old = await rpc.state();
+              if (old.isStreaming !== false || old.isCompacting !== false || old.pendingMessageCount !== 0) throw error;
+            } finally { maintenance = undefined; }
+            if (!compacted) modelFailure = undefined;
+          }
+        }
         const continuation = history.slice(sessionStore.promptHistoryStart);
-        const actualPrompt = sessionStore.resumed ? (sessionStore.needsPromptRefresh
+        const actualPrompt = sessionStore.resumed ? (sessionStore.needsPromptRefresh || compactedSeed
           ? `<system-reminder>Current Hara standing governance context for this resumed Pi session:\n${standing}\n</system-reminder>\n\n` : "")
           + "Continue the same frozen Hara task without replaying completed actions.\n"
           + (continuation.length ? JSON.stringify(continuation) : "No new human message; continue only unfinished work.") : prompt;
-        const result = await rpc.prompt(actualPrompt);
+        const result = await rpc.prompt(compactedSeed + actualPrompt);
         if (typeof result.state.sessionFile !== "string") throw new Error("Pi native session receipt missing");
         finalSession = result.state.sessionFile;
         return { ok: true, stdout: redactToolSubprocessOutput(result.text, {

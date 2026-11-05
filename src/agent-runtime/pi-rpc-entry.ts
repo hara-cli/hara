@@ -84,7 +84,7 @@ export async function mainPiNativeRpc(args: string[]): Promise<never> {
         supportsReasoningEffort: false, supportsUsageInStreaming: true, supportsLongCacheRetention: false, supportsMidConvoSystemMessages: false, thinkingFormat: "deepseek" } }] });
   const model = modelRuntime.getModel("hara", "coding"); if (!model) return refused();
   const settingsManager = SettingsManager.inMemory({ defaultProvider: "hara", defaultModel: "coding", defaultThinkingLevel: "off", enabledModels: ["hara/coding"],
-    defaultProjectTrust: "never", defaultTools: nativeTools, compaction: { enabled: false }, retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } },
+    defaultProjectTrust: "never", defaultTools: nativeTools, compaction: { enabled: false, keepRecentTokens: 8192, reserveTokens: 16384 }, retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } },
     cacheWarming: "off", enableAnalytics: false, enableInstallTelemetry: false, enableSkillCommands: false, packages: [], extensions: [], skills: [], prompts: [], themes: [],
     images: { blockImages: true }, transport: "sse", quietStartup: true });
   const extensionRuntime = createExtensionRuntime();

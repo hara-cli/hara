@@ -117,8 +117,8 @@ export async function fakeCodexMain() {
       }
     }
     if (stopped || turnId !== currentTurn) return;
-    const inputTokens = selected === "over-budget" ? 300000 : 100;
-    const samples = mode().telemetry ?? [{ total: { inputTokens: total.inputTokens + inputTokens, outputTokens: total.outputTokens + 20 }, last: { inputTokens, outputTokens: 20 } }];
+    const inputTokens = mode().contextInput ?? (selected === "over-budget" ? 300000 : 100);
+    const samples = mode().telemetry ?? [{ total: { inputTokens: total.inputTokens + inputTokens, ...(total.cachedInputTokens !== undefined ? { cachedInputTokens: total.cachedInputTokens } : {}), outputTokens: total.outputTokens + 20 }, last: { inputTokens, cachedInputTokens: 0, outputTokens: 20 } }];
     for (const sample of samples) {
       total = sample.total;
       const state = JSON.parse(fs.readFileSync(command + ".native.json", "utf8")); state.total = total; fs.writeFileSync(command + ".native.json", JSON.stringify(state));
@@ -155,6 +155,24 @@ export async function fakeCodexMain() {
       cwd = p.cwd; config = p.config;
       reply(message, { thread: { id: thread, cwd, status: { type: mode().threadStatus ?? "idle" } }, approvalPolicy: p.approvalPolicy, approvalsReviewer: "user",
         sandbox: { type: p.sandbox === "danger-full-access" ? "dangerFullAccess" : "readOnly", networkAccess: false }, model: p.model, reasoningEffort: p.config?.model_reasoning_effort ?? null }); continue;
+    }
+    if (message.method === "thread/compact/start") {
+      if (mode().compactUnsupported) { send({ id: message.id, error: { code: -32601, message: "compact unavailable" } }); continue; }
+      const compactTurn = crypto.randomUUID(), compactItem = crypto.randomUUID();
+      reply(message, {});
+      note("turn/started", { threadId: thread, turn: { id: compactTurn, status: "inProgress" } });
+      if (mode().compactHang) continue;
+      if (mode().compactDelayMs) await new Promise(resolve => setTimeout(resolve, mode().compactDelayMs));
+      if (!mode().compactFail) {
+        note("item/started", { threadId: thread, turnId: compactTurn, item: { type: "contextCompaction", id: compactItem } });
+        total = { inputTokens: total.inputTokens + 18020, cachedInputTokens: (total.cachedInputTokens ?? 0) + 17000, outputTokens: total.outputTokens + 300 };
+        const state = JSON.parse(fs.readFileSync(command + ".native.json", "utf8")); state.total = total; fs.writeFileSync(command + ".native.json", JSON.stringify(state));
+        note("thread/tokenUsage/updated", { threadId: thread, turnId: compactTurn, tokenUsage: { total,
+          last: { inputTokens: 18020, cachedInputTokens: 17000, outputTokens: 300 } } });
+        note("item/completed", { threadId: thread, turnId: compactTurn, item: { type: "contextCompaction", id: compactItem } });
+      }
+      note("turn/completed", { threadId: thread, turn: { id: compactTurn, status: mode().compactFail ? "failed" : "completed" } });
+      continue;
     }
     if (message.method === "turn/start") {
       turnId = crypto.randomUUID(); stopped = false; reply(message, { turn: { id: turnId } });

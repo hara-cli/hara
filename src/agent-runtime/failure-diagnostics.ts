@@ -15,7 +15,7 @@ export interface RuntimeFailureContext {
   /** Code-owned policy metadata. Absence preserves older diagnostic records. */
   extensionsIsolation?: "inherited";
 }
-export const RUNTIME_RPC_METHODS = ["initialize", "thread/start", "thread/resume", "turn/start", "turn/interrupt", "thread/unsubscribe"] as const;
+export const RUNTIME_RPC_METHODS = ["initialize", "thread/start", "thread/resume", "turn/start", "turn/interrupt", "thread/unsubscribe", "thread/compact/start"] as const;
 export interface RuntimeRpcDiagnostic { rpcMethod: typeof RUNTIME_RPC_METHODS[number]; rpcTimeoutMs: number }
 /** Code-owned RPC metadata only; never forward method parameters or native error data. */
 export function runtimeRpcDiagnostic(value: unknown): RuntimeRpcDiagnostic | undefined {

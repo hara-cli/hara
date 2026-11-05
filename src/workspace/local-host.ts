@@ -78,6 +78,7 @@ import { executeLegacyPrint } from "./legacy-print.js";
 import { RuntimeStageRecorder, WorkspaceRuntimeStageStore, projectRuntimeStageReports,
   MAX_RUNTIME_STAGE_REPORTS, type RuntimeStageReport } from "./runtime-stage-events.js";
 import { runtimeStageErrorKind } from "../agent-runtime/stage-observer.js";
+import { WorkspaceContextCompactions } from "./context-compaction.js";
 import { codexSessionPool } from "../agent-runtime/codex-session.js";
 import { codexThreadState, codexThreadView } from "./codex-thread.js";
 
@@ -800,6 +801,7 @@ export class LocalWorkspaceHost {
         pendingInteractions: this.pendingInteractions(context, value, [...this.pending.values()].filter(pending => pending.card.workspaceId === workspaceId
           && pending.card.agentId === selected && !pending.card.channelId && pending.clientId === clientId).map(pending => pending.card)),
         usage: value.usage, runUsage: value.runUsage, pastTaskCount: value.pastTasks.length,
+        contextCompactions: new WorkspaceContextCompactions(context.storage, selected, value.sessionId).views(),
         runtimeStages: this.runtimeStageReports(context, selected, value.sessionId),
         messageTimings: this.messageTimingReports(context, selected, value.sessionId),
         nativeRisks: new WorkspaceNativeRiskStore(context.storage, selected, value.sessionId).read(),
@@ -1395,6 +1397,7 @@ export class LocalWorkspaceHost {
           this.changed(workspaceId, agentId);
         },
         onRuntimeStageChanged: () => { this.saveRuntimeStages(owned); this.changed(owned.workspaceId, owned.agentId); },
+        compactionSource: () => owned.value,
         interaction: owned.interaction, interactionUsage: () => tree.read().usage,
         onQuestion: question => { this.commit(owned, this.questionCheckpoint(owned.value.task!, question)); },
         onInteractionChanged: () => { this.changed(owned.workspaceId, owned.agentId); },

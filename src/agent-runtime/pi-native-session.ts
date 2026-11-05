@@ -79,6 +79,11 @@ export class PiNativeSessionStore {
     if (this.current.receipt!.state !== "accepted") this.save({ ...this.current.receipt!, state: "accepted",
       contextGeneration: this.current.receipt!.contextGeneration ?? randomUUID() });
   }
+  /** A confirmed native compaction changes model memory, never history/budget or an accepted-write receipt. */
+  compacted(): void {
+    if (this.current.receipt!.state !== "accepted") invalid();
+    this.save({ ...this.current.receipt!, contextGeneration: randomUUID(), standingPromptHash: null });
+  }
   /** Only call after the shared policy has drained all descendants and the turn was settled. */
   finished(sessionFile: string, history: readonly NeutralMsg[]): void {
     const root = join(this.root, "agent/sessions");

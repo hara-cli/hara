@@ -1,3 +1,6 @@
+import { WorkspaceContextCompactions, compactionSourceKey, type ContextSummary } from "../workspace/context-compaction.js";
+import { workspaceCompactionSource, workspaceRuntimeStorage } from "../workspace/execution.js";
+import { oneShotCompactionPrompt } from "./context-compaction.js";
 import { claudeRuntimeEnvironment, parseClaudeCliOutput } from "./claude-cli.js";
 import { workspaceRunPermissionTier } from "./execution-policy.js";
 import { newWorkspaceNativePolicy, endWorkspaceNativePolicy, observeWorkspaceNativeItem } from "./workspace-native-policy.js";
@@ -78,11 +81,24 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
     }
     let successfulUse: (() => void) | undefined;
     const session = id === "codex" ? await codexSessionPool(installer).acquire(permit, assertCurrent) : undefined;
+    let hostSeed: { ledger: WorkspaceContextCompactions; summary: ContextSummary; source: NonNullable<ReturnType<typeof workspaceCompactionSource>>; tokens: number } | undefined;
     const native = createRegisteredCliMcpTurn({
       signal: options.signal!, assertCurrent, jsonEvents: id === "codex",
       ...(session ? { bearerToken: session.token, createEndpoint: session.createEndpoint.bind(session),
         prompt: (args: import("../providers/types.js").TurnArgs) => args.history.flatMap(message => message.role === "user" ? [message.content] : []).join("\n\n"),
-        takeUsage: () => session.takeUsage(), decorateResult: session.decorateResult.bind(session) } : {}),
+        takeUsage: () => session.takeUsage(), decorateResult: session.decorateResult.bind(session) } : { prompt: (args: import("../providers/types.js").TurnArgs) => {
+        // Claude is a fresh -p process, with no native resumed thread to compact. Bound only an actually long launch view.
+        const original = oneShotCompactionPrompt(args);
+        const tokens = Math.ceil(Buffer.byteLength(JSON.stringify(args.history)) / 4);
+        if (tokens < 16_384 && args.history.filter(row => row.role === "user").length < 40) return original;
+        const source = workspaceCompactionSource(permit);
+        if (!source) return original;
+        const ledger = new WorkspaceContextCompactions(workspaceRuntimeStorage(permit), permit.binding.agent.agentId, permit.binding.sessionId);
+        const summary = ledger.plan(source, { runtimeId: "claude", sourceKey: compactionSourceKey("claude", permit.binding.runId), tokens, idle: true });
+        if (!summary) return original;
+        hostSeed = { ledger, summary, source, tokens };
+        return oneShotCompactionPrompt(args, summary);
+      } }),
       async launch(endpoint, prompt, activity, turnArgs) {
         assertCurrent();
         if (session) {
@@ -128,7 +144,10 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
             ? codexHostToolOverrides(resolved.env.HOME, resolved.env.CODEX_HOME, options.ctx.cwd, serverName) : [],
           mcp: { serverName, url: endpoint.url, timeoutMs: Number(options.timeoutMs) || 120_000 } });
         const policy = newWorkspaceNativePolicy(permit, id, resolved, installer);
+        let seedRecord: string | undefined, seedSucceeded = false;
         try {
+          if (hostSeed) seedRecord = hostSeed.ledger.begin(hostSeed.source, { runtimeId: "claude", method: "host-seed",
+            sourceKey: compactionSourceKey("claude", permit.binding.runId), tokens: hostSeed.tokens, requests: 0, summary: hostSeed.summary });
           const launch = policy.wrap({ command: resolved.command, env, args });
           if (id === "claude") launch.env = claudeRuntimeEnvironment(launch.env, policy.tempRoot);
           const result = await runExternalCommandCapture(launch, launch.args, {
@@ -159,10 +178,11 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
               stderr: eventFailure, timedOut: result.timedOut });
             return { ...result, ok: false, stdout: "", runtimeFailure: tracker.failed(kind, Date.now() - started, result.errorFirstLine) };
           }
-          tracker.succeeded();
+          tracker.succeeded(); seedSucceeded = true;
           if (result.ok && !native.signal.aborted && runtimeUseProtocolSucceeded(id, result.stdout)) successfulUse = recordSuccessfulUse;
           return { ...result, stdout: redactToolSubprocessOutput(claude?.text ?? result.stdout, env) };
-        } finally { observer.finish(false); delete env[WORKSPACE_MCP_TOKEN_ENV]; await endWorkspaceNativePolicy(permit, policy); await policy.close(); }
+        } finally { observer.finish(false); delete env[WORKSPACE_MCP_TOKEN_ENV]; await endWorkspaceNativePolicy(permit, policy); await policy.close();
+          if (hostSeed && seedRecord) hostSeed.ledger.recordOutcome(seedRecord, seedSucceeded ? "completed" : "failed", { requests: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 }); }
       },
     });
     try {
