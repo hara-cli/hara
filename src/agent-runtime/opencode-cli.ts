@@ -11,6 +11,7 @@ import type { NeutralMsg, ToolResult, ToolSpec, TurnArgs, TurnResult } from "../
 import { assertWorkspaceRunAdmission, workspaceRunRuntimeStages } from "../workspace/execution.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
+import { ENGINE_DEFAULT_EFFORT } from "../workspace/default-effort.js";
 import type { TaskRuntimeBinding } from "./bindings.js";
 import type { GovernedAgentRuntimeDriver } from "./registry.js";
 import { CLI_TOOL_GUIDANCE } from "./tool-guidance.js";
@@ -192,7 +193,7 @@ export function openCodeCliDriver(installer: WorkspaceRuntimeInstaller, models?:
       error: runtimeFailureMessage({ ...installer.failureContext("opencode", resolved), kind, elapsedMs: 0 }) });
     if (resolved.loginSource !== "host") return diagnostic("runtime_auth_required");
     const model = models.selection("opencode");
-    if (!model.modelId || model.effort) return diagnostic("invalid_model");
+    if (!model.modelId || model.effort && model.effort !== ENGINE_DEFAULT_EFFORT) return diagnostic("invalid_model");
     const tracker = runtimeFailureTracker(installer, "opencode", permit.binding.agent.agentId,
       JSON.stringify([resolved.command, resolved.loginSource, resolved.env.HOME, installer.proxy.read().revision, permit.binding.agent.configRevision, model.modelId]), resolved, permit.binding.sessionId);
     const held = tracker.blocked();

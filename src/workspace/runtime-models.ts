@@ -12,8 +12,8 @@ import { HARA_RUNTIME_VERSION } from "../version.js";
 import { inspectWorkspaceResourceFile, sameWorkspaceResourceBinding, workspaceStateHome,
   type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { OPTIONAL_RUNTIMES } from "./runtime-catalog.js";
-import { optionalRuntimeId, type OptionalRuntimeId, type WorkspaceRuntimeInstaller } from "./runtime-install.js";
-import { defaultEffortForLevels, resolveReasoningEffort } from "./default-effort.js";
+import { optionalRuntimeId, type OptionalRuntimeId, type RuntimeUnavailableReason, type RuntimeUse, type WorkspaceRuntimeInstaller } from "./runtime-install.js";
+import { ENGINE_DEFAULT_EFFORT, defaultEffortForLevels, resolveReasoningEffort } from "./default-effort.js";
 
 export interface RuntimeModel { id: string; label: string; description?: string; recommended?: boolean;
   /** Reasoning levels this exact model advertised on the live inventory. Absent/empty means the
@@ -25,6 +25,24 @@ const MAX_INVENTORY_BYTES = 4 * 1024 * 1024;
 const MAX_EFFORTS = 8;
 const EFFORT_ID = /^[a-z][a-z0-9-]{0,31}$/;
 const selectionFields = ["runtimeId", "revision", "selectedModelId"] as const;
+/**
+ * "Follow the engine's own default": Hara passes no effort argument at all. Stored in the existing
+ * `selectedEffort` field (it matches EFFORT_ID), so the state format is unchanged. Distinct from
+ * null/"auto", which keep Hara's per-message automatic choice.
+ */
+export { ENGINE_DEFAULT_EFFORT };
+export type RuntimeModelSource = "live" | "official" | "engine_default" | "none";
+export interface RuntimeFormOptions {
+  runtimeId: OptionalRuntimeId; use: RuntimeUse; unavailableReason?: RuntimeUnavailableReason;
+  version: string | null; path: string | null; fingerprint: string | null; loginSource: "host" | "isolated";
+  models: RuntimeModel[]; defaultModelId: string | null; modelSource: RuntimeModelSource; effortSupported: boolean;
+  selected: { modelId: string | null; effort: string | null } | null; revision: number;
+}
+/** Claude publishes its accepted levels in `--help`; a CLI without the flag yields none. */
+export function claudeHelpEfforts(text: string): string[] {
+  const flag = /--effort\s+(?:<[^>]+>)?[\s\S]{0,400}?\(([a-z][a-z0-9, ]*)\)/.exec(text);
+  return flag ? [...new Set(flag[1]!.split(",").map(value => value.trim()).filter(validEffort))].slice(0, MAX_EFFORTS) : [];
+}
 
 // These runtimes have no stable, non-interactive model inventory yet.
 const CATALOG: Partial<Record<OptionalRuntimeId, readonly RuntimeModel[]>> = {
@@ -250,9 +268,7 @@ export class WorkspaceRuntimeModels {
     if (this.claudeEfforts?.key === key) return this.claudeEfforts.levels;
     const result = await protectedInventory(this.storage, this.runtimes, "claude", resolved, ["--setting-sources", "project,local", "--settings", JSON.stringify({ disableAllHooks: true, sandbox: { enabled: false } }), "--help"],
       launch => runExternalCommandCapture(launch, launch.args, { cwd: resolved.env.HOME, waitForClose: true, timeoutMs: 10_000, maxOutputBytes: 256 * 1024 }));
-    const text = result.ok ? result.stdout : "";
-    const flag = /--effort\s+(?:<[^>]+>)?[\s\S]{0,400}?\(([a-z][a-z0-9, ]*)\)/.exec(text);
-    const levels = flag ? [...new Set(flag[1]!.split(",").map(value => value.trim()).filter(validEffort))].slice(0, MAX_EFFORTS) : [];
+    const levels = claudeHelpEfforts(result.ok ? result.stdout : "");
     this.claudeEfforts = { key, levels };
     return levels;
   }
@@ -304,6 +320,8 @@ export class WorkspaceRuntimeModels {
   async launchSelection(runtimeId: OptionalRuntimeId, objective = ""): Promise<{ modelId: string | null; effort: string | null; effortSource: "auto" | "user" | "default" }> {
     this.bound(runtimeId);
     const row = this.state.read().selections.find(value => value.runtimeId === runtimeId);
+    // "Follow the engine default" passes nothing; the runtime decides, exactly like a runtime without effort.
+    if (row?.selectedEffort === ENGINE_DEFAULT_EFFORT) return { modelId: row.selectedModelId, effort: null, effortSource: "default" };
     const effortSource = ["codex", "claude", "copilot"].includes(runtimeId) ? row?.selectedEffort != null && row.selectedEffort !== "auto" ? "user" as const : "auto" as const : "default" as const;
     if (row?.selectedEffort != null && row.selectedEffort !== "auto")
       return { modelId: row.selectedModelId, effort: row.selectedEffort, effortSource };
@@ -361,6 +379,54 @@ export class WorkspaceRuntimeModels {
         : runtimeId === "opencode" ? null : defaultEffortForLevels(selected?.supportedReasoningEfforts), models };
   }
   /**
+   * One read for the colleague form: the runtime's models, its default, effort capability and the
+   * Workspace's saved choice. A confirmed runtime uses the ordinary bound inventory. An unconfirmed one
+   * is never launched with the account Home: only the documented catalog, plus Claude's `--help` in the
+   * isolated version-probe environment. Codex lists nothing before confirmation (engine default only).
+   */
+  async formOptions(runtimeId: unknown, signal?: AbortSignal): Promise<RuntimeFormOptions> {
+    if (!optionalRuntimeId(runtimeId)) throw new Error("Invalid runtimeId");
+    const option = this.runtimes.list().options.find(row => row.runtimeId === runtimeId)!;
+    const saved = this.state.read().selections.find(row => row.runtimeId === runtimeId);
+    const base = { runtimeId, use: option.use, ...(option.unavailableReason ? { unavailableReason: option.unavailableReason } : {}),
+      version: option.version ?? null, path: "path" in option && typeof option.path === "string" ? option.path : null,
+      fingerprint: option.fingerprint ?? null, loginSource: option.loginSource,
+      selected: saved ? { modelId: saved.selectedModelId, effort: saved.selectedEffort ?? null } : null, revision: saved?.revision ?? 0 };
+    let models: RuntimeModel[] = [], modelSource: RuntimeModelSource = "none";
+    if (option.use === "ready") {
+      const listed = await this.list(runtimeId);
+      models = listed.models;
+      modelSource = runtimeId === "codex" || runtimeId === "opencode" || runtimeId === "cursor" ? "live" : "official";
+    } else if (option.use === "confirm_first_use" || option.use === "confirm_update") {
+      if (runtimeId === "codex" || runtimeId === "opencode" || runtimeId === "cursor") modelSource = "engine_default";
+      else {
+        models = (runtimeId === "copilot" || runtimeId === "grok" ? DOCUMENTED_EXPANDED_MODELS[runtimeId]! : CATALOG[runtimeId] ?? []).map(row => ({ ...row }));
+        modelSource = "official";
+        if (runtimeId === "claude") {
+          const help = await this.runtimes.probeUnconfirmedHelp("claude", signal);
+          const levels = help && help.fingerprint === option.fingerprint ? claudeHelpEfforts(help.text) : [];
+          if (levels.length) models = models.map(row => ({ ...row, supportedReasoningEfforts: [...levels] }));
+        }
+      }
+    }
+    const defaultModelId = models.find(row => row.recommended)?.id ?? models[0]?.id ?? null;
+    return { ...base, models, defaultModelId, modelSource,
+      effortSupported: runtimeId !== "opencode" && models.some(row => (row.supportedReasoningEfforts?.length ?? 0) > 0) };
+  }
+  /** Validate a form's model choice without writing; the same rules as select(). */
+  async checkSelection(runtimeId: OptionalRuntimeId, modelId: unknown, expectedRevision: unknown, effort: unknown, models: readonly RuntimeModel[], modelsKnown: boolean): Promise<void> {
+    if (!validModelId(modelId)) throw new Error("Invalid runtime modelId");
+    if (effort !== undefined && effort !== null && !validEffort(effort)) throw new Error("Invalid runtime effort");
+    if (!Number.isSafeInteger(expectedRevision) || Number(expectedRevision) < 0) throw new Error("Invalid runtime model revision");
+    if ((this.state.read().selections.find(row => row.runtimeId === runtimeId)?.revision ?? 0) !== expectedRevision)
+      throw new Error("Runtime model revision changed; refresh before selecting");
+    if (!modelsKnown) return;
+    const model = models.find(row => row.id === modelId);
+    if (!model) throw new Error("Invalid runtime modelId");
+    if (effort !== undefined && effort !== null && effort !== "auto" && effort !== ENGINE_DEFAULT_EFFORT
+      && !(model.supportedReasoningEfforts ?? []).includes(effort as string)) throw new Error("Invalid runtime effort");
+  }
+  /**
    * Persist the model and, optionally, its reasoning level.
    *
    * `effort` is three-valued: `undefined` keeps the current level, `null` clears it, and a string must
@@ -374,7 +440,7 @@ export class WorkspaceRuntimeModels {
     const models = runtimeId === "codex" || runtimeId === "opencode" || runtimeId === "cursor" ? await this.live(runtimeId) : await this.catalogModels(runtimeId);
     const model = models.find(row => row.id === modelId);
     if (!model) throw new Error("Invalid runtime modelId");
-    if (effort !== undefined && effort !== null && effort !== "auto") {
+    if (effort !== undefined && effort !== null && effort !== "auto" && effort !== ENGINE_DEFAULT_EFFORT) {
       const declared = model.supportedReasoningEfforts ?? [];
       if (!declared.length) throw new Error("This model does not report reasoning effort; no level was selected");
       if (!declared.includes(effort as string)) throw new Error("Invalid runtime effort");

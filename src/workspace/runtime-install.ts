@@ -10,7 +10,7 @@ import { HOST_LOGIN_ONLY_RUNTIMES, MANUAL_RUNTIME_INSTALL_URLS, OPTIONAL_RUNTIME
 import { runtimeArchiveMember } from "./runtime-archive.js";
 import { WorkspaceRuntimeProxy } from "./runtime-proxy.js";
 import { validOpenCodeNativeHeader } from "../coding/bundled-opencode.js";
-import { detectInstalledRuntimes, inspectLocalRuntime, isKimiCodeExecutable, KIMI_LEGACY_MESSAGE, type DetectionOptions, type DetectedRuntime, type CopilotVersionProbe } from "./runtime-detect.js";
+import { boundedRuntimeCommand, detectInstalledRuntimes, inspectLocalRuntime, isKimiCodeExecutable, KIMI_LEGACY_MESSAGE, runtimeProbeEnvironment, type DetectionOptions, type DetectedRuntime, type CopilotVersionProbe } from "./runtime-detect.js";
 import { WorkspaceRuntimeVersionStore, projectRuntimeVersionStatus, type RuntimeVersionCurrent } from "./runtime-version-history.js";
 
 export type OptionalRuntimeId = "opencode" | "codex" | "claude" | "agy" | "gemini" | "kimi" | "copilot" | "cursor" | "grok";
@@ -35,6 +35,39 @@ export type RuntimeLoginSource = "host" | "isolated";
 export interface RuntimeLoginBinding { runtimeId: OptionalRuntimeId; source: RuntimeLoginSource; confirmedAt: string }
 const generalAgentAvailable = (runtimeId: OptionalRuntimeId, registered: boolean, loginSource: RuntimeLoginSource): boolean =>
   registered && (runtimeId === "codex" || runtimeId === "claude" || HOST_LOGIN_ONLY_RUNTIMES.includes(runtimeId) && loginSource === "host");
+/**
+ * Display/selection projection only. `ready` is the sole value that is also execution authority, and it
+ * is derived from the same confirmed-file check as `generalAgentDriverAvailable`. The two `confirm_*`
+ * values mean "installed and passed the file check, but a person must confirm it before first use".
+ */
+export type RuntimeUse = "ready" | "confirm_first_use" | "confirm_update" | "unavailable" | "detecting";
+export type RuntimeUnavailableReason = "not_installed" | "unsafe_file" | "legacy_unsupported" | "adapter_pending" | "detection_failed" | "host_login_required";
+interface UseFacts { registered: boolean; available: boolean; valid: boolean; hadConfirmation: boolean; legacy: boolean; missing: boolean;
+  detecting: boolean; incomplete: boolean; probe?: "detecting" | "detection_failed" }
+function projectRuntimeUse(runtimeId: OptionalRuntimeId, facts: UseFacts): { use: RuntimeUse; unavailableReason?: RuntimeUnavailableReason } {
+  const unavailable = (unavailableReason: RuntimeUnavailableReason) => ({ use: "unavailable" as const, unavailableReason });
+  if (facts.legacy) return unavailable("legacy_unsupported");
+  if (facts.valid) {
+    if (runtimeId === "agy") return unavailable("adapter_pending");
+    if (facts.available) return { use: "ready" };
+    // A registered host-only runtime with a legacy isolated login can be fixed by confirming the host login.
+    if (facts.registered) return HOST_LOGIN_ONLY_RUNTIMES.includes(runtimeId) ? { use: "confirm_first_use" } : unavailable("host_login_required");
+    return { use: facts.hadConfirmation ? "confirm_update" : "confirm_first_use" };
+  }
+  if (facts.probe === "detecting") return { use: "detecting" };
+  if (facts.probe === "detection_failed") return unavailable("detection_failed");
+  // A confirmed file that changed in place is usually an update; until a completed round has looked at
+  // it, say "checking" rather than accusing it. After that, a present-but-unlisted file is unsafe.
+  if (facts.hadConfirmation && !facts.missing) return facts.detecting ? { use: "detecting" } : unavailable("unsafe_file");
+  if (facts.detecting) return { use: "detecting" };
+  if (facts.incomplete) return unavailable("detection_failed");
+  return unavailable("not_installed");
+}
+/** A vanished confirmed file is "not installed"; anything else that fails inspection is unsafe. */
+function runtimeFileMissing(path: string | undefined): boolean {
+  if (!path) return true;
+  try { lstatSync(path); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR"; }
+}
 interface InstallState { resourceBinding: WorkspaceResourceBinding; revision: number; entries: Registration[]; loginSources: RuntimeLoginBinding[] }
 interface LocalState { resourceBinding: WorkspaceResourceBinding; revision: number; entries: DetectedRuntime[]; loginSources: RuntimeLoginBinding[] }
 export interface RuntimeInstallCard { id: string; runtimeId: OptionalRuntimeId; label: string; version: string;
@@ -98,6 +131,12 @@ export class WorkspaceRuntimeInstaller {
   private detected: DetectedRuntime[] = [];
   private discovery?: Promise<void>;
   private copilotProbe?: { path: string; source: string; state: "detecting" | "detection_failed" };
+  /** Runtimes the last round could not finish; their earlier results are kept, absence is not inferred. */
+  private incomplete = new Set<OptionalRuntimeId>();
+  private discoveredAt: string | null = null;
+  private scheduledDiscovery?: ReturnType<typeof setTimeout>;
+  /** Changed-in-place confirmed files already sent through one automatic recheck. */
+  private readonly rechecked = new Set<string>();
   private copilotRetry?: Promise<void>;
   private readonly versionProbes = new Set<AbortController>();
   private readonly proposals = new Map<string, Proposal>();
@@ -160,21 +199,73 @@ export class WorkspaceRuntimeInstaller {
         this.storage.run(() => {});
         let deferred: CopilotVersionProbe | undefined;
         const copilotProbeInProgress = Boolean(this.copilotRetry);
-        const found = await detectInstalledRuntimes({ ...this.options.discovery!, signal: controller.signal, copilotProbeInProgress,
-          onCopilotProbeTimeout: probe => { deferred = probe; } });
+        const incomplete = new Set<OptionalRuntimeId>();
+        let found: DetectedRuntime[];
+        try {
+          found = await detectInstalledRuntimes({ ...this.options.discovery!, signal: controller.signal, copilotProbeInProgress,
+            onCopilotProbeTimeout: probe => { deferred = probe; },
+            partial: { ...(this.options.discovery!.partial ?? {}), onIncomplete: id => { incomplete.add(id); } } });
+        } catch (error) {
+          // A failed round confirms nothing: keep earlier results and report every runtime as unfinished.
+          if (!this.closed && !controller.signal.aborted) { this.incomplete = new Set(OPTIONAL_RUNTIMES); this.discoveredAt = new Date().toISOString(); }
+          throw error;
+        }
         if (this.closed || controller.signal.aborted) return;
         this.storage.run(() => {});
+        // An unfinished runtime keeps its previous result; a timeout is never evidence of removal.
+        const kept = this.detected.filter(row => incomplete.has(row.runtimeId) && !found.some(next => next.runtimeId === row.runtimeId));
+        this.incomplete = incomplete; this.discoveredAt = new Date().toISOString();
         if (copilotProbeInProgress) {
           // The retry may finish while other runtimes are rescanned. Do not erase its newer result.
-          this.detected = [...found, ...this.detected.filter(row => row.runtimeId === "copilot")];
+          this.detected = [...found, ...kept.filter(row => row.runtimeId !== "copilot"), ...this.detected.filter(row => row.runtimeId === "copilot")];
         } else {
-          this.detected = found;
+          this.detected = [...found, ...kept];
           this.copilotProbe = deferred ? { path: deferred.path, source: deferred.source, state: "detecting" } : undefined;
           if (deferred) this.retryCopilotVersion(deferred);
         }
       })().finally(() => { this.versionProbes.delete(controller); this.discovery = undefined; });
     }
     return this.discovery;
+  }
+  /**
+   * Background detection after a Workspace opens. Same probe code and environment as an explicit
+   * rescan; nothing is persisted and close() cancels the timer and any running round.
+   */
+  scheduleDiscovery(delayMs = 3000): void {
+    if (this.closed || !this.options.discovery) return;
+    if (this.scheduledDiscovery) clearTimeout(this.scheduledDiscovery);
+    const notify = () => { if (!this.closed) try { this.options.onChange?.(); } catch { /* observer only */ } };
+    this.scheduledDiscovery = setTimeout(() => {
+      this.scheduledDiscovery = undefined;
+      if (!this.closed) void this.discover().then(notify, notify);
+    }, Math.max(0, delayMs));
+    this.scheduledDiscovery.unref?.();
+  }
+  /** Round state for "last checked" / partial progress; not authority. */
+  detectionStatus(): { running: boolean; completedAt: string | null; incomplete: OptionalRuntimeId[] } {
+    return { running: Boolean(this.discovery), completedAt: this.discoveredAt, incomplete: [...this.incomplete] };
+  }
+  /**
+   * `--help` for a detected runtime the user has not confirmed, in the isolated version-probe
+   * environment: probe Home, fixed PATH, bounded time/output, no account login or credential. The
+   * file must be byte-identical before and after. Returns null on any doubt.
+   */
+  async probeUnconfirmedHelp(runtimeId: OptionalRuntimeId, signal?: AbortSignal): Promise<{ text: string; fingerprint: string } | null> {
+    if (this.closed || !this.options.discovery || runtimeId !== "claude") return null;
+    const row = this.detected.find(value => value.runtimeId === runtimeId);
+    const before = row && inspectLocalRuntime(row.path, true);
+    if (!row || !before || before.realPath !== row.realPath || before.fingerprint !== row.fingerprint) return null;
+    const controller = new AbortController(); this.versionProbes.add(controller);
+    const abort = () => controller.abort(); signal?.addEventListener("abort", abort, { once: true });
+    try {
+      const run = this.options.discovery.run ?? boundedRuntimeCommand;
+      const env = runtimeProbeEnvironment(this.options.discovery, row.path);
+      const text = await run(row.path, ["--help"], env, 5000, { signal: controller.signal, maxBytes: 256 * 1024 });
+      const after = inspectLocalRuntime(row.path, true);
+      if (this.closed || controller.signal.aborted || text === null || !after || after.realPath !== row.realPath || after.fingerprint !== row.fingerprint) return null;
+      return { text, fingerprint: row.fingerprint };
+    } catch { return null; }
+    finally { signal?.removeEventListener("abort", abort); this.versionProbes.delete(controller); }
   }
   private retryCopilotVersion(probe: CopilotVersionProbe): void {
     const controller = new AbortController(); this.versionProbes.add(controller);
@@ -581,6 +672,26 @@ export class WorkspaceRuntimeInstaller {
     return { state: installed && runtimeId === "kimi" ? "legacy_unsupported" : installed ? verified ? "registered" : "integrity_failed" : (runtimeId === "copilot" ? this.copilotProbe?.state : undefined) ?? "not_installed",
       generalAgentDriverAvailable: generalAgentAvailable(runtimeId, verified, loginSource) };
   }
+  private downloadedUse(runtimeId: OptionalRuntimeId, installed: boolean, verified: boolean, available: boolean, probe?: "detecting" | "detection_failed") {
+    return projectRuntimeUse(runtimeId, { registered: verified, available, valid: verified, hadConfirmation: installed,
+      legacy: installed && runtimeId === "kimi", missing: false, probe,
+      // Detection never examines Hara-downloaded files, so it cannot make their state "checking".
+      detecting: !installed && this.firstRoundPending(), incomplete: !installed && this.incomplete.has(runtimeId) });
+  }
+  /**
+   * A confirmed file that still passes the file check but has new bytes (typically an auto-update) gets
+   * one automatic recheck so it can be offered for confirmation. Returns whether that check is pending.
+   * The recheck is the ordinary detection round; it never confirms or executes the new file.
+   */
+  private recheckChanged(runtimeId: OptionalRuntimeId, fingerprint: string): boolean {
+    if (this.closed || !this.options.discovery) return false;
+    const key = `${runtimeId}:${fingerprint}`;
+    if (this.rechecked.has(key)) return Boolean(this.discovery || this.scheduledDiscovery);
+    if (this.rechecked.size >= 64) this.rechecked.clear();
+    this.rechecked.add(key); this.scheduleDiscovery(0); return true;
+  }
+  /** Discovery is configured but no round has completed since this Workspace opened. */
+  private firstRoundPending(): boolean { return Boolean(this.options.discovery) && this.discoveredAt === null && !this.closed; }
   list() {
     const value = this.state.read(), locals = this.locals.read(), versionStatus = this.versionProjection();
     // Local registrations win over an older downloaded install, so their recorded source is the
@@ -599,11 +710,16 @@ export class WorkspaceRuntimeInstaller {
         const selected = registered ? local! : discovered ? detected! : local ?? detected!;
         const inspected = registered ? localCheck : discovered ? detectedCheck : localCheck ?? detectedCheck;
         const valid = registered || discovered, version = valid ? selected.version : null;
+        const legacy = runtimeId === "kimi" && !valid && !isKimiCodeExecutable(selected.path, selected.version);
+        const available = generalAgentAvailable(runtimeId, registered, loginSource);
+        const use = projectRuntimeUse(runtimeId, { registered, available, valid, hadConfirmation: Boolean(local), legacy,
+          missing: runtimeFileMissing(selected.path), incomplete: this.incomplete.has(runtimeId),
+          detecting: this.firstRoundPending() || Boolean(local && localCheck && !valid) && this.recheckChanged(runtimeId, localCheck!.fingerprint) });
         return { runtimeId, label: RUNTIME_LABELS[runtimeId], ...(["kimi", "copilot", "cursor", "grok"].includes(runtimeId) ? { extensionsIsolation: "inherited" as const } : {}), ...(manualRuntimeInstallation(runtimeId) ? { manualInstallation: manualRuntimeInstallation(runtimeId)! } : {}), ...(MANUAL_RUNTIME_INSTALL_URLS[runtimeId] ? { installUrl: MANUAL_RUNTIME_INSTALL_URLS[runtimeId] } : {}), installed: valid, registered, version,
           path: selected.path, fingerprint: valid ? selected.fingerprint : null, source: selected.source, loginSource,
           versionStatus: versionStatus(runtimeId, { version, fingerprint: inspected?.fingerprint ?? null,
             registered, requiresRetrust: !registered && Boolean(local || discovered) }),
-          generalAgentDriverAvailable: generalAgentAvailable(runtimeId, registered, loginSource), state: runtimeId === "kimi" && !valid && !isKimiCodeExecutable(selected.path, selected.version) ? "legacy_unsupported" : valid ? registered ? "local_registered" : "detected" : "integrity_failed", ...(runtimeId === "kimi" && !valid ? { compatibilityMessage: KIMI_LEGACY_MESSAGE } : {}) };
+          generalAgentDriverAvailable: available, ...use, state: legacy ? "legacy_unsupported" : valid ? registered ? "local_registered" : "detected" : "integrity_failed", ...(runtimeId === "kimi" && !valid ? { compatibilityMessage: KIMI_LEGACY_MESSAGE } : {}) };
       }
       const installed = value.entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
       let verified = false; if (installed && runtimeId !== "kimi") try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* tampering revokes use, never repair or fallback */ }
@@ -612,8 +728,10 @@ export class WorkspaceRuntimeInstaller {
       return { runtimeId, ...(probe && !installed ? { path: probe.path, source: probe.source } : {}), label: RUNTIME_LABELS[runtimeId], ...(["kimi", "copilot", "cursor", "grok"].includes(runtimeId) ? { extensionsIsolation: "inherited" as const } : {}), ...(manualRuntimeInstallation(runtimeId) ? { manualInstallation: manualRuntimeInstallation(runtimeId)! } : {}), ...(MANUAL_RUNTIME_INSTALL_URLS[runtimeId] ? { installUrl: MANUAL_RUNTIME_INSTALL_URLS[runtimeId] } : {}), installed: verified, registered: verified, version, fingerprint: verified ? installed!.executableSha256 : null,
         versionStatus: versionStatus(runtimeId, { version, fingerprint: verified ? installed!.executableSha256 : null,
           registered: verified, requiresRetrust: Boolean(installed && !verified) }),
-        loginSource, generalAgentDriverAvailable: generalAgentAvailable(runtimeId, verified, loginSource), state: installed && runtimeId === "kimi" ? "legacy_unsupported" : installed ? verified ? "registered" : "integrity_failed" : probe?.state ?? "not_installed", ...(installed && runtimeId === "kimi" ? { compatibilityMessage: KIMI_LEGACY_MESSAGE } : {}) };
-    }), operations: [...this.operations.values()].slice(-64).map(({ controller: _c, ...row }) => row) };
+        loginSource, generalAgentDriverAvailable: generalAgentAvailable(runtimeId, verified, loginSource),
+        ...this.downloadedUse(runtimeId, Boolean(installed), verified, generalAgentAvailable(runtimeId, verified, loginSource), installed ? undefined : probe?.state),
+        state: installed && runtimeId === "kimi" ? "legacy_unsupported" : installed ? verified ? "registered" : "integrity_failed" : probe?.state ?? "not_installed", ...(installed && runtimeId === "kimi" ? { compatibilityMessage: KIMI_LEGACY_MESSAGE } : {}) };
+    }), detection: this.detectionStatus(), operations: [...this.operations.values()].slice(-64).map(({ controller: _c, ...row }) => row) };
   }
   private resolveUnproxied(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
     if (runtimeId === "agy") return fail();
@@ -633,7 +751,8 @@ export class WorkspaceRuntimeInstaller {
     return { ...resolved, ...this.proxy.applyWithEndpoint(resolved.env) };
   }
   async close(): Promise<void> {
-    this.closed = true; this.proposals.clear(); for (const operation of this.active.values()) operation.controller.abort();
+    this.closed = true; this.proposals.clear();
+    if (this.scheduledDiscovery) { clearTimeout(this.scheduledDiscovery); this.scheduledDiscovery = undefined; } for (const operation of this.active.values()) operation.controller.abort();
     for (const controller of this.metadata) controller.abort();
     for (const controller of this.versionProbes) controller.abort();
     await Promise.all([...this.nativeResources].map(close => close())); this.nativeResources.clear();

@@ -18,9 +18,9 @@ export interface WorkspaceOperationCard {
 export const WORKSPACE_OPERATION_CARDS = [
   {
     "id": "runtime-login",
-    "title": "绑定运行时与登录来源",
-    "when": "绑定本机 CLI、登录无效、切换 host / isolated 来源",
-    "permission": "human-rpc; 模型只能指导；本机登记必须 approved:true，切换同事运行时须当前 configRevision 和 agentEpoch。",
+    "title": "选择引擎、首次确认与登录方式",
+    "when": "给同事换引擎、第一次用某个引擎、引擎更新后要确认、登录无效、切换 host / isolated 来源",
+    "permission": "human-rpc; 模型只能指导；首次使用或更新后的确认只能由人在「应用」时带上检测到的 fingerprint（旧入口 registerLocal 仍须 approved:true）；换引擎须当前 configRevision 和 agentEpoch。",
     "rpcs": [
       {
         "method": "workspace.runtime.registerLocal",
@@ -53,18 +53,44 @@ export const WORKSPACE_OPERATION_CARDS = [
           "configRevision",
           "agentEpoch"
         ]
+      },
+      {
+        "method": "workspace.runtime.formOptions",
+        "fields": [
+          "workspaceId",
+          "expectedGeneration",
+          "runtimeId"
+        ],
+        "optional": [
+          "agentId"
+        ]
+      },
+      {
+        "method": "workspace.agents.applyRuntimeForm",
+        "fields": [
+          "workspaceId",
+          "expectedGeneration",
+          "agentId",
+          "runtimeId",
+          "configRevision",
+          "agentEpoch"
+        ],
+        "optional": [
+          "confirm",
+          "model"
+        ]
       }
     ],
     "tools": [],
     "steps": [
-      "先让用户查看当前 Workspace 的运行时检测/登记状态与同事的运行时选择；只推荐界面实际提供的选项，不编造菜单路径或安装成功。",
-      "本机 CLI 登记绑定检测到的 fingerprint；人类确认后才登记。已有授权按现有流程继续，不把说明卡当作另一层确认。",
+      "先让用户看设置里的引擎列表：Hara 启动和点「重新检查」时会自动检测，每行显示可用、第一次用时确认、已更新待确认、检测中或不可用（原因）。只推荐界面实际提供的选项，不编造菜单路径或安装成功。",
+      "换引擎在同事设置的「引擎与模型」里改，只有一个「应用」。第一次用某个引擎或它更新后，应用时会弹一次确认，确认带上检测到的 fingerprint；没确认的引擎不会被执行。已有授权按现有流程继续，不把说明卡当作另一层确认。",
       "新登记的 Codex / Claude 默认使用 host 登录；OpenCode、Gemini、Kimi、Copilot、Cursor、Grok 只允许 host，Antigravity 仍不可绑定为通用同事。旧绑定看实际 loginSource，不从默认值推断；Pi 使用 Hara 连接且不另要 CLI 登录。",
       "host 复用当前操作系统账号已有登录；isolated 使用 Workspace 私有运行环境。不要复制凭据，不让用户把令牌或登录文件内容贴进对话。",
-      "Codex 的独立登录指引只适用于 isolated；host 下不要反复要求在 Hara 再登录。二进制 fingerprint 变化后重新检查和明确登记，不能自动信任。",
+      "Codex 的独立登录指引只适用于 isolated；host 下不要反复要求在 Hara 再登录。文件 fingerprint 变化（例如自动更新）后状态变为「已更新，用前确认」，必须由人确认，不能自动信任。",
       "Kimi、Copilot、Cursor、Grok 会带上本机个人扩展（插件／hooks／MCP），选择和登记时须显示该提示；其它已隔离的 runtime 保持隔离。Hara 插件目录默认关闭，空间启用与同事授权分别设置，不因读卡启动连接或自动授予工具。"
     ],
-    "evidence": "只有登记成功回执和最新运行时快照能证明绑定；检测到、已登记、已登录、可执行任务分别说明。"
+    "evidence": "只有应用或确认回执（applied 列表）和最新运行时快照能证明绑定；检测到、待确认、已确认、已登录、可执行任务分别说明。"
   },
   {
     "id": "model-effort",
@@ -99,7 +125,8 @@ export const WORKSPACE_OPERATION_CARDS = [
       "先区分同事的外部 CLI 运行时与内置连接：本卡的两个入口只适用于运行时模型；连接模型使用界面实际提供的连接选择。",
       "读取当前 runtimeId 的模型目录及 revision，使用真实 modelId；不要把品牌名称、旧缓存或其他运行时的选项当作当前目录。",
       "只有当前模型公布 supportedReasoningEfforts 时才能选其中的强度；缺字段或缓存列表不等于支持所有等级。不要硬编码 low / max 等为每个模型都支持。",
-      "提交选择使用当前 expectedRevision；过期就刷新。切换模型后重新检查强度，不沿用另一个模型的能力。"
+      "提交选择使用当前 expectedRevision；过期就刷新。切换模型后重新检查强度，不沿用另一个模型的能力。",
+      "强度有两个不传固定档的选项：「自动」(auto/null) 由 Hara 按每条消息选；「跟随引擎默认」(engine-default) 完全不传强度参数，由引擎自己决定。同一引擎的模型和强度是本空间共用的，改之前告诉用户还有哪些同事在用。"
     ],
     "evidence": "选择回执 selected:true 代表已保存选择；实际请求是否成功、用量和计费仍需本次运行证据。"
   },

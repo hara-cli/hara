@@ -6,7 +6,7 @@ import { OPTIONAL_RUNTIME_PACKAGES } from "./runtime-catalog.js";
 import type { OptionalRuntimeId } from "./runtime-install.js";
 
 export interface DetectedRuntime { runtimeId: OptionalRuntimeId; path: string; realPath: string; version: string; fingerprint: string; source: string }
-export interface RuntimeCommandControl { signal?: AbortSignal; onTimeout?: () => void }
+export interface RuntimeCommandControl { signal?: AbortSignal; onTimeout?: () => void; /** Default 16 KiB; capped at 256 KiB. */ maxBytes?: number }
 export interface CopilotVersionProbe extends Omit<DetectedRuntime, "runtimeId" | "version"> {
   /** Host-owned, single-use metadata retry; never grants registration or execution authority. */
   retry(signal: AbortSignal): Promise<DetectedRuntime | null>;
@@ -17,6 +17,9 @@ export interface DetectionOptions { home: string; probeHome?: string; shell?: st
   /** The owning installer already has a retry; rescan every other runtime normally. */
   copilotProbeInProgress?: boolean;
   onCopilotProbeTimeout?: (probe: CopilotVersionProbe) => void;
+  /** Keep finished runtimes when the round deadline passes. Without it the historical whole-round
+   * refusal applies. Unfinished runtimes are reported, never treated as confirmed absence. */
+  partial?: { roundMs?: number; onIncomplete?: (runtimeId: OptionalRuntimeId) => void };
   systemBins?: string[] }
 const ids: OptionalRuntimeId[] = ["opencode", "codex", "claude", "agy", "gemini", "kimi", "copilot", "cursor", "grok"];
 const commands = (id: OptionalRuntimeId): string[] => id === "cursor" ? ["cursor-agent", "agent"] : [id];
@@ -37,7 +40,8 @@ export function boundedRuntimeCommand(command: string, args: string[], env: Node
       if (timedOut) try { control.onTimeout?.(); } catch { /* An observer cannot retain a stopped child. */ }
       resolve(code === 0 && !stopped ? output : null);
     };
-    child.stdout.on("data", chunk => { if (output.length + chunk.length > 16_384) { stopped = true; kill(); } else output += chunk.toString(); });
+    const limit = Math.min(256 * 1024, Math.max(1024, control.maxBytes ?? 16_384));
+    child.stdout.on("data", chunk => { if (output.length + chunk.length > limit) { stopped = true; kill(); } else output += chunk.toString(); });
     child.once("error", () => finish(null));
     child.once("close", finish);
     control.signal?.addEventListener("abort", abort, { once: true });
@@ -75,6 +79,17 @@ export function isKimiCodeExecutable(path: string, version: string): boolean {
       && realpathSync(join(root, manifest.bin.kimi)) === real;
   } catch { return false; }
 }
+/** The same isolated environment as the version probe: the probe Home, a fixed PATH, no account login.
+ * Used for metadata-only commands (`--version`, `--help`) on a runtime the user has not confirmed. */
+export function runtimeProbeEnvironment(options: Pick<DetectionOptions, "home" | "probeHome" | "path">, command: string, extraBins: readonly string[] = []): NodeJS.ProcessEnv {
+  const probeHome = options.probeHome ?? options.home, path = options.path ?? "/usr/bin:/bin:/usr/sbin:/sbin";
+  if (!safePath(probeHome) || !safePath(command)) throw new Error("Invalid isolated runtime probe");
+  return { HOME: probeHome, USERPROFILE: probeHome, DISABLE_AUTOUPDATER: "1", DISABLE_TELEMETRY: "1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    OPENCODE_DISABLE_AUTOUPDATE: "true", OPENCODE_DISABLE_MODELS_FETCH: "true", HARA_UPDATE_CHECK: "0", NO_COLOR: "1",
+    GEMINI_CLI_HOME: probeHome, KIMI_SHARE_DIR: join(probeHome, ".kimi"), KIMI_CODE_HOME: join(probeHome, ".kimi-code"),
+    XDG_CONFIG_HOME: join(probeHome, ".config"), XDG_CACHE_HOME: join(probeHome, ".cache"), XDG_DATA_HOME: join(probeHome, ".local/share"),
+    PATH: [dirname(command), ...extraBins, path].join(":") };
+}
 export const KIMI_LEGACY_MESSAGE = "Legacy kimi-cli is no longer maintained; install official @moonshot-ai/kimi-code (旧版已停止维护，请换新版)";
 /** Explicit local metadata check only. Never invokes npx, install, update, fetch or an installer. */
 export async function detectInstalledRuntimes(options: DetectionOptions): Promise<DetectedRuntime[]> {
@@ -82,7 +97,7 @@ export async function detectInstalledRuntimes(options: DetectionOptions): Promis
   const probeHome = options.probeHome ?? options.home;
   if (!safePath(probeHome)) throw new Error("Invalid isolated runtime version-probe Home");
   const run = options.run ?? boundedRuntimeCommand, timeout = Math.min(3000, Math.max(25, options.timeoutMs ?? 1200));
-  const deadline = Date.now() + 10000;
+  const deadline = Date.now() + (options.partial ? Math.min(90_000, Math.max(1000, options.partial.roundMs ?? 30_000)) : 10000);
   const path = options.path ?? "/usr/bin:/bin:/usr/sbin:/sbin";
   const env: NodeJS.ProcessEnv = { HOME: options.home, USERPROFILE: options.home, PATH: path,
     DISABLE_AUTOUPDATER: "1", DISABLE_TELEMETRY: "1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
@@ -115,12 +130,13 @@ export async function detectInstalledRuntimes(options: DetectionOptions): Promis
     let legacy: DetectedRuntime | null = null;
     if (runtimeId === "copilot" && options.copilotProbeInProgress) return null;
     for (const candidate of candidates.get(runtimeId)!) {
-      if (Date.now() >= deadline) throw new Error("Local runtime discovery deadline reached; absence is not confirmed");
+      if (Date.now() >= deadline) {
+        if (!options.partial) throw new Error("Local runtime discovery deadline reached; absence is not confirmed");
+        try { options.partial.onIncomplete?.(runtimeId); } catch { /* Observer failure cannot widen a result. */ }
+        return null;
+      }
       const inspected = inspectLocalRuntime(candidate.path); if (!inspected) continue;
-      const versionEnv = { ...env, HOME: probeHome, USERPROFILE: probeHome,
-        GEMINI_CLI_HOME: probeHome, KIMI_SHARE_DIR: join(probeHome, ".kimi"), KIMI_CODE_HOME: join(probeHome, ".kimi-code"),
-        XDG_CONFIG_HOME: join(probeHome,".config"), XDG_CACHE_HOME: join(probeHome,".cache"), XDG_DATA_HOME: join(probeHome,".local/share"),
-        PATH: `${dirname(candidate.path)}:${bins.map(b => b.path).join(":")}:${path}` };
+      const versionEnv = runtimeProbeEnvironment({ home: options.home, probeHome, path }, candidate.path, bins.map(b => b.path));
       const verified = (output: string | null): DetectedRuntime | null => {
         if (runtimeId === "cursor" && candidate.path.split(/[\\/]/).at(-1) === "agent" && !/cursor/i.test(output ?? "")) return null;
         const version = output?.match(/\b\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?\b/)?.[0];
