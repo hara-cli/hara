@@ -131,7 +131,7 @@ async function liveModels(runtimeId: "codex" | "opencode" | "cursor", runtimes: 
   };
   if (runtimeId === "codex") {
     try {
-      const result = await protectedInventory(storage, runtimes, "codex", { command, env, loginSource }, ["app-server", "--stdio"], async launch => {
+      const result = await protectedInventory(storage, runtimes, "codex", { command, env, loginSource, proxyUrl }, ["app-server", "--stdio"], async launch => {
         const client = JsonlRpcClient.start({ ...launch, appServerArgs: launch.args, timeoutMs: 15000, maxOutputBytes: 4 * 1024 * 1024 });
         try {
           await client.call("initialize", { clientInfo: { name: "hara", title: "Hara", version: HARA_RUNTIME_VERSION }, capabilities: { experimentalApi: false } });
@@ -147,7 +147,7 @@ async function liveModels(runtimeId: "codex" | "opencode" | "cursor", runtimes: 
   const inventoryEnv = { ...env, NO_COLOR: "1", OPENCODE_DISABLE_AUTOUPDATE: "true", OPENCODE_DISABLE_MODELS_FETCH: "true",
     ...(runtimeId === "opencode" ? { OPENCODE_PURE: "1", OPENCODE_DISABLE_DEFAULT_PLUGINS: "1", OPENCODE_DISABLE_PROJECT_CONFIG: "1",
       OPENCODE_CONFIG_CONTENT: JSON.stringify({ plugin: [], mcp: {}, permission: { "*": "deny" } }) } : {}) };
-  const result = await protectedInventory(storage, runtimes, runtimeId, { command, env: inventoryEnv, loginSource },
+  const result = await protectedInventory(storage, runtimes, runtimeId, { command, env: inventoryEnv, loginSource, proxyUrl },
     runtimeId === "codex" ? ["debug", "models"] : ["models"], launch => runExternalCommandCapture(launch, launch.args,
       { cwd: env.HOME, proxyUrl, waitForClose: true, timeoutMs: 15000, maxOutputBytes: 4 * 1024 * 1024 }));
   if (result.errorCode === "runtime_proxy_failed") throw new Error(result.errorCode);
