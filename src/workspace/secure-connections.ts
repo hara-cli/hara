@@ -14,7 +14,7 @@ export interface LegacyConnectionSeed { id: string; label: string; provider: "op
 function checked(value: unknown) {
   if (!plain(value) || !text(value.label, 80) || !text(value.defaultModel) || !text(value.baseURL, 4096) || !["openai", "anthropic"].includes(String(value.provider))
     || value.defaultReasoning !== undefined && value.defaultReasoning !== null
-      && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value.defaultReasoning))) throw new Error("Invalid model connection metadata");
+      && !["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value.defaultReasoning))) throw new Error("Invalid model connection metadata");
   let url: URL; try { url = new URL(value.baseURL); } catch { throw new Error("Invalid model endpoint"); }
   if (url.username || url.password || url.search || url.hash || !["http:", "https:"].includes(url.protocol) || url.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) throw new Error("Unsafe model endpoint");
   return { label: value.label, provider: value.provider as "openai" | "anthropic", baseURL: value.baseURL, defaultModel: value.defaultModel,

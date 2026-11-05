@@ -7,12 +7,9 @@ import { defaultEffortForLevels } from "../dist/workspace/default-effort.js";
 import { codexHostToolOverrides } from "../dist/agent-runtime/codex-host-config.js";
 import { registeredCliArgs } from "../dist/agent-runtime/registered-cli.js";
 
-test("new strength chooses medium or the nearest advertised lower level", () => {
-  assert.equal(defaultEffortForLevels(["low", "medium", "high", "max"]), "medium");
-  assert.equal(defaultEffortForLevels(["off", "low", "high"]), "low");
-  assert.equal(defaultEffortForLevels(["off", "high"]), "off");
-  assert.equal(defaultEffortForLevels(["high", "max"]), null);
-  assert.equal(defaultEffortForLevels(undefined), null);
+test("a new setting stays automatic until the Host has an objective", () => {
+  for (const levels of [["low", "medium", "high", "max"], ["off", "low", "high"], ["off", "high"], ["high", "max"], undefined])
+    assert.equal(defaultEffortForLevels(levels), null);
 });
 
 test("host Codex launch disables named user MCPs and plugins while preserving the Hara bridge", () => {

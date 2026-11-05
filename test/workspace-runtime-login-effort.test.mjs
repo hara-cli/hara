@@ -252,7 +252,11 @@ test("effort selection accepts only a level the model published and persists it"
   } finally { await f.runtimes.close(); }
 });
 
-test("the main Hara bot uses the same detect/register/bind/model/effort path as a colleague", async () => {
+for (const scenario of [
+  { configured: "xhigh", message: "Reply with a short greeting.", actual: "xhigh", state: "blocked" },
+  { configured: "auto", message: "hello", actual: "low", state: "completed" },
+  { configured: null, message: "Investigate failing tests", actual: "medium", state: "blocked" },
+]) test(`main-bot native wire freezes ${scenario.configured ?? "unset"} as ${scenario.actual}`, async () => {
   const data = root(), host = root(), command = join(host, ".codex/tmp/bin/codex"); binary(command);
   writeFakeCodex(command, { mode: "reply", recordHome: true, inventory: JSON.parse(fs.readFileSync(`${command}.appmodels`, "utf8")) });
   fs.mkdirSync(join(host, ".codex"), { recursive: true });
@@ -300,9 +304,11 @@ test("the main Hara bot uses the same detect/register/bind/model/effort path as 
     // Registering with an unknown login source is refused.
     await assert.rejects(request("workspace.runtime.registerLocal", { ...scope, runtimeId: "codex", fingerprint: codex.fingerprint, approved: true, loginSource: "ambient" }), /Invalid runtime login source/);
     await assert.rejects(request("workspace.runtime.registerLocal", { ...scope, runtimeId: "codex", fingerprint: codex.fingerprint, approved: false }), /Explicit local runtime approval/);
+    if (scenario.configured !== "xhigh") await request("workspace.runtime.selectModel", { ...scope, runtimeId: "codex",
+      modelId: "gpt-5.6-sol", expectedRevision: 2, effort: scenario.configured });
     // Exercise main-bot RPC -> local-host -> governed runtime -> registered native app-server.
     const accepted = await request("workspace.session.send", { ...scope, agentId: main.agentId,
-      message: "Reply with a short greeting.", requestId: randomUUID(), source: "ui" });
+      message: scenario.message, requestId: randomUUID(), source: "ui" });
     assert.equal(typeof accepted.runId, "string");
     let finished;
     for (let attempt = 0; attempt < 100; attempt++) {
@@ -310,15 +316,17 @@ test("the main Hara bot uses the same detect/register/bind/model/effort path as 
       if (["completed", "blocked"].includes(current.conversation.state)) { finished = current; break; }
       await new Promise(resolve => setTimeout(resolve, 100));
     }
-    assert.equal(finished?.conversation.state, "blocked", "registered Codex returns an unverified greeting without completing the task");
-    assert.equal(finished?.conversation.taskState, "paused");
+    assert.equal(finished?.conversation.state, scenario.state);
+    const stage = finished.conversation.runtimeStages.at(-1);
+    assert.equal(stage.runtime.effort, scenario.actual, "hidden timing details report the actual native effort");
+    assert.equal((await request("workspace.runtime.listModels", { ...scope, runtimeId: "codex" })).selectedEffort, scenario.configured);
     assert.deepEqual(fs.readFileSync(`${command}.home`, "utf8").trim().split("\n"), [host, "login=present"]);
     assert.equal(fs.readFileSync(`${command}.codexhome`, "utf8").trim(), "unset");
     const requests = fs.readFileSync(`${command}.rpc.jsonl`, "utf8").trim().split("\n").map(line => JSON.parse(line));
     const thread = requests.find(row => row.method === "thread/start"), turn = requests.find(row => row.method === "turn/start");
     assert.equal(thread.params.model, "gpt-5.6-sol", "selected model reaches the native thread");
-    assert.equal(thread.params.config.model_reasoning_effort, "xhigh", "selected effort reaches the native thread");
-    assert.equal(turn.params.model, "gpt-5.6-sol"); assert.equal(turn.params.effort, "xhigh");
+    assert.equal(thread.params.config.model_reasoning_effort, scenario.actual, "selected effort reaches the native thread");
+    assert.equal(turn.params.model, "gpt-5.6-sol"); assert.equal(turn.params.effort, scenario.actual);
     assert.equal(thread.params.sandbox, "danger-full-access"); assert.equal(thread.params.approvalPolicy, "never");
   } finally { const closed = once(socket, "close"); socket.close(); await closed; await handle.close(); }
 });

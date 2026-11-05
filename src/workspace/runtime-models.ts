@@ -13,7 +13,7 @@ import { inspectWorkspaceResourceFile, sameWorkspaceResourceBinding, workspaceSt
   type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { OPTIONAL_RUNTIMES } from "./runtime-catalog.js";
 import { optionalRuntimeId, type OptionalRuntimeId, type WorkspaceRuntimeInstaller } from "./runtime-install.js";
-import { defaultEffortForLevels } from "./default-effort.js";
+import { defaultEffortForLevels, resolveReasoningEffort } from "./default-effort.js";
 
 export interface RuntimeModel { id: string; label: string; description?: string; recommended?: boolean;
   /** Reasoning levels this exact model advertised on the live inventory. Absent/empty means the
@@ -208,7 +208,7 @@ function codexEfforts(value: unknown): { supportedReasoningEfforts?: string[]; d
 export class WorkspaceRuntimeModels {
   private readonly state: WorkspaceJsonState<RuntimeModelsState>;
   private readonly pending = new Map<string, Promise<RuntimeModel[]>>();
-  private readonly launchDefaults = new Map<string, Promise<{ modelId: string | null; effort: string | null }>>();
+  private readonly launchDefaults = new Map<string, Promise<{ modelId: string | null; levels?: string[] }>>();
   constructor(private readonly storage: WorkspaceResourceStorage, private readonly runtimes: WorkspaceRuntimeInstaller,
     private readonly expandedMetadata: ExpandedMetadataCapture = captureExpandedMetadata) {
     this.state = new WorkspaceJsonState(storage, "runtime-models-v1.json", value => {
@@ -299,12 +299,13 @@ export class WorkspaceRuntimeModels {
     const row = this.state.read().selections.find(row => row.runtimeId === runtimeId);
     return { modelId: row?.selectedModelId ?? null, effort: row?.selectedEffort ?? null };
   }
-  /** New/legacy unchosen strength gets a live-model-backed default at launch. Explicit saved
-   * string or null is never changed. The returned choice is not persisted behind the user's back. */
-  async launchSelection(runtimeId: OptionalRuntimeId): Promise<{ modelId: string | null; effort: string | null }> {
+  /** Freeze this request's actual effort. Only inventory is cached; fixed settings pass through.
+   * Missing/null/auto settings are classified locally and never persisted as a fixed level. */
+  async launchSelection(runtimeId: OptionalRuntimeId, objective = ""): Promise<{ modelId: string | null; effort: string | null }> {
     this.bound(runtimeId);
     const row = this.state.read().selections.find(value => value.runtimeId === runtimeId);
-    if (row && Object.hasOwn(row, "selectedEffort")) return this.selection(runtimeId);
+    if (row?.selectedEffort != null && row.selectedEffort !== "auto")
+      return { modelId: row.selectedModelId, effort: row.selectedEffort };
     // The first lookup needs the live inventory; repeating app-server model/list on every chat
     // would add a second native process to the latency path. Reuse only for this bound runtime
     // identity and state revision. A failed lookup is retried on the next attempt.
@@ -314,14 +315,16 @@ export class WorkspaceRuntimeModels {
     if (!choice) {
       choice = this.list(runtimeId).then(inventory => {
         const model = inventory.models.find(value => value.id === row?.selectedModelId)
-          ?? (!row ? inventory.models.find(value => value.recommended) : undefined);
+          ?? (row?.selectedModelId == null ? inventory.models.find(value => value.recommended) : undefined);
         return { modelId: row?.selectedModelId ?? model?.id ?? null,
-          effort: runtimeId === "opencode" ? null : defaultEffortForLevels(model?.supportedReasoningEfforts) };
+          ...(runtimeId !== "opencode" && model?.supportedReasoningEfforts ? { levels: model.supportedReasoningEfforts } : {}) };
       }).catch(error => { this.launchDefaults.delete(key); throw error; });
       if (this.launchDefaults.size >= 8) this.launchDefaults.clear();
       this.launchDefaults.set(key, choice);
     }
-    return choice;
+    const selected = await choice;
+    this.bound(runtimeId);
+    return { modelId: selected.modelId, effort: resolveReasoningEffort(row?.selectedEffort, selected.levels, objective) };
   }
   selected(runtimeId: OptionalRuntimeId): string | null { return this.selection(runtimeId).modelId; }
   selectedEffort(runtimeId: OptionalRuntimeId): string | null { return this.selection(runtimeId).effort; }
@@ -364,7 +367,7 @@ export class WorkspaceRuntimeModels {
     const models = runtimeId === "codex" || runtimeId === "opencode" || runtimeId === "cursor" ? await this.live(runtimeId) : await this.catalogModels(runtimeId);
     const model = models.find(row => row.id === modelId);
     if (!model) throw new Error("Invalid runtime modelId");
-    if (effort !== undefined && effort !== null) {
+    if (effort !== undefined && effort !== null && effort !== "auto") {
       const declared = model.supportedReasoningEfforts ?? [];
       if (!declared.length) throw new Error("This model does not report reasoning effort; no level was selected");
       if (!declared.includes(effort as string)) throw new Error("Invalid runtime effort");

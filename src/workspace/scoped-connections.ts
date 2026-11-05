@@ -13,7 +13,7 @@ export interface ScopedConnection {
   apiKey?: string;
   credentialFile?: WorkspaceFileCredential;
   defaultModel: string;
-  defaultReasoning?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null;
+  defaultReasoning?: "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null;
   credentialGeneration: string;
   revision: number;
   status: "active" | "revoked";
@@ -45,7 +45,7 @@ function input(value: unknown): ScopedConnectionInput {
     || !text(value.defaultModel) || !text(value.baseURL, 4096)
     || (value.provider !== "openai" && value.provider !== "anthropic")
     || value.defaultReasoning !== undefined && value.defaultReasoning !== null
-      && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value.defaultReasoning))) return fail();
+      && !["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value.defaultReasoning))) return fail();
   let url: URL;
   try { url = new URL(value.baseURL); } catch { return fail(); }
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) return fail();
@@ -56,7 +56,7 @@ export function isScopedRunConnection(value: unknown): value is ScopedRunConnect
   return plain(value) && exact(value, ["connectionId", "credentialGeneration", "connectionRevision", "model", "reasoning"])
     && isConnectionId(value.connectionId) && isCredentialGeneration(value.credentialGeneration)
     && positive(value.connectionRevision) && text(value.model) && (value.reasoning === null
-      || ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value.reasoning)));
+      || ["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value.reasoning)));
 }
 
 /** The v2 connection and its credential generation are one atomic, owner-only Workspace snapshot. */

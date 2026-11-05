@@ -52,9 +52,19 @@ export function answerQuestionObjective(objective: string): boolean {
 }
 
 /** User wording supplies authority; the first model response supplies only a bounded execution hint. */
+export function taskObjectiveIntent(objective: string): TaskBriefInput["intent"] {
+  return CHANGE.test(objective) ? "change" : answerQuestionObjective(objective) ? "answer" : "investigate";
+}
+
+/** The same Host classification, bounded to one short outcome for automatic reasoning. */
+export function simpleAnswerObjective(objective: string): boolean {
+  return taskObjectiveIntent(objective) === "answer" && (conversationalAnswerObjective(objective)
+    || requestedReplyText(objective) !== null || objective.trim().length <= 400 && !MULTI_OUTCOME.test(objective));
+}
+
 export function engineTaskBrief(task: TaskExecution, firstReply: { text: string; toolUses: readonly { name: string }[] }): TaskBriefInput {
   const objective = task.objective.trim();
-  const intent = CHANGE.test(objective) ? "change" : answerQuestionObjective(objective) ? "answer" : "investigate";
+  const intent = taskObjectiveIntent(objective);
   const firstTool = firstReply.toolUses.find(item => item.name !== "task_intake")?.name;
   return {
     intent,
