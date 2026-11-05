@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { constants, accessSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { spawn } from "node:child_process";
+import { OPTIONAL_RUNTIME_PACKAGES } from "./runtime-catalog.js";
 import type { OptionalRuntimeId } from "./runtime-install.js";
 
 export interface DetectedRuntime { runtimeId: OptionalRuntimeId; path: string; realPath: string; version: string; fingerprint: string; source: string }
@@ -42,6 +43,20 @@ export function inspectLocalRuntime(path: string, force = false): { realPath: st
     if (fingerprints.size > 128) fingerprints.clear(); fingerprints.set(path, { identity, value }); return value;
   } catch { return null; }
 }
+/** Published Node CLI identity. A legacy Python shim or an unmarked cached registration never
+ * gains the replacement adapter merely because both commands are named `kimi`. No user config read. */
+export function isKimiCodeExecutable(path: string, version: string): boolean {
+  try {
+    const real = realpathSync(path), root = dirname(dirname(real)), manifestPath = join(root, "package.json");
+    const stat = lstatSync(manifestPath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024 || stat.nlink !== 1) return false;
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    return manifest.name === OPTIONAL_RUNTIME_PACKAGES.kimi && manifest.version === version
+      && typeof manifest.bin?.kimi === "string" && !isAbsolute(manifest.bin.kimi)
+      && realpathSync(join(root, manifest.bin.kimi)) === real;
+  } catch { return false; }
+}
+export const KIMI_LEGACY_MESSAGE = "Legacy kimi-cli is no longer maintained; install official @moonshot-ai/kimi-code (旧版已停止维护，请换新版)";
 /** Explicit local metadata check only. Never invokes npx, install, update, fetch or an installer. */
 export async function detectInstalledRuntimes(options: DetectionOptions): Promise<DetectedRuntime[]> {
   if (!safePath(options.home)) throw new Error("Invalid explicit runtime discovery Home");
@@ -78,6 +93,7 @@ export async function detectInstalledRuntimes(options: DetectionOptions): Promis
   // Inherited PATH is still useful on CLI/Windows hosts, but never outranks explicit login/nvm sources.
   for (const bin of path.split(":").filter(safePath)) for (const id of ids) for (const command of commands(id)) add(id, join(bin, command), "inherited-path");
   return (await Promise.all(ids.map(async runtimeId => {
+    let legacy: DetectedRuntime | null = null;
     for (const candidate of candidates.get(runtimeId)!) {
       if (Date.now() >= deadline) throw new Error("Local runtime discovery deadline reached; absence is not confirmed");
       const inspected = inspectLocalRuntime(candidate.path); if (!inspected) continue;
@@ -88,9 +104,12 @@ export async function detectInstalledRuntimes(options: DetectionOptions): Promis
       if (runtimeId === "cursor" && candidate.path.split(/[\\/]/).at(-1) === "agent" && !/cursor/i.test(output ?? "")) continue;
       const version = output?.match(/\b\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?\b/)?.[0];
       const after = inspectLocalRuntime(candidate.path);
-      if (version && after && after.fingerprint === inspected.fingerprint && after.realPath === inspected.realPath)
-        return { runtimeId, ...candidate, ...inspected, version };
+      if (version && after && after.fingerprint === inspected.fingerprint && after.realPath === inspected.realPath) {
+        const row = { runtimeId, ...candidate, ...inspected, version };
+        if (runtimeId === "kimi" && !isKimiCodeExecutable(candidate.path, version)) { legacy ??= row; continue; }
+        return row;
+      }
     }
-    return null;
+    return legacy;
   }))).filter((row): row is DetectedRuntime => row !== null);
 }

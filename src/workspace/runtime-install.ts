@@ -10,7 +10,7 @@ import { HOST_LOGIN_ONLY_RUNTIMES, MANUAL_RUNTIME_INSTALL_URLS, OPTIONAL_RUNTIME
 import { runtimeArchiveMember } from "./runtime-archive.js";
 import { WorkspaceRuntimeProxy } from "./runtime-proxy.js";
 import { validOpenCodeNativeHeader } from "../coding/bundled-opencode.js";
-import { detectInstalledRuntimes, inspectLocalRuntime, type DetectionOptions, type DetectedRuntime } from "./runtime-detect.js";
+import { detectInstalledRuntimes, inspectLocalRuntime, isKimiCodeExecutable, KIMI_LEGACY_MESSAGE, type DetectionOptions, type DetectedRuntime } from "./runtime-detect.js";
 import { WorkspaceRuntimeVersionStore, projectRuntimeVersionStatus, type RuntimeVersionCurrent } from "./runtime-version-history.js";
 
 export type OptionalRuntimeId = "opencode" | "codex" | "claude" | "agy" | "gemini" | "kimi" | "copilot" | "cursor" | "grok";
@@ -167,6 +167,7 @@ export class WorkspaceRuntimeInstaller {
       ?? this.locals.read().entries.find(row => row.runtimeId === runtimeId && row.fingerprint === fingerprint);
     const current = found && inspectLocalRuntime(found.path, true);
     if (!found || !current || current.realPath !== found.realPath || current.fingerprint !== fingerprint) return fail();
+    if (runtimeId === "kimi" && !isKimiCodeExecutable(found.path, found.version)) throw new Error(KIMI_LEGACY_MESSAGE);
     if (!isLoginSource(loginSource) || runtimeId === "agy" && loginSource !== "isolated"
       || HOST_LOGIN_ONLY_RUNTIMES.includes(runtimeId) && loginSource !== "host") return fail();
     if (loginSource === "isolated" && runtimeId === "codex") this.privateHome(runtimeId);
@@ -246,6 +247,7 @@ export class WorkspaceRuntimeInstaller {
   private resolveLocalUnproxied(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
     const row = this.locals.read().entries.find(row => row.runtimeId === runtimeId), checked = row && inspectLocalRuntime(row.path, true);
     if (!row || !checked || checked.realPath !== row.realPath || checked.fingerprint !== row.fingerprint) return fail();
+    if (runtimeId === "kimi" && !isKimiCodeExecutable(row.path, row.version)) throw new Error(KIMI_LEGACY_MESSAGE);
     if (runtimeId === "agy") return { command: row.path, env: { HOME: this.options.discovery?.home ?? userInfo().homedir,
       USERPROFILE: this.options.discovery?.home ?? userInfo().homedir, PATH: `${dirname(row.path)}:${this.options.discovery?.path ?? process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin"}`,
       DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" }, loginSource: "isolated" };
@@ -287,11 +289,12 @@ export class WorkspaceRuntimeInstaller {
     const current = this.resolveBoundUnproxied(runtimeId);
     if (current.command !== launched.command || current.loginSource !== launched.loginSource || current.env.HOME !== launched.env.HOME
       || current.env.CODEX_HOME !== launched.env.CODEX_HOME || current.env.CLAUDE_CONFIG_DIR !== launched.env.CLAUDE_CONFIG_DIR
+      || current.env.KIMI_CODE_HOME !== launched.env.KIMI_CODE_HOME
       || current.env.COPILOT_HOME !== launched.env.COPILOT_HOME || current.env.CURSOR_CONFIG_DIR !== launched.env.CURSOR_CONFIG_DIR || current.env.GROK_HOME !== launched.env.GROK_HOME) return fail();
     const accountHome = this.accountHome(), home = current.env.HOME; if (!home) return fail();
     const runtimeHome = runtimeId === "claude" ? current.env.CLAUDE_CONFIG_DIR ?? join(home, ".claude")
       : runtimeId === "codex" ? current.env.CODEX_HOME ?? join(home, ".codex")
-      : runtimeId === "gemini" ? join(home, ".gemini") : runtimeId === "kimi" ? join(home, ".kimi")
+      : runtimeId === "gemini" ? join(home, ".gemini") : runtimeId === "kimi" ? join(home, ".kimi-code")
       : runtimeId === "opencode" ? join(current.env.XDG_DATA_HOME ?? join(home, ".local/share"), "opencode") : join(home, "." + runtimeId);
     return Object.freeze({ accountHome, runtimeHome, protectedStateRoots: Object.freeze([this.storage.runtimeProtectedStateRoot()]) });
   }
@@ -528,19 +531,20 @@ export class WorkspaceRuntimeInstaller {
     const detected = this.detected.find(row => row.runtimeId === runtimeId);
     if (local || detected) {
       const checked = local && inspectLocalRuntime(local.path);
-      const registered = Boolean(local && checked && checked.realPath === local.realPath && checked.fingerprint === local.fingerprint);
-      const discovered = !registered && detected && inspectLocalRuntime(detected.path);
+      const registered = Boolean(local && (runtimeId !== "kimi" || isKimiCodeExecutable(local.path, local.version)) && checked && checked.realPath === local.realPath && checked.fingerprint === local.fingerprint);
+      const discovered = !registered && detected && (runtimeId !== "kimi" || isKimiCodeExecutable(detected.path, detected.version)) && inspectLocalRuntime(detected.path);
       const valid = registered || Boolean(detected && discovered && discovered.realPath === detected.realPath && discovered.fingerprint === detected.fingerprint);
-      if (!registered) return { state: valid ? "detected" : "integrity_failed", generalAgentDriverAvailable: false };
+      const selected = registered ? local! : discovered ? detected! : (local ?? detected)!;
+      if (!registered) return { state: runtimeId === "kimi" && !valid && !isKimiCodeExecutable(selected.path, selected.version) ? "legacy_unsupported" : valid ? "detected" : "integrity_failed", generalAgentDriverAvailable: false };
       const loginSource = locals.loginSources.find(row => row.runtimeId === runtimeId)?.source
         ?? this.state.read().loginSources.find(row => row.runtimeId === runtimeId)?.source ?? "isolated";
       return { state: "local_registered", generalAgentDriverAvailable: generalAgentAvailable(runtimeId, true, loginSource) };
     }
     const value = this.state.read(), installed = value.entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
-    let verified = false; if (installed) try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* fail closed, no fallback */ }
+    let verified = false; if (installed && runtimeId !== "kimi") try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* fail closed, no fallback */ }
     const loginSource = locals.loginSources.find(row => row.runtimeId === runtimeId)?.source
       ?? value.loginSources.find(row => row.runtimeId === runtimeId)?.source ?? "isolated";
-    return { state: installed ? verified ? "registered" : "integrity_failed" : "not_installed",
+    return { state: installed && runtimeId === "kimi" ? "legacy_unsupported" : installed ? verified ? "registered" : "integrity_failed" : "not_installed",
       generalAgentDriverAvailable: generalAgentAvailable(runtimeId, verified, loginSource) };
   }
   list() {
@@ -553,9 +557,9 @@ export class WorkspaceRuntimeInstaller {
       const loginSource = loginSources.find(row => row.runtimeId === runtimeId)?.source ?? "isolated";
       if (local || detected) {
         const localCheck = local && inspectLocalRuntime(local.path);
-        const registered = Boolean(local && localCheck && localCheck.realPath === local.realPath && localCheck.fingerprint === local.fingerprint);
+        const registered = Boolean(local && (runtimeId !== "kimi" || isKimiCodeExecutable(local.path, local.version)) && localCheck && localCheck.realPath === local.realPath && localCheck.fingerprint === local.fingerprint);
         const detectedCheck = detected && inspectLocalRuntime(detected.path);
-        const discovered = Boolean(detected && detectedCheck && detectedCheck.realPath === detected.realPath && detectedCheck.fingerprint === detected.fingerprint);
+        const discovered = Boolean(detected && (runtimeId !== "kimi" || isKimiCodeExecutable(detected.path, detected.version)) && detectedCheck && detectedCheck.realPath === detected.realPath && detectedCheck.fingerprint === detected.fingerprint);
         // A newly discovered replacement may be explained/confirmed, but the old binding still
         // refuses it until registerLocal receives a new explicit human confirmation.
         const selected = registered ? local! : discovered ? detected! : local ?? detected!;
@@ -565,19 +569,20 @@ export class WorkspaceRuntimeInstaller {
           path: selected.path, fingerprint: valid ? selected.fingerprint : null, source: selected.source, loginSource,
           versionStatus: versionStatus(runtimeId, { version, fingerprint: inspected?.fingerprint ?? null,
             registered, requiresRetrust: !registered && Boolean(local || discovered) }),
-          generalAgentDriverAvailable: generalAgentAvailable(runtimeId, registered, loginSource), state: valid ? registered ? "local_registered" : "detected" : "integrity_failed" };
+          generalAgentDriverAvailable: generalAgentAvailable(runtimeId, registered, loginSource), state: runtimeId === "kimi" && !valid && !isKimiCodeExecutable(selected.path, selected.version) ? "legacy_unsupported" : valid ? registered ? "local_registered" : "detected" : "integrity_failed", ...(runtimeId === "kimi" && !valid ? { compatibilityMessage: KIMI_LEGACY_MESSAGE } : {}) };
       }
       const installed = value.entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
-      let verified = false; if (installed) try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* tampering revokes use, never repair or fallback */ }
+      let verified = false; if (installed && runtimeId !== "kimi") try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* tampering revokes use, never repair or fallback */ }
       const version = verified ? installed!.artifact.version : null;
       return { runtimeId, label: RUNTIME_LABELS[runtimeId], ...(["kimi", "copilot", "cursor", "grok"].includes(runtimeId) ? { extensionsIsolation: "inherited" as const } : {}), ...(manualRuntimeInstallation(runtimeId) ? { manualInstallation: manualRuntimeInstallation(runtimeId)! } : {}), ...(MANUAL_RUNTIME_INSTALL_URLS[runtimeId] ? { installUrl: MANUAL_RUNTIME_INSTALL_URLS[runtimeId] } : {}), installed: verified, registered: verified, version, fingerprint: verified ? installed!.executableSha256 : null,
         versionStatus: versionStatus(runtimeId, { version, fingerprint: verified ? installed!.executableSha256 : null,
           registered: verified, requiresRetrust: Boolean(installed && !verified) }),
-        loginSource, generalAgentDriverAvailable: generalAgentAvailable(runtimeId, verified, loginSource), state: installed ? verified ? "registered" : "integrity_failed" : "not_installed" };
+        loginSource, generalAgentDriverAvailable: generalAgentAvailable(runtimeId, verified, loginSource), state: installed && runtimeId === "kimi" ? "legacy_unsupported" : installed ? verified ? "registered" : "integrity_failed" : "not_installed", ...(installed && runtimeId === "kimi" ? { compatibilityMessage: KIMI_LEGACY_MESSAGE } : {}) };
     }), operations: [...this.operations.values()].slice(-64).map(({ controller: _c, ...row }) => row) };
   }
   private resolveUnproxied(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
     if (runtimeId === "agy") return fail();
+    if (runtimeId === "kimi") throw new Error(KIMI_LEGACY_MESSAGE);
     const row = this.state.read().entries.find(row => row.artifact.runtimeId === runtimeId && row.artifact.version === version && row.artifact.sha256 === artifactSha256);
     if (!row) return fail(); const checked = this.inspect(row.artifact, row); if (!checked) return fail();
     const loginSource = this.loginSource(runtimeId);

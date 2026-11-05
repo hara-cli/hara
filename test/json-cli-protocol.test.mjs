@@ -32,11 +32,11 @@ test("Kimi print messages preserve final assistant text and do not execute nativ
 });
 test("protocol bounds and incompatible CLI dialects fail closed", () => {
   for (const runtime of ["gemini", "kimi"]) {
-    const help = jsonCliRequiredFlags(runtime).join(" \n"); assert.equal(jsonCliHelpCompatible(runtime, help), true);
-    assert.equal(jsonCliHelpCompatible(runtime, help.replace("--yolo", "--yolo-unknown")), false);
+    const help = jsonCliRequiredFlags(runtime).join(" \n") + (runtime === "kimi" ? "\n  acp Native server" : ""); assert.equal(jsonCliHelpCompatible(runtime, help), true);
+    assert.equal(jsonCliHelpCompatible(runtime, help.replace(jsonCliRequiredFlags(runtime)[0], "--unknown-flag")), false);
     assert.equal(normalizeJsonCliOutput(runtime, "x".repeat(4 * 1024 * 1024 + 1)).turn.stop, "error");
   }
-  assert.equal(jsonCliHelpCompatible("kimi", "--prompt --auto --model --output-format"), false, "new Kimi Code flags are not silently treated as the documented print dialect");
+  assert.equal(jsonCliHelpCompatible("kimi", "--prompt --auto --model --output-format"), false, "ACP subcommand is mandatory even when print flags exist");
   const oversized = normalizeJsonCliOutput("kimi", lines({ role: "assistant", content: "x", tool_calls: Array.from({ length: 3000 }, () => ({ function: { name: "Shell" } })) }));
   assert.equal(oversized.turn.stop, "error"); assert.ok(oversized.events.length <= 2048);
 });
@@ -49,12 +49,12 @@ test("process-only MCP settings and argv keep host config untouched and token ou
       const body = JSON.parse(fs.readFileSync(config.path, "utf8")); assert.deepEqual(Object.keys(body.mcpServers), ["hara"]);
       assert.equal(fs.statSync(config.path).mode & 0o077, 0);
       const args = jsonCliArgs({ runtime, prompt: "hello", cwd: root, model: "default", mcpPath: config.path });
-      assert.ok(args.includes("--yolo")); assert.ok(!args.includes("--model")); assert.ok(!args.some(value => value.includes(token)));
-      if (runtime === "gemini") { assert.equal(config.env.GEMINI_CLI_TRUST_WORKSPACE, "true"); assert.equal(body.mcpServers.hara.trust, true); assert.deepEqual(body.mcp.allowed, ["hara"]);
+      assert.equal(args.includes("--yolo"), runtime === "gemini"); assert.ok(!args.includes("--model")); assert.ok(!args.some(value => value.includes(token)));
+      if (runtime === "gemini") { assert.equal(config.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH, undefined); assert.equal(config.env.GEMINI_CLI_TRUST_WORKSPACE, "true"); assert.equal(body.mcpServers.hara.trust, true); assert.deepEqual(body.mcp.allowed, ["hara"]); assert.equal(body.mcp.serverCommand, "");
         assert.equal(body.hooksConfig.enabled, false); assert.equal(body.skills.enabled, false); assert.equal(body.tools.sandbox, false);
         assert.deepEqual(body.tools.core, [...GEMINI_NATIVE_TOOLS]); assert.equal(body.tools.discoveryCommand, ""); assert.equal(body.tools.callCommand, "");
         assert.ok(body.tools.core.includes("run_shell_command")); assert.ok(!body.tools.core.some(tool => /background|cron|schedule|agent/i.test(tool))); }
-      else assert.ok(args.includes("--mcp-config-file"));
+      else assert.deepEqual(args, ["acp"]);
     }
     const controlled = jsonCliArgs({ runtime: "gemini", prompt: "hello", cwd: root, model: "flash", mcpPath: "unused", tier: "controlled" });
     assert.ok(!controlled.includes("--yolo")); assert.ok(controlled.includes("plan"));
@@ -81,4 +81,15 @@ test("unreturned and duplicate native calls never record terminal success", () =
   assert.equal(normalizeJsonCliOutput("kimi", kimi).turn.stop, "error");
   const duplicate = lines({ type: "tool_use", tool_id: "one", tool_name: "read_file" }, { type: "tool_use", tool_id: "one", tool_name: "read_file" });
   assert.equal(normalizeJsonCliOutput("gemini", duplicate).failure, "version_incompatible");
+});
+
+test("JSON native error lines require Host opt-in and retain no raw data or later lines", () => {
+  const env = { NATIVE_TOKEN: "opaque-fixture-credential-12345" };
+  for (const runtime of ["gemini", "kimi"]) {
+    const frame = { ...(runtime === "gemini" ? { type: "error" } : {}), error: { message: "Bad configuration token=" + env.NATIVE_TOKEN + " /Users/private/settings.json https://private.example/ account=private@example.com\nPRIVATE_SECOND_LINE", data: { debug: "PRIVATE_ERROR_DATA" } } };
+    const output = lines(frame, ...(runtime === "gemini" ? [{ type: "result", status: "error" }] : []));
+    assert.equal(normalizeJsonCliOutput(runtime, output).errorFirstLine, undefined);
+    const parsed = normalizeJsonCliOutput(runtime, output, env); assert.match(parsed.errorFirstLine, /^Bad configuration/); assert.ok([...parsed.errorFirstLine].length <= 320);
+    assert.doesNotMatch(JSON.stringify(parsed), /opaque-fixture|Users|private\.example|private@example|PRIVATE_SECOND_LINE|PRIVATE_ERROR_DATA/);
+  }
 });

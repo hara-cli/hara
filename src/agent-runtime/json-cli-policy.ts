@@ -15,7 +15,7 @@ export type JsonCliPolicyFactory = (input: {
 }) => Promise<JsonCliPolicyHandle>;
 
 export const createJsonCliExecutionPolicy: JsonCliPolicyFactory = async input => {
-  // Jeff 2026-11-03 option A: classic Kimi inherits host extensions. This removes only
+  // Jeff 2026-11-03 option A, retained by Node Kimi Code: inherit host extensions. Remove only
   // the extension-isolation gate; the frozen permit and shared Seatbelt boundary stay mandatory.
   const tier = workspaceRunPermissionTier(input.permit);
   const roots = input.installer.executionPolicyDirectories(input.runtimeId, input.resolved);

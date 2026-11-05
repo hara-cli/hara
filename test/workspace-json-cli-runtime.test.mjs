@@ -53,7 +53,7 @@ test("Kimi host registration enables binding and advertises inherited extensions
   const main = view.agents.find(row => row.agentId === f.main);
   f.host.setAgentRuntime(f.workspaceId, f.main, "kimi", main.configRevision, main.agentEpoch);
   assert.equal(f.read().agents.find(row => row.agentId === f.main).runtime.id, "kimi");
-  const models = await f.host.listRuntimeModels(f.workspaceId, "kimi"); assert.equal(models.source, "documented"); assert.ok(models.models.some(row => row.id === "default"));
+  const models = await f.host.listRuntimeModels(f.workspaceId, "kimi"); assert.equal(models.source, "documented"); assert.ok(models.models.some(row => row.id === "default")); assert.ok(models.models.some(row => row.id === "kimi-code/kimi-for-coding")); assert.match(models.sourceURL, /kimi-code/);
   assert.equal(fs.existsSync(f.metaPath), false);
 });
 

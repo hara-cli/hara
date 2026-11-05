@@ -34,3 +34,12 @@ for (const runtime of ["gemini", "kimi"]) {
     assert.ok(!JSON.stringify(view).includes("PRIVATE_ARGUMENT"));
   });
 }
+
+test("Gemini default managed App layout keeps the project override outside native evidence and passes N1", { skip: process.platform !== "darwin" }, async t => {
+  const f = await jsonCliFixture(t, "gemini", { mode: "native-write", productionPolicy: true, defaultLayout: true });
+  const sent = f.send("Write native-result.txt"); await f.host.wait(sent.runId); const view = f.read();
+  assert.equal(view.conversation.state, "completed"); assert.equal(view.conversation.completion.state, "verified");
+  assert.equal(fs.readFileSync(join(f.project, "native-result.txt"), "utf8"), "native fixture result");
+  assert.equal(fs.existsSync(join(f.project, ".gemini/settings.json")), false);
+  assert.match(view.conversation.completion.evidence.join(" "), /native-workspace-diff/);
+});

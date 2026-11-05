@@ -35,7 +35,7 @@ const CATALOG: Partial<Record<OptionalRuntimeId, readonly RuntimeModel[]>> = {
     { id: "haiku", label: "Claude Haiku (latest)", description: "CLI alias; follows the current Haiku mapping of the installed Claude CLI/provider." },
   ],
   gemini: [{ id: "default", label: "CLI default", recommended: true }, { id: "gemini-3-pro-preview", label: "Gemini 3 Pro Preview" }, { id: "gemini-3-flash-preview", label: "Gemini 3 Flash Preview" }, { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" }, { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" }],
-  kimi: [{ id: "default", label: "CLI default", recommended: true }, { id: "kimi-for-coding", label: "Kimi for Coding" }],
+  kimi: [{ id: "default", label: "CLI default", recommended: true }, { id: "kimi-code/kimi-for-coding", label: "Kimi for Coding" }],
   agy: [{ id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", recommended: true }],
 };
 function codexModels(parsed: unknown, field: "models" | "data"): RuntimeModel[] {
@@ -355,7 +355,7 @@ export class WorkspaceRuntimeModels {
     this.bound(runtimeId);
     const selected = models.find(value => value.id === row?.selectedModelId);
     return { runtimeId, ...(runtimeId === "gemini" || runtimeId === "kimi" ? { source: "documented" as const, sourceURL: runtimeId === "gemini"
-      ? "https://geminicli.com/docs/cli/model/" : "https://github.com/MoonshotAI/kimi-cli/blob/main/docs/en/configuration/config-files.md" } : {}), ...(["copilot", "cursor", "grok"].includes(runtimeId) ? { source: runtimeId === "cursor" ? "live" as const : "documented" as const, sourceUrl: EXPANDED_MODEL_SOURCES[runtimeId as keyof typeof EXPANDED_MODEL_SOURCES] } : {}), revision: row?.revision ?? 0, selectedModelId: row?.selectedModelId ?? null,
+      ? "https://geminicli.com/docs/cli/model/" : "https://moonshotai.github.io/kimi-code/en/configuration/providers.html" } : {}), ...(["copilot", "cursor", "grok"].includes(runtimeId) ? { source: runtimeId === "cursor" ? "live" as const : "documented" as const, sourceUrl: EXPANDED_MODEL_SOURCES[runtimeId as keyof typeof EXPANDED_MODEL_SOURCES] } : {}), revision: row?.revision ?? 0, selectedModelId: row?.selectedModelId ?? null,
       selectedEffort: row && Object.hasOwn(row, "selectedEffort") ? row.selectedEffort ?? null
         : runtimeId === "opencode" ? null : defaultEffortForLevels(selected?.supportedReasoningEfforts), models };
   }

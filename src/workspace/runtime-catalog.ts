@@ -1,7 +1,8 @@
 import type { RuntimeArtifact, OptionalRuntimeId, RuntimeTarget } from "./runtime-install.js";
 
 export const OPTIONAL_RUNTIMES = ["opencode", "codex", "claude", "agy", "gemini", "kimi", "copilot", "cursor", "grok"] as const;
-export const RUNTIME_LABELS = { opencode: "OpenCode", codex: "Codex", claude: "Claude Code", agy: "Antigravity", gemini: "Gemini CLI", kimi: "Kimi CLI", copilot: "GitHub Copilot", cursor: "Cursor", grok: "Grok Build" } as const;
+export const OPTIONAL_RUNTIME_PACKAGES = Object.freeze({ kimi: "@moonshot-ai/kimi-code" });
+export const RUNTIME_LABELS = { opencode: "OpenCode", codex: "Codex", claude: "Claude Code", agy: "Antigravity", gemini: "Gemini CLI", kimi: "Kimi Code", copilot: "GitHub Copilot", cursor: "Cursor", grok: "Grok Build" } as const;
 export const HOST_LOGIN_ONLY_RUNTIMES: readonly string[] = ["opencode", "gemini", "kimi", "copilot", "cursor", "grok"];
 export const MANUAL_RUNTIME_INSTALL_URLS: Partial<Record<OptionalRuntimeId, string>> = {
   copilot: "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli",
@@ -53,6 +54,6 @@ export async function resolveOfficialRuntimeArtifact(id: OptionalRuntimeId, targ
 /** Documentation only, never an installer command or a fetch authority. */
 export function manualRuntimeInstallation(id: string): { url: string } | null {
   if (id === "gemini") return { url: "https://geminicli.com/docs/get-started/installation/" };
-  if (id === "kimi") return { url: "https://github.com/MoonshotAI/kimi-cli#installation" };
+  if (id === "kimi") return { url: "https://moonshotai.github.io/kimi-code/en/guides/getting-started.html" };
   return null;
 }
