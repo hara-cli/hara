@@ -29,7 +29,7 @@ export function writeManagedMcpCli(command, runtime, toolName) {
     const anchor = 'meta.listed = await call("agent_list", {}); save();';
     if (!code.includes(anchor)) throw Error("Synthetic Codex fixture contract changed");
     code = code.replace(anchor, anchor + '\nif(selected === "managed") { meta.intake = await call("task_intake", {intent:"investigate",goal:"Read the fixed synthetic MCP data",constraints:["Only the reviewed synthetic server"],acceptance:["Observe the synthetic result"],steps:["Read the fixture"]}); meta.plugin = await call(mode().managedTool,{key:"one"}); save(); const observed=JSON.parse(receiptText(meta.plugin.text)); await call("task_checkpoint",{completion:{state:"verified",checks:[{acceptance_index:0,evidence:"Observed the synthetic server result only",tool_call_ids:[observed.receipt.toolCallId]}],final_answer:"Synthetic MCP result observed."}}); }');
-    fs.writeFileSync(command + ".mode.json", JSON.stringify({ mode: "managed", managedTool: toolName }));
+    fs.writeFileSync(command + ".mode.json", JSON.stringify({ mode: "managed", managedTool: toolName, debugMcp: true }));
     code = "(" + code + ")();";
   } else {
     const input = { toolName, clientModule: import.meta.resolve("@modelcontextprotocol/sdk/client/index.js"), transportModule: import.meta.resolve("@modelcontextprotocol/sdk/client/streamableHttp.js") };

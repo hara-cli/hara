@@ -112,7 +112,7 @@ export function expandedCliDriver(id: ExpandedRuntimeId, installer: WorkspaceRun
     const inventory = await models.list(id);
     if (!inventory.models.some(model => model.id === selection.modelId)) return diagnostic("invalid_model");
     const tracker = runtimeFailureTracker(installer, id, permit.binding.agent.agentId,
-      JSON.stringify([resolved.command, resolved.env.HOME, installer.proxy.read().revision, permit.binding.agent.configRevision, selection]), resolved);
+      JSON.stringify([resolved.command, resolved.env.HOME, installer.proxy.read().revision, permit.binding.agent.configRevision, selection]), resolved, permit.binding.sessionId);
     const held = tracker.blocked(); if (held) return { status: "error", error: held };
     try { workspaceRunRuntimeStages(permit)?.setRuntime({ id,
       version: installer.list().options.find(row => row.runtimeId === id)?.version ?? null,

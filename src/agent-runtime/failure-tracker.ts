@@ -2,13 +2,14 @@ import { runtimeErrorFirstLine } from "../security/runtime-error.js";
 import { RuntimeLaunchCooldown, runtimeFailureMessage, runtimeRpcDiagnostic, type RuntimeRpcDiagnostic, type RuntimeFailureContext, type RuntimeFailureKind } from "./failure-diagnostics.js";
 import type { WorkspaceRuntimeInstaller, RuntimeLoginSource } from "../workspace/runtime-install.js";
 
-// Registry instances are per turn. Retain only per-installer, per-colleague state, never global user state.
+// Registry instances are per turn. Retain only the original installer/colleague/conversation state;
+// a channel failure must not block or clear another channel or its private conversation.
 const trackers = new WeakMap<object, Map<string, { route: string; cooldown: RuntimeLaunchCooldown; errorFirstLine?: string; rpc?: RuntimeRpcDiagnostic }>>();
 export function runtimeFailureTracker(installer: WorkspaceRuntimeInstaller, runtime: RuntimeFailureContext["runtime"],
-  agentId: string, route: string, launched: { env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource }) {
+  agentId: string, route: string, launched: { env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource }, sessionId: string = agentId) {
   let rows = trackers.get(installer);
   if (!rows) { rows = new Map(); trackers.set(installer, rows); }
-  const key = runtime + ":" + agentId;
+  const key = JSON.stringify([runtime, agentId, sessionId]);
   let row = rows.get(key);
   if (!row || row.route !== route) {
     // Bound memory even when a workspace creates/removes many colleagues.

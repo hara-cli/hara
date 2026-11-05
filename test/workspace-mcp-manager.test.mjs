@@ -168,7 +168,7 @@ for (const runtime of ["codex", "claude"]) managedTest(`registered ${runtime} ad
     const snapshot = h.read(), file = h.command + ".meta.json";
     const meta = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
     throw Error(error.message + " " + JSON.stringify({ state: snapshot.conversation.state, taskState: snapshot.conversation.taskState,
-      blockReason: snapshot.conversation.blockReason, toolsListed: Boolean(meta.tools), intake: meta.intake, plugin: meta.plugin }));
+      blockReason: snapshot.conversation.blockReason, toolsListed: Boolean(meta.tools), mcpMethod: meta.mcpMethod, mcpStatus: meta.mcpStatus, refusedMcp: meta.refusedMcp, intake: meta.intake, plugin: meta.plugin }));
   });
   assert.equal(allCalls(h.host, h.id).length, 0); h.host.answerApproval("client", h.id, card.id, true); await h.host.wait(started.runId);
   const snapshot = h.read(), meta = JSON.parse(fs.readFileSync(h.command + ".meta.json", "utf8"));

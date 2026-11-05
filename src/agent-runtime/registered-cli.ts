@@ -89,7 +89,7 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
           if (turnArgs.system.length > 200_000) throw new Error("Native Agent Runtime system context is too large");
           const resolved = installer.resolveBound(id), started = Date.now();
           const tracker = runtimeFailureTracker(installer, id, permit.binding.agent.agentId,
-            JSON.stringify([resolved.command, resolved.loginSource, resolved.env.HOME, installer.proxy.read().revision, permit.binding.agent.configRevision, model, effort]), resolved);
+            JSON.stringify([resolved.command, resolved.loginSource, resolved.env.HOME, installer.proxy.read().revision, permit.binding.agent.configRevision, model, effort]), resolved, permit.binding.sessionId);
           const held = tracker.blocked(); if (held) return { ok: false, stdout: "", code: null, timedOut: false, runtimeFailure: held };
           try {
             const result = await session.launch(endpoint, prompt, turnArgs, { model, effort, cwd: options.ctx.cwd, signal: native.signal, assertCurrent, activity });
@@ -114,7 +114,7 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
           loginSource: resolved.loginSource, model, effort }); } catch { /* Metadata is diagnostic only. */ }
         const observer = createRuntimeStageProcessObserver(stages, id, native.signal);
         const tracker = runtimeFailureTracker(installer, id, permit.binding.agent.agentId,
-          JSON.stringify([resolved.command, resolved.loginSource, resolved.env.HOME, resolved.proxyUrl, permit.binding.agent.configRevision, model, effort]), resolved);
+          JSON.stringify([resolved.command, resolved.loginSource, resolved.env.HOME, resolved.proxyUrl, permit.binding.agent.configRevision, model, effort]), resolved, permit.binding.sessionId);
         const held = tracker.blocked();
         if (held) return { ok: false, stdout: "", code: null, timedOut: false, runtimeFailure: held };
         const started = Date.now();

@@ -37,7 +37,7 @@ export function jsonCliDriver(id: JsonCliRuntimeId, installer: WorkspaceRuntimeI
         try {
           const resolved = await installer.prepareBound(id, native.signal); assertCurrent();
           tracker = runtimeFailureTracker(installer, id, permit.binding.agent.agentId,
-            JSON.stringify([resolved.command, resolved.loginSource, resolved.proxyUrl, permit.binding.agent.configRevision, selection]), resolved);
+            JSON.stringify([resolved.command, resolved.loginSource, resolved.proxyUrl, permit.binding.agent.configRevision, selection]), resolved, permit.binding.sessionId);
           const held = tracker.blocked(); if (held) return { ok: false, stdout: "", code: null, timedOut: false, runtimeFailure: held };
           directory = realpathSync.native(mkdtempSync(join(tmpdir(), `hara-${id}-attempt-`)));
           // --help uses a fresh probe HOME, never the account's login/configuration files.

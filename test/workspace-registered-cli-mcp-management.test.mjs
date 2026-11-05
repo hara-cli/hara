@@ -32,7 +32,10 @@ test("Codex generic creation keeps the native turn-limit guard after the exact D
   await until(() => f.request("workspace.snapshot", { workspaceId: f.scope.workspaceId, agentId: colleague.agentId }), done);
   const child = f.meta();
   for (const name of ["agent_list", "agent_create", "agent_rename", "agent_contact"]) assert.equal(child.tools.includes(name), false);
-  assert.equal(child.listed.isError, true);
+  assert.equal(child.listed, undefined, "an unavailable colleague tool is refused before the governor call");
+  assert.deepEqual(child.refusedMcp, { method: "tools/call", tool: "agent_list", status: 200, code: -32600 });
+  const colleagueView = await f.request("workspace.snapshot", { workspaceId: f.scope.workspaceId, agentId: colleague.agentId });
+  assert.notEqual(colleagueView.conversation.state, "completed");
   await revoked(child);
 });
 

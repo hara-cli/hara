@@ -37,3 +37,24 @@ test("restore RPC metadata is route-owned, closed, available during cooldown and
   assert.equal(read(tracker.failed("runtime_failed", 1)).rpcMethod, undefined);
   assert.equal(read(tracker.failed("timeout", 1, undefined, { rpcMethod: "PRIVATE_METHOD", rpcTimeoutMs: 10000 })).rpcMethod, undefined);
 });
+
+test("same-colleague channel cooldowns and diagnostics stay isolated from other channels and the DM", () => {
+  for (const runtime of ["pi", "codex", "claude"]) {
+    const owner = installer();
+    const scoped = session => runtimeFailureTracker(owner, runtime, "same-colleague", "same-route", context, session);
+    const a = scoped("channel-a"), b = scoped("channel-b"), dm = scoped("private");
+    const aFailure = read(a.failed("runtime_auth_rejected", 10));
+    assert.equal(b.blocked(), null);
+    assert.equal(dm.blocked(), null);
+    const bFailure = read(b.failed("spawn_failed", 10));
+    assert.equal(read(scoped("channel-a").blocked()).retryAtMs, aFailure.retryAtMs);
+    assert.equal(read(scoped("channel-a").blocked()).consecutiveFailures, 1);
+    assert.equal(read(scoped("channel-b").blocked()).kind, "spawn_failed");
+    dm.succeeded();
+    assert.equal(read(a.blocked()).kind, "runtime_auth_rejected", "private success cannot clear channel failure");
+    assert.equal(read(b.blocked()).retryAtMs, bFailure.retryAtMs);
+    a.succeeded();
+    assert.equal(scoped("channel-a").blocked(), null);
+    assert.equal(read(scoped("channel-b").blocked()).kind, "spawn_failed");
+  }
+});

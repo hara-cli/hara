@@ -65,7 +65,7 @@ export async function runFullProtectedPi(history: NeutralMsg[], options: RunOpts
     return { status: "error", error: "Pi full-protected requires the shared native evidence/C-lite integration; no fallback was started" };
   }
   const tracker = runtimeFailureTracker(installer, "pi", permit.binding.agent.agentId,
-    canonical([permit.binding.connection, permit.binding.agent.configRevision, installer.proxy.read().revision]), { env: {}, loginSource: "isolated" });
+    canonical([permit.binding.connection, permit.binding.agent.configRevision, installer.proxy.read().revision]), { env: {}, loginSource: "isolated" }, permit.binding.sessionId);
   const held = tracker.blocked(); if (held) return { status: "error", error: held };
   const began = Date.now();
   let modelFailure: RuntimeFailureKind | undefined, activeArgs: TurnArgs | undefined, policy: RuntimeExecutionPolicy | undefined;

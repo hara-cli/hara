@@ -69,13 +69,19 @@ export async function fakeCodexMain() {
     meta.attemptMarkerFingerprint = marker ? crypto.createHash("sha256").update(marker).digest("hex") : null; save();
     let serial = 0, session = mcpURL === url ? mcpSession : undefined;
     async function request(method, parameters) {
+      if (mode().debugMcp) { meta.mcpMethod = method; save(); }
       const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream",
         Authorization: "Bearer " + token, ...(session ? { "Mcp-Session-Id": session } : {}) },
         body: JSON.stringify({ jsonrpc: "2.0", ...(method.startsWith("notifications/") ? {} : { id: ++serial }), method, params: parameters }) });
+      if (mode().debugMcp) { meta.mcpStatus = response.status; save(); }
       session = response.headers.get("mcp-session-id") ?? session; mcpSession = session; mcpURL = url;
       if (response.status === 202) return {};
       const body = await response.json();
-      if (!response.ok || body.error) throw new Error("fixture MCP request refused");
+      if (!response.ok || body.error) {
+        meta.refusedMcp = { method, tool: method === "tools/call" ? parameters.name : null, status: response.status,
+          code: typeof body.error?.code === "number" ? body.error.code : null }; save();
+        throw new Error("fixture MCP request refused");
+      }
       return body.result;
     }
     async function call(name, input) {
