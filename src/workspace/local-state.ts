@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { withPrivateStateLockSync, writePrivateStateFileSync } from "../security/private-state.js";
 import {
   currentWorkspaceResourceBinding, inspectWorkspaceResourceFile, workspaceResourceCommitGuard,
-  workspaceStateHome, type WorkspaceResourceStorage,
+  workspaceStateHome, type WorkspaceResourceStorage, type WorkspaceResourceBinding,
 } from "./resource-context.js";
 
 export function plain(value: unknown): value is Record<string, unknown> {
@@ -40,17 +40,28 @@ export function deepFreeze<T>(value: T): Readonly<T> {
 
 /** The supplied storage is already bound to a trusted, explicit host/scope. No public arbitrary-path API. */
 export class WorkspaceJsonState<T> {
+  private validationBinding?: Readonly<WorkspaceResourceBinding>;
   constructor(readonly storage: WorkspaceResourceStorage, private readonly filename: string,
     private readonly parse: (value: unknown) => T, private readonly empty: () => T) {
     if (!/^[a-z][a-z0-9-]{0,79}\.json$/.test(filename)) throw new Error("invalid private Workspace state filename");
   }
   private file() { return inspectWorkspaceResourceFile(join(workspaceStateHome(), ".hara", this.filename), 4 * 1024 * 1024); }
+  /** JSON validators compare provenance with this original structural tuple, not a new authority
+   * grant. The actual file read/write and enclosing storage operation keep their fresh fences.
+   * Clear synchronously even if a validator throws/returns a Promise; no fact survives an await. */
+  private validate(operation: () => T): T {
+    const binding = currentWorkspaceResourceBinding();
+    if (!binding) throw new Error("Workspace JSON validation requires its bound storage context");
+    const previous = this.validationBinding;
+    this.validationBinding = binding;
+    try { return operation(); } finally { this.validationBinding = previous; }
+  }
   private load() {
     const file = this.file();
-    if (!file.snapshot) return { file, value: this.empty() };
+    if (!file.snapshot) return { file, value: this.validate(() => this.empty()) };
     let raw: unknown;
     try { raw = JSON.parse(file.snapshot.text); } catch { throw new Error("invalid private Workspace JSON; state was preserved"); }
-    return { file, value: this.parse(raw) };
+    return { file, value: this.validate(() => this.parse(raw)) };
   }
   read(): T { return this.storage.run(() => structuredClone(this.load().value)); }
   update(expectedRevision: number, change: (value: T) => T): T {
@@ -59,7 +70,8 @@ export class WorkspaceJsonState<T> {
       const { file, value } = this.load();
       if ((value as { revision: number }).revision !== expectedRevision) throw new Error("Workspace state changed; refresh before writing");
       if (expectedRevision >= Number.MAX_SAFE_INTEGER) throw new Error("Workspace revision exhausted");
-      const next = this.parse({ ...change(value), revision: expectedRevision + 1 });
+      const changed = { ...change(value), revision: expectedRevision + 1 };
+      const next = this.validate(() => this.parse(changed));
       const result = JSON.stringify(next) + "\n";
       if (Buffer.byteLength(result) > 4 * 1024 * 1024) throw new Error("Workspace state is full");
       const assertResource = workspaceResourceCommitGuard();
@@ -70,5 +82,8 @@ export class WorkspaceJsonState<T> {
       return structuredClone(next);
     }));
   }
-  binding() { return this.storage.run(() => ({ ...currentWorkspaceResourceBinding()! })); }
+  binding() {
+    if (this.validationBinding) return { ...this.validationBinding };
+    return this.storage.run(() => ({ ...currentWorkspaceResourceBinding()! }));
+  }
 }
