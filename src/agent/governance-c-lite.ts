@@ -18,6 +18,9 @@ const MULTI_OUTCOME = /(?:并且|同时|另外|以及|之后还|然后再|和|an
 const MULTI_STEP_ANSWER = /(?:并且|同時|同时|另外|以及|之后还|之後還|然后|然後|接着|接著|and also|also|then|plus|(?:^|\n)\s*\d+[.)、])/iu;
 const SHORT_CHAT = /^(?:(?:hello|hi|hey)(?:\s+there)?|good\s+(?:morning|afternoon|evening|night)|thanks|thank\s+you(?:\s+(?:very much|so much))?|ok(?:ay)?|谢谢|謝謝|好的|早安|晚安)[。.！!?？\s]*$/iu;
 const SHORT_INTRO = /^(?:(?:hello|hi|hey)[,\s]+)?(?:我是|我叫|my name is|i(?: am|'m))\s*[\p{L}\p{N}][\p{L}\p{N} _'-]{0,39}[。.！!?？\s]*$/iu;
+// A request to investigate remains work even if the user phrases it as a question. This affects
+// effort only; it does not change the engine's completion/side-effect authority classification.
+const INVESTIGATE_REQUEST = /^(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?(?:investigate|debug|diagnose|inspect|audit)\b|^(?:调查|調查|排查|诊断|診斷|审计|審計)/iu;
 
 
 /** Direct engine completion is limited to one stated outcome; richer tasks use explicit checks. */
@@ -65,7 +68,8 @@ export function taskObjectiveIntent(objective: string): TaskBriefInput["intent"]
 
 /** The same Host classification, bounded to one short outcome for automatic reasoning. */
 export function simpleAnswerObjective(objective: string): boolean {
-  return taskObjectiveIntent(objective) === "answer" && (conversationalAnswerObjective(objective)
+  return taskObjectiveIntent(objective) === "answer" && !INVESTIGATE_REQUEST.test(answerQuestionText(objective))
+    && (conversationalAnswerObjective(objective)
     || requestedReplyText(objective) !== null || objective.trim().length <= 400 && !MULTI_STEP_ANSWER.test(objective));
 }
 
