@@ -10,7 +10,7 @@ import { HOST_LOGIN_ONLY_RUNTIMES, MANUAL_RUNTIME_INSTALL_URLS, OPTIONAL_RUNTIME
 import { runtimeArchiveMember } from "./runtime-archive.js";
 import { WorkspaceRuntimeProxy } from "./runtime-proxy.js";
 import { validOpenCodeNativeHeader } from "../coding/bundled-opencode.js";
-import { detectInstalledRuntimes, inspectLocalRuntime, isKimiCodeExecutable, KIMI_LEGACY_MESSAGE, type DetectionOptions, type DetectedRuntime } from "./runtime-detect.js";
+import { detectInstalledRuntimes, inspectLocalRuntime, isKimiCodeExecutable, KIMI_LEGACY_MESSAGE, type DetectionOptions, type DetectedRuntime, type CopilotVersionProbe } from "./runtime-detect.js";
 import { WorkspaceRuntimeVersionStore, projectRuntimeVersionStatus, type RuntimeVersionCurrent } from "./runtime-version-history.js";
 
 export type OptionalRuntimeId = "opencode" | "codex" | "claude" | "agy" | "gemini" | "kimi" | "copilot" | "cursor" | "grok";
@@ -97,6 +97,9 @@ export class WorkspaceRuntimeInstaller {
   private readonly locals: WorkspaceJsonState<LocalState>;
   private detected: DetectedRuntime[] = [];
   private discovery?: Promise<void>;
+  private copilotProbe?: { path: string; source: string; state: "detecting" | "detection_failed" };
+  private copilotRetry?: Promise<void>;
+  private readonly versionProbes = new Set<AbortController>();
   private readonly proposals = new Map<string, Proposal>();
   private readonly operations = new Map<string, Operation>();
   private readonly active = new Map<OptionalRuntimeId, Operation>();
@@ -151,13 +154,44 @@ export class WorkspaceRuntimeInstaller {
   }
   async discover(): Promise<void> {
     if (this.closed || !this.options.discovery) return;
-    if (!this.discovery) this.discovery = (async () => {
-      this.storage.run(() => {});
-      const found = await detectInstalledRuntimes(this.options.discovery!);
-      if (this.closed) return;
-      this.storage.run(() => {}); this.detected = found;
-    })().finally(() => { this.discovery = undefined; });
+    if (!this.discovery) {
+      const controller = new AbortController(); this.versionProbes.add(controller);
+      this.discovery = (async () => {
+        this.storage.run(() => {});
+        let deferred: CopilotVersionProbe | undefined;
+        const copilotProbeInProgress = Boolean(this.copilotRetry);
+        const found = await detectInstalledRuntimes({ ...this.options.discovery!, signal: controller.signal, copilotProbeInProgress,
+          onCopilotProbeTimeout: probe => { deferred = probe; } });
+        if (this.closed || controller.signal.aborted) return;
+        this.storage.run(() => {});
+        if (copilotProbeInProgress) {
+          // The retry may finish while other runtimes are rescanned. Do not erase its newer result.
+          this.detected = [...found, ...this.detected.filter(row => row.runtimeId === "copilot")];
+        } else {
+          this.detected = found;
+          this.copilotProbe = deferred ? { path: deferred.path, source: deferred.source, state: "detecting" } : undefined;
+          if (deferred) this.retryCopilotVersion(deferred);
+        }
+      })().finally(() => { this.versionProbes.delete(controller); this.discovery = undefined; });
+    }
     return this.discovery;
+  }
+  private retryCopilotVersion(probe: CopilotVersionProbe): void {
+    const controller = new AbortController(); this.versionProbes.add(controller);
+    const notify = () => { try { this.options.onChange?.(); } catch { /* Observer disconnection cannot discard metadata. */ } };
+    const failed = () => { this.copilotProbe = { path: probe.path, source: probe.source, state: "detection_failed" }; };
+    const pending = new Promise<void>(resolve => setImmediate(resolve)).then(() => probe.retry(controller.signal)).then(found => {
+      if (this.closed || controller.signal.aborted) return;
+      this.storage.run(() => {});
+      if (found) { this.detected = [...this.detected.filter(row => row.runtimeId !== "copilot"), found]; this.copilotProbe = undefined; }
+      else failed();
+      notify();
+    }).catch(() => {
+      if (this.closed || controller.signal.aborted) return;
+      try { this.storage.run(() => {}); failed(); notify(); } catch { /* Retired Workspace generation: discard the late result. */ }
+    }).finally(() => { this.versionProbes.delete(controller); if (this.copilotRetry === pending) this.copilotRetry = undefined; });
+    this.copilotRetry = pending;
+    notify();
   }
   registerLocal(runtimeId: OptionalRuntimeId, fingerprint: string, loginSource: RuntimeLoginSource = runtimeId === "agy" ? "isolated" : "host"): void {
     if (this.closed) return fail();
@@ -544,7 +578,7 @@ export class WorkspaceRuntimeInstaller {
     let verified = false; if (installed && runtimeId !== "kimi") try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* fail closed, no fallback */ }
     const loginSource = locals.loginSources.find(row => row.runtimeId === runtimeId)?.source
       ?? value.loginSources.find(row => row.runtimeId === runtimeId)?.source ?? "isolated";
-    return { state: installed && runtimeId === "kimi" ? "legacy_unsupported" : installed ? verified ? "registered" : "integrity_failed" : "not_installed",
+    return { state: installed && runtimeId === "kimi" ? "legacy_unsupported" : installed ? verified ? "registered" : "integrity_failed" : (runtimeId === "copilot" ? this.copilotProbe?.state : undefined) ?? "not_installed",
       generalAgentDriverAvailable: generalAgentAvailable(runtimeId, verified, loginSource) };
   }
   list() {
@@ -574,10 +608,11 @@ export class WorkspaceRuntimeInstaller {
       const installed = value.entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
       let verified = false; if (installed && runtimeId !== "kimi") try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* tampering revokes use, never repair or fallback */ }
       const version = verified ? installed!.artifact.version : null;
-      return { runtimeId, label: RUNTIME_LABELS[runtimeId], ...(["kimi", "copilot", "cursor", "grok"].includes(runtimeId) ? { extensionsIsolation: "inherited" as const } : {}), ...(manualRuntimeInstallation(runtimeId) ? { manualInstallation: manualRuntimeInstallation(runtimeId)! } : {}), ...(MANUAL_RUNTIME_INSTALL_URLS[runtimeId] ? { installUrl: MANUAL_RUNTIME_INSTALL_URLS[runtimeId] } : {}), installed: verified, registered: verified, version, fingerprint: verified ? installed!.executableSha256 : null,
+      const probe = runtimeId === "copilot" ? this.copilotProbe : undefined;
+      return { runtimeId, ...(probe && !installed ? { path: probe.path, source: probe.source } : {}), label: RUNTIME_LABELS[runtimeId], ...(["kimi", "copilot", "cursor", "grok"].includes(runtimeId) ? { extensionsIsolation: "inherited" as const } : {}), ...(manualRuntimeInstallation(runtimeId) ? { manualInstallation: manualRuntimeInstallation(runtimeId)! } : {}), ...(MANUAL_RUNTIME_INSTALL_URLS[runtimeId] ? { installUrl: MANUAL_RUNTIME_INSTALL_URLS[runtimeId] } : {}), installed: verified, registered: verified, version, fingerprint: verified ? installed!.executableSha256 : null,
         versionStatus: versionStatus(runtimeId, { version, fingerprint: verified ? installed!.executableSha256 : null,
           registered: verified, requiresRetrust: Boolean(installed && !verified) }),
-        loginSource, generalAgentDriverAvailable: generalAgentAvailable(runtimeId, verified, loginSource), state: installed && runtimeId === "kimi" ? "legacy_unsupported" : installed ? verified ? "registered" : "integrity_failed" : "not_installed", ...(installed && runtimeId === "kimi" ? { compatibilityMessage: KIMI_LEGACY_MESSAGE } : {}) };
+        loginSource, generalAgentDriverAvailable: generalAgentAvailable(runtimeId, verified, loginSource), state: installed && runtimeId === "kimi" ? "legacy_unsupported" : installed ? verified ? "registered" : "integrity_failed" : probe?.state ?? "not_installed", ...(installed && runtimeId === "kimi" ? { compatibilityMessage: KIMI_LEGACY_MESSAGE } : {}) };
     }), operations: [...this.operations.values()].slice(-64).map(({ controller: _c, ...row }) => row) };
   }
   private resolveUnproxied(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
@@ -600,10 +635,12 @@ export class WorkspaceRuntimeInstaller {
   async close(): Promise<void> {
     this.closed = true; this.proposals.clear(); for (const operation of this.active.values()) operation.controller.abort();
     for (const controller of this.metadata) controller.abort();
+    for (const controller of this.versionProbes) controller.abort();
     await Promise.all([...this.nativeResources].map(close => close())); this.nativeResources.clear();
     // Own downloads have a finite deadline; callers can observe incomplete drain rather than delete locks.
     const deadline = Date.now() + 5000;
-    while ((this.active.size || this.metadata.size) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    while ((this.active.size || this.metadata.size || this.versionProbes.size) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
     if (this.active.size || this.metadata.size) throw new Error("Runtime downloads have not drained");
+    if (this.versionProbes.size) throw new Error("Runtime version probes have not drained");
   }
 }
