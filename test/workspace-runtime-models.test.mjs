@@ -193,23 +193,37 @@ async function inventoryFixture() {
   return { discovery, command, storage, runtimes, models, env, cache: join(env.CODEX_HOME, "models_cache.json") };
 }
 
-test("a new Codex binding uses live model medium without changing an explicit saved automatic choice", async () => {
+test("new and legacy automatic Codex choices resolve each objective without caching a fixed level", async () => {
   const f = await inventoryFixture();
   try {
     fs.writeFileSync(`${f.command}.appmodels`, JSON.stringify({ data: [{ id: "fixture-model", displayName: "Fixture",
       isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "medium" }, { reasoningEffort: "high" }] }] }));
-    assert.deepEqual(await f.models.launchSelection("codex"), { modelId: "fixture-model", effort: "medium" });
+    assert.deepEqual(await f.models.launchSelection("codex", "hello"), { modelId: "fixture-model", effort: "low" });
     const firstLaunchCalls = fs.readFileSync(join(f.env.CODEX_HOME, "log/fixture.calls"), "utf8");
     const beforeUse = f.runtimes.list().options.find(row => row.runtimeId === "codex").versionStatus;
     f.runtimes.captureSuccessfulUse("codex", f.command)();
     assert.notDeepEqual(f.runtimes.list().options.find(row => row.runtimeId === "codex").versionStatus, beforeUse);
-    assert.deepEqual(await f.models.launchSelection("codex"), { modelId: "fixture-model", effort: "medium" });
+    assert.deepEqual(await f.models.launchSelection("codex", "Investigate failing tests"), { modelId: "fixture-model", effort: "medium" });
     assert.equal(fs.readFileSync(join(f.env.CODEX_HOME, "log/fixture.calls"), "utf8"), firstLaunchCalls,
-      "later turns reuse the live-backed default without spawning another model inventory process");
+      "later turns reuse only inventory, not the automatic result or another inventory process");
     await f.models.select("codex", "fixture-model", 0);
-    assert.deepEqual(f.models.selection("codex"), { modelId: "fixture-model", effort: "medium" });
-    await f.models.select("codex", "fixture-model", 1, null);
-    assert.deepEqual(await f.models.launchSelection("codex"), { modelId: "fixture-model", effort: null });
+    assert.deepEqual(f.models.selection("codex"), { modelId: "fixture-model", effort: null });
+    await f.models.select("codex", "fixture-model", 1, "auto");
+    assert.equal((await f.models.launchSelection("codex", "你好")).effort, "low");
+    assert.equal(f.models.selectedEffort("codex"), "auto", "actual effort never overwrites the user's automatic setting");
+    // Old model-selection documents had no selectedEffort field. Preserve that representation.
+    f.models.state.update(f.models.state.read().revision, state => {
+      delete state.selections[0].selectedEffort; return state;
+    });
+    const reopened = new WorkspaceRuntimeModels(f.storage, f.runtimes);
+    assert.equal((await reopened.launchSelection("codex", "hello")).effort, "low");
+    assert.equal((await reopened.launchSelection("codex", "Update the docs")).effort, "medium");
+    assert(!Object.hasOwn(reopened.state.read().selections[0], "selectedEffort"));
+    await reopened.select("codex", "fixture-model", 2, "high");
+    assert.equal((await reopened.launchSelection("codex", "hello")).effort, "high");
+    assert.equal((await reopened.launchSelection("codex", "Investigate failing tests")).effort, "high");
+    await reopened.select("codex", "fixture-model", 3, null);
+    assert.equal((await reopened.launchSelection("codex", "hello")).effort, "low");
   } finally { await f.runtimes.close(); }
 });
 

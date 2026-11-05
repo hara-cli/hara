@@ -107,7 +107,9 @@ export function expandedCliDriver(id: ExpandedRuntimeId, installer: WorkspaceRun
     try { (protect as PreflightExpandedRuntimeProtection).assertLaunchSupported?.(id); }
     catch { return diagnostic("runtime_permission_denied"); }
     let selection;
-    try { selection = await models.launchSelection(id); } catch { return diagnostic("invalid_model"); }
+    const objective = options.taskIntake?.task.objective ?? history.slice().reverse().find(message => message.role === "user")?.content ?? "";
+    try { selection = await models.launchSelection(id, objective); } catch { return diagnostic("invalid_model"); }
+    assertCurrent();
     if (!selection.modelId || selection.effort && !await models.effortLaunchable(id)) return diagnostic("invalid_model");
     const inventory = await models.list(id);
     if (!inventory.models.some(model => model.id === selection.modelId)) return diagnostic("invalid_model");

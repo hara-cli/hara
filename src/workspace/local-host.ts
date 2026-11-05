@@ -1,6 +1,7 @@
 import { parseWorkspaceAssistantPreview, type WorkspaceAssistantPreview } from "./assistant-preview.js";
 import { MessageTimingRecorder, type MessageTimingIdentity, type MessageTimingInput, type MessageTimingReport } from "./message-timing.js";
 import { WorkspaceMessageTimingStore } from "./message-timing-store.js";
+import { connectionForObjective } from "./connection-effort.js";
 import { WorkspaceMcpOwnerReview, type McpOwnerContext } from "./extension-owner-review.js";
 import { McpOwnerReviewError } from "./extension-review-store.js";
 import { readHostWorkspaceMcpLaunch, type WorkspaceMcpLaunchProvider } from "./extension-candidate.js";
@@ -678,7 +679,7 @@ export class LocalWorkspaceHost {
     if (modelId !== undefined) {
       const binding = store.capture(id), connection = store.resolve(binding);
       const supported = connectionModelEfforts(connection, modelId);
-      if (!text(modelId, 200) || effort !== undefined && effort !== null && !supported.includes(effort)) throw new Error("Invalid connection model or reasoning effort");
+      if (!text(modelId, 200) || effort !== undefined && effort !== null && effort !== "auto" && !supported.includes(effort)) throw new Error("Invalid connection model or reasoning effort");
     } else if (effort !== undefined) throw new Error("Model is required when selecting reasoning effort");
     store.select(id, expected, modelId, effort as ScopedConnection["defaultReasoning"]);
     this.queueUsageRefresh(workspaceId); this.changed(workspaceId);
@@ -1336,8 +1337,9 @@ export class LocalWorkspaceHost {
       const binding = task.workspaceRunBinding!, controller = new AbortController();
       if (binding.project.root !== context.project) throw new Error("Workspace project root changed; old task retained read-only, no implicit project migration");
       const connection = context.connections.resolve(binding.connection);
-      const selectedProvider = this.realKey ? this.realKey.createProvider(connection, binding.connection)
-        : (this.options.providerFactory ?? (this.options.mode === "workspace" ? createWorkspaceProvider : createWorkspaceSyntheticProvider))(connection, binding.connection,
+      const providerConnection = connectionForObjective(connection, binding.connection, task.objective);
+      const selectedProvider = this.realKey ? this.realKey.createProvider(connection, providerConnection)
+        : (this.options.providerFactory ?? (this.options.mode === "workspace" ? createWorkspaceProvider : createWorkspaceSyntheticProvider))(connection, providerConnection,
           { agent, objective: task.objective, colleagues: () => context.resources.agents.list().agents });
       const provider = new WorkspaceProviderRecovery(context.storage, agentId, channel?.id).observe(selectedProvider, binding.runId);
       // Prepare every mandatory dependency before publishing an accepted request/attempt. A malformed
@@ -1377,7 +1379,8 @@ export class LocalWorkspaceHost {
           resourceGeneration: context.storage.run(() => currentWorkspaceResourceBinding()!.generation),
           agentId, sessionId: store.sessionId, runId: binding.runId, attemptId: lease.attemptId, historyStart: modelHistoryStart },
         { id: binding.agent.runtimeId, version: null, loginSource: "unknown",
-          model: binding.agent.runtimeId === "pi" ? binding.connection.model : null, effort: null },
+          model: binding.agent.runtimeId === "pi" ? binding.connection.model : null,
+          effort: binding.agent.runtimeId === "pi" ? providerConnection.reasoning : null },
         { provenance: { startedAt: value.attempt!.startedAt, coreInstanceId: this.runtimeStageCoreInstance } });
         this.saveRuntimeStages(owned, true);
       } catch { /* No diagnostic initialization may change a durably accepted execution. */ }

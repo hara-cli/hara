@@ -70,3 +70,15 @@ test("Claude host and isolated bindings retain separate launch homes without cop
   assert(isolated.env.HOME.startsWith(f.home)); assert(isolated.env.CLAUDE_CONFIG_DIR.startsWith(f.home));
   assert.equal(fs.existsSync(join(f.account, ".claude")), false);
 });
+
+test("Claude automatic effort uses the declared CLI levels per request and preserves a fixed colleague choice", async t => {
+  const f = await fixture(t);
+  assert.equal((await f.models.launchSelection("claude", "hello")).effort, "low");
+  assert.equal((await f.models.launchSelection("claude", "Investigate the error")).effort, "medium");
+  await f.models.select("claude", "sonnet", 0, "auto");
+  assert.equal((await f.models.launchSelection("claude", "你好")).effort, "low");
+  await f.models.select("claude", "sonnet", 1, "max");
+  assert.equal((await f.models.launchSelection("claude", "hello")).effort, "max");
+  const unsupported = await fixture(t, false);
+  assert.equal((await unsupported.models.launchSelection("claude", "hello")).effort, null);
+});

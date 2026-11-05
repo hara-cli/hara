@@ -13,6 +13,15 @@ const QUESTION = /[?？]|^(?:\s*(?:list|show|read|describe|explain|what|who|whic
 const ANSWER_PREFIX = /^(?:请|請)?(?:用|以)(?:(?:简体|繁体|簡體|繁體)?中文)?(?:一句话|一句話)?(?:回答|回复|回覆)?[：:，,\s]*/u;
 const CJK_ANSWER = /^(?:请|請)?(?:简单|簡單)?(?:介绍|介紹|简述|簡述|请问|請問|什么|甚麼|如何|为什么|為什麼|怎样|怎樣|怎么|怎麼|多少|是否|能否)|^(?:你|您|这|這)(?:是|能|会|會|可以)|^(?:你好|您好|嗨|早上好|晚上好|晚安)(?:[，,。.！!\s]|$)/u;
 const MULTI_OUTCOME = /(?:并且|同时|另外|以及|之后还|然后再|和|and also|also|then|plus|[,，、;；])/iu;
+// A comma in a short answer/greeting is not itself another task step. This guard is effort-only;
+// simple-change completion keeps its stricter MULTI_OUTCOME check above.
+const MULTI_STEP_ANSWER = /(?:并且|同時|同时|另外|以及|之后还|之後還|然后|然後|接着|接著|and also|also|then|plus|(?:^|\n)\s*\d+[.)、])/iu;
+const SHORT_CHAT = /^(?:(?:hello|hi|hey)(?:\s+there)?|good\s+(?:morning|afternoon|evening|night)|thanks|thank\s+you(?:\s+(?:very much|so much))?|ok(?:ay)?|谢谢|謝謝|好的|早安|晚安)[。.！!?？\s]*$/iu;
+const SHORT_INTRO = /^(?:(?:hello|hi|hey)[,\s]+)?(?:我是|我叫|my name is|i(?: am|'m))\s*[\p{L}\p{N}][\p{L}\p{N} _'-]{0,39}[。.！!?？\s]*$/iu;
+// A request to investigate remains work even if the user phrases it as a question. This affects
+// effort only; it does not change the engine's completion/side-effect authority classification.
+const INVESTIGATE_REQUEST = /^(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?(?:investigate|debug|diagnose|inspect|audit)\b|^(?:调查|調查|排查|诊断|診斷|审计|審計)/iu;
+
 
 /** Direct engine completion is limited to one stated outcome; richer tasks use explicit checks. */
 export function simpleChangeObjective(objective: string): boolean {
@@ -48,13 +57,26 @@ export function requestedReplyText(objective: string): string | null {
 
 export function answerQuestionObjective(objective: string): boolean {
   const question = answerQuestionText(objective);
-  return QUESTION.test(question) || CJK_ANSWER.test(question) || conversationalAnswerObjective(objective) || requestedReplyText(objective) !== null;
+  return QUESTION.test(question) || CJK_ANSWER.test(question) || SHORT_CHAT.test(question) || SHORT_INTRO.test(question)
+    || conversationalAnswerObjective(objective) || requestedReplyText(objective) !== null;
+}
+
+/** Deterministic Host intent from the original user objective, before any model response. */
+export function taskObjectiveIntent(objective: string): TaskBriefInput["intent"] {
+  return CHANGE.test(objective) ? "change" : answerQuestionObjective(objective) ? "answer" : "investigate";
+}
+
+/** The same Host classification, bounded to one short outcome for automatic reasoning. */
+export function simpleAnswerObjective(objective: string): boolean {
+  return taskObjectiveIntent(objective) === "answer" && !INVESTIGATE_REQUEST.test(answerQuestionText(objective))
+    && (conversationalAnswerObjective(objective)
+    || requestedReplyText(objective) !== null || objective.trim().length <= 400 && !MULTI_STEP_ANSWER.test(objective));
 }
 
 /** User wording supplies authority; the first model response supplies only a bounded execution hint. */
 export function engineTaskBrief(task: TaskExecution, firstReply: { text: string; toolUses: readonly { name: string }[] }): TaskBriefInput {
   const objective = task.objective.trim();
-  const intent = CHANGE.test(objective) ? "change" : answerQuestionObjective(objective) ? "answer" : "investigate";
+  const intent = taskObjectiveIntent(objective);
   const firstTool = firstReply.toolUses.find(item => item.name !== "task_intake")?.name;
   return {
     intent,

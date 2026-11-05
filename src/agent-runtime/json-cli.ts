@@ -24,7 +24,11 @@ export function jsonCliDriver(id: JsonCliRuntimeId, installer: WorkspaceRuntimeI
     const permit = options.workspaceRun;
     if (!permit || permit.binding.agent.runtimeId !== id || permit.binding.agent.taskId !== binding.taskId) return { status: "error", error: "Runtime requires its exact Workspace run permit" };
     const assertCurrent = () => assertWorkspaceRunAdmission(permit, options, id); assertCurrent();
-    const selection = models ? await models.launchSelection(id).catch(() => models.selection(id)) : null;
+    const objective = options.taskIntake?.task.objective ?? history.slice().reverse().find(message => message.role === "user")?.content ?? "";
+    const selection = models ? await models.launchSelection(id, objective).catch(() => {
+      const saved = models.selection(id); return { ...saved, effort: saved.effort === "auto" ? null : saved.effort };
+    }) : null;
+    assertCurrent();
     if (selection?.effort) return { status: "error", error: runtimeFailureMessage({ ...installer.failureContext(id), kind: "version_incompatible", elapsedMs: 0 }) };
     let policy: JsonCliPolicyHandle | undefined, directory: string | undefined, success: (() => void) | undefined;
     const native = createRegisteredCliMcpTurn({ signal: options.signal!, assertCurrent,
