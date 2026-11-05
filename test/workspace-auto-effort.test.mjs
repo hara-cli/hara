@@ -11,10 +11,10 @@ import { scriptedWorkspaceProvider } from "./fixtures/scripted-workspace-provide
 
 const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 test("auto reuses Host objective classification for short replies versus change/investigation/multiple outcomes", () => {
-  for (const objective of ["hello", "hello there", "Good morning!", "thanks", "谢谢", "早安", "你好", "你好，我是 Jeff", "Who are you?", "What is 2 + 2?", "只回复：“收到”"])
+  for (const objective of ["hello", "hello there", "hello, I'm Jeff", "Good morning!", "thanks", "谢谢", "早安", "你好", "你好，我是 Jeff", "Who are you?", "What is 2 + 2?", "只回复：“收到”"])
     for (const automatic of [undefined, null, "auto"])
       assert.equal(resolveReasoningEffort(automatic, levels, objective), "low", objective);
-  for (const objective of ["Update README", "修改文案", "Thanks, update README", "你好，请修改 note.txt", "Investigate a failing test", "Read the logs then summarize the error", "What is X and also explain Y?", "What " + "a".repeat(500) + "?"])
+  for (const objective of ["Update README", "修改文案", "Thanks, update README", "你好，请修改 note.txt", "你好，我是 Jeff，调查一下测试错误", "Investigate a failing test", "Read the logs then summarize the error", "What is X and also explain Y?", "What " + "a".repeat(500) + "?"])
     assert.equal(resolveReasoningEffort("auto", levels, objective), "medium", objective);
 });
 test("every explicit level survives automatic classification and no unsupported/high level is auto-invented", () => {

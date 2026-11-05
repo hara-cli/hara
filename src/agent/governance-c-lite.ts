@@ -17,6 +17,7 @@ const MULTI_OUTCOME = /(?:并且|同时|另外|以及|之后还|然后再|和|an
 // simple-change completion keeps its stricter MULTI_OUTCOME check above.
 const MULTI_STEP_ANSWER = /(?:并且|同時|同时|另外|以及|之后还|之後還|然后|然後|接着|接著|and also|also|then|plus|(?:^|\n)\s*\d+[.)、])/iu;
 const SHORT_CHAT = /^(?:(?:hello|hi|hey)(?:\s+there)?|good\s+(?:morning|afternoon|evening|night)|thanks|thank\s+you(?:\s+(?:very much|so much))?|ok(?:ay)?|谢谢|謝謝|好的|早安|晚安)[。.！!?？\s]*$/iu;
+const SHORT_INTRO = /^(?:(?:hello|hi|hey)[,\s]+)?(?:我是|我叫|my name is|i(?: am|'m))\s*[\p{L}\p{N}][\p{L}\p{N} _'-]{0,39}[。.！!?？\s]*$/iu;
 
 
 /** Direct engine completion is limited to one stated outcome; richer tasks use explicit checks. */
@@ -53,7 +54,7 @@ export function requestedReplyText(objective: string): string | null {
 
 export function answerQuestionObjective(objective: string): boolean {
   const question = answerQuestionText(objective);
-  return QUESTION.test(question) || CJK_ANSWER.test(question) || SHORT_CHAT.test(question)
+  return QUESTION.test(question) || CJK_ANSWER.test(question) || SHORT_CHAT.test(question) || SHORT_INTRO.test(question)
     || conversationalAnswerObjective(objective) || requestedReplyText(objective) !== null;
 }
 
