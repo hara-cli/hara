@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import {cliMcpFixture,until} from "./helpers/workspace-cli-mcp.mjs";
+import {cliMcpFixture,until,waitForNativeRetryWindow} from "./helpers/workspace-cli-mcp.mjs";
 const done=v=>["completed","blocked","paused","cancelled"].includes(v.conversation.state);
 const cold=v=>v.conversation.runtimeStages.at(-1).events.some(e=>e.kind==="cold_start");
 async function exchange(f,text){await f.send(text);return until(f.read,done);}
@@ -30,9 +30,10 @@ test("launcher resident still recycles on frozen tier change and failed native p
  await f.request("workspace.agents.setPermissionTier",{...f.scope,agentId:a.agentId,permissionTier:"controlled",configRevision:a.configRevision,agentEpoch:a.agentEpoch});
  assert.equal((await exchange(f,"List colleagues with controlled tier?")).conversation.state,"completed");const controlled=f.meta();
  assert.notEqual(controlled.pid,first.pid);assert.notEqual(controlled.url,first.url,"a new profile must not reinitialize the old MCP SDK session");assert.equal(starts(f).at(-1).params.threadId,starts(f)[1].params.threadId);
- f.mode({mode:"crash",launcher:true});assert.equal((await exchange(f,"List colleagues with a failed process?")).conversation.state,"blocked");
+ f.mode({mode:"crash",launcher:true});const failed=await exchange(f,"List colleagues with a failed process?");assert.equal(failed.conversation.state,"blocked");
  const before=f.native().filter(r=>r.method==="turn/start").length;assert.equal(before,3);
- f.mode({mode:"list",launcher:true});assert.equal((await exchange(f,"List colleagues after explicit recovery?")).conversation.state,"completed");
+ await waitForNativeRetryWindow(failed);assert.equal(f.native().filter(r=>r.method==="turn/start").length,before,"cooldown starts no inference");
+ f.mode({mode:"list",launcher:true});const recovered=await exchange(f,"List colleagues after explicit recovery?");assert.equal(recovered.conversation.state,"completed",recovered.conversation.blockReason);
  assert.notEqual(f.meta().pid,controlled.pid);assert.notEqual(f.meta().tokenFingerprint,controlled.tokenFingerprint);
  assert.equal(f.native().filter(r=>r.method==="turn/start").length,4);assert.equal(starts(f).filter(r=>r.method==="thread/start").length,1);
 });

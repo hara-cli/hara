@@ -78,3 +78,18 @@ export async function until(operation, accept, timeoutMs = 20000) {
   while (Date.now() < deadline) { const value = await operation(); if (accept(value)) return value; await new Promise(resolve => setTimeout(resolve, 60)); }
   throw new Error("bounded MCP fixture condition was not observed");
 }
+
+
+/** An explicit test message must wait for the observed admission deadline, never bypass cooldown.
+ * Faster Host preparation must not turn CPU/disk delay into the fixture's hidden timing dependency. */
+export async function waitForNativeRetryWindow(view) {
+  const match = /hara_runtime_failure_v1=(\{[^\n]+\})/.exec(view.conversation.blockReason ?? "");
+  if (!match) throw new Error("Expected the controlled native failure receipt before recovery");
+  const info = JSON.parse(match[1]);
+  if (!Number.isSafeInteger(info.retryAtMs) || info.retryAtMs < 0)
+    throw new Error("Invalid native retry deadline");
+  const delayMs = Math.max(0, info.retryAtMs - Date.now());
+  if (delayMs > 35000) throw new Error("Native retry deadline exceeds the bounded fixture window");
+  if (delayMs) await new Promise(resolve => setTimeout(resolve, delayMs + 2));
+  return info;
+}

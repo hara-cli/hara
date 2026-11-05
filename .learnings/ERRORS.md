@@ -11405,3 +11405,10 @@ A seventh failure exposed an old Pi Host fixture expecting unrelated inherited m
 
 
 The completed first full retained3938pass/8fail/3skip/0cancel at unchanged21dfa4c: six preload guards and two old Hello-memory expectations. The second fixture covers personal-global plus Workspace notes; now it explicitly checks Hello omits both, a matching question receives both complete note snippets, and private source paths stay hidden. Product src is unchanged by both fixture migrations. All original queues ended naturally; none were stopped.
+
+
+## 2026-11-05 — A8 speed exposed recovery fixtures relying on slow preparation
+
+A1+A8 full2 naturally completed3963pass/2fail/3skip/0cancel at clean4c2e4dc. Proper isolated-home fixed all six Serve guards and both memory migrations passed. Two native crash/recovery fixtures immediately resent while RuntimeLaunchCooldown's existing first-failure1second window was still active. Targeted diagnostic assertion messages reproduced both: controlled runtime_failed, elapsedMs0, consecutiveFailures1, retryAtMs still set. This is admission cooldown, not a DirectoryChainFence identity assertion; no ancestor rollback was called for.
+
+Fixtures now wait for the actual observed failure receipt's retryAtMs before an explicit new send, bound the wait to35seconds, and prove cooldown itself starts zero additional native inference. PID/bearer rotation, original thread start/resume counts and frozen tier assertions remain. Production src, cooldown, permissions and native responses are unchanged. Preserve the two-failure full and diagnostic logs; run clean-SHA final checks again.
