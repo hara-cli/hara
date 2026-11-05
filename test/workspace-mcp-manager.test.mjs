@@ -164,11 +164,18 @@ for (const runtime of ["codex", "claude"]) managedTest(`registered ${runtime} ad
   const revoked = runtime === "codex" ? observeCodexAttempts(t) : undefined;
   const f = await fixture(t), h = await hostFixture(t, f, { runtime, tier: "full-protected" });
   const started = h.host.start("client", h.id, h.main.agentId, "Read the synthetic plugin data.", randomUUID());
-  const card = await until(() => h.read().approvals.find(row => row.kind === "extension_call"), runtime + " external card").catch(error => {
+  const card = await until(() => {
+    const snapshot = h.read(), card = snapshot.approvals.find(row => row.kind === "extension_call");
+    if (!card && ["blocked", "cancelled", "completed"].includes(snapshot.conversation.state)) throw Error("Native fixture ended before the external card");
+    return card;
+  }, runtime + " external card").catch(error => {
     const snapshot = h.read(), file = h.command + ".meta.json";
     const meta = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
     throw Error(error.message + " " + JSON.stringify({ state: snapshot.conversation.state, taskState: snapshot.conversation.taskState,
-      blockReason: snapshot.conversation.blockReason, toolsListed: Boolean(meta.tools), mcpMethod: meta.mcpMethod, mcpStatus: meta.mcpStatus, refusedMcp: meta.refusedMcp, intake: meta.intake, plugin: meta.plugin }));
+      blockReason: snapshot.conversation.blockReason, toolsListed: Boolean(meta.tools), mcpMethod: meta.mcpMethod, mcpStatus: meta.mcpStatus, refusedMcp: meta.refusedMcp, intake: meta.intake, plugin: meta.plugin,
+      nativeMethods: fs.existsSync(h.command + ".rpc.jsonl") ? fs.readFileSync(h.command + ".rpc.jsonl", "utf8").trim().split("\\n").filter(Boolean).map(line => JSON.parse(line).method) : [],
+      nativeStateWritten: fs.existsSync(h.command + ".native.json"), metaWritten: fs.existsSync(file),
+      stages: snapshot.conversation.runtimeStages?.at(-1) }));
   });
   assert.equal(allCalls(h.host, h.id).length, 0); h.host.answerApproval("client", h.id, card.id, true); await h.host.wait(started.runId);
   const snapshot = h.read(), meta = JSON.parse(fs.readFileSync(h.command + ".meta.json", "utf8"));
