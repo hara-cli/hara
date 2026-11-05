@@ -11384,3 +11384,14 @@ The first proxy-identity build at06b2fdf caught two inventory adapters rebuildin
 
 ### Same-conversation cooldown retry fixture
 The second full suite at99f6542 naturally ended with exactly one failed legacy fixture: its supposed retry changed sessionId, so the now-isolated new conversation correctly did not inherit another conversation's cooldown. Retire the completed old physical permit, then create a new attempt with the SAME original conversation and a fresh runId. Preserve exact retryAtMs/consecutiveFailures and zero extra thread/start assertions. Original channel/DM isolation regression remains unchanged. No production source change; retain failed full2 and rerun the corrected direct fixture plus final full3 under original load/worker/timeout gates.
+
+
+## 2026-11-05 — A1 prefix stability and immutable prompt boundaries
+
+The old Workspace Host labelled an objective-dependent start packet, per-attempt retained references, and conditional complete creation card as static core. Same-text warm fixtures hid false standing refreshes. A1 splits immutable governance/session metadata/current-turn data without changing real Codex confinement/refresh contracts. New structured parts must be copied/frozen at bindWorkspaceRunOptions and checked by identity in assertWorkspaceRunAdmission just like systemOverride; negative replacement starts zero models.
+
+Initial A1 focus:63/64; diagnostic reproduced message1 (project context question) blocked with no completion because the synthetic runtime replied without any observed read. Kept N1/C-lite unchanged. The fixture now makes the original governed read for contextual answers/thanks, while the greeting stays on the existing narrow tool-free path. Do not loosen product completion to make a latency fixture green. Original failures retained under A1 task evidence/a1-prompt-focused-1 and a1-native-diagnostic-1.
+
+Tooling: nested JS raw templates containing TypeScript backticks or dollar-brace regex can fail before execution. Use non-interpolated placeholders or simple includes assertions, JSON-stringify Python payload only inside a quoted heredoc, and syntax-check fixtures. Discover filenames with rg --files/rg before reading; use the registered task root for evidence and source/core only for code to avoid guessed-path noise. No source or native process was changed by parse-only failures.
+
+After preserving both failures: unified focus2 passed91/91. Further reduced project hints to actual lexical hits, keeping explicit creation candidates. Build4 and final seven-file focus53/53 passed. Native five-message counts:1PID/1thread/1standingHash,0resume/0standing refresh, input1113/1177/1113/1614/4002bytes, complete current card once, original human approval/refusal enforced. Fixed-SHA final full still required; no real model calls.

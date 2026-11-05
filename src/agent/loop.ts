@@ -121,7 +121,8 @@ import {
   HEADLESS_USER_INPUT_REQUIRED,
   NO_INTERACTIVE_USER,
 } from "../tools/ask_user.js";
-import { PromptAssembler, type AssembledSystemPrompt } from "./prompt.js";
+import { WORKSPACE_WAKE_GOVERNANCE } from "../workspace/model-context.js";
+import { PromptAssembler, type AssembledSystemPrompt, type SystemPromptInput } from "./prompt.js";
 import { REFERENCE_CLARIFICATION_POLICY } from "./reference-clarification.js";
 import { runtimeTimePrompt, type RuntimeTimePromptOptions } from "../runtime-time.js";
 import {
@@ -573,12 +574,21 @@ export function composeSystem(
   runtimeTime?: RuntimeTimePromptOptions,
   scopedWorkspace = false,
   workspaceWakeContext?: string,
+  overrideParts?: readonly SystemPromptInput[],
 ): AssembledSystemPrompt {
   const assembler = new PromptAssembler();
-  assembler.add("core", "static", "core", override || HARA_SYSTEM());
+  // Validate Host-composed boundaries before merging with the engine tiers. Objective data
+  // cannot silently acquire a static label or reorder a malformed supplied prefix.
+  const supplied = new PromptAssembler();
+  for (const part of overrideParts ?? []) supplied.add(part.id, part.stability, part.source, part.content);
+  const suppliedParts = supplied.build().parts;
+  const staticParts = suppliedParts.filter(part => part.stability === "static");
+  if (!staticParts.length) assembler.add("core", "static", "core", override || HARA_SYSTEM());
+  for (const part of staticParts) assembler.add(part.id, part.stability, part.source, part.content);
   assembler.add("reference-clarification", "static", "core", REFERENCE_CLARIFICATION_POLICY);
+  if (scopedWorkspace) assembler.add("workspace-wake-governance", "static", "core", WORKSPACE_WAKE_GOVERNANCE);
   const skills = scopedWorkspace ? "" : skillsDigest(cwd);
-  const roles = scopedWorkspace || override ? "" : rolesDigest(cwd, profileId);
+  const roles = scopedWorkspace || override || overrideParts ? "" : rolesDigest(cwd, profileId);
   const checkpointContext = scopedWorkspace ? "" : taskCheckpointContext(intake?.checkpoint, intake?.decisions);
   const intakeContext = scopedWorkspace && workspaceWakeContext ? workspaceWakeContext : !intake?.enabled
     ? ""
@@ -642,8 +652,14 @@ export function composeSystem(
     .add("project", "session", "project", projectContext ? `# Project context (AGENTS.md)\n${projectContext}` : "")
     .add("memory", "session", "memory", memory ? `# Memory (durable — facts/decisions/prefs you've saved; use memory_search/get for more)\n${memory}` : "")
     .add("roles", "session", "role", roles ? `# Specialist roles (metadata only — use \`agent\` with a role id for bounded read-only expertise)\n${roles}` : "")
-    .add("skills", "session", "skill", skills ? `# Skills (capabilities you can load — call the \`skill\` tool with the id for full instructions before using one)\n${skills}` : "")
-    .add("task-intake", "turn", "task", intakeContext)
+    .add("skills", "session", "skill", skills ? `# Skills (capabilities you can load — call the \`skill\` tool with the id for full instructions before using one)\n${skills}` : "");
+  for (const part of suppliedParts.filter(part => part.stability === "session")) {
+    assembler.add(part.id, part.stability, part.source, part.content);
+  }
+  for (const part of suppliedParts.filter(part => part.stability === "turn")) {
+    assembler.add(part.id, part.stability, part.source, part.content);
+  }
+  assembler.add("task-intake", "turn", "task", intakeContext)
     .add("task-checkpoint", "turn", "task", checkpointContext)
     // Keep the changing clock at the very end: stable core/session prefixes remain cacheable, while every
     // provider request (including later tool rounds and a long-lived session's next turn) gets a fresh value.
@@ -720,6 +736,8 @@ export interface RunOpts {
   };
   /** role persona used instead of the default hara system prompt */
   systemOverride?: string;
+  /** Host-only replacement with explicit static/session/turn boundaries. Never model- or RPC-supplied. */
+  systemOverrideParts?: readonly SystemPromptInput[];
   /** Version of the Control bundle from which systemOverride/toolFilter were resolved. If a fresh policy
    * sync observes another version, halt this run instead of mixing an old persona with new authority. */
   organizationPolicyVersion?: number;
@@ -2039,6 +2057,7 @@ async function runAgentInner(
       undefined,
       Boolean(opts.workspaceRun),
       opts.workspaceRun ? prepareWorkspaceRunWakeBrief(opts.workspaceRun) : undefined,
+      opts.systemOverrideParts,
     );
     // Turn-tier parts (accepted brief, checkpoint, clock) change between provider requests. Left in the
     // system prompt they sit in FRONT of the whole conversation, so every request misses the provider's

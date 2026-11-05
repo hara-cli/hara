@@ -22,7 +22,7 @@ const temporary=[];
 after(()=>{for(const path of temporary)fs.rmSync(path,{recursive:true,force:true});});
 function dir(){const path=fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(),"hara-local-execution-")));temporary.push(path);return path;}
 const reply=text=>({text,toolUses:[],stop:"end",usage:{input:7,output:3}});
-function fixture(turn,extraTools=[],modelHistory){
+function fixture(turn,extraTools=[],modelHistory,systemOverrideParts){
  const home=dir(),project=dir(),catalog=new LocalWorkspaceCatalog(home),row=catalog.create("Personal",1);
  const resources=new WorkspaceResources(home,row.scope);resources.initialize();let main=resources.agents.initializeMain();
  main=resources.agents.setPermissionTier(main.agentId,"controlled",main.configRevision,main.agentEpoch);
@@ -42,7 +42,7 @@ function fixture(turn,extraTools=[],modelHistory){
   updateUsage(value){usage={...value};}});
  const input={ctx:{cwd:project,sessionId,todoScope:`local-${sessionId}`,sandbox:"off"},signal:controller.signal,
   approval:"auto-edit",approvalChannel:true,confirm:async()=>false,hooks:false,quiet:true,extraTools,
-  systemOverride:"You are the scoped Hara. Use only the supplied task and tools.",
+  systemOverride:"You are the scoped Hara. Use only the supplied task and tools.",systemOverrideParts,
   taskIntake:{task,current:()=>task,onUpdate(next){task=next;},onCheckpoint(next){task=next;},onRoundUsage(next){task=next;}}};
  const options=bindWorkspaceRunOptions(permit,input);
  return{home,project,catalog,row,resources,connections,storage,lease,controller,permit,options,input,binding,
@@ -228,4 +228,21 @@ for (const revoked of ["generation", "lease"]) test("MCP refuses a real Workspac
   if(original)fs.writeFileSync(marker,original,{mode:0o600});
   await client.close().catch(()=>{});await endpoint?.close();await a.close();
  }
+});
+
+
+test("structured prompt parts are immutable Host-owned permit input; substituted arrays start zero models", async () => {
+ const parts=[{id:"core",stability:"static",source:"core",content:"Pinned policy before admission"}];
+ const a=fixture(async args=>{assert.match(args.system,/Pinned policy before admission/);assert.doesNotMatch(args.system,/Changed after binding/);return reply("Hello");},[],undefined,parts);
+ try {
+  assert.equal(Object.isFrozen(a.options.systemOverrideParts),true);
+  assert.equal(Object.isFrozen(a.options.systemOverrideParts[0]),true);
+  assert.throws(()=>{a.options.systemOverrideParts[0].content="mutated";},TypeError);
+  parts[0].content="Changed after binding";
+  const forged={...a.options,systemOverrideParts:[...a.options.systemOverrideParts]};
+  const refused=await runConfiguredAgent([{role:"user",content:"hello"}],forged);
+  assert.equal(refused.status,"error");assert.match(refused.error,/trusted Host permit/);assert.equal(a.requests,0);
+  assert.equal((await runConfiguredAgent([{role:"user",content:"hello"}],a.options)).status,"completed");
+  assert.equal(a.requests,1);
+ }finally{await a.close();}
 });

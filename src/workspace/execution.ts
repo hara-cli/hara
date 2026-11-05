@@ -21,7 +21,7 @@ import { canonical } from "./local-state.js";
 import { workspaceStateHome, type WorkspaceResourceStorage } from "./resource-context.js";
 import { freezeWorkspaceRunBinding, workspaceFileIdMatches, workspaceRunBindingsEqual, workspaceRunMatchesTask, type WorkspaceRunBinding } from "./run-binding.js";
 import type { WorkspaceUsage } from "./conversations.js";
-import { workspaceTaskHistory, workspaceTaskProjection, workspaceWakeBrief, type WorkspaceContextStats } from "./model-context.js";
+import { workspaceTaskHistory, workspaceTaskProjection, workspaceWakeData, type WorkspaceContextStats } from "./model-context.js";
 import { historyChars } from "../agent/context-budget.js";
 import type { ToolResult } from "../providers/types.js";
 import type { WorkspaceContextObservation } from "./context-audit.js";
@@ -279,6 +279,8 @@ export function bindWorkspaceRunOptions(permit: WorkspaceRunPermit, input: Omit<
   const options: RunOpts = { ...input, ctx: Object.freeze({ ...input.ctx, stateHome: state.stateHome, writeBoundary: state.cwd,
     ...(input.ctx.ui ? { ui: Object.freeze({ ...input.ctx.ui }) } : {}) }),
     taskIntake: Object.freeze({ ...input.taskIntake }), extraTools: Object.freeze(extraTools) as unknown as Tool[],
+    systemOverrideParts: input.systemOverrideParts
+      ? Object.freeze(input.systemOverrideParts.map(part => Object.freeze({ ...part }))) : undefined,
     provider: state.provider, workspaceRun: permit, toolFilter: name => state.tools.has(name), autoContinue: false,
     maxRounds: permit.binding.budget.maxRounds, timeoutMs: permit.binding.budget.timeoutMs };
   state.options = options;
@@ -294,7 +296,8 @@ export function assertWorkspaceRunAdmission(permit: unknown, options: RunOpts, r
     || options.toolFilter !== pinned.toolFilter || options.hooks !== false || options.guardian || options.fallback
     || options.ctx.cwd !== state.cwd || options.ctx.sessionId !== binding.sessionId || options.ctx.stateHome !== state.stateHome
     || options.ctx.spaceId !== undefined || options.ctx.profileId !== undefined || options.signal !== state.signal
-    || options.systemOverride !== pinned.systemOverride || options.memory !== pinned.memory || options.projectContext !== pinned.projectContext
+    || options.systemOverride !== pinned.systemOverride || options.systemOverrideParts !== pinned.systemOverrideParts
+    || options.memory !== pinned.memory || options.projectContext !== pinned.projectContext
     || options.approval !== pinned.approval || options.approvalChannel !== pinned.approvalChannel || options.confirm !== pinned.confirm
     || options.ctx.ui !== pinned.ctx.ui || options.ctx.ask !== pinned.ctx.ask || options.ctx.todoScope !== pinned.ctx.todoScope
     || options.ctx.writeBoundary !== pinned.ctx.writeBoundary || options.ctx.spawn || options.ctx.agentTeam
@@ -371,7 +374,7 @@ export function prepareWorkspaceRunWakeBrief(permit: WorkspaceRunPermit): string
   const state = stateOf(permit); state.assertLive();
   const task = state.options?.taskIntake?.current?.() ?? state.options?.taskIntake?.task;
   if (!state.started || !task) throw new Error("Workspace wake context requires the governed task");
-  const brief = workspaceWakeBrief(task, state.modelHistory?.retain); state.wakeChars = brief.length; return brief;
+  const brief = workspaceWakeData(task, state.modelHistory?.retain); state.wakeChars = brief.length; return brief;
 }
 /** Called at a closed-history boundary, before another model request or tool batch. */
 export function workspaceRunQuestion(permit: WorkspaceRunPermit): WorkspaceUserQuestion | null {
