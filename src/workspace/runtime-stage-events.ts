@@ -1,3 +1,4 @@
+import { isSafeRuntimeTargetLabel } from "./runtime-tool-label.js";
 import { expandedExtensionsIsolation } from "../agent-runtime/expanded-isolation.js";
 // Observational metadata only. A record is provenance, never execution authority or a receipt
 // proving a tool's external effect. Only trusted Host composition supplies these identities.
@@ -24,11 +25,11 @@ export const RUNTIME_STAGE_ERROR_KINDS = [
   "runtime_permission_denied", "runtime_crashed", "project_not_trusted", "timeout", "spawn_failed", "runtime_failed",
 ] as const;
 export type RuntimeStageErrorKind = typeof RUNTIME_STAGE_ERROR_KINDS[number];
-export type RuntimeStageKind = "spawn" | "cold_start" | "first_token" | "first_output" | "model_roundtrip" | "tool_call" | "complete";
+export type RuntimeStageKind = "queued" | "retry" | "spawn" | "cold_start" | "first_token" | "first_output" | "model_roundtrip" | "tool_call" | "complete";
 export type RuntimeStageSource = "host" | "provider_stream" | "native_event";
 export type RuntimeStageOutcome = "completed" | "error" | "cancelled";
 export type RuntimeStageState = "running" | "completed" | "blocked" | "cancelled" | "error" | "incomplete";
-type SpanKind = Exclude<RuntimeStageKind, "first_token" | "first_output" | "complete">;
+type SpanKind = Exclude<RuntimeStageKind, "first_token" | "first_output" | "complete" | "retry">;
 export interface RuntimeStageIdentity {
   workspaceId: string;
   resourceGeneration: string;
@@ -45,6 +46,7 @@ export interface RuntimeStageRuntime {
   loginSource: "host" | "isolated" | "unknown";
   model: string | null;
   effort: string | null;
+  effortSource?: "auto" | "user" | "default";
 }
 export interface RuntimeStageEvent {
   seq: number;
@@ -54,6 +56,7 @@ export interface RuntimeStageEvent {
   durationMs: number | null;
   call: number | null;
   toolName: string | null;
+  targetLabel?: string;
   outcome: RuntimeStageOutcome | null;
   source: RuntimeStageSource;
   errorKind: RuntimeStageErrorKind | null;
@@ -74,17 +77,18 @@ export interface RuntimeStageReport extends RuntimeStageIdentity {
   errorKind: RuntimeStageErrorKind | null;
   events: RuntimeStageEvent[];
   droppedEvents: number;
+  contextTokens?: number;
 }
 export interface RuntimeStageExportReceipt { fileName: string; path: string; bytes: number; sha256: string }
 const identityKeys = ["workspaceId", "resourceGeneration", "agentId", "sessionId", "runId", "attemptId", "historyStart"] as const;
 const runtimeKeys = ["id", "version", "loginSource", "model", "effort"] as const;
 const eventKeys = ["seq", "kind", "phase", "offsetMs", "durationMs", "call", "toolName", "outcome", "source", "errorKind"] as const;
 const reportKeys = ["schemaVersion", ...identityKeys, "runtime", "state", "durationMs", "errorKind", "events", "droppedEvents"] as const;
-const stages: readonly string[] = ["spawn", "cold_start", "first_token", "first_output", "model_roundtrip", "tool_call", "complete"];
+const stages: readonly string[] = ["queued", "retry", "spawn", "cold_start", "first_token", "first_output", "model_roundtrip", "tool_call", "complete"];
 const states: readonly string[] = ["running", "completed", "blocked", "cancelled", "error", "incomplete"];
 const outcomes: readonly string[] = ["completed", "error", "cancelled"];
 const sources: readonly string[] = ["host", "provider_stream", "native_event"];
-const spanKinds: readonly string[] = ["spawn", "cold_start", "model_roundtrip", "tool_call"];
+const spanKinds: readonly string[] = ["queued", "spawn", "cold_start", "model_roundtrip", "tool_call"];
 const integer = (value: unknown, maximum = MAX_COUNTER): value is number => Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= maximum;
 const errorKind = (value: unknown): value is RuntimeStageErrorKind => typeof value === "string" && (RUNTIME_STAGE_ERROR_KINDS as readonly string[]).includes(value);
 const nullableError = (value: unknown): value is RuntimeStageErrorKind | null => value === null || errorKind(value);
@@ -117,23 +121,27 @@ export function projectRuntimeStageRuntime(input: RuntimeStageRuntime): RuntimeS
   return { id: input.id, version: safeVersion(input.version),
     ...(expandedExtensionsIsolation(input.id) ? { extensionsIsolation: "inherited" as const } : {}),
     loginSource: input.loginSource === "host" || input.loginSource === "isolated" ? input.loginSource : "unknown",
-    model: safeModel(input.model), effort: safeEffort(input.effort) };
+    model: safeModel(input.model), effort: safeEffort(input.effort),
+    ...(["auto", "user", "default"].includes(input.effortSource ?? "") ? { effortSource: input.effortSource } : {}) };
 }
 function validRuntime(value: unknown): value is RuntimeStageRuntime {
-  if (!plain(value) || !exact(value, [...runtimeKeys, ...(Object.hasOwn(value, "extensionsIsolation") ? ["extensionsIsolation"] : [])]) || !isAgentRuntimeId(value.id)) return false;
+  if (!plain(value) || !exact(value, [...runtimeKeys, ...(Object.hasOwn(value, "extensionsIsolation") ? ["extensionsIsolation"] : []), ...(Object.hasOwn(value, "effortSource") ? ["effortSource"] : [])]) || !isAgentRuntimeId(value.id)) return false;
   return (!Object.hasOwn(value, "extensionsIsolation") || value.extensionsIsolation === "inherited" && expandedExtensionsIsolation(value.id) === "inherited")
     && (value.version === null || safeVersion(value.version) === value.version)
     && ["host", "isolated", "unknown"].includes(String(value.loginSource))
     && (value.model === null || safeModel(value.model) === value.model)
-    && (value.effort === null || safeEffort(value.effort) === value.effort);
+    && (value.effort === null || safeEffort(value.effort) === value.effort)
+    && (!Object.hasOwn(value, "effortSource") || ["auto", "user", "default"].includes(String(value.effortSource)));
 }
 function validEvent(value: unknown): value is RuntimeStageEvent {
-  if (!plain(value) || !exact(value, eventKeys) || !integer(value.seq) || value.seq === 0
+  if (!plain(value) || !exact(value, [...eventKeys, ...(Object.hasOwn(value, "targetLabel") ? ["targetLabel"] : [])]) || !integer(value.seq) || value.seq === 0
     || !stages.includes(String(value.kind)) || !["start", "end", "mark"].includes(String(value.phase))
     || !duration(value.offsetMs) || !(value.durationMs === null || duration(value.durationMs))
     || !(value.call === null || integer(value.call) && value.call > 0)
     || !(value.toolName === null || toolName(value.toolName))
     || !(value.outcome === null || outcomes.includes(String(value.outcome))) || !source(value.source) || !nullableError(value.errorKind)) return false;
+  if (Object.hasOwn(value, "targetLabel") && (value.kind !== "tool_call" || !isSafeRuntimeTargetLabel(value.targetLabel))) return false;
+  if (value.kind === "queued" && (value.call !== null || value.toolName !== null || value.source !== "host")) return false;
   if (value.durationMs !== null && value.durationMs > value.offsetMs) return false;
   if (spanKinds.includes(String(value.kind))) {
     if (value.phase === "mark") return false;
@@ -141,16 +149,18 @@ function validEvent(value: unknown): value is RuntimeStageEvent {
       : value.durationMs !== null && value.outcome !== null;
   }
   if (value.phase !== "mark" || value.call !== null || value.toolName !== null) return false;
+  if (value.kind === "retry") return value.durationMs === null && value.outcome === null && value.source === "host" && value.errorKind !== null;
   if (value.kind === "complete") return value.outcome !== null && value.durationMs !== null && value.source === "host";
   return value.durationMs === null && value.outcome === null && value.errorKind === null
     && (value.kind === "first_output" || value.source !== "host");
 }
 /** Exact wire validation also applies on disk reads and again before exporting. */
 export function parseRuntimeStageReport(value: unknown): RuntimeStageReport {
-  if (!plain(value) || !exact(value, [...reportKeys, ...(Object.hasOwn(value, "provenance") ? ["provenance"] : [])])
+  if (!plain(value) || !exact(value, [...reportKeys, ...(Object.hasOwn(value, "provenance") ? ["provenance"] : []), ...(Object.hasOwn(value, "contextTokens") ? ["contextTokens"] : [])])
     || Object.hasOwn(value, "provenance") && !validProvenance(value.provenance) || value.schemaVersion !== 1 || !validIdentity(value)
     || !validRuntime(value.runtime) || !states.includes(String(value.state))
     || !(value.durationMs === null || duration(value.durationMs)) || !nullableError(value.errorKind)
+    || Object.hasOwn(value, "contextTokens") && !integer(value.contextTokens, 1_000_000_000)
     || !integer(value.droppedEvents) || !Array.isArray(value.events) || value.events.length > MAX_RUNTIME_STAGE_EVENTS
     || !value.events.every(validEvent)) return invalid();
   const events = value.events as RuntimeStageEvent[];
@@ -206,19 +216,32 @@ export class RuntimeStageRecorder {
   }
   setRuntime(input: Partial<RuntimeStageRuntime>): void {
     if (this.closed) return;
-    if (!plain(input) || Object.keys(input).some(key => !(runtimeKeys as readonly string[]).includes(key))
+    if (!plain(input) || Object.keys(input).some(key => ![...runtimeKeys, "effortSource"].includes(key))
       || input.id !== undefined && input.id !== this.report.runtime.id) return invalid();
     this.report.runtime = projectRuntimeStageRuntime({ ...this.report.runtime, ...input });
   }
-  beginEvent(kind: SpanKind, input: { call?: number; toolName?: string; source?: RuntimeStageSource } = {}):
+  setContextTokens(tokens: number): void {
+    if (this.closed) return;
+    if (!integer(tokens, 1_000_000_000)) return invalid();
+    this.report.contextTokens = tokens;
+  }
+  markRetry(error: RuntimeStageErrorKind): void {
+    if (this.closed) return;
+    if (!errorKind(error)) return invalid();
+    this.append({ kind: "retry", phase: "mark", offsetMs: this.offset(), durationMs: null, call: null, toolName: null, outcome: null, source: "host", errorKind: error });
+  }
+  beginEvent(kind: SpanKind, input: { call?: number; toolName?: string; source?: RuntimeStageSource; targetLabel?: string } = {}):
     (outcome?: RuntimeStageOutcome, error?: RuntimeStageErrorKind | null) => void {
     if (this.closed) return () => {};
-    if (!spanKinds.includes(kind) || !plain(input) || Object.keys(input).some(key => !["call", "toolName", "source"].includes(key))
+    if (!spanKinds.includes(kind) || !plain(input) || Object.keys(input).some(key => !["call", "toolName", "source", "targetLabel"].includes(key))
       || input.call !== undefined && (!integer(input.call) || input.call === 0)
       || input.toolName !== undefined && !toolName(input.toolName)
-      || input.source !== undefined && !source(input.source)) return invalid();
+      || input.source !== undefined && !source(input.source)
+      || input.targetLabel !== undefined && (kind !== "tool_call" || !isSafeRuntimeTargetLabel(input.targetLabel))
+      || kind === "queued" && (input.call !== undefined || input.toolName !== undefined || input.source !== undefined && input.source !== "host")) return invalid();
     const started = this.offset(), call = input.call ?? null, name = input.toolName ?? null, origin = input.source ?? "host";
-    this.append({ kind, phase: "start", offsetMs: started, durationMs: null, call, toolName: name,
+    const target = input.targetLabel === undefined ? {} : { targetLabel: input.targetLabel };
+    this.append({ kind, phase: "start", offsetMs: started, durationMs: null, call, toolName: name, ...target,
       outcome: null, source: origin, errorKind: null });
     let ended = false;
     return (outcome = "completed", error = null): void => {
@@ -226,7 +249,7 @@ export class RuntimeStageRecorder {
       if (!outcomes.includes(outcome)) return invalid();
       ended = true;
       const offsetMs = this.offset();
-      this.append({ kind, phase: "end", offsetMs, durationMs: offsetMs - started, call, toolName: name,
+      this.append({ kind, phase: "end", offsetMs, durationMs: offsetMs - started, call, toolName: name, ...target,
         outcome, source: origin, errorKind: error === null ? null : errorKind(error) ? error : "runtime_failed" });
     };
   }

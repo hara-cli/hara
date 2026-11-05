@@ -1380,7 +1380,8 @@ export class LocalWorkspaceHost {
           agentId, sessionId: store.sessionId, runId: binding.runId, attemptId: lease.attemptId, historyStart: modelHistoryStart },
         { id: binding.agent.runtimeId, version: null, loginSource: "unknown",
           model: binding.agent.runtimeId === "pi" ? binding.connection.model : null,
-          effort: binding.agent.runtimeId === "pi" ? providerConnection.reasoning : null },
+          effort: binding.agent.runtimeId === "pi" ? providerConnection.reasoning : null,
+          ...(binding.agent.runtimeId === "pi" ? { effortSource: binding.connection.reasoning && binding.connection.reasoning !== "auto" ? "user" as const : "auto" as const } : {}) },
         { provenance: { startedAt: value.attempt!.startedAt, coreInstanceId: this.runtimeStageCoreInstance } });
         this.saveRuntimeStages(owned, true);
       } catch { /* No diagnostic initialization may change a durably accepted execution. */ }

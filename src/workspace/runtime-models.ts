@@ -301,11 +301,12 @@ export class WorkspaceRuntimeModels {
   }
   /** Freeze this request's actual effort. Only inventory is cached; fixed settings pass through.
    * Missing/null/auto settings are classified locally and never persisted as a fixed level. */
-  async launchSelection(runtimeId: OptionalRuntimeId, objective = ""): Promise<{ modelId: string | null; effort: string | null }> {
+  async launchSelection(runtimeId: OptionalRuntimeId, objective = ""): Promise<{ modelId: string | null; effort: string | null; effortSource: "auto" | "user" | "default" }> {
     this.bound(runtimeId);
     const row = this.state.read().selections.find(value => value.runtimeId === runtimeId);
+    const effortSource = ["codex", "claude", "copilot"].includes(runtimeId) ? row?.selectedEffort != null && row.selectedEffort !== "auto" ? "user" as const : "auto" as const : "default" as const;
     if (row?.selectedEffort != null && row.selectedEffort !== "auto")
-      return { modelId: row.selectedModelId, effort: row.selectedEffort };
+      return { modelId: row.selectedModelId, effort: row.selectedEffort, effortSource };
     // The first lookup needs the live inventory; repeating app-server model/list on every chat
     // would add a second native process to the latency path. Reuse only for this bound runtime
     // identity and state revision. A failed lookup is retried on the next attempt.
@@ -330,7 +331,7 @@ export class WorkspaceRuntimeModels {
     }
     const selected = await choice;
     this.bound(runtimeId);
-    return { modelId: selected.modelId, effort: resolveReasoningEffort(row?.selectedEffort, selected.levels, objective) };
+    return { modelId: selected.modelId, effort: resolveReasoningEffort(row?.selectedEffort, selected.levels, objective), effortSource };
   }
   selected(runtimeId: OptionalRuntimeId): string | null { return this.selection(runtimeId).modelId; }
   selectedEffort(runtimeId: OptionalRuntimeId): string | null { return this.selection(runtimeId).effort; }

@@ -3705,7 +3705,7 @@ async function runAgentInner(
         const asyncAsk = opts.workspaceRun && p.tool === askUserTool && isAsyncWorkspaceAsk(p.tu.input) && !askUserRequestsCredential(p.tu.input);
         const physicalTool = opts.workspaceRun
           ? executeWorkspaceTool(opts.workspaceRun, p.tool!.name, asyncAsk ? async () => postAsyncWorkspaceAsk(opts.workspaceRun!, p.tu.input)
-            : () => p.tool!.run(p.tu.input, executionToolCtx), () => structuredToolError)
+            : () => p.tool!.run(p.tu.input, executionToolCtx), () => structuredToolError, p.tu.input)
           : p.tool!.run(p.tu.input, executionToolCtx);
         const observedTool = physicalTool.then(
           (value) => { settled = { ok: true, value }; return value; },

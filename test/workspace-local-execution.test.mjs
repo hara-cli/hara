@@ -1,3 +1,5 @@
+import { MessageTimingRecorder } from "../dist/workspace/message-timing.js";
+import { RuntimeStageRecorder } from "../dist/workspace/runtime-stage-events.js";
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -11,7 +13,7 @@ import { WorkspaceResources } from "../dist/workspace/resources.js";
 import { WorkspaceConnectionStoreV2 } from "../dist/workspace/connections.js";
 import { captureWorkspaceProjectIdentity, freezeWorkspaceRunBinding, workspaceAgentBindingHash } from "../dist/workspace/run-binding.js";
 import { WorkspaceSessionLease } from "../dist/workspace/session-lease.js";
-import { createWorkspaceRunPermit, bindWorkspaceRunOptions, beginWorkspaceGovernedRun, closeWorkspaceRunPermit, executeWorkspaceTool, prepareWorkspaceRunHistory } from "../dist/workspace/execution.js";
+import { createWorkspaceRunPermit, bindWorkspaceRunOptions, beginWorkspaceGovernedRun, closeWorkspaceRunPermit, executeWorkspaceTool, prepareWorkspaceRunHistory, observeWorkspaceMessageTiming } from "../dist/workspace/execution.js";
 import { WorkspaceExecutionAudit } from "../dist/workspace/execution-audit.js";
 import { createTaskExecution, finishTaskExecution } from "../dist/session/task.js";
 import { runConfiguredAgent, bindNewAgentTask } from "../dist/agent-runtime/dispatch.js";
@@ -22,7 +24,7 @@ const temporary=[];
 after(()=>{for(const path of temporary)fs.rmSync(path,{recursive:true,force:true});});
 function dir(){const path=fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(),"hara-local-execution-")));temporary.push(path);return path;}
 const reply=text=>({text,toolUses:[],stop:"end",usage:{input:7,output:3}});
-function fixture(turn,extraTools=[],modelHistory,systemOverrideParts){
+function fixture(turn,extraTools=[],modelHistory,systemOverrideParts,observation={}){
  const home=dir(),project=dir(),catalog=new LocalWorkspaceCatalog(home),row=catalog.create("Personal",1);
  const resources=new WorkspaceResources(home,row.scope);resources.initialize();let main=resources.agents.initializeMain();
  main=resources.agents.setPermissionTier(main.agentId,"controlled",main.configRevision,main.agentEpoch);
@@ -38,7 +40,7 @@ function fixture(turn,extraTools=[],modelHistory,systemOverrideParts){
  let requests=0,usage={modelCalls:0,toolCalls:0,inputTokens:0,outputTokens:0};
  const permit=createWorkspaceRunPermit({binding,catalog,resources,storage,connections,lease,cwd:project,signal:controller.signal,
   provider:{id:"openai",model:binding.connection.model,async turn(args){requests++;return turn(args,requests);}},
-  toolNames:["task_intake","task_checkpoint","todo_write",...extraTools.map(tool=>tool.name)],usage,modelHistory,
+  toolNames:["task_intake","task_checkpoint","todo_write",...extraTools.map(tool=>tool.name)],usage,modelHistory,...observation,
   updateUsage(value){usage={...value};}});
  const input={ctx:{cwd:project,sessionId,todoScope:`local-${sessionId}`,sandbox:"off"},signal:controller.signal,
   approval:"auto-edit",approvalChannel:true,confirm:async()=>false,hooks:false,quiet:true,extraTools,
@@ -245,4 +247,19 @@ test("structured prompt parts are immutable Host-owned permit input; substituted
   assert.equal((await runConfiguredAgent([{role:"user",content:"hello"}],a.options)).status,"completed");
   assert.equal(a.requests,1);
  }finally{await a.close();}
+});
+test("T8 publishes once before T9 and ignores aborted or retired observers",async()=>{
+ let now=100,pushes=0;const timing=new MessageTimingRecorder({receivedAt:100,now:()=>now});
+ const f=fixture(async()=>reply("fixture"),[],undefined,undefined,{messageTiming:timing,onRuntimeStageChanged(){pushes++;}});
+ const id={workspaceId:"ws_"+randomUUID(),resourceGeneration:randomUUID(),agentId:"ag_"+randomUUID(),sessionId:randomUUID(),runId:randomUUID(),attemptId:randomUUID(),historyStart:0};
+ // The recorder's own closed identity is unrelated to the notification authority.
+ try{now=180;observeWorkspaceMessageTiming(f.permit,"T8",now);assert.equal(pushes,1);assert.equal(timing.snapshot(id).points.T8,80);assert.equal(timing.snapshot(id).points.T9,null);
+ observeWorkspaceMessageTiming(f.permit,"T8",200);assert.equal(pushes,1);f.controller.abort();observeWorkspaceMessageTiming(f.permit,"T8",210);assert.equal(pushes,1);
+ timing.finish();assert.equal(timing.snapshot(id).points.T9,80);
+ }finally{await f.close();}observeWorkspaceMessageTiming(f.permit,"T8",220);assert.equal(pushes,1);
+});
+test("actual provider retry and context usage are observed without another model call",async()=>{
+ const stage=new RuntimeStageRecorder({workspaceId:"ws_"+randomUUID(),resourceGeneration:randomUUID(),agentId:"ag_"+randomUUID(),sessionId:randomUUID(),runId:randomUUID(),attemptId:randomUUID(),historyStart:0},{id:"pi",version:null,loginSource:"unknown",model:null,effort:null});
+ const f=fixture(async args=>{args.onRetry?.({provider:"openai",model:"fixture",attempt:1,nextAttempt:2,kind:"timeout",delayMs:0,elapsedMs:1});return reply("done");},[],undefined,undefined,{runtimeStages:stage});
+ try{await runPiAgent([{role:"user",content:"hello"}],f.options);assert.equal(f.requests,1);assert.equal(stage.snapshot().contextTokens,7);assert.deepEqual(stage.snapshot().events.filter(e=>e.kind==="retry").map(e=>e.errorKind),["timeout"]);}finally{await f.close();}
 });

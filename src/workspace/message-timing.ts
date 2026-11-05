@@ -50,10 +50,11 @@ export class MessageTimingRecorder {
     }
   }
   private now(): number { return (this.options.now ?? performance.now.bind(performance))(); }
-  mark(point: Exclude<MessageTimingPoint, "T0" | "T1" | "T7">, at = this.now()): void {
-    if (this.ended || !MESSAGE_TIMING_POINTS.includes(point) || this.points[point] !== null || !Number.isFinite(at)) return;
+  mark(point: Exclude<MessageTimingPoint, "T0" | "T1" | "T7">, at = this.now()): boolean {
+    if (this.ended || !MESSAGE_TIMING_POINTS.includes(point) || this.points[point] !== null || !Number.isFinite(at)) return false;
     const offset = Math.floor(at - this.began);
-    if (offset >= 0 && offset <= LIMIT) this.points[point] = offset;
+    if (offset >= 0 && offset <= LIMIT) { this.points[point] = offset; return true; }
+    return false;
   }
   paint(input: MessageTimingInput): boolean {
     const value = parseMessageTimingInput(input);

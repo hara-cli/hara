@@ -1,3 +1,4 @@
+import { runtimeToolTargetLabel } from "./runtime-tool-label.js";
 import type { MessageTimingPoint, MessageTimingRecorder } from "./message-timing.js";
 import { runtimeStageErrorKind } from "../agent-runtime/stage-observer.js";
 import { decorateWorkspaceExtensionTool, isWorkspaceExtensionTool } from "./extension-binding.js";
@@ -227,7 +228,9 @@ export function createWorkspaceRunPermit(input: {
           if (now - lastActivityAt < 50) return;
           lastActivityAt = now; forwardActivity();
         }, onRetry: forward((event: ProviderRetryEvent) => {
-          state.audit.retry(auditIndex, event); args.onRetry?.(event);
+          state.audit.retry(auditIndex, event);
+          runtimeStageObserve(state, () => state.runtimeStages?.markRetry(event.kind === "rate_limit" ? "runtime_rate_limit" : event.kind === "timeout" ? "timeout" : "runtime_network"));
+          args.onRetry?.(event);
         }) };
       const operation = Promise.resolve().then(() => { assertLive(); if (guardedArgs.signal.aborted) throw new Error("Workspace model cancelled"); return state.runtimeModel ? state.runtimeModel(guardedArgs) : input.provider.turn(guardedArgs); });
       try {
@@ -237,6 +240,7 @@ export function createWorkspaceRunPermit(input: {
         finally { input.observeContext?.({ ...observation, input: result.usage?.input ?? null, output: result.usage?.output ?? null,
           inputWarning: (result.usage?.input ?? 0) > 12000 }); }
         assertLive();
+        if (result.usage && Number.isSafeInteger(result.usage.input) && result.usage.input >= 0) runtimeStageObserve(state, () => state.runtimeStages?.setContextTokens(result.usage!.input));
         if (binding.budget.mode !== "interactive" && state.usage.inputTokens + state.usage.outputTokens > binding.budget.maxTokens) {
           errorKind = "budget_exhausted"; throw new Error("Workspace token telemetry safety ceiling reached");
         }
@@ -436,7 +440,7 @@ export function workspaceRunAsyncAnswers(permit: WorkspaceRunPermit): NeutralMsg
 export function workspaceRunBeginToolBatch(permit: WorkspaceRunPermit, names: readonly string[]): void {
   stateOf(permit).interaction?.beginBatch(names);
 }
-export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string, execute: () => Promise<T>, toolFailed?: (result: T) => boolean): Promise<T> {
+export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string, execute: () => Promise<T>, toolFailed?: (result: T) => boolean, toolInput?: unknown): Promise<T> {
   const state = stateOf(permit); state.assertLive();
   // Serialize the governed dispatch boundary, including read lookups. A third queued search or a
   // sibling write cannot run past the second result that required a real user's answer.
@@ -447,7 +451,8 @@ export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string
     state.interaction?.admit(name);
     publishUsage(state, { toolCalls: 1 });
     const auditIndex = state.audit.start("tool", state.usage.toolCalls, name), callStarted = performance.now();
-    const endStage = runtimeStageObserve(state, () => state.runtimeStages?.beginEvent("tool_call", { call: state.usage.toolCalls, toolName: name }));
+    const targetLabel = runtimeToolTargetLabel(name, toolInput);
+    const endStage = runtimeStageObserve(state, () => state.runtimeStages?.beginEvent("tool_call", { call: state.usage.toolCalls, toolName: name, ...(targetLabel ? { targetLabel } : {}) }));
     let outcome: "completed" | "error" | "cancelled" = "error", errorKind: WorkspaceExecutionError = "thrown";
     try {
       state.assertLive(); const result = await execute();
@@ -482,7 +487,11 @@ export async function closeWorkspaceRunPermit(permit: WorkspaceRunPermit): Promi
 /** Observation only. Callers retain the original live checks at protected boundaries. */
 export function observeWorkspaceMessageTiming(permit: WorkspaceRunPermit, point: Exclude<MessageTimingPoint, "T0" | "T1" | "T7">, at?: number): void {
   const state = stateOf(permit);
-  if (!state.retired && !state.signal.aborted) try { state.messageTiming?.mark(point, at); } catch { /* Optional diagnostics. */ }
+  if (!state.retired && !state.signal.aborted) try {
+    const observed = state.messageTiming?.mark(point, at);
+    // T8 is a live observation, not durable completion. Publish it before the T9 drain/commit.
+    if (point === "T8" && observed) state.onRuntimeStageChanged?.();
+  } catch { /* Optional diagnostics. */ }
 }
 
 /** Diagnostics never confer execution authority or make an observer failure a task failure. */
