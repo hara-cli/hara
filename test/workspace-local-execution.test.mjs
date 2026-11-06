@@ -17,7 +17,7 @@ import { createWorkspaceRunPermit, bindWorkspaceRunOptions, beginWorkspaceGovern
 import { WorkspaceExecutionAudit } from "../dist/workspace/execution-audit.js";
 import { createTaskExecution, finishTaskExecution } from "../dist/session/task.js";
 import { runConfiguredAgent, bindNewAgentTask } from "../dist/agent-runtime/dispatch.js";
-import { runAgent } from "../dist/agent/loop.js";
+import { runAgent, deadlineCheckpointReminder, taskRoundCheckpointReminder } from "../dist/agent/loop.js";
 import { runPiAgent } from "../dist/agent-runtime/pi.js";
 
 const temporary=[];
@@ -266,8 +266,8 @@ test("actual provider retry and context usage are observed without another model
 
 
 for (const [kind, reminder] of [
-  ["deadline", "Deadline checkpoint: wrap up the current work and verify the result."],
-  ["task checkpoint", "Task-round checkpoint: verify evidence before continuing the current strategy."],
+  ["deadline", deadlineCheckpointReminder(60000)],
+  ["task checkpoint", taskRoundCheckpointReminder(8, 12)],
   ["progress", "No-progress checkpoint: inspect observed artifacts and record a verified next step."],
 ]) test(`Pi keeps ${kind} feedback in all three later requests without durable reminders`, async () => {
   const { pushReminder, disposeReminderScope } = await import("../dist/agent/reminders.js");

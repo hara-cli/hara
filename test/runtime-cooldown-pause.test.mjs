@@ -8,8 +8,8 @@ test("an immediate cached resume-timeout retry retains its recoverable native pa
   tracker.failed("timeout", 11000, undefined, { rpcMethod: "thread/resume", rpcTimeoutMs: 10000 });
   assert(tracker.blocked());
   const controller = new AbortController(); let calls = 0;
-  const turn = createRegisteredCliMcpTurn({ model: "fixture", signal: controller.signal,
-    async startEndpoint() { return { url: "http://127.0.0.1:1", env: {}, close: async () => {} }; },
+  const turn = createRegisteredCliMcpTurn({ model: "fixture", signal: controller.signal, assertCurrent() {},
+    async createEndpoint() { return { url: "http://127.0.0.1:1", env: {}, close: async () => {} }; },
     async launch() { calls++; return { ok: false, code: null, timedOut: false, stdout: "", runtimeFailure: tracker.blocked(), ...tracker.blockedNativeMetadata() }; } });
   try {
     const result = await turn.turn({ system: "fixture", history: [{ role: "user", content: "retry" }], tools: [], signal: controller.signal });
