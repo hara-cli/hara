@@ -2679,7 +2679,9 @@ async function runAgentInner(
       if (freshTaskCompletion(intakeTask)) {
         // The normal final-response branch below now sees a durable verified completion.
       } else if (successfulOwnedActionObserved) {
-        if (r.nativeContinuation === "unavailable") return { status: "halted", stopReason: "completion_verification" };
+        // A terminal native run already returned an action result (including a declined card).
+        // Keep verification resumable; the prose-only follow-up must not replay that operation.
+        if (r.nativeContinuation !== undefined) return { status: "halted", stopReason: "completion_verification" };
         if (completionReceiptRetries < 1) {
           completionReceiptRetries += 1;
           history.pop();

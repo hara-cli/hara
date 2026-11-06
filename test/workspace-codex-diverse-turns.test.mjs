@@ -30,6 +30,10 @@ test("five different governed messages keep one loaded Codex thread, bounded gre
     }
     const view = await until(f.read, done);
     if (i < messages.length - 1) assert.equal(view.conversation.state, "completed", JSON.stringify({ messageIndex: i, blockReason: view.conversation.blockReason, completion: view.conversation.completion }));
+    else {
+      assert.equal(view.conversation.taskState, "paused", "a declined card stays uncompleted without another native follow-up");
+      assert.doesNotMatch(view.conversation.blockReason ?? "", /runtime_failed|Native CLI ended|hara_runtime_failure_v1/);
+    }
     assert.equal(view.agents.length, 1);
     hashes.push(standingState(f).standingPromptHash); pids.push(f.meta().pid);
   }
