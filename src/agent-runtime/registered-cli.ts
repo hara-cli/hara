@@ -114,7 +114,7 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
           const resolved = installer.resolveBound(id), started = Date.now();
           const tracker = runtimeFailureTracker(installer, id, permit.binding.agent.agentId,
             JSON.stringify([resolved.command, resolved.loginSource, resolved.env.HOME, installer.proxy.read().revision, permit.binding.agent.configRevision, model, effort]), resolved, permit.binding.sessionId);
-          const held = tracker.blocked(); if (held) return { ok: false, stdout: "", code: null, timedOut: false, runtimeFailure: held, ...tracker.blockedNativeMetadata() };
+          const held = tracker.blockedNativeResult(); if (held) return { ok: false, stdout: "", code: null, timedOut: false, ...held };
           try {
             const result = await session.launch(endpoint, prompt, turnArgs, { model, effort, cwd: options.ctx.cwd, signal: native.signal, assertCurrent, activity });
             if (!result.ok) return native.signal.aborted || result.errorCode === "interrupted" ? result : { ...result,

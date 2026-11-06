@@ -1,5 +1,5 @@
 import { runtimeErrorFirstLine } from "../security/runtime-error.js";
-import { RuntimeLaunchCooldown, runtimeFailureMessage, runtimeRpcDiagnostic, type RuntimeRpcDiagnostic, type RuntimeFailureContext, type RuntimeFailureKind } from "./failure-diagnostics.js";
+import { RuntimeLaunchCooldown, runtimeFailureMessage, runtimeRpcDiagnostic, type RuntimeRpcDiagnostic, type RuntimeCooldownState, type RuntimeFailureContext, type RuntimeFailureKind } from "./failure-diagnostics.js";
 import type { WorkspaceRuntimeInstaller, RuntimeLoginSource } from "../workspace/runtime-install.js";
 
 // Registry instances are per turn. Retain only the original installer/colleague/conversation state;
@@ -17,18 +17,18 @@ export function runtimeFailureTracker(installer: WorkspaceRuntimeInstaller, runt
     row = { route, cooldown: new RuntimeLaunchCooldown() }; rows.set(key, row);
   }
   const cooldown = row.cooldown;
-  const message = (kind: RuntimeFailureKind, elapsedMs: number) => {
-    const blocked = cooldown.blocked();
+  const message = (kind: RuntimeFailureKind, elapsedMs: number, blocked: RuntimeCooldownState | null = cooldown.blocked()) => {
     return runtimeFailureMessage({ ...(runtime === "pi" ? { runtime: "pi" as const, version: "1.5.0", loginSource: "isolated" as const, homeMatchesAccount: false } : installer.failureContext(runtime, launched)), kind, elapsedMs, errorFirstLine: row?.errorFirstLine, rpc: row?.rpc,
       retryAtMs: blocked?.retryAtMs ?? 0, consecutiveFailures: blocked?.consecutiveFailures ?? 0 });
   };
   return {
-    blocked(): string | null { const held = cooldown.blocked(); return held ? message(held.kind, 0) : null; },
+    blocked(): string | null { const held = cooldown.blocked(); return held ? message(held.kind, 0, held) : null; },
     // Keep the code-owned native RPC category when an admission fence blocks a quick retry.
     // A resume timeout must remain the same recoverable pause without launching another turn.
-    blockedNativeMetadata() {
+    blockedNativeResult() {
       const held = cooldown.blocked();
-      return held ? { nativeFailureKind: held.kind, ...(row.rpc ? { nativeRpc: row.rpc } : {}) } : {};
+      return held ? { runtimeFailure: message(held.kind, 0, held), nativeFailureKind: held.kind,
+        ...(row.rpc ? { nativeRpc: row.rpc } : {}) } : null;
     },
     failed(kind: RuntimeFailureKind, elapsedMs: number, firstLine?: string, rpc?: RuntimeRpcDiagnostic): string { row.rpc = runtime === "codex" ? runtimeRpcDiagnostic(rpc) : undefined; row.errorFirstLine = runtimeErrorFirstLine(firstLine, launched.env); cooldown.failed(kind, elapsedMs); return message(kind, elapsedMs); },
     succeeded(): void { row.rpc = undefined; row.errorFirstLine = undefined; cooldown.succeeded(); },

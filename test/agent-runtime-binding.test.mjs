@@ -131,5 +131,5 @@ for (const runtimeId of ["pi", "opencode", "codex", "claude", "agy"]) {
 
 test("Antigravity is a visible pending colleague runtime without a driver", () => {
  const option=new AgentRuntimeRegistry().options().find(row=>row.id==="agy");
- assert.deepEqual(option,{id:"agy",label:"Antigravity",available:false,reason:"general_agent_adapter_pending",recommended:false});
+ assert.deepEqual(option,{id:"agy",label:"Antigravity",available:false,reason:"general_agent_adapter_pending",recommended:false,selectable:false,confirmation:"none"});
 });
