@@ -51,7 +51,7 @@ import { WorkspaceUserInteraction, workspacePermissionInteraction, type Workspac
 import { boundWorkspaceText } from "./model-context.js";
 import { createWorkspaceProvider } from "./provider.js";
 import { legacyWorkspaceProviderFailure, WorkspaceProviderAdmissionError, WorkspaceProviderRecovery } from "./provider-recovery.js";
-import { WorkspaceRuntimeInstaller, optionalRuntimeId, type RuntimeLoginSource } from "./runtime-install.js";
+import { WorkspaceRuntimeInstaller, optionalRuntimeId, type OptionalRuntimeId, type RuntimeLoginSource } from "./runtime-install.js";
 import { WorkspaceRuntimeModels } from "./runtime-models.js";
 import { WorkspaceSecureConnections } from "./secure-connections.js";
 import { connectionModelEfforts, connectionModels } from "./connection-models.js";
@@ -165,6 +165,8 @@ export class LocalWorkspaceHost {
     legacySourceHome?: string;
     credentialVault?: CredentialVault;
     runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1];
+    /** Operator entry only: detect installed engines in the background this long after a Workspace opens. */
+    backgroundRuntimeDetectionMs?: number;
     providerFactory?: LocalWorkspaceProviderFactory;
     /** Trusted Host/test composition only; never exposed through RPC or a persisted setting. */
     jsonCliPolicyFactory?: JsonCliPolicyFactory;
@@ -274,6 +276,7 @@ export class LocalWorkspaceHost {
       mcp: new WorkspaceMcpManager(storage, { accountHome: this.options.hostHome ?? this.home, invalidateReview: (sourceId, revision) => this.mcpOwnerReview.invalidate(sourceId, revision), proxy: () => runtimes.proxy.read(), onChange: () => this.changed(workspaceId) }),
       features: new WorkspaceFeatures(storage, project, workspaceId, this.options.mode === "workspace" ? this.options.hostHome : undefined),
       runtimes, runtimeModels: new WorkspaceRuntimeModels(storage, runtimes) };
+    if (this.options.backgroundRuntimeDetectionMs !== undefined) runtimes.scheduleDiscovery(this.options.backgroundRuntimeDetectionMs);
     const folders = new WorkspaceLegacyResources(storage);
     context.legacyBusiness = this.options.legacyBusinessFactory?.({ storage, features: context.features, resources: folders })
       ?? new WorkspaceLegacyBusiness(storage, context.features, folders, { commands: { authorize: () => undefined,
@@ -625,6 +628,59 @@ export class LocalWorkspaceHost {
   listRuntimeModels(workspaceId: string, runtimeId: unknown) { return this.context(workspaceId).runtimeModels.list(runtimeId); }
   async selectRuntimeModel(workspaceId: string, runtimeId: unknown, modelId: unknown, expectedRevision: unknown, effort?: unknown): Promise<void> {
     await this.context(workspaceId).runtimeModels.select(runtimeId, modelId, expectedRevision, effort); this.changed(workspaceId);
+  }
+  /** Colleague form read: the runtime's models and state plus which other colleagues share its setting. */
+  async runtimeFormOptions(workspaceId: string, runtimeId: unknown, agentId?: string) {
+    const context = this.context(workspaceId);
+    const form = await context.runtimeModels.formOptions(runtimeId);
+    const sharedWith = context.resources.agents.list().agents
+      .filter(agent => agent.state === "active" && agent.runtime.id === runtimeId && agent.agentId !== agentId)
+      .map(agent => ({ agentId: agent.agentId, displayName: agent.identity.displayName }));
+    return { ...form, sharedWith };
+  }
+  /**
+   * One "Apply" for engine, first-use confirmation, model and effort. Everything is validated before the
+   * first write; then confirm → runtime → model, each through the existing fenced path. A later step's
+   * failure is reported with the steps already applied, never rolled back silently.
+   */
+  async applyRuntimeForm(workspaceId: string, input: { agentId: string; runtimeId: AgentRuntimeId; configRevision: number; agentEpoch: number;
+    confirm?: { fingerprint: string; loginSource: RuntimeLoginSource }; model?: { modelId: unknown; expectedRevision: unknown; effort?: unknown } }) {
+    const context = this.context(workspaceId), agents = context.resources.agents;
+    const agent = agents.list().agents.find(row => row.agentId === input.agentId);
+    if (!agent || agent.state !== "active") throw new Error("Colleague unavailable");
+    if (agent.configRevision !== input.configRevision || agent.agentEpoch !== input.agentEpoch) throw new Error("Colleague settings changed; refresh before applying");
+    const external = optionalRuntimeId(input.runtimeId);
+    let confirmWith: "register" | "login" | null = null;
+    let form: Awaited<ReturnType<WorkspaceRuntimeModels["formOptions"]>> | null = null;
+    if (external) {
+      form = await context.runtimeModels.formOptions(input.runtimeId);
+      const row = context.runtimes.list().options.find(option => option.runtimeId === input.runtimeId)!;
+      if (form.use === "confirm_first_use" || form.use === "confirm_update") {
+        if (!input.confirm) throw new Error("runtime_confirmation_required");
+        confirmWith = row.registered ? "login" : "register";
+      } else if (form.use !== "ready") throw new Error(`Engine unavailable: ${form.unavailableReason ?? form.use}`);
+      else if (input.confirm && input.confirm.loginSource !== row.loginSource) confirmWith = "login";
+      if (input.confirm && (input.confirm.fingerprint !== form.fingerprint || !form.fingerprint)) throw new Error("Engine file changed; check again before confirming");
+    } else if (input.confirm || input.model) throw new Error("The built-in engine has no confirmation or engine model here");
+    const option = agents.runtimeOptions().find(row => row.id === input.runtimeId);
+    if (!option || input.runtimeId === "hara" || !option.selectable) throw new Error("Engine cannot be selected");
+    if (input.model && form) await context.runtimeModels.checkSelection(input.runtimeId as OptionalRuntimeId, input.model.modelId, input.model.expectedRevision,
+      input.model.effort, form.models, form.modelSource === "live" || form.modelSource === "official");
+    const applied: ("confirm" | "runtime" | "model")[] = [];
+    let step: "confirm" | "runtime" | "model" = "confirm";
+    try {
+      if (confirmWith === "register") { this.registerLocalRuntime(workspaceId, input.runtimeId, input.confirm!.fingerprint, input.confirm!.loginSource); applied.push("confirm"); }
+      else if (confirmWith === "login") { context.runtimes.setLoginSource(input.runtimeId, input.confirm!.loginSource); this.changed(workspaceId); applied.push("confirm"); }
+      step = "runtime";
+      if (agent.runtime.id !== input.runtimeId) { this.setAgentRuntime(workspaceId, input.agentId, input.runtimeId, input.configRevision, input.agentEpoch); applied.push("runtime"); }
+      step = "model";
+      if (input.model) { await this.selectRuntimeModel(workspaceId, input.runtimeId, input.model.modelId, input.model.expectedRevision, input.model.effort); applied.push("model"); }
+    } catch (error) {
+      if (!applied.length) throw error;
+      return { applied, failed: { step, message: error instanceof Error ? error.message.slice(0, 300) : "failed" },
+        agent: agents.list().agents.find(row => row.agentId === input.agentId) ?? null };
+    }
+    return { applied, agent: agents.list().agents.find(row => row.agentId === input.agentId) ?? null };
   }
   getPreferences() { const current = this.preferences.read(); if (!current.readOnly && current.revision === 0) this.preferences.save(current.theme, 0); return this.preferences.read(); }
   setPreferences(theme: unknown, expected: number, extra = {}) { this.preferences.save(theme, expected, extra); return this.preferences.read(); }
@@ -1156,7 +1212,9 @@ export class LocalWorkspaceHost {
         if (agentCreateAttempts >= 1) return JSON.stringify({ created: false, refused: "turn_limit", humanConfirmed: false, limit: 1 });
         agentCreateAttempts += 1; // Reserve before approval yields so parallel tool uses cannot show two cards.
         const options = job.context.resources.agents.runtimeOptions().filter(row => row.available && row.id !== "hara");
-        const defaultRuntime = options.some(row => row.id === agent.runtime.id) ? agent.runtime.id : options.some(row => row.id === "pi") ? "pi" : options[0]?.id;
+        // The built-in engine is the starting point; the person picks another on the card. The proposing
+        // colleague's own engine is not a recommendation for the new colleague.
+        const defaultRuntime = options.some(row => row.id === "pi") ? "pi" : options[0]?.id;
         if (!defaultRuntime) return JSON.stringify({ created: false, refused: "runtime_unavailable", humanConfirmed: false });
         const decision = await host.approval(job, { username: proposed.username as string, displayName: proposed.displayName as string, title: proposed.title as string, instructions: proposed.instructions as string,
           project: typeof proposed.project === "string" ? proposed.project : "", runtimeId: defaultRuntime, permissionTier: "full-protected" });

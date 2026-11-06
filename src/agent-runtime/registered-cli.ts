@@ -16,6 +16,7 @@ import type { TaskRuntimeBinding } from "./bindings.js";
 import type { GovernedAgentRuntimeDriver } from "./registry.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
+import { ENGINE_DEFAULT_EFFORT, launchableSavedEffort } from "../workspace/default-effort.js";
 import { assertWorkspaceRunAdmission, attachWorkspaceRuntimeModel, recordWorkspaceRuntimeUsage, workspaceRunHasManagedProject, workspaceRunRuntimeStages } from "../workspace/execution.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { createRegisteredCliMcpTurn, WORKSPACE_MCP_TOKEN_ENV } from "./registered-cli-mcp.js";
@@ -76,8 +77,8 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
     if (options.signal?.aborted) return { status: "error", error: "Agent Runtime execution cancelled" };
     const objective = options.taskIntake?.task.objective ?? history.slice().reverse().find(message => message.role === "user")?.content ?? "";
     const selection = models ? await models.launchSelection(id, objective).catch(() => {
-      const saved = models.selection(id); return { ...saved, effort: saved.effort === "auto" ? null : saved.effort,
-        effortSource: saved.effort != null && saved.effort !== "auto" ? "user" as const : "auto" as const };
+      const saved = models.selection(id); return { ...saved, effort: launchableSavedEffort(saved.effort),
+        effortSource: saved.effort === ENGINE_DEFAULT_EFFORT ? "default" as const : saved.effort != null && saved.effort !== "auto" ? "user" as const : "auto" as const };
     }) : null;
     assertCurrent();
     const model = selection?.modelId ?? null, effort = selection?.effort ?? null;

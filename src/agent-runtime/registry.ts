@@ -29,10 +29,17 @@ export interface AgentRuntimeOption {
   reason?: "general_agent_adapter_pending" | "adapter_pending_p05" | "not_registered" | "not_installed" | "integrity_failed" | "detection_pending" | "detection_failed";
   /** Product direction only; never used to silently substitute an execution Runtime. */
   recommended: boolean;
+  /**
+   * May be chosen in a form: installed, passed the file check and has a driver. Not execution authority:
+   * `available` (confirmed) is still the only gate for setRuntime, dispatch and colleague creation.
+   */
+  selectable: boolean;
+  /** What a person must confirm before `available` can become true. */
+  confirmation: "none" | "first_use" | "update";
 }
 
 const LABELS: Record<AgentRuntimeId, string> = {
-  hara: "Hara（現有相容引擎）", pi: "Pi（內建）", opencode: "OpenCode", codex: "Codex", claude: "Claude Code", agy: "Antigravity", gemini: "Gemini CLI", kimi: "Kimi CLI", copilot: "GitHub Copilot", cursor: "Cursor", grok: "Grok Build",
+  hara: "Hara（现有兼容引擎）", pi: "Pi（内建）", opencode: "OpenCode", codex: "Codex", claude: "Claude Code", agy: "Antigravity", gemini: "Gemini CLI", kimi: "Kimi Code", copilot: "GitHub Copilot", cursor: "Cursor", grok: "Grok Build",
 };
 
 export class AgentRuntimeRegistry {
@@ -49,7 +56,7 @@ export class AgentRuntimeRegistry {
     }
   }
 
-  private option(id: AgentRuntimeId, row?: { state: string; generalAgentDriverAvailable: boolean }): AgentRuntimeOption {
+  private option(id: AgentRuntimeId, row?: { state: string; generalAgentDriverAvailable: boolean; use?: string }): AgentRuntimeOption {
     const driver = this.drivers.has(id);
     const available = id === "agy" ? false
       : id === "codex" || id === "claude" || id === "opencode" || id === "gemini" || id === "kimi" || id === "copilot" || id === "cursor" || id === "grok" ? Boolean(driver && row?.generalAgentDriverAvailable) : driver;
@@ -59,7 +66,11 @@ export class AgentRuntimeRegistry {
       : row?.state === "detecting" ? "detection_pending"
       : row?.state === "detection_failed" ? "detection_failed"
       : row?.state === "detected" || !row ? "not_registered" : "general_agent_adapter_pending";
-    return { id, label: LABELS[id], available, ...(reason ? { reason: reason as AgentRuntimeOption["reason"] } : {}), recommended: id === "pi" };
+    const external = id !== "hara" && id !== "pi";
+    const confirmation = !external || available ? "none" as const
+      : row?.use === "confirm_update" ? "update" as const : row?.use === "confirm_first_use" ? "first_use" as const : "none" as const;
+    const selectable = id !== "agy" && driver && (available || confirmation !== "none");
+    return { id, label: LABELS[id], available, ...(reason ? { reason: reason as AgentRuntimeOption["reason"] } : {}), recommended: id === "pi", selectable, confirmation };
   }
   options(): AgentRuntimeOption[] {
     const installed = this.installer?.list().options;

@@ -6,6 +6,7 @@ import { runGovernedAgent, type RunOpts } from "../agent/loop.js";
 import { assertWorkspaceRunAdmission, attachWorkspaceRuntimeModel, publishWorkspaceNativeRisks, workspaceRunRuntimeStages } from "../workspace/execution.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
+import { launchableSavedEffort } from "../workspace/default-effort.js";
 import type { GovernedAgentRuntimeDriver } from "./registry.js";
 import { createRegisteredCliMcpTurn, WORKSPACE_MCP_TOKEN_ENV } from "./registered-cli-mcp.js";
 import { runKimiCodeAcp, KIMI_CODE_ENV } from "./kimi-code-acp.js";
@@ -28,7 +29,7 @@ export function jsonCliDriver(id: JsonCliRuntimeId, installer: WorkspaceRuntimeI
     const assertCurrent = () => assertWorkspaceRunAdmission(permit, options, id); assertCurrent();
     const objective = options.taskIntake?.task.objective ?? history.slice().reverse().find(message => message.role === "user")?.content ?? "";
     const selection = models ? await models.launchSelection(id, objective).catch(() => {
-      const saved = models.selection(id); return { ...saved, effort: saved.effort === "auto" ? null : saved.effort };
+      const saved = models.selection(id); return { ...saved, effort: launchableSavedEffort(saved.effort) };
     }) : null;
     assertCurrent();
     if (selection?.effort) return { status: "error", error: runtimeFailureMessage({ ...installer.failureContext(id), kind: "version_incompatible", elapsedMs: 0 }) };

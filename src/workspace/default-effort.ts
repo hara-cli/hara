@@ -8,6 +8,13 @@ export function defaultEffortForLevels(levels: readonly string[] | undefined, ob
   return order.find(level => levels.includes(level)) ?? null;
 }
 
+/** "Follow the engine default": no effort argument at all. Distinct from null/"auto" (Hara chooses). */
+export const ENGINE_DEFAULT_EFFORT = "engine-default";
+/** A saved setting as it may reach a launch when the inventory is unavailable: only a fixed level passes. */
+export function launchableSavedEffort(effort: string | null): string | null {
+  return effort === "auto" || effort === ENGINE_DEFAULT_EFFORT ? null : effort;
+}
+
 /** Explicit settings retain their exact value. Unknown/unsupported capabilities receive no automatic
  * override; automatic selection never escalates to high/xhigh/max or invents a provider level. */
 export function resolveReasoningEffort(configured: string | null | undefined, levels: readonly string[] | undefined,

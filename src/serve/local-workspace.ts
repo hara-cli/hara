@@ -10,7 +10,7 @@ import type { ArkAcceptanceSlice } from "../workspace/real-key-provider.js";
 import { bindPrivateHaraStateFile, readPrivateStateFileSnapshotSync, removePrivateStateFile, writePrivateStateFileSync } from "../security/private-state.js";
 import type { ServeHandle, ServeOpts } from "./server.js";
 import { workspaceRequestSource } from "../workspace/request-journal.js";
-import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
+import type { RuntimeLoginSource, WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { CredentialVault } from "../workspace/credential-vault.js";
 import { isAgentRuntimeId } from "../agent-runtime/bindings.js";
 import type { ExtensionCatalogProvider } from "../workspace/extension-catalog.js";
@@ -21,7 +21,7 @@ function tokenMatches(actual: unknown, expected: string): boolean {
   if (typeof actual !== "string" || !/^[a-f0-9]{64}$/.test(actual) || actual.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
 }
-export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; hostHome?: string; discoveryHome?: string; legacySourceHome?: string; credentialVault?: CredentialVault; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; extensionCatalog?: ExtensionCatalogProvider; reviewedMcpSources?: () => readonly ReviewedMcpSource[]; mcpReviewHome?: string; mcpLaunchCandidate?: WorkspaceMcpLaunchProvider; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1] }): Promise<ServeHandle> {
+export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; hostHome?: string; discoveryHome?: string; legacySourceHome?: string; credentialVault?: CredentialVault; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; extensionCatalog?: ExtensionCatalogProvider; reviewedMcpSources?: () => readonly ReviewedMcpSource[]; mcpReviewHome?: string; mcpLaunchCandidate?: WorkspaceMcpLaunchProvider; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1]; backgroundRuntimeDetectionMs?: number }): Promise<ServeHandle> {
   if (opts.host !== "127.0.0.1" || !Number.isSafeInteger(opts.port) || opts.port < 0 || opts.port > 65535) throw new Error("Workspace Dev listens only on explicit IPv4 loopback");
   const token = opts.token ?? randomBytes(32).toString("hex");
   if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("invalid Workspace Dev transport token");
@@ -29,7 +29,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
   const clients = new Map<WebSocket, { id: string; initialized: boolean }>();
   let closing = false;
   const capability = input.mode === "workspace" ? "workspace.v1" : CAPABILITY;
-  const host = new LocalWorkspaceHost(input.root, { mode: input.mode, hostHome: input.hostHome, discoveryHome: input.discoveryHome, legacySourceHome: input.legacySourceHome, credentialVault: input.credentialVault, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, extensionCatalog: input.extensionCatalog, reviewedMcpSources: input.reviewedMcpSources, mcpReviewHome: input.mcpReviewHome, mcpLaunchCandidate: input.mcpLaunchCandidate, runtimeInstallerOptions: input.runtimeInstallerOptions, onChange(event) {
+  const host = new LocalWorkspaceHost(input.root, { mode: input.mode, hostHome: input.hostHome, discoveryHome: input.discoveryHome, legacySourceHome: input.legacySourceHome, credentialVault: input.credentialVault, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, extensionCatalog: input.extensionCatalog, reviewedMcpSources: input.reviewedMcpSources, mcpReviewHome: input.mcpReviewHome, mcpLaunchCandidate: input.mcpLaunchCandidate, runtimeInstallerOptions: input.runtimeInstallerOptions, backgroundRuntimeDetectionMs: input.backgroundRuntimeDetectionMs, onChange(event) {
     for (const [client, state] of clients) if (state.initialized && client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ jsonrpc: "2.0", method: "workspace.changed", params: event }));
   }, onAssistantPreview(clientId, frame) {
     for (const [client, state] of clients) if (state.id === clientId && state.initialized && client.readyState === WebSocket.OPEN) {
@@ -75,7 +75,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, capabilities: [capability, "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, capabilities: [capability, "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
@@ -212,6 +212,9 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     // Switching back and forth reuses `registerLocal` with the same verified fingerprint and a different
     // `loginSource`; no second method name is introduced for the same confirmed decision.
     if (method === "workspace.runtime.loginInstructions") { fields(["workspaceId", "expectedGeneration", "runtimeId"]); return host.runtimeLoginInstructions(workspaceId, params.runtimeId); }
+    if (method === "workspace.runtime.formOptions") { fields(["workspaceId", "expectedGeneration", "runtimeId", ...(Object.hasOwn(params, "agentId") ? ["agentId"] : [])]);
+      if (params.agentId !== undefined && !text(params.agentId)) throw new Error("Invalid runtime form colleague");
+      return host.runtimeFormOptions(workspaceId, params.runtimeId, params.agentId as string | undefined); }
     if (method === "workspace.runtime.listModels") { fields(["workspaceId", "expectedGeneration", "runtimeId"]); return host.listRuntimeModels(workspaceId, params.runtimeId); }
     if (method === "workspace.runtime.selectModel") { fields(["workspaceId", "expectedGeneration", "runtimeId", "modelId", "expectedRevision",
       ...(Object.hasOwn(params, "effort") ? ["effort"] : [])]);
@@ -235,6 +238,19 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       fields(["workspaceId", "expectedGeneration", "agentId", "runtimeId", "configRevision", "agentEpoch"]);
       if (!text(params.agentId) || !isAgentRuntimeId(params.runtimeId) || !positive(params.configRevision) || !positive(params.agentEpoch)) throw new Error("invalid Workspace Agent Runtime update");
       return host.setAgentRuntime(workspaceId, params.agentId, params.runtimeId, params.configRevision, params.agentEpoch);
+    }
+    if (method === "workspace.agents.applyRuntimeForm") {
+      fields(["workspaceId", "expectedGeneration", "agentId", "runtimeId", "configRevision", "agentEpoch",
+        ...["confirm", "model"].filter(key => Object.hasOwn(params, key))]);
+      if (!text(params.agentId) || !isAgentRuntimeId(params.runtimeId) || !positive(params.configRevision) || !positive(params.agentEpoch)) throw new Error("Invalid colleague engine form");
+      const confirm = params.confirm, model = params.model;
+      if (confirm !== undefined && (!plain(confirm) || !exact(confirm, ["fingerprint", "loginSource"]) || typeof confirm.fingerprint !== "string"
+        || confirm.loginSource !== "host" && confirm.loginSource !== "isolated")) throw new Error("Invalid engine confirmation");
+      if (model !== undefined && (!plain(model) || !exact(model, ["modelId", "expectedRevision", ...(Object.hasOwn(model, "effort") ? ["effort"] : [])])
+        || model.effort !== undefined && model.effort !== null && typeof model.effort !== "string")) throw new Error("Invalid engine model choice");
+      return host.applyRuntimeForm(workspaceId, { agentId: params.agentId, runtimeId: params.runtimeId, configRevision: params.configRevision, agentEpoch: params.agentEpoch,
+        ...(confirm ? { confirm: { fingerprint: confirm.fingerprint as string, loginSource: confirm.loginSource as RuntimeLoginSource } } : {}),
+        ...(model ? { model: { modelId: model.modelId, expectedRevision: model.expectedRevision, ...(Object.hasOwn(model, "effort") ? { effort: model.effort } : {}) } } : {}) });
     }
     if (method === "workspace.agents.updatePersona") {
       fields(["workspaceId", "expectedGeneration", "agentId", "input", "configRevision", "agentEpoch"]);
