@@ -45,8 +45,8 @@ if (selected.includes(1)) test("silent thread/resume timeout after Core restart 
   const failed = await exchange(f, "List colleagues MANUALLY-RESTORED?");
   assert.equal(failed.conversation.taskState, "paused");
   assert.equal(failed.conversation.nativeSession.status, "recovery_needed");
-  assert.doesNotMatch(failed.conversation.blockReason, /hara_runtime_failure_v1|runtime_failed/);
-  assert.match(failed.conversation.blockReason, /before this message was submitted/);
+  assert.doesNotMatch(failed.conversation.blockReason ?? "", /hara_runtime_failure_v1|runtime_failed/);
+  assert(failed.conversation.history.some(row => row.role === "assistant" && /Loading the existing conversation timed out before this message was submitted/.test(row.text)));
   assert(failed.conversation.history.some(row => row.role === "assistant" && /The task is paused/.test(row.text)));
   assert.equal(threadState(f).threadId, saved.threadId); assert.equal(threadState(f).phase, "unknown");
   assert.equal(f.native().filter(row => row.method === "turn/start").length, 1);
