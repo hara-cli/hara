@@ -26,6 +26,12 @@ import { createWorkspaceMcpEndpoint, WORKSPACE_MCP_TOKEN_ENV, type WorkspaceMcpE
 
 const hash = (value: unknown): string => createHash("sha256").update(canonical(value)).digest("hex");
 const object = (value: unknown): Record<string, unknown> => plain(value) ? value : {};
+const codexModelId = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/u.test(value)
+  && !value.includes("..") && !value.includes("//") && !value.endsWith("/");
+const codexEffortId = (value: unknown): value is string => typeof value === "string" && /^[a-z][a-z0-9-]{0,31}$/u.test(value);
+class CodexDefaultSettingsUnavailable extends Error {
+  constructor() { super("Codex default model or reasoning effort is unconfirmed; choose explicit supported settings"); }
+}
 /** Documented agentMessage is visible prose even when legacy providers omit its phase.
  * Require its real typed item first; unknown future phases never become preview text. */
 export function codexVisibleAgentMessage(value: unknown): value is { type: "agentMessage"; id: string; text: string; phase?: null | "partial_answer" | "final_answer" } {
@@ -39,7 +45,7 @@ export function codexStandingContext(args: Pick<TurnArgs, "system" | "systemPart
   const standingParts = args.systemParts?.filter(part => part.stability !== "turn") ?? [];
   const turnParts = args.systemParts?.filter(part => part.stability === "turn") ?? [];
   const standing = standingParts.length ? standingParts.map(part => part.content).join("\n\n") : args.system;
-  return { standing, turnParts, digest: hash([standing, tier, configRevision]) };
+  return { standing, turnParts, digest: hash([standing, tier, configRevision, _model === null, _effort === null]) };
 }
 const origin = (resolved: ReturnType<WorkspaceRuntimeInstaller["resolveBound"]>, project: unknown): string =>
   hash([resolved.command, inspectLocalRuntime(resolved.command)?.fingerprint ?? null, resolved.loginSource,
@@ -133,7 +139,7 @@ export class GovernedCodexSession {
   private nativeSucceeded = false;
   private loadedContract?: string;
   /** Created only after a real native start/resume response passes every existing check. */
-  private loadedHandle?: Readonly<{ id: string; cwd: string; client: JsonlRpcClient }>;
+  private loadedHandle?: Readonly<{ id: string; cwd: string; client: JsonlRpcClient; model?: string; effort?: string }>;
   private readonly state: ReturnType<typeof codexThreadState>;
   private value: CodexThreadState;
   private pendingUsage = { input: 0, output: 0, cachedInput: 0 };
@@ -411,40 +417,44 @@ export class GovernedCodexSession {
     };
     input.signal.addEventListener("abort", interrupt, { once: true });
     let freshProcess = false;
+    const ensureClient = async (): Promise<JsonlRpcClient> => {
+      if (this.client) return this.client;
+      freshProcess = true;
+      const stages = workspaceRunRuntimeStages(this.permit);
+      const endSpawn = stages?.beginEvent("spawn"), endCold = stages?.beginEvent("cold_start");
+      const nativeArgs = ["app-server", "--stdio", "-c", "thread_unload_delay_secs=0", "-c", "mcp_servers={}",
+          "-c", "model_auto_compact_token_limit=9007199254740991", "-c", "model_post_turn_compact_threshold_percent=0",
+          "-c", 'shell_environment_policy.set.HARA_WORKSPACE_MCP_TOKEN=""',
+          "-c", 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="never"',
+          ...codexHostToolOverrides(resolved.env.HOME!, resolved.env.CODEX_HOME, input.cwd, this.mcpName)];
+      if (!this.policy) throw new Error("Codex execution policy is unavailable");
+      const launch = this.policy.wrap({ command: resolved.command, env, args: nativeArgs });
+      const client = JsonlRpcClient.start({ ...launch, captureErrorFirstLine: true, timeoutMs: 10_000, maxOutputBytes: 64 * 1024 * 1024,
+        appServerArgs: launch.args,
+        onSpawn: () => { try { endSpawn?.("completed"); } catch { /* Diagnostic only. */ } },
+        onRequestSent: method => { if (method === "turn/start") observeWorkspaceMessageTiming(this.permit, "T4"); },
+        onNotification: (method, params) => this.notification(client, method, params),
+        onServerRequest: (_request, _reply, reject) => reject(-32601, "Use Hara Workspace tools and its governed approval channel"),
+        onClose: error => {
+          if (this.client !== client) return;
+          this.client = undefined; this.loaded = false; this.unload?.();
+          this.maintenance?.fail(new NativeCompactionError("unknown", error));
+          // During a control RPC, its rejected promise owns the precise terminal reason. onClose
+          // runs synchronously before that catch; settling here would hide restore timeouts.
+          if (this.active?.id) this.active.finish(false, "codex_delivery_unknown_no_replay",
+            error instanceof ExternalJsonlRpcTransportError ? error.runtimeFailureKind : undefined,
+            error instanceof ExternalJsonlRpcTransportError ? error.errorFirstLine : undefined,
+            error instanceof ExternalJsonlRpcTransportError ? error.rpc : undefined);
+        },
+      });
+      this.client = client; this.exit = client.waitForClose(); void this.exit.catch(() => {});
+      await client.call("initialize", { clientInfo: { name: "hara", version: "1.0.2" }, capabilities: { experimentalApi: true } });
+      client.notify("initialized");
+      try { endCold?.("completed"); } catch { /* Diagnostic only. */ }
+      return client;
+    };
     try {
-      if (!this.client) {
-        freshProcess = true;
-        const stages = workspaceRunRuntimeStages(this.permit);
-        const endSpawn = stages?.beginEvent("spawn"), endCold = stages?.beginEvent("cold_start");
-        const nativeArgs = ["app-server", "--stdio", "-c", "thread_unload_delay_secs=0", "-c", "mcp_servers={}",
-            "-c", "model_auto_compact_token_limit=9007199254740991", "-c", "model_post_turn_compact_threshold_percent=0",
-            "-c", 'shell_environment_policy.set.HARA_WORKSPACE_MCP_TOKEN=""',
-            "-c", 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="never"',
-            ...codexHostToolOverrides(resolved.env.HOME!, resolved.env.CODEX_HOME, input.cwd, this.mcpName)];
-        const launch = this.policy.wrap({ command: resolved.command, env, args: nativeArgs });
-        const client = JsonlRpcClient.start({ ...launch, captureErrorFirstLine: true, timeoutMs: 10_000, maxOutputBytes: 64 * 1024 * 1024,
-          appServerArgs: launch.args,
-          onSpawn: () => { try { endSpawn?.("completed"); } catch { /* Diagnostic only. */ } },
-          onRequestSent: method => { if (method === "turn/start") observeWorkspaceMessageTiming(this.permit, "T4"); },
-          onNotification: (method, params) => this.notification(client, method, params),
-          onServerRequest: (_request, _reply, reject) => reject(-32601, "Use Hara Workspace tools and its governed approval channel"),
-          onClose: error => {
-            if (this.client !== client) return;
-            this.client = undefined; this.loaded = false; this.unload?.();
-            this.maintenance?.fail(new NativeCompactionError("unknown", error));
-            // During a control RPC, its rejected promise owns the precise terminal reason. onClose
-            // runs synchronously before that catch; settling here would hide restore timeouts.
-            if (this.active?.id) this.active.finish(false, "codex_delivery_unknown_no_replay",
-              error instanceof ExternalJsonlRpcTransportError ? error.runtimeFailureKind : undefined,
-              error instanceof ExternalJsonlRpcTransportError ? error.errorFirstLine : undefined,
-              error instanceof ExternalJsonlRpcTransportError ? error.rpc : undefined);
-          },
-        });
-        this.client = client; this.exit = client.waitForClose(); void this.exit.catch(() => {});
-        await client.call("initialize", { clientInfo: { name: "hara", version: "1.0.2" }, capabilities: { experimentalApi: true } });
-        client.notify("initialized");
-        try { endCold?.("completed"); } catch { /* Diagnostic only. */ }
-      }
+      await ensureClient();
       const endpointReady = endpoint.prepare?.(contract);
       if (endpointReady) {
         await endpointReady;
@@ -457,8 +467,9 @@ export class GovernedCodexSession {
       }
       if (endpoint.attemptMarker) visibleEnv.HARA_PREVIEW_ATTEMPT_TOKEN = endpoint.attemptMarker;
       input.assertCurrent(); if (input.signal.aborted) throw new Error("interrupted");
-      const client = this.client;
-      if (!client) throw new Error("Codex native process changed during preparation; no turn was sent");
+      const preparedClient = this.client;
+      if (!preparedClient) throw new Error("Codex native process changed during preparation; no turn was sent");
+      let client = preparedClient;
       const config = { mcp_servers: { [this.mcpName]: { enabled: true, url: endpoint.url, bearer_token_env_var: WORKSPACE_MCP_TOKEN_ENV,
         // Only this immutable governed endpoint is trusted. Codex 0.166's `auto` can ask a second
         // native MCP approval before reaching Hara; `approve` changes no Hara tool/card authority.
@@ -469,14 +480,33 @@ export class GovernedCodexSession {
       let recoverySeed: string | undefined;
       const direct = Boolean(endpoint.attemptMarker && this.loaded && this.value.phase === "idle" && this.value.contextGeneration
         && this.value.standingPromptHash === standingHash && this.loadedContract === contract
-        && this.loadedHandle?.client === client && this.loadedHandle.id === this.value.threadId && this.loadedHandle.cwd === input.cwd);
+        && this.loadedHandle?.client === client && this.loadedHandle.id === this.value.threadId && this.loadedHandle.cwd === input.cwd
+        && (input.model !== null || codexModelId(this.loadedHandle.model)) && (input.effort !== null || codexEffortId(this.loadedHandle.effort)));
       let threadId = this.loadedHandle?.id;
+      let turnModel: unknown = input.model ?? this.loadedHandle?.model;
+      let turnEffort: unknown = input.effort ?? this.loadedHandle?.effort ?? null;
       if (!direct) {
       let response: Record<string, unknown>;
       try {
         // Codex ignores resume overrides while the thread is already loaded. The close
         // notification, not just the unsubscribe ACK, proves that fresh governance can load.
-        if (resumed && this.loaded) await this.unloadThread(client);
+        if (resumed && this.loaded) {
+          try { await this.unloadThread(client); }
+          catch {
+            // No user turn was submitted. Drain the old resident root before retrying this
+            // control boundary once in a cold process, with the same frozen permit/endpoint.
+            input.assertCurrent(); if (input.signal.aborted) throw new Error("interrupted");
+            if (this.policy) { await endWorkspaceNativePolicy(this.permit, this.policy); await this.policy.close(); this.policy = undefined; }
+            input.assertCurrent();
+            const current = this.installer.resolveBound("codex");
+            const currentPolicy = workspaceRuntimePolicyInput(this.permit, "codex", current, "resident", this.installer);
+            if (origin(current, this.project) !== this.origin || workspaceRuntimeProcessKey(currentPolicy, current) !== processKey)
+              throw new Error("Codex launch profile changed during unload; no turn was sent");
+            this.policy = createRuntimeExecutionPolicy(currentPolicy);
+            beginWorkspaceNativePolicy(this.permit, this.policy); await this.policy.prepareAttempt();
+            input.assertCurrent(); client = await ensureClient(); input.assertCurrent();
+          }
+        }
         input.assertCurrent(); if (input.signal.aborted) throw new Error("interrupted");
         const load = (resume: boolean) => client.call<Record<string, unknown>>(resume ? "thread/resume" : "thread/start", {
           ...(resume ? { threadId: this.value.threadId, excludeTurns: true } : { ephemeral: false }),
@@ -505,6 +535,11 @@ export class GovernedCodexSession {
           || object(thread.status).type !== "idle") {
           throw new Error("Codex thread confinement or idle origin was not confirmed");
         }
+        // A resume without overrides restores sticky rollout values, not engine defaults.
+        // Unknown defaults cannot justify inheriting a prior model/effort on a nonempty thread.
+        if (resumed && !resetFrom && (input.model === null || input.effort === null && response.reasoningEffort != null)) throw new CodexDefaultSettingsUnavailable();
+        turnModel = input.model ?? response.model; turnEffort = input.effort ?? response.reasoningEffort ?? null;
+        if (!codexModelId(turnModel) || turnEffort !== null && !codexEffortId(turnEffort)) throw new CodexDefaultSettingsUnavailable();
         if (resetFrom) {
           const reset = recordCodexEmptyThreadReset(workspaceRuntimeStorage(this.permit), this.value, resetFrom, thread.id as string);
           this.value.resets = [...this.value.resets.slice(-1023), reset];
@@ -515,23 +550,26 @@ export class GovernedCodexSession {
         if (resumed) { this.value.phase = "unknown"; this.save(); }
         active.bind("");
         const typed = error instanceof ExternalJsonlRpcRequestError || error instanceof ExternalJsonlRpcTransportError ? error : undefined;
-        active.finish(false, resumed ? "codex_resume_failed_history_preserved" : "codex_thread_start_failed",
-          typed?.runtimeFailureKind ?? "runtime_failed", typed?.errorFirstLine, typed?.rpc);
+        const defaults = error instanceof CodexDefaultSettingsUnavailable;
+        active.finish(false, defaults ? "codex_default_settings_unconfirmed" : resumed ? "codex_resume_failed_history_preserved" : "codex_thread_start_failed",
+          defaults ? "invalid_model" : typed?.runtimeFailureKind ?? "runtime_failed", defaults ? error.message : typed?.errorFirstLine, typed?.rpc);
         client.close();
         await this.settleNativeAttempt();
         return await terminal;
       }
       const thread = object(response.thread);
       threadId = thread.id as string;
-      this.loadedHandle = Object.freeze({ id: thread.id as string, cwd: input.cwd, client });
+      this.loadedHandle = Object.freeze({ id: thread.id as string, cwd: input.cwd, client,
+        ...(codexModelId(turnModel) ? { model: turnModel } : {}), ...(codexEffortId(turnEffort) ? { effort: turnEffort } : {}) });
       }
       if (!threadId) throw new Error("Codex loaded thread handle is unavailable");
+      if (!codexModelId(turnModel) || turnEffort !== null && !codexEffortId(turnEffort)) throw new CodexDefaultSettingsUnavailable();
       // npm's launcher remains the owned root; its initialized native app-server child is
       // resident too. Seal that baseline before turn/start, never after model tools can run.
       if (freshProcess) await this.policy.prepareResidentRoot();
       this.value.threadId = threadId; this.loaded = true;
       if (!resumed || this.value.contextGeneration === null) this.value.contextGeneration = randomUUID();
-      const compacted = await this.compactIdle({ client, endpoint, resumed, standing, config, model: input.model, effort: input.effort,
+      const compacted = await this.compactIdle({ client, endpoint, resumed, standing, config, model: turnModel, effort: turnEffort,
         cwd: input.cwd, signal: input.signal, assertCurrent: input.assertCurrent, activity: input.activity });
       threadId = this.value.threadId!;
       if (compacted.seedRecord) active.seedRecord = compacted.seedRecord;
@@ -554,7 +592,7 @@ export class GovernedCodexSession {
       observeWorkspaceMessageTiming(this.permit, "T3");
       const started = await client.call<Record<string, unknown>>("turn/start", { threadId,
         input: [{ type: "text", text: currentPrompt, text_elements: [] }], cwd: input.cwd, approvalPolicy: "never", approvalsReviewer: "user",
-        ...(input.model ? { model: input.model } : {}), ...(input.effort ? { effort: input.effort } : {}) });
+        model: turnModel, ...(turnEffort !== null ? { effort: turnEffort } : {}) });
       const turn = object(started.turn);
       if (!nativeId(turn.id)) throw new Error("Codex did not bind the accepted turn");
       active.id = turn.id; active.bind(turn.id);
@@ -596,7 +634,8 @@ export class GovernedCodexSession {
           || input.model !== null && response.model !== input.model || input.effort !== null && response.reasoningEffort !== input.effort)
           throw new Error("Compacted seed thread confinement was not confirmed");
         input.assertCurrent(); this.value.threadId = thread.id; this.loaded = true;
-        this.loadedHandle = Object.freeze({ id: thread.id, cwd: input.cwd, client: input.client });
+        this.loadedHandle = Object.freeze({ id: thread.id, cwd: input.cwd, client: input.client,
+          ...(codexModelId(response.model) ? { model: response.model } : {}), ...(codexEffortId(response.reasoningEffort) ? { effort: response.reasoningEffort } : {}) });
         this.value.contextGeneration = randomUUID(); this.value.standingPromptHash = null; this.value.contextTokens = null;
         this.systemDigests.clear(); this.loadedContract = undefined;
       }
@@ -653,6 +692,9 @@ export class GovernedCodexSession {
     try {
       const result = await client.call<{ status?: string }>("thread/unsubscribe", { threadId: this.value.threadId });
       if (result.status === "notLoaded") this.loaded = false;
+      // notSubscribed does not prove the server unloaded its cached configuration.
+      // Close now instead of waiting for a notification that need not arrive.
+      if (result.status === "notSubscribed") throw new Error("Codex thread subscription is unavailable");
       if (this.loaded) await Promise.race([unloaded, new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error("Codex thread unload unconfirmed")), 3000);
       })]);

@@ -199,8 +199,11 @@ function codexEfforts(value: unknown): { supportedReasoningEfforts?: string[]; d
     ids.push(id);
     if (ids.length >= MAX_EFFORTS) break;
   }
-  const defaultEffort = plain(value) && validEffort(value.defaultReasoningEffort) && ids.includes(value.defaultReasoningEffort)
-    ? value.defaultReasoningEffort : undefined;
+  const markedDefaults = raw.filter(entry => plain(entry) && entry.isDefault === true)
+    .map(entry => plain(entry) ? entry.reasoningEffort ?? entry.id : null).filter(validEffort);
+  const declaredDefault = plain(value) && validEffort(value.defaultReasoningEffort) ? value.defaultReasoningEffort
+    : markedDefaults.length === 1 ? markedDefaults[0] : undefined;
+  const defaultEffort = declaredDefault && ids.includes(declaredDefault) ? declaredDefault : undefined;
   return ids.length ? { supportedReasoningEfforts: ids, ...(defaultEffort ? { defaultReasoningEffort: defaultEffort } : {}) } : {};
 }
 
@@ -208,7 +211,7 @@ function codexEfforts(value: unknown): { supportedReasoningEfforts?: string[]; d
 export class WorkspaceRuntimeModels {
   private readonly state: WorkspaceJsonState<RuntimeModelsState>;
   private readonly pending = new Map<string, Promise<RuntimeModel[]>>();
-  private readonly launchDefaults = new Map<string, Promise<{ modelId: string | null; levels?: string[] }>>();
+  private readonly launchDefaults = new Map<string, Promise<{ modelId: string | null; levels?: string[]; defaultEffort?: string }>>();
   constructor(private readonly storage: WorkspaceResourceStorage, private readonly runtimes: WorkspaceRuntimeInstaller,
     private readonly expandedMetadata: ExpandedMetadataCapture = captureExpandedMetadata) {
     this.state = new WorkspaceJsonState(storage, "runtime-models-v1.json", value => {
@@ -305,7 +308,7 @@ export class WorkspaceRuntimeModels {
     this.bound(runtimeId);
     const row = this.state.read().selections.find(value => value.runtimeId === runtimeId);
     const effortSource = ["codex", "claude", "copilot"].includes(runtimeId) ? row?.selectedEffort != null && row.selectedEffort !== "auto" ? "user" as const : "auto" as const : "default" as const;
-    if (row?.selectedEffort != null && row.selectedEffort !== "auto")
+    if (row?.selectedEffort != null && row.selectedEffort !== "auto" && (runtimeId !== "codex" || row.selectedModelId !== null))
       return { modelId: row.selectedModelId, effort: row.selectedEffort, effortSource };
     // The first lookup needs the live inventory; repeating app-server model/list on every chat
     // would add a second native process to the latency path. Reuse only for this bound runtime
@@ -322,16 +325,21 @@ export class WorkspaceRuntimeModels {
     if (!choice) {
       choice = this.list(runtimeId).then(inventory => {
         const model = inventory.models.find(value => value.id === row?.selectedModelId)
-          ?? (row?.selectedModelId == null ? inventory.models.find(value => value.recommended) : undefined);
+          ?? (row?.selectedModelId == null ? inventory.models.find(value => value.recommended)
+            ?? (runtimeId === "codex" && inventory.models.length === 1 ? inventory.models[0] : undefined) : undefined);
         return { modelId: row?.selectedModelId ?? model?.id ?? null,
-          ...(runtimeId !== "opencode" && model?.supportedReasoningEfforts ? { levels: model.supportedReasoningEfforts } : {}) };
+          ...(runtimeId !== "opencode" && model?.supportedReasoningEfforts ? { levels: model.supportedReasoningEfforts } : {}),
+          ...(runtimeId === "codex" && model?.defaultReasoningEffort ? { defaultEffort: model.defaultReasoningEffort } : {}) };
       }).catch(error => { this.launchDefaults.delete(key); throw error; });
       if (this.launchDefaults.size >= 8) this.launchDefaults.clear();
       this.launchDefaults.set(key, choice);
     }
     const selected = await choice;
     this.bound(runtimeId);
-    return { modelId: selected.modelId, effort: resolveReasoningEffort(row?.selectedEffort, selected.levels, objective), effortSource };
+    return { modelId: selected.modelId,
+      // Codex overrides are sticky. Use its declared default if auto cannot select a level;
+      // never invent a level for an unknown capability. Null transitions leave the direct path.
+      effort: resolveReasoningEffort(row?.selectedEffort, selected.levels, objective) ?? selected.defaultEffort ?? null, effortSource };
   }
   selected(runtimeId: OptionalRuntimeId): string | null { return this.selection(runtimeId).modelId; }
   selectedEffort(runtimeId: OptionalRuntimeId): string | null { return this.selection(runtimeId).effort; }

@@ -29,6 +29,8 @@ if (selected.includes(0)) test("standing hash covers rules, operation cards and 
     assert.notEqual(read({ ...base, systemParts: parts }).digest, original.digest);
   assert.equal(read(base, "model-B").digest, original.digest);
   assert.equal(read(base, "model-A", "high").digest, original.digest);
+  assert.notEqual(read(base, null, "low").digest, original.digest);
+  assert.notEqual(read(base, "model-A", null).digest, original.digest);
   assert.notEqual(read(base, "model-A", "low", "full-protected").digest, original.digest);
   assert.notEqual(read(base, "model-A", "low", "controlled", 2).digest, original.digest);
 });

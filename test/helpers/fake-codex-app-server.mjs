@@ -13,12 +13,12 @@ export async function fakeCodexMain() {
   if (args[0] !== "app-server") { process.exitCode = 2; return; }
   if (mode().startupStderr) { process.stderr.write(mode().startupStderr); process.exitCode = 1; return; }
   let mcpSession, mcpURL, previousMarker;
-  let thread, config, cwd, model, developerInstructions, loaded = false, turnId, total = { inputTokens: 0, outputTokens: 0 }, meta, stopped = false;
+  let thread, config, cwd, model, developerInstructions, approvalPolicy, sandbox, approvalsReviewer, loaded = false, turnId, total = { inputTokens: 0, outputTokens: 0 }, meta, stopped = false;
   const save = () => { fs.writeFileSync(command + ".meta.next", JSON.stringify(meta)); fs.renameSync(command + ".meta.next", command + ".meta.json"); };
   async function execute(params) {
     const currentTurn = turnId, selected = mode().mode;
     const bridge = Object.values(config?.mcp_servers ?? {}).find(row => row.url && row.required), url = bridge?.url, token = process.env.HARA_WORKSPACE_MCP_TOKEN;
-    meta = { pid: process.pid, url, mode: selected, model: params.model ?? model, effort: params.effort ?? config?.model_reasoning_effort ?? null,
+    meta = { pid: process.pid, url, mode: selected, model, effort: config?.model_reasoning_effort ?? null,
       developerInstructions, tokenPresent: Boolean(token), tokenInArgv: args.some(value => token && value.includes(token)),
       readOnly: false, onRequest: false, nativeSandboxDisabled: true, nativeApprovalDisabled: true, haraOnlyTrust: bridge?.default_tools_approval_mode === "approve",
       tokenFingerprint: crypto.createHash("sha256").update(token ?? "").digest("hex") };
@@ -151,9 +151,8 @@ export async function fakeCodexMain() {
       if (mode().requiredMcpFail) {
         send({ id: message.id, error: { code: -32000, message: "Failed to initialize session: required MCP servers failed to initialize: fixture handshake failed" } }); continue;
       }
-      let ignoredOverrides = false;
+      let ignoredOverrides = false, state;
       if (message.method === "thread/resume") {
-        let state;
         try { state = JSON.parse(fs.readFileSync(command + ".native.json", "utf8")); } catch {}
         if (!state || state.thread !== p.threadId || mode().missingRollout) {
           send({ id: message.id, error: { code: -32000, message: "no rollout found for thread id " + p.threadId } }); continue;
@@ -161,11 +160,19 @@ export async function fakeCodexMain() {
         ignoredOverrides = loaded && thread === p.threadId;
         thread = p.threadId; total = mode().mode === "usage-reset" ? { inputTokens: 1, outputTokens: 1 } : state.total;
       } else { thread = crypto.randomUUID(); total = { inputTokens: 0, outputTokens: 0 }; }
-      if (!ignoredOverrides) { cwd = p.cwd; config = p.config; model = p.model; developerInstructions = p.developerInstructions; }
+      if (!ignoredOverrides) {
+        cwd = p.cwd ?? state?.cwd; model = p.model ?? state?.model ?? "fixture-model";
+        config = { ...state?.config, ...p.config,
+          model_reasoning_effort: p.config?.model_reasoning_effort ?? state?.config?.model_reasoning_effort ?? mode().threadDefaultEffort ?? null };
+        developerInstructions = p.developerInstructions ?? state?.developerInstructions;
+        approvalPolicy = p.approvalPolicy ?? state?.approvalPolicy ?? "never";
+        sandbox = p.sandbox ?? state?.sandbox ?? "danger-full-access";
+        approvalsReviewer = p.approvalsReviewer ?? state?.approvalsReviewer ?? "user";
+      }
       loaded = true;
       fs.appendFileSync(command + ".events.jsonl", JSON.stringify({ method: message.method, thread, ignoredOverrides, developerInstructions, config }) + "\n");
-      reply(message, { thread: { id: thread, cwd, status: { type: mode().threadStatus ?? "idle" } }, approvalPolicy: p.approvalPolicy, approvalsReviewer: "user",
-        sandbox: { type: p.sandbox === "danger-full-access" ? "dangerFullAccess" : "readOnly", networkAccess: false }, model, reasoningEffort: config?.model_reasoning_effort ?? null }); continue;
+      reply(message, { thread: { id: thread, cwd, status: { type: mode().threadStatus ?? "idle" } }, approvalPolicy, approvalsReviewer,
+        sandbox: { type: sandbox === "danger-full-access" ? "dangerFullAccess" : "readOnly", networkAccess: false }, model, reasoningEffort: config?.model_reasoning_effort ?? null }); continue;
     }
     if (message.method === "thread/compact/start") {
       if (mode().compactUnsupported) { send({ id: message.id, error: { code: -32601, message: "compact unavailable" } }); continue; }
@@ -191,7 +198,9 @@ export async function fakeCodexMain() {
       }
       if (mode().rejectTurnStart) { send({ id: message.id, error: { code: -32000, message: "fixture rejected before accepting turn" } }); continue; }
       // Match Codex: thread/start allocates an ID, but only an accepted user turn creates a rollout.
-      fs.writeFileSync(command + ".native.json", JSON.stringify({ thread, total, cwd, config, model, developerInstructions }));
+      if (p.model != null) model = p.model;
+      if (p.effort != null) config = { ...config, model_reasoning_effort: p.effort };
+      fs.writeFileSync(command + ".native.json", JSON.stringify({ thread, total, cwd, config, model, developerInstructions, approvalPolicy, sandbox, approvalsReviewer }));
       turnId = crypto.randomUUID(); stopped = false; reply(message, { turn: { id: turnId } });
       void execute(p).catch(() => { if (!stopped) note("turn/completed", { threadId: thread, turn: { id: turnId, status: "failed" } }); }); continue;
     }
@@ -199,7 +208,12 @@ export async function fakeCodexMain() {
       stopped = true; reply(message, {}); note("turn/completed", { threadId: thread, turn: { id: turnId, status: "interrupted" } }); continue;
     }
     if (message.method === "thread/unsubscribe") {
-      reply(message, { status: loaded ? "unsubscribed" : "notLoaded" });
+      const status = mode().unloadStatus ?? (loaded ? "unsubscribed" : "notLoaded");
+      fs.appendFileSync(command + ".events.jsonl", JSON.stringify({ method: "thread/unsubscribe/result", thread, status }) + "\n");
+      reply(message, { status });
+      if (status === "notLoaded") loaded = false;
+      if (status === "notSubscribed" && mode().probeUnsubscribeWait) setTimeout(() => fs.writeFileSync(command + ".unload-waited", "waited"), 2700);
+      if (status !== "unsubscribed") continue;
       const closingThread = thread;
       if (!mode().unloadHang) setTimeout(() => {
         loaded = false;
