@@ -1270,7 +1270,8 @@ export async function runGovernedAgent(
     const outcome = await runAgentInner(history, { ...opts, ctx: { ...opts.ctx, computerScope } }, life, media, taskAuthority, executeTurn);
     const task = opts.taskIntake?.current ? opts.taskIntake.current() : opts.taskIntake?.task;
     const sameTaskTurn = task && task.id === runTaskBinding?.id && task.turnId === runTaskBinding?.turnId;
-    if (sameTaskTurn && task.brief?.intent === "change" && outcome.status !== "completed" && !opts.signal?.aborted) {
+    if (sameTaskTurn && (task.brief?.intent === "change" || outcome.stopReason === "native_resume_timeout" || outcome.stopReason === "native_prose_only")
+      && outcome.status !== "completed" && !opts.signal?.aborted) {
       // Notices carry diagnostics; an ordinary persisted assistant reply carries the human handoff.
       // Do not ask the provider to summarize a stopped run, or re-run its external side effects.
       const text = pausedCloseoutText(task, currentTodos(opts.ctx.todoScope), life.language, outcome);
