@@ -7,6 +7,8 @@ const FAILURE_MARKER = "hara_runtime_failure_v1=";
 export function runtimeStageErrorKind(value: unknown): RuntimeStageErrorKind {
   const message = value instanceof Error ? value.message : typeof value === "string" ? value : "";
   if (KINDS.has(message)) return message as RuntimeStageErrorKind;
+  // This Host control status changes recovery UX, not the underlying observed error category.
+  if (message === "native_resume_timeout") return "timeout";
   const marker = message.indexOf(FAILURE_MARKER);
   if (marker >= 0 && message.length < 4096) {
     // The governor may append a human hint after the envelope. Scan the single flat object,

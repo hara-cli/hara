@@ -36,6 +36,8 @@ test("buffered Claude output is explicitly a host-delivery observation and error
  assert.equal(f.recorder.snapshot().events.some(e=>e.kind==="first_token"),false);
  assert.equal(runtimeStageErrorKind('hara_runtime_failure_v1={"kind":"runtime_proxy","prompt":"PRIVATE"}'),"runtime_proxy");
  assert.equal(runtimeStageErrorKind("PRIVATE_PROVIDER_REPLY"),"runtime_failed");
+ assert.equal(runtimeStageErrorKind("native_resume_timeout"),"timeout");
+ assert.equal(runtimeStageErrorKind("model said native_resume_timeout"),"runtime_failed");
 });
 test("OS spawn observer is optional and its failure cannot change command success",async()=>{
  let calls=0;const result=await runExternalCommandCapture({command:process.execPath},["-e","process.stdout.write('fixture')"],
