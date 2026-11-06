@@ -13,12 +13,13 @@ export async function fakeCodexMain() {
   if (args[0] !== "app-server") { process.exitCode = 2; return; }
   if (mode().startupStderr) { process.stderr.write(mode().startupStderr); process.exitCode = 1; return; }
   let mcpSession, mcpURL, previousMarker;
-  let thread, config, cwd, turnId, total = { inputTokens: 0, outputTokens: 0 }, meta, stopped = false;
+  let thread, config, cwd, model, developerInstructions, loaded = false, turnId, total = { inputTokens: 0, outputTokens: 0 }, meta, stopped = false;
   const save = () => { fs.writeFileSync(command + ".meta.next", JSON.stringify(meta)); fs.renameSync(command + ".meta.next", command + ".meta.json"); };
   async function execute(params) {
     const currentTurn = turnId, selected = mode().mode;
     const bridge = Object.values(config?.mcp_servers ?? {}).find(row => row.url && row.required), url = bridge?.url, token = process.env.HARA_WORKSPACE_MCP_TOKEN;
-    meta = { pid: process.pid, url, mode: selected, tokenPresent: Boolean(token), tokenInArgv: args.some(value => token && value.includes(token)),
+    meta = { pid: process.pid, url, mode: selected, model: params.model ?? model, effort: params.effort ?? config?.model_reasoning_effort ?? null,
+      developerInstructions, tokenPresent: Boolean(token), tokenInArgv: args.some(value => token && value.includes(token)),
       readOnly: false, onRequest: false, nativeSandboxDisabled: true, nativeApprovalDisabled: true, haraOnlyTrust: bridge?.default_tools_approval_mode === "approve",
       tokenFingerprint: crypto.createHash("sha256").update(token ?? "").digest("hex") };
     const boundary = (paths, write) => Array.isArray(paths) ? paths.map(path => {
@@ -135,7 +136,7 @@ export async function fakeCodexMain() {
     fs.appendFileSync(command + ".rpc.jsonl", JSON.stringify({ pid: process.pid, method: message.method, params: p }) + "\n");
     if (message.method === "model/list" && mode().inventory) { reply(message, mode().inventory); continue; }
     if (message.method === "model/list") { reply(message, { data: ["fixture-model", "fixture-model-2"].map(id => ({ id, displayName: id,
-      supportedReasoningEfforts: ["low", "high"].map(reasoningEffort => ({ reasoningEffort, description: reasoningEffort })), isDefault: id === "fixture-model" })) }); continue; }
+      supportedReasoningEfforts: (mode().reasoningEfforts ?? ["low", "high"]).map(reasoningEffort => ({ reasoningEffort, description: reasoningEffort })), isDefault: id === "fixture-model" })) }); continue; }
     if (["thread/start", "thread/resume"].includes(message.method)) {
       if (mode().recordHome) {
         fs.writeFileSync(command + ".home", process.env.HOME + "\nlogin=" + (fs.existsSync(process.env.HOME + "/.codex/auth.json") ? "present" : "missing") + "\n");
@@ -147,14 +148,24 @@ export async function fakeCodexMain() {
         continue;
       }
       if (message.method === "thread/resume" && mode().resumeDelayMs) await new Promise(resolve => setTimeout(resolve, mode().resumeDelayMs));
+      if (mode().requiredMcpFail) {
+        send({ id: message.id, error: { code: -32000, message: "Failed to initialize session: required MCP servers failed to initialize: fixture handshake failed" } }); continue;
+      }
+      let ignoredOverrides = false;
       if (message.method === "thread/resume") {
-        const state = JSON.parse(fs.readFileSync(command + ".native.json", "utf8"));
-        if (state.thread !== p.threadId) { error(message); continue; }
+        let state;
+        try { state = JSON.parse(fs.readFileSync(command + ".native.json", "utf8")); } catch {}
+        if (!state || state.thread !== p.threadId || mode().missingRollout) {
+          send({ id: message.id, error: { code: -32000, message: "no rollout found for thread id " + p.threadId } }); continue;
+        }
+        ignoredOverrides = loaded && thread === p.threadId;
         thread = p.threadId; total = mode().mode === "usage-reset" ? { inputTokens: 1, outputTokens: 1 } : state.total;
-      } else { thread = crypto.randomUUID(); fs.writeFileSync(command + ".native.json", JSON.stringify({ thread, total })); }
-      cwd = p.cwd; config = p.config;
+      } else { thread = crypto.randomUUID(); total = { inputTokens: 0, outputTokens: 0 }; }
+      if (!ignoredOverrides) { cwd = p.cwd; config = p.config; model = p.model; developerInstructions = p.developerInstructions; }
+      loaded = true;
+      fs.appendFileSync(command + ".events.jsonl", JSON.stringify({ method: message.method, thread, ignoredOverrides, developerInstructions, config }) + "\n");
       reply(message, { thread: { id: thread, cwd, status: { type: mode().threadStatus ?? "idle" } }, approvalPolicy: p.approvalPolicy, approvalsReviewer: "user",
-        sandbox: { type: p.sandbox === "danger-full-access" ? "dangerFullAccess" : "readOnly", networkAccess: false }, model: p.model, reasoningEffort: p.config?.model_reasoning_effort ?? null }); continue;
+        sandbox: { type: p.sandbox === "danger-full-access" ? "dangerFullAccess" : "readOnly", networkAccess: false }, model, reasoningEffort: config?.model_reasoning_effort ?? null }); continue;
     }
     if (message.method === "thread/compact/start") {
       if (mode().compactUnsupported) { send({ id: message.id, error: { code: -32601, message: "compact unavailable" } }); continue; }
@@ -175,13 +186,28 @@ export async function fakeCodexMain() {
       continue;
     }
     if (message.method === "turn/start") {
+      if (mode().terminateBeforeTurnStart) {
+        process.stderr.write("ERROR rmcp::transport::worker: unrelated error sending request\n"); process.kill(process.pid, "SIGTERM"); continue;
+      }
+      if (mode().rejectTurnStart) { send({ id: message.id, error: { code: -32000, message: "fixture rejected before accepting turn" } }); continue; }
+      // Match Codex: thread/start allocates an ID, but only an accepted user turn creates a rollout.
+      fs.writeFileSync(command + ".native.json", JSON.stringify({ thread, total, cwd, config, model, developerInstructions }));
       turnId = crypto.randomUUID(); stopped = false; reply(message, { turn: { id: turnId } });
       void execute(p).catch(() => { if (!stopped) note("turn/completed", { threadId: thread, turn: { id: turnId, status: "failed" } }); }); continue;
     }
     if (message.method === "turn/interrupt") {
       stopped = true; reply(message, {}); note("turn/completed", { threadId: thread, turn: { id: turnId, status: "interrupted" } }); continue;
     }
-    if (message.method === "thread/unsubscribe") { reply(message, { status: "unsubscribed" }); note("thread/closed", { threadId: thread }); continue; }
+    if (message.method === "thread/unsubscribe") {
+      reply(message, { status: loaded ? "unsubscribed" : "notLoaded" });
+      const closingThread = thread;
+      if (!mode().unloadHang) setTimeout(() => {
+        loaded = false;
+        fs.appendFileSync(command + ".events.jsonl", JSON.stringify({ method: "thread/closed", thread: closingThread }) + "\n");
+        note("thread/closed", { threadId: closingThread });
+      }, mode().unloadDelayMs ?? 0);
+      continue;
+    }
     reply(message, {});
   }
 }

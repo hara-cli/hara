@@ -36,7 +36,7 @@ export function codexHostToolOverrides(home: string, runtimeHome = join(home, ".
     // Disable Codex's embedded-skills installer instead of granting it writes to
     // the user's global skills/.system. CLI overrides leave host files untouched.
     "-c", "skills.bundled.enabled=false",
-    "-c", "features.plugins=false", "-c", "features.hooks=false", "-c", "features.codex_hooks=false",
+    "-c", "features.apps=false", "-c", "features.plugins=false", "-c", "features.hooks=false", "-c", "features.codex_hooks=false",
     "-c", "hooks={}", "-c", "notify=[]", "-c", "features.multi_agent=false", "-c", "features.in_app_local_automation=false", "-c", "features.remote_control=false", "-c", "features.unified_exec=false",
   ]);
 }

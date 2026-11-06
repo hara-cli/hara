@@ -63,3 +63,11 @@ test('real Codex metadata rejects an enabled-only MCP table but initializes with
   const result=await init(['-c','mcp_servers={}',...overrides]);assert.ok(result.initialized);assert.equal(result.systemSkillsUpdateAttempted,false);assert.equal(fs.readFileSync(join(home,'.codex/skills/.system/keep.fixture'),'utf8'),'UNCHANGED');assert.deepEqual(fs.readFileSync(config),before);
  }finally{await policy.close();}
 });
+
+
+test('host startup disables built-in apps/connectors alongside global plugins and hooks', t => {
+ const {home}=tree(t), overrides=codexHostToolOverrides(home);
+ for (const setting of ['features.apps=false','features.plugins=false','features.hooks=false']) {
+  const index=overrides.indexOf(setting);assert.ok(index>0);assert.equal(overrides[index-1],'-c');
+ }
+});

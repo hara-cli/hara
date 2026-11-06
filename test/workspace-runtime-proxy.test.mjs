@@ -37,9 +37,13 @@ test("runtime proxy accepts only credential-free http(s) endpoints and uses fixe
   }
 });
 
-test("unset leaves every existing environment entry unchanged; explicit proxy overrides both cases without mutating the parent", () => {
+test("unset preserves inherited routing and adds loopback; explicit proxy overrides both cases without mutating the parent", () => {
   const ambient = { HTTP_PROXY: "http://old-a:1", https_proxy: "http://old-b:2", all_proxy: "socks5://old-c:3", No_PrOxY: "*,provider.invalid,127.0.0.2:9876", no_proxy: "localhost:1234,::1", KEEP: "yes" };
-  assert.equal(runtimeProxyEnv(ambient, null), ambient);
+  const inherited = runtimeProxyEnv(ambient, null);
+  for (const name of ["HTTP_PROXY", "https_proxy", "all_proxy", "KEEP"]) assert.equal(inherited[name], ambient[name]);
+  for (const entry of ["*", "provider.invalid", "127.0.0.2:9876", "localhost:1234", "localhost", "127.0.0.1", "::1"])
+    assert.ok(inherited.NO_PROXY.split(",").includes(entry));
+  assert.equal(inherited.NO_PROXY, inherited.no_proxy); assert.equal(inherited.No_PrOxY, undefined);
   const original = structuredClone(ambient), env = runtimeProxyEnv(ambient, "http://127.0.0.1:18888");
   assert.deepEqual(ambient, original);
   for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) assert.equal(env[name], "http://127.0.0.1:18888");
@@ -178,7 +182,7 @@ test("proxy RPC enforces explicit Workspace generation and revision without chan
 
 test("fresh proxy environment and endpoint identity come from the same guarded read", () => {
   const settings = new WorkspaceRuntimeProxy(storage()), input = { KEEP: "owned", HTTP_PROXY: "http://old.invalid:1" };
-  assert.deepEqual(settings.applyWithEndpoint(input), { env: input, proxyUrl: null });
+  assert.deepEqual(settings.applyWithEndpoint(input), { env: { ...input, NO_PROXY: "localhost,127.0.0.1,::1,[::1]", no_proxy: "localhost,127.0.0.1,::1,[::1]" }, proxyUrl: null });
   settings.save("http://127.0.0.1:18888", 0);
   const current = settings.applyWithEndpoint(input);
   assert.equal(current.proxyUrl, "http://127.0.0.1:18888");
@@ -190,4 +194,22 @@ test("fresh proxy environment and endpoint identity come from the same guarded r
   assert.equal(changed.proxyUrl, "http://127.0.0.1:18889");
   assert.equal(changed.env.HTTP_PROXY, changed.proxyUrl);
   assert.equal(current.proxyUrl, "http://127.0.0.1:18888", "a previous result cannot silently become a new configuration");
+});
+
+
+test("host-bound Codex always appends loopback to ambient bypasses without changing its inherited AI proxy", async () => {
+ const resource=storage(),discovery=root(),bin=join(discovery,"bin"),command=join(bin,"codex");fs.mkdirSync(bin);
+ fs.writeFileSync(command,"#!/bin/sh\nexit 0\n",{mode:0o700});
+ const installer=new WorkspaceRuntimeInstaller(resource,{accountHome:()=>discovery,discovery:{home:discovery,path:bin+":/usr/bin:/bin",systemBins:[],run:async(_command,args)=>args[0]==="-lic"?null:"codex 1.2.3"}});
+ const names=["HTTP_PROXY","HTTPS_PROXY","NO_PROXY","no_proxy"],original=Object.fromEntries(names.map(name=>[name,process.env[name]]));
+ try {
+  process.env.HTTP_PROXY=process.env.HTTPS_PROXY="http://127.0.0.1:1";
+  await installer.discover();installer.registerLocal("codex",installer.list().options.find(row=>row.runtimeId==="codex").fingerprint,"host");
+  for(const previous of [undefined,"example.invalid,10.0.0.0/8"]) {
+   delete process.env.NO_PROXY;delete process.env.no_proxy;if(previous)process.env.no_proxy=previous;
+   const resolved=installer.resolveBound("codex");assert.equal(resolved.env.HTTP_PROXY,"http://127.0.0.1:1");assert.equal(resolved.env.HTTPS_PROXY,"http://127.0.0.1:1");
+   assert.equal(resolved.env.NO_PROXY,resolved.env.no_proxy);
+   for(const value of ["localhost","127.0.0.1","::1",...(previous?previous.split(","):[])])assert.ok(resolved.env.NO_PROXY.split(",").includes(value));
+  }
+ } finally {await installer.close();for(const name of names){if(original[name]===undefined)delete process.env[name];else process.env[name]=original[name];}}
 });

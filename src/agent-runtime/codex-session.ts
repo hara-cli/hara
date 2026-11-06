@@ -1,5 +1,5 @@
 import { CodexContextCompaction, NativeCompactionError } from "./context-compaction.js";
-import { WorkspaceContextCompactions, compactionSourceKey, contextSummaryPrompt } from "../workspace/context-compaction.js";
+import { WorkspaceContextCompactions, compactionSourceKey, contextSummary, contextSummaryPrompt } from "../workspace/context-compaction.js";
 import { workspaceCompactionSource, reserveWorkspaceCompaction, recordWorkspaceRuntimeUsage } from "../workspace/execution.js";
 import { ResidentWorkspaceMcp, residentMcpToolsSupported, WORKSPACE_ATTEMPT_MARKER } from "./registered-cli-resident-mcp.js";
 import { createAssistantPreview } from "./assistant-preview.js";
@@ -17,7 +17,7 @@ import { JsonlRpcClient, ExternalJsonlRpcRequestError, ExternalJsonlRpcTransport
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { canonical, plain } from "../workspace/local-state.js";
 import type { WorkspaceResourceStorage } from "../workspace/resource-context.js";
-import { codexThreadState, codexConversationKey, nativeContextFull, nativeCodexId as nativeId, nativeTokenCount as count, type CodexThreadState } from "../workspace/codex-thread.js";
+import { codexThreadState, recordCodexEmptyThreadReset, codexConversationKey, nativeContextFull, nativeCodexId as nativeId, nativeTokenCount as count, type CodexThreadState } from "../workspace/codex-thread.js";
 import { assertWorkspaceRuntimeUsage, workspaceRuntimeStorage, type WorkspaceRunPermit } from "../workspace/execution.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import { inspectLocalRuntime } from "../workspace/runtime-detect.js";
@@ -34,12 +34,12 @@ export function codexVisibleAgentMessage(value: unknown): value is { type: "agen
     && (item.phase === undefined || item.phase === null || item.phase === "partial_answer" || item.phase === "final_answer");
 }
 /** Stable policy changes refresh the native context; turn-clock/checkpoint text travels every turn. */
-export function codexStandingContext(args: Pick<TurnArgs, "system" | "systemParts">, model: string | null, effort: string | null,
+export function codexStandingContext(args: Pick<TurnArgs, "system" | "systemParts">, _model: string | null, _effort: string | null,
   tier: string, configRevision: number) {
   const standingParts = args.systemParts?.filter(part => part.stability !== "turn") ?? [];
   const turnParts = args.systemParts?.filter(part => part.stability === "turn") ?? [];
   const standing = standingParts.length ? standingParts.map(part => part.content).join("\n\n") : args.system;
-  return { standing, turnParts, digest: hash([standing, model, effort, tier, configRevision]) };
+  return { standing, turnParts, digest: hash([standing, tier, configRevision]) };
 }
 const origin = (resolved: ReturnType<WorkspaceRuntimeInstaller["resolveBound"]>, project: unknown): string =>
   hash([resolved.command, inspectLocalRuntime(resolved.command)?.fingerprint ?? null, resolved.loginSource,
@@ -465,7 +465,8 @@ export class GovernedCodexSession {
         default_tools_approval_mode: "approve", required: true, tool_timeout_sec: 120 } },
         model_auto_compact_token_limit: Number.MAX_SAFE_INTEGER, model_post_turn_compact_threshold_percent: 0,
         ...(input.effort ? { model_reasoning_effort: input.effort } : {}) };
-      const resumed = Boolean(this.value.threadId);
+      let resumed = Boolean(this.value.threadId);
+      let recoverySeed: string | undefined;
       const direct = Boolean(endpoint.attemptMarker && this.loaded && this.value.phase === "idle" && this.value.contextGeneration
         && this.value.standingPromptHash === standingHash && this.loadedContract === contract
         && this.loadedHandle?.client === client && this.loadedHandle.id === this.value.threadId && this.loadedHandle.cwd === input.cwd);
@@ -473,18 +474,42 @@ export class GovernedCodexSession {
       if (!direct) {
       let response: Record<string, unknown>;
       try {
-        response = await client.call(resumed ? "thread/resume" : "thread/start", {
-          ...(resumed ? { threadId: this.value.threadId, excludeTurns: true } : { ephemeral: false }),
+        // Codex ignores resume overrides while the thread is already loaded. The close
+        // notification, not just the unsubscribe ACK, proves that fresh governance can load.
+        if (resumed && this.loaded) await this.unloadThread(client);
+        input.assertCurrent(); if (input.signal.aborted) throw new Error("interrupted");
+        const load = (resume: boolean) => client.call<Record<string, unknown>>(resume ? "thread/resume" : "thread/start", {
+          ...(resume ? { threadId: this.value.threadId, excludeTurns: true } : { ephemeral: false }),
           cwd: input.cwd, sandbox: "danger-full-access", approvalPolicy: "never", approvalsReviewer: "user",
           developerInstructions: standing, config, ...(input.model ? { model: input.model } : {}),
         });
+        let resetFrom: string | undefined;
+        try { response = await load(resumed); }
+        catch (error) {
+          // Local-install exception pending Elon/Linus review: only an explicitly missing,
+          // provably empty rollout can be replaced. Never replay a submitted/unknown action.
+          if (!resumed || !(error instanceof ExternalJsonlRpcRequestError) || error.rpc?.rpcMethod !== "thread/resume"
+            || !/^no rollout found for thread id(?:\s|:|$)/iu.test(error.errorFirstLine ?? "")
+            || this.value.input !== 0 || this.value.output !== 0 || this.value.contextTokens !== null) throw error;
+          resetFrom = this.value.threadId!;
+          const source = workspaceCompactionSource(this.permit);
+          if (source) recoverySeed = contextSummaryPrompt(contextSummary(source));
+          input.assertCurrent(); if (input.signal.aborted) throw new Error("interrupted");
+          response = await load(false);
+        }
         const thread = object(response.thread);
-        if (!nativeId(thread.id) || resumed && thread.id !== this.value.threadId || thread.cwd !== input.cwd
+        if (!nativeId(thread.id) || resumed && !resetFrom && thread.id !== this.value.threadId || thread.cwd !== input.cwd
           || response.approvalPolicy !== "never" || response.approvalsReviewer !== "user"
           || object(response.sandbox).type !== "dangerFullAccess"
           || input.model !== null && response.model !== input.model || input.effort !== null && response.reasoningEffort !== input.effort
           || object(thread.status).type !== "idle") {
           throw new Error("Codex thread confinement or idle origin was not confirmed");
+        }
+        if (resetFrom) {
+          const reset = recordCodexEmptyThreadReset(workspaceRuntimeStorage(this.permit), this.value, resetFrom, thread.id as string);
+          this.value.resets = [...this.value.resets.slice(-1023), reset];
+          this.value.contextGeneration = null; this.value.standingPromptHash = null;
+          resumed = false;
         }
       } catch (error) {
         if (resumed) { this.value.phase = "unknown"; this.save(); }
@@ -517,6 +542,7 @@ export class GovernedCodexSession {
       this.value.phase = "unknown"; this.save(); // Write ahead of an accepted or outcome-unknown turn.
       const refresh = resumed && this.value.standingPromptHash !== standingHash;
       const currentPrompt = [
+        ...(recoverySeed ? [recoverySeed] : []),
         ...(compacted.seed ? [compacted.seed] : []),
         ...(endpoint.attemptMarker ? [`<system-reminder>Current Hara attempt: every Hara Workspace MCP tool call MUST include the extra argument "${WORKSPACE_ATTEMPT_MARKER}": "${endpoint.attemptMarker}". Never use an earlier turn's marker. Hara removes this routing field before the governed tool; it grants no permission or approval.</system-reminder>`] : []),
         ...(refresh ? [`<system-reminder>Current Hara standing governance context for this resumed thread:\n${standing}\n</system-reminder>`] : []),
@@ -619,6 +645,20 @@ export class GovernedCodexSession {
     this.value.phase = "idle"; this.save();
     return success ? { seed: contextSummaryPrompt(summary, false) } : {};
   }
+  private async unloadThread(client: JsonlRpcClient): Promise<void> {
+    if (!this.loaded || !this.value.threadId) return;
+    this.loadedContract = undefined; this.loadedHandle = undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const unloaded = new Promise<void>(resolve => { this.unload = resolve; });
+    try {
+      const result = await client.call<{ status?: string }>("thread/unsubscribe", { threadId: this.value.threadId });
+      if (result.status === "notLoaded") this.loaded = false;
+      if (this.loaded) await Promise.race([unloaded, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Codex thread unload unconfirmed")), 3000);
+      })]);
+    } catch (error) { client.close(); await client.waitForClose(); throw error; }
+    finally { clearTimeout(timer); this.unload = undefined; }
+  }
   private settleNativeAttempt(): Promise<void> { return this.settling ??= this.settleCurrentAttempt(); }
   private async settleCurrentAttempt(): Promise<void> {
       const cleanMcp = this.residentMcp?.retireCurrent() ?? false;
@@ -627,16 +667,7 @@ export class GovernedCodexSession {
       if (!keepLoaded) this.loadedContract = undefined;
       const client = this.client;
       if (client && this.loaded && this.value.threadId && !keepLoaded) {
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const unloaded = new Promise<void>(resolve => { this.unload = resolve; });
-        try {
-          const result = await client.call<{ status?: string }>("thread/unsubscribe", { threadId: this.value.threadId });
-          if (result.status === "notLoaded") this.loaded = false;
-          if (this.loaded) await Promise.race([unloaded, new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(new Error("Codex thread unload unconfirmed")), 3000);
-          })]);
-        } catch { client.close(); await client.waitForClose(); }
-        finally { clearTimeout(timer); this.unload = undefined; }
+        try { await this.unloadThread(client); } catch { /* Closed by unloadThread; the saved thread survives. */ }
       }
       if (!this.client) { await this.exit; if (this.policy) { await endWorkspaceNativePolicy(this.permit, this.policy); await this.policy.close(); this.policy = undefined; } }
       else if (this.policy) {

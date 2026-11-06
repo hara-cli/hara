@@ -1,5 +1,5 @@
 // Host-private native context/telemetry. This is not execution authority or the Hara task budget.
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { canonical, exact, plain, UUID, WorkspaceJsonState } from "./local-state.js";
 import { sameWorkspaceResourceBinding, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 
@@ -79,4 +79,34 @@ export function codexThreadView(value: CodexThreadState) {
       : value.phase === "unknown" ? "recovery_needed" as const : "ready" as const,
     contextTokens: value.contextTokens, contextLimit: nativeContextLimit(value),
     lastAttempt: { ...value.lastAttempt }, lastResetRequestId: value.resets.at(-1)?.requestId ?? null };
+}
+
+/** Separate audit document preserves v3 thread-state rollback compatibility. No prompt/tool bodies. */
+export function recordCodexEmptyThreadReset(storage: WorkspaceResourceStorage, value: CodexThreadState, oldThreadId: string, newThreadId: string): CodexThreadState["resets"][number] {
+  interface Entry { requestId: string; at: string; reason: "codex_thread_never_materialized"; oldThreadId: string; newThreadId: string }
+  interface Audit { schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; agentId: string; sessionId: string; entries: Entry[] }
+  const state: WorkspaceJsonState<Audit> = new WorkspaceJsonState(storage,
+    "codex-empty-thread-resets-" + hash([value.agentId, value.sessionId]).slice(0, 24) + ".json", raw => {
+      if (!plain(raw) || !exact(raw, ["schemaVersion", "revision", "resourceBinding", "agentId", "sessionId", "entries"])
+        || raw.schemaVersion !== 1 || !nativeTokenCount(raw.revision) || Number(raw.revision) < 1
+        || !sameWorkspaceResourceBinding(raw.resourceBinding as WorkspaceResourceBinding, state.binding())
+        || raw.agentId !== value.agentId || raw.sessionId !== value.sessionId || !Array.isArray(raw.entries) || raw.entries.length > 1024)
+        throw new Error("Invalid empty Codex thread reset audit");
+      const seen = new Set<string>();
+      for (const row of raw.entries) {
+        if (!plain(row) || !exact(row, ["requestId", "at", "reason", "oldThreadId", "newThreadId"])
+          || typeof row.requestId !== "string" || !UUID.test(row.requestId) || seen.has(row.requestId)
+          || typeof row.at !== "string" || !Number.isFinite(Date.parse(row.at)) || row.reason !== "codex_thread_never_materialized"
+          || !nativeCodexId(row.oldThreadId) || !nativeCodexId(row.newThreadId) || row.oldThreadId === row.newThreadId)
+          throw new Error("Invalid empty Codex thread reset audit entry");
+        seen.add(row.requestId);
+      }
+      return structuredClone(raw) as unknown as Audit;
+    }, () => ({ schemaVersion: 1, revision: 0, resourceBinding: state.binding(), agentId: value.agentId, sessionId: value.sessionId, entries: [] }));
+  if (value.input !== 0 || value.output !== 0 || value.contextTokens !== null || value.threadId !== oldThreadId
+    || !nativeCodexId(newThreadId) || newThreadId === oldThreadId) throw new Error("Nonempty Codex thread reset refused");
+  const entry: Entry = { requestId: randomUUID(), at: new Date().toISOString(), reason: "codex_thread_never_materialized", oldThreadId, newThreadId };
+  const current = state.read();
+  state.update(current.revision, audit => ({ ...audit, entries: [...audit.entries.slice(-1023), entry] }));
+  return { requestId: entry.requestId, at: entry.at, actorId: "system", oldThreadId, revision: value.revision + 1 };
 }

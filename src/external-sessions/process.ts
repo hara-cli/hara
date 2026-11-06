@@ -1,4 +1,4 @@
-import { runtimeErrorFirstLine } from "../security/runtime-error.js";
+import { runtimeErrorFirstLine, runtimeTransportErrorFirstLine } from "../security/runtime-error.js";
 import { runtimeProxyFailureFromText } from "../security/runtime-proxy.js";
 import { classifyRuntimeFailure, runtimeRpcDiagnostic, type RuntimeRpcDiagnostic } from "../agent-runtime/failure-diagnostics.js";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
@@ -607,6 +607,7 @@ export class JsonlRpcClient {
   private readonly maxOutputBytes: number;
   private readonly pending = new Map<number, PendingJsonlRequest>();
   private stderr = "";
+  private processExit?: { code: number | null; signal?: string | null };
   private pendingText = "";
   private outputBytes = 0;
   private nextId = 1;
@@ -627,11 +628,13 @@ export class JsonlRpcClient {
     if (options.signal?.aborted) this.abort();
     child.stdout?.on("data", (chunk: Buffer) => this.consume(chunk));
     // Hold bounded native evidence locally, then expose only its redacted first line on failure.
-    child.stderr?.on("data", (chunk: Buffer) => { if (options.captureErrorFirstLine) this.stderr = boundedAppend(this.stderr, chunk.toString(), 65_536); });
+    child.stderr?.on("data", (chunk: Buffer) => { if (options.captureErrorFirstLine) this.stderr = (this.stderr + chunk.toString()).slice(-65_536); });
     child.stdin?.on("error", () => this.fail("external session adapter input closed"));
     child.once("error", () => this.fail("external session adapter process failed"));
-    child.once("close", (code) => {
-      if (!this.closed) this.fail(`external session adapter exited unexpectedly (code ${code ?? "unknown"})`);
+    child.once("exit", (code, signal) => { this.processExit = { code, signal }; });
+    child.once("close", (code, signal) => {
+      this.processExit = { code, signal };
+      if (!this.closed) this.fail("external session adapter exited unexpectedly");
     });
   }
 
@@ -765,8 +768,10 @@ export class JsonlRpcClient {
     this.closed = true;
     this.options.signal?.removeEventListener("abort", this.abort);
     const method = timedOutMethod ?? (this.pending.size === 1 ? this.pending.values().next().value?.method : undefined);
-    const error = new ExternalJsonlRpcTransportError(message, classifyRuntimeFailure({ stderr: this.stderr, timedOut: message.endsWith("timed out") }),
-      this.options.captureErrorFirstLine ? runtimeErrorFirstLine(this.stderr, this.options.env) : undefined,
+    const evidence = runtimeTransportErrorFirstLine(this.stderr, this.processExit, this.options.env);
+    const error = new ExternalJsonlRpcTransportError(message, classifyRuntimeFailure({ stderr: this.processExit ? "" : evidence,
+      signal: this.processExit?.signal, timedOut: message.endsWith("timed out") }),
+      this.options.captureErrorFirstLine ? evidence : undefined,
       runtimeRpcDiagnostic({ rpcMethod: method, rpcTimeoutMs: this.requestTimeoutMs }));
     this.stderr = "";
     for (const request of this.pending.values()) {

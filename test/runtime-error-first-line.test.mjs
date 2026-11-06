@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { runtimeErrorFirstLine } from '../dist/security/runtime-error.js';
+import { runtimeErrorFirstLine, runtimeTransportErrorFirstLine } from '../dist/security/runtime-error.js';
 import { JsonlRpcClient, runExternalCommandCapture, ExternalJsonlRpcRequestError, ExternalJsonlRpcTransportError } from '../dist/external-sessions/process.js';
 import { runtimeFailureMessage } from '../dist/agent-runtime/failure-diagnostics.js';
 import { runtimeFailureTracker } from '../dist/agent-runtime/failure-tracker.js';
@@ -38,7 +38,7 @@ test('split stderr is redacted as one line and transport/RPC failures preserve t
  const child=rpcChild();const client=JsonlRpcClient.start({command:process.execPath,env,captureErrorFirstLine:true,spawnProcess:()=>child});
  const waiting=client.call('initialize');
  child.stderr.write(raw.slice(0,35));child.stderr.write(raw.slice(35));child.emit('close',1);
- await assert.rejects(waiting,error=>error instanceof ExternalJsonlRpcTransportError&&error.errorFirstLine.startsWith('Error: invalid transport')&&!JSON.stringify(error).includes(secret));
+ await assert.rejects(waiting,error=>error instanceof ExternalJsonlRpcTransportError&&error.errorFirstLine==='External runtime exited with code 1'&&!JSON.stringify(error).includes(secret));
  const rpc=rpcChild();const another=JsonlRpcClient.start({command:process.execPath,env,captureErrorFirstLine:true,spawnProcess:()=>rpc});
  const response=another.call('thread/start');rpc.stdout.write(JSON.stringify({id:1,error:{code:-32602,message:raw,data:{prompt:'PRIVATE_DATA'}}})+'\n');
  await assert.rejects(response,error=>error instanceof ExternalJsonlRpcRequestError&&error.code===-32602&&error.errorFirstLine.startsWith('Error: invalid transport')&&!JSON.stringify(error).includes('PRIVATE_DATA'));
@@ -59,7 +59,7 @@ test('native startup stderr reaches the real Hara recovery diagnostic without a 
  const f=await cliMcpFixture(t,'list');f.mode({mode:'list',startupStderr:'Error: invalid transport /Users/private/config.toml\nPRIVATE_SECOND_LINE'});
  await f.send('Say ready without tools.');const view=await until(f.read,v=>v.conversation.state==='blocked');
  const text=JSON.stringify(view.conversation);
- assert.match(text,/errorFirstLine/);assert.match(text,/Error: invalid transport \[path\]/);
+ assert.match(text,/errorFirstLine/);assert.match(text,/External runtime exited with code 1/);
  assert.doesNotMatch(text,/Users\/private|PRIVATE_SECOND_LINE/);
 });
 
@@ -79,4 +79,17 @@ test('RPC timeout keeps its closed method/deadline and safe stderr despite synch
    assert.doesNotMatch(JSON.stringify(closeError),/PRIVATE_THREAD|PRIVATE_PROMPT|opaque-native|Users|example|SECOND_LINE/);
   } finally {clearTimeout(keepAlive);client.close();child.emit('close',0);}
  }
+});
+
+
+test('transport closure prefers its signal and otherwise the latest ERROR, while RPC errors keep their own message', async () => {
+ const noise = 'ERROR rmcp unrelated error sending request https://noise.invalid\nINFO harmless\nERROR final failure /Users/private/file\n';
+ assert.equal(runtimeTransportErrorFirstLine(noise,{code:null,signal:'SIGTERM'},env),'External runtime terminated by signal SIGTERM');
+ assert.equal(runtimeTransportErrorFirstLine(noise,{code:7,signal:null},env),'External runtime exited with code 7');
+ assert.equal(runtimeTransportErrorFirstLine(noise,undefined,env),'ERROR final failure [path]');
+ const child=rpcChild(),client=JsonlRpcClient.start({command:process.execPath,env,captureErrorFirstLine:true,spawnProcess:()=>child});
+ const pending=client.call('turn/start');child.stderr.write(noise);child.emit('exit',null,'SIGTERM');child.emit('close',null,'SIGTERM');
+ await assert.rejects(pending,error=>error instanceof ExternalJsonlRpcTransportError&&error.runtimeFailureKind==='runtime_failed'
+  &&error.errorFirstLine==='External runtime terminated by signal SIGTERM');
+ await client.waitForClose();
 });

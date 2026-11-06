@@ -19,3 +19,12 @@ export function runtimeErrorFirstLine(value: unknown, env: NodeJS.ProcessEnv = p
     .trim();
   return safe ? [...safe].slice(0, 320).join("") : undefined;
 }
+
+/** Transport closure is not an RPC error: prefer observed exit evidence, then the latest ERROR. */
+export function runtimeTransportErrorFirstLine(stderr: string, exit: { code: number | null; signal?: string | null } | undefined,
+  env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (exit?.signal) return runtimeErrorFirstLine(`External runtime terminated by signal ${exit.signal}`, env);
+  if (exit && exit.code !== null && exit.code !== 0) return runtimeErrorFirstLine(`External runtime exited with code ${exit.code}`, env);
+  const lines = stderr.slice(-65_536).split(/\r?\n/u);
+  return runtimeErrorFirstLine([...lines].reverse().find(line => /\bERROR\b/iu.test(line)) ?? lines.find(line => line.trim()), env);
+}

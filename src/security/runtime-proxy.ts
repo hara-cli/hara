@@ -22,7 +22,17 @@ export function normalizeRuntimeProxyUrl(raw: unknown): string | null {
 const LOOPBACK = ["localhost", "127.0.0.1", "::1", "[::1]"];
 /** Only loopback bypasses survive an explicit proxy; wildcard/provider bypasses could silently go direct. */
 export function runtimeProxyEnv(env: NodeJS.ProcessEnv, proxyUrl: string | null): NodeJS.ProcessEnv {
-  if (proxyUrl === null) return env;
+  if (proxyUrl === null) {
+    // Inherited AI routing stays untouched. Local Host MCP traffic must always stay local.
+    const bypass = new Set<string>();
+    for (const [key, value] of Object.entries(env)) if (key.toUpperCase() === "NO_PROXY")
+      for (const token of (value ?? "").split(",").map(value => value.trim()).filter(Boolean)) bypass.add(token);
+    for (const token of LOOPBACK) bypass.add(token);
+    const next = { ...env };
+    for (const key of Object.keys(next)) if (key.toUpperCase() === "NO_PROXY") delete next[key];
+    next.NO_PROXY = next.no_proxy = [...bypass].join(",");
+    return next;
+  }
   const endpoint = normalizeRuntimeProxyUrl(proxyUrl)!;
   const bypass = new Set(LOOPBACK);
   for (const [key, value] of Object.entries(env)) if (key.toUpperCase() === "NO_PROXY") {

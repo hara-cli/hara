@@ -27,8 +27,8 @@ if (selected.includes(0)) test("standing hash covers rules, operation cards and 
   for (const parts of [[{ ...base.systemParts[0], content: "permit-B" }, ...base.systemParts.slice(1)],
     [base.systemParts[0], { ...base.systemParts[1], content: "card-B" }, base.systemParts[2]]])
     assert.notEqual(read({ ...base, systemParts: parts }).digest, original.digest);
-  assert.notEqual(read(base, "model-B").digest, original.digest);
-  assert.notEqual(read(base, "model-A", "high").digest, original.digest);
+  assert.equal(read(base, "model-B").digest, original.digest);
+  assert.equal(read(base, "model-A", "high").digest, original.digest);
   assert.notEqual(read(base, "model-A", "low", "full-protected").digest, original.digest);
   assert.notEqual(read(base, "model-A", "low", "controlled", 2).digest, original.digest);
 });
@@ -53,9 +53,9 @@ if (selected.includes(1)) test("a second governed Codex message reuses one loade
   await f.request("workspace.runtime.selectModel", { ...f.scope, runtimeId: "codex", modelId: "fixture-model-2", effort: "high", expectedRevision: 1 });
   assert.equal((await exchange(f, "List colleagues using the selected model?" )).conversation.state, "completed");
   const switched = starts(f).at(-1), turn = f.native().filter(row => row.method === "turn/start").at(-1);
-  assert.equal(switched.method, "thread/resume"); assert.equal(switched.pid, a.pid);
-  assert.notEqual(f.meta().url, b.url, "changed model contract gets a fresh MCP SDK session");
-  assert.equal(switched.params.model, "fixture-model-2"); assert.equal(switched.params.config.model_reasoning_effort, "high");
+  assert.equal(switched.method, "thread/start"); assert.equal(starts(f).length, 1); assert.equal(switched.pid, a.pid);
+  assert.equal(f.meta().url, b.url, "model/effort are per-turn overrides on the same loaded contract");
+  assert.equal(f.meta().model, "fixture-model-2"); assert.equal(f.meta().effort, "high");
   assert.equal(turn.params.model, "fixture-model-2"); assert.equal(turn.params.effort, "high");
 });
 
@@ -69,8 +69,10 @@ if (selected.includes(2)) test("standing prompt changes reach the next resident 
   f.mode({ mode: "list", foreignCompaction: true }); await exchange(f, "List current colleagues? Foreign event");
   assert.equal(nativeState(f).contextGeneration, first.contextGeneration, "another session cannot reset this model-memory epoch");
   f.mode("list");
-  await f.request("workspace.runtime.selectModel", { ...f.scope, runtimeId: "codex", modelId: "fixture-model-2", effort: "high", expectedRevision: 1 });
-  await exchange(f, "List current colleagues? New model"); const switched = nativeState(f);
+  const agent = (await f.read()).agents.find(row => row.agentId === f.main.agentId);
+  await f.request("workspace.agents.updatePersona", { ...f.scope, agentId: agent.agentId, configRevision: agent.configRevision,
+    agentEpoch: agent.agentEpoch, input: { profile: { displayName: "New standing persona" } } });
+  await exchange(f, "List current colleagues? New standing"); const switched = nativeState(f);
   assert.notEqual(switched.standingPromptHash, second.standingPromptHash); assert.equal(switched.contextGeneration, first.contextGeneration);
   assert.match(f.native().filter(row => row.method === "turn/start").at(-1).params.input[0].text, /Current Hara standing governance context/);
   f.mode({ mode: "list", emitCompaction: true }); await exchange(f, "List current colleagues? Compact"); const compacted = nativeState(f);
