@@ -263,3 +263,52 @@ test("actual provider retry and context usage are observed without another model
  const f=fixture(async args=>{args.onRetry?.({provider:"openai",model:"fixture",attempt:1,nextAttempt:2,kind:"timeout",delayMs:0,elapsedMs:1});return reply("done");},[],undefined,undefined,{runtimeStages:stage});
  try{await runPiAgent([{role:"user",content:"hello"}],f.options);assert.equal(f.requests,1);assert.equal(stage.snapshot().contextTokens,7);assert.deepEqual(stage.snapshot().events.filter(e=>e.kind==="retry").map(e=>e.errorKind),["timeout"]);}finally{await f.close();}
 });
+
+
+for (const [kind, reminder] of [
+  ["deadline", "Deadline checkpoint: wrap up the current work and verify the result."],
+  ["task checkpoint", "Task-round checkpoint: verify evidence before continuing the current strategy."],
+  ["progress", "No-progress checkpoint: inspect observed artifacts and record a verified next step."],
+]) test(`Pi keeps ${kind} feedback in all three later requests without durable reminders`, async () => {
+  const { pushReminder, disposeReminderScope } = await import("../dist/agent/reminders.js");
+  const requests = [], probe = { name: "memory_feedback_probe", description: "Return a bounded read-only observation",
+    kind: "read", input_schema: { type: "object", properties: {} }, async run() { return "observed"; } };
+  let a;
+  a = fixture(async (args, round) => {
+    requests.push(structuredClone(args.history));
+    if (round === 1) pushReminder(reminder, a.options.ctx.todoScope);
+    return round <= 3 ? { text: "", toolUses: [{ id: `probe-${round}`, name: probe.name, input: {} }], stop: "tool_use", usage: { input: 7, output: 3 } } : reply("Observed.");
+  }, [probe]);
+  a.options.quiet = false;
+  const history = [{ role: "user", content: "Observe the bounded fixture." }];
+  try {
+    const result = await runConfiguredAgent(history, a.options);
+    assert.equal(result.status, "completed", result.error);
+    assert.equal(requests.length, 4);
+    for (const request of requests.slice(1)) {
+      const index = request.findIndex(row => row.role === "user" && row.content.includes(reminder));
+      assert(index >= 0, `${kind} must remain visible through the third request after feedback`);
+      if (request.some(row => row.role === "assistant" && row.toolUses.some(tool => tool.id === "probe-2")))
+        assert(index < request.findIndex(row => row.role === "assistant" && row.toolUses.some(tool => tool.id === "probe-2")), "feedback keeps its original place before later tool rounds");
+    }
+    assert.doesNotMatch(JSON.stringify(history), /Deadline checkpoint|Task-round checkpoint|No-progress checkpoint|<system-reminder>/);
+  } finally { disposeReminderScope(a.options.ctx.todoScope); await a.close(); }
+});
+
+for (const kind of ["empty", "credential-withheld"]) test(`native prose-only closeout is accurate for ${kind}`, async () => {
+  const { pausedCloseoutText } = await import("../dist/agent/task-closeout.js");
+  const history = [{ role: "user", content: "Observe this fixture." }];
+  const a = fixture(async (_args, round) => kind === "credential-withheld" && round > 1
+    ? { text: "", toolUses: [], stop: "error", errorMetadata: { code: "native_continuation_unavailable" }, errorMsg: "one-shot native turn is terminal" }
+    : { ...reply(kind === "empty" ? "" : "Please send me your API key."), nativeContinuation: "unavailable" });
+  try {
+    const result = await runConfiguredAgent(history, a.options);
+    assert.equal(result.status, "halted"); assert.equal(result.stopReason, "native_prose_only");
+    assert.doesNotMatch(JSON.stringify(history), /Please send me your API key/);
+    for (const language of ["en", "zh-Hans"]) {
+      const text = pausedCloseoutText(a.task, [], language, result);
+      assert.doesNotMatch(text, /reply is retained|回复已保留|文字回复|send me your API key/i);
+      assert.match(text, /without a verified action receipt|尚未取得操作回执/);
+    }
+  } finally { await a.close(); }
+});

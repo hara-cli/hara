@@ -1,3 +1,4 @@
+import { RunModelTranscript } from "./run-model-transcript.js";
 import { createWorkspaceExtensionApproval, isWorkspaceExtensionTool, type WorkspaceExtensionApproval } from "../workspace/extension-binding.js";
 import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment, TurnArgs, TurnResult } from "../providers/types.js";
 import { isTaskRuntimeBinding } from "../agent-runtime/bindings.js";
@@ -1774,8 +1775,9 @@ async function runAgentInner(
   let emptyRetried = false; // one-shot: a genuinely empty model turn gets a single nudge before we give up
   let actionOwnershipRetries = 0; // accepted change tasks may not terminate as advice without a typed blocker
   // Host feedback is model-only in Workspace runs; it must never become a person-authored message.
-  const modelFeedback: NeutralMsg[] = [];
-  const feedbackHistory = opts.workspaceRun ? modelFeedback : history;
+  const modelTranscript = opts.workspaceRun ? new RunModelTranscript(history,
+    message => message.role === "user" && isSystemReminderContent(message.content)) : undefined;
+  const feedbackHistory = modelTranscript ?? history;
   let completionReceiptRetries = 0; // performed work gets one bounded chance to record final verification
   let noProgressFinalizationRetries = 0; // a successful side effect gets one close-out round before watchdog halt
   let credentialDisclosureRetries = 0; // gateway prose gets one hidden correction before a safe hard stop
@@ -2083,7 +2085,7 @@ async function runAgentInner(
       ? stableSystemParts.map((part) => part.content).join("\n\n")
       : assembledSystem.text;
     const requestHistory = opts.workspaceRun
-      ? [...prepareWorkspaceRunHistory(opts.workspaceRun, history).filter(message => message.role !== "user" || !isSystemReminderContent(message.content)), ...modelFeedback.splice(0)]
+      ? prepareWorkspaceRunHistory(opts.workspaceRun, history, modelTranscript!.read())
       : history;
     const prepared = prepareHistoryForModel(requestHistory, {
       model: activeProvider.model,
@@ -2414,7 +2416,7 @@ async function runAgentInner(
     if (r.errorMetadata?.code === "native_resume_timeout")
       return { status: "halted", stopReason: "native_resume_timeout", error: "Loading the existing native conversation timed out before this message was submitted. History was kept. Retry loading or open a new session." };
     if (r.errorMetadata?.code === "native_continuation_unavailable")
-      return { status: "halted", stopReason: "native_prose_only", error: "The native reply ended without an accepted action receipt. Continue explicitly or clarify the request; no action has been replayed." };
+      return { status: "halted", stopReason: "native_prose_only", error: "The native turn ended without an accepted action receipt. Continue explicitly or clarify the request; no action has been replayed." };
     if (opts.workspaceRun?.binding.agent.runtimeId === "codex" && r.errorMetadata?.code === "native_context_limit")
       return { status: "halted", stopReason: "native_context_limit" };
     const responseCallIds = new Set<string>();
@@ -2656,7 +2658,7 @@ async function runAgentInner(
       && !freshTaskCompletion(intakeTask)
     ) {
       if (r.nativeContinuation === "unavailable" && !successfulOwnedActionObserved)
-        return { status: "halted", stopReason: "native_prose_only", error: "The native reply contains no verified action receipt. The reply is retained; continue explicitly or clarify the request." };
+        return { status: "halted", stopReason: "native_prose_only", error: "The native turn ended without a verified action receipt; continue explicitly or clarify the request." };
       if (engineBriefCreated && workspaceChangeTrace && r.text.trim() && opts.workspaceRun
         && simpleChangeObjective(intakeTask.objective)) {
         syncIntakeTask();

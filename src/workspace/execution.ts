@@ -387,15 +387,19 @@ export function workspaceRunIsInteractive(permit: WorkspaceRunPermit): boolean {
   const state = stateOf(permit); state.assertLive(); return permit.binding.budget.mode === "interactive";
 }
 export function assertWorkspaceRunContextCurrent(permit: WorkspaceRunPermit): void { stateOf(permit).assertLive(); }
-export function prepareWorkspaceRunHistory(permit: WorkspaceRunPermit, history: NeutralMsg[]): NeutralMsg[] {
+export function prepareWorkspaceRunHistory(permit: WorkspaceRunPermit, history: NeutralMsg[], modelTranscript?: NeutralMsg[]): NeutralMsg[] {
   const state = stateOf(permit); state.assertLive();
   if (!state.started) throw new Error("Workspace model context requires the governed entry");
   const pinned = state.modelHistory;
-  if (!pinned) return history; // Existing trusted non-Host fixtures already contain one attempt only.
+  if (!pinned) return modelTranscript ?? history; // Existing trusted non-Host fixtures already contain one attempt only.
   if (history !== pinned.history || createHash("sha256").update(canonical(history.slice(0, pinned.start))).digest("hex") !== pinned.prefixDigest) {
     throw new Error("Workspace durable history prefix changed; model request refused");
   }
-  const projected = workspaceTaskProjection(history, pinned.start, { usedTokens: pinned.usedTokens?.() ?? state.usage.inputTokens + state.usage.outputTokens,
+  // Validate the original durable prefix first. The run-only overlay retains the current user
+  // object, so removing legacy internal rows or adding feedback cannot shift the task boundary.
+  const source = modelTranscript ?? history;
+  const start = modelTranscript ? source.indexOf(history[pinned.start]!) : pinned.start;
+  const projected = workspaceTaskProjection(source, start, { usedTokens: pinned.usedTokens?.() ?? state.usage.inputTokens + state.usage.outputTokens,
     maxTokens: permit.binding.budget.maxTokens, task: state.options?.taskIntake?.current?.(), retain: pinned.retain });
   state.contextStats = projected.stats; return projected.history;
 }

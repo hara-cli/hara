@@ -323,10 +323,12 @@ export class WorkspaceRuntimeModels {
   async launchSelection(runtimeId: OptionalRuntimeId, objective = ""): Promise<{ modelId: string | null; effort: string | null; effortSource: "auto" | "user" | "default" }> {
     this.bound(runtimeId);
     const row = this.state.read().selections.find(value => value.runtimeId === runtimeId);
-    // "Follow the engine default" passes nothing; the runtime decides, exactly like a runtime without effort.
-    if (row?.selectedEffort === ENGINE_DEFAULT_EFFORT) return { modelId: row.selectedModelId, effort: null, effortSource: "default" };
-    const effortSource = ["codex", "claude", "copilot"].includes(runtimeId) ? row?.selectedEffort != null && row.selectedEffort !== "auto" ? "user" as const : "auto" as const : "default" as const;
-    if (row?.selectedEffort != null && row.selectedEffort !== "auto" && (runtimeId !== "codex" || row.selectedModelId !== null))
+    const engineDefault = row?.selectedEffort === ENGINE_DEFAULT_EFFORT;
+    // One-shot engines can omit the override. Codex overrides are sticky, so its sentinel must
+    // resolve through inventory to the declared default, before the fixed-effort fast path.
+    if (engineDefault && runtimeId !== "codex") return { modelId: row.selectedModelId, effort: null, effortSource: "default" };
+    const effortSource = engineDefault ? "default" as const : ["codex", "claude", "copilot"].includes(runtimeId) ? row?.selectedEffort != null && row.selectedEffort !== "auto" ? "user" as const : "auto" as const : "default" as const;
+    if (!engineDefault && row?.selectedEffort != null && row.selectedEffort !== "auto" && (runtimeId !== "codex" || row.selectedModelId !== null))
       return { modelId: row.selectedModelId, effort: row.selectedEffort, effortSource };
     // The first lookup needs the live inventory; repeating app-server model/list on every chat
     // would add a second native process to the latency path. Reuse only for this bound runtime
@@ -357,7 +359,8 @@ export class WorkspaceRuntimeModels {
     return { modelId: selected.modelId,
       // Codex overrides are sticky. Use its declared default if auto cannot select a level;
       // never invent a level for an unknown capability. Null transitions leave the direct path.
-      effort: resolveReasoningEffort(row?.selectedEffort, selected.levels, objective) ?? selected.defaultEffort ?? null, effortSource };
+      effort: engineDefault ? selected.defaultEffort ?? null
+        : resolveReasoningEffort(row?.selectedEffort, selected.levels, objective) ?? selected.defaultEffort ?? null, effortSource };
   }
   selected(runtimeId: OptionalRuntimeId): string | null { return this.selection(runtimeId).modelId; }
   selectedEffort(runtimeId: OptionalRuntimeId): string | null { return this.selection(runtimeId).effort; }

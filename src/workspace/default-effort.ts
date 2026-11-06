@@ -8,7 +8,8 @@ export function defaultEffortForLevels(levels: readonly string[] | undefined, ob
   return order.find(level => levels.includes(level)) ?? null;
 }
 
-/** "Follow the engine default": no effort argument at all. Distinct from null/"auto" (Hara chooses). */
+/** "Follow the engine default": omit one-shot overrides; persistent Codex resolves its catalog
+ * default explicitly. Distinct from null/"auto" (Hara chooses for the current request). */
 export const ENGINE_DEFAULT_EFFORT = "engine-default";
 /** A saved setting as it may reach a launch when the inventory is unavailable: only a fixed level passes. */
 export function launchableSavedEffort(effort: string | null): string | null {

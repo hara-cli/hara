@@ -24,6 +24,12 @@ export function runtimeFailureTracker(installer: WorkspaceRuntimeInstaller, runt
   };
   return {
     blocked(): string | null { const held = cooldown.blocked(); return held ? message(held.kind, 0) : null; },
+    // Keep the code-owned native RPC category when an admission fence blocks a quick retry.
+    // A resume timeout must remain the same recoverable pause without launching another turn.
+    blockedNativeMetadata() {
+      const held = cooldown.blocked();
+      return held ? { nativeFailureKind: held.kind, ...(row.rpc ? { nativeRpc: row.rpc } : {}) } : {};
+    },
     failed(kind: RuntimeFailureKind, elapsedMs: number, firstLine?: string, rpc?: RuntimeRpcDiagnostic): string { row.rpc = runtime === "codex" ? runtimeRpcDiagnostic(rpc) : undefined; row.errorFirstLine = runtimeErrorFirstLine(firstLine, launched.env); cooldown.failed(kind, elapsedMs); return message(kind, elapsedMs); },
     succeeded(): void { row.rpc = undefined; row.errorFirstLine = undefined; cooldown.succeeded(); },
   };

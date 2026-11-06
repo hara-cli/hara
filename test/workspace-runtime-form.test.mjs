@@ -239,12 +239,12 @@ test("one Apply: validates before writing, confirms, switches, then saves the en
     }
     assert.ok(finished, "the run finished");
     const stage = finished.conversation.runtimeStages.at(-1);
-    assert.equal(stage.runtime.effort ?? null, null, "no effort was sent");
+    assert.equal(stage.runtime.effort, "medium", "persistent Codex receives its declared catalog default");
     assert.equal(stage.runtime.effortSource, "default");
     const requests = fs.readFileSync(`${command}.rpc.jsonl`, "utf8").trim().split("\n").map(line => JSON.parse(line));
     const thread = requests.find(row => row.method === "thread/start"), turn = requests.find(row => row.method === "turn/start");
     assert.equal(thread.params.model, "gpt-6.1-sol");
-    assert.ok(!Object.hasOwn(thread.params.config ?? {}, "model_reasoning_effort"), "no -c model_reasoning_effort for the engine default");
-    assert.equal(turn.params.effort ?? null, null);
+    assert.equal(thread.params.config.model_reasoning_effort, "medium");
+    assert.equal(turn.params.effort, "medium");
   } finally { socket.close(); await handle.close(); }
 });

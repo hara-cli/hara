@@ -105,7 +105,7 @@ export function pausedCloseoutText(task: TaskExecution, todos: readonly Todo[], 
     no_progress: zh ? "近期没有取得新的可核验进展。" : "Recent work produced no new verifiable progress.",
     repeat_loop: zh ? "检测到重复执行，已停止以避免再次操作。" : "Repeated execution was detected and stopped to avoid repeating actions.",
     native_context_limit: zh ? "上下文已达上限，请开新会话。" : "The context limit was reached. Open a new session.",
-    native_prose_only: zh ? "引擎已结束文字回复，但尚未取得操作回执。回复已保留；你可以补充说明或继续执行。" : "The native reply ended without a verified action receipt. The reply is retained; clarify or continue explicitly.",
+    native_prose_only: zh ? "引擎本轮已结束，尚未取得操作回执。你可以补充说明或继续执行。" : "The engine finished this turn without a verified action receipt. Clarify or continue explicitly.",
     native_resume_timeout: zh ? "加载已有对话超时，本条消息尚未提交给引擎。原历史已保留，可重试加载或开新会话。" : "Loading the existing conversation timed out before this message was submitted. History was kept; retry loading or open a new session.",
   };
   const reason = outcome?.status === "error"
