@@ -16,10 +16,10 @@ const call = (id, name, input = {}) => ({ id, name, input });
 
 // These exact tool-ID ledger tests exercise the governed in-process path explicitly.
 async function run(message, turns, tier = "controlled") {
-  const path = root(); let rounds = 0;
+  const path = root(); let rounds = 0; const requests = [];
   const host = new LocalWorkspaceHost(path, { credentialVault: new MemoryCredentialVault(),
-    providerFactory(_connection, binding) { return { id: "openai", model: binding.model, async turn() {
-      return turns[rounds++] ?? response("Still done.");
+    providerFactory(_connection, binding) { return { id: "openai", model: binding.model, async turn(args) {
+      requests.push(args.history); return turns[rounds++] ?? response("Still done.");
     } }; } });
   try {
     const ws = host.createWorkspace("C-lite", host.list().revision); host.configureSynthetic(ws.workspaceId, 0);
@@ -28,7 +28,7 @@ async function run(message, turns, tier = "controlled") {
     host.select("tester", ws.workspaceId, host.list().revision);
     const receipt = host.start("tester", ws.workspaceId, ws.selectedAgentId, message, randomUUID());
     await host.wait(receipt.runId);
-    return { rounds, view: host.snapshot(ws.workspaceId, ws.selectedAgentId, "tester").conversation,
+    return { rounds, requests, view: host.snapshot(ws.workspaceId, ws.selectedAgentId, "tester").conversation,
       project: join(path, "project", ws.workspaceId) };
   } finally { await host.close(); }
 }
@@ -59,11 +59,12 @@ test("engine creates an answer brief and closes a read-only response without boo
 });
 
 test("fabricated completion without write is corrected once and stays uncompleted", async () => {
-  const { rounds, view } = await run("写入 note.txt 内容 hello", [response("完成了。"), response("已经完成。")]);
+  const { rounds, view, requests } = await run("写入 note.txt 内容 hello", [response("完成了。"), response("已经完成。")]);
   assert.equal(rounds, 2);
   assert.notEqual(view.taskState, "completed");
   assert.equal(view.completion, null);
-  assert.match(JSON.stringify(view.history), /未见实际修改回执/);
+  assert.doesNotMatch(JSON.stringify(view.history), /未见实际修改回执/);
+  assert.match(JSON.stringify(requests[1]), /未见实际修改回执/);
 });
 
 test("explicit checkpoint cannot verify a change from read receipts alone", async () => {

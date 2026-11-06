@@ -127,6 +127,8 @@ export function createRegisteredCliMcpTurn(input: {
   createEndpoint?(input: WorkspaceMcpAttemptInput): Promise<WorkspaceMcpEndpoint>;
   decorateResult?(result: ToolResult, args: TurnArgs): ToolResult;
   takeUsage?(): TurnResult["usage"];
+  /** Explicit Host follow-up after a successful, physically drained native turn. At most once per run. */
+  prepareContinuation?(): Promise<void>;
   launch(endpoint: WorkspaceMcpEndpoint, prompt: string, activity: () => void, args: TurnArgs): Promise<ExternalCommandCaptureResult>;
 }) {
   const stopped = new AbortController();
@@ -136,6 +138,7 @@ export function createRegisteredCliMcpTurn(input: {
   let preview: TurnArgs["onAssistantPreview"];
   let activity: (() => void) | undefined, closed = false, ended = false;
   let closing: Promise<void> | undefined, deferredCompletion: PendingCall | undefined;
+  let continuations = 0, endedSuccessfully = false;
   const notify = () => { wake?.(); wake = undefined; };
   const flush = (history: readonly NeutralMsg[], args?: TurnArgs) => {
     for (const message of history) if (message.role === "tool") for (const result of message.results) {
@@ -157,6 +160,12 @@ export function createRegisteredCliMcpTurn(input: {
     async turn(args: TurnArgs): Promise<TurnResult> {
       input.assertCurrent();
       if (closed || args.signal?.aborted) return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
+      if (ended && endedSuccessfully && input.prepareContinuation && continuations < 1 && !pending.size && !queue.length) {
+        await physical; await endpoint?.close(); input.assertCurrent();
+        if (args.signal?.aborted || input.signal.aborted) return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
+        await input.prepareContinuation();
+        endpoint = undefined; physical = undefined; finished = undefined; ended = false; endedSuccessfully = false; continuations += 1;
+      }
       tools = args.tools; activity = args.onActivity; preview = args.onAssistantPreview; flush(args.history, args);
       if (!physical) {
         endpoint = await (input.createEndpoint ?? createWorkspaceMcpEndpoint)({ signal: AbortSignal.any([input.signal, stopped.signal]), assertCurrent: input.assertCurrent,
@@ -190,7 +199,8 @@ export function createRegisteredCliMcpTurn(input: {
               ? result.errorCode : undefined;
             if (!result.ok) finished = { text: "", toolUses: [], stop: "error",
               ...(result.nativeFailureKind || nativeControlFailure ? { errorMetadata: {
-                ...(result.nativeFailureKind ? { code: result.nativeFailureKind } : {}),
+                ...(result.nativeRpc?.rpcMethod === "thread/resume" && result.nativeFailureKind === "timeout"
+                   ? { code: "native_resume_timeout" } : result.nativeFailureKind ? { code: result.nativeFailureKind } : {}),
                 ...(nativeControlFailure ? { nativeControlFailure } : {}),
               } } : {}),
               errorMsg: result.runtimeFailure ?? "registered Runtime failed (" + (result.errorCode ?? (result.timedOut ? "timeout" : "exit")) + "); no fallback was selected" };
@@ -225,9 +235,10 @@ export function createRegisteredCliMcpTurn(input: {
         input.assertCurrent();
         const next = queue.shift();
         if (next) return { text: "", toolUses: [next.call], stop: "tool_use", ...(input.takeUsage ? { usage: input.takeUsage() } : {}) };
-        if (finished) { const result = finished; finished = undefined; ended = true;
-          return input.takeUsage ? { ...result, usage: input.takeUsage() } : result; }
-        if (ended) return { text: "", toolUses: [], stop: "error", errorMsg: "Native CLI ended before the governed task completed; no automatic replay" };
+        if (finished) { const result = finished; finished = undefined; ended = true; endedSuccessfully = result.stop !== "error";
+          const outcome = { ...result, ...(result.stop !== "error" ? { nativeContinuation: input.prepareContinuation && continuations < 1 ? "available" as const : "unavailable" as const } : {}) };
+          return input.takeUsage ? { ...outcome, usage: input.takeUsage() } : outcome; }
+        if (ended) return { text: "", toolUses: [], stop: "error", errorMsg: "Native CLI ended before the governed task completed; no automatic replay", errorMetadata: { code: "native_continuation_unavailable" } };
         await new Promise<void>(resolve => {
           const onAbort = () => { void close().catch(() => {}); settle(); };
           const settle = () => { args.signal?.removeEventListener("abort", onAbort); resolve(); };

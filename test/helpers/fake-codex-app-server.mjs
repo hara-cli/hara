@@ -129,6 +129,7 @@ export async function fakeCodexMain() {
     if (mode().emitCompaction) note("thread/compacted", { threadId: thread });
     if (mode().foreignCompaction) note("thread/compacted", { threadId: "foreign-thread" });
     note("turn/completed", { threadId: thread, turn: { id: currentTurn, status: "completed" } });
+    const next = mode().nextMode; if (next) { const settings = mode(); delete settings.nextMode; settings.mode = next; fs.writeFileSync(command + ".mode.json", JSON.stringify(settings)); }
   }
   for await (const line of readline.createInterface({ input: process.stdin })) {
     const message = JSON.parse(line), p = message.params ?? {};

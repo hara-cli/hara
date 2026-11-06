@@ -839,7 +839,7 @@ export interface RunOutcome {
   progress?: RunProgressEvent;
 }
 
-export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop" | "no_progress" | "strategy_stall" | "task_round_budget" | "completion_verification" | "native_context_limit";
+export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop" | "no_progress" | "strategy_stall" | "task_round_budget" | "completion_verification" | "native_context_limit" | "native_prose_only" | "native_resume_timeout";
 
 export interface RunProgressEvent extends ProgressState {
   rounds: number;
@@ -1772,6 +1772,9 @@ async function runAgentInner(
   let contextGuardNotified = false;
   let emptyRetried = false; // one-shot: a genuinely empty model turn gets a single nudge before we give up
   let actionOwnershipRetries = 0; // accepted change tasks may not terminate as advice without a typed blocker
+  // Host feedback is model-only in Workspace runs; it must never become a person-authored message.
+  const modelFeedback: NeutralMsg[] = [];
+  const feedbackHistory = opts.workspaceRun ? modelFeedback : history;
   let completionReceiptRetries = 0; // performed work gets one bounded chance to record final verification
   let noProgressFinalizationRetries = 0; // a successful side effect gets one close-out round before watchdog halt
   let credentialDisclosureRetries = 0; // gateway prose gets one hidden correction before a safe hard stop
@@ -1921,7 +1924,7 @@ async function runAgentInner(
             opts,
             `✻ durable progress verified; continuing automatically in a fresh bounded tranche (${details.join(", ")}).`,
           );
-          history.push({
+          feedbackHistory.push({
             role: "user",
             content: wrapReminders([
               "Automatic continuation boundary: Hara persisted the closed round usage and accepted the recent durable task checkpoint. Continue from that checkpoint without repeating completed work. Re-check the original acceptance criteria, keep the next step bounded, and stop normally when verified; unchanged evidence, human-only dependencies, the active deadline, and the absolute run ceiling still halt execution.",
@@ -1948,7 +1951,7 @@ async function runAgentInner(
         opts,
         `⚠ task checkpoint: ${cumulativeTaskRounds}/${life.taskRoundLimit} cumulative rounds used. Hara is reviewing evidence and strategy before continuing.`,
       );
-      history.push({
+      feedbackHistory.push({
         role: "user",
         content: wrapReminders([taskRoundCheckpointReminder(cumulativeTaskRounds, life.taskRoundLimit!)]),
       });
@@ -1957,7 +1960,7 @@ async function runAgentInner(
     if (!life.interactiveWorkspace && runActiveElapsedMs(life) >= Math.floor(life.timeoutMs * 0.8)) requestRunCheckpoint(opts, life);
     if (!opts.quiet && life.checkpointDue && !life.checkpointInjected) {
       life.checkpointInjected = true;
-      history.push({
+      feedbackHistory.push({
         role: "user",
         content: wrapReminders([deadlineCheckpointReminder(life.timeoutMs)]),
       });
@@ -1992,7 +1995,7 @@ async function runAgentInner(
     // sub-agent must not steal the main conversation's reminders.
     if (!opts.quiet) {
       const reminders = drainReminders(ctx.todoScope);
-      if (reminders.length) history.push({ role: "user", content: wrapReminders(reminders) });
+      if (reminders.length) feedbackHistory.push({ role: "user", content: wrapReminders(reminders) });
     }
     if (companyExecution) {
       try {
@@ -2078,7 +2081,9 @@ async function runAgentInner(
     const system = turnContext
       ? stableSystemParts.map((part) => part.content).join("\n\n")
       : assembledSystem.text;
-    const requestHistory = opts.workspaceRun ? prepareWorkspaceRunHistory(opts.workspaceRun, history) : history;
+    const requestHistory = opts.workspaceRun
+      ? [...prepareWorkspaceRunHistory(opts.workspaceRun, history).filter(message => message.role !== "user" || !isSystemReminderContent(message.content)), ...modelFeedback.splice(0)]
+      : history;
     const prepared = prepareHistoryForModel(requestHistory, {
       model: activeProvider.model,
       // Budget against the full context: the trailing turn message costs the same tokens as before.
@@ -2405,6 +2410,10 @@ async function runAgentInner(
     // The original run signal is authoritative: do not append/approve/execute any late response.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return stoppedOutcome();
     // Host-owned native transport status, not a provider/model-authored success or a retry request.
+    if (r.errorMetadata?.code === "native_resume_timeout")
+      return { status: "halted", stopReason: "native_resume_timeout", error: "Loading the existing native conversation timed out before this message was submitted. History was kept. Retry loading or open a new session." };
+    if (r.errorMetadata?.code === "native_continuation_unavailable")
+      return { status: "halted", stopReason: "native_prose_only", error: "The native reply ended without an accepted action receipt. Continue explicitly or clarify the request; no action has been replayed." };
     if (opts.workspaceRun?.binding.agent.runtimeId === "codex" && r.errorMetadata?.code === "native_context_limit")
       return { status: "halted", stopReason: "native_context_limit" };
     const responseCallIds = new Set<string>();
@@ -2447,7 +2456,7 @@ async function runAgentInner(
       if (requestsCredentialDisclosure(guardedText)) {
         if (credentialDisclosureRetries < 1) {
           credentialDisclosureRetries += 1;
-          history.push({
+          feedbackHistory.push({
             role: "user",
             content: wrapReminders([
               `${CREDENTIAL_DISCLOSURE_BLOCKED} Your previous response was withheld and no credential was requested from the user. Continue through a safe registered capability or state the non-secret blocker/workflow.`,
@@ -2536,7 +2545,7 @@ async function runAgentInner(
       if (recoverableMalformedToolCall(r.errorMsg) && !malformedToolCallRetried && replaySafe) {
         malformedToolCallRetried = true;
         history.pop(); // no partial tool call was executed; discard the invalid assistant protocol row
-        history.push({
+        feedbackHistory.push({
           role: "user",
           content: wrapReminders([
             "Provider protocol recovery: the previous tool call had incomplete or malformed JSON arguments and was not executed. Retry this model once with one small, complete tool call. Include every required parameter; split large writes/commands into bounded calls. Do not repeat the truncated payload.",
@@ -2616,10 +2625,11 @@ async function runAgentInner(
     // vanished. Retry ONCE with a nudge (usually a transient hiccup), then, if still empty, say so
     // plainly and end — never loop forever, never disappear. (Claude Code / codex both guard this.)
     if (!r.text.trim() && r.toolUses.length === 0) {
+      if (r.nativeContinuation === "unavailable") return { status: "halted", stopReason: "native_prose_only" };
       if (!emptyRetried) {
         emptyRetried = true;
         history.pop(); // drop the empty assistant turn before re-asking
-        history.push({ role: "user", content: "(Your previous response was empty. Continue the task now — take the next concrete step with a tool, or reply with text. Do not return an empty response.)" });
+        feedbackHistory.push({ role: "user", content: "(Your previous response was empty. Continue the task now — take the next concrete step with a tool, or reply with text. Do not return an empty response.)" });
         if (!opts.quiet) {
           const note = "✻ empty response — retrying once…";
           if (sink) sink.notice(note);
@@ -2644,6 +2654,8 @@ async function runAgentInner(
       && intakeTask?.brief?.intent === "change"
       && !freshTaskCompletion(intakeTask)
     ) {
+      if (r.nativeContinuation === "unavailable" && !successfulOwnedActionObserved)
+        return { status: "halted", stopReason: "native_prose_only", error: "The native reply contains no verified action receipt. The reply is retained; continue explicitly or clarify the request." };
       if (engineBriefCreated && workspaceChangeTrace && r.text.trim() && opts.workspaceRun
         && simpleChangeObjective(intakeTask.objective)) {
         syncIntakeTask();
@@ -2666,6 +2678,7 @@ async function runAgentInner(
       if (freshTaskCompletion(intakeTask)) {
         // The normal final-response branch below now sees a durable verified completion.
       } else if (successfulOwnedActionObserved) {
+        if (r.nativeContinuation === "unavailable") return { status: "halted", stopReason: "completion_verification" };
         if (completionReceiptRetries < 1) {
           completionReceiptRetries += 1;
           history.pop();
@@ -2673,7 +2686,7 @@ async function runAgentInner(
             opts,
             "✻ completion receipt guard: work was performed; asking the Agent to verify and record the result…",
           );
-          history.push({
+          feedbackHistory.push({
             role: "user",
             content: wrapReminders([
               "Completion receipt correction: you already completed at least one concrete change action in this task. Do not repeat finished work and do not hand remaining work to the user. If the accepted checks now pass, record task_checkpoint completion.state=verified with concise observable evidence in its own tool round. If work remains, take the next concrete action. Use awaiting_user only for a currently observed typed human-only dependency.",
@@ -2729,7 +2742,7 @@ async function runAgentInner(
           ? "✻ action ownership guard: advice was not accepted as execution; continuing with the fallback model…"
           : "✻ action ownership guard: advice was not accepted as execution; continuing the task…";
         showRunNotice(opts, note);
-        history.push({
+        feedbackHistory.push({
           role: "user",
           content: wrapReminders([
             "未见实际修改回执，请执行或说明。Your previous prose-only response was not accepted as completion. Take one concrete in-scope action with an available tool now, or report a currently observed typed human-only blocker.",
@@ -4062,7 +4075,7 @@ async function runAgentInner(
       });
     }
     if (grantNoProgressFinalization) {
-      history.push({
+      feedbackHistory.push({
         role: "user",
         content: wrapReminders([life.language === "zh-Hans"
           ? "任务收尾边界：Hara 已观察到本任务至少有一次成功的修改或外部操作，但在 Agent 记录完成证据前触发了无进展止损。不要重复上传、发送、发布或执行其他外部操作。下一轮只开放 task_checkpoint 和必要的 todo_write。根据已有工具回执核对原验收条件：如果已经全部满足，用 task_checkpoint 一次记录 completion.state=verified、简短可观察 evidence 和给用户的 final_answer；如果尚未满足，记录当前事实、剩余步骤或真实的人类依赖，然后安全停止。"
@@ -4105,7 +4118,7 @@ async function runAgentInner(
       // Quiet/background children still receive the deterministic hard stop, but never steal or inject
       // the main conversation's reminder stream.
       if (!opts.quiet) {
-        history.push({
+        feedbackHistory.push({
           role: "user",
           content: wrapReminders([life.language === "zh-Hans"
             ? `任务进展检查：第 ${progressEvent.rounds} 轮，${progressEvent.toolCalls} 次工具调用，` +
@@ -4160,7 +4173,7 @@ async function runAgentInner(
       }
       if (blindShots >= 2) {
         blindNudged = true;
-        history.push({
+        feedbackHistory.push({
           role: "user",
           content: wrapReminders([
             "⚠ Self-check: the selected model has no native image input, so you are acting blind. Stop using the computer tool. Switch models or reach the user through a non-visual path (CLI, API, or send_file). State the new plan in one line, then do it.",

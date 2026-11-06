@@ -1,3 +1,4 @@
+import { CodexHistoryBoundaries } from "./codex-history-boundary.js";
 import { parseWorkspaceAssistantPreview, type WorkspaceAssistantPreview } from "./assistant-preview.js";
 import { MessageTimingRecorder, type MessageTimingIdentity, type MessageTimingInput, type MessageTimingReport } from "./message-timing.js";
 import { WorkspaceMessageTimingStore } from "./message-timing-store.js";
@@ -1553,6 +1554,7 @@ export class LocalWorkspaceHost {
       assertCurrent(); lease.assertCurrent();
       if (store.read().revision !== expectedRevision) throw new Error("Conversation changed; native reset refused");
       const actorId = this.catalog.resolve(workspaceId).actorId;
+      new CodexHistoryBoundaries(context.storage, agentId, store.sessionId).record(requestId, conversation.history.length, previous.resets);
       const value = native.update(expectedNativeRevision, current => ({ ...current, threadId: null, input: 0, output: 0, cachedInput: 0,
         contextTokens: null, modelContextWindow: null, phase: "idle", contextGeneration: null, standingPromptHash: null,
         lastAttempt: { input: 0, output: 0, cachedInput: 0 },

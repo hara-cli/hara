@@ -1,3 +1,4 @@
+import { CodexHistoryBoundaries } from "../workspace/codex-history-boundary.js";
 import { CodexContextCompaction, NativeCompactionError } from "./context-compaction.js";
 import { WorkspaceContextCompactions, compactionSourceKey, contextSummary, contextSummaryPrompt } from "../workspace/context-compaction.js";
 import { workspaceCompactionSource, reserveWorkspaceCompaction, recordWorkspaceRuntimeUsage } from "../workspace/execution.js";
@@ -17,7 +18,7 @@ import { JsonlRpcClient, ExternalJsonlRpcRequestError, ExternalJsonlRpcTransport
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { canonical, plain } from "../workspace/local-state.js";
 import type { WorkspaceResourceStorage } from "../workspace/resource-context.js";
-import { codexThreadState, recordCodexEmptyThreadReset, codexConversationKey, nativeContextFull, nativeCodexId as nativeId, nativeTokenCount as count, type CodexThreadState } from "../workspace/codex-thread.js";
+import { codexThreadState, recordCodexEmptyThreadReset, codexConversationKey, codexCompactionThreshold, nativeContextFull, nativeCodexId as nativeId, nativeTokenCount as count, type CodexThreadState } from "../workspace/codex-thread.js";
 import { assertWorkspaceRuntimeUsage, workspaceRuntimeStorage, type WorkspaceRunPermit } from "../workspace/execution.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import { inspectLocalRuntime } from "../workspace/runtime-detect.js";
@@ -168,6 +169,15 @@ export class GovernedCodexSession {
     if (!this.client) this.token = randomBytes(32).toString("hex");
     this.pendingUsage = { input: 0, output: 0, cachedInput: 0 }; this.observedUsage = false; this.firstUsage = true;
     this.value.lastAttempt = { input: 0, output: 0, cachedInput: 0 };
+  }
+  async prepareContinuation(assertCurrent: () => void): Promise<void> {
+    assertCurrent();
+    if (!this.busy || this.closing || !this.nativeSucceeded || !this.active?.settled || this.value.phase !== "idle")
+      throw new Error("Codex completed-turn continuation is unavailable");
+    await this.settleNativeAttempt(); assertCurrent();
+    if (this.pendingUsage.input || this.pendingUsage.output || this.pendingUsage.cachedInput) throw new Error("Codex usage was not settled before follow-up");
+    this.active = undefined; this.settling = undefined; this.attemptEndpoint = undefined; this.nativeSucceeded = false;
+    this.firstUsage = true; this.observedUsage = false;
   }
   async createEndpoint(input: WorkspaceMcpAttemptInput): Promise<WorkspaceMcpEndpoint> {
     input.assertCurrent();
@@ -523,7 +533,7 @@ export class GovernedCodexSession {
             || this.value.input !== 0 || this.value.output !== 0 || this.value.contextTokens !== null) throw error;
           resetFrom = this.value.threadId!;
           const source = workspaceCompactionSource(this.permit);
-          if (source) recoverySeed = contextSummaryPrompt(contextSummary(source));
+          if (source) recoverySeed = contextSummaryPrompt(contextSummary(source, this.historyBoundary(source.history.length)));
           input.assertCurrent(); if (input.signal.aborted) throw new Error("interrupted");
           response = await load(false);
         }
@@ -611,14 +621,19 @@ export class GovernedCodexSession {
     }
     finally { input.signal.removeEventListener("abort", interrupt); }
   }
+  private historyBoundary(length: number): number {
+    const b = this.permit.binding;
+    return new CodexHistoryBoundaries(workspaceRuntimeStorage(this.permit), b.agent.agentId, b.sessionId).read(this.value.resets, length);
+  }
   private async compactIdle(input: { client: JsonlRpcClient; endpoint: WorkspaceMcpEndpoint; resumed: boolean; standing: string;
     config: Record<string, unknown>; model: string | null; effort: string | null; cwd: string; signal: AbortSignal;
     assertCurrent(): void; activity(): void }): Promise<{ seed?: string; seedRecord?: string }> {
     input.assertCurrent();
     const source = workspaceCompactionSource(this.permit), threadId = this.value.threadId;
     if (!source || !threadId || !this.loaded || this.maintenance) return {};
-    const key = compactionSourceKey("codex", threadId);
-    const summary = this.compactions.plan(source, { runtimeId: "codex", sourceKey: key, tokens: this.value.contextTokens, idle: true });
+    const key = compactionSourceKey("codex", threadId), historyBoundary = this.historyBoundary(source.history.length);
+    const summary = this.compactions.plan(source, { runtimeId: "codex", sourceKey: key, tokens: this.value.contextTokens, idle: true,
+      tokenThreshold: codexCompactionThreshold(this.value), historyBoundary });
     if (!summary) return {};
     const control = this.endpointMaintenance.get(input.endpoint);
     const makeSeed = async (record?: string): Promise<{ seed: string; seedRecord: string }> => {
@@ -641,7 +656,7 @@ export class GovernedCodexSession {
       }
       if (record) this.compactions.recordOutcome(record, "failed");
       const seedRecord = this.compactions.begin(source, { runtimeId: "codex", method: "host-seed",
-        sourceKey: compactionSourceKey("codex", this.value.threadId!), tokens: beforeTokens, requests: 0, summary, priorThreadId: original });
+        sourceKey: compactionSourceKey("codex", this.value.threadId!), tokens: beforeTokens, requests: 0, summary, priorThreadId: original, historyBoundary });
       this.firstUsage = true;
       return { seed: contextSummaryPrompt(summary), seedRecord };
     };
@@ -649,7 +664,7 @@ export class GovernedCodexSession {
     const endCost = reserveWorkspaceCompaction(this.permit);
     if (!endCost) return {}; // Preserve the frozen budget; compaction is optional, the admitted user turn is not.
     const record = this.compactions.begin(source, { runtimeId: "codex", method: "codex-native", sourceKey: key,
-      tokens: this.value.contextTokens, requests: 1, summary });
+      tokens: this.value.contextTokens, requests: 1, summary, historyBoundary });
     let suspended = false, success = false, failure: NativeCompactionError | undefined;
     try {
       suspended = await control.suspend();

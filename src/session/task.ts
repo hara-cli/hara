@@ -1176,6 +1176,8 @@ export function isRecoverableRunPause(outcome: RunOutcome | undefined): boolean 
     || outcome.stopReason === "repeat_loop"
     || outcome.stopReason === "completion_verification"
     || outcome.stopReason === "native_context_limit"
+    || outcome.stopReason === "native_prose_only"
+    || outcome.stopReason === "native_resume_timeout"
   );
 }
 

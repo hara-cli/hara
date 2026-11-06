@@ -92,7 +92,8 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
       signal: options.signal!, assertCurrent, jsonEvents: id === "codex",
       ...(session ? { bearerToken: session.token, createEndpoint: session.createEndpoint.bind(session),
         prompt: (args: import("../providers/types.js").TurnArgs) => args.history.flatMap(message => message.role === "user" ? [message.content] : []).join("\n\n"),
-        takeUsage: () => session.takeUsage(), decorateResult: session.decorateResult.bind(session) } : { prompt: (args: import("../providers/types.js").TurnArgs) => {
+        takeUsage: () => session.takeUsage(), decorateResult: session.decorateResult.bind(session),
+        prepareContinuation: () => session.prepareContinuation(assertCurrent) } : { prompt: (args: import("../providers/types.js").TurnArgs) => {
         // Claude is a fresh -p process, with no native resumed thread to compact. Bound only an actually long launch view.
         const original = oneShotCompactionPrompt(args);
         const tokens = Math.ceil(Buffer.byteLength(JSON.stringify(args.history)) / 4);

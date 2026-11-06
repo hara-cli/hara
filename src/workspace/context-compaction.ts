@@ -1,3 +1,4 @@
+import { isSystemReminderContent } from "../agent/reminders.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { WorkspaceConversation } from "./conversations.js";
 import type { WorkspaceResourceBinding, WorkspaceResourceStorage } from "./resource-context.js";
@@ -42,8 +43,10 @@ export function safeContextText(value: unknown, max = 512): string {
 }
 const unique = (values: unknown[], max: number, bytes: number) => [...new Set(values.map(v => safeContextText(v, bytes)).filter(Boolean))].slice(-max);
 const sensitivePath = (path: string) => /(?:^|[/\\])(?:\.env(?:\.[^/\\]*)?|\.ssh|\.aws|\.codex|\.claude|credentials?|auth\.json|secrets?)(?:[/\\]|$)|\.(?:pem|key|p12|pfx)$/i.test(path);
-export function contextSummary(source: WorkspaceConversation): ContextSummary {
-  const tasks = [...source.pastTasks.map(row => row.task), ...(source.task ? [source.task] : [])];
+export function contextSummary(source: WorkspaceConversation, historyBoundary = 0): ContextSummary {
+  if (!Number.isSafeInteger(historyBoundary) || historyBoundary < 0 || historyBoundary > source.history.length) throw new Error("Invalid summary history boundary");
+  const history = source.history.slice(historyBoundary);
+  const tasks = [...(historyBoundary ? [] : source.pastTasks.map(row => row.task)), ...(source.task ? [source.task] : [])];
   const goals = unique(tasks.slice(-5).map(task => task.brief?.goal ?? task.objective), 5, 420);
   const decisions = unique(tasks.slice(-5).flatMap(task => (task.decisions ?? []).slice(-3).map(value =>
     `Question: ${safeContextText(value.question, 140)}; Answer: ${safeContextText(value.answer, 240)}; source: ${value.source}`)), 6, 440);
@@ -51,7 +54,7 @@ export function contextSummary(source: WorkspaceConversation): ContextSummary {
     .map(task => `${task.brief?.goal ?? task.objective}; ${task.checkpoint?.nextStep ?? "unfinished; re-observe before continuing"}`), 4, 360);
   const references = unique(tasks.slice(-5).flatMap(task => task.checkpoint?.artifacts ?? []).filter(path => typeof path === "string" && !sensitivePath(path)), 6, 180);
   const cards: string[] = [];
-  for (const message of source.history) if (message.role === "tool") for (const result of message.results) {
+  for (const message of history) if (message.role === "tool") for (const result of message.results) {
     if (result.name !== "agent_create" || result.content.length > 32_000) continue;
     try {
       const row = JSON.parse(result.content.split("\n\n<system-reminder>")[0]!);
@@ -64,7 +67,7 @@ export function contextSummary(source: WorkspaceConversation): ContextSummary {
   for (const key of ["references", "cards", "decisions", "goals", "unfinished"] as const)
     while (Buffer.byteLength(JSON.stringify(summary)) > CONTEXT_COMPACTION.summaryBytes && summary[key].length > 1) summary[key].shift();
   let room = CONTEXT_COMPACTION.recentBytes;
-  for (const message of source.history.slice(0, -1).filter(row => row.role === "user" || row.role === "assistant").slice(-CONTEXT_COMPACTION.recentMessages).reverse()) {
+  for (const message of history.slice(0, -1).filter(row => row.role === "assistant" || row.role === "user" && !isSystemReminderContent(row.content)).slice(-CONTEXT_COMPACTION.recentMessages).reverse()) {
     const text = safeContextText(message.role === "user" ? message.content : message.role === "assistant" ? message.text : "", Math.min(room, CONTEXT_COMPACTION.messageBytes));
     if (!text) continue;
     summary.recent.unshift({ role: message.role as "user" | "assistant", text }); room -= Buffer.byteLength(text);
@@ -112,28 +115,30 @@ export class WorkspaceContextCompactions {
       return structuredClone(raw) as unknown as State;
     }, () => ({ schemaVersion: 1, revision: 0, resourceBinding: this.state.binding(), agentId, sessionId, entries: [] }));
   }
-  plan(source: WorkspaceConversation, input: { runtimeId: ContextCompactionView["runtimeId"]; sourceKey: string; tokens: number | null; idle: boolean }): ContextSummary | null {
+  plan(source: WorkspaceConversation, input: { runtimeId: ContextCompactionView["runtimeId"]; sourceKey: string; tokens: number | null; idle: boolean; tokenThreshold?: number; historyBoundary?: number }): ContextSummary | null {
     if (source.agentId !== this.agentId || source.sessionId !== this.sessionId || !sameWorkspaceResourceBinding(source.resourceBinding, this.state.binding())) throw new Error("Compaction source belongs to another conversation");
     if (!input.idle || !source.task || !source.history.length) return null;
-    const users = source.history.filter(row => row.role === "user").length;
+    const boundary = input.historyBoundary ?? 0, threshold = input.tokenThreshold ?? CONTEXT_COMPACTION.tokens;
+    if (!Number.isSafeInteger(boundary) || boundary < 0 || boundary > source.history.length || !Number.isSafeInteger(threshold) || threshold < 1) throw new Error("Invalid compaction limits");
+    const users = source.history.slice(boundary).filter(row => row.role === "user" && !isSystemReminderContent(row.content)).length;
     const previous = [...this.state.read().entries].reverse().find(row => row.runtimeId === input.runtimeId && row.sourceKey === input.sourceKey);
     if (previous) {
       if (previous.status === "running") return null; // An unknown paid operation is never automatically retried.
       const growth = input.tokens === null ? 0 : input.tokens - (previous.afterTokens ?? previous.beforeTokens ?? input.tokens);
       if (users - previous.userMessages < CONTEXT_COMPACTION.messages && growth < CONTEXT_COMPACTION.growthTokens) return null;
     }
-    if ((input.tokens ?? 0) < CONTEXT_COMPACTION.tokens && users - (previous?.userMessages ?? 0) < CONTEXT_COMPACTION.messages) return null;
-    return contextSummary(source);
+    if ((input.tokens ?? 0) < threshold && users - (previous?.userMessages ?? 0) < CONTEXT_COMPACTION.messages) return null;
+    return contextSummary(source, boundary);
   }
   begin(source: WorkspaceConversation, input: { runtimeId: Entry["runtimeId"]; method: Entry["method"]; sourceKey: string; tokens: number | null;
-    requests: number; summary: ContextSummary; priorThreadId?: string | null }): string {
+    requests: number; summary: ContextSummary; priorThreadId?: string | null; historyBoundary?: number }): string {
     if (source.agentId !== this.agentId || source.sessionId !== this.sessionId || !source.task?.workspaceRunBinding
       || !sameWorkspaceResourceBinding(source.resourceBinding, this.state.binding())) throw new Error("Compaction source belongs to another conversation");
     const current = this.state.read(), id = randomUUID();
     const entry: Entry = { id, agentId: this.agentId, sessionId: this.sessionId, runId: source.task!.workspaceRunBinding!.runId,
       at: new Date().toISOString(), runtimeId: input.runtimeId, method: input.method, sourceKey: input.sourceKey, status: "running",
       historyStart: Math.max(0, source.history.length - 1 - [...source.history].reverse().findIndex(row => row.role === "user")), beforeTokens: input.tokens, afterTokens: null,
-      summary: structuredClone(input.summary), userMessages: source.history.filter(row => row.role === "user").length, priorThreadId: input.priorThreadId ?? null,
+      summary: structuredClone(input.summary), userMessages: source.history.slice(input.historyBoundary ?? 0).filter(row => row.role === "user" && !isSystemReminderContent(row.content)).length, priorThreadId: input.priorThreadId ?? null,
       usage: { requests: input.requests, inputTokens: null, outputTokens: null, cachedInputTokens: null } };
     if (!validEntry(entry)) throw new Error("Unsafe context compaction metadata");
     this.state.update(current.revision, value => ({ ...value, entries: [...value.entries.slice(-(CONTEXT_COMPACTION.records - 1)), entry] }));

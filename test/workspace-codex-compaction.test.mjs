@@ -5,7 +5,7 @@ const done = value => ["completed", "blocked", "paused", "cancelled"].includes(v
 async function exchange(f, text) { await f.send(text); return until(f.read, done); }
 const turns = f => f.native().filter(row => row.method === "turn/start");
 test("idle native compaction rotates MCP markers, charges maintenance, preserves history and keeps the loaded thread resident", async t => {
-  const f = await cliMcpFixture(t, "list", { contextInput: 18000, previewOptIn: true });
+  const f = await cliMcpFixture(t, "list", { contextInput: 70000, previewOptIn: true });
   const first = await exchange(f, "List colleagues ORIGINAL-HISTORY"); assert.equal(first.conversation.state, "completed"); const a = f.meta();
   assert.equal(first.conversation.contextCompactions.length, 0);
   f.mode({ mode: "list", probePreviousMarker: true, compactDelayMs: 80 });
@@ -18,7 +18,7 @@ test("idle native compaction rotates MCP markers, charges maintenance, preserves
   assert.equal(turns(f)[0].params.threadId, turns(f)[1].params.threadId);
   const record = second.conversation.contextCompactions[0]; assert.equal(record.method, "codex-native"); assert.equal(record.status, "completed");
   assert.equal(record.usage.requests, 1); assert.equal(record.usage.inputTokens, 18020); assert.equal(record.usage.cachedInputTokens, 17000); assert.equal(record.usage.outputTokens, 300);
-  assert.equal(record.afterTokens, 120); assert.equal(record.beforeTokens, 18020);
+  assert.equal(record.afterTokens, 120); assert.equal(record.beforeTokens, 70020);
   assert.deepEqual(second.conversation.nativeSession.lastAttempt, { input: 18120, cachedInput: 17000, output: 320 });
   assert.equal(second.conversation.runUsage.inputTokens, 1120, "maintenance and user request each debit only non-cache input");
   assert.equal(second.conversation.runUsage.outputTokens, 320);

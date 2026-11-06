@@ -70,6 +70,10 @@ export function codexThreadState(storage: WorkspaceResourceStorage, agentId: str
 export function nativeContextLimit(value: CodexThreadState): number {
   return Math.min(codexContextLimit(), value.modelContextWindow === null ? Infinity : Math.max(1, Math.floor(value.modelContextWindow * 0.75)));
 }
+/** Compact before the existing conservative hard cap, leaving 30% for new work. Cached tokens still occupy context. */
+export function codexCompactionThreshold(value: CodexThreadState): number {
+  return Math.max(1, Math.floor(nativeContextLimit(value) * 0.7));
+}
 export function nativeContextFull(value: CodexThreadState): boolean {
   return value.phase === "new_session_required" || value.contextTokens !== null && value.contextTokens >= nativeContextLimit(value);
 }

@@ -90,6 +90,8 @@ export interface TurnResult {
   stop: "end" | "tool_use" | "error";
   /** Opaque-to-the-UI provider state needed to continue this exact tool-call turn. */
   continuation?: AssistantContinuation;
+  /** Host-native adapter fact after a successful terminal frame; never a replay permission. */
+  nativeContinuation?: "available" | "unavailable";
   errorMsg?: string;
   /** Bounded, credential-free transport facts used by the central replay-safe retry policy. */
   errorMetadata?: ProviderErrorMetadata;

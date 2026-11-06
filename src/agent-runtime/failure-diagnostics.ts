@@ -46,7 +46,7 @@ const CODE_KINDS: Readonly<Record<string, RuntimeFailureKind>> = {
   model_not_configured: "invalid_model", unknown_model: "invalid_model", quota_exhausted: "runtime_quota",
   insufficient_quota: "runtime_quota", billing_error: "runtime_quota", rate_limit_exceeded: "runtime_rate_limit",
   econnrefused: "runtime_network", econnreset: "runtime_network", enotfound: "runtime_network", eai_again: "runtime_network",
-  etimedout: "timeout", timed_out: "timeout", proxy_connect_failed: "runtime_proxy", spawn_error: "spawn_failed",
+  etimedout: "timeout", timed_out: "timeout", native_resume_timeout: "timeout", proxy_connect_failed: "runtime_proxy", spawn_error: "spawn_failed",
   runtime_proxy_invalid: "runtime_proxy", runtime_proxy_unreachable: "runtime_proxy", runtime_proxy_failed: "runtime_proxy",
 };
 
