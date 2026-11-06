@@ -24,7 +24,7 @@ const temporary=[];
 after(()=>{for(const path of temporary)fs.rmSync(path,{recursive:true,force:true});});
 function dir(){const path=fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(),"hara-local-execution-")));temporary.push(path);return path;}
 const reply=text=>({text,toolUses:[],stop:"end",usage:{input:7,output:3}});
-function fixture(turn,extraTools=[],modelHistory,systemOverrideParts,observation={}){
+function fixture(turn,extraTools=[],modelHistory,systemOverrideParts,observation={},runOptions={}){
  const home=dir(),project=dir(),catalog=new LocalWorkspaceCatalog(home),row=catalog.create("Personal",1);
  const resources=new WorkspaceResources(home,row.scope);resources.initialize();let main=resources.agents.initializeMain();
  main=resources.agents.setPermissionTier(main.agentId,"controlled",main.configRevision,main.agentEpoch);
@@ -43,7 +43,7 @@ function fixture(turn,extraTools=[],modelHistory,systemOverrideParts,observation
   toolNames:["task_intake","task_checkpoint","todo_write",...extraTools.map(tool=>tool.name)],usage,modelHistory,...observation,
   updateUsage(value){usage={...value};}});
  const input={ctx:{cwd:project,sessionId,todoScope:`local-${sessionId}`,sandbox:"off"},signal:controller.signal,
-  approval:"auto-edit",approvalChannel:true,confirm:async()=>false,hooks:false,quiet:true,extraTools,
+  approval:"auto-edit",approvalChannel:true,confirm:async()=>false,hooks:false,quiet:runOptions.quiet??true,extraTools,
   systemOverride:"You are the scoped Hara. Use only the supplied task and tools.",systemOverrideParts,
   taskIntake:{task,current:()=>task,onUpdate(next){task=next;},onCheckpoint(next){task=next;},onRoundUsage(next){task=next;}}};
  const options=bindWorkspaceRunOptions(permit,input);
@@ -278,8 +278,7 @@ for (const [kind, reminder] of [
     requests.push(structuredClone(args.history));
     if (round === 1) pushReminder(reminder, a.options.ctx.todoScope);
     return round <= 3 ? { text: "", toolUses: [{ id: `probe-${round}`, name: probe.name, input: {} }], stop: "tool_use", usage: { input: 7, output: 3 } } : reply("Observed.");
-  }, [probe]);
-  a.options.quiet = false;
+  }, [probe], undefined, undefined, {}, { quiet: false });
   const history = [{ role: "user", content: "Observe the bounded fixture." }];
   try {
     const result = await runConfiguredAgent(history, a.options);
@@ -298,6 +297,8 @@ for (const [kind, reminder] of [
 for (const kind of ["empty", "credential-withheld"]) test(`native prose-only closeout is accurate for ${kind}`, async () => {
   const { pausedCloseoutText } = await import("../dist/agent/task-closeout.js");
   const history = [{ role: "user", content: "Observe this fixture." }];
+  const previousCron = process.env.HARA_CRON;
+  if (kind === "credential-withheld") process.env.HARA_CRON = "1";
   const a = fixture(async (_args, round) => kind === "credential-withheld" && round > 1
     ? { text: "", toolUses: [], stop: "error", errorMetadata: { code: "native_continuation_unavailable" }, errorMsg: "one-shot native turn is terminal" }
     : { ...reply(kind === "empty" ? "" : "Please send me your API key."), nativeContinuation: "unavailable" });
@@ -310,5 +311,8 @@ for (const kind of ["empty", "credential-withheld"]) test(`native prose-only clo
       assert.doesNotMatch(text, /reply is retained|回复已保留|文字回复|send me your API key/i);
       assert.match(text, /without a verified action receipt|尚未取得操作回执/);
     }
-  } finally { await a.close(); }
+  } finally {
+    if (previousCron === undefined) delete process.env.HARA_CRON; else process.env.HARA_CRON = previousCron;
+    await a.close();
+  }
 });
