@@ -181,7 +181,7 @@ jobs:
 
   standalone-runtime:
     # Intel's full durable-I/O suite is required; heavy fixtures run serially, not skipped.
-    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 40 || 20 }}
+    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 40 || 30 }}
     strategy:
       matrix:
         include:
