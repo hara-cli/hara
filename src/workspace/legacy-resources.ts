@@ -44,6 +44,8 @@ export class WorkspaceLegacyResources {
     }, () => ({ revision: 0, resourceBinding: this.state.binding(), sourceFingerprint: "", resources: [] }));
   }
   list() { return this.state.read().resources.map(({ originalPath: _path, ...row }) => row); }
+  /** Bound directory metadata for a clarification menu; no source directory is opened or granted. */
+  directoryReferencesForHost() { return this.state.read().resources.map(row => ({ path: row.originalPath, purposes: [...row.purposes] })); }
   bindingForHost() { return this.state.binding(); }
   /** Host-only lookup is metadata, not a runnable mount or a renderer-selected filesystem path. */
   sourceForHost(id: string) { return this.sourcesForHost([id])[0]!; }

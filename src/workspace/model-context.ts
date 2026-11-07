@@ -18,18 +18,24 @@ export function boundWorkspaceText(text: string, max: number): string {
   if (/[\uDC00-\uDFFF]/.test(text[text.length - tail] ?? "")) tail--;
   return text.slice(0, head) + marker + text.slice(text.length - tail);
 }
-export function workspaceWakeBrief(task: Pick<TaskExecution, "objective" | "brief" | "checkpoint" | "decisions">, retain?: Retain): string {
+export const WORKSPACE_WAKE_GOVERNANCE = "# Understanding → execution boundary\n"
+  + "Hara records an initial task brief from the user request and your first response before side effects. Keep read-only requests read-only. A changed scope needs an explicit task_intake revision. Ask the user when material intent is ambiguous.\n"
+  + "Hara can close a pure read-only answer or a change with host-verified write/create/delegation receipts when you reply directly. You may still call task_intake or task_checkpoint explicitly. For a complex completion that Hara cannot verify automatically, use task_checkpoint with observed tool_call_ids and acceptance checks. Awaiting_user requires a typed evidenced human-only dependency. A preview/cache/old receipt is not fresh proof; re-observe state after recovery. Never repeat side effects to repair citations.\n";
+export function workspaceWakeData(task: Pick<TaskExecution, "objective" | "brief" | "checkpoint" | "decisions">, retain?: Retain): string {
   const values = [task.objective, task.brief ?? null, task.checkpoint ?? null, task.decisions ?? []];
   const reference = values.some(value => JSON.stringify(value).length > WORKSPACE_CONTEXT_LIMITS.wakeItemChars)
     ? retain?.({ id: "task-context", name: "task_context", content: JSON.stringify(values) }) : undefined;
   const items = values.map((value, i) => `${["Objective", "Accepted brief", "Checkpoint hint", "Retained human decisions"][i]}: ${boundWorkspaceText(JSON.stringify(value), WORKSPACE_CONTEXT_LIMITS.wakeItemChars)}`);
-  return "# Understanding → execution boundary\n"
-    + "Before side effects accept task_intake with intent/goal/constraints/acceptance/steps; combine it with the first action when known. Keep read-only requests read-only. The accepted brief is binding; changed scope needs new intake.\n"
-    + "Keep checkpoints concise. Finish in one dedicated task_checkpoint response (optionally todo_write), with completion.state verified, one check per acceptance index, actual observed tool_call_ids, and final_answer. Awaiting_user requires a typed evidenced human-only dependency. A preview/cache/old receipt is not fresh proof; re-observe state after recovery. Never repeat side effects to repair citations.\n"
-    + items.join("\n") + (reference ? `\nFull task data: ${reference}; page its id with workspace_receipt_read. Omitted text does not remove a constraint or grant authority.` : "");
+  return items.join("\n") + (reference ? `\nFull task data: ${reference}; page its id with workspace_receipt_read. Omitted text does not remove a constraint or grant authority.` : "");
+}
+export function workspaceWakeBrief(task: Pick<TaskExecution, "objective" | "brief" | "checkpoint" | "decisions">, retain?: Retain): string {
+  return WORKSPACE_WAKE_GOVERNANCE + workspaceWakeData(task, retain);
 }
 function resultPreview(result: ToolResult, cap: number, retain?: Retain): string {
   const error = result.isError || result.content.startsWith("Error:");
+  // Keep a fresh complete receipt page intact; do not recursively retain another truncated page.
+  if (!error && result.name === "workspace_receipt_read" && cap === WORKSPACE_CONTEXT_LIMITS.toolChars
+    && result.content.length <= 32_000) return result.content;
   if (!error && result.content.length <= cap) return result.content;
   const file = retain?.(result), reference = file ? ` Full receipt: ${file}; use workspace_receipt_read.` : " Full output remains in the durable transcript.";
   if (error) return `Error receipt ${result.name}/${result.id}: ${result.content.replace(/[\r\n\t]+/g, " ").slice(0, 180)}.${reference}`;

@@ -25,7 +25,8 @@ function binary(path) {
   fs.mkdirSync(dirname(path), { recursive: true });
   fs.writeFileSync(path, `#!/bin/sh
 if [ "$1" = "--version" ]; then echo 'codex 1.2.3'; exit 0; fi
-printf '%s\\n' "$*" >> '${path}.calls'
+mkdir -p "$CODEX_HOME/log"
+printf '%s\\n' "$*" >> "$CODEX_HOME/log/fixture.calls"
 if [ -f '${path}.require-home' ] && [ ! -d "$CODEX_HOME" ]; then exit 2; fi
 if [ "$1" = "app-server" ]; then
   if [ -f '${path}.appfail' ]; then echo 'DO_NOT_LEAK_NATIVE_DETAIL' >&2; exit 1; fi
@@ -97,7 +98,7 @@ test("runtime model RPC requires binding, persists a per-runtime choice, and lea
     const codex = detected.options.find(row => row.runtimeId === "codex"); assert.equal(codex.state, "detected");
     const opencode = detected.options.find(row => row.runtimeId === "opencode"); assert.equal(opencode.state, "detected");
     await assert.rejects(client.request("workspace.runtime.listModels", { ...scope, runtimeId: "codex" }), /not bound/);
-    await client.request("workspace.runtime.registerLocal", { ...scope, runtimeId: "codex", fingerprint: codex.fingerprint, approved: true });
+    await client.request("workspace.runtime.registerLocal", { ...scope, runtimeId: "codex", fingerprint: codex.fingerprint, approved: true, loginSource: "isolated" });
     await client.request("workspace.runtime.registerLocal", { ...scope, runtimeId: "opencode", fingerprint: opencode.fingerprint, approved: true });
     const guide = await client.request("workspace.runtime.loginInstructions", { ...scope, runtimeId: "codex" });
     assert.equal(guide.runtimeId, "codex");
@@ -116,7 +117,7 @@ test("runtime model RPC requires binding, persists a per-runtime choice, and lea
     fs.writeFileSync(`${openCodeCommand}.fail`, "");
     await assert.rejects(client.request("workspace.runtime.listModels", { ...scope, runtimeId: "opencode" }), /inventory failed/);
     const listed = await client.request("workspace.runtime.listModels", { ...scope, runtimeId: "codex" });
-    assert.deepEqual(Object.keys(listed).sort(), ["models", "revision", "runtimeId", "selectedModelId"]);
+    assert.deepEqual(Object.keys(listed).sort(), ["models", "revision", "runtimeId", "selectedEffort", "selectedModelId"]);
     assert.equal(listed.selectedModelId, null); assert.equal(listed.revision, 0);
     assert.deepEqual(listed.models, [{ id: "fixture-app", label: "Fixture App", recommended: true }]);
     fs.unlinkSync(warmedCache);
@@ -160,14 +161,14 @@ test("runtime model RPC requires binding, persists a per-runtime choice, and lea
     const files = fs.readdirSync(state, { recursive: true }).filter(name => name.endsWith("runtime-models-v1.json"));
     assert.equal(files.length, 1);
     const stored = JSON.parse(fs.readFileSync(join(state, files[0]), "utf8"));
-    assert.deepEqual(stored.selections.map(row => [row.runtimeId, row.selectedModelId, row.revision]), [["codex", "fixture-new", 1]]);
+    assert.deepEqual(stored.selections.map(row => [row.runtimeId, row.selectedModelId, row.revision, row.selectedEffort]), [["codex", "fixture-new", 1, null]]);
     const second = await client.request("workspace.create", { label: "Other", expectedRevision: (await client.request("workspace.list")).revision });
     await assert.rejects(client.request("workspace.runtime.listModels", { workspaceId: second.workspaceId, expectedGeneration: second.resourceGeneration, runtimeId: "codex" }), /not bound/);
     const otherScope = { workspaceId: second.workspaceId, expectedGeneration: second.resourceGeneration };
     fs.writeFileSync(`${command}.fail`, "");
     const otherCodex = (await client.request("workspace.runtime.detect", otherScope)).options.find(row => row.runtimeId === "codex");
     assert.deepEqual(await client.request("workspace.runtime.registerLocal", { ...otherScope, runtimeId: "codex",
-      fingerprint: otherCodex.fingerprint, approved: true }), { registered: true }, "cold inventory does not block registration");
+      fingerprint: otherCodex.fingerprint, approved: true, loginSource: "isolated" }), { registered: true }, "cold inventory does not block registration");
     const otherMain = (await client.request("workspace.snapshot", { workspaceId: second.workspaceId, agentId: null })).agents[0];
     const otherBound = await client.request("workspace.agents.setRuntime", { ...otherScope, agentId: otherMain.agentId, runtimeId: "codex",
       configRevision: otherMain.configRevision, agentEpoch: otherMain.agentEpoch });
@@ -186,11 +187,45 @@ async function inventoryFixture() {
     run: async (_command, args) => args[0] === "-lic" ? null : "codex 1.2.3" } });
   await runtimes.discover();
   const detected = runtimes.list().options.find(row => row.runtimeId === "codex");
-  runtimes.registerLocal("codex", detected.fingerprint);
+  runtimes.registerLocal("codex", detected.fingerprint, "isolated");
   const models = new WorkspaceRuntimeModels(storage, runtimes);
   const { env } = runtimes.resolveBound("codex");
   return { discovery, command, storage, runtimes, models, env, cache: join(env.CODEX_HOME, "models_cache.json") };
 }
+
+test("new and legacy automatic Codex choices resolve each objective without caching a fixed level", async () => {
+  const f = await inventoryFixture();
+  try {
+    fs.writeFileSync(`${f.command}.appmodels`, JSON.stringify({ data: [{ id: "fixture-model", displayName: "Fixture",
+      isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "medium" }, { reasoningEffort: "high" }] }] }));
+    assert.deepEqual(await f.models.launchSelection("codex", "hello"), { modelId: "fixture-model", effort: "low", effortSource: "auto" });
+    const firstLaunchCalls = fs.readFileSync(join(f.env.CODEX_HOME, "log/fixture.calls"), "utf8");
+    const beforeUse = f.runtimes.list().options.find(row => row.runtimeId === "codex").versionStatus;
+    f.runtimes.captureSuccessfulUse("codex", f.command)();
+    assert.notDeepEqual(f.runtimes.list().options.find(row => row.runtimeId === "codex").versionStatus, beforeUse);
+    assert.deepEqual(await f.models.launchSelection("codex", "Investigate failing tests"), { modelId: "fixture-model", effort: "medium", effortSource: "auto" });
+    assert.equal(fs.readFileSync(join(f.env.CODEX_HOME, "log/fixture.calls"), "utf8"), firstLaunchCalls,
+      "later turns reuse only inventory, not the automatic result or another inventory process");
+    await f.models.select("codex", "fixture-model", 0);
+    assert.deepEqual(f.models.selection("codex"), { modelId: "fixture-model", effort: null });
+    await f.models.select("codex", "fixture-model", 1, "auto");
+    assert.equal((await f.models.launchSelection("codex", "你好")).effort, "low");
+    assert.equal(f.models.selectedEffort("codex"), "auto", "actual effort never overwrites the user's automatic setting");
+    // Old model-selection documents had no selectedEffort field. Preserve that representation.
+    f.models.state.update(f.models.state.read().revision, state => {
+      delete state.selections[0].selectedEffort; return state;
+    });
+    const reopened = new WorkspaceRuntimeModels(f.storage, f.runtimes);
+    assert.deepEqual(await reopened.launchSelection("codex", "hello"), { modelId: "fixture-model", effort: "low", effortSource: "auto" });
+    assert.equal((await reopened.launchSelection("codex", "Update the docs")).effort, "medium");
+    assert(!Object.hasOwn(reopened.state.read().selections[0], "selectedEffort"));
+    await reopened.select("codex", "fixture-model", 2, "high");
+    assert.deepEqual(await reopened.launchSelection("codex", "hello"), { modelId: "fixture-model", effort: "high", effortSource: "user" });
+    assert.equal((await reopened.launchSelection("codex", "Investigate failing tests")).effort, "high");
+    await reopened.select("codex", "fixture-model", 3, null);
+    assert.deepEqual(await reopened.launchSelection("codex", "hello"), { modelId: "fixture-model", effort: "low", effortSource: "auto" });
+  } finally { await f.runtimes.close(); }
+});
 
 test("an empty private Codex home can list live models and retain a selectable inventory across restart", async () => {
   const f = await inventoryFixture();
@@ -200,7 +235,7 @@ test("an empty private Codex home can list live models and retain a selectable i
     assert(!fs.existsSync(f.cache));
     const listed = await f.models.list("codex");
     assert.deepEqual(listed.models, [{ id: "fixture-app", label: "Fixture App", recommended: true }]);
-    assert(!fs.readFileSync(`${f.command}.calls`, "utf8").includes("debug models"), "app-server success short-circuits debug");
+    assert(!fs.readFileSync(join(f.env.CODEX_HOME, "log/fixture.calls"), "utf8").includes("debug models"), "app-server success short-circuits debug");
     assert.equal(fs.statSync(f.cache).mode & 0o777, 0o600);
     fs.writeFileSync(`${f.command}.appfail`, ""); fs.writeFileSync(`${f.command}.fail`, "");
     const reopened = new WorkspaceRuntimeModels(f.storage, f.runtimes);

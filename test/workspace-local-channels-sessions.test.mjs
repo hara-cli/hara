@@ -70,6 +70,9 @@ test("stopping a channel aborts the current request and skips queued colleagues;
 });
 test("channel membership never grants a colleague the main Hara's Agent-creation authority", async () => {
   const f = await setup(1, (connection, binding, context) => createWorkspaceSyntheticProvider(connection, binding, { ...context, agent: { ...context.agent, kind: "main" } }));
+  // Exercise the governor's denied-tool receipt explicitly; full Pi rejects unadvertised tools earlier at its model gateway.
+  const agent = f.host.context(f.id).resources.agents.get(f.members[0]);
+  f.host.context(f.id).resources.agents.setPermissionTier(agent.agentId, "controlled", agent.configRevision, agent.agentEpoch);
   try {
     const channel = f.create(); f.host.sendChannel("client", f.id, channel, "建立同事 Coder", randomUUID(), f.members);
     await f.host.waitChannel(f.id, channel);

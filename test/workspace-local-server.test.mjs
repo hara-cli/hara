@@ -47,7 +47,8 @@ test("formal startServe local branch boots without provider/global config and en
   await assert.rejects(client.request("workspace.list"),/unauthorized/);
   await assert.rejects(client.request("initialize",{token:"x".repeat(64)}),/unauthorized/);
   await assert.rejects(client.request("initialize",{token:"中".repeat(64)}),/unauthorized/);
-  const init=await client.request("initialize",{token:handle.token});assert.deepEqual(init.capabilities,["workspace.local-dev.v2","workspace.user-interaction.v1","workspace.interaction.v2","workspace.local-channels.v1","workspace.local-channels.peer.v1","workspace.colleague-schedules.v1"]);assert.equal(init.workspace.workspaces.length,0);
+  await assert.rejects(client.request("initialize",{token:handle.token,clientCapabilities:[1]}),/capabilities/);
+  const init=await client.request("initialize",{token:handle.token,clientCapabilities:["workspace.extensions.manager.v1"]});assert.deepEqual(init.capabilities,["workspace.local-dev.v2","workspace.extensions.v1","workspace.extensions.manager.v1","workspace.extensions.owner-review.v1","workspace.user-interaction.v1","workspace.interaction.v2","workspace.local-channels.v1","workspace.local-channels.peer.v1","workspace.channel-pass.v1","workspace.channel-queue.v1","workspace.channel-autonomy.v1","workspace.colleague-schedules.v1","workspace.runtime-login-effort.v1","workspace.runtime-form.v1", "workspace.media.v1","workspace.media.states.v1","workspace.agents.archive.v1","workspace.runtime-proxy.v1","workspace.runtime-stage-events.v1","workspace.message-timing.v1","workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1"]);assert.equal(init.workspace.workspaces.length,0);
   await assert.rejects(client.request("session.create",{}),/Workspace must be explicit|legacy/);
   const created=await client.request("workspace.create",{label:"Personal",expectedRevision:init.workspace.revision});
   await client.request("workspace.connection.synthetic",{workspaceId:created.workspaceId,expectedGeneration:created.resourceGeneration,expectedRevision:0});
@@ -57,7 +58,8 @@ test("formal startServe local branch boots without provider/global config and en
   await assert.rejects(client.request("workspace.session.send",{workspaceId:created.workspaceId,expectedGeneration:created.resourceGeneration,agentId:created.selectedAgentId+"\n",message:"hello",requestId:randomUUID()}),/invalid/);
   await assert.rejects(client.request("workspace.session.send",{workspaceId:created.workspaceId,expectedGeneration:created.resourceGeneration,agentId:created.selectedAgentId,message:"hello\x1bworld",requestId:randomUUID()}),/invalid/);
   const run=await client.request("workspace.session.send",{workspaceId:created.workspaceId,expectedGeneration:created.resourceGeneration,agentId:created.selectedAgentId,message:"hello\n你好\r\n第二行\t內容",requestId:randomUUID()});assert.equal(typeof run.runId,"string");
-  const snapshot=await until(async()=>{const view=await client.request("workspace.snapshot",{workspaceId:created.workspaceId,agentId:null});return view.conversation.state==="completed"?view:null;});
+  const snapshot=await until(async()=>{const view=await client.request("workspace.snapshot",{workspaceId:created.workspaceId,agentId:null});return view.conversation.state==="blocked"?view:null;});
+  assert.equal(snapshot.conversation.taskState,"paused");
   assert.equal(snapshot.conversation.usage.modelCalls,1);assert.equal(snapshot.syntheticOnly,true);
   assert.equal(snapshot.conversation.history[0].content,"hello\n你好\r\n第二行\t內容");
   const blocked=new WebSocket(`ws://127.0.0.1:${handle.port}`,{origin:"https://evil.example.invalid"});blocked.on("error",()=>{});
@@ -83,7 +85,7 @@ test("RPC creation approval is tied to original controller and Workspace, not a 
 });
 test("RPC acknowledges a slow mock task, records its source, and receipt lookup never resends or calls a Provider",async()=>{
  const root=dir();let release,entered,calls=0;const ready=new Promise(r=>entered=r),pending=new Promise(r=>release=r);
- const handle=await startLocalWorkspaceServe({host:"127.0.0.1",port:0,cwd:root},{root,version:"synthetic",providerFactory(_connection,binding){return{id:"openai",model:binding.model,async turn(){calls++;entered();await pending;return{text:"mock",toolUses:[],stop:"end",usage:{input:1,output:1}};}};}});
+ const handle=await startLocalWorkspaceServe({host:"127.0.0.1",port:0,cwd:root},{root,version:"synthetic",providerFactory(_connection,binding){return{id:"openai",model:binding.model,async turn(){calls++;entered();await pending;return{text:"Hello from the slow synthetic provider.",toolUses:[],stop:"end",usage:{input:1,output:1}};}};}});
  const c=await connect(handle);try{
   const init=await c.request("initialize",{token:handle.token}),w=await c.request("workspace.create",{label:"Slow mock",expectedRevision:init.workspace.revision});
   await c.request("workspace.connection.synthetic",{workspaceId:w.workspaceId,expectedGeneration:w.resourceGeneration,expectedRevision:0});
@@ -95,7 +97,8 @@ test("RPC acknowledges a slow mock task, records its source, and receipt lookup 
   for(let i=0;i<3;i++)await c.request("workspace.session.receipt",receiptParams);assert.equal(calls,1);
   await assert.rejects(c.request("workspace.session.send",{...params,requestId:randomUUID(),source:"delegation"}),/source/);
   await assert.rejects(c.request("workspace.session.receipt",{...receiptParams,expectedGeneration:randomUUID()}),/generation/);
-  release();await until(async()=>{const view=await c.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId});return view.conversation.state==="completed";});assert.equal(calls,1);
+   // A pure greeting now closes with the Host no-tool proof; receipt reads must still start zero additional model calls.
+  release();await until(async()=>{const view=await c.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId});return view.conversation.state==="completed"&&view.conversation.taskState==="completed"&&view.conversation.completion?.state==="verified";});assert.equal(calls,1);
  }finally{release();await c.close();await handle.close();}
 });
 
@@ -111,6 +114,10 @@ test("two answer connections compete for one durable question; stale/cross-scope
   assert(init.capabilities.includes("workspace.user-interaction.v1"));
   const w=await a.request("workspace.create",{label:"Question",expectedRevision:init.workspace.revision});
   await a.request("workspace.connection.synthetic",{workspaceId:w.workspaceId,expectedGeneration:w.resourceGeneration,expectedRevision:0});
+  // This fixture tests durable in-process ask recovery, distinct from native outcome-unknown refusal.
+  const before=await a.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId});
+  const agent=before.agents.find(row=>row.agentId===w.selectedAgentId);
+  await a.request("workspace.agents.setPermissionTier",{workspaceId:w.workspaceId,expectedGeneration:w.resourceGeneration,agentId:agent.agentId,permissionTier:"controlled",configRevision:agent.configRevision,agentEpoch:agent.agentEpoch});
   const base={workspaceId:w.workspaceId,expectedGeneration:w.resourceGeneration,agentId:w.selectedAgentId};
   const first=await a.request("workspace.session.send",{...base,message:"Clarify this target",requestId:randomUUID()});
   const pending=await until(async()=>{const view=await a.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId});return view.conversation.state==="awaiting_user"?view.conversation.pendingQuestion:null;});
@@ -122,7 +129,7 @@ test("two answer connections compete for one durable question; stale/cross-scope
   assert.equal(results.filter(row=>row.status==="fulfilled").length,1);assert.equal(results.filter(row=>row.status==="rejected").length,1);
   const index=results.findIndex(row=>row.status==="fulfilled"),accepted=results[index].value;
   assert.equal(accepted.runId,first.runId);
-  await until(async()=>{const view=await a.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId});return view.conversation.state==="completed";});
+  await until(async()=>{const view=await a.request("workspace.snapshot",{workspaceId:w.workspaceId,agentId:w.selectedAgentId});return view.conversation.state==="blocked"&&view.conversation.taskState==="paused";});
   assert.equal(calls,2);
   const replay=await a.request("workspace.session.answer",requests[index]);assert.equal(replay.duplicate,true);assert.equal(calls,2);
   await assert.rejects(a.request("workspace.session.answer",{...requests[index],message:"Other answer"}),/another request/);

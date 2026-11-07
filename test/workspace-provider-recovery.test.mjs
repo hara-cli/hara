@@ -48,6 +48,8 @@ for (const refusal of [
   let host = new LocalWorkspaceHost(root, options);
   try {
     const w = host.createWorkspace("HTTP quota fixture", host.list().revision);
+    const fixtureAgent=host.context(w.workspaceId).resources.agents.get(w.selectedAgentId);
+    host.context(w.workspaceId).resources.agents.setPermissionTier(fixtureAgent.agentId,"controlled",fixtureAgent.configRevision,fixtureAgent.agentEpoch);
     host.configureConnection(w.workspaceId, { label: "Loopback fixture", provider: "openai", baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: "local-fixture-credential", defaultModel: "fixture-model" }, 0);
     const first = host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
     assert.equal(requests.length, 1, "no automatic Workspace resend");
@@ -141,6 +143,8 @@ test("a transient error still permits explicit continuation on the original froz
   } }; } });
   try {
     const w = host.createWorkspace("Transient fixture", host.list().revision);host.configureSynthetic(w.workspaceId, 0);
+    const fixtureAgent=host.context(w.workspaceId).resources.agents.get(w.selectedAgentId);
+    host.context(w.workspaceId).resources.agents.setPermissionTier(fixtureAgent.agentId,"controlled",fixtureAgent.configRevision,fixtureAgent.agentEpoch);
     const first = host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
     assert.equal(host.snapshot(w.workspaceId).conversation.resumeAdmission.allowed, true);assert.equal(calls, 1);
     const resumed = host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true);await host.wait(resumed.runId);
@@ -177,6 +181,8 @@ test("429 metadata without a numeric message prefix stays resumable through the 
     let host = new LocalWorkspaceHost(root, options);
     try {
       const w = host.createWorkspace("Rate-window checkpoint", host.list().revision);host.configureSynthetic(w.workspaceId, 0);
+    const fixtureAgent=host.context(w.workspaceId).resources.agents.get(w.selectedAgentId);
+    host.context(w.workspaceId).resources.agents.setPermissionTier(fixtureAgent.agentId,"controlled",fixtureAgent.configRevision,fixtureAgent.agentEpoch);
       const first = host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
       assert.equal(host.snapshot(w.workspaceId).conversation.resumeAdmission.allowed, true);assert.equal(calls, 1);
       assert.equal(legacyWorkspaceProviderFailure(`[openai error] ${message}`), null);

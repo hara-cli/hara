@@ -7,7 +7,8 @@ import type { WorkspaceFeatures, WorkspaceSchedule } from "./features.js";
 interface ScheduleRun { id: string; scheduleId: string; definitionHash: string; requestId: string; occurredAt: number; runId: string | null;
   state: "running" | "completed" | "blocked" | "unknown"; reason: string | null }
 interface State { revision: number; resourceBinding: WorkspaceResourceBinding; enabled: boolean; migratedEnabled: boolean; runs: ScheduleRun[] }
-interface Executor { available(agentId: string): boolean; execute(agentId: string, task: string, requestId: string): Promise<{ runId: string; completed: boolean }>;
+interface Executor { available(agentId: string): boolean; execute(agentId: string, task: string, requestId: string, row: WorkspaceSchedule): Promise<{ runId: string; completed: boolean }>;
+  validateAnchor?(row: WorkspaceSchedule): string | null;
   executeLegacy?(row: WorkspaceSchedule, requestId: string): Promise<{ runId: string; completed: boolean; unknown?: boolean }> }
 /** Durable claim precedes execution. Unknown/crashed claims never auto-replay; no global cron fallback. */
 export class WorkspaceScheduler {
@@ -37,7 +38,7 @@ export class WorkspaceScheduler {
   list(now = Date.now()) {
     const value = this.state.read(); return { ...value, schedules: this.features.schedules().map(row => ({ id: row.id,
       nextRunAt: row.enabled ? nextRun(this.timing(row, value.runs).job, now, { deadlineMs: Date.now() + 15 }) : null,
-      awaitingHandoff: row.source !== "workspace" && !value.migratedEnabled,
+      awaitingHandoff: row.source !== "workspace" && row.source !== "chat" && !value.migratedEnabled,
       lastRun: value.runs.filter(run => run.scheduleId === row.id).at(-1) ?? null })) };
   }
   async tick(mainAgentId: string, now = Date.now(), manualId?: string): Promise<void> {
@@ -47,24 +48,28 @@ export class WorkspaceScheduler {
       for (const row of this.features.schedules()) {
         const state = this.state.read(), timing = this.timing(row, state.runs);
         if (manualId ? row.id !== manualId : !row.enabled || !isDue(timing.job, now)) continue;
-        if (row.source !== "workspace" && !state.migratedEnabled) continue;
-        if (row.source !== "workspace" && !row.enabled) continue;
+        if (row.source !== "workspace" && row.source !== "chat" && !state.migratedEnabled) continue;
+        if (row.source !== "workspace" && row.source !== "chat" && !row.enabled) continue;
         if (state.runs.some(run => run.scheduleId === row.id && ["running", "unknown"].includes(run.state))) continue;
+        // A lost chat anchor is a durable block for this definition; do not claim every repeat again.
+        if (row.source === "chat" && state.runs.some(run => run.scheduleId === row.id && run.definitionHash === timing.hash
+          && run.state === "blocked" && run.reason?.startsWith("chat_"))) continue;
         if (state.runs.filter(run => ["running", "unknown"].includes(run.state)).length >= 128) return;
         // Legacy shell/org/external delivery has not been silently converted into Pi authority.
-        const legacy = row.source !== "workspace", hasLegacyExecutor = legacy && Boolean(this.executor.executeLegacy);
+        const legacy = row.source !== "workspace" && row.source !== "chat", hasLegacyExecutor = legacy && Boolean(this.executor.executeLegacy);
         const unsupported = !hasLegacyExecutor && (row.definition.mode !== undefined && row.definition.mode !== "print" || Boolean(row.definition.deliver));
         const agentId = typeof row.definition.agentId === "string" ? row.definition.agentId : mainAgentId;
-        if (!this.executor.available(agentId)) continue;
+        const anchorReason = row.source === "chat" ? this.executor.validateAnchor ? this.executor.validateAnchor(row) : "chat_anchor_unavailable" : null;
+        if (!anchorReason && !this.executor.available(agentId)) continue;
         const task = row.definition.task;
         const run: ScheduleRun = { id: randomUUID(), scheduleId: row.id, definitionHash: timing.hash, requestId: randomUUID(), occurredAt: now, runId: null,
-          state: unsupported || !(hasLegacyExecutor ? typeof task === "string" && task.length > 0 && task.length <= 128000 : text(task, 8000)) ? "blocked" : "running",
-          reason: unsupported ? "legacy_execution_review_required" : !task ? "missing_task" : null };
+          state: anchorReason || unsupported || !(hasLegacyExecutor ? typeof task === "string" && task.length > 0 && task.length <= 128000 : text(task, 8000)) ? "blocked" : "running",
+          reason: anchorReason ?? (unsupported ? "legacy_execution_review_required" : !task ? "missing_task" : null) };
         this.state.update(state.revision, value => ({ ...value, runs: [...value.runs.filter(item => ["running", "unknown"].includes(item.state)),
           ...value.runs.filter(item => !["running", "unknown"].includes(item.state)).slice(-126), run] }));
         if (run.state !== "running") continue;
         try {
-          const result = hasLegacyExecutor ? await this.executor.executeLegacy!(row, run.requestId) : await this.executor.execute(agentId, task as string, run.requestId);
+          const result = hasLegacyExecutor ? await this.executor.executeLegacy!(row, run.requestId) : await this.executor.execute(agentId, task as string, run.requestId, row);
           const unknown = "unknown" in result && result.unknown === true;
           this.finish(run.id, unknown ? "unknown" : result.completed ? "completed" : "blocked", result.runId, unknown ? "execution_outcome_unconfirmed" : result.completed ? null : "task_not_completed");
         } catch { this.finish(run.id, "unknown", null, "execution_outcome_unconfirmed"); }

@@ -23,6 +23,8 @@ import {
   type WorkspaceAgentTaskBinding,
 } from "./agent-binding.js";
 
+import { availableRuntimePermissionTiers, defaultRuntimePermissionTier, isRuntimePermissionTier, RuntimeTierUnavailableError, type RuntimePermissionTier } from "../agent-runtime/execution-policy.js";
+
 const FILE = "workspace-agents.json";
 const OWNER = "workspace-agents-owner.json";
 const MAX_BYTES = 2 * 1024 * 1024;
@@ -38,6 +40,7 @@ export interface WorkspaceAgentPersonaInput {
 export interface WorkspaceAgentCreateInput extends WorkspaceAgentPersonaInput {
   username: string;
   runtimeId?: AgentRuntimeId;
+  permissionTier?: RuntimePermissionTier;
 }
 /** Private immutable configuration, never a renderer/catalog DTO. */
 export interface WorkspaceAgentConfiguration {
@@ -46,6 +49,7 @@ export interface WorkspaceAgentConfiguration {
   description: string;
   instructions: string;
   runtimeId: AgentRuntimeId;
+  permissionTier?: RuntimePermissionTier;
   hash: string;
   toolPolicy?: WorkspaceLegacyToolPolicy;
 }
@@ -61,6 +65,8 @@ interface AgentRecord {
   currentConfigRevision: number;
   configurations: WorkspaceAgentConfiguration[];
   legacy?: { importId: string; sourceHash: string };
+  archivedAt?: string;
+  pausedScheduleCount?: number;
 }
 interface Owner {
   schemaVersion: 1;
@@ -77,10 +83,15 @@ export interface WorkspaceAgentView {
   kind: "main" | "colleague";
   state: "active" | "archived";
   agentEpoch: number;
+  archivedAt?: string;
+  pausedScheduleCount?: number;
   configRevision: number;
   identity: AgentPublicIdentity;
   description: string;
   runtime: AgentRuntimeOption;
+  permissionTier: RuntimePermissionTier;
+  /** Present only when the stored tier is unavailable on this Host platform (decision B); never silently downgraded. */
+  permissionTierUnavailable?: true;
   /** Main Hara uses the packaged product mark, not a private prompt-supplied path. */
   brand?: "hara";
 }
@@ -113,18 +124,19 @@ function persona(value: unknown, username: string): Omit<WorkspaceAgentConfigura
   }
   return { identity: normalizeAgentPublicIdentityInput(value.profile, username, "global"), description, instructions };
 }
-function configuration(input: ReturnType<typeof persona>, revision: number, runtimeId: AgentRuntimeId, toolPolicy?: WorkspaceLegacyToolPolicy): WorkspaceAgentConfiguration {
-  const value = { revision, ...input, runtimeId, ...(toolPolicy ? { toolPolicy: validateWorkspaceLegacyToolPolicy(toolPolicy) } : {}) };
+function configuration(input: ReturnType<typeof persona>, revision: number, runtimeId: AgentRuntimeId, toolPolicy?: WorkspaceLegacyToolPolicy, permissionTier: RuntimePermissionTier | null = defaultRuntimePermissionTier()): WorkspaceAgentConfiguration {
+  const value = { revision, ...input, runtimeId, ...(permissionTier ? { permissionTier } : {}), ...(toolPolicy ? { toolPolicy: validateWorkspaceLegacyToolPolicy(toolPolicy) } : {}) };
   return { ...value, hash: hashConfiguration(value) };
 }
 function parseConfiguration(value: unknown, username: string): WorkspaceAgentConfiguration {
-  if (!object(value) || !keys(value, ["revision", "identity", "description", "instructions", "runtimeId", "hash"], ["toolPolicy"])
+  if (!object(value) || !keys(value, ["revision", "identity", "description", "instructions", "runtimeId", "hash"], ["toolPolicy", "permissionTier"])
+    || value.permissionTier !== undefined && !isRuntimePermissionTier(value.permissionTier)
     || !positive(value.revision) || !isAgentRuntimeId(value.runtimeId) || !object(value.identity)
     || !keys(value.identity, ["version", "displayName", "source"], PROFILE_FIELDS.slice(1))
     || value.identity.version !== 1 || value.identity.source !== "hara") return invalid();
   const { version: _version, source: _source, ...profile } = value.identity;
   const next = configuration(persona({ profile, description: value.description, instructions: value.instructions }, username), value.revision, value.runtimeId,
-    value.toolPolicy === undefined ? undefined : validateWorkspaceLegacyToolPolicy(value.toolPolicy));
+    value.toolPolicy === undefined ? undefined : validateWorkspaceLegacyToolPolicy(value.toolPolicy), value.permissionTier as RuntimePermissionTier ?? null);
   if (canonical(next.identity) !== canonical(value.identity) || next.hash !== value.hash) return invalid();
   return next;
 }
@@ -171,7 +183,7 @@ export class WorkspaceAgentStore {
     if (canonical(this.parseOwner(rawManifestOwner)) !== canonical(owner)) return invalid();
     const ids = new Set<string>(), usernames = new Set<string>();
     const rows: AgentRecord[] = agents.map(value => {
-      if (!object(value) || !keys(value, ["agentId", "username", "kind", "state", "epoch", "currentConfigRevision", "configurations"], ["legacy"])
+      if (!object(value) || !keys(value, ["agentId", "username", "kind", "state", "epoch", "currentConfigRevision", "configurations"], ["legacy", "archivedAt", "pausedScheduleCount"])
         || !isWorkspaceAgentId(value.agentId) || ids.has(value.agentId)
         || typeof value.username !== "string" || !USERNAME.test(value.username) || usernames.has(value.username)
         || (value.kind !== "main" && value.kind !== "colleague") || (value.state !== "active" && value.state !== "archived")
@@ -181,6 +193,10 @@ export class WorkspaceAgentStore {
         : (value.agentId === owner.mainAgentId || value.username === "hara" || value.username === "main")) return invalid();
       if (value.legacy !== undefined && (!object(value.legacy) || !keys(value.legacy, ["importId", "sourceHash"])
         || !/^[a-f0-9]{64}$/.test(String(value.legacy.importId)) || !/^[a-f0-9]{64}$/.test(String(value.legacy.sourceHash)) || value.kind !== "colleague")) return invalid();
+      if ((value.archivedAt !== undefined || value.pausedScheduleCount !== undefined) && (value.state !== "archived"
+        || typeof value.archivedAt !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value.archivedAt)
+        || !Number.isFinite(Date.parse(value.archivedAt)) || !Number.isSafeInteger(value.pausedScheduleCount)
+        || Number(value.pausedScheduleCount) < 0 || Number(value.pausedScheduleCount) > 4096)) return invalid();
       const configurations = value.configurations.map(entry => parseConfiguration(entry, value.username as string));
       if (configurations.some((entry, index) => entry.revision !== index + 1)
         || value.currentConfigRevision !== configurations.length) return invalid();
@@ -210,11 +226,13 @@ export class WorkspaceAgentStore {
       assertCurrent,
     });
   }
-  private view(row: AgentRecord): WorkspaceAgentView {
+  private view(row: AgentRecord, runtimes: readonly AgentRuntimeOption[] = this.runtimes.options()): WorkspaceAgentView {
     const config = row.configurations[row.currentConfigRevision - 1]!;
     return { workspaceId: this.scope.workspaceId, agentId: row.agentId, username: row.username, kind: row.kind,
       state: row.state, agentEpoch: row.epoch, configRevision: config.revision, identity: structuredClone(config.identity),
-      description: config.description, runtime: this.runtimes.options().find(option => option.id === config.runtimeId)!,
+      ...(row.archivedAt ? { archivedAt: row.archivedAt, pausedScheduleCount: row.pausedScheduleCount ?? 0 } : {}),
+      description: config.description, permissionTier: config.permissionTier ?? defaultRuntimePermissionTier(), runtime: { ...runtimes.find(option => option.id === config.runtimeId)! },
+      ...(availableRuntimePermissionTiers().includes(config.permissionTier ?? defaultRuntimePermissionTier()) ? {} : { permissionTierUnavailable: true as const }),
       ...(row.kind === "main" ? { brand: "hara" as const } : {}) };
   }
   currentPersona(agentId: string): WorkspaceAgentPersonaInput {
@@ -227,14 +245,25 @@ export class WorkspaceAgentStore {
   }
   list() {
     const value = this.load().value;
+    // One read-only roster reply uses one fresh inventory. Task binding/resolution and execution
+    // still read availability independently; this snapshot never grants permission to run.
+    const runtimes = value?.agents.length ? this.runtimes.options() : [];
     return { revision: value?.revision ?? 0, mainAgentId: value?.mainAgentId ?? null,
-      agents: value?.agents.map(row => this.view(row)) ?? [] };
+      agents: value?.agents.map(row => this.view(row, runtimes)) ?? [] };
   }
   references() {
     return (this.load().value?.agents ?? []).map(row => ({ agentId: row.agentId,
       name: row.configurations[row.currentConfigRevision - 1]!.identity.displayName, state: row.state,
       ...(row.configurations[row.currentConfigRevision - 1]!.identity.title ? { title: row.configurations[row.currentConfigRevision - 1]!.identity.title } : {}),
       aliases: [...new Set([row.username, ...row.configurations.map(config => config.identity.displayName)])] }));
+  }
+  /** Host-only L0 input. One manifest read, no runtime inventory or model call; never expose instructions in a DTO. */
+  channelPrefilterProfiles() {
+    return (this.load().value?.agents ?? []).filter(row => row.kind === "colleague" && row.state === "active").map(row => {
+      const config = row.configurations[row.currentConfigRevision - 1]!;
+      return { agentId: row.agentId, title: config.identity.title ?? "", description: config.description, instructions: config.instructions,
+        aliases: [...new Set([row.username, ...row.configurations.map(item => item.identity.displayName)])] };
+    });
   }
   get(agentId: string): WorkspaceAgentView | null {
     if (!isWorkspaceAgentId(agentId)) throw new Error("invalid Workspace Agent id");
@@ -261,10 +290,13 @@ export class WorkspaceAgentStore {
   }
   create(input: WorkspaceAgentCreateInput, expectedCatalogRevision: number): WorkspaceAgentView {
     this.binding();
-    if (!object(input) || !keys(input, ["username", "profile"], ["description", "instructions", "runtimeId"])
+    if (!object(input) || !keys(input, ["username", "profile"], ["description", "instructions", "runtimeId", "permissionTier"])
       || typeof input.username !== "string" || !USERNAME.test(input.username) || ["main", "hara"].includes(input.username)
       || !positive(expectedCatalogRevision)) throw new Error("invalid Workspace Agent creation");
-    const { username, runtimeId = "pi", ...fields } = input;
+    if (input.permissionTier !== undefined && !isRuntimePermissionTier(input.permissionTier)) throw new Error("invalid Workspace Agent permission tier");
+    // Decision B: the full tier exists only where the Host has Seatbelt; never accept it elsewhere.
+    if (input.permissionTier !== undefined && !availableRuntimePermissionTiers().includes(input.permissionTier)) throw new RuntimeTierUnavailableError();
+    const { username, runtimeId = "pi", permissionTier = defaultRuntimePermissionTier(), ...fields } = input;
     const normalized = persona(fields, username);
     if (!isAgentRuntimeId(runtimeId)) throw new Error("invalid Workspace Agent Runtime");
     this.runtimes.assertAvailable(runtimeId);
@@ -273,7 +305,7 @@ export class WorkspaceAgentStore {
       if (!value || value.revision !== expectedCatalogRevision) throw new Error("Workspace Agent catalog changed; reload before creating");
       if (value.agents.some(row => row.username === username)) throw new Error("Workspace Agent username is retained; restore the exact archived colleague or choose another");
       const row: AgentRecord = { agentId: `ag_${randomUUID()}`, username, kind: "colleague", state: "active", epoch: 1,
-        currentConfigRevision: 1, configurations: [configuration(normalized, 1, runtimeId)] };
+        currentConfigRevision: 1, configurations: [configuration(normalized, 1, runtimeId, undefined, permissionTier)] };
       value.agents.push(row); this.advance(value); this.persist(loaded, value);
       return this.view(row);
     });
@@ -293,11 +325,11 @@ export class WorkspaceAgentStore {
       return this.view(row);
     });
   }
-  private appendConfiguration(row: AgentRecord, input: ReturnType<typeof persona>, runtimeId: AgentRuntimeId): void {
+  private appendConfiguration(row: AgentRecord, input: ReturnType<typeof persona>, runtimeId: AgentRuntimeId, permissionTier = row.configurations.at(-1)!.permissionTier ?? defaultRuntimePermissionTier()): void {
     if (row.state !== "active") throw new Error("restore the exact archived Workspace Agent before editing");
     if (row.configurations.length >= MAX_CONFIGS) throw new Error("Workspace Agent configuration history is full; no snapshot was removed");
     row.currentConfigRevision++;
-    row.configurations.push(configuration(input, row.currentConfigRevision, runtimeId, row.configurations.at(-1)!.toolPolicy));
+    row.configurations.push(configuration(input, row.currentConfigRevision, runtimeId, row.configurations.at(-1)!.toolPolicy, permissionTier));
   }
   updatePersona(agentId: string, input: WorkspaceAgentPersonaInput, configRevision: number, agentEpoch: number): WorkspaceAgentView {
     const normalized = persona(input, "agent");
@@ -326,13 +358,25 @@ export class WorkspaceAgentStore {
       this.appendConfiguration(row, { identity, description, instructions }, runtimeId);
     });
   }
-  setArchived(agentId: string, archived: boolean, configRevision: number, agentEpoch: number): WorkspaceAgentView {
-    if (typeof archived !== "boolean") throw new Error("invalid Workspace Agent lifecycle update");
+  setPermissionTier(agentId: string, permissionTier: RuntimePermissionTier, configRevision: number, agentEpoch: number): WorkspaceAgentView {
+    if (!isRuntimePermissionTier(permissionTier)) throw new Error("Invalid runtime permission tier");
+    if (!availableRuntimePermissionTiers().includes(permissionTier)) throw new RuntimeTierUnavailableError();
+    return this.update(agentId, configRevision, agentEpoch, row => {
+      const current = row.configurations[row.currentConfigRevision - 1]!;
+      const { identity, description, instructions } = current;
+      this.appendConfiguration(row, { identity, description, instructions }, current.runtimeId, permissionTier);
+    });
+  }
+  setArchived(agentId: string, archived: boolean, configRevision: number, agentEpoch: number, pausedScheduleCount = 0): WorkspaceAgentView {
+    if (typeof archived !== "boolean" || !Number.isSafeInteger(pausedScheduleCount) || pausedScheduleCount < 0 || pausedScheduleCount > 4096)
+      throw new Error("invalid Workspace Agent lifecycle update");
     return this.update(agentId, configRevision, agentEpoch, (row, value) => {
       if (row.kind === "main") throw new Error("the Workspace main Hara cannot be archived or replaced");
       if ((row.state === "archived") === archived) throw new Error("Workspace Agent lifecycle already changed; refresh before editing");
       if (row.epoch >= Number.MAX_SAFE_INTEGER) throw new Error("Workspace Agent lifecycle epoch exhausted");
       row.state = archived ? "archived" : "active"; row.epoch++;
+      if (archived) { row.archivedAt = new Date().toISOString(); row.pausedScheduleCount = pausedScheduleCount; }
+      else { delete row.archivedAt; delete row.pausedScheduleCount; }
     });
   }
   /** Explicit owner importer, NOT an Agent/RPC method or ambient roles discovery. All sources are
@@ -379,7 +423,7 @@ export class WorkspaceAgentStore {
     const config = row.configurations[row.currentConfigRevision - 1]!;
     this.runtimes.assertAvailable(config.runtimeId);
     return freezeWorkspaceAgentTaskBinding({ schemaVersion: 1, workspaceId: this.scope.workspaceId, resourceBinding: this.binding(),
-      agentId: row.agentId, agentEpoch: row.epoch, configRevision: config.revision, configHash: config.hash, runtimeId: config.runtimeId, taskId });
+      agentId: row.agentId, agentEpoch: row.epoch, configRevision: config.revision, configHash: config.hash, runtimeId: config.runtimeId, permissionTier: config.permissionTier ?? defaultRuntimePermissionTier(), taskId });
   }
   /** Private snapshot resolution, NOT execution admission. Callers still need live membership, policy,
    * Host/resource grants and fully scoped dependencies. Old runners explicitly refuse this provenance. */
@@ -389,6 +433,7 @@ export class WorkspaceAgentStore {
     const row = this.load().value?.agents.find(entry => entry.agentId === binding.agentId);
     if (!row || row.state !== "active" || row.epoch !== binding.agentEpoch) throw new Error("Workspace Agent task lifecycle is no longer active");
     const config = row.configurations[binding.configRevision - 1];
+    if (binding.permissionTier !== undefined && binding.permissionTier !== (config?.permissionTier ?? defaultRuntimePermissionTier())) throw new Error("Frozen runtime permission tier does not match its configuration");
     if (!config || config.hash !== binding.configHash || config.runtimeId !== binding.runtimeId) throw new Error("Workspace Agent task configuration snapshot is unavailable; no fallback was selected");
     this.runtimes.assertAvailable(config.runtimeId);
     const result = structuredClone(config);

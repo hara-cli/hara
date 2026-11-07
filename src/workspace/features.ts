@@ -1,15 +1,26 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { MAX_CHAT_SCHEDULES_PER_AGENT, MAX_CHAT_SCHEDULES_PER_WORKSPACE, MIN_CHAT_REPEAT_MS, type ChatScheduleTime } from "./chat-schedule.js";
 import { readFileSync, copyFileSync, constants, lstatSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, relative, join } from "node:path";
 import { tmpdir } from "node:os";
-import { WorkspaceJsonState, canonical, plain, text } from "./local-state.js";
+import { WorkspaceJsonState, UUID, canonical, plain, text } from "./local-state.js";
 import { sameWorkspaceResourceBinding, workspaceStateHome, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { WorkspaceSkillLibrary, forkWorkspaceSkill, validateWorkspaceSkill, type WorkspaceSkillBundle } from "./skills.js";
-import { parseCron, validTz, type Schedule } from "../cron/schedule.js";
+import { parseCron, validDateTimestamp, validTz, type Schedule } from "../cron/schedule.js";
 import { redactSensitiveText } from "../security/secrets.js";
 import { WorkspaceInheritedSkills } from "./legacy-skills.js";
+import { isScopedRunConnection, type ScopedRunConnection } from "./scoped-connections.js";
 
 export interface WorkspaceSchedule { id: string; name: string; schedule: Schedule; enabled: boolean; workspaceId: string; migrationId: string; source: string; definition: Record<string, unknown> }
+export interface ChatScheduleAnchor { workspaceId: string; conversationId: string; messageId: string; agentId: string; channelId?: string;
+  runtimeId: string; configRevision: number; agentEpoch: number; connection: ScopedRunConnection }
+function validChatAnchor(value: unknown, workspaceId: string): value is ChatScheduleAnchor {
+  return plain(value) && value.workspaceId === workspaceId && text(value.conversationId, 256) && typeof value.messageId === "string"
+    && UUID.test(value.messageId) && text(value.agentId, 256)
+    && (value.channelId === undefined || text(value.channelId, 256)) && text(value.runtimeId, 80)
+    && Number.isSafeInteger(value.configRevision) && Number(value.configRevision) > 0
+    && Number.isSafeInteger(value.agentEpoch) && Number(value.agentEpoch) > 0 && isScopedRunConnection(value.connection);
+}
 interface FeatureState { resourceBinding: WorkspaceResourceBinding; revision: number; schedules: WorkspaceSchedule[]; disabledSkills: string[]; skills: WorkspaceSkillBundle[] }
 const safe = (value: string) => redactSensitiveText(value).text;
 export function validWorkspaceSchedule(value: any): value is Schedule {
@@ -28,7 +39,8 @@ export class WorkspaceFeatures {
       if (!plain(raw) || !sameWorkspaceResourceBinding(raw.resourceBinding as WorkspaceResourceBinding, this.state.binding()) || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 1
         || !Array.isArray(raw.schedules) || raw.schedules.length > 4096 || !Array.isArray(raw.disabledSkills) || raw.disabledSkills.some(id => !text(id))) throw new Error("Invalid workspace feature settings");
       for (const item of raw.schedules) if (!plain(item) || item.workspaceId !== workspaceId || !text(item.id) || !text(item.name, 256) || !validWorkspaceSchedule(item.schedule)
-        || typeof item.enabled !== "boolean" || typeof item.migrationId !== "string" || typeof item.source !== "string" || !plain(item.definition)) throw new Error("Invalid scoped schedule");
+        || typeof item.enabled !== "boolean" || typeof item.migrationId !== "string" || typeof item.source !== "string" || !plain(item.definition)
+        || item.source === "chat" && (!validChatAnchor(item.definition.anchor, workspaceId) || item.definition.agentId !== item.definition.anchor.agentId)) throw new Error("Invalid scoped schedule");
       const skills = raw.skills === undefined ? [] : Array.isArray(raw.skills) && raw.skills.length <= 128 ? raw.skills.map(validateWorkspaceSkill) : null;
       if (!skills || new Set(skills.map(row => row.id)).size !== skills.length) throw new Error("Invalid skill locks");
       return { ...structuredClone(raw), skills } as unknown as FeatureState;
@@ -41,14 +53,40 @@ export class WorkspaceFeatures {
     for (const row of value.skills) skills.set(row.id, row);
     return { revision: value.revision, workspaceId: this.workspaceId,
       schedules: value.schedules.map(({ definition, ...row }) => ({ ...row, name: safe(row.name),
-        ...(row.source === "workspace" && typeof definition.agentId === "string" ? { agentId: definition.agentId } : {}),
-        ...(row.source === "workspace" && typeof definition.task === "string" ? { task: safe(definition.task) } : {}),
-        ...(row.source === "workspace" && typeof definition.tz === "string" ? { tz: definition.tz } : {}) })),
+        ...(row.source === "chat" && validChatAnchor(definition.anchor, this.workspaceId) ? { anchor: {
+          conversationId: definition.anchor.conversationId, messageId: definition.anchor.messageId, agentId: definition.anchor.agentId } } : {}),
+        ...((row.source === "workspace" || row.source === "chat") && typeof definition.agentId === "string" ? { agentId: definition.agentId } : {}),
+        ...((row.source === "workspace" || row.source === "chat") && typeof definition.task === "string" ? { task: safe(definition.task) } : {}),
+        ...((row.source === "workspace" || row.source === "chat") && typeof definition.tz === "string" ? { tz: definition.tz } : {}) })),
       skills: [...skills.values()].map(row => ({ id: row.id, description: row.description, enabled: row.enabled, version: row.version, source: row.source,
         locked: value.skills.some(pin => pin.id === row.id) || inherited.some(pin => pin.id === row.id), availableVersion: candidates.find(candidate => candidate.id === row.id)?.version ?? row.version })) };
   }
-  setScheduleEnabled(id: string, enabled: boolean, expected: number) {
-    this.state.update(expected, current => { const row = current.schedules.find(row => row.id === id); if (!row) throw new Error("Scoped schedule unavailable"); row.enabled = enabled; return current; });
+  setScheduleEnabled(id: string, enabled: boolean, expected: number, restoredAgentEpoch?: number) {
+    this.state.update(expected, current => { const row = current.schedules.find(row => row.id === id); if (!row) throw new Error("Scoped schedule unavailable");
+      if (enabled && restoredAgentEpoch !== undefined && row.source === "chat" && validChatAnchor(row.definition.anchor, this.workspaceId))
+        row.definition.anchor = { ...row.definition.anchor, agentEpoch: restoredAgentEpoch };
+      row.enabled = enabled; return current; });
+  }
+  /** Deletion pauses durably before drain. User restoration never re-enables these schedules. */
+  pauseAgentSchedules(agentId: string): number { return this.pauseAgentSchedulesWithReceipt(agentId).length; }
+  pauseAgentSchedulesWithReceipt(agentId: string): WorkspaceSchedule[] {
+    const before = this.state.read(), matches = before.schedules.filter(row => row.enabled && row.definition.agentId === agentId);
+    if (!matches.length) return [];
+    const ids = new Set(matches.map(row => row.id));
+    this.state.update(before.revision, current => ({ ...current, schedules: current.schedules.map(row => ids.has(row.id) ? { ...row, enabled: false } : row) }));
+    return matches;
+  }
+  /** Only rollback a failed archive's exact pause receipt; preserve unrelated schedule changes. */
+  restorePausedAgentSchedules(agentId: string, receipt: readonly WorkspaceSchedule[]): void {
+    if (!receipt.length) return;
+    const before = this.state.read(), ids = new Set(receipt.map(row => row.id));
+    for (const original of receipt) {
+      const current = before.schedules.find(row => row.id === original.id);
+      if (!original.enabled || original.definition.agentId !== agentId || !current
+        || JSON.stringify({ ...current, enabled: false }) !== JSON.stringify({ ...original, enabled: false }))
+        throw new Error("Paused schedule changed; review before restoring its state");
+    }
+    this.state.update(before.revision, current => ({ ...current, schedules: current.schedules.map(row => ids.has(row.id) ? { ...row, enabled: true } : row) }));
   }
   schedules(): WorkspaceSchedule[] { return this.state.read().schedules; }
   saveSchedule(input: unknown, expected: number) {
@@ -56,12 +94,33 @@ export class WorkspaceFeatures {
       || !text(input.task, 8000) || typeof input.agentId !== "string" || (input.tz !== undefined && (typeof input.tz !== "string" || !validTz(input.tz))) || redactSensitiveText(JSON.stringify(input)).redactions.length) throw new Error("Invalid scheduled task");
     this.state.update(expected, current => {
       const previous = current.schedules.find(row => row.id === input.id);
-      if (previous && (previous.source !== "workspace" || previous.definition.agentId !== input.agentId)) throw new Error("Schedule owner cannot change");
+      if (previous && (!["workspace", "chat"].includes(previous.source) || previous.definition.agentId !== input.agentId)) throw new Error("Schedule owner cannot change");
+      if (previous?.source === "chat") {
+        const next = input.schedule as Schedule;
+        if (next.kind === "every" && next.everyMs < MIN_CHAT_REPEAT_MS
+          || next.kind === "once" && (!validDateTimestamp(next.runAt) || next.runAt <= Date.now())
+          || next.kind === "cron" && !/^\d{1,2} \d{1,2} \* \* (?:\*|[0-6](?:,[0-6])*)$/.test(next.expr)) throw new Error("Invalid chat schedule timing");
+      }
+
       const row: WorkspaceSchedule = { id: input.id as string, name: input.name as string, enabled: input.enabled as boolean, schedule: structuredClone(input.schedule) as Schedule,
         workspaceId: this.workspaceId, migrationId: previous?.migrationId ?? "", source: previous?.source ?? "workspace",
-        definition: { task: input.task, agentId: input.agentId, ...(input.tz ? { tz: input.tz } : {}), mode: "print", createdAt: previous?.definition.createdAt ?? Date.now() } };
+        definition: { ...(previous?.source === "chat" ? { anchor: previous.definition.anchor } : {}), task: input.task, agentId: input.agentId, ...(input.tz ? { tz: input.tz } : {}), mode: "print", createdAt: previous?.definition.createdAt ?? Date.now() } };
       return { ...current, schedules: [...current.schedules.filter(item => item.id !== row.id), row] };
     });
+  }
+  createChatSchedule(input: { title: string; task: string; agentId: string; time: ChatScheduleTime; anchor: ChatScheduleAnchor }) {
+    if (!text(input.title, 256) || !text(input.task, 8000) || !text(input.agentId) || input.anchor.workspaceId !== this.workspaceId || input.anchor.agentId !== input.agentId
+      || !validChatAnchor(input.anchor, this.workspaceId) || !validWorkspaceSchedule(input.time.schedule)
+      || !validTz(input.time.tz)
+      || redactSensitiveText(JSON.stringify(input)).redactions.length) throw new Error("Invalid chat schedule");
+    const current = this.state.read();
+    if (current.schedules.length >= MAX_CHAT_SCHEDULES_PER_WORKSPACE || current.schedules.filter(row => row.source === "chat" && row.definition.agentId === input.agentId).length >= MAX_CHAT_SCHEDULES_PER_AGENT)
+      throw new Error("Chat schedule count limit reached");
+    const id = randomUUID();
+    this.state.update(current.revision, state => ({ ...state, schedules: [...state.schedules, { id, name: input.title, schedule: input.time.schedule, enabled: true,
+      workspaceId: this.workspaceId, migrationId: "", source: "chat", definition: { task: input.task, agentId: input.agentId, tz: input.time.tz,
+        mode: "print", createdAt: Date.now(), anchor: input.anchor } }] }));
+    return id;
   }
   deleteSchedule(id: string, expected: number) { this.state.update(expected, current => ({ ...current, schedules: current.schedules.filter(row => row.id !== id) })); }
   removeMigration(ids: readonly string[]) {

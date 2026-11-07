@@ -90,3 +90,20 @@ test("a failed native group preserves all later groups and the final exit remain
   }
   assert.equal(runNativeTestGroups(batches, "arm64", { run: () => 0, log: () => {} }), 0);
 });
+
+test("partitioned fixtures retain their original CI budget family and native isolation", () => {
+  const files = readdirSync(new URL(".", import.meta.url)).filter(file => file.endsWith(".test.mjs")).sort();
+  const inheritedSlow = ["workspace-model-context-flow.test.mjs", "workspace-model-context-handoff.test.mjs", "workspace-model-context-ledger.test.mjs", "workspace-production-flow.test.mjs", "workspace-production-create.test.mjs", "workspace-production-create-refusal.test.mjs", "workspace-production-loopback.test.mjs"];
+  const native = ["agent-runtime-expanded-integration.test.mjs", "agent-runtime-expanded-cursor-integration.test.mjs", "agent-runtime-expanded-grok-integration.test.mjs", "runtime-permission-process.test.mjs", "runtime-permission-process-enforcement.test.mjs", "workspace-codex-budget-reset.test.mjs", "workspace-codex-budget-usage.test.mjs", "workspace-codex-budget-ceiling.test.mjs", "workspace-codex-budget-recovery.test.mjs", "workspace-codex-budget-busy.test.mjs", "workspace-codex-persistent-session.test.mjs", "workspace-codex-standing-context.test.mjs", "workspace-codex-colleague-fastpath.test.mjs", "workspace-governance-c-lite-native-a.test.mjs", "workspace-governance-c-lite-native-b.test.mjs", "workspace-governance-c-lite-native-write.test.mjs", "workspace-local-channels-native.test.mjs"];
+  for (const file of inheritedSlow) assert.ok(INTEL_SLOW_FILES.includes(file), `parent budget family missing: ${file}`);
+  for (const file of native) assert.ok(NATIVE_CONTENTION_FILES.includes(file), `native isolation missing: ${file}`);
+  for (const arch of ["arm64", "x64"]) {
+    const batches = strictNativeTestBatches(files, arch);
+    for (const file of [...inheritedSlow, ...native]) {
+      const batch = batches.find(row => row.files.includes(file));
+      assert.equal(batch.timeout, 120000, `strict deadline unchanged: ${file}`);
+      assert.equal(batch.concurrency, 1, `native/durable partition remains serial: ${file}`);
+    }
+    assert.deepEqual(batches.flatMap(row => row.files).sort(), files);
+  }
+});

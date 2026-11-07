@@ -9,6 +9,7 @@ import { readModelContextFileSync } from "../fs-read.js";
 import { redactSensitiveText } from "../security/secrets.js";
 import { canonical, plain } from "./local-state.js";
 import type { Tool } from "../tools/registry.js";
+import { withWorkspaceOperationSkill } from "./operation-cards.js";
 
 export interface WorkspaceSkillBundle { id: string; description: string; version: string; files: Record<string, string>; source: "global" | "private"; enabled: boolean }
 const ID = /^[a-z0-9][a-z0-9-]{0,79}$/;
@@ -94,11 +95,12 @@ export function forkWorkspaceSkill(bundle: WorkspaceSkillBundle, content: string
 }
 /** Captured version locks for one attempt. Disabling/forking a skill revokes that attempt's reads. */
 export function workspaceSkillTool(bundles: WorkspaceSkillBundle[], assertCurrent: (id: string, version: string) => void): Tool {
-  return { name: "workspace_skill", kind: "read", description: "Read instructions or a relative text resource from an enabled version-locked skill in THIS Workspace. Start with SKILL.md; continue at nextOffset until complete. This grants no new tools or global paths.",
+  const readable = withWorkspaceOperationSkill(bundles);
+  return { name: "workspace_skill", kind: "read", description: "Read built-in Hara operation cards, skill instructions or a relative text resource from an enabled version-locked skill in THIS Workspace. Start with SKILL.md; continue at nextOffset until complete. This grants no new tools or global paths.",
     input_schema: { type: "object", properties: { id: { type: "string" }, file: { type: "string" }, offset: { type: "integer", minimum: 0 } }, required: ["id"] },
     async run(input, context) {
       if (!plain(input) || Object.keys(input).some(key => !["id", "file", "offset"].includes(key)) || typeof input.id !== "string") throw new Error("Invalid Workspace skill read");
-      const bundle = bundles.find(row => row.id === input.id && row.enabled), name = input.file ?? "SKILL.md", offset = input.offset ?? 0;
+      const bundle = readable.find(row => row.id === input.id && row.enabled), name = input.file ?? "SKILL.md", offset = input.offset ?? 0;
       if (!bundle || typeof name !== "string" || !safeFile(name) || !Object.hasOwn(bundle.files, name) || !Number.isSafeInteger(offset) || Number(offset) < 0) throw new Error("Enabled Workspace skill resource unavailable");
       assertCurrent(bundle.id, bundle.version);
       const content = bundle.files[name]!, info = metadata(bundle.files["SKILL.md"]!, bundle.id);

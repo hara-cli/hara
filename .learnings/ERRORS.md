@@ -11107,3 +11107,324 @@ explicitly deferred with two alternatives. Earlier historical failures and stres
   minimal exact hunks before syntax-checking; no build, signing or source mutation ran on failure.
 
 ---
+
+
+## [ERR-20261103-RUNTIME-DIAGNOSTIC-FIXTURES] resolved native failure fixtures
+
+- Added Claude network/proxy/version fixtures initially inherited a Codex-only trusted-project argument check. The next run still had the matching old argument assertion. Both were fixed only in the fixture and expected CLI-specific arguments; product confinement was unchanged.
+- Keep raw-output retention opt-in for a documented JSON parser. A nonzero native exit otherwise discards stdout before the driver can classify its terminal error frame. Generic transport failure must not overwrite a specific structured error event.
+- Resolve files with `rg --files` in the intended repository before cross-repository reads. Guessed sibling filenames and reads at the task root produced harmless missing-file/not-a-repository errors during this run; no source or shared state changed from those reads.
+- Final focused and full results are recorded in the workspace inbox handoff. Preserve the initial failure logs separately from the final verification.
+## [ERR-20261103-CODEX-PERSISTENT-MCP] Native approval mode and resumed usage need real protocol verification
+
+**Logged**: 2026-11-03T01:20:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: backend
+
+### Summary
+Codex 0.166 `auto` can request native MCP approval before a governed tool reaches Hara. A persistent process also needs explicit thread unload before new endpoint/instruction overrides can take effect.
+
+### Details
+The first implementation passed fake RPC/MCP checks, but a real app-server tool probe was rejected before Hara recorded a tool call. Only the fresh attempt's Hara endpoint now uses `approve`; other inherited MCP servers are cleared, native execution stays read-only/on-request/user, and every Hara tool remains subject to its immutable permit, governor and Desk card. Model and effort responses are verified. Each attempt unsubscribes with zero native unload delay and waits for thread/closed, retaining the app-server process only after that boundary.
+
+Usage is charged from the first current-turn request's explicit `last` telemetry, then native cumulative deltas. Replay from an earlier native turn is fenced out. Updating a separate durable watermark before governor accounting could lose the crash gap; it is not an accounting authority. Token overage is checked on each observed update and the final drain retains observed usage. A real longer conversation reached 147606 input / 228 output against the frozen 128000 token limit and was stopped; this was not solved by raising the budget. Future context/budget policy needs a separate decision.
+
+### Resolution
+- Source implements scoped process pooling, per-attempt MCP, explicit resume failure without replay, native event attribution, process exit drain and token rotation on process replacement.
+- Focused protocol/governor/card/lifecycle checks: 21/21 passed. Real tool calls reached Hara after the native approval correction; full-suite and handoff results live in the workspace inbox report.
+- First build had a local `args` name collision; fixed without changing behavior. The private live harness also had revision/variable-shadowing setup mistakes. Its already accepted first request was preserved and not replayed.
+- A cumulative S3 test file hit the unchanged 120-second file deadline under full-suite load; split by lifecycle without raising limits or removing assertions. Two unchanged Host/channel files also failed under that load and passed 12/12 on the fixed baseline in isolation.
+
+### Metadata
+- Source: real protocol test
+- Related Files: src/agent-runtime/codex-session.ts, src/agent-runtime/registered-cli-mcp.ts, src/workspace/execution.ts, test/workspace-codex-session-recovery.test.mjs
+- Tags: codex, app-server, mcp, governance, accounting, recovery
+- Pattern-Key: native_session.context_is_not_authority
+
+## [ERR-20261103-PI-RPC-EMPTY-AUTH-LOCK] Pi RPC requires a narrow lock directory even for empty auth
+
+**Logged**: 2026-11-03T20:48:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: tests
+
+The isolated Pi 1.5.0 RPC process accepted get_state but refused prompt with a credential-store mkdir EPERM. Its file auth backend locks even an empty auth.json before looking up the loopback capability in models.json. The fixture now allows only its dedicated agentDir/auth.json.lock directory; auth.json, models.json and settings.json remain unwritable. Real Seatbelt/native tool, key-absence, token lifecycle, resume and MCP tests pass. This does not grant real Pi credentials, a broad agentDir write grant, or production admission. Shared policy must implement and test this exact empty-lock requirement before Pi integration.
+
+### Related fixture/tooling corrections
+
+- Node fetch did not transmit the deliberately overridden Host header. Use node:http for the Host-confusion negative test; retain the exact 403 assertion.
+- npm rejects a single /dev/null path serving as both userconfig and globalconfig. Two separate empty task-local files preserve isolation and allow the same install without reading user config.
+- Local official Pi reference fetch failed with an early EOF; freshness is unknown. The executed official npm 1.5.0 tarball is pinned and integrity-checked separately. Raft fetch succeeded at db5e399; do not claim that Pi's old source checkout was refreshed.
+
+### Resolution
+
+- Focused local prototype: 11/11 PASS; existing Pi tests: 23/23 PASS; Core build PASS.
+- Production/defaults/C-lite integration: HOLD pending design review and public-policy Pi support.
+- Related Files: scripts/pi-full-mode-prototype.mjs, scripts/pi-full-mode-prototype.test.mjs, ../inbox/2026-11-03-pi-full-mode-tip.md
+- Pattern-Key: pi_rpc.empty_auth_read_requires_exact_lock
+
+
+## [ERR-20261103-PI-NATIVE-PRODUCTION-BOUNDARIES] Native completion must join physical work
+
+- Logged: 2026-11-03
+- Status: resolved in adapter; final shared-layer integration pending
+- Production integration found that a repeated MCP close could return while its first close still awaited a physical native launch. Close now returns one shared promise. A Pi MCP completion request is deferred until native settle and common process-tree drain; it cannot publish done while native effects remain active.
+- The adapter awaits the public layer's asynchronous STOP/CONT ownership registration. A failed drain leaves the native policy attached and the Workspace lease retained; no private Pi process-tree cleanup was introduced.
+- Per-attempt model/MCP capabilities travel only through one inherited fd 3, consumed and closed before tools/session loading. They are absent from argv, env and launch configuration files. Opaque upstream reasoning remains in authenticated scoped Host storage across gateway replacement.
+- A first native idle-resume fixture incorrectly reused the prior MCP transport session. Recreating the per-attempt endpoint fixes the fixture and matches production; the same native session id resumes without replaying the previous tools. The original failure log is retained.
+- Initial new TypeScript/narrowing and test syntax errors were corrected and the original build/failure logs retained. Do not treat a test file that failed to parse as a passed acceptance check.
+- Verification: production RPC, background descendant drain, resource traps, continuation restoration and request-local proxy tests pass with a hashed public-layer draft snapshot. Exact immutable public Pi/drain/N1 commits and Desk acceptance remain separate prerequisites.
+- Pattern-Key: pi_native.physical_close_and_per_attempt_capability
+
+
+## [ERR-20261103-PI-TIER-WIRING] Real SDK dependency code hit the credential basename mask
+
+- Status: resolved in Pi integration, pending coordinator integration
+- The actual full Workspace entry reached zero upstream model calls because the public generic credentials.* read mask also matched OpenAI SDK source resources/beta/agents/vaults/credentials.mjs. The hand-written prototype profile could not reveal this public-policy difference.
+- Keep the credential mask. Resolve the installed Pi SDK's OpenAI dependency from trusted Hara module identity and exempt only that exact single-link source file from the generic basename read mask. Do not exempt its directory, writes, Hara state, Keychain, or foreign credential roots. Its path participates in the policy key. Real Seatbelt verifies the SDK source is readable while a user's same-named SSH credential file is unreadable.
+- Native verified task_checkpoint requests are completion proposals until settled physical drain. They are queued to the real governor after drain, without claiming a successful receipt to the child. Real Workspace positive N1 passes and read-only/invented native proof is rejected; one physical model call is charged once.
+- Fixture corrections: checkpoint schema requires completion.evidence; omit empty optional tool_call_ids for native-only checks; durable completion lives in task.checkpoint.completion. Close the fixture's permit/installer before removing its private state. Existing controlled Pi fixtures must explicitly select controlled now that new bindings default full, and N1 checks must cite the observed write as well as the read verification.
+- Bun1.3.9 local file dependency install passes with the real Pi policy and (deny file-link), default backend, isolated HOME/cache and a loopback-only registry. This does not verify pnpm or arbitrary registry packages.
+- Public final 9c75b58 is merged with its S3 parent history; no rewrite/cherry-pick of its terminal fix. The accepted unobserved instantaneous daemon/reparent limitation remains; Pi uses only common ownership/drain.
+- A closeout call used an absolute task path and was held invalid_task_name, removed0. Use the registered task name at final closeout. Preserve original failure logs, without capabilities or real credentials.
+
+
+## [ERR-20261103-EXTENSION-CATALOG-CONTRACT] Strict metadata DTO and capability checks
+
+- Status: resolved
+- Area: backend/tests
+- Source: self-review
+- Summary: Initial extension DTO compilation required explicit union narrowing after plain-record checks.
+  A related RPC regression then correctly rejected an outdated exact capability list after
+  `workspace.extensions.v1` was added. Narrow boundary fields explicitly and advance the exact expected
+  capability contract together with an intentional protocol addition; retain strict equality.
+- Resolution: Explicit descriptor validation/typing, synchronized capability expectation, and focused
+  catalog/authorization/RPC regressions. Failed catalog refreshes revoke cached metadata immediately.
+- Related: src/workspace/extension-catalog.ts, src/workspace/extensions.ts,
+  test/workspace-extensions.test.mjs, test/workspace-local-server.test.mjs.
+
+## [ERR-20261103-OP-CARDS-FIXTURE-MODEL] Operation-card fixture must use the admitted model
+
+**Logged**: 2026-11-03T11:10:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+The first operation-card test fixture hard-coded provider.model=fixture after selecting the synthetic connection. The live Workspace dependency guard rejected the mismatch before model dispatch; 11 tests reported hookFailed, while existing skills 5/5 passed. The fixture now uses binding.model, as the production provider boundary requires. No dependency guard, timeout or assertion was weakened. Other preparation mistakes were absent guessed paths (located with rg --files) and sandbox denial for the required external task init (identical elevated command passed the capacity gate). Evidence is retained in the task evidence directory; not a Hara product defect or real-home operation.
+
+- Related Files: test/workspace-operation-cards.test.mjs
+- Pattern-Key: tests.fake_provider_matches_admitted_binding
+
+Operation-card fixture follow-up: the first governed tool-use probe emitted stopReason/inputTokens instead of the actual TurnResult.stop/usage fields. The engine correctly did not interpret that fake result as a tool-use continuation (26/27 pass). Fixed the fixture DTO and retained focused-final.log; no production governor, timeout or assertion was weakened.
+
+The follow-up unknown-outcome fixture created a new WorkspaceResourceStorage wrapper without initialize(); the existing resource guard refused its journal read. Initialized that same isolated wrapper before the journal fixture. Original focused-verified.log retained. The input .sha256 files use inbox-relative names; an initial check from the workspace root failed to locate them, and checking from inbox passed both unchanged digests.
+
+Final verification: build-pass.log succeeded; focused-pass.log contains 27/27 pass, 0 fail/cancel/skip (13 new operation-card checks, 9 login/effort checks, 5 existing skills checks), Node 22.23.1, concurrency=1, original 120000ms test limit and isolated HOME/TMP. No full-suite run or external model request. Owned node_modules symlink removed after test completion; the shared dependency target was not modified.
+
+
+## [ERR-20261104-INTEGRATION-W2] Full native transport changes fixture contracts
+
+- Logged: 2026-11-04T02:30:00+08:00
+- Priority: high
+- Status: resolved (known regressions verified in focused runs; final complete run tracked in external evidence)
+- Area: integration/tests
+- Summary: Complete slice merges built successfully but the first full run exposed stale controlled-only fixtures, missing compact built-in help context, and a legacy Pi tool-policy intersection.
+- Details: Default full Pi uses real namespaced MCP and Host receipt IDs; model ToolSpec omits authority kind. Keep exact in-process ledger/recovery tests explicitly controlled and retain real full/N1/token/permission negatives. Legacy role allow-lists must not gain a native shell. Pure greetings require both user-objective gating and Host proof of zero tool/native activity with an unchanged complete project snapshot. Changes still need actual write receipts. Synthetic completion must cite the working write plus verification; read verification alone fails N1. The default synthetic provider now uses C-lite's engine brief; only the dedicated multiple-acceptance fixture opts into explicit intake.
+- Verification: Original Core full failure logs retained; entire S3 permission/process file passed within unchanged120000ms. Actual full Pi Chinese four-question positives and hidden-native-write negative passed focused run. Remaining focused repairs are being rerun; no declared all-green status.
+- Follow-up: Run full Core/Desk serially under the load gate, preserve original deadlines, then backed-up local adhoc install. No Keychain entries, Feishu doctor, outward sends, main/push/tag/candidate/PEM. Native accepted/outcome-unknown sessions remain fail-closed.
+- Related: src/workspace/synthetic-provider.ts, src/agent/readonly-light.ts, src/agent-runtime/pi-full.ts, src/workspace/local-host.ts; shared local docs/ERROR-LOG.md and wave2 inbox reports.
+
+- Second complete run at e656589: 3756 total,3750 pass,4 fail,2 skip,0 cancel. S3 process file5/5, all four actual full Pi CJK questions and model context passed. Final exact-tip complete run still required and recorded in the external wave2 report.
+- Follow-up fixes verified: Host-only protected same-binding dispatch journal carries a prior effect only alongside newly dispatched observation for every criterion. A pending-question answer must append exactly one matching interactive decision; defaults, changed history/scope, wrong question/turn cannot acquire that link. Actual crash/answer resume preserves inode and avoids repeating writes. Native diff stays attempt-local.
+- Two native bearer cases already masked their output as***; a real working read receipt bypassed the new placeholder check. Gate all read-only answer text, not just the zero-tool branch; numeric fact answers remain supported. Focus5 passes13/13 including both original bearer negatives. Focus4's other53 cases passed, covering question recovery, slow RPC source/nonce/receipt/call-count guards and private journal negatives.
+- Fixture contracts: a pure hello now expects completed+verified, with no extra Provider call. Do not stretch the bounded RPC wait to hide the old paused expectation. Desktop capture must compare localized safe diagnostics, and user-turn peer wakes use depth0; depth1 is reserved for autonomy.
+
+## [ERR-20261104-CODEX-STARTUP] Real CLI config/Seatbelt startup differs from fake RPC fixtures
+
+- Status: resolved (startup implementation and 116/116 focused regressions); Priority: high; Area: runtime
+- Evidence: native Codex 0.163.0 synthetic HOME initialize rejects disabled-only MCP tables; Seatbelt raw-string path escaping denies SQLite state; native thread creation also needs its writer-lock directory. Fake RPC fixtures alone did not exercise these contracts.
+- Fix: inert valid MCP replacement, correctly escaped closed SQLite/state paths, opt-in bounded redacted first-line diagnostics. Add actual CLI metadata-only initialize/thread-start positive and negative tests with synthetic credentials only. Final evidence in local project inbox/2026-11-04-wave2-codex-failed-fix.md. Native host 0.163.0 already completed one inference and returned a reply; a separate plain greeting closeout and prepared adhoc artifact remain under verification. Installation and Jeff acceptance are separate, pending states.
+- Execution corrections: exact registered binary first; create the fixture TMPDIR; metadata-only ENOENT/version mismatches consume no model budget; original probes retained and no accepted/unknown native turn is replayed.
+
+
+## [ERR-20261104-CODEX-RESIDUAL-DENIES] Keep model metadata writable without allowing global installers
+
+- Logged: 2026-11-04T16:49:19.028771+08:00
+- Priority: medium
+- Status: resolved locally; integration/installation held by the task
+- Area: runtime/security/tests
+- Summary: Codex 0.163.0 could refresh a model list in memory, but the protected host boundary rejected models_cache.json persistence. Its embedded-skills installer also tried to replace the user's global skills/.system.
+- Resolution: Allow only the literal models_cache.json in the common Codex execution policy. Version-matched save_file uses fs::write directly, so no speculative temporary basename is allowed. Pass skills.bundled.enabled=false through the shared launch override helper; keep global skills writes denied. No stderr filtering or process-tree lifecycle changes are needed.
+- Verification: Build and 74 focused tests pass serially, including native initialize/thread-start without turn-start. Synthetic HOME plus loopback catalog probes confirm new/updated metadata persistence, online refresh on restart, fail-closed explicit-catalog invalidation persisted to disk, expired-cache refresh, and unchanged auth/config/system-skill sentinels. Real model calls: 0.
+- Probe lessons: Built-in provider IDs cannot be overridden in 0.163.0; use a named synthetic provider with model_catalog_url for a local fixture. App Server's refresh worker fetches online on startup, and explicit-catalog failures invalidate rather than fall back; neither cache reuse nor offline fallback may be inferred from a successful write. Empty optional etag is omitted when serialized. Failed exploration logs were retained. A new protected-root negative initially omitted wrap.env; its unspawned ownership guard correctly failed close. Supply the fixture env; do not weaken the common drain boundary.
+- Related Files: src/agent-runtime/execution-policy.ts, src/agent-runtime/codex-host-config.ts, test/codex-host-startup.test.mjs, test/reply-latency-defaults.test.mjs
+
+
+## [ERR-20261104-MANAGED-MCP-BOUNDARY] Protected stdio and actual runtime fixture contracts
+
+**Logged**: 2026-11-04
+**Priority**: high
+**Status**: resolved; local verification only
+**Area**: Workspace MCP admission, process boundary, tests
+
+### Summary
+
+A reviewed source must bind actual code and schema, then use the common guarded process owner and governor. Passing a scripted response or using a different guard label is insufficient.
+
+### Errors and corrections
+
+- Seatbelt rejects a numeric address in its `remote ip` host filter. Use its supported localhost/port filter while pinning the Workspace proxy URL to IPv4 loopback; retain kernel denial of every other outbound port and no direct fallback.
+- The common process boundary recognizes the canonical `hara-native-guard` and exact guard script. A new label caused a correctly unowned process rejection; reuse the common owner/drain rather than bypassing it.
+- A data-read allowlist needs a literal root-directory read for dyld startup. Missing it aborted Node before script execution. This grants no descendant file reads. Allow actual system libraries, never all `/System` including `/System/Volumes/Data`; deny other Workspace data, credential paths, Keychain services and hard links.
+- The review hasher rejects non-regular files before opening and uses O_NONBLOCK against FIFO replacement races; a real synthetic named pipe proves bounded rejection. It rejects credential files/directories before content reads. A Host review record is separate from both Workspace grants and one-call approval; metadata, annotations or recomputed changed digests cannot grant execution.
+- Scripted Host fixtures must create the private root, use the bound model, cite observed toolCallId values and supply the full Pi RPC completion shape including evidence. Fix the fixture; preserve the completed-state assertion and external result `verified:false`.
+- Optional catalog failure must invalidate every extension tool while keeping the ordinary governed core usable; never let a stale review library block all conversations. A real Host greeting verifies this without an MCP spawn.
+- Check actual inventory names for duplicates as well as count and digest. `tools/list_changed` freezes the connection. Recheck authorization after an awaited result, not only before dispatch.
+- Approval displays the entire redacted bounded input; an unseen truncated tail cannot be treated as an approved target. Unknown outcomes remain protected against replay after restart.
+
+### Verification and prevention
+
+Real task-owned stdio, proxy/direct and credential canaries, common drain, actual Pi SDK/RPC and synthetic Codex/Claude executables exercised the Host/governor path. Core focused 50/50 plus final admission/RPC/availability guards 5/5; Desk focused 40/40 and both builds passed under serial low-priority execution. Synthetic executables do not establish authenticated vendor compatibility, release readiness or visual product acceptance. Keep unsupported platforms non-callable; never substitute an unprotected transport or real credentials after an isolated fixture error.
+
+
+## [ERR-20261104-MCP-OWNER-REVIEW] Frozen human review and stale renderer callbacks
+
+- Logged: 2026-11-04
+- Status: resolved in local owner-review branch; integration/release remain HOLD
+- Area: Workspace MCP admission, renderer lifecycle and synthetic fixtures
+- Owner review is separate from executable discovery, Workspace/agent grants and individual calls. Freeze code before an explicitly confirmed bounded startup; inspect only initialize/tools/list, drain, then approve the same code and exact observed schema. Keep optional protocol metadata in the fingerprint without trusting readOnlyHint; inspected tools default to exec.
+- A catalog reload initially reused a prior proposal after its code changed. Reload now cancels/discards the client's previous records and issues new opaque IDs. Changed code/config/library/proxy cannot be rebased into an approval. New review nonces prevent identical-code reapproval from reviving old two-level grants; persisted invalidation checks the original revision so a late notification cannot revoke a newer record.
+- Disabled controls alone did not stop a retained pre-error renderer callback from retrying an unknown inspection. A mutable halted/pending/scope fence now makes that callback inert until explicit read-back. Closing or switching cancels the record and discards late results. Keep user permission drafts behind an independent edit/review lock.
+- Main agent IDs/rows are nullable; narrow both before creating a trusted owner context. Channel identity belongs to the Core session selection, not the renderer's agent DTO. Server-side authenticated local Main ownership remains authoritative.
+- New synthetic fixtures initially omitted the private Host root and then returned a provider model different from the frozen connection model. These were fixture errors, corrected without loosening Host admission. Cleanup hooks must be registered before later setup can fail. One failed runner's exact owned process/cwd was verified and terminated; unrelated compile sessions were untouched. Retain failure logs.
+- Proxy changes may reject an old opaque record as view_changed before the proxy-specific fence; assert the actual fail-closed contract. Unsupported credential/header/environment/OAuth/HTTP sources and shell/install/inline launchers explain refusal without starting a child. A read-only/unavailable proxy cannot prevent fresh permission removal.
+- Final source builds and owner tests passed (12/12, including actual full native read/write/replace/delete denial on the review library). The earlier combined run was 61/62: all 51 existing regression cases passed; its one owner assertion was corrected and the full owner file passed separately. Desk focused 48/48 and real Desk handler/model/socket-to-Host stdio smoke passed. No real user MCP config, model keys, Keychain, install, Feishu, merge, push or release was used. Headless handlers/static markup do not establish native visual acceptance.
+
+
+## [ERR-20261104-INTEGRATION-W3-CAPABILITIES] Advertised MCP APIs update exact protocol fixtures
+
+- Status: resolved locally; final integration gates tracked in the task evidence
+- Priority: medium
+- Area: integration/tests
+- Evidence: First merged hotspot run passed 62/63. The formal protocol's strict capability list lacked the reviewed manager/owner-review APIs. The equivalent local-dev list was also stale for owner-review.
+- Resolution: Keep deep equality and update both exact lists to the intentional advertised API union. Client opt-in and authenticated owner checks remain independent; no production permission or protocol check was weakened. One-round draft, edited confirmation, scoped candidates, warm launcher PID/thread, context generation and owner-review cases passed in that first run.
+- Merge rules: preserve compact roster and interactive deadlines from round-burn, official project candidates from ask-user-options, the first-response editable colleague contract, strict Raft capability validation plus MCP client declarations, and the real per-call MCP confirmation callback. Both sides of the previous error history remain.
+
+
+## Wave3 native colleague creation preread conflict
+
+The two authorized native Codex turns completed hello and an unconfirmed editable colleague card, but the second used three internal model rounds: workspace_skill twice, then agent_create. The generic instruction to read skill pages first contradicted the explicit first-response proposal contract. For explicit main/private colleague creation only, preload the full current code-shipped creation card and its version, keep unrelated cards on demand, and remove the conflicting preread requirement for that proposal. Human confirmation and all tool/governor fences remain unchanged. A regression fails before the fix and checks complete preloaded content, no contradictory prerequisite, and no colleague before/after decline. Do not replay the two paid turns; their counters are two native submissions and four observed internal model rounds, with actual monetary charges unverified.
+
+## [ERR-20261105-RESTORE-CONTROL-RPC] Recovery completion and constrained verification
+
+- Product cause: JSONL fail rejects pending requests and synchronously invokes onClose before promise catches. A generic active.finish in onClose masks the restore-specific result. A native recovery card's early return also hid its closed diagnostic. Preserve typed method/deadline/first-line metadata; let control RPC catch settle its reason and persisted unknown phase, then use existing shared drain. Never replay or replace an uncertain native thread automatically.
+- Verification mistakes: one load gate command lacked set-e and build continued after exit75; excluded that build from valid evidence. A broad replacement touched a tool-stage scope and caused TS2552; narrowed to model stage and rebuilt. Multiple native scenarios in one file exhausted original120000ms; split new cases into independent helper registrations, no higher deadlines. Native baseline/inventory also failed during machine load220+; retain all failures and rerun only after load<30. No real provider substitution.
+- Operations: writes under the admitted external task need the scoped filesystem permission; a metadata-only read/write script hit EPERM before saving its receipt, no source/user-data mutation. Cross-repository reads must use rg --files and exact roots; unquoted zsh globs were rejected before execution. Reuse the existing prevention entries about fail-fast gate scripts and exact paths.
+- Status: implementation committed locally; final focused/build currently waiting on external machine load. No actual model invocation, installation or real state mutation.
+
+
+## [ERR-20261105-SPEED-MODEL-IDENTITY] Narrow optional detected-runtime path
+
+- Logged: 2026-11-05
+- Status: fixed locally; build/focused verification pending
+- Area: runtime model inventory cache
+- First resident build at Core735b937 failed TS2339 because the installed/not-installed runtime option union does not guarantee a path. Narrow with the in operator and represent absent paths as null in the non-authoritative inventory identity. Registration, binary fingerprint, login source, proxy revision and all fresh launch checks remain in the key/path. No permission cache was added.
+- Original receipt: resident-core-build-1.result.json and log in the admitted speed-parity task. The queue naturally exited on the build error before any focused test. Retain that receipt and use a new label for the corrected build; do not overwrite or claim tests ran.
+
+
+## [ERR-20261105-NATIVE-CONTROL-CONTINUE] Successful restore retained an obsolete transient blocker
+
+- Diagnostic: native focused50/52; independent synthetic resume-probe-1 reproduced with a new attempt, same thread, fresh native turn, ready native status, and successful tools, while task stayed paused under the previous control-timeout blocker. Not a new network failure or a snapshot race.
+- Fix: carry a closed Host-only native control-failure code (only thread/start or thread/resume before model input) through the governed error outcome, persist same-turn/checkpoint-digest provenance, and consume only that matching transient block on explicit continuation. Model-authored prose, business/approval blockers and accepted/unknown native deliveries do not qualify. No completion/permission is granted; fresh C-lite evidence, frozen binding, prior usage and process drain remain required. Old failure history and stage receipts remain unchanged.
+- The other failure expected every healthy message to resume. Force Core restart before injecting resume-fail so the test still exercises a real failed restore and preserves all no-replay/history assertions. New task tests cover persistence, matching provenance, changed blocker, native-looking prose and retained business blockers.
+- Status: committed verification pending; original failure/diagnostic receipts retained.
+
+
+## [PERF-20261105-JSON-VALIDATION-BINDING] Repeated structural queries revalidated the whole scope
+
+- Evidence: zero-real-model warm-profile-1 at88c0f84 recorded38763 realpath calls pre-native and25431 post-native; JSON state reads/updates repeatedly called binding() while validating the same freshly read document, re-entering full authority/directory/marker guards just to compare the original immutable provenance tuple. Warm host overhead2677ms remained above the1000ms goal.
+- Change: only inside the synchronous JSON validator/empty constructor, binding() projects the already bound original structural identity. It is not an allow/credential result. A finally clears it before any await; change callbacks and outside binding() still run the original fresh fence, and actual private file opens, pre/post storage authority checks, CAS writes and commit guards are unchanged.
+- Regression plan: revoke during validation, revoke acrossawait/outside binding, revoke before commit, generation replacement during parse, final symlink/hardlink; existing scope/private-state/admission regressions remain. No target claim until fresh benchmark/full verification.
+
+
+### Single JSON read envelope follow-up
+Afterf199e15, build+93scope/private-state/native tests passed; zero-real warm host improved2677->2410ms but stillmisses1000ms. Scope checks still repeated for path projection/binding/postread inside the same read. Add a Host-only fixed JSON reader: original generic binder performs fresh scope/authority/private-parent check before I/O; unchanged no-follow descriptor and lexical/hardlink/permission reader verifies bytes; private parent is rechecked; synchronous decoder is followed by full original scope/authority check before returning. No async decoder/foreign filename allowed, no cached read/authorization value, and all writer locking/CAS/commit paths unchanged. Existing revoke/generation/link cases remain plus async-selector negatives. Further benchmark pending.
+
+
+### Selected runtime availability
+Warm-profile-2 still found pre-native49runtime-local/40version-history/40install-state reads: hot assertAvailable built the complete display list for each selected-runtime admission. Add fresh exact-runtime availability using the same registration/fingerprint/login-source rules; no successful-use history or unrelated binaries are queried. Local registration retains precedence, invalid/detected cannot grant availability, physical resolve/Host fences remain. Full settings options still use full list. New tests reject cached permission and prove no optional display access for builtins; real synthetic detection/registration/tampering compares selected facts with existing full projection. Pending validation; no performance claim.
+
+
+### Selected-runtime combination and duplicate projection writes
+Selected focus atf458fdd found five old closed-schema assertions omitted h6's safe rpcMethod/rpcTimeoutMs fields; keep exact keys and assert thread/start+10000 for these fresh Codex failures. No diagnostic values/secret assertions are removed. Also deduplicate only fully identical already-durable conversation projections after a fresh verified read/revision check; initial/changed data keeps original lock/CAS/fsync. Coalesce only nonterminal optional stage diagnostics within one event turn, with original-scope store fresh checks; forced start/terminal writes remain synchronous and cancel only their own queued callback. New tests cover no-op inode/revision, real change persistence, stale revision, revoke and hardlink. All previous failure logs retained.
+
+
+### Full-suite lifecycle migration (first final receipt retained)
+At ae255b8 the full Core suite naturally completed under load<30 and a single worker: 3921 pass,14 fail,3 skip,0 cancelled;2397s, source stable. Four old tests required a resume for every healthy message or injected a restore failure without unloading; correct them to require direct same-thread turns and force a real Core restart for restore-failure injection. Keep tier-change process recycle, original thread, Seatbelt read/write denials, old-task freeze, background drain, approved reset/history/budget/idempotency checks.
+Five registered native tests required the MCP TCP port to close. Healthy Codex now retains its listener: observation-only test instrumentation captures only its own synthetic driver's real bearer in memory, returns the exact original endpoint unchanged, and requires authenticated403 after physical settlement (never accepts401 as revocation). Failed/cancelled attempts may instead close the socket. No credential/token file, native response fabrication or production authorization change.
+Two exact protocol capability lists now include timing/preview; the skill assertion now requires catalog metadata and on-demand exact skill loading rather than the superseded prompt heading. MCP managed-card and private-channel task lifecycle failures remain under diagnosis; add bounded synthetic failure context before changing assertions. All original failed receipts remain; no claim of full pass yet.
+
+
+### Integration finding: native cooldown crossed channel boundaries
+The 7f4420b affected run proved the DM was never sent to its synthetic model: its blockReason carried the Pi authentication cooldown from the preceding channel (consecutiveFailures2). The shared tracker keyed only runtime+colleague, despite provider recovery/native history being conversation-bound. Key the transient tracker by original installer/runtime/colleague/session and pass the frozen sessionId from every runtime caller; retain same-conversation cooldown, route invalidation, bounded map and redaction. Add direct regression for two channels and DM, including one scope's success not clearing another. Keep the original DM lifecycle/factory-count assertions.
+The same run passes authenticated resident revocation but reveals a later old colleague-tool assertion: the resident handler refuses unknown tools at the MCP boundary rather than returning a governor ToolResult. Assert the actual attempted forbidden tool's fixed protocol refusal and incomplete colleague task, alongside all tool absence checks. Managed Codex still fails before tools/list; add only synthetic method/status/refusal codes to diagnose, no bearer/marker/request arguments/raw exceptions.
+
+The conversation-isolated tracker build passed; affected focus33/34 passed, including original channel/DM recovery and the colleague MCP-boundary refusal. The one managed Codex fixture still fails before any metadata/tools list. Fail immediately on a terminal pre-card run and emit only closed synthetic startup code, native RPC method names and file-presence booleans to locate this stage; no raw token/prompt/error payload.
+
+The first early-failure diagnostic obscured its result by splitting a literal backslash-n instead of JSONL newlines. Replace with an explicit CRLF/LF regex; retained failed diagnostic receipt, no production data or model calls involved.
+
+
+### Configured proxy falsely rejected after native preparation
+Private observation-only trace at041edef proved real MCP preparation returned, original login/binary/project origin still matched, but the fresh process key differed. prepareBound includes proxyUrl; synchronous resolveBound previously applied that same proxy to env while omitting its identity. The post-await fresh guard consequently compared the configured URL to null, rejecting every explicitly proxied resident cold launch before thread/start. Return env+endpoint from one guarded proxy read and carry both from resolveBound. The original asynchronous revalidation remains; add a real Host/registered fake Codex negative where the proxy actually changes during MCP preparation and zero thread/model/upstream calls may follow. Do not bypass the guard or cache authorization.
+Also correct the unknown-schema isolated endpoint fallback to use the same process bearer that Codex actually receives; keep the original immutable per-attempt transport/closure, unique URL, revoke and no loaded fast path. Add real endpoint handshake and authenticated revoke unit coverage, without synthesizing a native response.
+Diagnostics-only helper initially overescaped its regex before execution; corrected and node --check passed. Its instrumented failing sample is diagnosis only, not acceptance. Original failed receipts are retained.
+
+The first proxy-identity build at06b2fdf caught two inventory adapters rebuilding a partial resolved descriptor without the newly required proxyUrl. Carry the already-frozen prepared proxy identity through both protected inventory calls; do not loosen the resolved type or remove launch checks. Retain handoff-core-build-1 failure; no focused tests ran from that failed build.
+
+### Same-conversation cooldown retry fixture
+The second full suite at99f6542 naturally ended with exactly one failed legacy fixture: its supposed retry changed sessionId, so the now-isolated new conversation correctly did not inherit another conversation's cooldown. Retire the completed old physical permit, then create a new attempt with the SAME original conversation and a fresh runId. Preserve exact retryAtMs/consecutiveFailures and zero extra thread/start assertions. Original channel/DM isolation regression remains unchanged. No production source change; retain failed full2 and rerun the corrected direct fixture plus final full3 under original load/worker/timeout gates.
+
+
+## 2026-11-05 — A1 prefix stability and immutable prompt boundaries
+
+The old Workspace Host labelled an objective-dependent start packet, per-attempt retained references, and conditional complete creation card as static core. Same-text warm fixtures hid false standing refreshes. A1 splits immutable governance/session metadata/current-turn data without changing real Codex confinement/refresh contracts. New structured parts must be copied/frozen at bindWorkspaceRunOptions and checked by identity in assertWorkspaceRunAdmission just like systemOverride; negative replacement starts zero models.
+
+Initial A1 focus:63/64; diagnostic reproduced message1 (project context question) blocked with no completion because the synthetic runtime replied without any observed read. Kept N1/C-lite unchanged. The fixture now makes the original governed read for contextual answers/thanks, while the greeting stays on the existing narrow tool-free path. Do not loosen product completion to make a latency fixture green. Original failures retained under A1 task evidence/a1-prompt-focused-1 and a1-native-diagnostic-1.
+
+Tooling: nested JS raw templates containing TypeScript backticks or dollar-brace regex can fail before execution. Use non-interpolated placeholders or simple includes assertions, JSON-stringify Python payload only inside a quoted heredoc, and syntax-check fixtures. Discover filenames with rg --files/rg before reading; use the registered task root for evidence and source/core only for code to avoid guessed-path noise. No source or native process was changed by parse-only failures.
+
+After preserving both failures: unified focus2 passed91/91. Further reduced project hints to actual lexical hits, keeping explicit creation candidates. Build4 and final seven-file focus53/53 passed. Native five-message counts:1PID/1thread/1standingHash,0resume/0standing refresh, input1113/1177/1113/1614/4002bytes, complete current card once, original human approval/refusal enforced. Fixed-SHA final full still required; no real model calls.
+
+
+## 2026-11-05 — A1 full harness and inherited-memory contract migration
+
+The first A1 full command omitted the repository-required isolated-home preload and feedback evaluation. Its parent HOME was task-private, but six durable Serve fixtures correctly refused without the per-file hara-test-home guard before persistence. Preserve that result; run the repository preload, feedback check, original120000ms/file and one worker at the final cleanSHA. Check package.json and the last actual passing receipt before reconstructing full commands.
+
+A seventh failure exposed an old Pi Host fixture expecting unrelated inherited memory during Hello. The new A1 contract deliberately omits unmatched data. Migrate the real Host fixture to four requests: greeting and a matching reporting-period question in both owning and another Workspace. Assert the owner note reaches the matching question, both greetings omit it, the other Workspace omits it, private memory paths stay hidden, and the bounded projection/tools remain. Product src tree stays byte-identical; no completion, permission, memory isolation or revocation guard is relaxed.
+
+
+The completed first full retained3938pass/8fail/3skip/0cancel at unchanged21dfa4c: six preload guards and two old Hello-memory expectations. The second fixture covers personal-global plus Workspace notes; now it explicitly checks Hello omits both, a matching question receives both complete note snippets, and private source paths stay hidden. Product src is unchanged by both fixture migrations. All original queues ended naturally; none were stopped.
+
+
+## 2026-11-05 — A8 speed exposed recovery fixtures relying on slow preparation
+
+A1+A8 full2 naturally completed3963pass/2fail/3skip/0cancel at clean4c2e4dc. Proper isolated-home fixed all six Serve guards and both memory migrations passed. Two native crash/recovery fixtures immediately resent while RuntimeLaunchCooldown's existing first-failure1second window was still active. Targeted diagnostic assertion messages reproduced both: controlled runtime_failed, elapsedMs0, consecutiveFailures1, retryAtMs still set. This is admission cooldown, not a DirectoryChainFence identity assertion; no ancestor rollback was called for.
+
+Fixtures now wait for the actual observed failure receipt's retryAtMs before an explicit new send, bound the wait to35seconds, and prove cooldown itself starts zero additional native inference. PID/bearer rotation, original thread start/resume counts and frozen tier assertions remain. Production src, cooldown, permissions and native responses are unchanged. Preserve the two-failure full and diagnostic logs; run clean-SHA final checks again.
+
+## [ERR-20261104-GEMINI-REAL-CLI] Native startup state and configuration ownership
+
+- Gemini 0.66 initializes projects.json and its proper-lockfile directory before useful output. Missing exact state writes can therefore appear as a silent hang. Admit the registry, an exact UUID-v4 atomic temporary filename, the directory-only lock and installation_id; retain configuration, credential, Hara and hard-link denials. The macOS Seatbelt probe required expanded fixed-width UUID character classes rather than the initially tried {n} pattern.
+- The CLI rejects user-owned system-settings overrides. Use a private, exclusive project settings file before the native evidence baseline, deny native mutation including its parent rename, and remove it only after full process drain. Preserve and refuse pre-existing settings, links, unexpected writers and higher-priority administrator configuration. Do not obtain root ownership or mirror login credentials.
+- Runtime and --help errors must opt in to the existing redacted errorFirstLine boundary and pass it to the route cooldown. Never substitute raw stdout, subsequent stderr lines or account data. Read-only metadata and session-list success do not prove authentication, model completion or N1.
+- Verification preparation matters: /dev/fd/<directory-fd>/child is not a usable directory-relative creation path on this Mac. O_EXCL/O_NOFOLLOW and directory/file identities are checked around creation and cleanup; changed files remain for recovery. A new default-layout fixture must create its private root before Host construction and register teardown early, with every home/legacy source explicit. Borrowed dependencies must match package-lock: an old Pi 1.1 tree caused a Pi 1.5 default-layout regression until the correct existing tree was selected. No dependency installation or product timeout change was needed.
+- PR: none; local task branch only. Exact receipts, original failures, final checks and any external CLI acceptance blockers are recorded in the private project inbox delivery.
+
+
+## ERR-20261104-KIMI-CODE-GENERATION
+
+- Legacy Python kimi-cli and official Node @moonshot-ai/kimi-code share the `kimi` name and numeric versions. Require the Node package/bin/version identity at discovery, registration and launch; preserve and reject old registrations instead of routing them into the new adapter.
+- Node 2.4.1 has no legacy print/MCP-file/work-dir dialect and rejects prompt with plan/yolo. Its native ACP supports per-session HTTP MCP, auto/plan mode and model config options without changing global provider settings. Keep client filesystem/terminal capabilities disabled under the shared execution policy.
+- Session creation atomically writes workspaces.json.tmp.<pid>.<8 lower-hex>; allow only that transaction plus documented session/index/lock state, not the data root. Root mkdir permission must not authorize rename/unlink of configuration/credential parents.
+- Keep inherited personal extensions explicit, set KIMI_DISABLE_CRON=1 and keep-alive false per process, and retain physical process ownership/drain. A zero-model session with fake provider/MCP data does not establish a real account/model acceptance.

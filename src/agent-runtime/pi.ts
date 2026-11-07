@@ -1,3 +1,6 @@
+import { workspaceRunPermissionTier } from "./execution-policy.js";
+import { runFullProtectedPi } from "./pi-full.js";
+import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -80,6 +83,10 @@ export const piRuntimeTurn: AgentRuntimeTurn = async (provider, args) => {
   }
 };
 
-export function runPiAgent(history: NeutralMsg[], options: RunOpts): Promise<RunOutcome> {
+export function runPiAgent(history: NeutralMsg[], options: RunOpts, installer?: WorkspaceRuntimeInstaller): Promise<RunOutcome> {
+  if (options.workspaceRun && workspaceRunPermissionTier(options.workspaceRun) === "full-protected") {
+    if (!installer) return Promise.resolve({ status: "error", error: "Pi protected mode requires its bound Workspace Host; no fallback was started" });
+    return runFullProtectedPi(history, options, installer);
+  }
   return runGovernedAgent(history, options, "pi", piRuntimeTurn);
 }

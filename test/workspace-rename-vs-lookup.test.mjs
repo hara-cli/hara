@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
+import { scriptedWorkspaceProvider } from "./fixtures/scripted-workspace-provider.mjs";
 import { WorkspaceResources } from "../dist/workspace/resources.js";
 import { prepareWorkspaceStartContext, workspaceRenameIntent } from "../dist/workspace/start-context.js";
 import { WorkspaceColleagueReferences } from "../dist/workspace/colleague-references.js";
@@ -84,7 +85,7 @@ const call = (name, input = {}) => ({ text: "", toolUses: [{ id: randomUUID(), n
 test("end to end: 把负责程序的同事改名嘉夫 renames the colleague without a lookup_missing question", async () => {
   const root = realpathSync.native(mkdtempSync(join(tmpdir(), "hara-rename-gate-")));
   let requests = 0, coderId;
-  const host = new LocalWorkspaceHost(root, { providerFactory(_connection, binding) { return { id: "openai", model: binding.model, async turn(args) {
+  const host = new LocalWorkspaceHost(root, { providerFactory(_connection, binding) { return scriptedWorkspaceProvider({ id: "openai", model: binding.model, async turn(args) {
     requests++;
     assert.ok(args.tools.some(tool => tool.name === "agent_rename"));
     if (requests === 1) return call("workspace_context_lookup", { query: "嘉夫" });
@@ -96,7 +97,7 @@ test("end to end: 把负责程序的同事改名嘉夫 renames the colleague wit
       turn.toolUses.push(call("agent_rename", { agentId: coderId, displayName: "嘉夫" }).toolUses[0]); return turn;
     }
     return { text: "已把负责程序的同事改名为嘉夫。", toolUses: [], stop: "end", usage: { input: 20, output: 5 } };
-  } }; } });
+  } }); } });
   try {
     const workspace = host.createWorkspace("Synthetic", host.list().revision), workspaceId = workspace.workspaceId;
     host.configureSynthetic(workspaceId, 0); host.select("client", workspaceId, host.list().revision);

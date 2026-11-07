@@ -1,3 +1,4 @@
+import { writeFakeCodex } from "./helpers/workspace-cli-mcp.mjs";
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -15,14 +16,15 @@ import { captureWorkspaceProjectIdentity, freezeWorkspaceRunBinding, workspaceAg
 import { createWorkspaceRunPermit, bindWorkspaceRunOptions, closeWorkspaceRunPermit } from "../dist/workspace/execution.js";
 import { AgentRuntimeRegistry } from "../dist/agent-runtime/registry.js";
 import { runConfiguredAgent } from "../dist/agent-runtime/dispatch.js";
-import { createTaskExecution } from "../dist/session/task.js";
+import { finishTaskExecution, createTaskExecution } from "../dist/session/task.js";
 
 const roots = [];
 function root() { const path = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-cli-driver-"))); roots.push(path); return path; }
 after(() => roots.forEach(path => fs.rmSync(path, { recursive: true, force: true })));
 
 for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, null], ["claude", false, null],
-  ["codex", true, null], ["codex", true, null, true], ["codex", true, "project_not_trusted"], ["codex", true, "runtime_auth_required"], ["codex", true, "command_failed"]]) test(`${runtimeId} managed=${managed} git=${hasGit} failure=${failure} stays confined with no fallback`, async () => {
+  ["codex", true, null], ["codex", true, null, true], ["codex", true, "project_not_trusted"], ["codex", true, "runtime_auth_required"], ["codex", true, "command_failed"], ["claude", true, "runtime_network"], ["claude", true, "runtime_proxy"], ["claude", true, "version_incompatible"], ["codex", true, "runtime_auth_event"], ["codex", true, "runtime_auth_event_nonzero"], ["codex", true, "runtime_auth_recovered"]]) test(`${runtimeId} managed=${managed} git=${hasGit} failure=${failure} stays confined with no fallback`, async () => {
+  const expectedFailure = failure && failure !== "runtime_auth_recovered";
   const data = root(), home = managed ? join(data, "home") : data, account = root();
   fs.mkdirSync(home, { recursive: true });
   const catalog = new LocalWorkspaceCatalog(home), row = catalog.create("Local", 1);
@@ -30,10 +32,12 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
   fs.mkdirSync(project, { recursive: true });
   if (hasGit) fs.mkdirSync(join(project, ".git"));
   const storage = new WorkspaceResourceStorage(home, row.scope); storage.initialize();
-  const command = join(account, ".local", "bin", runtimeId), argv = join(account, "argv.txt");
+  const bin = join(account, runtimeId === "codex" ? ".codex/tmp/bin" : ".claude/projects/fixture-bin");
+  const command = join(bin, runtimeId), argv = runtimeId === "codex" ? command + ".rpc.jsonl" : join(bin, "argv.txt");
   fs.mkdirSync(dirname(command), { recursive: true });
-  fs.writeFileSync(command, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${runtimeId} 1.2.3'; exit 0; fi\nif [ "$1" = "app-server" ]; then exit 1; fi\nif [ "$1" = "debug" ]; then echo '{"models":[{"slug":"fixture-model","display_name":"Fixture"}]}'; exit 0; fi\nprintf '%s\\n' "$@" > '${argv}'\n${managed && !hasGit ? `case " $* " in *' --skip-git-repo-check '*) ;; *) echo 'Not inside a trusted directory and --skip-git-repo-check was not specified.' >&2; exit 1;; esac` : ''}\n${failure ? `echo '${failure === 'project_not_trusted' ? 'Not inside a trusted directory' : failure === 'runtime_auth_required' ? 'websocket 401 Unauthorized PRIVATE_ACCOUNT_DETAIL' : 'PRIVATE_ACCOUNT_DETAIL'}' >&2; exit 1` : ''}\necho 'registered ${runtimeId} reply'\n`, { mode: 0o755 });
-  const installer = new WorkspaceRuntimeInstaller(storage, { discovery: { home: account, path: "/usr/bin:/bin", systemBins: [],
+  fs.writeFileSync(command, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${runtimeId} 1.2.3'; exit 0; fi\nif [ "$1" = "app-server" ]; then exit 1; fi\nif [ "$1" = "debug" ]; then echo '{"models":[{"slug":"fixture-model","display_name":"Fixture"}]}'; exit 0; fi\nprintf 'launch\\n' >> '${argv}.launches'\nprintf '%s\\n' "$@" > '${argv}'\n${runtimeId === "codex" && managed && !hasGit ? `case " $* " in *' --skip-git-repo-check '*) ;; *) echo 'Not inside a trusted directory and --skip-git-repo-check was not specified.' >&2; exit 1;; esac` : ''}\n${failure === 'runtime_auth_recovered' ? `echo '{"type":"error","message":"temporary network error PRIVATE_ACCOUNT_DETAIL"}'; echo '{"type":"item.completed","item":{"type":"agent_message","text":"registered codex reply"}}'; echo '{"type":"turn.completed"}'; exit 0` : failure?.startsWith('runtime_auth_event') ? `echo '{"type":"turn.failed","error":{"message":"401 Unauthorized PRIVATE_ACCOUNT_DETAIL"}}'; exit ${failure === 'runtime_auth_event' ? 0 : 1}` : failure ? `echo '${failure === 'project_not_trusted' ? 'Not inside a trusted directory' : failure === 'runtime_auth_required' ? 'websocket 401 Unauthorized PRIVATE_ACCOUNT_DETAIL' : failure === 'runtime_network' ? 'ECONNRESET PRIVATE_ACCOUNT_DETAIL' : failure === 'runtime_proxy' ? 'proxy connect failed PRIVATE_ACCOUNT_DETAIL' : failure === 'version_incompatible' ? 'unrecognized option --fixture PRIVATE_ACCOUNT_DETAIL' : 'PRIVATE_ACCOUNT_DETAIL'}' >&2; exit 1` : ''}\n${runtimeId === 'codex' ? `echo '{"type":"item.completed","item":{"type":"agent_message","text":"registered codex reply"}}'\necho '{"type":"turn.completed"}'` : `echo '{"type":"result","subtype":"success","is_error":false,"result":"registered ${runtimeId} reply"}'`}\n`, { mode: 0o755 });
+  if (runtimeId === "codex") writeFakeCodex(command, { mode: "reply", failure });
+  const installer = new WorkspaceRuntimeInstaller(storage, { accountHome: () => account, discovery: { home: account, path: bin + ":/usr/bin:/bin", systemBins: [],
     run: async (_command, args) => args[0] === "-lic" ? null : `${runtimeId} 1.2.3` } });
   const resources = new WorkspaceResources(home, row.scope, { runtimeInstaller: installer }); resources.initialize();
   const main = resources.agents.initializeMain();
@@ -42,9 +46,9 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
   const detected = installer.list().options.find(option => option.runtimeId === runtimeId);
   assert.equal(detected.state, "detected");
   assert.equal(resources.agents.runtimeOptions().find(option => option.id === runtimeId).available, false);
-  installer.registerLocal(runtimeId, detected.fingerprint);
+  installer.registerLocal(runtimeId, detected.fingerprint, "host");
   const models = new WorkspaceRuntimeModels(storage, installer);
-  const modelId = runtimeId === "codex" ? "fixture-model" : "claude-sonnet-4-5";
+  const modelId = runtimeId === "codex" ? "fixture-model" : "sonnet";
   await models.select(runtimeId, modelId, 0);
   assert.equal(models.selected(runtimeId), modelId);
   assert.equal(installer.list().options.find(option => option.runtimeId === runtimeId).generalAgentDriverAvailable, true);
@@ -81,32 +85,92 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
   try {
     const history = [{ role: "user", content: "hello" }];
     const result = await storage.run(() => runConfiguredAgent(history, options, new AgentRuntimeRegistry(undefined, installer, models)));
-    assert.equal(result.status, failure ? "error" : "completed", result.error);
-    if (failure) {
-      assert.ok(result.error.includes(`(${failure})`));
-      assert.ok(result.error.includes("no fallback was selected"));
+    assert.equal(result.status, expectedFailure ? "error" : "completed", result.error);
+    if (expectedFailure) {
+      const match = /hara_runtime_failure_v1=(\{[^{}]+\})/.exec(result.error);
+      assert.ok(match, "a fixed-field diagnostic survives the common governor");
+      const diagnostic = JSON.parse(match[1]);
+      const expected = failure === "runtime_auth_required" || failure.startsWith("runtime_auth_event") ? "runtime_auth_rejected"
+        : failure === "command_failed" ? "runtime_failed" : failure;
+      assert.equal(diagnostic.kind, expected);
+      assert.equal(diagnostic.runtime, runtimeId);
+      assert.equal(diagnostic.version, "1.2.3");
+      assert.equal(diagnostic.loginSource, "host");
+      assert.equal(diagnostic.homeMatchesAccount, true);
+      assert.ok(diagnostic.elapsedMs >= 0 && diagnostic.elapsedMs <= 600000);
+      assert.equal(diagnostic.consecutiveFailures, 1);
+      assert.ok(diagnostic.retryAtMs > Date.now() - 1000);
+      assert.deepEqual(Object.keys(diagnostic).sort(), ["runtime", "kind", "version", "loginSource", "homeMatchesAccount", "elapsedMs", "retryAtMs", "consecutiveFailures", "errorFirstLine",
+        ...(runtimeId === "codex" ? ["rpcMethod", "rpcTimeoutMs"] : [])].sort());
+      if (runtimeId === "codex") { assert.equal(diagnostic.rpcMethod,"thread/start"); assert.equal(diagnostic.rpcTimeoutMs,10000); }
+      assert.equal(typeof diagnostic.errorFirstLine, "string");
+      assert.ok(diagnostic.errorFirstLine.length > 0 && [...diagnostic.errorFirstLine].length <= 320);
+      assert.doesNotMatch(diagnostic.errorFirstLine, /[\r\n]/);
+      const checkpoint = finishTaskExecution(task, result).checkpoint;
+      const persisted = JSON.parse(/hara_runtime_failure_v1=(\{[^{}]+\})/.exec(checkpoint.blockReason)[1]);
+      assert.deepEqual(persisted, diagnostic, "the persisted task block reason keeps the complete safe payload");
+      assert.ok(!JSON.stringify(diagnostic).includes(home));
+      assert.ok(!JSON.stringify(diagnostic).includes(account));
       assert.ok(!result.error.includes("PRIVATE_ACCOUNT_DETAIL"));
-      assert.equal(history.length, 1);
-    } else assert.equal(history.at(-1).text, `registered ${runtimeId} reply`);
+      assert.ok(history.slice(1).every(row => row.role === "assistant" && row.text === "" && row.toolUses.length === 0),
+        "a failed native run leaves no fabricated text or tool result; the common governor may retain an empty assistant boundary");
+      assert.doesNotMatch(JSON.stringify(history), /PRIVATE_ACCOUNT_DETAIL/);
+      if (failure === "runtime_auth_required") {
+        // A new registry and attempt in this same conversation must retain its cooldown.
+        // Production retires the old attempt's physical lease before accepting the next one.
+        await closeWorkspaceRunPermit(permit);
+        const retryBinding = freezeWorkspaceRunBinding({ ...binding, runId: randomUUID() });
+        const retryTask = { ...task, workspaceRunBinding: retryBinding };
+        const retryLease = WorkspaceSessionLease.acquire(storage, retryBinding.sessionId);
+        const retryPermit = createWorkspaceRunPermit({ ...permitInput, binding: retryBinding, lease: retryLease });
+        const retryOptions = bindWorkspaceRunOptions(retryPermit, { ctx: { cwd: project, sessionId: retryBinding.sessionId, sandbox: "off" },
+          signal: controller.signal, approval: "auto-edit", approvalChannel: true, confirm: async () => false, hooks: false,
+          systemOverride: "Reply concisely", taskIntake: { task: retryTask, current: () => retryTask } });
+        const realNow = Date.now;
+        try {
+          Date.now = () => diagnostic.retryAtMs - 500;
+          const repeated = await storage.run(() => runConfiguredAgent([{ role: "user", content: "hello" }], retryOptions,
+            new AgentRuntimeRegistry(undefined, installer, models)));
+          assert.equal(repeated.status, "error");
+          const held = JSON.parse(/hara_runtime_failure_v1=(\{[^{}]+\})/.exec(repeated.error)[1]);
+          assert.equal(held.retryAtMs, diagnostic.retryAtMs, "blocked retries do not extend or clear the failure");
+          assert.equal(held.consecutiveFailures, 1);
+          assert.equal(fs.readFileSync(argv, "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(row => row.method === "thread/start").length, 1, "no second native startup after the cooldown");
+        } finally { Date.now = realNow; await closeWorkspaceRunPermit(retryPermit); }
+      }
+    } else {
+      assert.equal(history.at(-1).text, `registered ${runtimeId} reply`);
+      assert.doesNotMatch(JSON.stringify(history), /PRIVATE_ACCOUNT_DETAIL/);
+    }
+    const versionStatus = installer.list().options.find(row => row.runtimeId === runtimeId).versionStatus;
+    assert.equal(versionStatus.lastSuccessfulVersion, expectedFailure ? null : "1.2.3");
+    assert.equal(versionStatus.compatibility, expectedFailure ? "unverified" : "previously_succeeded");
     const args = fs.readFileSync(argv, "utf8");
-    assert.match(args, runtimeId === "codex" ? /read-only/ : /plan/);
-    assert.equal(args.includes("--skip-git-repo-check"), managed && !hasGit);
+    assert.match(args, runtimeId === "codex" ? /danger-full-access/ : /bypassPermissions/);
+    assert.equal(args.includes("--skip-git-repo-check"), false, "S3 uses an admitted thread cwd, without an exec trust-check flag");
     assert.equal(fs.existsSync(join(project, ".git")), hasGit);
     const privateEnv = installer.resolveBound(runtimeId).env;
-    assert.ok(privateEnv.HOME.startsWith(home));
-    assert.equal(fs.existsSync(join(account, ".codex")), false);
+    assert.equal(privateEnv.HOME, account);
+    assert.equal(fs.existsSync(join(account, ".codex/auth.json")), false, "binding creates no host login credential");
     if (runtimeId === "codex") {
-      const guide = installer.codexLoginInstructions();
-      assert.equal(guide.runtimeId, "codex");
-      assert.ok(guide.command.includes(privateEnv.CODEX_HOME));
-      assert.ok(guide.command.endsWith(" login"));
-      assert.ok(!guide.command.includes("--skip-git-repo-check"));
+      assert.throws(() => installer.codexLoginInstructions(), /reuses the host login/);
     }
-    assert.ok(args.includes(modelId), "spawn uses the existing Workspace runtime model selection");
-    assert.ok(!args.includes("danger-full-access") && !args.includes("bypassPermissions"));
+    assert.ok(args.includes(modelId), "native launch uses the existing Workspace runtime model selection");
+    assert.ok(args.includes(runtimeId === "codex" ? "danger-full-access" : "bypassPermissions"));
     fs.appendFileSync(command, "# changed after registration\n");
     assert.equal(resources.agents.runtimeOptions().find(option => option.id === runtimeId).available, false);
     assert.equal(installer.list().options.find(option => option.runtimeId === runtimeId).state, "integrity_failed");
     assert.throws(() => new AgentRuntimeRegistry(undefined, installer).assertAvailable(runtimeId), /no fallback/);
   } finally { await closeWorkspaceRunPermit(permit); await installer.close(); }
+});
+
+test("native args keep model/effort choices while the outer policy owns both permission tiers", async () => {
+  const { registeredCliArgs } = await import("../dist/agent-runtime/registered-cli.js");
+  for (const permissionTier of ["controlled", "full-protected"]) {
+    const codex = registeredCliArgs({ id: "codex", permissionTier, prompt: "hi", cwd: "/fixture/project", model: "gpt-5.6-sol", effort: "xhigh", skipGitRepoCheck: true });
+    assert.ok(codex.includes('model_reasoning_effort="xhigh"')); assert.ok(codex.includes("gpt-5.6-sol")); assert.ok(codex.includes("--dangerously-bypass-approvals-and-sandbox")); assert.equal(codex.includes("--sandbox"),false);
+    const claude = registeredCliArgs({ id: "claude", permissionTier, claudeStreamJson: true, prompt: "hi", cwd: "/fixture/project", model: "claude-sonnet-4-5", effort: "high", skipGitRepoCheck: false });
+    assert.ok(claude.includes("claude-sonnet-4-5")); assert.ok(claude.includes("high")); assert.ok(claude.includes(permissionTier === "controlled" ? "plan" : "bypassPermissions")); assert.ok(claude.includes("stream-json")); assert.ok(claude.includes("Cron*")); assert.ok(claude.includes("project,local"));
+  }
+  const bare = registeredCliArgs({ id: "codex", prompt: "hi", cwd: "/fixture/project", model: null, effort: null, skipGitRepoCheck: false }); assert(!bare.includes("-c") && !bare.includes("-m"));
 });

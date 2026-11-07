@@ -1,3 +1,5 @@
+import { MessageTimingRecorder } from "../dist/workspace/message-timing.js";
+import { RuntimeStageRecorder } from "../dist/workspace/runtime-stage-events.js";
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -11,20 +13,21 @@ import { WorkspaceResources } from "../dist/workspace/resources.js";
 import { WorkspaceConnectionStoreV2 } from "../dist/workspace/connections.js";
 import { captureWorkspaceProjectIdentity, freezeWorkspaceRunBinding, workspaceAgentBindingHash } from "../dist/workspace/run-binding.js";
 import { WorkspaceSessionLease } from "../dist/workspace/session-lease.js";
-import { createWorkspaceRunPermit, bindWorkspaceRunOptions, beginWorkspaceGovernedRun, closeWorkspaceRunPermit, executeWorkspaceTool, prepareWorkspaceRunHistory } from "../dist/workspace/execution.js";
+import { createWorkspaceRunPermit, bindWorkspaceRunOptions, beginWorkspaceGovernedRun, closeWorkspaceRunPermit, executeWorkspaceTool, prepareWorkspaceRunHistory, observeWorkspaceMessageTiming } from "../dist/workspace/execution.js";
 import { WorkspaceExecutionAudit } from "../dist/workspace/execution-audit.js";
 import { createTaskExecution, finishTaskExecution } from "../dist/session/task.js";
 import { runConfiguredAgent, bindNewAgentTask } from "../dist/agent-runtime/dispatch.js";
-import { runAgent } from "../dist/agent/loop.js";
+import { runAgent, deadlineCheckpointReminder, taskRoundCheckpointReminder } from "../dist/agent/loop.js";
 import { runPiAgent } from "../dist/agent-runtime/pi.js";
 
 const temporary=[];
 after(()=>{for(const path of temporary)fs.rmSync(path,{recursive:true,force:true});});
 function dir(){const path=fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(),"hara-local-execution-")));temporary.push(path);return path;}
 const reply=text=>({text,toolUses:[],stop:"end",usage:{input:7,output:3}});
-function fixture(turn,extraTools=[],modelHistory){
+function fixture(turn,extraTools=[],modelHistory,systemOverrideParts,observation={},runOptions={}){
  const home=dir(),project=dir(),catalog=new LocalWorkspaceCatalog(home),row=catalog.create("Personal",1);
- const resources=new WorkspaceResources(home,row.scope);resources.initialize();const main=resources.agents.initializeMain();
+ const resources=new WorkspaceResources(home,row.scope);resources.initialize();let main=resources.agents.initializeMain();
+ main=resources.agents.setPermissionTier(main.agentId,"controlled",main.configRevision,main.agentEpoch);
  const storage=new WorkspaceResourceStorage(home,row.scope);storage.initialize();
  const connections=new WorkspaceConnectionStoreV2(storage);connections.add({label:"Fake",provider:"openai",baseURL:"http://127.0.0.1:1/v1",apiKey:"synthetic-not-a-real-key",defaultModel:"fixed-synthetic"},0);
  let task=resources.agents.bindTask(createTaskExecution("synthetic task","fixture-turn"),main.agentId,main.configRevision,main.agentEpoch);
@@ -37,11 +40,11 @@ function fixture(turn,extraTools=[],modelHistory){
  let requests=0,usage={modelCalls:0,toolCalls:0,inputTokens:0,outputTokens:0};
  const permit=createWorkspaceRunPermit({binding,catalog,resources,storage,connections,lease,cwd:project,signal:controller.signal,
   provider:{id:"openai",model:binding.connection.model,async turn(args){requests++;return turn(args,requests);}},
-  toolNames:["task_intake","task_checkpoint","todo_write",...extraTools.map(tool=>tool.name)],usage,modelHistory,
+  toolNames:["task_intake","task_checkpoint","todo_write",...extraTools.map(tool=>tool.name)],usage,modelHistory,...observation,
   updateUsage(value){usage={...value};}});
  const input={ctx:{cwd:project,sessionId,todoScope:`local-${sessionId}`,sandbox:"off"},signal:controller.signal,
-  approval:"auto-edit",approvalChannel:true,confirm:async()=>false,hooks:false,quiet:true,extraTools,
-  systemOverride:"You are the scoped Hara. Use only the supplied task and tools.",
+  approval:"auto-edit",approvalChannel:true,confirm:async()=>false,hooks:false,quiet:runOptions.quiet??true,extraTools,
+  systemOverride:"You are the scoped Hara. Use only the supplied task and tools.",systemOverrideParts,
   taskIntake:{task,current:()=>task,onUpdate(next){task=next;},onCheckpoint(next){task=next;},onRoundUsage(next){task=next;}}};
  const options=bindWorkspaceRunOptions(permit,input);
  return{home,project,catalog,row,resources,connections,storage,lease,controller,permit,options,input,binding,
@@ -85,6 +88,17 @@ test("connection rotation, grant revocation and Agent lifecycle epoch changes in
   const a=fixture(async()=>reply("must not run"));try{revoke(a);assert.equal((await runConfiguredAgent([],a.options)).status,"error");assert.equal(a.requests,0);}finally{await a.close();}
  }
 });
+for (const authorityPart of ["hostEpoch", "grantRevision", "actorId"]) test(`fresh permit checks reject changed ${authorityPart} before any model request`, async () => {
+ const a=fixture(async()=>reply("must not run"));
+ try {
+  const target=join(a.home,".hara/workspace-local-dev/catalog-v2.json"), changed=JSON.parse(fs.readFileSync(target,"utf8"));
+  if(authorityPart==="hostEpoch") changed.hostEpoch++;
+  else if(authorityPart==="grantRevision") changed.workspaces[0].grantRevision++;
+  else changed.workspaces[0].actorId="replacement-owner";
+  fs.writeFileSync(target,JSON.stringify(changed)+"\n",{mode:0o600});
+  assert.equal((await runConfiguredAgent([],a.options)).status,"error"); assert.equal(a.requests,0);
+ } finally { await a.close(); }
+});
 test("initial/current task provenance cannot be changed by steering an active scoped run",async()=>{
  const a=fixture(async()=>reply("no"));try{
   a.task={...a.task,turnId:"forged-turn"};assert.equal((await runConfiguredAgent([],a.options)).status,"error");assert.equal(a.requests,0);
@@ -100,11 +114,11 @@ test("shared governor still requires intake, observed work and final receipt for
   {text:"",stop:"tool_use",toolUses:[{id:"brief",name:"task_intake",input:{intent:"change",goal:"write hello.md",constraints:["only the approved project"],acceptance:["hello.md exact bytes verified"],steps:["write","verify"]}}]},
   {text:"",stop:"tool_use",toolUses:[{id:"write",name:write.name,input:{}}]},
   {text:"",stop:"tool_use",toolUses:[{id:"verify",name:verify.name,input:{}}]},
-  {text:"",stop:"tool_use",toolUses:[{id:"complete",name:"task_checkpoint",input:{completion:{state:"verified",checks:[{acceptance_index:0,evidence:"exact bytes were read",tool_call_ids:["verify"]}],final_answer:"hello.md is ready and verified."}}}]},
+  {text:"",stop:"tool_use",toolUses:[{id:"complete",name:"task_checkpoint",input:{completion:{state:"verified",checks:[{acceptance_index:0,evidence:"exact bytes were read",tool_call_ids:["write","verify"]}],final_answer:"hello.md is ready and verified."}}}]},
  ];
  const a=fixture(async(_args,n)=>{assert.ok(n<=4);return steps[n-1];},[write,verify]);project=a.project;
  try{const history=[{role:"user",content:"Create hello.md in the approved project and verify it."}],result=await runConfiguredAgent(history,a.options);
-  assert.equal(result.status,"completed");assert.equal(writes,1);assert.equal(a.requests,4);
+  assert.equal(result.status,"completed",result.error);assert.equal(writes,1);assert.equal(a.requests,4);
   assert.equal(finishTaskExecution(a.task,result).status,"completed");assert.equal(history.at(-1).text,"hello.md is ready and verified.");
  }finally{await a.close();}
 });
@@ -186,4 +200,119 @@ test("credential revocation during a provider stream mutes late text and never r
   assert.equal(result.status,"error");assert.equal(a.requests,1);assert.equal(signalAborted,true);
   assert.equal(JSON.stringify(history).includes("late secret sentinel"),false);assert.equal(JSON.stringify(history).includes("late reply"),false);
  }finally{await a.close();}
+});
+
+for (const revoked of ["generation", "lease"]) test("MCP refuses a real Workspace " + revoked + " revocation with its original live bearer", async () => {
+ const { createWorkspaceMcpEndpoint, WORKSPACE_MCP_TOKEN_ENV } = await import("../dist/agent-runtime/registered-cli-mcp.js");
+ const { assertWorkspaceRunAdmission } = await import("../dist/workspace/execution.js");
+ const { workspaceResourceScopeKey } = await import("../dist/workspace/resource-context.js");
+ const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+ const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
+ const a=fixture(async()=>reply("not called")),client=new Client({name:"fence-fixture",version:"1"});
+ let endpoint,original,marker;
+ try {
+  beginWorkspaceGovernedRun(a.permit,a.options,"pi");
+  endpoint=await createWorkspaceMcpEndpoint({signal:a.controller.signal,
+   assertCurrent(){assertWorkspaceRunAdmission(a.permit,a.options,"pi");},tools:()=>[],
+   async call(){throw new Error("no fixture tools");}});
+  await client.connect(new StreamableHTTPClientTransport(new URL(endpoint.url),{requestInit:{headers:{
+   Authorization:"Bearer "+endpoint.env[WORKSPACE_MCP_TOKEN_ENV]}}}));
+  assert.deepEqual((await client.listTools()).tools,[]);
+  if(revoked==="lease")a.lease.release();
+  else{
+   marker=join(a.home,".hara","workspace-data","v1",workspaceResourceScopeKey(a.row.scope),"scope.json");
+   original=fs.readFileSync(marker);const value=JSON.parse(original);value.generation=randomUUID();
+   fs.writeFileSync(marker,JSON.stringify(value),{mode:0o600});
+  }
+  await assert.rejects(client.listTools());
+  assert.equal(a.requests,0,"a rejected capability cannot start another model");
+ }finally{
+  if(original)fs.writeFileSync(marker,original,{mode:0o600});
+  await client.close().catch(()=>{});await endpoint?.close();await a.close();
+ }
+});
+
+
+test("structured prompt parts are immutable Host-owned permit input; substituted arrays start zero models", async () => {
+ const parts=[{id:"core",stability:"static",source:"core",content:"Pinned policy before admission"}];
+ const a=fixture(async args=>{assert.match(args.system,/Pinned policy before admission/);assert.doesNotMatch(args.system,/Changed after binding/);return reply("Hello");},[],undefined,parts);
+ try {
+  assert.equal(Object.isFrozen(a.options.systemOverrideParts),true);
+  assert.equal(Object.isFrozen(a.options.systemOverrideParts[0]),true);
+  assert.throws(()=>{a.options.systemOverrideParts[0].content="mutated";},TypeError);
+  parts[0].content="Changed after binding";
+  const forged={...a.options,systemOverrideParts:[...a.options.systemOverrideParts]};
+  const refused=await runConfiguredAgent([{role:"user",content:"hello"}],forged);
+  assert.equal(refused.status,"error");assert.match(refused.error,/trusted Host permit/);assert.equal(a.requests,0);
+  assert.equal((await runConfiguredAgent([{role:"user",content:"hello"}],a.options)).status,"completed");
+  assert.equal(a.requests,1);
+ }finally{await a.close();}
+});
+test("T8 publishes once before T9 and ignores aborted or retired observers",async()=>{
+ let now=100,pushes=0;const timing=new MessageTimingRecorder({receivedAt:100,now:()=>now});
+ const f=fixture(async()=>reply("fixture"),[],undefined,undefined,{messageTiming:timing,onRuntimeStageChanged(){pushes++;}});
+ const id={workspaceId:"ws_"+randomUUID(),resourceGeneration:randomUUID(),agentId:"ag_"+randomUUID(),sessionId:randomUUID(),runId:randomUUID(),attemptId:randomUUID(),historyStart:0};
+ // The recorder's own closed identity is unrelated to the notification authority.
+ try{now=180;observeWorkspaceMessageTiming(f.permit,"T8",now);assert.equal(pushes,1);assert.equal(timing.snapshot(id).points.T8,80);assert.equal(timing.snapshot(id).points.T9,null);
+ observeWorkspaceMessageTiming(f.permit,"T8",200);assert.equal(pushes,1);f.controller.abort();observeWorkspaceMessageTiming(f.permit,"T8",210);assert.equal(pushes,1);
+ timing.finish();assert.equal(timing.snapshot(id).points.T9,80);
+ }finally{await f.close();}observeWorkspaceMessageTiming(f.permit,"T8",220);assert.equal(pushes,1);
+});
+test("actual provider retry and context usage are observed without another model call",async()=>{
+ const stage=new RuntimeStageRecorder({workspaceId:"ws_"+randomUUID(),resourceGeneration:randomUUID(),agentId:"ag_"+randomUUID(),sessionId:randomUUID(),runId:randomUUID(),attemptId:randomUUID(),historyStart:0},{id:"pi",version:null,loginSource:"unknown",model:null,effort:null});
+ const f=fixture(async args=>{args.onRetry?.({provider:"openai",model:"fixture",attempt:1,nextAttempt:2,kind:"timeout",delayMs:0,elapsedMs:1});return reply("done");},[],undefined,undefined,{runtimeStages:stage});
+ try{await runPiAgent([{role:"user",content:"hello"}],f.options);assert.equal(f.requests,1);assert.equal(stage.snapshot().contextTokens,7);assert.deepEqual(stage.snapshot().events.filter(e=>e.kind==="retry").map(e=>e.errorKind),["timeout"]);}finally{await f.close();}
+});
+
+
+for (const [kind, reminder] of [
+  ["deadline", deadlineCheckpointReminder(60000)],
+  ["task checkpoint", taskRoundCheckpointReminder(8, 12)],
+  ["progress", "No-progress checkpoint: inspect observed artifacts and record a verified next step."],
+]) test(`Pi keeps ${kind} feedback in all three later requests without durable reminders`, async () => {
+  const { pushReminder, disposeReminderScope } = await import("../dist/agent/reminders.js");
+  const requests = [], probe = { name: "memory_feedback_probe", description: "Return a bounded read-only observation",
+    kind: "read", input_schema: { type: "object", properties: {} }, async run() { return "observed"; } };
+  let a;
+  a = fixture(async (args, round) => {
+    requests.push(structuredClone(args.history));
+    if (round === 1) pushReminder(reminder, a.options.ctx.todoScope);
+    return round <= 3 ? { text: "", toolUses: [{ id: `probe-${round}`, name: probe.name, input: {} }], stop: "tool_use", usage: { input: 7, output: 3 } } : reply("Observed.");
+  }, [probe], undefined, undefined, {}, { quiet: false });
+  const history = [{ role: "user", content: "Observe the bounded fixture." }];
+  try {
+    const result = await runConfiguredAgent(history, a.options);
+    assert.equal(result.status, "completed", result.error);
+    assert.equal(requests.length, 4);
+    for (const request of requests.slice(1)) {
+      const index = request.findIndex(row => row.role === "user" && row.content.includes(reminder));
+      assert(index >= 0, `${kind} must remain visible through the third request after feedback`);
+      if (request.some(row => row.role === "assistant" && row.toolUses.some(tool => tool.id === "probe-2")))
+        assert(index < request.findIndex(row => row.role === "assistant" && row.toolUses.some(tool => tool.id === "probe-2")), "feedback keeps its original place before later tool rounds");
+    }
+    assert.doesNotMatch(JSON.stringify(history), /Deadline checkpoint|Task-round checkpoint|No-progress checkpoint|<system-reminder>/);
+  } finally { disposeReminderScope(a.options.ctx.todoScope); await a.close(); }
+});
+
+for (const kind of ["empty", "credential-withheld"]) test(`native prose-only closeout is accurate for ${kind}`, async () => {
+  const { pausedCloseoutText } = await import("../dist/agent/task-closeout.js");
+  const history = [{ role: "user", content: "Observe this fixture." }];
+  const previousCron = process.env.HARA_CRON;
+  if (kind === "credential-withheld") process.env.HARA_CRON = "1";
+  const a = fixture(async (_args, round) => kind === "credential-withheld" && round > 1
+    ? { text: "", toolUses: [], stop: "error", errorMetadata: { code: "native_continuation_unavailable" }, errorMsg: "one-shot native turn is terminal" }
+    : { ...reply(kind === "empty" ? "" : "Please send me your API key."), nativeContinuation: "unavailable" });
+  try {
+    const result = await runConfiguredAgent(history, a.options);
+    assert.equal(result.status, "halted"); assert.equal(result.stopReason, "native_prose_only");
+    assert.doesNotMatch(JSON.stringify(history), /Please send me your API key/);
+    for (const language of ["en", "zh-Hans"]) {
+      const text = pausedCloseoutText(a.task, [], language, result);
+      assert.doesNotMatch(text, /reply is retained|回复已保留|文字回复|send me your API key/i);
+      assert.match(text, /without a verified action receipt|尚未取得操作回执/);
+    }
+  } finally {
+    if (previousCron === undefined) delete process.env.HARA_CRON; else process.env.HARA_CRON = previousCron;
+    await a.close();
+  }
 });

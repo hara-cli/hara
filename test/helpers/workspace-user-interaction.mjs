@@ -28,6 +28,9 @@ function hostFixture(t, responder) {
   const host = new LocalWorkspaceHost(root, options);
   t.after(async () => { await host.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const workspace = host.createWorkspace("Synthetic", host.list().revision);
+  const fixtureAgent = host.context(workspace.workspaceId).resources.agents.get(workspace.selectedAgentId);
+  host.context(workspace.workspaceId).resources.agents.setPermissionTier(fixtureAgent.agentId, "controlled", fixtureAgent.configRevision, fixtureAgent.agentEpoch);
+
   host.configureSynthetic(workspace.workspaceId, 0); host.select("client", workspace.workspaceId, host.list().revision);
   const storage = new WorkspaceResourceStorage(host.home, host.catalog.resolve(workspace.workspaceId).scope); storage.initialize();
   return { root, host, workspace, storage, turns, options };

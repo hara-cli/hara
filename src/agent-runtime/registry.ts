@@ -1,3 +1,6 @@
+import { sharedExpandedRuntimeProtection } from "./expanded-policy-adapter.js";
+import type { ExpandedRuntimeProtection } from "./expanded-protection.js";
+import { runtimeFailureMessage } from "./failure-diagnostics.js";
 import { runAgent, type RunOpts, type RunOutcome } from "../agent/loop.js";
 import { runPiAgent } from "./pi.js";
 import type { NeutralMsg } from "../providers/types.js";
@@ -7,6 +10,10 @@ import { assertWorkspaceRunAdmission } from "../workspace/execution.js";
 import type { WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
 import type { WorkspaceRuntimeModels } from "../workspace/runtime-models.js";
 import { registeredCliDriver } from "./registered-cli.js";
+import { expandedCliDriver } from "./expanded-cli.js";
+import { openCodeCliDriver } from "./opencode-cli.js";
+import { jsonCliDriver } from "./json-cli.js";
+import type { JsonCliPolicyFactory } from "./json-cli-policy.js";
 
 /** Host-owned code only. Imported persona text and renderer fields cannot register a driver or grant
  * tools. New drivers must implement the same Hara admission, approval, cancellation and recovery rules. */
@@ -19,22 +26,29 @@ export interface AgentRuntimeOption {
   id: AgentRuntimeId;
   label: string;
   available: boolean;
-  reason?: "general_agent_adapter_pending" | "adapter_pending_p05" | "not_registered" | "not_installed" | "integrity_failed";
+  reason?: "general_agent_adapter_pending" | "adapter_pending_p05" | "not_registered" | "not_installed" | "integrity_failed" | "detection_pending" | "detection_failed";
   /** Product direction only; never used to silently substitute an execution Runtime. */
   recommended: boolean;
+  /**
+   * May be chosen in a form: installed, passed the file check and has a driver. Not execution authority:
+   * `available` (confirmed) is still the only gate for setRuntime, dispatch and colleague creation.
+   */
+  selectable: boolean;
+  /** What a person must confirm before `available` can become true. */
+  confirmation: "none" | "first_use" | "update";
 }
 
 const LABELS: Record<AgentRuntimeId, string> = {
-  hara: "Hara（現有相容引擎）", pi: "Pi（內建）", opencode: "OpenCode", codex: "Codex", claude: "Claude Code", agy: "Antigravity",
+  hara: "Hara（现有兼容引擎）", pi: "Pi（内建）", opencode: "OpenCode", codex: "Codex", claude: "Claude Code", agy: "Antigravity", gemini: "Gemini CLI", kimi: "Kimi Code", copilot: "GitHub Copilot", cursor: "Cursor", grok: "Grok Build",
 };
 
 export class AgentRuntimeRegistry {
   private readonly drivers = new Map<AgentRuntimeId, GovernedAgentRuntimeDriver>();
 
   constructor(drivers?: readonly GovernedAgentRuntimeDriver[], private readonly installer?: WorkspaceRuntimeInstaller,
-    models?: WorkspaceRuntimeModels) {
-    const selected = drivers ?? [{ id: "hara", run: runAgent }, { id: "pi", run: runPiAgent }];
-    for (const driver of [...selected, ...(installer ? [registeredCliDriver("codex", installer, models), registeredCliDriver("claude", installer, models)] : [])]) {
+    models?: WorkspaceRuntimeModels, jsonCliPolicyFactory?: JsonCliPolicyFactory, expandedProtection: ExpandedRuntimeProtection = sharedExpandedRuntimeProtection) {
+    const selected = drivers ?? [{ id: "hara", run: runAgent }, { id: "pi", run: (history: NeutralMsg[], options: RunOpts) => runPiAgent(history, options, installer) }];
+    for (const driver of [...selected, ...(installer ? [registeredCliDriver("codex", installer, models), registeredCliDriver("claude", installer, models), openCodeCliDriver(installer, models), jsonCliDriver("gemini", installer, models, jsonCliPolicyFactory), jsonCliDriver("kimi", installer, models, jsonCliPolicyFactory), ...(["copilot", "cursor", "grok"] as const).map(id => expandedCliDriver(id, installer, models, expandedProtection))] : [])]) {
       if (!AGENT_RUNTIME_IDS.includes(driver.id) || this.drivers.has(driver.id) || typeof driver.run !== "function") {
         throw new Error("invalid or duplicate governed Agent Runtime driver");
       }
@@ -42,23 +56,35 @@ export class AgentRuntimeRegistry {
     }
   }
 
+  private option(id: AgentRuntimeId, row?: { state: string; generalAgentDriverAvailable: boolean; use?: string }): AgentRuntimeOption {
+    const driver = this.drivers.has(id);
+    const available = id === "agy" ? false
+      : id === "codex" || id === "claude" || id === "opencode" || id === "gemini" || id === "kimi" || id === "copilot" || id === "cursor" || id === "grok" ? Boolean(driver && row?.generalAgentDriverAvailable) : driver;
+    const reason = available ? undefined : id === "agy" ? "general_agent_adapter_pending"
+      : row?.state === "integrity_failed" ? "integrity_failed"
+      : row?.state === "not_installed" ? "not_installed"
+      : row?.state === "detecting" ? "detection_pending"
+      : row?.state === "detection_failed" ? "detection_failed"
+      : row?.state === "detected" || !row ? "not_registered" : "general_agent_adapter_pending";
+    const external = id !== "hara" && id !== "pi";
+    const confirmation = !external || available ? "none" as const
+      : row?.use === "confirm_update" ? "update" as const : row?.use === "confirm_first_use" ? "first_use" as const : "none" as const;
+    const selectable = id !== "agy" && driver && (available || confirmation !== "none");
+    return { id, label: LABELS[id], available, ...(reason ? { reason: reason as AgentRuntimeOption["reason"] } : {}), recommended: id === "pi", selectable, confirmation };
+  }
   options(): AgentRuntimeOption[] {
     const installed = this.installer?.list().options;
-    return AGENT_RUNTIME_IDS.map(id => {
-      const row = installed?.find(option => option.runtimeId === id);
-      const driver = this.drivers.has(id);
-      const available = id === "opencode" || id === "agy" ? false
-        : id === "codex" || id === "claude" ? Boolean(driver && row?.generalAgentDriverAvailable) : driver;
-      const reason = available ? undefined : id === "opencode" ? "adapter_pending_p05" : id === "agy" ? "general_agent_adapter_pending"
-        : row?.state === "integrity_failed" ? "integrity_failed"
-        : row?.state === "not_installed" ? "not_installed"
-        : row?.state === "detected" || !row ? "not_registered" : "general_agent_adapter_pending";
-      return { id, label: LABELS[id], available, ...(reason ? { reason: reason as AgentRuntimeOption["reason"] } : {}), recommended: id === "pi" };
-    });
+    return AGENT_RUNTIME_IDS.map(id => this.option(id, installed?.find(option => option.runtimeId === id)));
+  }
+  private selectedOption(id: AgentRuntimeId): AgentRuntimeOption {
+    if (id === "hara" || id === "pi" || id === "agy") return this.option(id);
+    const row = typeof this.installer?.availability === "function" ? this.installer.availability(id)
+      : this.installer?.list().options.find(option => option.runtimeId === id);
+    return this.option(id, row);
   }
 
   assertAvailable(id: AgentRuntimeId): void {
-    if (!this.options().some(row => row.id === id && row.available)) throw new Error(`Agent Runtime '${id}' is not available for general Agents; no fallback was selected`);
+    if (!this.selectedOption(id).available) throw new Error(`Agent Runtime '${id}' is not available for general Agents; no fallback was selected`);
   }
 
   /** Separate trusted entry: no legacy TaskRuntimeBinding or personal/org Space substitution. */
@@ -66,8 +92,15 @@ export class AgentRuntimeRegistry {
     if (!options.workspaceRun) throw new Error(WORKSPACE_AGENT_EXECUTION_PENDING);
     const runtimeId = options.workspaceRun.binding.agent.runtimeId;
     assertWorkspaceRunAdmission(options.workspaceRun, options, runtimeId);
-    this.assertAvailable(runtimeId);
-    if (runtimeId === "pi") return runPiAgent(history, options);
+    const availability = this.selectedOption(runtimeId);
+    if (!availability?.available) {
+      if (this.installer && (runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode" || runtimeId === "gemini" || runtimeId === "kimi" || runtimeId === "copilot" || runtimeId === "cursor" || runtimeId === "grok")) {
+        return Promise.resolve({ status: "error", error: runtimeFailureMessage({ ...this.installer.failureContext(runtimeId),
+          kind: availability?.reason === "not_installed" || availability?.reason === "not_registered" ? "not_installed" : "runtime_failed", elapsedMs: 0 }) });
+      }
+      this.assertAvailable(runtimeId);
+    }
+    if (runtimeId === "pi") return runPiAgent(history, options, this.installer);
     if (runtimeId === "hara") return runAgent(history, options);
     const agent = options.workspaceRun.binding.agent;
     const binding = freezeTaskRuntimeBinding({ version: 1, spaceId: "personal", agentRef: "main", runtimeId,

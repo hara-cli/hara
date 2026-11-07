@@ -4,35 +4,50 @@ import { currentWorkspaceResourceBinding, sameWorkspaceResourceBinding, workspac
 import { deepFreeze, plain, positive, text } from "./local-state.js";
 import { VersionedSettings, SettingsMigrationPendingError } from "./versioned-settings.js";
 import type { CredentialVault } from "./credential-vault.js";
+import { connectionModelEfforts } from "./connection-models.js";
+import { defaultEffortForLevels } from "./default-effort.js";
 
 interface Metadata extends Omit<ScopedConnection, "apiKey" | "credentialFile"> { keyRef: string; createdAt: string; updatedAt: string; importId?: string; retiredKeyRefs?: string[]; credentialInvalid?: boolean; credentialMissing?: boolean }
 interface LegacyImport { state: "pending" | "complete"; rows: { sourceId: string; connectionId: string }[] }
 interface Document { schemaVersion: 3; resourceBinding: WorkspaceResourceBinding; revision: number; activeConnectionId: string | null; connections: Metadata[]; legacyImport?: LegacyImport }
 export interface LegacyConnectionSeed { id: string; label: string; provider: "openai" | "anthropic"; baseURL: string; defaultModel: string; isDefault?: boolean; keySaved?: boolean }
 function checked(value: unknown) {
-  if (!plain(value) || !text(value.label, 80) || !text(value.defaultModel) || !text(value.baseURL, 4096) || !["openai", "anthropic"].includes(String(value.provider))) throw new Error("Invalid model connection metadata");
+  if (!plain(value) || !text(value.label, 80) || !text(value.defaultModel) || !text(value.baseURL, 4096) || !["openai", "anthropic"].includes(String(value.provider))
+    || value.defaultReasoning !== undefined && value.defaultReasoning !== null
+      && !["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value.defaultReasoning))) throw new Error("Invalid model connection metadata");
   let url: URL; try { url = new URL(value.baseURL); } catch { throw new Error("Invalid model endpoint"); }
   if (url.username || url.password || url.search || url.hash || !["http:", "https:"].includes(url.protocol) || url.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) throw new Error("Unsafe model endpoint");
-  return { label: value.label, provider: value.provider as "openai" | "anthropic", baseURL: value.baseURL, defaultModel: value.defaultModel };
+  return { label: value.label, provider: value.provider as "openai" | "anthropic", baseURL: value.baseURL, defaultModel: value.defaultModel,
+    ...(Object.hasOwn(value, "defaultReasoning") ? { defaultReasoning: value.defaultReasoning as ScopedConnectionInput["defaultReasoning"] } : {}) };
 }
 export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
   private readonly document: VersionedSettings<Document>;
   constructor(storage: WorkspaceResourceStorage, private readonly vault: CredentialVault,
     private readonly resolveLegacy?: (id: string) => { input: ScopedConnectionInput; importId: string }) {
     super(storage);
-    const binding = () => storage.run(() => ({ ...currentWorkspaceResourceBinding()! }));
+    // These callbacks run only inside this document's VersionedSettings storage boundary.
+    // Reading its immutable provenance is structural work; the enclosing read/update performs
+    // the live authority checks, including after parsing and before committing a migration.
+    const binding = (): WorkspaceResourceBinding => {
+      const current = currentWorkspaceResourceBinding();
+      if (!current || current.scopeKey !== storage.scopeKey) throw new Error("Secure settings require their bound Workspace resource context");
+      return { ...current };
+    };
     const parse = (raw: unknown): Document => {
-      if (!plain(raw) || raw.schemaVersion !== 3 || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 0 || !sameWorkspaceResourceBinding(raw.resourceBinding as WorkspaceResourceBinding, binding())
+      // One immutable provenance value for this fresh document parse. The surrounding
+      // VersionedSettings read/update still checks live storage authority before and after.
+      const resourceBinding = binding();
+      if (!plain(raw) || raw.schemaVersion !== 3 || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 0 || !sameWorkspaceResourceBinding(raw.resourceBinding as WorkspaceResourceBinding, resourceBinding)
         || !Array.isArray(raw.connections) || raw.connections.length > 256) throw new Error("Invalid secure model settings");
       const ids = new Set<string>(), connections: Metadata[] = raw.connections.map(row => {
         if (!plain(row) || Object.hasOwn(row, "apiKey") || Object.hasOwn(row, "credentialFile") || !isConnectionId(row.id) || ids.has(row.id) || !isCredentialGeneration(row.credentialGeneration)
-          || !positive(row.revision) || !["active", "revoked"].includes(String(row.status)) || typeof row.keyRef !== "string" || !row.keyRef.startsWith(`${binding().scopeKey}:${row.id}:`)
-          || row.status === "active" && row.keyRef !== `${binding().scopeKey}:${row.id}:${row.credentialGeneration}`
+          || !positive(row.revision) || !["active", "revoked"].includes(String(row.status)) || typeof row.keyRef !== "string" || !row.keyRef.startsWith(`${resourceBinding.scopeKey}:${row.id}:`)
+          || row.status === "active" && row.keyRef !== `${resourceBinding.scopeKey}:${row.id}:${row.credentialGeneration}`
           || row.credentialInvalid !== undefined && typeof row.credentialInvalid !== "boolean"
           || row.credentialMissing !== undefined && typeof row.credentialMissing !== "boolean"
           || typeof row.createdAt !== "string" || !Number.isFinite(Date.parse(row.createdAt)) || typeof row.updatedAt !== "string" || !Number.isFinite(Date.parse(row.updatedAt))) throw new Error("Invalid secure connection");
         const retiredKeyRefs = row.retiredKeyRefs ?? [];
-        if (!Array.isArray(retiredKeyRefs) || retiredKeyRefs.length > 256 || retiredKeyRefs.some(ref => typeof ref !== "string" || !ref.startsWith(`${binding().scopeKey}:${row.id}:`) || !isCredentialGeneration(ref.slice(ref.lastIndexOf(":") + 1)))) throw new Error("Invalid credential cleanup record");
+        if (!Array.isArray(retiredKeyRefs) || retiredKeyRefs.length > 256 || retiredKeyRefs.some(ref => typeof ref !== "string" || !ref.startsWith(`${resourceBinding.scopeKey}:${row.id}:`) || !isCredentialGeneration(ref.slice(ref.lastIndexOf(":") + 1)))) throw new Error("Invalid credential cleanup record");
         ids.add(row.id); return { ...checked(row), id: row.id, keyRef: row.keyRef, credentialGeneration: row.credentialGeneration, revision: row.revision,
           status: row.status as "active" | "revoked", createdAt: row.createdAt, updatedAt: row.updatedAt, retiredKeyRefs, credentialInvalid: row.credentialInvalid === true, credentialMissing: row.credentialMissing === true, ...(typeof row.importId === "string" ? { importId: row.importId } : {}) };
       });
@@ -41,7 +56,7 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
       if (legacy !== undefined && (!plain(legacy) || !["pending", "complete"].includes(String(legacy.state)) || !Array.isArray(legacy.rows) || legacy.rows.length > 256
         || legacy.rows.some(row => !plain(row) || typeof row.sourceId !== "string" || !/^[a-f0-9]{64}$/.test(row.sourceId) || !connections.some(item => item.id === row.connectionId))
         || new Set(legacy.rows.map(row => row.connectionId)).size !== legacy.rows.length)) throw new Error("Invalid legacy import marker");
-      return { schemaVersion: 3, resourceBinding: binding(), revision: Number(raw.revision), activeConnectionId: raw.activeConnectionId as string | null, connections,
+      return { schemaVersion: 3, resourceBinding: resourceBinding, revision: Number(raw.revision), activeConnectionId: raw.activeConnectionId as string | null, connections,
         ...(legacy ? { legacyImport: structuredClone(legacy) as unknown as LegacyImport } : {}) };
     };
     this.document = new VersionedSettings<Document>(() => storage.run(() => workspaceStateHome()), "workspace-connections-v2.json", 3,
@@ -69,6 +84,7 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     const pending = state.value.legacyImport?.state === "pending";
     return { revision: state.value.revision, defaultConnectionId: pending || state.value.connections.some(row => row.id === state.value.activeConnectionId && (row.credentialInvalid || row.credentialMissing)) ? null : state.value.activeConnectionId, activeConnectionId: state.value.activeConnectionId, readOnly: state.readOnly || pending, recovered: state.recovered, migrationPending: state.migrationPending || pending,
       connections: state.value.connections.map(row => ({ id: row.id, label: row.label, provider: row.provider, baseURL: row.baseURL, defaultModel: row.defaultModel,
+        defaultReasoning: row.defaultReasoning ?? null,
         credentialGeneration: row.credentialGeneration, revision: row.revision, status: row.status, keySaved: !pending && !row.credentialMissing && row.status === "active", keyState: pending || row.credentialMissing ? "pending" : row.credentialInvalid ? "invalid" : "saved", credentialRequired: row.credentialMissing === true, cleanupPending: Boolean(row.retiredKeyRefs?.length), createdAt: row.createdAt, updatedAt: row.updatedAt })) };
   }
   /** Metadata-only prefill, once per personal Workspace. No vault access or secret persistence. */
@@ -122,7 +138,9 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     const id = `mc_${randomUUID()}`, generation = `gen_${randomUUID()}`, keyRef = `${state.value.resourceBinding.scopeKey}:${id}:${generation}`, now = new Date().toISOString();
     this.vault.set(keyRef, value.apiKey);
     try { this.document.update(expected, current => ({ ...current, activeConnectionId: current.activeConnectionId ?? id, connections: [...current.connections,
-      { ...metadata, id, keyRef, credentialGeneration: generation, revision: 1, status: "active", createdAt: now, updatedAt: now, ...(importId ? { importId } : {}) }] })); }
+      { ...metadata, defaultReasoning: Object.hasOwn(value, "defaultReasoning") || importId ? metadata.defaultReasoning ?? null
+        : defaultEffortForLevels(connectionModelEfforts(metadata, metadata.defaultModel)) as ScopedConnection["defaultReasoning"],
+        id, keyRef, credentialGeneration: generation, revision: 1, status: "active", createdAt: now, updatedAt: now, ...(importId ? { importId } : {}) }] })); }
     catch (error) { this.discardUncommittedCredential(keyRef, expected); throw error; }
     return this.list().connections.find(row => row.id === id)!;
   }
@@ -134,7 +152,9 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     const generation = `gen_${randomUUID()}`, ref = `${state.value.resourceBinding.scopeKey}:${id}:${generation}`;
     this.vault.set(ref, key);
     try { this.document.update(expected, current => ({ ...current, connections: current.connections.map(item => item.id === id
-      ? { ...item, ...metadata, keyRef: ref, credentialInvalid: false, credentialMissing: false, retiredKeyRefs: [...new Set([...(item.retiredKeyRefs ?? []), item.keyRef])], credentialGeneration: generation, revision: item.revision + 1, updatedAt: new Date().toISOString() } : item) })); }
+      ? { ...item, ...metadata, defaultReasoning: Object.hasOwn(value, "defaultReasoning") ? metadata.defaultReasoning ?? null : metadata.defaultModel === item.defaultModel ? item.defaultReasoning ?? null
+        : defaultEffortForLevels(connectionModelEfforts(metadata, metadata.defaultModel)) as ScopedConnection["defaultReasoning"],
+        keyRef: ref, credentialInvalid: false, credentialMissing: false, retiredKeyRefs: [...new Set([...(item.retiredKeyRefs ?? []), item.keyRef])], credentialGeneration: generation, revision: item.revision + 1, updatedAt: new Date().toISOString() } : item) })); }
     catch (error) { this.discardUncommittedCredential(ref, expected); throw error; }
     this.cleanupCredentials(id, this.document.read().value.revision);
   }
@@ -168,9 +188,15 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     for (const ref of refs) this.vault.remove(ref);
     this.document.update(expected, current => ({ ...current, connections: current.connections.map(item => item.id === id ? { ...item, retiredKeyRefs: [] } : item) }));
   }
-  override select(id: string, expected: number) { this.document.update(expected, current => {
+  override select(id: string, expected: number, modelId?: string, effort?: ScopedConnectionInput["defaultReasoning"]) { this.document.update(expected, current => {
     if (current.legacyImport?.state === "pending") throw new Error("Credential authorization pending");
-    if (!current.connections.some(row => row.id === id && row.status === "active")) throw new Error("Connection unavailable");
+    const row = current.connections.find(row => row.id === id && row.status === "active");
+    if (!row || modelId !== undefined && !text(modelId)) throw new Error("Connection unavailable");
+    if (modelId !== undefined) {
+      const nextEffort = effort === undefined ? (row.defaultModel === modelId ? row.defaultReasoning ?? null
+        : defaultEffortForLevels(connectionModelEfforts(row, modelId)) as ScopedConnection["defaultReasoning"]) : effort;
+      row.defaultModel = modelId; row.defaultReasoning = nextEffort; row.updatedAt = new Date().toISOString();
+    }
     current.activeConnectionId = id; return current;
   }); }
   override capture(id?: string, model?: string): Readonly<ScopedRunConnection> {
@@ -178,7 +204,7 @@ export class WorkspaceSecureConnections extends WorkspaceConnectionStoreV2 {
     if (state.legacyImport?.state === "pending") throw new Error("Credential authorization pending; no model call allowed");
     const row = state.connections.find(row => row.id === (id ?? state.activeConnectionId) && row.status === "active");
     if (!row || row.credentialInvalid || row.credentialMissing || model !== undefined && !text(model)) throw new Error("invalid or unavailable scoped model connection; no fallback was selected");
-    return deepFreeze({ connectionId: row.id, credentialGeneration: row.credentialGeneration, connectionRevision: row.revision, model: model ?? row.defaultModel, reasoning: null });
+    return deepFreeze({ connectionId: row.id, credentialGeneration: row.credentialGeneration, connectionRevision: row.revision, model: model ?? row.defaultModel, reasoning: row.defaultReasoning ?? null });
   }
   override resolve(binding: ScopedRunConnection): Readonly<ScopedConnection> {
     if (!isScopedRunConnection(binding)) throw new Error("Invalid connection binding");

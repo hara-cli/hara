@@ -1,7 +1,9 @@
+import { RunModelTranscript } from "./run-model-transcript.js";
+import { createWorkspaceExtensionApproval, isWorkspaceExtensionTool, type WorkspaceExtensionApproval } from "../workspace/extension-binding.js";
 import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment, TurnArgs, TurnResult } from "../providers/types.js";
 import { isTaskRuntimeBinding } from "../agent-runtime/bindings.js";
 import { WORKSPACE_AGENT_EXECUTION_PENDING } from "../workspace/agent-binding.js";
-import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, workspaceRunQuestion, workspaceRunBeginToolBatch, workspaceRunAsk, workspaceRunAsyncAnswers, type WorkspaceRunPermit } from "../workspace/execution.js";
+import { beginWorkspaceGovernedRun, executeWorkspaceTool, prepareWorkspaceRunHistory, prepareWorkspaceRunWakeBrief, workspaceRunToolAllowed, workspaceRunQuestion, workspaceRunIsInteractive, bindWorkspaceRoundClock, workspaceRunHasPendingInteraction, workspaceRunBeginToolBatch, workspaceRunAsk, workspaceRunAsyncAnswers, workspaceRunNativeEvidence, workspaceRunCanCompleteConversation, workspaceRunCompletionEvidence, type WorkspaceRunPermit } from "../workspace/execution.js";
 import { createToolImageStore, redactOwnedToolImageText } from "../tools/tool-images.js";
 import { redactOwnedToolImageValue } from "../security/tool-media-redaction.js";
 import { createComputerRunScope, closeComputerRunScope } from "../tools/computer-run.js";
@@ -82,7 +84,9 @@ import { coreDeferredToolsForHistory } from "./core-capabilities.js";
 import { setTurnPhase } from "./phase.js";
 import { AssistantTextSanitizer, sanitizeAssistantText } from "./assistant-text.js";
 import { completionCloseoutText, pausedCloseoutText } from "./task-closeout.js";
-import { CompletionEvidenceLedger, completionEvidenceScope } from "./completion-evidence.js";
+import { CompletionEvidenceLedger, completionEvidenceScope, nativeEvidenceAllowedForTask } from "./completion-evidence.js";
+import { ReadOnlyAnswerTrace } from "./readonly-light.js";
+import { engineTaskBrief, simpleChangeObjective, WorkspaceChangeTrace } from "./governance-c-lite.js";
 import { recordTouch } from "./touched.js";
 import { resolve as resolvePath } from "node:path";
 import { redactSensitiveText, requestsCredentialDisclosure } from "../security/secrets.js";
@@ -101,6 +105,7 @@ import {
   applyTaskCheckpoint,
   extendTaskRoundBudget,
   freshTaskCompletion,
+  hasPendingTaskSteering,
   recordTaskDecision,
   recordTaskRoundUsage,
   taskRoundBudget,
@@ -117,7 +122,8 @@ import {
   HEADLESS_USER_INPUT_REQUIRED,
   NO_INTERACTIVE_USER,
 } from "../tools/ask_user.js";
-import { PromptAssembler, type AssembledSystemPrompt } from "./prompt.js";
+import { WORKSPACE_WAKE_GOVERNANCE } from "../workspace/model-context.js";
+import { PromptAssembler, type AssembledSystemPrompt, type SystemPromptInput } from "./prompt.js";
 import { REFERENCE_CLARIFICATION_POLICY } from "./reference-clarification.js";
 import { runtimeTimePrompt, type RuntimeTimePromptOptions } from "../runtime-time.js";
 import {
@@ -569,12 +575,21 @@ export function composeSystem(
   runtimeTime?: RuntimeTimePromptOptions,
   scopedWorkspace = false,
   workspaceWakeContext?: string,
+  overrideParts?: readonly SystemPromptInput[],
 ): AssembledSystemPrompt {
   const assembler = new PromptAssembler();
-  assembler.add("core", "static", "core", override || HARA_SYSTEM());
+  // Validate Host-composed boundaries before merging with the engine tiers. Objective data
+  // cannot silently acquire a static label or reorder a malformed supplied prefix.
+  const supplied = new PromptAssembler();
+  for (const part of overrideParts ?? []) supplied.add(part.id, part.stability, part.source, part.content);
+  const suppliedParts = supplied.build().parts;
+  const staticParts = suppliedParts.filter(part => part.stability === "static");
+  if (!staticParts.length) assembler.add("core", "static", "core", override || HARA_SYSTEM());
+  for (const part of staticParts) assembler.add(part.id, part.stability, part.source, part.content);
   assembler.add("reference-clarification", "static", "core", REFERENCE_CLARIFICATION_POLICY);
+  if (scopedWorkspace) assembler.add("workspace-wake-governance", "static", "core", WORKSPACE_WAKE_GOVERNANCE);
   const skills = scopedWorkspace ? "" : skillsDigest(cwd);
-  const roles = scopedWorkspace || override ? "" : rolesDigest(cwd, profileId);
+  const roles = scopedWorkspace || override || overrideParts ? "" : rolesDigest(cwd, profileId);
   const checkpointContext = scopedWorkspace ? "" : taskCheckpointContext(intake?.checkpoint, intake?.decisions);
   const intakeContext = scopedWorkspace && workspaceWakeContext ? workspaceWakeContext : !intake?.enabled
     ? ""
@@ -638,8 +653,14 @@ export function composeSystem(
     .add("project", "session", "project", projectContext ? `# Project context (AGENTS.md)\n${projectContext}` : "")
     .add("memory", "session", "memory", memory ? `# Memory (durable — facts/decisions/prefs you've saved; use memory_search/get for more)\n${memory}` : "")
     .add("roles", "session", "role", roles ? `# Specialist roles (metadata only — use \`agent\` with a role id for bounded read-only expertise)\n${roles}` : "")
-    .add("skills", "session", "skill", skills ? `# Skills (capabilities you can load — call the \`skill\` tool with the id for full instructions before using one)\n${skills}` : "")
-    .add("task-intake", "turn", "task", intakeContext)
+    .add("skills", "session", "skill", skills ? `# Skills (capabilities you can load — call the \`skill\` tool with the id for full instructions before using one)\n${skills}` : "");
+  for (const part of suppliedParts.filter(part => part.stability === "session")) {
+    assembler.add(part.id, part.stability, part.source, part.content);
+  }
+  for (const part of suppliedParts.filter(part => part.stability === "turn")) {
+    assembler.add(part.id, part.stability, part.source, part.content);
+  }
+  assembler.add("task-intake", "turn", "task", intakeContext)
     .add("task-checkpoint", "turn", "task", checkpointContext)
     // Keep the changing clock at the very end: stable core/session prefixes remain cacheable, while every
     // provider request (including later tool rounds and a long-lived session's next turn) gets a fresh value.
@@ -671,7 +692,7 @@ export interface RunOpts {
   confirm: (
     q: string,
     signal?: AbortSignal,
-    options?: { allowAlways?: boolean; presentation?: AgentCreationApproval; taskApproval?: TaskApprovalOffer },
+    options?: { allowAlways?: boolean; presentation?: AgentCreationApproval; taskApproval?: TaskApprovalOffer; workspaceExtension?: WorkspaceExtensionApproval },
   ) => Promise<boolean | "always">;
   /** Opaque project-scope keys auto-approved for the rest of the attached session. */
   autoApprove?: Set<string>;
@@ -716,6 +737,8 @@ export interface RunOpts {
   };
   /** role persona used instead of the default hara system prompt */
   systemOverride?: string;
+  /** Host-only replacement with explicit static/session/turn boundaries. Never model- or RPC-supplied. */
+  systemOverrideParts?: readonly SystemPromptInput[];
   /** Version of the Control bundle from which systemOverride/toolFilter were resolved. If a fresh policy
    * sync observes another version, halt this run instead of mixing an old persona with new authority. */
   organizationPolicyVersion?: number;
@@ -731,6 +754,8 @@ export interface RunOpts {
    *  filter can't accidentally drop them) and resolved BEFORE the registry on dispatch. Never
    *  registered globally, so other runs/modes can't see or call them. */
   extraTools?: Tool[];
+  /** Workspace Host-only: a single confirmed colleague receipt closes an explicit creation request without another model call. */
+  finishOnConfirmedColleagueCreate?: boolean;
   /** abort the in-flight LLM request (user interrupt) */
   signal?: AbortSignal;
   /** Total active provider/tool execution ceiling for this run. Engine-owned human question/approval waits
@@ -755,6 +780,7 @@ export interface RunOpts {
   /** Credential-free transport retry telemetry. Persistent hosts may journal/log this without request
    * bodies, prompts, URLs, or authorization material. */
   onProviderRetry?: (event: ProviderRetryEvent) => void;
+  onAssistantPreview?: TurnArgs["onAssistantPreview"];
   /** Content-free lifecycle events for deterministic host replay. No prompt, reasoning, tool input/result,
    * path, diff body, endpoint, provider error text, or credential is included. */
   onRuntimeItem?: (event: RunRuntimeItemEvent) => void;
@@ -807,12 +833,14 @@ function emitRuntimeItem(opts: RunOpts, event: Omit<RunRuntimeItemEvent, "at"> &
 export interface RunOutcome {
   status: "completed" | "error" | "empty" | "halted";
   error?: string;
+  /** Host-only control failure provenance; not a completion, permission or retry grant. */
+  nativeControlFailure?: "codex_thread_start_failed" | "codex_resume_failed_history_preserved";
   stopReason?: RunStopReason;
   /** Present for Engine-owned progress/repeat pauses so task snapshots can restore the safe metrics. */
   progress?: RunProgressEvent;
 }
 
-export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop" | "no_progress" | "strategy_stall" | "task_round_budget" | "completion_verification";
+export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop" | "no_progress" | "strategy_stall" | "task_round_budget" | "completion_verification" | "native_context_limit" | "native_prose_only" | "native_resume_timeout";
 
 export interface RunProgressEvent extends ProgressState {
   rounds: number;
@@ -839,6 +867,8 @@ function recoverableMalformedToolCall(error: string | undefined): boolean {
 }
 
 interface RunLifecycle {
+  interactiveWorkspace: boolean;
+  releaseRoundClock?: () => void;
   language: RuntimeCopyLanguage;
   signal: AbortSignal;
   timeoutController: AbortController;
@@ -981,6 +1011,7 @@ function armRunTimers(opts: RunOpts, life: RunLifecycle): void {
   }, timeoutDelay);
   // The hard timer stays referenced while the agent is actively executing. Human prompts have their own
   // visible UI plus Esc/shutdown cancellation and deliberately do not keep this active budget running.
+  if (life.interactiveWorkspace) return; // Per-round timeout remains armed; chat has no near-budget warning.
   const warningAt = Math.min(5 * 60_000, Math.max(250, Math.floor(life.timeoutMs * 0.8)));
   if (!life.warned) {
     life.warningTimer = setTimeout(() => warnRun(opts, life), Math.max(0, warningAt - elapsedMs));
@@ -1068,6 +1099,7 @@ function createRunLifecycle(opts: RunOpts, language: RuntimeCopyLanguage): RunLi
     else signal.addEventListener("abort", stopped, { once: true });
   });
   const life: RunLifecycle = {
+    interactiveWorkspace: !!opts.workspaceRun && workspaceRunIsInteractive(opts.workspaceRun),
     language,
     signal,
     timeoutController,
@@ -1097,11 +1129,16 @@ function createRunLifecycle(opts: RunOpts, language: RuntimeCopyLanguage): RunLi
     } : {}),
     taskRoundCheckpointInjected: false,
   };
+  if (opts.workspaceRun && life.interactiveWorkspace) life.releaseRoundClock = bindWorkspaceRoundClock(opts.workspaceRun, () => {
+    if (expireRunBudgetIfNeeded(life)) throw new Error("Workspace model round expired");
+    if (life.pauseDepth === 0) { life.activeElapsedMs = 0; life.activeStartedAt = Date.now(); armRunTimers(opts, life); }
+  });
   armRunTimers(opts, life);
   return life;
 }
 
 function disposeRunLifecycle(life: RunLifecycle): void {
+  life.releaseRoundClock?.();
   life.disposed = true;
   clearRunTimers(life);
   life.removeStopListener();
@@ -1195,9 +1232,10 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
  * There is one physical model request, not a Hara planner delegating its full task to a second planner. */
 export type AgentRuntimeTurn = (provider: Provider, args: TurnArgs) => Promise<TurnResult>;
 export async function runGovernedAgent(
-  history: NeutralMsg[], opts: RunOpts, runtimeId: "hara" | "pi", executeTurn?: AgentRuntimeTurn,
+  history: NeutralMsg[], opts: RunOpts, runtimeId: "hara" | "pi" | "codex" | "claude" | "opencode" | "gemini" | "kimi" | "copilot" | "cursor" | "grok", executeTurn?: AgentRuntimeTurn,
 ): Promise<RunOutcome> {
-  if ((runtimeId !== "hara" && runtimeId !== "pi") || (runtimeId === "pi" && !executeTurn)) {
+  if (!["hara", "pi", "codex", "claude", "opencode", "gemini", "kimi", "copilot", "cursor", "grok"].includes(runtimeId) || (runtimeId !== "hara" && !executeTurn)
+    || ((runtimeId === "codex" || runtimeId === "claude" || runtimeId === "opencode" || runtimeId === "gemini" || runtimeId === "kimi" || runtimeId === "copilot" || runtimeId === "cursor" || runtimeId === "grok") && !opts.workspaceRun)) {
     return { status: "error", error: "Agent Runtime kernel is unavailable; no fallback was started." };
   }
   // CLI/headless callers also reach this compatibility engine directly. A persisted task bound to
@@ -1233,7 +1271,8 @@ export async function runGovernedAgent(
     const outcome = await runAgentInner(history, { ...opts, ctx: { ...opts.ctx, computerScope } }, life, media, taskAuthority, executeTurn);
     const task = opts.taskIntake?.current ? opts.taskIntake.current() : opts.taskIntake?.task;
     const sameTaskTurn = task && task.id === runTaskBinding?.id && task.turnId === runTaskBinding?.turnId;
-    if (sameTaskTurn && task.brief?.intent === "change" && outcome.status !== "completed" && !opts.signal?.aborted) {
+    if (sameTaskTurn && (task.brief?.intent === "change" || outcome.stopReason === "native_resume_timeout" || outcome.stopReason === "native_prose_only")
+      && outcome.status !== "completed" && !opts.signal?.aborted) {
       // Notices carry diagnostics; an ordinary persisted assistant reply carries the human handoff.
       // Do not ask the provider to summarize a stopped run, or re-run its external side effects.
       const text = pausedCloseoutText(task, currentTodos(opts.ctx.todoScope), life.language, outcome);
@@ -1381,7 +1420,15 @@ async function runAgentInner(
     restrictToolsForSkill,
   };
   let intakeTask = opts.taskIntake?.task;
-  const completionEvidence = new CompletionEvidenceLedger();
+  const completionEvidence = opts.workspaceRun ? workspaceRunCompletionEvidence(opts.workspaceRun) : new CompletionEvidenceLedger();
+  const readOnlyAnswerTrace = opts.workspaceRun && opts.taskIntake ? new ReadOnlyAnswerTrace() : null;
+  const workspaceChangeTrace = opts.workspaceRun && opts.taskIntake ? new WorkspaceChangeTrace() : null;
+  const nativeEvidence = () => {
+    if (!opts.workspaceRun) return null;
+    try { return workspaceRunNativeEvidence(opts.workspaceRun); } catch { return null; }
+  };
+  const changeEvidence = () => workspaceChangeTrace?.evidence(nativeEvidenceAllowedForTask(intakeTask) ? nativeEvidence() : null);
+  let engineBriefCreated = false;
   let taskStateDirty = false;
   const syncIntakeTask = (): void => {
     const current = opts.taskIntake?.current?.();
@@ -1427,7 +1474,9 @@ async function runAgentInner(
   const taskIntakeTool: Tool | undefined = opts.taskIntake
     ? {
         name: "task_intake",
-        description:
+        description: opts.workspaceRun
+          ? "Optionally revise Hara's engine-generated task brief when the user changes intent, target or scope. Hara records the first brief from the user request and your first response before side effects."
+          :
           "Record or revise your explicit understanding of the active task before side effects. Send it in the same " +
           "response as the first actions it authorizes: Hara saves the brief first, then runs those calls against it. " +
           "Call this only after using the conversation and any needed read-only evidence to identify " +
@@ -1457,6 +1506,7 @@ async function runAgentInner(
         kind: "read",
         classify: () => ({ effect: "state", concurrencySafe: false }),
         run: async (input) => {
+          engineBriefCreated = false;
           // Multiple engine-owned state updates may share one serial tool round. Refresh only before the
           // first update; a later refresh would replace the not-yet-checkpointed local transition.
           if (!taskStateDirty) syncIntakeTask();
@@ -1476,7 +1526,9 @@ async function runAgentInner(
   const taskCheckpointTool: Tool | undefined = opts.taskIntake
     ? {
         name: "task_checkpoint",
-        description:
+        description: opts.workspaceRun
+          ? "Optionally record progress, complex completion checks, or a typed human-only blocker. Hara automatically records simple verified read-only and write/create/delegation completion from actual tool receipts. Explicit completion still needs observed checks and final_answer."
+          :
           "Persist the active task's shared execution state. Use after a major stage, whenever a verified fact " +
           "or required capability state changes, before reporting a blocker, and before final synthesis. Keep the " +
           "canonical completed/pending step list in todo_write; this tool stores the current/blocked/next cursor, " +
@@ -1485,7 +1537,7 @@ async function runAgentInner(
           "the final reply in completion.final_answer (only todo_write may accompany it): " +
           "set completion to verified with observable acceptance evidence, or awaiting_user only with a typed, evidenced " +
           "human-only dependency. Never use awaiting_user merely because giving instructions is easier than acting. " +
-          "Without this fresh receipt an accepted task remains paused. A changed prior fact requires fresh evidence. " +
+          "Without this fresh receipt an accepted task remains paused, except for a pure Workspace read-only answer that Hara itself verifies and records when you reply directly. A changed prior fact requires fresh evidence. " +
           "A changed capability state requires fresh detail. Pass an empty string to clear a resolved cursor/blocker " +
           "field and pass the full artifact list when updating artifacts.",
         input_schema: {
@@ -1550,9 +1602,10 @@ async function runAgentInner(
                     properties: {
                       acceptance_index: { type: "integer", minimum: 0, maximum: 11 },
                       evidence: { type: "string", maxLength: 400 },
-                      tool_call_ids: { type: "array", minItems: 1, maxItems: 4, items: { type: "string" } },
+                      native_evidence_ids: { type: "array", items: { type: "string" }, maxItems: 4, description: "Current Host workspace_native_evidence IDs, scoped to this attempt." },
+                        tool_call_ids: { type: "array", minItems: 1, maxItems: 4, items: { type: "string" } },
                     },
-                    required: ["acceptance_index", "evidence", "tool_call_ids"],
+                    required: ["acceptance_index", "evidence"],
                   },
                 },
                 waiting_for: {
@@ -1609,6 +1662,16 @@ async function runAgentInner(
         classify: () => ({ effect: "state", concurrencySafe: false }),
         run: async (input) => {
           if (!taskStateDirty) syncIntakeTask();
+          // A checked explicit completion is validated against this attempt's observed tool-call
+          // IDs below. The C-lite direct-evidence shortcut is stricter: it needs a structured
+          // change receipt, so a model cannot complete a change by claiming it from prose.
+          const explicitChecks = (input as { completion?: { checks?: unknown } } | null)?.completion?.checks;
+          if (opts.workspaceRun && intakeTask?.brief?.intent === "change"
+            && (input as { completion?: { state?: unknown } } | null)?.completion?.state === "verified"
+            && !Array.isArray(explicitChecks) && !changeEvidence()) {
+            return "Error: task checkpoint rejected — no verified write, create, rename or delegation receipt was observed";
+          }
+          completionEvidence.observeNative(completionEvidenceScope(intakeTask), nativeEvidence());
           const boundEvidence = completionEvidence.bind(intakeTask, input);
           if (!boundEvidence.ok) return `Error: task checkpoint rejected — ${boundEvidence.reason}`;
           input = boundEvidence.input;
@@ -1711,6 +1774,10 @@ async function runAgentInner(
   let contextGuardNotified = false;
   let emptyRetried = false; // one-shot: a genuinely empty model turn gets a single nudge before we give up
   let actionOwnershipRetries = 0; // accepted change tasks may not terminate as advice without a typed blocker
+  // Host feedback is model-only in Workspace runs; it must never become a person-authored message.
+  const modelTranscript = opts.workspaceRun ? new RunModelTranscript(history,
+    message => message.role === "user" && isSystemReminderContent(message.content)) : undefined;
+  const feedbackHistory = modelTranscript ?? history;
   let completionReceiptRetries = 0; // performed work gets one bounded chance to record final verification
   let noProgressFinalizationRetries = 0; // a successful side effect gets one close-out round before watchdog halt
   let credentialDisclosureRetries = 0; // gateway prose gets one hidden correction before a safe hard stop
@@ -1759,7 +1826,7 @@ async function runAgentInner(
   // The engine owns this ledger rather than trusting reminder prose. It retains only digests/shingles and
   // credential-free counters, while treating same-evidence checkpoints/todo rewrites as no progress.
   const progressWatchdog = new AgentProgressWatchdog({
-    unattended: unattendedRun,
+    unattended: life.interactiveWorkspace ? false : unattendedRun, interactive: life.interactiveWorkspace,
     task: intakeTask,
     todos: currentTodos(ctx.todoScope),
     usage: opts.stats,
@@ -1835,9 +1902,12 @@ async function runAgentInner(
     // A cancellation that already happened is authoritative: do not start pending-input work, a provider
     // request, or any later tool round merely to give it an already-aborted signal.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return stoppedOutcome();
-    const taskBoundary = life.taskRoundLimit !== undefined
+    if (life.interactiveWorkspace) {
+      life.activeElapsedMs = 0; life.activeStartedAt = Date.now(); armRunTimers(opts, life);
+    }
+    const taskBoundary = !life.interactiveWorkspace && life.taskRoundLimit !== undefined
       && life.taskRoundsUsed + life.rounds >= life.taskRoundLimit;
-    const runBoundary = life.rounds >= life.maxRounds;
+    const runBoundary = !life.interactiveWorkspace && life.rounds >= life.maxRounds;
     if (taskBoundary || runBoundary) {
       const runCanExtend = !runBoundary || life.maxRounds < MAX_AGENT_MAX_ROUNDS;
       if (runCanExtend && canAutoContinue()) {
@@ -1857,7 +1927,7 @@ async function runAgentInner(
             opts,
             `✻ durable progress verified; continuing automatically in a fresh bounded tranche (${details.join(", ")}).`,
           );
-          history.push({
+          feedbackHistory.push({
             role: "user",
             content: wrapReminders([
               "Automatic continuation boundary: Hara persisted the closed round usage and accepted the recent durable task checkpoint. Continue from that checkpoint without repeating completed work. Re-check the original acceptance criteria, keep the next step bounded, and stop normally when verified; unchanged evidence, human-only dependencies, the active deadline, and the absolute run ceiling still halt execution.",
@@ -1874,7 +1944,7 @@ async function runAgentInner(
     life.rounds += 1;
     const cumulativeTaskRounds = life.taskRoundsUsed + life.rounds;
     if (
-      life.taskRoundCheckpointAt !== undefined
+      !life.interactiveWorkspace && life.taskRoundCheckpointAt !== undefined
       && life.taskRoundsUsed < life.taskRoundCheckpointAt
       && cumulativeTaskRounds >= life.taskRoundCheckpointAt
       && !life.taskRoundCheckpointInjected
@@ -1884,16 +1954,16 @@ async function runAgentInner(
         opts,
         `⚠ task checkpoint: ${cumulativeTaskRounds}/${life.taskRoundLimit} cumulative rounds used. Hara is reviewing evidence and strategy before continuing.`,
       );
-      history.push({
+      feedbackHistory.push({
         role: "user",
         content: wrapReminders([taskRoundCheckpointReminder(cumulativeTaskRounds, life.taskRoundLimit!)]),
       });
     }
-    if (life.rounds >= Math.ceil(life.maxRounds * 0.75)) warnRun(opts, life);
-    if (runActiveElapsedMs(life) >= Math.floor(life.timeoutMs * 0.8)) requestRunCheckpoint(opts, life);
+    if (!life.interactiveWorkspace && life.rounds >= Math.ceil(life.maxRounds * 0.75)) warnRun(opts, life);
+    if (!life.interactiveWorkspace && runActiveElapsedMs(life) >= Math.floor(life.timeoutMs * 0.8)) requestRunCheckpoint(opts, life);
     if (!opts.quiet && life.checkpointDue && !life.checkpointInjected) {
       life.checkpointInjected = true;
-      history.push({
+      feedbackHistory.push({
         role: "user",
         content: wrapReminders([deadlineCheckpointReminder(life.timeoutMs)]),
       });
@@ -1928,7 +1998,7 @@ async function runAgentInner(
     // sub-agent must not steal the main conversation's reminders.
     if (!opts.quiet) {
       const reminders = drainReminders(ctx.todoScope);
-      if (reminders.length) history.push({ role: "user", content: wrapReminders(reminders) });
+      if (reminders.length) feedbackHistory.push({ role: "user", content: wrapReminders(reminders) });
     }
     if (companyExecution) {
       try {
@@ -1993,6 +2063,7 @@ async function runAgentInner(
       undefined,
       Boolean(opts.workspaceRun),
       opts.workspaceRun ? prepareWorkspaceRunWakeBrief(opts.workspaceRun) : undefined,
+      opts.systemOverrideParts,
     );
     // Turn-tier parts (accepted brief, checkpoint, clock) change between provider requests. Left in the
     // system prompt they sit in FRONT of the whole conversation, so every request misses the provider's
@@ -2013,7 +2084,9 @@ async function runAgentInner(
     const system = turnContext
       ? stableSystemParts.map((part) => part.content).join("\n\n")
       : assembledSystem.text;
-    const requestHistory = opts.workspaceRun ? prepareWorkspaceRunHistory(opts.workspaceRun, history) : history;
+    const requestHistory = opts.workspaceRun
+      ? prepareWorkspaceRunHistory(opts.workspaceRun, history, modelTranscript!.read())
+      : history;
     const prepared = prepareHistoryForModel(requestHistory, {
       model: activeProvider.model,
       // Budget against the full context: the trailing turn message costs the same tokens as before.
@@ -2048,6 +2121,7 @@ async function runAgentInner(
     });
     // Never persisted: the durable history stays free of engine context, and the next request rebuilds it.
     if (turnContext) modelHistory.push({ role: "user", content: wrapTurnContext(turnContext) });
+    readOnlyAnswerTrace?.observeModelView(system, modelHistory);
     if (prepared.changed && !contextGuardNotified && !opts.quiet) {
       contextGuardNotified = true;
       const note = `✻ context guard bounded this model request (${Math.round(prepared.originalChars / 1000)}k → ${Math.round(prepared.preparedChars / 1000)}k chars); durable history is unchanged`;
@@ -2218,6 +2292,7 @@ async function runAgentInner(
         else if (hasPendingToolMedia) deferredMediaProse += visible;
         else emitVisibleText(visible);
       },
+      onAssistantPreview: opts.onAssistantPreview,
       onReasoning: () => {
         if (attempt.signal.aborted) return;
         observableProviderActivity = true;
@@ -2337,6 +2412,13 @@ async function runAgentInner(
     // A provider may ignore AbortSignal and return a perfectly valid-looking tool_use after cancellation.
     // The original run signal is authoritative: do not append/approve/execute any late response.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return stoppedOutcome();
+    // Host-owned native transport status, not a provider/model-authored success or a retry request.
+    if (r.errorMetadata?.code === "native_resume_timeout")
+      return { status: "halted", stopReason: "native_resume_timeout", error: "Loading the existing native conversation timed out before this message was submitted. History was kept. Retry loading or open a new session." };
+    if (r.errorMetadata?.code === "native_continuation_unavailable")
+      return { status: "halted", stopReason: "native_prose_only", error: "The native turn ended without an accepted action receipt. Continue explicitly or clarify the request; no action has been replayed." };
+    if (opts.workspaceRun?.binding.agent.runtimeId === "codex" && r.errorMetadata?.code === "native_context_limit")
+      return { status: "halted", stopReason: "native_context_limit" };
     const responseCallIds = new Set<string>();
     const invalidToolIdentity = r.toolUses.some((toolUse) => {
       const id = toolUse.id;
@@ -2377,7 +2459,7 @@ async function runAgentInner(
       if (requestsCredentialDisclosure(guardedText)) {
         if (credentialDisclosureRetries < 1) {
           credentialDisclosureRetries += 1;
-          history.push({
+          feedbackHistory.push({
             role: "user",
             content: wrapReminders([
               `${CREDENTIAL_DISCLOSURE_BLOCKED} Your previous response was withheld and no credential was requested from the user. Continue through a safe registered capability or state the non-secret blocker/workflow.`,
@@ -2429,6 +2511,22 @@ async function runAgentInner(
         r = { ...r, toolUses: split.state };
       }
     }
+    // The first model response supplies an execution hint, while the user's objective remains the
+    // sole authority for intent. Persist this host-owned brief before planning any side effect.
+    if (opts.workspaceRun && opts.taskIntake && !intakeTask?.brief && r.stop !== "error"
+      && !r.toolUses.some(call => call.name === "task_intake")) {
+      syncIntakeTask();
+      if (intakeTask && !intakeTask.brief) {
+        const applied = applyTaskBrief(intakeTask, engineTaskBrief(intakeTask, r));
+        if (!applied.ok) return interactionFailure("engine task brief", applied.reason);
+        try {
+          intakeTask = applied.task;
+          opts.taskIntake.onUpdate?.(intakeTask);
+          opts.taskIntake.onCheckpoint?.(intakeTask);
+          engineBriefCreated = true;
+        } catch (error) { return interactionFailure("engine task brief", error); }
+      }
+    }
     const assistantHistoryMessage: Extract<NeutralMsg, { role: "assistant" }> = {
       role: "assistant",
       // Tool protocol stays complete, but unaccepted completion prose is not a user-visible message.
@@ -2450,7 +2548,7 @@ async function runAgentInner(
       if (recoverableMalformedToolCall(r.errorMsg) && !malformedToolCallRetried && replaySafe) {
         malformedToolCallRetried = true;
         history.pop(); // no partial tool call was executed; discard the invalid assistant protocol row
-        history.push({
+        feedbackHistory.push({
           role: "user",
           content: wrapReminders([
             "Provider protocol recovery: the previous tool call had incomplete or malformed JSON arguments and was not executed. Retry this model once with one small, complete tool call. Include every required parameter; split large writes/commands into bounded calls. Do not repeat the truncated payload.",
@@ -2519,7 +2617,9 @@ async function runAgentInner(
         if (sink) sink.notice(msg);
         else out(kind === "interrupted" ? c.dim(`\n${msg}\n`) : c.red(`${msg}\n`));
       }
-      return { status: "error", error: msg };
+      return { status: "error", error: msg,
+        ...(opts.workspaceRun?.binding.agent.runtimeId === "codex" && replaySafe && r.errorMetadata?.nativeControlFailure
+          ? { nativeControlFailure: r.errorMetadata.nativeControlFailure } : {}) };
     }
 
     // Empty-turn guard. The model returned nothing actionable — no text AND no tool calls (a blank
@@ -2528,10 +2628,11 @@ async function runAgentInner(
     // vanished. Retry ONCE with a nudge (usually a transient hiccup), then, if still empty, say so
     // plainly and end — never loop forever, never disappear. (Claude Code / codex both guard this.)
     if (!r.text.trim() && r.toolUses.length === 0) {
+      if (r.nativeContinuation === "unavailable") return { status: "halted", stopReason: "native_prose_only" };
       if (!emptyRetried) {
         emptyRetried = true;
         history.pop(); // drop the empty assistant turn before re-asking
-        history.push({ role: "user", content: "(Your previous response was empty. Continue the task now — take the next concrete step with a tool, or reply with text. Do not return an empty response.)" });
+        feedbackHistory.push({ role: "user", content: "(Your previous response was empty. Continue the task now — take the next concrete step with a tool, or reply with text. Do not return an empty response.)" });
         if (!opts.quiet) {
           const note = "✻ empty response — retrying once…";
           if (sink) sink.notice(note);
@@ -2556,7 +2657,35 @@ async function runAgentInner(
       && intakeTask?.brief?.intent === "change"
       && !freshTaskCompletion(intakeTask)
     ) {
-      if (successfulOwnedActionObserved) {
+      // Verified native workspace-diff evidence is an action receipt: record it before the native
+      // prose-only guard, which must stop only native turns that changed nothing verifiable.
+      if (engineBriefCreated && workspaceChangeTrace && r.text.trim() && opts.workspaceRun
+        && simpleChangeObjective(intakeTask.objective)) {
+        syncIntakeTask();
+        let pendingInteraction = true;
+        try { pendingInteraction = workspaceRunHasPendingInteraction(opts.workspaceRun); } catch { /* fail closed */ }
+        const evidence = !pendingInteraction && !hasPendingTaskSteering(intakeTask)
+          && !currentTodos(ctx.todoScope).some(todo => todo.status !== "done")
+          ? changeEvidence() : null;
+        if (evidence) {
+          const applied = applyTaskCheckpoint(intakeTask, { completion: { state: "verified", evidence } });
+          if (applied.ok) {
+            try {
+              intakeTask = applied.task;
+              opts.taskIntake?.onUpdate?.(intakeTask);
+              opts.taskIntake?.onCheckpoint?.(intakeTask);
+            } catch (error) { return interactionFailure("engine change completion", error); }
+          }
+        }
+      }
+      if (r.nativeContinuation === "unavailable" && !successfulOwnedActionObserved && !freshTaskCompletion(intakeTask))
+        return { status: "halted", stopReason: "native_prose_only", error: "The native turn ended without a verified action receipt; continue explicitly or clarify the request." };
+      if (freshTaskCompletion(intakeTask)) {
+        // The normal final-response branch below now sees a durable verified completion.
+      } else if (successfulOwnedActionObserved) {
+        // A terminal native run already returned an action result (including a declined card).
+        // Keep verification resumable; the prose-only follow-up must not replay that operation.
+        if (r.nativeContinuation !== undefined) return { status: "halted", stopReason: "completion_verification" };
         if (completionReceiptRetries < 1) {
           completionReceiptRetries += 1;
           history.pop();
@@ -2564,7 +2693,7 @@ async function runAgentInner(
             opts,
             "✻ completion receipt guard: work was performed; asking the Agent to verify and record the result…",
           );
-          history.push({
+          feedbackHistory.push({
             role: "user",
             content: wrapReminders([
               "Completion receipt correction: you already completed at least one concrete change action in this task. Do not repeat finished work and do not hand remaining work to the user. If the accepted checks now pass, record task_checkpoint completion.state=verified with concise observable evidence in its own tool round. If work remains, take the next concrete action. Use awaiting_user only for a currently observed typed human-only dependency.",
@@ -2586,6 +2715,7 @@ async function runAgentInner(
           error: "Work was performed, but the accepted completion checks were not verified. Hara kept the result as a resumable checkpoint instead of reporting the task as complete.",
         };
       }
+      else {
       history.pop();
       try {
         if (!opts.workspaceRun) captureLearning({
@@ -2619,10 +2749,10 @@ async function runAgentInner(
           ? "✻ action ownership guard: advice was not accepted as execution; continuing with the fallback model…"
           : "✻ action ownership guard: advice was not accepted as execution; continuing the task…";
         showRunNotice(opts, note);
-        history.push({
+        feedbackHistory.push({
           role: "user",
           content: wrapReminders([
-            "Execution ownership correction: the accepted task intent is change. Your previous prose-only response was not shown or accepted as completion. Take the next concrete in-scope action with an available tool now. If and only if a human-only blocker is currently observed, record task_checkpoint completion.state=awaiting_user with its allowed dependency kind, exact detail, evidence, and any blocked capability. Otherwise continue through verification and record a verified completion receipt before final prose.",
+            "未见实际修改回执，请执行或说明。Your previous prose-only response was not accepted as completion. Take one concrete in-scope action with an available tool now, or report a currently observed typed human-only blocker.",
           ]),
         });
         continue;
@@ -2630,10 +2760,34 @@ async function runAgentInner(
       const message = "Agent execution ownership guard stopped this run after the model twice returned advice instead of acting or recording a valid human dependency.";
       showRunNotice(opts, message, true);
       return { status: "error", error: message };
+      }
     }
     // A "tool_use" stop with text but no tools (rare) has nothing to execute — end after showing the text
     // rather than pushing an empty tool round and re-requesting in a loop.
-    if (r.stop !== "tool_use" || r.toolUses.length === 0) return { status: "completed" };
+    if (r.stop !== "tool_use" || r.toolUses.length === 0) {
+      // Only the engine can grant the one-round read-only closeout. The model's `answer` label is
+      // insufficient: user objective, actual dispatched tools, paged receipts and open cards all gate it.
+      if (readOnlyAnswerTrace && opts.workspaceRun && r.text.trim()) {
+        syncIntakeTask();
+        let pendingInteraction = true;
+        try { pendingInteraction = workspaceRunHasPendingInteraction(opts.workspaceRun); } catch { /* fail closed */ }
+        let noTools = false;
+        try { noTools = workspaceRunCanCompleteConversation(opts.workspaceRun); } catch { /* fail closed */ }
+        const evidence = readOnlyAnswerTrace.evidence(intakeTask, pendingInteraction,
+          hasPendingTaskSteering(intakeTask), currentTodos(ctx.todoScope).some(todo => todo.status !== "done"), { answer: r.text, noTools });
+        if (evidence) {
+          const applied = applyTaskCheckpoint(intakeTask, { completion: { state: "verified", evidence } });
+          if (applied.ok) {
+            try {
+              intakeTask = applied.task;
+              opts.taskIntake?.onUpdate?.(intakeTask);
+              opts.taskIntake?.onCheckpoint?.(intakeTask);
+            } catch (error) { return interactionFailure("read-only completion checkpoint", error); }
+          }
+        }
+      }
+      return { status: "completed" };
+    }
     // Once an assistant tool_use turn enters history, every tool_use MUST receive a matching tool result.
     // OpenAI/Anthropic both reject a later user turn after an unclosed tool round. Cancellation can happen
     // while planning, approving, or executing, so finalize the round with real results for work that already
@@ -3163,7 +3317,7 @@ async function runAgentInner(
         });
         continue;
       }
-      if (tool.trustBoundary === "external" && !ctx.ask && process.env.HARA_ALLOW_TRUSTED_EXTENSIONS !== "1") {
+      if (tool.trustBoundary === "external" && !(opts.workspaceRun && isWorkspaceExtensionTool(tool)) && !ctx.ask && process.env.HARA_ALLOW_TRUSTED_EXTENSIONS !== "1") {
         plans.push({
           tu,
           tool,
@@ -3352,7 +3506,8 @@ async function runAgentInner(
             question,
             runSignal,
             { allowAlways: Boolean(approvalScope) && !actionGuardReviewReason && !alwaysGate && !organizationApprovalRequired,
-              ...(presentation ? { presentation } : {}), ...(taskApproval ? { taskApproval } : {}) },
+              ...(presentation ? { presentation } : {}), ...(taskApproval ? { taskApproval } : {}),
+              ...(opts.workspaceRun && isWorkspaceExtensionTool(tool) ? { workspaceExtension: createWorkspaceExtensionApproval(tool, tu.id, input) } : {}) },
           ))));
         } catch (error) {
           if (runSignal.aborted) return finalizeStoppedToolRound();
@@ -3570,7 +3725,7 @@ async function runAgentInner(
         const asyncAsk = opts.workspaceRun && p.tool === askUserTool && isAsyncWorkspaceAsk(p.tu.input) && !askUserRequestsCredential(p.tu.input);
         const physicalTool = opts.workspaceRun
           ? executeWorkspaceTool(opts.workspaceRun, p.tool!.name, asyncAsk ? async () => postAsyncWorkspaceAsk(opts.workspaceRun!, p.tu.input)
-            : () => p.tool!.run(p.tu.input, executionToolCtx), () => structuredToolError)
+            : () => p.tool!.run(p.tu.input, executionToolCtx), () => structuredToolError, p.tu.input)
           : p.tool!.run(p.tu.input, executionToolCtx);
         const observedTool = physicalTool.then(
           (value) => { settled = { ok: true, value }; return value; },
@@ -3729,6 +3884,14 @@ async function runAgentInner(
     // output without spooling into the ambient homedir cache or rewriting canonical tool results.
     const boundedContents = opts.workspaceRun ? results.map(result => result.content) : limitToolResultBatch(results.map((result) => result.content));
     for (let i = 0; i < results.length; i++) results[i].content = boundedContents[i];
+    if (readOnlyAnswerTrace) for (let i = 0; i < results.length; i++) {
+      readOnlyAnswerTrace.observe(r.toolUses[i]!.name, r.toolUses[i]!.id, plans[i]?.operation?.effect,
+        results[i]!, plans[i]?.denied !== undefined || looksFailed(results[i]!.content, results[i]!.name));
+    }
+    if (workspaceChangeTrace) for (let i = 0; i < results.length; i++) {
+      workspaceChangeTrace.observe(results[i]!, plans[i]?.denied !== undefined
+        || looksFailed(results[i]!.content, results[i]!.name));
+    }
     history.push({ role: "tool", results });
     const acceptedCompletionReply = Boolean(
       opts.taskIntake
@@ -3797,6 +3960,25 @@ async function runAgentInner(
     }
     if (decisionRetentionError) {
       return interactionFailure("user-decision retention", decisionRetentionError);
+    }
+    if (opts.workspaceRun && opts.finishOnConfirmedColleagueCreate && intakeTask?.brief?.intent === "change"
+      && r.toolUses.filter(call => call.name === "agent_create").length === 1
+      && results.every(result => result.isError !== true && !looksFailed(result.content, result.name))) {
+      const created = results.find(result => result.name === "agent_create");
+      let value: Record<string, unknown> | null = null;
+      try { const raw: unknown = JSON.parse(created?.content ?? ""); if (raw && typeof raw === "object" && !Array.isArray(raw)) value = raw as Record<string, unknown>; } catch { /* Fail closed. */ }
+      const evidence = value?.created === true && value.humanConfirmed === true && value.approvalState === "consumed" ? changeEvidence() : null;
+      if (value && evidence && !workspaceRunHasPendingInteraction(opts.workspaceRun)) {
+        const applied = applyTaskCheckpoint(intakeTask, { completion: { state: "verified", evidence } });
+        if (!applied.ok) return interactionFailure("colleague creation checkpoint", new Error(applied.reason));
+        try { intakeTask = applied.task; opts.taskIntake?.onUpdate?.(intakeTask); opts.taskIntake?.onCheckpoint?.(intakeTask); }
+        catch (error) { return interactionFailure("colleague creation checkpoint", error); }
+        const name = typeof value.agent === "object" && value.agent !== null && !Array.isArray(value.agent)
+          && typeof (value.agent as { identity?: { displayName?: unknown } }).identity?.displayName === "string"
+          ? (value.agent as { identity: { displayName: string } }).identity.displayName : "";
+        history.push({ role: "assistant", text: name ? `已建立同事 ${name}。` : "同事已建立。", toolUses: [] });
+        return { status: "completed" };
+      }
     }
     const successfulTaskCheckpoint = r.toolUses.some((toolUse, index) => {
       const result = results[index];
@@ -3900,7 +4082,7 @@ async function runAgentInner(
       });
     }
     if (grantNoProgressFinalization) {
-      history.push({
+      feedbackHistory.push({
         role: "user",
         content: wrapReminders([life.language === "zh-Hans"
           ? "任务收尾边界：Hara 已观察到本任务至少有一次成功的修改或外部操作，但在 Agent 记录完成证据前触发了无进展止损。不要重复上传、发送、发布或执行其他外部操作。下一轮只开放 task_checkpoint 和必要的 todo_write。根据已有工具回执核对原验收条件：如果已经全部满足，用 task_checkpoint 一次记录 completion.state=verified、简短可观察 evidence 和给用户的 final_answer；如果尚未满足，记录当前事实、剩余步骤或真实的人类依赖，然后安全停止。"
@@ -3943,7 +4125,7 @@ async function runAgentInner(
       // Quiet/background children still receive the deterministic hard stop, but never steal or inject
       // the main conversation's reminder stream.
       if (!opts.quiet) {
-        history.push({
+        feedbackHistory.push({
           role: "user",
           content: wrapReminders([life.language === "zh-Hans"
             ? `任务进展检查：第 ${progressEvent.rounds} 轮，${progressEvent.toolCalls} 次工具调用，` +
@@ -3998,7 +4180,7 @@ async function runAgentInner(
       }
       if (blindShots >= 2) {
         blindNudged = true;
-        history.push({
+        feedbackHistory.push({
           role: "user",
           content: wrapReminders([
             "⚠ Self-check: the selected model has no native image input, so you are acting blind. Stop using the computer tool. Switch models or reach the user through a non-visual path (CLI, API, or send_file). State the new plan in one line, then do it.",

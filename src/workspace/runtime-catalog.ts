@@ -1,7 +1,14 @@
 import type { RuntimeArtifact, OptionalRuntimeId, RuntimeTarget } from "./runtime-install.js";
 
-export const OPTIONAL_RUNTIMES = ["opencode", "codex", "claude", "agy"] as const;
-export const RUNTIME_LABELS = { opencode: "OpenCode", codex: "Codex", claude: "Claude Code", agy: "Antigravity" } as const;
+export const OPTIONAL_RUNTIMES = ["opencode", "codex", "claude", "agy", "gemini", "kimi", "copilot", "cursor", "grok"] as const;
+export const OPTIONAL_RUNTIME_PACKAGES = Object.freeze({ kimi: "@moonshot-ai/kimi-code" });
+export const RUNTIME_LABELS = { opencode: "OpenCode", codex: "Codex", claude: "Claude Code", agy: "Antigravity", gemini: "Gemini CLI", kimi: "Kimi Code", copilot: "GitHub Copilot", cursor: "Cursor", grok: "Grok Build" } as const;
+export const HOST_LOGIN_ONLY_RUNTIMES: readonly string[] = ["opencode", "gemini", "kimi", "copilot", "cursor", "grok"];
+export const MANUAL_RUNTIME_INSTALL_URLS: Partial<Record<OptionalRuntimeId, string>> = {
+  copilot: "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli",
+  cursor: "https://cursor.com/docs/cli/installation",
+  grok: "https://x.ai/news/grok-build-cli",
+};
 const CLAUDE_DIST = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819";
 export const RUNTIME_DOWNLOAD_HOSTS = ["api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com", "storage.googleapis.com"] as const;
 const version = (value: unknown): value is string => typeof value === "string" && /^\d+\.\d+\.\d+$/.test(value);
@@ -10,6 +17,7 @@ const version = (value: unknown): value is string => typeof value === "string" &
  * No vendor installer, package script, global tool config, model endpoint or credential is consulted. */
 export async function resolveOfficialRuntimeArtifact(id: OptionalRuntimeId, target: RuntimeTarget,
   read: (url: string, maxBytes: number, signal?: AbortSignal) => Promise<Buffer>, signal?: AbortSignal): Promise<RuntimeArtifact> {
+  if (id === "gemini" || id === "kimi" || MANUAL_RUNTIME_INSTALL_URLS[id] !== undefined) throw new Error("Install this CLI using its official instructions, then detect and explicitly register it; Hara does not install or log in automatically");
   if (id === "agy") throw new Error("Antigravity is available only through local detection and registration; no official download is configured");
   if (!["darwin", "linux", "win32"].includes(target.platform) || !["arm64", "x64"].includes(target.arch)) throw new Error("Unsupported runtime platform");
   if (target.platform === "win32" && target.arch !== "x64") throw new Error("Windows ARM64 runtime acquisition is not supported");
@@ -41,4 +49,11 @@ export async function resolveOfficialRuntimeArtifact(id: OptionalRuntimeId, targ
   return { runtimeId: id, version: selectedVersion, target, url: entry.browser_download_url, sha256: entry.digest.slice(7),
     format: name.endsWith("zip") ? "zip" : "tar.gz", member: id === "codex" ? `codex-${triple}${target.platform === "win32" ? ".exe" : ""}` : `opencode${target.platform === "win32" ? ".exe" : ""}`,
     maxBytes: entry.size };
+}
+
+/** Documentation only, never an installer command or a fetch authority. */
+export function manualRuntimeInstallation(id: string): { url: string } | null {
+  if (id === "gemini") return { url: "https://geminicli.com/docs/get-started/installation/" };
+  if (id === "kimi") return { url: "https://moonshotai.github.io/kimi-code/en/guides/getting-started.html" };
+  return null;
 }

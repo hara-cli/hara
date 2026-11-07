@@ -26,6 +26,8 @@ const PUBLIC_FILES = new Set([
   "CHANGELOG.md", "SECURITY.md", "CLA.md", "scripts/jev-wechat-bridge.py",
   "docs/volcengine-agent-plan.md", "docs/volcengine-coding-plan.md",
   "docs/jev-action-guard-experience.md", "docs/wechat-agent-scenes.md",
+  // Build-verified generated intent table; its dotted module name is outside the generic module pattern.
+  "dist/agent/core-intents.generated.js",
 ]);
 
 function expectedFilename(pkg) {

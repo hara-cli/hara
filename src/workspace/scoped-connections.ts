@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { sameWorkspaceResourceBinding, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import { deepFreeze, exact, plain, positive, text, UUID, WorkspaceJsonState } from "./local-state.js";
 import { isWorkspaceFileCredential, resolveWorkspaceFileCredential, type WorkspaceFileCredential } from "./file-credential.js";
+import { connectionModelEfforts } from "./connection-models.js";
+import { defaultEffortForLevels } from "./default-effort.js";
 
 export interface ScopedConnection {
   id: string;
@@ -11,6 +13,7 @@ export interface ScopedConnection {
   apiKey?: string;
   credentialFile?: WorkspaceFileCredential;
   defaultModel: string;
+  defaultReasoning?: "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null;
   credentialGeneration: string;
   revision: number;
   status: "active" | "revoked";
@@ -29,18 +32,20 @@ export interface ScopedRunConnection {
   model: string;
   reasoning: string | null;
 }
-export type ScopedConnectionInput = Pick<ScopedConnection, "label" | "provider" | "baseURL" | "defaultModel"> &
+export type ScopedConnectionInput = Pick<ScopedConnection, "label" | "provider" | "baseURL" | "defaultModel" | "defaultReasoning"> &
   ({ apiKey: string; credentialFile?: never } | { credentialFile: WorkspaceFileCredential; apiKey?: never });
 export type ScopedConnectionView = Omit<ScopedConnection, "apiKey" | "baseURL" | "credentialFile">;
 const fail = (): never => { throw new Error("invalid or unavailable scoped model connection; no fallback was selected"); };
 export function isConnectionId(value: unknown): value is string { return typeof value === "string" && value.startsWith("mc_") && UUID.test(value.slice(3)); }
 export function isCredentialGeneration(value: unknown): value is string { return typeof value === "string" && value.startsWith("gen_") && UUID.test(value.slice(4)); }
 function input(value: unknown): ScopedConnectionInput {
-  if (!plain(value) || !exact(value, ["label", "provider", "baseURL", "defaultModel", Object.hasOwn(value, "credentialFile") ? "credentialFile" : "apiKey"])
+  if (!plain(value) || !exact(value, ["label", "provider", "baseURL", "defaultModel", Object.hasOwn(value, "credentialFile") ? "credentialFile" : "apiKey", ...(Object.hasOwn(value, "defaultReasoning") ? ["defaultReasoning"] : [])])
     || !text(value.label, 80)
     || (Object.hasOwn(value, "credentialFile") ? !isWorkspaceFileCredential(value.credentialFile) : !text(value.apiKey, 16_384) || /\s/.test(value.apiKey as string))
     || !text(value.defaultModel) || !text(value.baseURL, 4096)
-    || (value.provider !== "openai" && value.provider !== "anthropic")) return fail();
+    || (value.provider !== "openai" && value.provider !== "anthropic")
+    || value.defaultReasoning !== undefined && value.defaultReasoning !== null
+      && !["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value.defaultReasoning))) return fail();
   let url: URL;
   try { url = new URL(value.baseURL); } catch { return fail(); }
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) return fail();
@@ -50,7 +55,8 @@ function input(value: unknown): ScopedConnectionInput {
 export function isScopedRunConnection(value: unknown): value is ScopedRunConnection {
   return plain(value) && exact(value, ["connectionId", "credentialGeneration", "connectionRevision", "model", "reasoning"])
     && isConnectionId(value.connectionId) && isCredentialGeneration(value.credentialGeneration)
-    && positive(value.connectionRevision) && text(value.model) && (value.reasoning === null || text(value.reasoning, 64));
+    && positive(value.connectionRevision) && text(value.model) && (value.reasoning === null
+      || ["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value.reasoning)));
 }
 
 /** The v2 connection and its credential generation are one atomic, owner-only Workspace snapshot. */
@@ -65,11 +71,12 @@ export class WorkspaceConnectionStoreV2 {
         || !Array.isArray(value.connections) || value.connections.length > 256) return fail();
       const seen = new Set<string>();
       for (const row of value.connections) {
-        if (!plain(row) || !exact(row, ["id", "label", "provider", "baseURL", Object.hasOwn(row, "credentialFile") ? "credentialFile" : "apiKey", "defaultModel", "credentialGeneration", "revision", "status"])
+        if (!plain(row) || !exact(row, ["id", "label", "provider", "baseURL", Object.hasOwn(row, "credentialFile") ? "credentialFile" : "apiKey", "defaultModel", ...(Object.hasOwn(row, "defaultReasoning") ? ["defaultReasoning"] : []), "credentialGeneration", "revision", "status"])
           || !isConnectionId(row.id) || seen.has(row.id) || !isCredentialGeneration(row.credentialGeneration)
           || !positive(row.revision) || !["active", "revoked"].includes(String(row.status))) return fail();
         input({ label: row.label, provider: row.provider, baseURL: row.baseURL,
-          ...(Object.hasOwn(row, "credentialFile") ? { credentialFile: row.credentialFile } : { apiKey: row.apiKey }), defaultModel: row.defaultModel });
+          ...(Object.hasOwn(row, "credentialFile") ? { credentialFile: row.credentialFile } : { apiKey: row.apiKey }), defaultModel: row.defaultModel,
+          ...(Object.hasOwn(row, "defaultReasoning") ? { defaultReasoning: row.defaultReasoning } : {}) });
         seen.add(row.id);
       }
       if (value.defaultConnectionId !== null && !value.connections.some(row => row.id === value.defaultConnectionId && row.status === "active")) return fail();
@@ -84,7 +91,10 @@ export class WorkspaceConnectionStoreV2 {
   add(value: ScopedConnectionInput, expectedRevision: number): ScopedConnectionView {
     const checked = input(value), id = `mc_${randomUUID()}`;
     const next = this.state.update(expectedRevision, state => ({ ...state, defaultConnectionId: state.defaultConnectionId ?? id,
-      connections: [...state.connections, { ...checked, id, credentialGeneration: `gen_${randomUUID()}`, revision: 1, status: "active" }] }));
+      connections: [...state.connections, { ...checked,
+        defaultReasoning: Object.hasOwn(value, "defaultReasoning") ? checked.defaultReasoning ?? null
+          : defaultEffortForLevels(connectionModelEfforts(checked, checked.defaultModel)) as ScopedConnection["defaultReasoning"],
+        id, credentialGeneration: `gen_${randomUUID()}`, revision: 1, status: "active" }] }));
     const { apiKey: _key, credentialFile: _reference, baseURL: _url, ...safe } = next.connections.find(row => row.id === id)!;
     return safe;
   }
@@ -93,8 +103,11 @@ export class WorkspaceConnectionStoreV2 {
     this.state.update(expectedRevision, state => {
       const row = state.connections.find(row => row.id === id && row.status === "active");
       if (!row || row.revision >= Number.MAX_SAFE_INTEGER) return fail();
+      const defaultReasoning = Object.hasOwn(value, "defaultReasoning") ? checked.defaultReasoning ?? null
+        : checked.defaultModel === row.defaultModel ? row.defaultReasoning ?? null
+          : defaultEffortForLevels(connectionModelEfforts(checked, checked.defaultModel)) as ScopedConnection["defaultReasoning"];
       delete row.apiKey; delete row.credentialFile;
-      Object.assign(row, checked, { credentialGeneration: `gen_${randomUUID()}`, revision: row.revision + 1 });
+      Object.assign(row, checked, { defaultReasoning, credentialGeneration: `gen_${randomUUID()}`, revision: row.revision + 1 });
       return state;
     });
   }
@@ -107,9 +120,15 @@ export class WorkspaceConnectionStoreV2 {
       return state;
     });
   }
-  select(id: string, expectedRevision: number): void {
+  select(id: string, expectedRevision: number, modelId?: string, effort?: ScopedConnection["defaultReasoning"]): void {
     this.state.update(expectedRevision, state => {
-      if (!state.connections.some(row => row.id === id && row.status === "active")) return fail();
+      const row = state.connections.find(row => row.id === id && row.status === "active");
+      if (!row || modelId !== undefined && !text(modelId)) return fail();
+      if (modelId !== undefined) {
+        const nextEffort = effort === undefined ? (row.defaultModel === modelId ? row.defaultReasoning ?? null
+          : defaultEffortForLevels(connectionModelEfforts(row, modelId)) as ScopedConnection["defaultReasoning"]) : effort;
+        row.defaultModel = modelId; row.defaultReasoning = nextEffort;
+      }
       state.defaultConnectionId = id; return state;
     });
   }
@@ -117,7 +136,7 @@ export class WorkspaceConnectionStoreV2 {
     const state = this.state.read(), row = state.connections.find(r => r.id === (id ?? state.defaultConnectionId) && r.status === "active");
     if (!row || (model !== undefined && !text(model))) return fail();
     return deepFreeze({ connectionId: row.id, credentialGeneration: row.credentialGeneration,
-      connectionRevision: row.revision, model: model ?? row.defaultModel, reasoning: null });
+      connectionRevision: row.revision, model: model ?? row.defaultModel, reasoning: row.defaultReasoning ?? null });
   }
   /** Host-private; never serialize this result into renderer/history/event DTOs. */
   resolve(binding: ScopedRunConnection): Readonly<ScopedConnection> {

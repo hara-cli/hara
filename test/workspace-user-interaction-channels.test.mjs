@@ -13,6 +13,9 @@ test("a channel question targets only its original colleague and resumes the sam
       : { text: "Continued from the saved point", toolUses: [], stop: "end" };
   } }));
   try {
+    // Durable in-process ask/answer recovery keeps its original controlled transport.
+    const agent=f.host.context(f.id).resources.agents.get(f.members[0]);
+    f.host.context(f.id).resources.agents.setPermissionTier(agent.agentId,"controlled",agent.configRevision,agent.agentEpoch);
     const channel = f.create(), agentId = f.members[0], requestId = randomUUID();
     f.host.sendChannel("client", f.id, channel, "Clarify the target", requestId, [agentId]); await f.host.waitChannel(f.id, channel);
     const before = f.host.channelSnapshot(f.id, channel, "client"), q = before.questions[0].conversation.pendingQuestion;

@@ -44,9 +44,11 @@ test("formal Pi host exposes enabled workspace skill/tool but no global credenti
  const host=new LocalWorkspaceHost(root,{mode:"workspace",hostHome:home,credentialVault:new MemoryCredentialVault(),providerFactory:()=>({id:"openai",model:"fake",async turn(args){turns.push(args);return {text:"Hello from the fake provider",toolUses:[],stopReason:"end_turn",inputTokens:1,outputTokens:1};}})});
  try {
   const view=host.createWorkspace("Fixture",host.list().revision),id=view.workspaceId;host.configureConnection(id,{label:"Fake",provider:"openai",baseURL:"https://example.invalid/v1",defaultModel:"fake",apiKey:"fixture-private-key"},0);
+  // This data-only skill import fixture deliberately keeps the governed tool-only lane.
+  const agent=host.context(id).resources.agents.get(view.selectedAgentId);host.context(id).resources.agents.setPermissionTier(agent.agentId,"controlled",agent.configRevision,agent.agentEpoch);
   const skills=host.workspaceFeatures(id);host.updateFeature(id,"skill","fixture",true,skills.revision,skills.skills[0].version);
   const receipt=host.start("fixture-client",id,view.selectedAgentId,"Hello",randomUUID());await host.wait(receipt.runId);
-  assert.equal(turns.length,1,JSON.stringify(host.snapshot(id).conversation));assert.match(turns[0].system,/Enabled version-locked Workspace skills/);assert.match(turns[0].system,/"id":"fixture"/);
+  assert.equal(turns.length,1,JSON.stringify(host.snapshot(id).conversation));assert.match(turns[0].system,/Current Workspace startup catalog/);assert.match(turns[0].system,/"id":"fixture"/);assert.match(turns[0].system,/retrieve the exact enabled user skill instructions when that user skill is relevant/);
   assert(turns[0].tools.some(tool=>tool.name==="workspace_skill"));assert(!JSON.stringify({system:turns[0].system,tools:turns[0].tools}).includes(home));assert(!turns[0].tools.some(tool=>["bash","skill","exec"].includes(tool.name)));
  }finally{await host.close();}
 });

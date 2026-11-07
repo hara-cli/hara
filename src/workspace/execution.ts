@@ -1,9 +1,16 @@
+import { runtimeToolTargetLabel } from "./runtime-tool-label.js";
+import type { MessageTimingPoint, MessageTimingRecorder } from "./message-timing.js";
+import { runtimeStageErrorKind } from "../agent-runtime/stage-observer.js";
+import { decorateWorkspaceExtensionTool, isWorkspaceExtensionTool } from "./extension-binding.js";
+import type { CompletionEvidenceLedger } from "../agent/completion-evidence.js";
+import { createWorkspaceCompletionEvidence } from "./completion-evidence-store.js";
+import type { RuntimeExecutionPolicy, NativeWorkspaceEvidence, RuntimeRiskEvent } from "../agent-runtime/execution-policy.js";
 // A serialized RunBinding is provenance, never an execution capability. Only trusted Host composition
 // calls this factory; renderer/Agent arguments cannot populate the private WeakMap below.
 import { createHash } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import type { NeutralMsg, Provider, ProviderRetryEvent, TurnResult } from "../providers/types.js";
+import type { NeutralMsg, Provider, ProviderRetryEvent, TurnResult, TurnArgs } from "../providers/types.js";
 import type { RunOpts } from "../agent/loop.js";
 import type { TaskExecution } from "../session/task.js";
 import type { Tool } from "../tools/registry.js";
@@ -14,21 +21,27 @@ import type { WorkspaceSessionLease } from "./session-lease.js";
 import { canonical } from "./local-state.js";
 import { workspaceStateHome, type WorkspaceResourceStorage } from "./resource-context.js";
 import { freezeWorkspaceRunBinding, workspaceFileIdMatches, workspaceRunBindingsEqual, workspaceRunMatchesTask, type WorkspaceRunBinding } from "./run-binding.js";
-import type { WorkspaceUsage } from "./conversations.js";
-import { workspaceTaskHistory, workspaceTaskProjection, workspaceWakeBrief, type WorkspaceContextStats } from "./model-context.js";
+import type { WorkspaceUsage, WorkspaceConversation } from "./conversations.js";
+import { workspaceTaskHistory, workspaceTaskProjection, workspaceWakeData, type WorkspaceContextStats } from "./model-context.js";
 import { historyChars } from "../agent/context-budget.js";
 import type { ToolResult } from "../providers/types.js";
 import type { WorkspaceContextObservation } from "./context-audit.js";
 import { WorkspaceExecutionAudit, type WorkspaceExecutionError } from "./execution-audit.js";
+import type { RuntimeStageRecorder } from "./runtime-stage-events.js";
 import type { WorkspaceUserInteraction, WorkspaceUserQuestion } from "./user-interaction.js";
 
 export interface WorkspaceRunPermit { readonly binding: Readonly<WorkspaceRunBinding> }
 interface PermitState {
+  resetRoundClock?: () => void;
+  completionEvidence: CompletionEvidenceLedger;
+  storage: WorkspaceResourceStorage;
   assertLive(): void;
   provider: Provider;
   options?: RunOpts;
   cwd: string;
   managedProject: boolean;
+  hasLegacyToolPolicy: boolean;
+  nativeConversationSafe: boolean;
   stateHome: string;
   signal: AbortSignal;
   tools: Set<string>;
@@ -38,10 +51,20 @@ interface PermitState {
   lease: WorkspaceSessionLease;
   retired: boolean;
   started: boolean;
+  nativePolicy?: RuntimeExecutionPolicy;
+  nativeEvidence?: NativeWorkspaceEvidence;
+  nativeRisks?: RuntimeRiskEvent[];
+  onNativeRisks?(risks: readonly RuntimeRiskEvent[]): void;
+  compactionSource?(): WorkspaceConversation;
+  runtimeModel?: (args: TurnArgs) => Promise<TurnResult>;
   modelHistory?: { history: NeutralMsg[]; start: number; prefixDigest: string; retain?: (result: ToolResult) => string; usedTokens?: () => number };
   contextStats?: WorkspaceContextStats;
   wakeChars: number;
   audit: WorkspaceExecutionAudit;
+  runtimeStages?: RuntimeStageRecorder;
+  messageTiming?: MessageTimingRecorder;
+  firstStageToken: boolean;
+  onRuntimeStageChanged?: () => void;
   interaction?: WorkspaceUserInteraction;
   onQuestion?: (question: WorkspaceUserQuestion) => void;
   onInteractionChanged?: () => void;
@@ -71,6 +94,13 @@ function publishUsage(state: PermitState, delta: Partial<WorkspaceUsage>): void 
   if (state.updateUsage(Object.freeze({ ...next })) !== undefined) throw new Error("Workspace usage persistence must complete synchronously");
   state.usage = next;
 }
+/** Only native Codex has the approved non-cache run-budget policy. Preserve raw/cache counts in its
+ * private thread telemetry and context audit; other Runtime/provider budget semantics are unchanged. */
+function runtimeUsageDelta(usage: NonNullable<TurnResult["usage"]>, nativeCodex: boolean): Partial<WorkspaceUsage> {
+  const cached = nativeCodex ? usage.cachedInput ?? 0 : 0;
+  if (!Number.isSafeInteger(cached) || cached < 0 || cached > usage.input) throw new Error("invalid Workspace native cache telemetry");
+  return { inputTokens: usage.input - cached, outputTokens: usage.output };
+}
 
 /** A path-shaped string alone cannot opt a user project out of the CLI trust check. */
 export function workspaceRunHasManagedProject(permit: WorkspaceRunPermit): boolean {
@@ -91,9 +121,17 @@ export function createWorkspaceRunPermit(input: {
   signal: AbortSignal;
   toolNames: readonly string[];
   usage: WorkspaceUsage;
+  /** Same-task continuation predecessor and actual question answer from protected Host state; never renderer task data. */
+  completionRecovery?: { previousTask: TaskExecution; currentTask: TaskExecution; answeredQuestionId?: string };
   /** Trusted Host-only attempt boundary. Persisted history stays complete and append-only. */
   modelHistory?: { history: NeutralMsg[]; start: number; retain?: (result: ToolResult) => string; usedTokens?: () => number };
   observeContext?(value: WorkspaceContextObservation): void;
+  /** Host-created diagnostic recorder, never accepted from model/RPC data. */
+  runtimeStages?: RuntimeStageRecorder;
+  messageTiming?: MessageTimingRecorder;
+  onRuntimeStageChanged?(): void;
+  onNativeRisks?(risks: readonly RuntimeRiskEvent[]): void;
+  compactionSource?(): WorkspaceConversation;
   interaction?: WorkspaceUserInteraction;
   onQuestion?(question: WorkspaceUserQuestion): void;
   /** Host view refresh after an ask card is posted (async cards do not pass through a checkpoint). */
@@ -116,13 +154,15 @@ export function createWorkspaceRunPermit(input: {
   const stateHome = input.storage.run(() => workspaceStateHome());
   let state: PermitState;
   const assertLive = (): void => {
-    if (state?.retired || input.signal.aborted || Date.now() - started >= binding.budget.timeoutMs) throw new Error("Workspace attempt cancelled or expired");
+    if (state?.retired || input.signal.aborted || (binding.budget.mode !== "interactive" && Date.now() - started >= binding.budget.timeoutMs)) throw new Error("Workspace attempt cancelled or expired");
     input.lease.assertCurrent();
     const project = lstatSync(cwd, { bigint: true });
     if (!project.isDirectory() || project.isSymbolicLink() || realpathSync.native(cwd) !== cwd
       || !workspaceFileIdMatches(binding.project.dev, project.dev) || !workspaceFileIdMatches(binding.project.ino, project.ino)) throw new Error("Workspace project grant identity changed");
     input.storage.run(() => {});
-    const catalog = input.catalog.read(), row = input.catalog.resolve(binding.scope.workspaceId);
+    // Use one freshly verified catalog snapshot so host epoch and grant come from the same revision.
+    const catalog = input.catalog.read(), row = catalog.workspaces.find(row => row.scope.workspaceId === binding.scope.workspaceId && row.active);
+    if (!row) throw new Error("Workspace is unavailable or revoked");
     if (canonical(row.scope) !== canonical(binding.scope) || catalog.hostId !== binding.host.hostId || catalog.hostEpoch !== binding.host.hostEpoch
       || row.actorId !== binding.host.actorId || row.policyRevision !== binding.host.policyRevision
       || row.grantId !== binding.host.grantId || row.grantRevision !== binding.host.grantRevision) throw new Error("Workspace Host authority was revoked");
@@ -145,18 +185,22 @@ export function createWorkspaceRunPermit(input: {
       assertLive();
       if (!state.started) throw new Error("Workspace model requires the governed entry");
       if (signal?.aborted) throw new Error("Workspace model preparation cancelled");
+      if (state.runtimeModel) return undefined; // Native CLI owns its model transport; never prepare another provider route.
       const result = await track(state, Promise.resolve().then(() => { assertLive(); return input.provider.prepareTurn?.(history, signal); }));
       assertLive(); return result;
     },
     async turn(args) {
       assertLive();
       if (!state.started) throw new Error("Workspace model requires the governed entry");
-      if (args.signal?.aborted || state.usage.modelCalls >= binding.budget.maxRounds
-        || state.usage.inputTokens + state.usage.outputTokens >= binding.budget.maxTokens) throw new Error("Workspace model budget exhausted or cancelled");
+      if (args.signal?.aborted || (binding.budget.mode !== "interactive" && (state.usage.modelCalls >= binding.budget.maxRounds
+        || state.usage.inputTokens + state.usage.outputTokens >= binding.budget.maxTokens))) throw new Error("Workspace model budget exhausted or cancelled");
       if (state.interaction?.check(state.interactionUsage?.() ?? state.usage, Date.now() - started)) throw new Error("Workspace is waiting for user input; model not dispatched");
+      state.resetRoundClock?.();
       publishUsage(state, { modelCalls: 1 });
       const auditIndex = state.audit.start("model", state.usage.modelCalls, "provider"), callStarted = performance.now();
+      const endStage = runtimeStageObserve(state, () => state.runtimeStages?.beginEvent("model_roundtrip", { call: state.usage.modelCalls }));
       let outcome: "completed" | "error" | "cancelled" = "error", errorKind: WorkspaceExecutionError = "thrown", status: number | null = null;
+      let stageError = runtimeStageErrorKind(undefined);
       const observation = { modelCall: state.usage.modelCalls, systemChars: args.system.length, toolSchemaChars: JSON.stringify(args.tools).length,
         systemAndToolsUtf8Bytes: Buffer.byteLength(args.system + JSON.stringify(args.tools)), modelHistoryChars: historyChars(args.history), wakeChars: state.wakeChars,
         ...(state.contextStats ?? { compacted: false, originalChars: historyChars(args.history), recentChars: historyChars(args.history), summaryChars: 0, toolMaxChars: 0, agedToolMaxChars: 0 }) };
@@ -166,34 +210,56 @@ export function createWorkspaceRunPermit(input: {
         if (!fn || revoked.signal.aborted || args.signal?.aborted) return;
         try { assertLive(); fn(...values); } catch { revoked.abort(); }
       };
-      const guardedArgs = { ...args, signal: AbortSignal.any(signals), onText: forward(args.onText),
-        onReasoning: forward(args.onReasoning), onActivity: forward(args.onActivity), onRetry: forward((event: ProviderRetryEvent) => {
-          state.audit.retry(auditIndex, event); args.onRetry?.(event);
+      let lastActivityAt = -Infinity;
+      const forwardActivity = forward(args.onActivity);
+      const guardedArgs = { ...args, signal: AbortSignal.any(signals), onText: forward((chunk: string) => {
+        // A native MCP handoff is a governor wait, not proof of a model token. Native
+        // output is observed by its driver from documented structured events only.
+        if (chunk.length && !state.runtimeModel && state.runtimeStages && !state.firstStageToken) {
+          state.firstStageToken = true; runtimeStageObserve(state, () => state.runtimeStages?.mark("first_token", "provider_stream"));
+        }
+        args.onText?.(chunk);
+      }),
+        onAssistantPreview: forward(args.onAssistantPreview),
+        onReasoning: forward(args.onReasoning), onActivity: () => {
+          const now = performance.now();
+          // Drop redundant payload-free watchdog ticks. Every delivered tick still runs the
+          // original fresh check; no cached allow is reused for text, tools or side effects.
+          if (now - lastActivityAt < 50) return;
+          lastActivityAt = now; forwardActivity();
+        }, onRetry: forward((event: ProviderRetryEvent) => {
+          state.audit.retry(auditIndex, event);
+          runtimeStageObserve(state, () => state.runtimeStages?.markRetry(event.kind === "rate_limit" ? "runtime_rate_limit" : event.kind === "timeout" ? "timeout" : "runtime_network"));
+          args.onRetry?.(event);
         }) };
-      const operation = Promise.resolve().then(() => { assertLive(); if (guardedArgs.signal.aborted) throw new Error("Workspace model cancelled"); return input.provider.turn(guardedArgs); });
+      const operation = Promise.resolve().then(() => { assertLive(); if (guardedArgs.signal.aborted) throw new Error("Workspace model cancelled"); return state.runtimeModel ? state.runtimeModel(guardedArgs) : input.provider.turn(guardedArgs); });
       try {
         const result: TurnResult = await track(state, operation);
         // Even a cancelled/late request consumes its recorded telemetry, but never releases more tools.
-        try { if (result.usage) publishUsage(state, { inputTokens: result.usage.input, outputTokens: result.usage.output }); }
+        try { if (result.usage) publishUsage(state, runtimeUsageDelta(result.usage, Boolean(state.runtimeModel) && binding.agent.runtimeId === "codex")); }
         finally { input.observeContext?.({ ...observation, input: result.usage?.input ?? null, output: result.usage?.output ?? null,
           inputWarning: (result.usage?.input ?? 0) > 12000 }); }
         assertLive();
-        if (state.usage.inputTokens + state.usage.outputTokens > binding.budget.maxTokens) {
+        if (result.usage && Number.isSafeInteger(result.usage.input) && result.usage.input >= 0) runtimeStageObserve(state, () => state.runtimeStages?.setContextTokens(result.usage!.input));
+        if (binding.budget.mode !== "interactive" && state.usage.inputTokens + state.usage.outputTokens > binding.budget.maxTokens) {
           errorKind = "budget_exhausted"; throw new Error("Workspace token telemetry safety ceiling reached");
         }
         outcome = result.stop === "error" ? "error" : "completed"; errorKind = result.stop === "error" ? "provider_error" : null;
+        stageError = runtimeStageErrorKind(result.errorMetadata?.code ?? result.errorMsg);
         status = result.errorMetadata?.status ?? null;
         return result;
       } finally {
         if (input.signal.aborted || args.signal?.aborted || revoked.signal.aborted) { outcome = "cancelled"; errorKind = "cancelled"; }
+        runtimeStageObserve(state, () => endStage?.(outcome, outcome === "error" ? stageError : undefined));
         state.audit.finish(auditIndex, performance.now() - callStarted, outcome, errorKind, status);
       }
     },
   };
-  state = { assertLive, provider, cwd, managedProject, stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
+  state = { completionEvidence: createWorkspaceCompletionEvidence(input.storage, binding, input.completionRecovery), nativeConversationSafe: true, compactionSource: input.compactionSource, onNativeRisks: input.onNativeRisks, storage: input.storage, assertLive, provider, cwd, managedProject, hasLegacyToolPolicy: Boolean(input.resources.agents.resolveTask(binding.agent).toolPolicy), stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
     updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false, wakeChars: 0,
     interaction: input.interaction, onQuestion: input.onQuestion, onInteractionChanged: input.onInteractionChanged, interactionUsage: input.interactionUsage, startedAt: started, toolTail: Promise.resolve(),
     audit: new WorkspaceExecutionAudit(input.storage, binding.runId, binding.agent.agentId),
+    runtimeStages: input.runtimeStages, messageTiming: input.messageTiming, firstStageToken: false, onRuntimeStageChanged: input.onRuntimeStageChanged,
     ...(input.modelHistory ? { modelHistory: { ...input.modelHistory,
       prefixDigest: createHash("sha256").update(canonical(input.modelHistory.history.slice(0, input.modelHistory.start))).digest("hex") } } : {}) };
   for (const value of Object.values(state.usage)) if (!Number.isSafeInteger(value) || value < 0) throw new Error("invalid Workspace persisted usage");
@@ -213,12 +279,14 @@ export function bindWorkspaceRunOptions(permit: WorkspaceRunPermit, input: Omit<
     || input.signal !== state.signal || !input.taskIntake) throw new Error("Workspace run contains unscoped dependencies");
   const extraTools = input.extraTools?.map(tool => {
     if (!state.tools.has(tool.name) || ["task_intake", "task_checkpoint", "todo_write"].includes(tool.name)
-      || tool.kind === "exec" || tool.kind === "computer") throw new Error("unscoped Workspace extra tool");
-    return Object.freeze({ ...tool });
+      || (tool.kind === "exec" || tool.kind === "computer") && !isWorkspaceExtensionTool(tool)) throw new Error("unscoped Workspace extra tool");
+    return Object.freeze(decorateWorkspaceExtensionTool(tool, { ...tool }));
   }) ?? [];
   const options: RunOpts = { ...input, ctx: Object.freeze({ ...input.ctx, stateHome: state.stateHome, writeBoundary: state.cwd,
     ...(input.ctx.ui ? { ui: Object.freeze({ ...input.ctx.ui }) } : {}) }),
     taskIntake: Object.freeze({ ...input.taskIntake }), extraTools: Object.freeze(extraTools) as unknown as Tool[],
+    systemOverrideParts: input.systemOverrideParts
+      ? Object.freeze(input.systemOverrideParts.map(part => Object.freeze({ ...part }))) : undefined,
     provider: state.provider, workspaceRun: permit, toolFilter: name => state.tools.has(name), autoContinue: false,
     maxRounds: permit.binding.budget.maxRounds, timeoutMs: permit.binding.budget.timeoutMs };
   state.options = options;
@@ -234,13 +302,25 @@ export function assertWorkspaceRunAdmission(permit: unknown, options: RunOpts, r
     || options.toolFilter !== pinned.toolFilter || options.hooks !== false || options.guardian || options.fallback
     || options.ctx.cwd !== state.cwd || options.ctx.sessionId !== binding.sessionId || options.ctx.stateHome !== state.stateHome
     || options.ctx.spaceId !== undefined || options.ctx.profileId !== undefined || options.signal !== state.signal
-    || options.systemOverride !== pinned.systemOverride || options.memory !== pinned.memory || options.projectContext !== pinned.projectContext
+    || options.systemOverride !== pinned.systemOverride || options.systemOverrideParts !== pinned.systemOverrideParts
+    || options.memory !== pinned.memory || options.projectContext !== pinned.projectContext
     || options.approval !== pinned.approval || options.approvalChannel !== pinned.approvalChannel || options.confirm !== pinned.confirm
     || options.ctx.ui !== pinned.ctx.ui || options.ctx.ask !== pinned.ctx.ask || options.ctx.todoScope !== pinned.ctx.todoScope
     || options.ctx.writeBoundary !== pinned.ctx.writeBoundary || options.ctx.spawn || options.ctx.agentTeam
     || options.ctx.inspectImage || options.ctx.describeImage || options.ctx.locate || options.ctx.toolImageMode) {
     throw new Error("Workspace execution options do not match the trusted Host permit");
   }
+}
+/** Trusted native Runtime composition only: one immutable model transport before admission is consumed.
+ * The existing provider wrapper retains liveness, accounting, audit, cancellation and physical tracking. */
+export function attachWorkspaceRuntimeModel(permit: WorkspaceRunPermit, options: RunOpts, runtimeId: "codex" | "claude" | "gemini" | "kimi",
+  execute: (args: TurnArgs) => Promise<TurnResult>): void {
+  assertWorkspaceRunAdmission(permit, options, runtimeId);
+  const state = stateOf(permit);
+  if ((!["codex", "claude", "gemini", "kimi"].includes(runtimeId)) || state.started || state.runtimeModel || typeof execute !== "function") {
+    throw new Error("Workspace Runtime model transport is unavailable or already attached");
+  }
+  state.runtimeModel = execute;
 }
 export function beginWorkspaceGovernedRun(permit: WorkspaceRunPermit, options: RunOpts, runtimeId: string): void {
   assertWorkspaceRunAdmission(permit, options, runtimeId);
@@ -249,17 +329,77 @@ export function beginWorkspaceGovernedRun(permit: WorkspaceRunPermit, options: R
   state.started = true;
 }
 export function workspaceRunToolAllowed(permit: WorkspaceRunPermit, name: string): boolean { return stateOf(permit).tools.has(name); }
+/** Imported role policies grant only their scoped Hara tools, never an extra native shell. */
+export function workspaceRunHasLegacyToolPolicy(permit: WorkspaceRunPermit): boolean {
+  const state = stateOf(permit); state.assertLive(); return state.hasLegacyToolPolicy;
+}
+/** Trusted native transport composition; never derived from a renderer path or the foreground scope. */
+export function workspaceRuntimeStorage(permit: WorkspaceRunPermit): WorkspaceResourceStorage {
+  const state = stateOf(permit); state.assertLive(); return state.storage;
+}
+/** Trusted Host facts, rechecked at use. Never exposed as a model/renderer capability. */
+export function workspaceCompactionSource(permit: WorkspaceRunPermit): WorkspaceConversation | null {
+  const state = stateOf(permit); state.assertLive(); return state.compactionSource?.() ?? null;
+}
+/** Reserve the separate native maintenance dispatch before effects; the ordinary turn is already reserved. */
+export function reserveWorkspaceCompaction(permit: WorkspaceRunPermit): ((ok: boolean, kind?: import("../agent-runtime/failure-diagnostics.js").RuntimeFailureKind) => void) | null {
+  const state = stateOf(permit); state.assertLive();
+  const limits = permit.binding.budget;
+  if (!state.started || state.signal.aborted) throw new Error("Workspace compaction is not admitted");
+  if (limits.mode !== "interactive" && (state.usage.modelCalls >= limits.maxRounds
+    || state.usage.inputTokens + state.usage.outputTokens >= limits.maxTokens)) return null;
+  if (state.interaction?.check(state.interactionUsage?.() ?? state.usage, Date.now() - state.startedAt)) return null;
+  state.resetRoundClock?.();
+  publishUsage(state, { modelCalls: 1 });
+  const index = state.audit.start("model", state.usage.modelCalls, "context_compaction"), began = performance.now();
+  const end = runtimeStageObserve(state, () => state.runtimeStages?.beginEvent("model_roundtrip", { call: state.usage.modelCalls }));
+  let ended = false;
+  return (ok, kind) => {
+    if (ended) return; ended = true;
+    runtimeStageObserve(state, () => end?.(ok ? "completed" : "error", ok ? undefined : kind ?? "runtime_failed"));
+    state.audit.finish(index, performance.now() - began, ok ? "completed" : "error", ok ? null : "provider_error", null);
+  };
+}
+/** Charge observed native telemetry even when cancellation prevented another provider boundary. */
+export function recordWorkspaceRuntimeUsage(permit: WorkspaceRunPermit, usage: TurnResult["usage"]): void {
+  const state = stateOf(permit);
+  if (usage) publishUsage(state, runtimeUsageDelta(usage, Boolean(state.runtimeModel) && permit.binding.agent.runtimeId === "codex"));
+}
+/** Native inference can make progress between virtual governor boundaries. Stop on observed overage
+ * immediately; accounting still travels through the ordinary provider result or final drain. */
+export function assertWorkspaceRuntimeUsage(permit: WorkspaceRunPermit, pending: { input: number; output: number; cachedInput?: number }): void {
+  const state = stateOf(permit); state.assertLive();
+  const delta = runtimeUsageDelta(pending, permit.binding.agent.runtimeId === "codex");
+  if (!Number.isSafeInteger(pending.input) || !Number.isSafeInteger(pending.output) || pending.input < 0 || pending.output < 0
+    || (permit.binding.budget.mode !== "interactive" && state.usage.inputTokens + state.usage.outputTokens + delta.inputTokens! + pending.output > permit.binding.budget.maxTokens)) {
+    throw new Error("Workspace native token telemetry safety ceiling reached");
+  }
+}
 /** Trusted Host composition may retain a long instruction reference before options are pinned. */
+/** WeakMap-backed permit is required; an arbitrary option or renderer flag cannot enable this. */
+export function bindWorkspaceRoundClock(permit: WorkspaceRunPermit, reset: () => void): () => void {
+  const state = stateOf(permit); state.assertLive();
+  if (state.resetRoundClock) throw new Error("Workspace round clock already bound");
+  if (permit.binding.budget.mode === "interactive") state.resetRoundClock = reset;
+  return () => { if (state.resetRoundClock === reset) state.resetRoundClock = undefined; };
+}
+export function workspaceRunIsInteractive(permit: WorkspaceRunPermit): boolean {
+  const state = stateOf(permit); state.assertLive(); return permit.binding.budget.mode === "interactive";
+}
 export function assertWorkspaceRunContextCurrent(permit: WorkspaceRunPermit): void { stateOf(permit).assertLive(); }
-export function prepareWorkspaceRunHistory(permit: WorkspaceRunPermit, history: NeutralMsg[]): NeutralMsg[] {
+export function prepareWorkspaceRunHistory(permit: WorkspaceRunPermit, history: NeutralMsg[], modelTranscript?: NeutralMsg[]): NeutralMsg[] {
   const state = stateOf(permit); state.assertLive();
   if (!state.started) throw new Error("Workspace model context requires the governed entry");
   const pinned = state.modelHistory;
-  if (!pinned) return history; // Existing trusted non-Host fixtures already contain one attempt only.
+  if (!pinned) return modelTranscript ?? history; // Existing trusted non-Host fixtures already contain one attempt only.
   if (history !== pinned.history || createHash("sha256").update(canonical(history.slice(0, pinned.start))).digest("hex") !== pinned.prefixDigest) {
     throw new Error("Workspace durable history prefix changed; model request refused");
   }
-  const projected = workspaceTaskProjection(history, pinned.start, { usedTokens: pinned.usedTokens?.() ?? state.usage.inputTokens + state.usage.outputTokens,
+  // Validate the original durable prefix first. The run-only overlay retains the current user
+  // object, so removing legacy internal rows or adding feedback cannot shift the task boundary.
+  const source = modelTranscript ?? history;
+  const start = modelTranscript ? source.indexOf(history[pinned.start]!) : pinned.start;
+  const projected = workspaceTaskProjection(source, start, { usedTokens: pinned.usedTokens?.() ?? state.usage.inputTokens + state.usage.outputTokens,
     maxTokens: permit.binding.budget.maxTokens, task: state.options?.taskIntake?.current?.(), retain: pinned.retain });
   state.contextStats = projected.stats; return projected.history;
 }
@@ -267,7 +407,7 @@ export function prepareWorkspaceRunWakeBrief(permit: WorkspaceRunPermit): string
   const state = stateOf(permit); state.assertLive();
   const task = state.options?.taskIntake?.current?.() ?? state.options?.taskIntake?.task;
   if (!state.started || !task) throw new Error("Workspace wake context requires the governed task");
-  const brief = workspaceWakeBrief(task, state.modelHistory?.retain); state.wakeChars = brief.length; return brief;
+  const brief = workspaceWakeData(task, state.modelHistory?.retain); state.wakeChars = brief.length; return brief;
 }
 /** Called at a closed-history boundary, before another model request or tool batch. */
 export function workspaceRunQuestion(permit: WorkspaceRunPermit): WorkspaceUserQuestion | null {
@@ -276,6 +416,12 @@ export function workspaceRunQuestion(permit: WorkspaceRunPermit): WorkspaceUserQ
   const question = state.interaction?.check(state.interactionUsage?.() ?? state.usage, Date.now() - state.startedAt) ?? null;
   if (question) state.onQuestion?.(question);
   return question;
+}
+/** Read-only completion must not close a turn while a user question/card is still open. */
+export function workspaceRunHasPendingInteraction(permit: WorkspaceRunPermit): boolean {
+  const state = stateOf(permit);
+  if (state.retired || state.signal.aborted) return true;
+  return Boolean(state.interaction?.question() || state.interaction?.pendingInteractions().length);
 }
 /** ask_user enters the same run-bound ask channel as the observation gates. sync retains the one
  * blocking question; async posts a card and lets non-interactive work continue. */
@@ -298,17 +444,19 @@ export function workspaceRunAsyncAnswers(permit: WorkspaceRunPermit): NeutralMsg
 export function workspaceRunBeginToolBatch(permit: WorkspaceRunPermit, names: readonly string[]): void {
   stateOf(permit).interaction?.beginBatch(names);
 }
-export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string, execute: () => Promise<T>, toolFailed?: (result: T) => boolean): Promise<T> {
+export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string, execute: () => Promise<T>, toolFailed?: (result: T) => boolean, toolInput?: unknown): Promise<T> {
   const state = stateOf(permit); state.assertLive();
   // Serialize the governed dispatch boundary, including read lookups. A third queued search or a
   // sibling write cannot run past the second result that required a real user's answer.
   const operation = state.toolTail.then(async () => {
     state.assertLive();
-    if (!state.started || !state.tools.has(name) || state.usage.toolCalls >= permit.binding.budget.maxToolCalls) throw new Error("Workspace tool unavailable or budget exhausted");
+    if (!state.started || !state.tools.has(name) || (permit.binding.budget.mode !== "interactive" && state.usage.toolCalls >= permit.binding.budget.maxToolCalls)) throw new Error("Workspace tool unavailable or budget exhausted");
     if (name !== "ask_user" && state.interaction?.check(state.interactionUsage?.() ?? state.usage, Date.now() - state.startedAt)) throw new Error("Workspace is waiting for user input; tool not dispatched");
     state.interaction?.admit(name);
     publishUsage(state, { toolCalls: 1 });
     const auditIndex = state.audit.start("tool", state.usage.toolCalls, name), callStarted = performance.now();
+    const targetLabel = runtimeToolTargetLabel(name, toolInput);
+    const endStage = runtimeStageObserve(state, () => state.runtimeStages?.beginEvent("tool_call", { call: state.usage.toolCalls, toolName: name, ...(targetLabel ? { targetLabel } : {}) }));
     let outcome: "completed" | "error" | "cancelled" = "error", errorKind: WorkspaceExecutionError = "thrown";
     try {
       state.assertLive(); const result = await execute();
@@ -319,6 +467,7 @@ export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string
       state.interaction?.observe(name, undefined, true); throw error;
     } finally {
       if (state.signal.aborted) { outcome = "cancelled"; errorKind = "cancelled"; }
+      runtimeStageObserve(state, () => endStage?.(outcome, outcome === "error" ? "runtime_failed" : undefined));
       state.audit.finish(auditIndex, performance.now() - callStarted, outcome, errorKind);
     }
   });
@@ -328,5 +477,81 @@ export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string
 export async function closeWorkspaceRunPermit(permit: WorkspaceRunPermit): Promise<void> {
   const state = stateOf(permit); state.retired = true;
   while (state.pending.size) await Promise.allSettled([...state.pending]);
+  if (state.nativePolicy) {
+    state.lease.setDraining(true);
+    const policy = state.nativePolicy;
+    // A failed native teardown never releases the physical lease or silently reuses a resident.
+    const { endWorkspaceNativePolicy } = await import("../agent-runtime/workspace-native-policy.js");
+    await endWorkspaceNativePolicy(permit, policy, { keepResidentRoot: false }); await policy.close();
+    state.lease.setDraining(false);
+  }
   state.lease.release();
+}
+
+/** Observation only. Callers retain the original live checks at protected boundaries. */
+export function observeWorkspaceMessageTiming(permit: WorkspaceRunPermit, point: Exclude<MessageTimingPoint, "T0" | "T1" | "T7">, at?: number): void {
+  const state = stateOf(permit);
+  if (!state.retired && !state.signal.aborted) try {
+    const observed = state.messageTiming?.mark(point, at);
+    // T8 is a live observation, not durable completion. Publish it before the T9 drain/commit.
+    if (point === "T8" && observed) state.onRuntimeStageChanged?.();
+  } catch { /* Optional diagnostics. */ }
+}
+
+/** Diagnostics never confer execution authority or make an observer failure a task failure. */
+function runtimeStageObserve<T>(state: PermitState, observe: () => T): T | undefined {
+  if (state.retired || !state.runtimeStages) return undefined;
+  try { const value = observe(); state.onRuntimeStageChanged?.(); return value; } catch { return undefined; }
+}
+/** Only a real Host permit may attach native lifecycle metadata. No renderer identity is accepted. */
+export function workspaceRunRuntimeStages(permit: WorkspaceRunPermit): RuntimeStageRecorder | undefined {
+  const state = stateOf(permit); state.assertLive(); return state.runtimeStages;
+}
+
+/** Host composition only. Serialized events and model tool inputs cannot install a policy. */
+export function attachWorkspaceNativePolicy(permit: WorkspaceRunPermit, policy: RuntimeExecutionPolicy): void {
+  const state = stateOf(permit); state.assertLive();
+  if (state.nativePolicy && state.nativePolicy !== policy) throw new Error("A native process already owns this attempt");
+  if (policy.runtimeId !== permit.binding.agent.runtimeId || policy.tier !== (permit.binding.agent.permissionTier ?? "controlled")) throw new Error("Native policy does not match the frozen runtime and permission tier");
+  if (policy.workRoot !== state.cwd) throw new Error("Native working directory does not match the admitted project");
+  state.nativePolicy = policy; state.nativeEvidence = undefined; state.nativeConversationSafe = false;
+}
+/** Host-only proof for a tool-free greeting/self-introduction after native settle and drain. */
+export function workspaceRunCanCompleteConversation(permit: WorkspaceRunPermit): boolean {
+  const state = stateOf(permit); state.assertLive();
+  return state.usage.toolCalls === 0 && !state.nativePolicy && state.nativeConversationSafe;
+}
+export function workspaceRunNativeEvidence(permit: WorkspaceRunPermit): NativeWorkspaceEvidence | null {
+  const state = stateOf(permit); state.assertLive();
+  if (state.nativePolicy) state.nativeEvidence = state.nativePolicy.collectWorkspaceEvidence() ?? undefined;
+  return state.nativeEvidence ? structuredClone(state.nativeEvidence) : null;
+}
+export function publishWorkspaceNativeRisks(permit: WorkspaceRunPermit): void {
+  const state = stateOf(permit), policy = state.nativePolicy;
+  if (!policy) return;
+  const risks = policy.risks.map(row => ({ ...row }));
+  if (JSON.stringify(risks) !== JSON.stringify(state.nativeRisks)) {
+    state.nativeRisks = risks; state.onNativeRisks?.(risks);
+  }
+}
+/** Called before policy cleanup, including cancellation; collection never makes a retired permit live. */
+export function finishWorkspaceNativePolicy(permit: WorkspaceRunPermit, policy: RuntimeExecutionPolicy): void {
+  const state = stateOf(permit);
+  if (state.nativePolicy !== policy) return;
+  try { state.nativeEvidence = policy.collectWorkspaceEvidence() ?? undefined; state.nativeConversationSafe = typeof policy.canCompleteConversation === "function" && policy.canCompleteConversation(); publishWorkspaceNativeRisks(permit); }
+  finally { state.nativePolicy = undefined; }
+}
+
+/** Native Pi tool batches are issued by the Host model bridge, never inferred from CLI success text. */
+export function recordWorkspacePiNativeCalls(permit: WorkspaceRunPermit, names: readonly string[]): void {
+  const state = stateOf(permit); state.assertLive();
+  const native = new Set(["read", "bash", "edit", "write"]);
+  if (!state.started || !state.nativePolicy || permit.binding.agent.runtimeId !== "pi" || names.some(name => !native.has(name)) || names.length > 256
+    || (permit.binding.budget.mode !== "interactive" && state.usage.toolCalls + names.length > permit.binding.budget.maxToolCalls)) throw new Error("Workspace native Pi tool budget exhausted");
+  if (names.length) publishUsage(state, { toolCalls: names.length });
+}
+
+/** Trusted Host permit only. The model cannot supply or restore a provenance journal. */
+export function workspaceRunCompletionEvidence(permit: WorkspaceRunPermit): CompletionEvidenceLedger {
+  const state = stateOf(permit); state.assertLive(); return state.completionEvidence;
 }

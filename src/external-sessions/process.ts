@@ -1,3 +1,6 @@
+import { runtimeErrorFirstLine, runtimeTransportErrorFirstLine } from "../security/runtime-error.js";
+import { runtimeProxyFailureFromText } from "../security/runtime-proxy.js";
+import { classifyRuntimeFailure, runtimeRpcDiagnostic, type RuntimeRpcDiagnostic } from "../agent-runtime/failure-diagnostics.js";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir, platform } from "node:os";
@@ -28,6 +31,9 @@ export interface ExternalCommandOptions {
   spawnProcess?: ExternalSpawn;
   timeoutMs?: number;
   env?: NodeJS.ProcessEnv;
+  /** Trusted policy hook; physical OS ownership never comes from a native protocol event. */
+  onProcess?(child: ChildProcess, processGroup: boolean): void | Promise<void>;
+  drainProcess?(): Promise<void>;
 }
 
 export interface ExternalCommandCaptureResult {
@@ -37,21 +43,37 @@ export interface ExternalCommandCaptureResult {
   timedOut: boolean;
   /** A bounded machine-readable code only. Provider stderr is never returned. */
   errorCode?: string;
+  /** Redacted, bounded first native error line, only for runtime diagnostics. */
+  errorFirstLine?: string;
+  /** Fixed-field runtime diagnostic plus an optional redacted first line. */
+  runtimeFailure?: string;
+  nativeFailureKind?: ReturnType<typeof classifyRuntimeFailure>;
+  nativeRpc?: RuntimeRpcDiagnostic;
 }
 
 export interface ExternalCommandRunOptions {
+  /** Internal governed runtimes only: the engine owns per-round deadlines and physical cancellation. */
+  governedDeadline?: boolean;
   timeoutMs?: number;
   maxOutputBytes?: number;
   cwd?: string;
   /** Abort a long-running provider turn and terminate its complete process group. */
   signal?: AbortSignal;
+  /** Diagnostic notification after a successful OS spawn, with no PID authority. */
+  onSpawn?: () => void;
+  /** Protected runtimes retain their policy/tmp until the physical process has actually closed. */
+  waitForClose?: boolean;
   /** Observe bounded stdout while retaining the same total output limit and redaction boundary. */
   onStdout?: (chunk: string) => void;
   /** Preserve bounded stdout on a non-zero exit only for callers that parse a documented structured
    * response. It must never be forwarded to users or diagnostics because provider output may hold account data. */
   retainStdoutOnFailure?: boolean;
   /** Opt-in, allowlisted classification. Raw stderr never crosses this boundary. */
-  failureKind?: "registered-cli";
+  failureKind?: "registered-cli" | "runtime";
+  /** Host runtime adapters opt in to the redacted first-line diagnostic. */
+  captureErrorFirstLine?: boolean;
+  /** Explicit Workspace proxy only; enables evidence-based proxy diagnostics without exposing stderr. */
+  proxyUrl?: string | null;
 }
 
 const safeExternalErrorCode = (stderr: string): string | undefined => {
@@ -103,11 +125,18 @@ export async function runExternalCommandCapture(
         windowsHide: true,
         ...(cwd ? { cwd } : {}),
       });
-    } catch {
-      resolve({ ok: false, stdout: "", code: null, timedOut: false, errorCode: "spawn_failed" });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      resolve({ ok: false, stdout: "", code: null, timedOut: false, errorCode: run.failureKind === "runtime" && ["ENOENT", "EACCES", "EPERM"].includes(code ?? "")
+        ? classifyRuntimeFailure({ code }) : "spawn_failed" });
       return;
     }
 
+    let ownershipFailed = false;
+    let ownershipReady: Promise<void> = Promise.resolve();
+    try { ownershipReady = Promise.resolve(options.onProcess?.(child, processGroup)); }
+    catch { ownershipFailed = true; terminateSubprocessTree(child, { force: true, processGroup }); }
+    const physicalClose = new Promise<void>(resolveClose => child.once("close", () => resolveClose()));
     let done = false;
     let stdout = "";
     let stderr = "";
@@ -121,18 +150,33 @@ export async function runExternalCommandCapture(
       done = true;
       clearTimeout(timer);
       run.signal?.removeEventListener("abort", abort);
-      resolve(result);
+      if (ownershipFailed) result = { ok: false, stdout: "", code: null, timedOut: false, errorCode: "runtime_process_ownership_failed" };
+      void (async () => {
+        try {
+          await ownershipReady.catch(() => { ownershipFailed = true; });
+          await options.drainProcess?.(); if (run.waitForClose) await physicalClose;
+          resolve(ownershipFailed ? { ok: false, stdout: "", code: null, timedOut: false, errorCode: "runtime_process_ownership_failed" } : result);
+        }
+        catch { resolve({ ok: false, stdout: "", code: null, timedOut: false, errorCode: "runtime_process_cleanup_unverified" }); }
+      })();
     };
-    const timer = setTimeout(() => {
+    const timer = run.governedDeadline && run.signal ? undefined : setTimeout(() => {
       terminateSubprocessTree(child, { force: true, processGroup });
       finish({ ok: false, stdout: "", code: null, timedOut: true, errorCode: "timeout" });
     }, timeoutMs);
-    timer.unref();
+    timer?.unref();
+    void ownershipReady.catch(() => {
+      ownershipFailed = true; terminateSubprocessTree(child, { force: true, processGroup });
+      finish({ ok: false, stdout: "", code: null, timedOut: false, errorCode: "runtime_process_ownership_failed" });
+    });
     run.signal?.addEventListener("abort", abort, { once: true });
     if (run.signal?.aborted) {
       abort();
       return;
     }
+    child.once("spawn", () => {
+      if (!done) { try { run.onSpawn?.(); } catch { /* Diagnostics cannot fail the command. */ } }
+    });
     child.stdout?.on("data", (chunk: Buffer) => {
       if (done) return;
       outputBytes += chunk.length;
@@ -159,16 +203,19 @@ export async function runExternalCommandCapture(
         stdout: "",
         code: null,
         timedOut: false,
-        errorCode: error.code === "ENOENT" ? "command_not_found" : "spawn_failed",
+        errorCode: run.failureKind === "runtime" ? classifyRuntimeFailure({ code: error.code ?? "spawn_failed" })
+          : error.code === "ENOENT" ? "command_not_found" : "spawn_failed",
       });
     });
-    child.once("close", (code) => {
+    child.once("close", (code, signal) => {
       finish({
         ok: code === 0,
         stdout: code === 0 || run.retainStdoutOnFailure === true ? stdout : "",
         code,
         timedOut: false,
-        ...(code === 0 ? {} : { errorCode: (run.failureKind === "registered-cli" ? registeredCliFailureCode(stderr) : undefined) ?? safeExternalErrorCode(stderr) ?? "command_failed" }),
+        ...(code === 0 ? {} : { ...(run.captureErrorFirstLine ? { errorFirstLine: runtimeErrorFirstLine(stderr, options.env) } : {}), errorCode: runtimeProxyFailureFromText(stderr, Boolean(run.proxyUrl))
+          ?? (run.failureKind === "runtime" ? classifyRuntimeFailure({ stderr, code: safeExternalErrorCode(stderr), ...(signal ? { signal } : {}) })
+            : (run.failureKind === "registered-cli" ? registeredCliFailureCode(stderr) : undefined) ?? safeExternalErrorCode(stderr) ?? "command_failed") }),
       });
     });
   });
@@ -509,18 +556,30 @@ export interface JsonlRpcRequest {
 
 /** Sanitized provider RPC failure. The numeric code is safe for capability fallback; raw data stays local. */
 export class ExternalJsonlRpcRequestError extends Error {
-  constructor(readonly code: number) {
+  constructor(readonly code: number, readonly runtimeFailureKind: ReturnType<typeof classifyRuntimeFailure> = "runtime_failed", readonly errorFirstLine?: string, readonly rpc?: RuntimeRpcDiagnostic) {
     super("external session adapter request failed");
     this.name = "ExternalJsonlRpcRequestError";
   }
 }
 
+/** Transport failure retains only a safe diagnostic; raw stderr never leaves its client. */
+export class ExternalJsonlRpcTransportError extends Error {
+  constructor(message: string, readonly runtimeFailureKind: ReturnType<typeof classifyRuntimeFailure>, readonly errorFirstLine?: string, readonly rpc?: RuntimeRpcDiagnostic) { super(message); }
+}
+
 export interface JsonlRpcClientOptions extends ExternalCommandOptions {
+  /** Payload-free diagnostic hook after a request is written to the owned transport. */
+  onRequestSent?: (method: string) => void;
+  captureErrorFirstLine?: boolean;
+  cwd?: string;
+  signal?: AbortSignal;
+  jsonRpcVersion?: "2.0";
   maxOutputBytes?: number;
   /** Defaults to a private stdio App Server; Codex daemon clients use `app-server proxy`. */
   appServerArgs?: readonly string[];
   onNotification?: (method: string, params: Record<string, unknown>) => void;
   onClose?: (error: Error) => void;
+  onSpawn?: () => void;
   onServerRequest?: (
     request: JsonlRpcRequest,
     reply: (result: unknown) => void,
@@ -529,6 +588,7 @@ export interface JsonlRpcClientOptions extends ExternalCommandOptions {
 }
 
 interface PendingJsonlRequest {
+  method: string;
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -540,11 +600,16 @@ interface PendingJsonlRequest {
  * pending request is rejected and the whole process group is stopped when the transport becomes invalid.
  */
 export class JsonlRpcClient {
+  private readonly exited: Promise<void>;
   private readonly child: ChildProcess;
   private readonly processGroup: boolean;
   private readonly requestTimeoutMs: number;
   private readonly maxOutputBytes: number;
   private readonly pending = new Map<number, PendingJsonlRequest>();
+  private stderr = "";
+  private processExit?: { code: number | null; signal?: string | null };
+  /** Set once any RPC response arrives; before that, a non-zero exit is a startup failure. */
+  private answered = false;
   private pendingText = "";
   private outputBytes = 0;
   private nextId = 1;
@@ -556,19 +621,29 @@ export class JsonlRpcClient {
     private readonly options: JsonlRpcClientOptions,
   ) {
     this.child = child;
+    child.once("spawn", () => { try { options.onSpawn?.(); } catch { /* Diagnostic observer only. */ } });
+    this.exited = new Promise(resolve => child.once("close", () => resolve()));
     this.processGroup = processGroup;
     this.requestTimeoutMs = Math.max(500, Math.min(options.timeoutMs ?? 30_000, 120_000));
     this.maxOutputBytes = Math.max(64 * 1024, Math.min(options.maxOutputBytes ?? 16 * 1024 * 1024, 64 * 1024 * 1024));
+    options.signal?.addEventListener("abort", this.abort, { once: true });
+    if (options.signal?.aborted) this.abort();
     child.stdout?.on("data", (chunk: Buffer) => this.consume(chunk));
-    // Provider stderr may contain paths, native IDs or configuration data. Drain it without retaining it.
-    child.stderr?.on("data", () => {});
+    // Hold bounded native evidence locally, then expose only its redacted first line on failure.
+    child.stderr?.on("data", (chunk: Buffer) => { if (options.captureErrorFirstLine) this.stderr = (this.stderr + chunk.toString()).slice(-65_536); });
+    child.stdin?.on("error", () => this.fail("external session adapter input closed"));
     child.once("error", () => this.fail("external session adapter process failed"));
-    child.once("close", (code) => {
-      if (!this.closed) this.fail(`external session adapter exited unexpectedly (code ${code ?? "unknown"})`);
+    child.once("exit", (code, signal) => { this.processExit = { code, signal }; });
+    child.once("close", (code, signal) => {
+      this.processExit = { code, signal };
+      if (!this.closed) this.fail("external session adapter exited unexpectedly");
     });
   }
 
+  private readonly abort = (): void => { this.fail("external session adapter aborted"); };
+
   static start(options: JsonlRpcClientOptions): JsonlRpcClient {
+    if (options.signal?.aborted) throw new Error("external session adapter aborted");
     const spawnProcess = options.spawnProcess ?? defaultSpawn;
     const processGroup = platform() !== "win32";
     const launch = resolveExternalCommandLaunch(options.command, options.env ?? process.env);
@@ -583,16 +658,21 @@ export class JsonlRpcClient {
         env: externalLaunchEnv(options.env ?? process.env, launch.runtimeBin),
         detached: processGroup,
         windowsHide: true,
+        ...(options.cwd && isAbsolute(options.cwd) ? { cwd: options.cwd } : {}),
       });
     } catch {
       throw new Error("external session adapter could not start");
     }
-    return new JsonlRpcClient(child, processGroup, options);
+    const client = new JsonlRpcClient(child, processGroup, options);
+    try { void Promise.resolve(options.onProcess?.(child, processGroup)).catch(() => client.close()); }
+    catch { delete options.onClose; client.close(); throw new Error("Native process ownership could not be established"); }
+    return client;
   }
 
   private write(value: unknown): void {
     if (this.closed || !this.child.stdin?.writable) throw new Error("external session adapter is closed");
-    this.child.stdin.write(`${JSON.stringify(value)}\n`);
+    const message = this.options.jsonRpcVersion ? { jsonrpc: this.options.jsonRpcVersion, ...(value as object) } : value;
+    this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
   private consume(chunk: Buffer): void {
@@ -660,11 +740,15 @@ export class JsonlRpcClient {
       const pending = this.pending.get(record.id);
       if (!pending) return;
       this.pending.delete(record.id);
+      this.answered = true;
       clearTimeout(pending.timer);
       if (record.error && typeof record.error === "object" && !Array.isArray(record.error)) {
         const providerCode = (record.error as Record<string, unknown>).code;
         pending.reject(new ExternalJsonlRpcRequestError(
           typeof providerCode === "number" && Number.isSafeInteger(providerCode) ? providerCode : -32_000,
+          classifyRuntimeFailure({ stderr: JSON.stringify(record.error).slice(0, 65_536) }),
+          this.options.captureErrorFirstLine ? runtimeErrorFirstLine((record.error as Record<string, unknown>).message, this.options.env) : undefined,
+          runtimeRpcDiagnostic({ rpcMethod: pending.method, rpcTimeoutMs: this.requestTimeoutMs }),
         ));
       }
       else pending.resolve(record.result);
@@ -682,10 +766,20 @@ export class JsonlRpcClient {
     this.write({ id, error: { code, message } });
   }
 
-  private fail(message: string): void {
+  private fail(message: string, timedOutMethod?: string): void {
     if (this.closed) return;
     this.closed = true;
-    const error = new Error(message);
+    this.options.signal?.removeEventListener("abort", this.abort);
+    const method = timedOutMethod ?? (this.pending.size === 1 ? this.pending.values().next().value?.method : undefined);
+    const evidence = runtimeTransportErrorFirstLine(this.stderr, this.processExit, this.options.env, { beforeFirstResponse: !this.answered });
+    // Exit evidence keeps stderr out of classification, except a pre-response startup reason.
+    const startupStderr = !this.answered && !this.processExit?.signal && !!this.processExit && this.processExit.code !== 0
+      && /\bERROR\b/iu.test(this.stderr.slice(-65_536));
+    const error = new ExternalJsonlRpcTransportError(message, classifyRuntimeFailure({ stderr: this.processExit && !startupStderr ? "" : evidence,
+      signal: this.processExit?.signal, timedOut: message.endsWith("timed out") }),
+      this.options.captureErrorFirstLine ? evidence : undefined,
+      runtimeRpcDiagnostic({ rpcMethod: method, rpcTimeoutMs: this.requestTimeoutMs }));
+    this.stderr = "";
     for (const request of this.pending.values()) {
       clearTimeout(request.timer);
       request.reject(error);
@@ -707,16 +801,18 @@ export class JsonlRpcClient {
         // A provider may have accepted a turn even when its reply was lost. Once the request deadline
         // passes, the transport is no longer safe to reuse: terminate the owned process tree and reject
         // every in-flight request rather than leaving unobserved work running behind a live adapter.
-        this.fail("external session adapter request timed out");
+        this.fail("external session adapter request timed out", method);
       }, this.requestTimeoutMs);
       timer.unref();
       this.pending.set(id, {
+        method,
         resolve: (value) => resolve(value as T),
         reject,
         timer,
       });
       try {
         this.write({ id, method, params });
+        try { this.options.onRequestSent?.(method); } catch { /* Diagnostics never change delivery. */ }
       } catch (error) {
         clearTimeout(timer);
         this.pending.delete(id);
@@ -732,6 +828,12 @@ export class JsonlRpcClient {
   close(): void {
     this.fail("external session adapter closed");
   }
+
+  /** Process completion, rather than logical cancellation, releases an owned execution lease. */
+  async waitForClose(): Promise<void> { await this.exited; await this.options.drainProcess?.(); }
+
+  /** Compatibility wrapper: physical exit and the shared drain hook are both mandatory. */
+  async closeAndWait(): Promise<void> { this.close(); await this.waitForClose(); }
 }
 
 /**

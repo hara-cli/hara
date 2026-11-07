@@ -15,6 +15,9 @@ function fixture(turn) {
   const root=realpathSync.native(mkdtempSync(join(tmpdir(),"hara-reference-policy-")));
   const host=new LocalWorkspaceHost(root,{providerFactory(_connection,binding){return{id:"openai",model:binding.model,turn};}});
   const workspace=host.createWorkspace("Synthetic",host.list().revision),workspaceId=workspace.workspaceId;
+  // This fixture targets the in-process governor question/dispatch fence.
+  const agent=host.context(workspaceId).resources.agents.get(workspace.selectedAgentId);
+  host.context(workspaceId).resources.agents.setPermissionTier(agent.agentId,"controlled",agent.configRevision,agent.agentEpoch);
   host.configureSynthetic(workspaceId,0);host.select("client",workspaceId,host.list().revision);
   const scope=host.catalog.resolve(workspaceId).scope,storage=new WorkspaceResourceStorage(host.home,scope);
   storage.initialize();

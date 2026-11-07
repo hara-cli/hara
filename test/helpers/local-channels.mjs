@@ -12,7 +12,7 @@ import { SYNTHETIC_CONNECTION } from "../../dist/workspace/synthetic-provider.js
 // per-file test timeout on the slower hosted Intel runner.
 const temporary = [];
 after(() => { for (const p of temporary) fs.rmSync(p, { recursive: true, force: true }); });
-export async function setup(count = 3, providerFactory) {
+export async function setup(count = 3, providerFactory, permissionTier = "full-protected") {
   const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "hara-local-channel-"))); temporary.push(root);
   const calls = [], options = { mode: "workspace", credentialVault: new MemoryCredentialVault(), providerFactory: providerFactory ?? ((_connection, binding, context) => ({
     id: "openai", model: binding.model, async turn(args) {
@@ -24,7 +24,12 @@ export async function setup(count = 3, providerFactory) {
   host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
   const resources = new WorkspaceResources(host.home, host.catalog.resolve(id).scope); resources.initialize();
   const members = [];
-  for (let i = 0; i < count; i++) members.push(resources.agents.create({ username: `colleague-${i}`, profile: { displayName: `Colleague ${i}` } }, resources.agents.list().revision).agentId);
+  if (!["controlled", "full-protected"].includes(permissionTier)) throw new Error("Invalid fixture permission tier");
+  for (let i = 0; i < count; i++) {
+    const agent = resources.agents.create({ username: `colleague-${i}`, profile: { displayName: `Colleague ${i}` } }, resources.agents.list().revision);
+    if (agent.permissionTier !== permissionTier) resources.agents.setPermissionTier(agent.agentId, permissionTier, agent.configRevision, agent.agentEpoch);
+    members.push(agent.agentId);
+  }
   const create = (name = "Local planning", memberIds = members) => {
     const channelId = randomUUID(); host.createChannel("client", id, channelId, name, memberIds, host.listChannels(id).revision); host.selectChannel("client", id, channelId); return channelId;
   };

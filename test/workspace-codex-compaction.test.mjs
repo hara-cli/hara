@@ -1,0 +1,34 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { cliMcpFixture, until } from "./helpers/workspace-cli-mcp.mjs";
+const done = value => ["completed", "blocked", "paused", "cancelled"].includes(value.conversation.state);
+async function exchange(f, text) { await f.send(text); return until(f.read, done); }
+const turns = f => f.native().filter(row => row.method === "turn/start");
+test("idle native compaction rotates MCP markers, charges maintenance, preserves history and keeps the loaded thread resident", async t => {
+  const f = await cliMcpFixture(t, "list", { contextInput: 70000, previewOptIn: true });
+  const first = await exchange(f, "List colleagues ORIGINAL-HISTORY"); assert.equal(first.conversation.state, "completed"); const a = f.meta();
+  assert.equal(first.conversation.contextCompactions.length, 0);
+  f.mode({ mode: "list", probePreviousMarker: true, compactDelayMs: 80 });
+  const second = await exchange(f, "List colleagues AFTER-COMPACT");
+  assert.equal(second.conversation.state, "completed"); const b = f.meta();
+  const methods = f.native().map(row => row.method);
+  assert.equal(methods.filter(m => m === "thread/compact/start").length, 1); assert.equal(methods.filter(m => m === "thread/start").length, 1);
+  assert.equal(methods.includes("thread/resume"), false); assert.equal(methods.includes("thread/unsubscribe"), false);
+  assert.equal(a.pid, b.pid); assert.equal(a.url, b.url); assert.notEqual(a.attemptMarkerFingerprint, b.attemptMarkerFingerprint); assert.equal(b.oldMarkerRejected, true);
+  assert.equal(turns(f)[0].params.threadId, turns(f)[1].params.threadId);
+  const record = second.conversation.contextCompactions[0]; assert.equal(record.method, "codex-native"); assert.equal(record.status, "completed");
+  assert.equal(record.usage.requests, 1); assert.equal(record.usage.inputTokens, 18020); assert.equal(record.usage.cachedInputTokens, 17000); assert.equal(record.usage.outputTokens, 300);
+  assert.equal(record.afterTokens, 120); assert.equal(record.beforeTokens, 70020);
+  assert.deepEqual(second.conversation.nativeSession.lastAttempt, { input: 18120, cachedInput: 17000, output: 320 });
+  assert.equal(second.conversation.runUsage.inputTokens, 1120, "maintenance and user request each debit only non-cache input");
+  assert.equal(second.conversation.runUsage.outputTokens, 320);
+  assert.equal(second.conversation.usage.inputTokens, first.conversation.usage.inputTokens + 1120);
+  assert.equal(second.conversation.usage.outputTokens, first.conversation.usage.outputTokens + 320);
+  assert.deepEqual(second.conversation.history.slice(0, first.conversation.history.length), first.conversation.history);
+  assert.match(turns(f)[1].params.input[0].text, /hara-context-summary/);
+  assert.equal(second.conversation.usage.modelCalls > first.conversation.usage.modelCalls + 1, true);
+  const third = await exchange(f, "List colleagues WARM-AFTER-COMPACT"); assert.equal(third.conversation.state, "completed");
+  assert.equal(f.meta().pid, a.pid); assert.equal(f.native().filter(row => row.method === "thread/compact/start").length, 1);
+  assert.equal(f.native().some(row => row.method === "thread/resume" || row.method === "thread/unsubscribe"), false);
+  assert.equal(f.previews.some(row => /contextCompaction|PRIVATE|compact-item/.test(JSON.stringify(row))), false);
+});

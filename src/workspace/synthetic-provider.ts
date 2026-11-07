@@ -7,29 +7,31 @@ export const SYNTHETIC_CONNECTION = Object.freeze({ label: "本機合成測試�
   baseURL: "http://127.0.0.1:1/v1", apiKey: "hara-synthetic-local-only", defaultModel: "hara-synthetic-v1" });
 /** Explicit Dev fixture, NOT an LLM and never a fallback for an unavailable real connection. */
 export function createWorkspaceSyntheticProvider(connection: ScopedConnection, binding: ScopedRunConnection,
-  context: { agent: WorkspaceAgentView; objective: string; colleagues: () => WorkspaceAgentView[] }): Provider {
+  context: { agent: WorkspaceAgentView; objective: string; colleagues: () => WorkspaceAgentView[] }, options: { explicitIntake?: boolean } = {}): Provider {
   if (connection.provider !== SYNTHETIC_CONNECTION.provider || connection.apiKey !== SYNTHETIC_CONNECTION.apiKey
     || connection.baseURL !== SYNTHETIC_CONNECTION.baseURL || binding.model !== SYNTHETIC_CONNECTION.defaultModel) {
     throw new Error("本 Dev 僅允許明確的合成 Provider。真實模型/Key 調用尚未批准；沒有發出請求。");
   }
-  const tool = (name: string, input: unknown): ToolUse => ({ id: `call_${randomUUID()}`, name, input });
   const response = (text: string, toolUses: ToolUse[] = []) => ({ text, toolUses, stop: toolUses.length ? "tool_use" as const : "end" as const,
     usage: { input: 100, output: 20 } });
   return { id: "openai", model: binding.model, trailingTurnContext: true, async turn(args: TurnArgs) {
+    const nativeNames = new Map(args.tools.map(item => [item.name.replace(/^mcp__hara__/, ""), item.name]));
+    const tool = (name: string, input: unknown): ToolUse => ({ id: `call_${randomUUID()}`, name: nativeNames.get(name) ?? name, input });
     if (args.signal?.aborted) throw new Error("synthetic request cancelled");
     const reverseIndex = [...args.history].reverse().findIndex(message => message.role === "user" && !message.content.startsWith("<system-reminder>"));
     const start = reverseIndex < 0 ? 0 : args.history.length - reverseIndex - 1;
     const current = args.history.slice(Math.max(0, start));
-    const calls = current.flatMap(message => message.role === "assistant" ? message.toolUses : []);
-    const results = current.flatMap(message => message.role === "tool" ? message.results : []);
+    const calls = current.flatMap(message => message.role === "assistant" ? message.toolUses : []).map(call => ({ ...call, name: call.name.replace(/^mcp__hara__/, "") }));
+    const results = current.flatMap(message => message.role === "tool" ? message.results : []).map(result => ({ ...result, name: result.name.replace(/^mcp__hara__/, "") }));
     const last = results.at(-1), objective = context.objective;
     const creation = context.agent.kind === "main" && /(?:建立|创建|新建|create|hire).*(?:同事|agent|colleague)|(?:同事|colleague).*(?:建立|创建|create)/i.test(objective);
     const delegation = context.agent.kind === "main" && /(?:委派|安排|交给|交給|delegate)/i.test(objective);
     const fileTask = /hello\.md|(?:生成|写|寫|create|write).*(?:文件|file)/i.test(objective);
     if (!creation && !delegation && !fileTask) return response("你好，我是 Hara。這是本機合成驗收模式，不會連接真實模型。可以請我「建立同事 Coder」，再「委派 Coder 生成 hello.md 並驗證」。");
-    if (!calls.some(call => call.name === "task_intake")) return response("", [tool("task_intake", { intent: "change", goal: objective.slice(0, 1500),
+    // The default fixture follows C-lite: Host creates the brief before the first action.
+    if (options.explicitIntake && !calls.some(call => call.name === "task_intake")) return response("", [tool("task_intake", { intent: "change", goal: objective.slice(0, 1500),
       constraints: ["僅本空間與已授權本機 fixture 項目；不連外、不發布、不調用真實模型"],
-      acceptance: [creation ? "同事經使用者確認後建立" : delegation ? "同事任務有已驗證的完成回執" : "hello.md 內容與雜湊經工具驗證"], steps: ["執行", "驗證", "回覆結果"] })]);
+      acceptance: [creation ? "同事經使用者確認後建立" : delegation ? "同事任務有已驗證的完成回執" : "hello.md 內容與雜湊經工具驗證"], steps: ["執行", "驗證", "回覆結果"] }), ...(!creation && !delegation ? [tool("workspace_read", { path: "hello.md" })] : [])]);
     if (last?.isError || last?.content.startsWith("Error:")) return response("這一步未完成，已停止繼續嘗試；請查看執行詳情或重新確認。沒有宣稱成功。");
     if (creation && !calls.some(call => call.name === "agent_create")) return response("", [tool("agent_create", { username: "coder", displayName: "Coder", title: "Coding colleague", instructions: "在授權項目內完成文件工作並驗證，不連外。" })]);
     if (delegation && !calls.some(call => call.name === "agent_contact")) {
@@ -49,7 +51,14 @@ export function createWorkspaceSyntheticProvider(connection: ScopedConnection, b
     if (!success) return response("尚無可驗證回執，沒有標記完成。");
     const answer = creation ? "Coder 已經加入這個 Workspace，預設使用內建 Pi。你可以直接聊天，或請我委派文件任務。"
       : delegation ? "Coder 已完成 hello.md 並核驗內容與雜湊。結果已回到主對話，可展開執行詳情。" : "hello.md 已寫入並完成內容與雜湊驗證。";
+    if (calls.some(call => call.name === "task_checkpoint")) return response(answer);
+    let successId = success.id;
+    try { const receipt = JSON.parse(success.content).receipt; if (typeof receipt?.toolCallId === "string") successId = receipt.toolCallId; } catch { /* Governor still verifies every proposed citation. */ }
+    const write = success.name === "workspace_verify" ? [...results].reverse().find(result => result.name === "workspace_write" && !result.isError) : undefined;
+    let writeId = write?.id;
+    if (write) try { const receipt = JSON.parse(write.content).receipt; if (typeof receipt?.toolCallId === "string") writeId = receipt.toolCallId; } catch { /* No invented write citation. */ }
+    const successIds = writeId && writeId !== successId ? [writeId, successId] : [successId];
     return response("", [tool("task_checkpoint", { artifacts: fileTask && !delegation ? ["hello.md"] : [],
-      completion: { state: "verified", checks: [{ acceptance_index: 0, evidence: "已收到本次工具執行的成功回執", tool_call_ids: [success.id] }], final_answer: answer } })]);
+      completion: { state: "verified", evidence: ["已收到本次工具執行的成功回執"], checks: [{ acceptance_index: 0, evidence: "已收到本次工具執行的成功回執", tool_call_ids: successIds }], final_answer: answer } })]);
   } };
 }

@@ -90,6 +90,8 @@ export interface TurnResult {
   stop: "end" | "tool_use" | "error";
   /** Opaque-to-the-UI provider state needed to continue this exact tool-call turn. */
   continuation?: AssistantContinuation;
+  /** Host-native adapter fact after a successful terminal frame; never a replay permission. */
+  nativeContinuation?: "available" | "unavailable";
   errorMsg?: string;
   /** Bounded, credential-free transport facts used by the central replay-safe retry policy. */
   errorMetadata?: ProviderErrorMetadata;
@@ -106,6 +108,8 @@ export interface TurnResult {
 }
 
 export interface ProviderErrorMetadata {
+  /** Host native adapter only: the control RPC failed before any model input was submitted. */
+  nativeControlFailure?: "codex_thread_start_failed" | "codex_resume_failed_history_preserved";
   status?: number;
   retryAfterMs?: number;
   code?: string;
@@ -123,6 +127,8 @@ export interface ProviderRetryEvent {
   status?: number;
 }
 
+export interface AssistantPreviewDelta { nativeTurnId: string; itemId: string; text: string }
+
 export interface TurnArgs {
   system: string;
   /** Optional structured boundaries for cache-aware providers. `system` is always authoritative; a
@@ -131,6 +137,8 @@ export interface TurnArgs {
   history: NeutralMsg[];
   tools: ToolSpec[];
   onText: (delta: string) => void;
+  /** Draft-only local prose, separate from governed/canonical completion output. */
+  onAssistantPreview?: (value: AssistantPreviewDelta) => void;
   /** stream reasoning/thinking deltas (shown dimmed); optional, provider-dependent */
   onReasoning?: (delta: string) => void;
   /** ANY stream activity (a content/reasoning/tool-call chunk arrived) — resets the stall watchdog even

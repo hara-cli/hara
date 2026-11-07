@@ -19,15 +19,21 @@ export interface WorkspaceRunBinding {
   lineage: { rootRunId: string | null; parentRunId: string | null; depth: number };
   createdAt: string;
   host: { hostId: string; hostEpoch: number; grantId: string; grantRevision: number; actorId: string; policyRevision: number };
-  budget: { maxRounds: number; maxToolCalls: number; maxTokens: number; timeoutMs: number };
+  budget: { maxRounds: number; maxToolCalls: number; maxTokens: number; timeoutMs: number; mode?: "interactive" };
 }
 /** Transport input includes the fixed prompt/tool schema on EVERY round. Allow twelve ordinary
  * rounds: 12 x 8k input + 12 x 2k output = 120k, with 8k headroom. This is a sizing example,
  * not a token-price estimate or a guarantee that every task reaches twelve rounds. Retain raw usage.
  * The possible token ceiling is 4x the former 32k; actual spend depends on measured use and rates.
- * Only new ordinary tasks use this default. Existing bindings and acceptance slices stay frozen. */
+ * New budgeted background/external tasks use this default. Interactive chats use a recoverable fuse;
+ * existing bindings and acceptance slices stay frozen. */
 export const DEFAULT_WORKSPACE_RUN_BUDGET: Readonly<WorkspaceRunBinding["budget"]> = Object.freeze({
   maxRounds: 12, maxToolCalls: 32, maxTokens: 128_000, timeoutMs: 120_000,
+});
+/** Host-selected only for a new, directly requested chat. Numbers remain diagnostic/context sizing;
+ * the interactive governor uses a separate recoverable runaway fuse and per-round active timeout. */
+export const INTERACTIVE_WORKSPACE_RUN_BUDGET: Readonly<WorkspaceRunBinding["budget"]> = Object.freeze({
+  ...DEFAULT_WORKSPACE_RUN_BUDGET, mode: "interactive", maxRounds: 100,
 });
 export function workspaceAgentBindingHash(binding: WorkspaceAgentTaskBinding): string {
   return createHash("sha256").update("hara-workspace-run-agent-v1\0").update(canonical(binding)).digest("hex");
@@ -61,7 +67,7 @@ function parse(value: unknown): WorkspaceRunBinding {
   if (!plain(value) || !exact(value, ["schemaVersion", "scope", "agent", "agentBindingHash", "connection", "runtimeContract", "project", "sessionId", "runId", "lineage", "createdAt", "host", "budget"])
     || value.schemaVersion !== 1 || !isWorkspaceAgentTaskBinding(value.agent)
     || value.agentBindingHash !== workspaceAgentBindingHash(value.agent) || !isScopedRunConnection(value.connection)
-    || !(value.runtimeContract === "hara-governed-runtime-v1" && ["hara", "pi", "codex", "claude"].includes(value.agent.runtimeId)
+    || !(value.runtimeContract === "hara-governed-runtime-v1" && ["hara", "pi", "codex", "claude", "opencode", "gemini", "kimi", "copilot", "cursor", "grok"].includes(value.agent.runtimeId)
       || value.runtimeContract === "hara-governed-pi-v1" && value.agent.runtimeId === "pi") || !safeId(value.sessionId) || !safeId(value.runId)
     || !plain(value.lineage) || !exact(value.lineage, ["rootRunId", "parentRunId", "depth"])
     || !(value.lineage.depth === 0 ? value.lineage.rootRunId === null && value.lineage.parentRunId === null
@@ -73,9 +79,10 @@ function parse(value: unknown): WorkspaceRunBinding {
     || !plain(value.host) || !exact(value.host, ["hostId", "hostEpoch", "grantId", "grantRevision", "actorId", "policyRevision"])
     || !text(value.host.hostId) || !text(value.host.grantId) || !text(value.host.actorId)
     || !positive(value.host.hostEpoch) || !positive(value.host.grantRevision) || !positive(value.host.policyRevision)
-    || !plain(value.budget) || !exact(value.budget, ["maxRounds", "maxToolCalls", "maxTokens", "timeoutMs"])
+    || !plain(value.budget) || !(exact(value.budget, ["maxRounds", "maxToolCalls", "maxTokens", "timeoutMs"])
+      || (exact(value.budget, ["maxRounds", "maxToolCalls", "maxTokens", "timeoutMs", "mode"]) && value.budget.mode === "interactive" && value.lineage.depth === 0))
     || ![value.budget.maxRounds, value.budget.maxToolCalls, value.budget.maxTokens, value.budget.timeoutMs].every(positive)
-    || Number(value.budget.maxRounds) > 64 || Number(value.budget.maxToolCalls) > 256
+    || Number(value.budget.maxRounds) > (value.budget.mode === "interactive" ? 100 : 64) || Number(value.budget.maxToolCalls) > 256
     || Number(value.budget.maxTokens) > 200_000 || Number(value.budget.timeoutMs) > 10 * 60_000) return fail();
   const scope = parseWorkspaceResourceScope(value.scope);
   if (scope.authority.kind !== "local" || scope.workspaceId !== value.agent.workspaceId

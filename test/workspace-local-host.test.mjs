@@ -18,14 +18,17 @@ after(()=>{for(const path of temporary)fs.rmSync(path,{recursive:true,force:true
 function dir(){const path=fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(),"hara-local-host-")));temporary.push(path);return path;}
 function setup(options){
  const root=dir(),host=new LocalWorkspaceHost(root,options),workspace=host.createWorkspace("Personal",host.list().revision),workspaceId=workspace.workspaceId;
- host.configureSynthetic(workspaceId,0);host.select("client",workspaceId,host.list().revision);
+ host.configureSynthetic(workspaceId,0);
+ // Injected scripted providers target governed-loop fences; real default synthetic flows retain full.
+ if(options?.providerFactory){const a=host.context(workspaceId).resources.agents.get(workspace.selectedAgentId);host.context(workspaceId).resources.agents.setPermissionTier(a.agentId,"controlled",a.configRevision,a.agentEpoch);}
+ host.select("client",workspaceId,host.list().revision);
  return{root,host,workspaceId,main:workspace.selectedAgentId};
 }
 async function until(check){const deadline=Date.now()+intelCaseTimeout(10000,30000);while(Date.now()<deadline){const value=check();if(value)return value;await new Promise(r=>setTimeout(r,100));}throw new Error("bounded Workspace fixture did not reach expected state");}
 test("no-key boot, main chat, explicit creation card, colleague task and same-root restart are a real Host flow",async()=>{
  const a=setup();try{
   const hello=a.host.start("client",a.workspaceId,a.main,"hello",randomUUID());await a.host.wait(hello.runId);
-  let snapshot=a.host.snapshot(a.workspaceId,a.main,"client");assert.equal(snapshot.conversation.state,"completed");
+  let snapshot=a.host.snapshot(a.workspaceId,a.main,"client");assert.equal(snapshot.conversation.state,"completed");assert.equal(snapshot.conversation.taskState,"completed");assert.equal(snapshot.conversation.permissionTier,"full-protected");assert.equal(snapshot.conversation.completion.state,"verified");
   assert.ok(snapshot.conversation.history.some(row=>row.role==="assistant"&&row.text.includes("Hara")));
   const create=a.host.start("client",a.workspaceId,a.main,"建立 Pi 同事 Coder",randomUUID());
   const card=await until(()=>a.host.snapshot(a.workspaceId,a.main,"client").approvals[0]);
@@ -143,8 +146,9 @@ test("actual CLI routes before legacy startup and does not create caller Home st
 test("actual CLI sends multiline bodies unchanged through its isolated governed entry",async()=>{
  const a=setup(),callerHome=dir(),execute=promisify(execFile),cli=resolve("dist/cli.js");await a.host.close();
  const message="hello\n你好\r\n第二行\t內容";
- const {stdout}=await execute(process.execPath,[cli,"workspace-dev","run","--root",a.root,"--workspace",a.workspaceId,"--agent",a.main,"--message",message],
-  {cwd:dir(),env:{PATH:process.env.PATH,HOME:callerHome,USERPROFILE:callerHome}});
- const result=JSON.parse(stdout);assert.equal(result.conversation.state,"completed");assert.equal(result.conversation.history[0].content,message);
+  const stopped=await execute(process.execPath,[cli,"workspace-dev","run","--root",a.root,"--workspace",a.workspaceId,"--agent",a.main,"--message",message],
+  {cwd:dir(),env:{PATH:process.env.PATH,HOME:callerHome,USERPROFILE:callerHome}}).then(()=>null,error=>error);
+  assert.equal(stopped?.code,2);
+  const result=JSON.parse(stopped.stdout);assert.equal(result.conversation.state,"blocked");assert.equal(result.conversation.taskState,"paused");assert.equal(result.conversation.history[0].content,message);
  assert.deepEqual(fs.readdirSync(callerHome),[]);
 });

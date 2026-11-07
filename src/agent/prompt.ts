@@ -5,6 +5,8 @@ import type {
   SystemPromptStability,
 } from "../providers/types.js";
 
+export type SystemPromptInput = Pick<SystemPromptPart, "id" | "stability" | "source" | "content">;
+
 export interface AssembledSystemPrompt {
   /** Provider-compatible full prompt. */
   text: string;

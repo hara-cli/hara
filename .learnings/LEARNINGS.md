@@ -1432,3 +1432,23 @@ dependency gaps. A candidate-package estimate does not authorize live handoff, i
 - Related Files: src/version.ts, src/workspace/local-cli.ts, test/workspace-production-entry.test.mjs
 
 ---
+
+
+## [LRN-20261103-RUNTIME-DIAGNOSTIC-PROJECTION] best_practice
+
+**Status**: implemented
+**Area**: runtime/security
+**Pattern-Key**: runtime.failure-diagnostic-whitelist
+
+Classify native runtime evidence at the process boundary and project only closed metadata fields into durable errors. Authentication rejection does not prove the account is signed out. Compare launch HOME with the independently resolved OS account home, report only yes/no/unknown, and never inspect credential contents to construct a diagnostic. Keep startup cooldown within the workspace installer, colleague and frozen runtime route; per-turn registry reconstruction must not clear it. A cooldown only limits another explicit attempt and never schedules a replay or changes runtime/provider.
+
+
+## [LRN-20261104-INTEGRATION-CONTRACTS] best_practice
+
+**Status**: implemented
+**Area**: workspace/integration
+**Pattern-Key**: workspace.full-branch-contract-integration
+
+When combining reviewed slices, update shipped operation cards and exact-schema fixtures together: the compact roster is a five-column row table, agent_create accepts an editable optional project draft, and safe failure diagnostics may carry the bounded first line. Codex adds a separate system reminder after tool JSON; parse the receipt boundary without weakening receipt ownership checks. Explicit colleague creation now ends on the consumed Host receipt, while generic creation tests must retain the native second-create refusal. Cover the next message after early completion independently.
+
+Node's file deadline is cumulative. Partition unchanged multi-turn cases into exhaustive tracked entry files with shared registrars rather than increasing deadlines or skipping cases. Test a large mock roster's ordering on the controlled transport and retain separate full Pi channel coverage using its channel-scoped conversation and native stage evidence; a direct-message snapshot is a different session. Keep process-inventory and descendant-drain failures closed, and retain original failure logs when correcting fixture or harness issues.

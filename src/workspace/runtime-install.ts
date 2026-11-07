@@ -1,54 +1,172 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readSync, unlinkSync, writeFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { execFileSync } from "node:child_process";
+import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import type { RuntimeFailureContext } from "../agent-runtime/failure-diagnostics.js";
 import { userInfo } from "node:os";
+import { join, dirname, isAbsolute, resolve } from "node:path";
 import { WorkspaceJsonState, exact, plain, UUID } from "./local-state.js";
 import { sameWorkspaceResourceBinding, workspaceResourceDirectory, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
-import { OPTIONAL_RUNTIMES, RUNTIME_DOWNLOAD_HOSTS, RUNTIME_LABELS, resolveOfficialRuntimeArtifact } from "./runtime-catalog.js";
+import { HOST_LOGIN_ONLY_RUNTIMES, MANUAL_RUNTIME_INSTALL_URLS, OPTIONAL_RUNTIMES, RUNTIME_DOWNLOAD_HOSTS, RUNTIME_LABELS, resolveOfficialRuntimeArtifact, manualRuntimeInstallation } from "./runtime-catalog.js";
 import { runtimeArchiveMember } from "./runtime-archive.js";
+import { WorkspaceRuntimeProxy } from "./runtime-proxy.js";
 import { validOpenCodeNativeHeader } from "../coding/bundled-opencode.js";
-import { detectInstalledRuntimes, inspectLocalRuntime, type DetectionOptions, type DetectedRuntime } from "./runtime-detect.js";
+import { boundedRuntimeCommand, detectInstalledRuntimes, inspectLocalRuntime, isKimiCodeExecutable, KIMI_LEGACY_MESSAGE, runtimeProbeEnvironment, type DetectionOptions, type DetectedRuntime, type CopilotVersionProbe } from "./runtime-detect.js";
+import { WorkspaceRuntimeVersionStore, projectRuntimeVersionStatus, type RuntimeVersionCurrent } from "./runtime-version-history.js";
 
-export type OptionalRuntimeId = "opencode" | "codex" | "claude" | "agy";
+export type OptionalRuntimeId = "opencode" | "codex" | "claude" | "agy" | "gemini" | "kimi" | "copilot" | "cursor" | "grok";
 export interface RuntimeTarget { platform: NodeJS.Platform; arch: string }
 export interface RuntimeArtifact { runtimeId: OptionalRuntimeId; version: string; target: RuntimeTarget; url: string;
   sha256: string; format: "raw" | "tar.gz" | "zip"; member: string | null; maxBytes: number }
 interface Registration { artifact: RuntimeArtifact; executableSha256: string; bytes: number; installedAt: string }
-interface InstallState { resourceBinding: WorkspaceResourceBinding; revision: number; entries: Registration[] }
+/**
+ * Which CLI login a bound runtime launches with.
+ *
+ * - `host` (default for new bindings): use the OS account home so a runtime the user
+ *   already logged into works immediately. Hara never copies or links the host credential into its
+ *   private runtime home; the child receives the OS account home explicitly.
+ * - `isolated`: the historical behaviour — `HOME`/`CODEX_HOME` point at this Workspace's private
+ *   `runtime-homes/<id>` directory, so the user signs in again inside Hara.
+ *
+ * The record is stored per binding so switching back to `isolated` stays available to anyone who wants
+ * the separated home. A missing record means `isolated`: older state files never gain host access
+ * without an explicit, confirmed switch.
+ */
+export type RuntimeLoginSource = "host" | "isolated";
+export interface RuntimeLoginBinding { runtimeId: OptionalRuntimeId; source: RuntimeLoginSource; confirmedAt: string }
+const generalAgentAvailable = (runtimeId: OptionalRuntimeId, registered: boolean, loginSource: RuntimeLoginSource): boolean =>
+  registered && (runtimeId === "codex" || runtimeId === "claude" || HOST_LOGIN_ONLY_RUNTIMES.includes(runtimeId) && loginSource === "host");
+/**
+ * Display/selection projection only. `ready` is the sole value that is also execution authority, and it
+ * is derived from the same confirmed-file check as `generalAgentDriverAvailable`. The two `confirm_*`
+ * values mean "installed and passed the file check, but a person must confirm it before first use".
+ */
+export type RuntimeUse = "ready" | "confirm_first_use" | "confirm_update" | "unavailable" | "detecting";
+export type RuntimeUnavailableReason = "not_installed" | "unsafe_file" | "legacy_unsupported" | "adapter_pending" | "detection_failed" | "host_login_required";
+interface UseFacts { registered: boolean; available: boolean; valid: boolean; hadConfirmation: boolean; legacy: boolean; missing: boolean;
+  detecting: boolean; incomplete: boolean; probe?: "detecting" | "detection_failed" }
+function projectRuntimeUse(runtimeId: OptionalRuntimeId, facts: UseFacts): { use: RuntimeUse; unavailableReason?: RuntimeUnavailableReason } {
+  const unavailable = (unavailableReason: RuntimeUnavailableReason) => ({ use: "unavailable" as const, unavailableReason });
+  if (facts.legacy) return unavailable("legacy_unsupported");
+  if (facts.valid) {
+    if (runtimeId === "agy") return unavailable("adapter_pending");
+    if (facts.available) return { use: "ready" };
+    // A registered host-only runtime with a legacy isolated login can be fixed by confirming the host login.
+    if (facts.registered) return HOST_LOGIN_ONLY_RUNTIMES.includes(runtimeId) ? { use: "confirm_first_use" } : unavailable("host_login_required");
+    return { use: facts.hadConfirmation ? "confirm_update" : "confirm_first_use" };
+  }
+  if (facts.probe === "detecting") return { use: "detecting" };
+  if (facts.probe === "detection_failed") return unavailable("detection_failed");
+  // A confirmed file that changed in place is usually an update; until a completed round has looked at
+  // it, say "checking" rather than accusing it. After that, a present-but-unlisted file is unsafe.
+  if (facts.hadConfirmation && !facts.missing) return facts.detecting ? { use: "detecting" } : unavailable("unsafe_file");
+  if (facts.detecting) return { use: "detecting" };
+  if (facts.incomplete) return unavailable("detection_failed");
+  return unavailable("not_installed");
+}
+/** A vanished confirmed file is "not installed"; anything else that fails inspection is unsafe. */
+function runtimeFileMissing(path: string | undefined): boolean {
+  if (!path) return true;
+  try { lstatSync(path); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR"; }
+}
+interface InstallState { resourceBinding: WorkspaceResourceBinding; revision: number; entries: Registration[]; loginSources: RuntimeLoginBinding[] }
+interface LocalState { resourceBinding: WorkspaceResourceBinding; revision: number; entries: DetectedRuntime[]; loginSources: RuntimeLoginBinding[] }
 export interface RuntimeInstallCard { id: string; runtimeId: OptionalRuntimeId; label: string; version: string;
   origin: string; sha256: string; maxBytes: number; expiresAt: string; target: RuntimeTarget }
 interface Proposal { card: RuntimeInstallCard; artifact: RuntimeArtifact; controllerId: string; assertCurrent(): void; assertInstallCurrent(): void }
 interface Operation { id: string; runtimeId: OptionalRuntimeId; state: "downloading" | "registered" | "cancelled" | "failed"; controller: AbortController }
 const hash = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 const HASH = /^[a-f0-9]{64}$/;
+const MAX_HOST_CACHE_BYTES = 4 * 1024 * 1024;
+/** A host file is not Hara state, so it cannot use the private-state binder. It still refuses links and
+ * anything but a plain regular file, and never creates, repairs or rewrites the path. */
+function readOptionalHostText(path: string, maxBytes: number): string | null {
+  let before;
+  try { before = lstatSync(path); } catch { return null; }
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size <= 0 || before.size > maxBytes) return null;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.nlink !== 1 || opened.size !== before.size) return null;
+    const chunks: Buffer[] = []; let total = 0; const chunk = Buffer.alloc(64 * 1024);
+    for (;;) {
+      const length = readSync(fd, chunk, 0, chunk.length, null);
+      if (!length) break;
+      total += length;
+      if (total > maxBytes) return null;
+      chunks.push(Buffer.from(chunk.subarray(0, length)));
+    }
+    if (total !== before.size) return null;
+    return Buffer.concat(chunks).toString("utf8");
+  } catch { return null; }
+  finally { if (fd !== undefined) try { closeSync(fd); } catch { /* already closed */ } }
+}
 const fail = (): never => { throw new Error("Runtime installation unavailable or unsafe; no global configuration was changed"); };
-export function optionalRuntimeId(value: unknown): value is OptionalRuntimeId { return typeof value === "string" && OPTIONAL_RUNTIMES.includes(value as OptionalRuntimeId); }
+export const optionalRuntimeId = (value: unknown): value is OptionalRuntimeId => typeof value === "string" && OPTIONAL_RUNTIMES.includes(value as OptionalRuntimeId);
+const LOGIN_SOURCE_FIELDS = ["runtimeId", "source", "confirmedAt"] as const;
+const isLoginSource = (value: unknown): value is RuntimeLoginSource => value === "host" || value === "isolated";
+const validConfirmedAt = (value: unknown): value is string => typeof value === "string" && Number.isFinite(Date.parse(value));
+
+/** Legacy state files carry no `loginSources`. They stay isolated: host credentials are never granted
+ * by a migration the user did not confirm. Unknown or malformed records fail closed instead of being
+ * dropped, so a damaged file cannot silently widen credential scope. */
+function parseLoginSources(value: unknown): RuntimeLoginBinding[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > OPTIONAL_RUNTIMES.length) return fail();
+  const seen = new Set<string>();
+  return value.map(row => {
+    if (!plain(row) || !exact(row, [...LOGIN_SOURCE_FIELDS]) || !optionalRuntimeId(row.runtimeId)
+      || seen.has(row.runtimeId) || !isLoginSource(row.source) || !validConfirmedAt(row.confirmedAt)) return fail();
+    seen.add(row.runtimeId);
+    return { runtimeId: row.runtimeId, source: row.source, confirmedAt: row.confirmedAt };
+  });
+}
 
 /** Workspace-bound installation registry, NOT a claim that a general-Agent driver is implemented.
  * Host-only fixture resolver/fetch policy cannot be supplied by RPC, model tools or downloaded metadata. */
 export class WorkspaceRuntimeInstaller {
+  readonly proxy: WorkspaceRuntimeProxy;
   private readonly state: WorkspaceJsonState<InstallState>;
-  private readonly locals: WorkspaceJsonState<{ resourceBinding: WorkspaceResourceBinding; revision: number; entries: DetectedRuntime[] }>;
+  private readonly locals: WorkspaceJsonState<LocalState>;
   private detected: DetectedRuntime[] = [];
   private discovery?: Promise<void>;
+  private copilotProbe?: { path: string; source: string; state: "detecting" | "detection_failed" };
+  /** Runtimes the last round could not finish; their earlier results are kept, absence is not inferred. */
+  private incomplete = new Set<OptionalRuntimeId>();
+  private discoveredAt: string | null = null;
+  private scheduledDiscovery?: ReturnType<typeof setTimeout>;
+  /** Changed-in-place confirmed files already sent through one automatic recheck. */
+  private readonly rechecked = new Set<string>();
+  private copilotRetry?: Promise<void>;
+  private readonly versionProbes = new Set<AbortController>();
   private readonly proposals = new Map<string, Proposal>();
   private readonly operations = new Map<string, Operation>();
   private readonly active = new Map<OptionalRuntimeId, Operation>();
   private readonly metadata = new Set<AbortController>();
   private readonly target: RuntimeTarget;
   private closed = false;
+  private readonly nativeResources = new Set<() => Promise<void>>();
+  /** Host-owned native sessions share this installer's lifetime, including non-Host harnesses. */
+  ownNativeResource(close: () => Promise<void>): void {
+    if (this.closed) throw new Error("Workspace runtime installer is closed");
+    this.nativeResources.add(close);
+  }
   constructor(private readonly storage: WorkspaceResourceStorage, private readonly options: {
     target?: RuntimeTarget;
     fixtureOrigin?: string;
     resolveArtifact?: (id: OptionalRuntimeId, target: RuntimeTarget, signal?: AbortSignal) => Promise<RuntimeArtifact>;
     onChange?: () => void;
     discovery?: DetectionOptions;
+    /** Test-only OS account home seam; production always calls userInfo().homedir. */
+    accountHome?: () => string;
   } = {}) {
+    this.proxy = new WorkspaceRuntimeProxy(storage);
     this.target = Object.freeze({ platform: options.target?.platform ?? process.platform, arch: options.target?.arch ?? process.arch });
     if (options.fixtureOrigin) { const url = new URL(options.fixtureOrigin); if (url.origin !== options.fixtureOrigin || url.protocol !== "http:" || url.hostname !== "127.0.0.1") fail(); }
     const binding = () => this.state.binding();
-    this.state = new WorkspaceJsonState(storage, "runtime-installations-v1.json", value => {
-      if (!plain(value) || !exact(value, ["resourceBinding", "revision", "entries"]) || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, binding())
+    this.state = new WorkspaceJsonState<InstallState>(storage, "runtime-installations-v1.json", value => {
+      if (!plain(value) || !exact(value, ["resourceBinding", "revision", "entries", ...(value.loginSources === undefined ? [] : ["loginSources"])])
+        || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, binding())
         || !Number.isSafeInteger(value.revision) || Number(value.revision) < 1
         || !Array.isArray(value.entries) || value.entries.length > 64) return fail();
       const seen = new Set<string>();
@@ -58,38 +176,158 @@ export class WorkspaceRuntimeInstaller {
         const artifact = this.validateArtifact(row.artifact), key = `${artifact.runtimeId}:${artifact.version}:${artifact.sha256}`;
         if (seen.has(key)) return fail(); seen.add(key);
       }
-      return structuredClone(value) as unknown as InstallState;
-    }, () => ({ resourceBinding: binding(), revision: 0, entries: [] }));
-    this.locals = new WorkspaceJsonState(storage, "runtime-local-v1.json", value => {
-      if (!plain(value) || !exact(value, ["resourceBinding", "revision", "entries"]) || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, this.state.binding())
-        || !Number.isSafeInteger(value.revision) || Number(value.revision) < 1 || !Array.isArray(value.entries) || value.entries.length > 4) return fail();
+      return { ...structuredClone(value), loginSources: parseLoginSources(value.loginSources) } as unknown as InstallState;
+    }, () => ({ resourceBinding: binding(), revision: 0, entries: [], loginSources: [] }));
+    this.locals = new WorkspaceJsonState<LocalState>(storage, "runtime-local-v1.json", value => {
+      if (!plain(value) || !exact(value, ["resourceBinding", "revision", "entries", ...(value.loginSources === undefined ? [] : ["loginSources"])])
+        || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, this.state.binding())
+        || !Number.isSafeInteger(value.revision) || Number(value.revision) < 1 || !Array.isArray(value.entries) || value.entries.length > OPTIONAL_RUNTIMES.length) return fail();
       const seen = new Set<string>();
       for (const row of value.entries) {
         if (!plain(row) || !optionalRuntimeId(row.runtimeId) || seen.has(row.runtimeId) || !exact(row, ["runtimeId", "path", "realPath", "version", "fingerprint", "source"])
           || typeof row.path !== "string" || typeof row.realPath !== "string" || typeof row.version !== "string" || typeof row.source !== "string" || typeof row.fingerprint !== "string" || !HASH.test(row.fingerprint)) return fail();
         seen.add(row.runtimeId);
       }
-      return structuredClone(value) as unknown as { resourceBinding: WorkspaceResourceBinding; revision: number; entries: DetectedRuntime[] };
-    }, () => ({ resourceBinding: this.state.binding(), revision: 0, entries: [] }));
+      return { ...structuredClone(value), loginSources: parseLoginSources(value.loginSources) } as unknown as LocalState;
+    }, () => ({ resourceBinding: this.state.binding(), revision: 0, entries: [], loginSources: [] }));
   }
   async discover(): Promise<void> {
     if (this.closed || !this.options.discovery) return;
-    if (!this.discovery) this.discovery = (async () => {
-      this.storage.run(() => {});
-      const found = await detectInstalledRuntimes(this.options.discovery!);
-      if (this.closed) return;
-      this.storage.run(() => {}); this.detected = found;
-    })().finally(() => { this.discovery = undefined; });
+    if (!this.discovery) {
+      const controller = new AbortController(); this.versionProbes.add(controller);
+      this.discovery = (async () => {
+        this.storage.run(() => {});
+        let deferred: CopilotVersionProbe | undefined;
+        const copilotProbeInProgress = Boolean(this.copilotRetry);
+        const incomplete = new Set<OptionalRuntimeId>();
+        let found: DetectedRuntime[];
+        try {
+          found = await detectInstalledRuntimes({ ...this.options.discovery!, signal: controller.signal, copilotProbeInProgress,
+            onCopilotProbeTimeout: probe => { deferred = probe; },
+            partial: { ...(this.options.discovery!.partial ?? {}), onIncomplete: id => { incomplete.add(id); } } });
+        } catch (error) {
+          // A failed round confirms nothing: keep earlier results and report every runtime as unfinished.
+          if (!this.closed && !controller.signal.aborted) { this.incomplete = new Set(OPTIONAL_RUNTIMES); this.discoveredAt = new Date().toISOString(); }
+          throw error;
+        }
+        if (this.closed || controller.signal.aborted) return;
+        this.storage.run(() => {});
+        // An unfinished runtime keeps its previous result; a timeout is never evidence of removal.
+        const kept = this.detected.filter(row => incomplete.has(row.runtimeId) && !found.some(next => next.runtimeId === row.runtimeId));
+        this.incomplete = incomplete; this.discoveredAt = new Date().toISOString();
+        if (copilotProbeInProgress) {
+          // The retry may finish while other runtimes are rescanned. Do not erase its newer result.
+          this.detected = [...found, ...kept.filter(row => row.runtimeId !== "copilot"), ...this.detected.filter(row => row.runtimeId === "copilot")];
+        } else {
+          this.detected = [...found, ...kept];
+          this.copilotProbe = deferred ? { path: deferred.path, source: deferred.source, state: "detecting" } : undefined;
+          if (deferred) this.retryCopilotVersion(deferred);
+        }
+      })().finally(() => { this.versionProbes.delete(controller); this.discovery = undefined; });
+    }
     return this.discovery;
   }
-  registerLocal(runtimeId: OptionalRuntimeId, fingerprint: string): void {
+  /**
+   * Background detection after a Workspace opens. Same probe code and environment as an explicit
+   * rescan; nothing is persisted and close() cancels the timer and any running round.
+   */
+  scheduleDiscovery(delayMs = 3000): void {
+    if (this.closed || !this.options.discovery) return;
+    if (this.scheduledDiscovery) clearTimeout(this.scheduledDiscovery);
+    const notify = () => { if (!this.closed) try { this.options.onChange?.(); } catch { /* observer only */ } };
+    this.scheduledDiscovery = setTimeout(() => {
+      this.scheduledDiscovery = undefined;
+      if (!this.closed) void this.discover().then(notify, notify);
+    }, Math.max(0, delayMs));
+    this.scheduledDiscovery.unref?.();
+  }
+  /** Round state for "last checked" / partial progress; not authority. */
+  detectionStatus(): { running: boolean; completedAt: string | null; incomplete: OptionalRuntimeId[] } {
+    return { running: Boolean(this.discovery), completedAt: this.discoveredAt, incomplete: [...this.incomplete] };
+  }
+  /**
+   * `--help` for a detected runtime the user has not confirmed, in the isolated version-probe
+   * environment: probe Home, fixed PATH, bounded time/output, no account login or credential. The
+   * file must be byte-identical before and after. Returns null on any doubt.
+   */
+  async probeUnconfirmedHelp(runtimeId: OptionalRuntimeId, signal?: AbortSignal): Promise<{ text: string; fingerprint: string } | null> {
+    if (this.closed || !this.options.discovery || runtimeId !== "claude") return null;
+    const row = this.detected.find(value => value.runtimeId === runtimeId);
+    const before = row && inspectLocalRuntime(row.path, true);
+    if (!row || !before || before.realPath !== row.realPath || before.fingerprint !== row.fingerprint) return null;
+    const controller = new AbortController(); this.versionProbes.add(controller);
+    const abort = () => controller.abort(); signal?.addEventListener("abort", abort, { once: true });
+    try {
+      const run = this.options.discovery.run ?? boundedRuntimeCommand;
+      const env = runtimeProbeEnvironment(this.options.discovery, row.path);
+      const text = await run(row.path, ["--help"], env, 5000, { signal: controller.signal, maxBytes: 256 * 1024 });
+      const after = inspectLocalRuntime(row.path, true);
+      if (this.closed || controller.signal.aborted || text === null || !after || after.realPath !== row.realPath || after.fingerprint !== row.fingerprint) return null;
+      return { text, fingerprint: row.fingerprint };
+    } catch { return null; }
+    finally { signal?.removeEventListener("abort", abort); this.versionProbes.delete(controller); }
+  }
+  private retryCopilotVersion(probe: CopilotVersionProbe): void {
+    const controller = new AbortController(); this.versionProbes.add(controller);
+    const notify = () => { try { this.options.onChange?.(); } catch { /* Observer disconnection cannot discard metadata. */ } };
+    const failed = () => { this.copilotProbe = { path: probe.path, source: probe.source, state: "detection_failed" }; };
+    const pending = new Promise<void>(resolve => setImmediate(resolve)).then(() => probe.retry(controller.signal)).then(found => {
+      if (this.closed || controller.signal.aborted) return;
+      this.storage.run(() => {});
+      if (found) { this.detected = [...this.detected.filter(row => row.runtimeId !== "copilot"), found]; this.copilotProbe = undefined; }
+      else failed();
+      notify();
+    }).catch(() => {
+      if (this.closed || controller.signal.aborted) return;
+      try { this.storage.run(() => {}); failed(); notify(); } catch { /* Retired Workspace generation: discard the late result. */ }
+    }).finally(() => { this.versionProbes.delete(controller); if (this.copilotRetry === pending) this.copilotRetry = undefined; });
+    this.copilotRetry = pending;
+    notify();
+  }
+  registerLocal(runtimeId: OptionalRuntimeId, fingerprint: string, loginSource: RuntimeLoginSource = runtimeId === "agy" ? "isolated" : "host"): void {
     if (this.closed) return fail();
-    const found = this.detected.find(row => row.runtimeId === runtimeId && row.fingerprint === fingerprint);
+    // A confirmed legacy binding may switch login source after restart, before a fresh discovery.
+    // Its stored path and fingerprint are re-inspected just like a newly detected binary.
+    const found = this.detected.find(row => row.runtimeId === runtimeId && row.fingerprint === fingerprint)
+      ?? this.locals.read().entries.find(row => row.runtimeId === runtimeId && row.fingerprint === fingerprint);
     const current = found && inspectLocalRuntime(found.path, true);
     if (!found || !current || current.realPath !== found.realPath || current.fingerprint !== fingerprint) return fail();
-    if (runtimeId === "codex") this.privateHome(runtimeId);
+    if (runtimeId === "kimi" && !isKimiCodeExecutable(found.path, found.version)) throw new Error(KIMI_LEGACY_MESSAGE);
+    if (!isLoginSource(loginSource) || runtimeId === "agy" && loginSource !== "isolated"
+      || HOST_LOGIN_ONLY_RUNTIMES.includes(runtimeId) && loginSource !== "host") return fail();
+    if (loginSource === "isolated" && runtimeId === "codex") this.privateHome(runtimeId);
     const state = this.locals.read();
-    this.locals.update(state.revision, value => ({ ...value, entries: [...value.entries.filter(row => row.runtimeId !== runtimeId), found] }));
+    this.locals.update(state.revision, value => ({ ...value, entries: [...value.entries.filter(row => row.runtimeId !== runtimeId), found],
+      loginSources: [...value.loginSources.filter(row => row.runtimeId !== runtimeId),
+        { runtimeId, source: loginSource, confirmedAt: new Date().toISOString() }] }));
+  }
+  /** Which stored login this binding launches with. Absent means the legacy isolated home. */
+  loginSource(runtimeId: OptionalRuntimeId): RuntimeLoginSource {
+    if (!optionalRuntimeId(runtimeId)) return "isolated";
+    return this.locals.read().loginSources.find(row => row.runtimeId === runtimeId)?.source
+      ?? this.state.read().loginSources.find(row => row.runtimeId === runtimeId)?.source ?? "isolated";
+  }
+  /**
+   * Explicit, confirmed switch between the host login and this Workspace's private home.
+   * Core records the decision; the renderer's confirmation card is the human gate. Re-registering the
+   * same fingerprint is the only way a legacy isolated binding can gain host access.
+   */
+  setLoginSource(runtimeId: unknown, source: unknown): RuntimeLoginSource {
+    if (!optionalRuntimeId(runtimeId) || !isLoginSource(source) || runtimeId === "agy" && source !== "isolated"
+      || HOST_LOGIN_ONLY_RUNTIMES.includes(runtimeId) && source !== "host") throw new Error("Invalid runtime login source");
+    const local = this.locals.read().entries.some(row => row.runtimeId === runtimeId);
+    if (!local && !this.state.read().entries.some(row => row.artifact.runtimeId === runtimeId)) return fail();
+    if (source === "isolated" && runtimeId === "codex") this.privateHome(runtimeId);
+    const record = (current: { loginSources: RuntimeLoginBinding[] }) => [...current.loginSources.filter(row => row.runtimeId !== runtimeId),
+      { runtimeId, source, confirmedAt: new Date().toISOString() }];
+    if (local) {
+      const current = this.locals.read();
+      this.locals.update(current.revision, value => ({ ...value, loginSources: record(value) }));
+    } else {
+      const current = this.state.read();
+      this.state.update(current.revision, value => ({ ...value, loginSources: record(value) }));
+    }
+    return source;
   }
   private privateHome(runtimeId: OptionalRuntimeId): string {
     return this.storage.run(() => {
@@ -100,27 +338,131 @@ export class WorkspaceRuntimeInstaller {
       return home;
     });
   }
-  resolveLocal(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv } {
+  /** Bun's os.userInfo() follows HOME on macOS; query the passwd record independently. */
+  private accountHome(): string {
+    let home: string;
+    if (this.options.accountHome) home = this.options.accountHome();
+    else if (process.platform === "darwin") {
+      const uid = process.geteuid?.();
+      if (uid === undefined) return fail();
+      let fields: string[];
+      try {
+        fields = execFileSync("/usr/bin/id", ["-P"], { encoding: "utf8", timeout: 1500,
+          maxBuffer: 4096, env: { PATH: "/usr/bin:/bin" } }).trim().split(":");
+      } catch { return fail(); }
+      if (fields.length !== 10 || fields[2] !== String(uid)) return fail();
+      home = fields[8]!;
+    } else home = this.options.discovery?.home ?? userInfo().homedir;
+    if (!isAbsolute(home) || home === "/" || /[\u0000-\u001f\u007f]/.test(home)) return fail();
+    return home;
+  }
+  /** Launch a host-bound runtime with the account login directory, without copying credentials. */
+  private hostEnv(command: string): NodeJS.ProcessEnv {
+    const { CODEX_HOME: _codexHome, CLAUDE_CONFIG_DIR: _claudeConfigDir, GEMINI_CLI_HOME: _geminiHome,
+      GEMINI_CLI_SYSTEM_SETTINGS_PATH: _geminiSettings, GEMINI_CLI_SYSTEM_DEFAULTS_PATH: _geminiDefaults,
+      GEMINI_CLI_TRUSTED_FOLDERS_PATH: _geminiTrust, GEMINI_SANDBOX: _geminiSandbox, KIMI_SHARE_DIR: _kimiShare, KIMI_CODE_HOME: _kimiCodeHome, COPILOT_HOME: _copilotHome, CURSOR_CONFIG_DIR: _cursorConfig, GROK_HOME: _grokHome, ...ambient } = process.env;
+    const home = this.accountHome();
+    return {
+      ...ambient,
+      HOME: home, USERPROFILE: home,
+      PATH: `${dirname(command)}:${this.options.discovery?.path ?? ambient.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin"}`,
+      DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0",
+    };
+  }
+  private resolveLocalUnproxied(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
     const row = this.locals.read().entries.find(row => row.runtimeId === runtimeId), checked = row && inspectLocalRuntime(row.path, true);
     if (!row || !checked || checked.realPath !== row.realPath || checked.fingerprint !== row.fingerprint) return fail();
+    if (runtimeId === "kimi" && !isKimiCodeExecutable(row.path, row.version)) throw new Error(KIMI_LEGACY_MESSAGE);
     if (runtimeId === "agy") return { command: row.path, env: { HOME: this.options.discovery?.home ?? userInfo().homedir,
       USERPROFILE: this.options.discovery?.home ?? userInfo().homedir, PATH: `${dirname(row.path)}:${this.options.discovery?.path ?? process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin"}`,
-      DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" } };
+      DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" }, loginSource: "isolated" };
+    const loginSource = this.loginSource(runtimeId);
+    if (HOST_LOGIN_ONLY_RUNTIMES.includes(runtimeId) && loginSource !== "host") return fail();
+    if (loginSource === "host") return { command: row.path, env: this.hostEnv(row.path), loginSource };
     const privateHome = this.privateHome(runtimeId);
     return { command: row.path, env: { HOME: privateHome, USERPROFILE: privateHome, CODEX_HOME: join(privateHome, ".codex"),
       CLAUDE_CONFIG_DIR: join(privateHome, ".claude"), PATH: `${dirname(row.path)}:${this.options.discovery?.path ?? "/usr/bin:/bin:/usr/sbin:/sbin"}`,
-      DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" } };
+      DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" }, loginSource };
   }
-  resolveBound(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv } {
-    if (this.locals.read().entries.some(row => row.runtimeId === runtimeId)) return this.resolveLocal(runtimeId);
+  resolveLocal(runtimeId: OptionalRuntimeId) {
+    const resolved = this.resolveLocalUnproxied(runtimeId);
+    return { ...resolved, ...this.proxy.applyWithEndpoint(resolved.env) };
+  }
+  /** Check only an explicit Workspace proxy, then revalidate the registered binary at physical launch. */
+  /** The bundled Pi has no external login and never receives this account's credentials. */
+  async prepareBuiltinPi(signal?: AbortSignal): Promise<{ accountHome: string; proxyUrl: string | null }> {
+    const checked = await this.proxy.check(signal);
+    return { accountHome: realpathSync.native(this.accountHome()), proxyUrl: checked.proxyUrl };
+  }
+  async prepareBound(runtimeId: OptionalRuntimeId, signal?: AbortSignal) {
+    const checked = await this.proxy.check(signal), resolved = this.resolveBoundUnproxied(runtimeId);
+    return { ...resolved, env: this.proxy.applyChecked(resolved.env, checked), proxyUrl: checked.proxyUrl };
+  }
+  resolveBound(runtimeId: OptionalRuntimeId) {
+    const resolved = this.resolveBoundUnproxied(runtimeId);
+    return { ...resolved, ...this.proxy.applyWithEndpoint(resolved.env) };
+  }
+  private resolveBoundUnproxied(runtimeId: OptionalRuntimeId): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
+    if (this.locals.read().entries.some(row => row.runtimeId === runtimeId)) return this.resolveLocalUnproxied(runtimeId);
     const installed = this.state.read().entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
     if (!installed) return fail();
-    return this.resolve(runtimeId, installed.artifact.version, installed.artifact.sha256);
+    return this.resolveUnproxied(runtimeId, installed.artifact.version, installed.artifact.sha256);
+  }
+  /** Host-attested directories, revalidated against the exact installed command and login selection. */
+  executionPolicyDirectories(runtimeId: "codex" | "claude" | "opencode" | "gemini" | "kimi" | "copilot" | "cursor" | "grok",
+    launched: { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource }) {
+    const current = this.resolveBoundUnproxied(runtimeId);
+    if (current.command !== launched.command || current.loginSource !== launched.loginSource || current.env.HOME !== launched.env.HOME
+      || current.env.CODEX_HOME !== launched.env.CODEX_HOME || current.env.CLAUDE_CONFIG_DIR !== launched.env.CLAUDE_CONFIG_DIR
+      || current.env.KIMI_CODE_HOME !== launched.env.KIMI_CODE_HOME
+      || current.env.COPILOT_HOME !== launched.env.COPILOT_HOME || current.env.CURSOR_CONFIG_DIR !== launched.env.CURSOR_CONFIG_DIR || current.env.GROK_HOME !== launched.env.GROK_HOME) return fail();
+    const accountHome = this.accountHome(), home = current.env.HOME; if (!home) return fail();
+    const runtimeHome = runtimeId === "claude" ? current.env.CLAUDE_CONFIG_DIR ?? join(home, ".claude")
+      : runtimeId === "codex" ? current.env.CODEX_HOME ?? join(home, ".codex")
+      : runtimeId === "gemini" ? join(home, ".gemini") : runtimeId === "kimi" ? join(home, ".kimi-code")
+      : runtimeId === "opencode" ? join(current.env.XDG_DATA_HOME ?? join(home, ".local/share"), "opencode") : join(home, "." + runtimeId);
+    return Object.freeze({ accountHome, runtimeHome, protectedStateRoots: Object.freeze([this.storage.runtimeProtectedStateRoot()]) });
+  }
+  /** Diagnostic metadata only: no login files, environment dump, paths or version probe. */
+  failureContext(runtimeId: "codex" | "claude" | "opencode" | "gemini" | "kimi" | "copilot" | "cursor" | "grok",
+    launched?: { env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource }): RuntimeFailureContext {
+    let version: string | null = null, loginSource: RuntimeFailureContext["loginSource"] = "unknown";
+    try {
+      const local = this.locals.read().entries.find(row => row.runtimeId === runtimeId);
+      version = local?.version ?? this.state.read().entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1)?.artifact.version ?? null;
+      loginSource = launched?.loginSource ?? this.loginSource(runtimeId);
+    } catch { /* unavailable metadata is unknown, never proof of a missing login */ }
+    let homeMatchesAccount: boolean | null = null;
+    if (launched?.env.HOME) {
+      try {
+        const comparable = (path: string) => process.platform === "win32" ? realpathSync(resolve(path)).toLowerCase() : realpathSync(resolve(path));
+        homeMatchesAccount = comparable(launched.env.HOME) === comparable(this.accountHome());
+      } catch { /* account lookup failure is not a mismatched home */ }
+    }
+    return { runtime: runtimeId, version, loginSource, homeMatchesAccount,
+      ...(["kimi", "copilot", "cursor", "grok"].includes(runtimeId) ? { extensionsIsolation: "inherited" as const } : {}) };
+  }
+  /**
+   * Read-only snapshot of the host's own Codex model cache, only while this binding launches with the
+   * host login. The file is read through the same no-follow/no-hardlink checks as private state, but it
+   * is never copied into `runtime-homes/*` and never written; a missing or unsafe file simply yields null.
+   */
+  hostCodexModelCache(): string | null {
+    if (this.loginSource("codex") !== "host") return null;
+    this.resolveBound("codex"); // revalidate the current registration before reading host metadata
+    const root = join(this.accountHome(), ".codex");
+    try {
+      if (!isAbsolute(root) || /[\u0000-\u001f\u007f]/.test(root)) return null;
+      return readOptionalHostText(join(root, "models_cache.json"), MAX_HOST_CACHE_BYTES);
+    } catch { return null; }
   }
   /** Read-only login guidance for the registered executable and this Workspace's private home.
    * No login is launched and no global auth/config is read or projected. */
   codexLoginInstructions(): { runtimeId: "codex"; shell: "posix" | "powershell"; command: string } {
-    const { command, env } = this.resolveBound("codex");
+    const { command, env, loginSource } = this.resolveBound("codex");
+    // Host mode reuses the machine login; there is nothing to sign in again for, and returning a
+    // command that re-points HOME would quietly contradict the mode the user confirmed.
+    if (loginSource === "host") throw new Error("Codex reuses the host login; no separate sign-in is required");
     const quote = (value: string) => "'" + value.replaceAll("'", process.platform === "win32" ? "''" : "'\"'\"'") + "'";
     const values = ["HOME", "USERPROFILE", "CODEX_HOME"] as const;
     if (values.some(key => !env[key] || /[\r\n\0]/.test(env[key]!)) || /[\r\n\0]/.test(command)) return fail();
@@ -138,7 +480,7 @@ export class WorkspaceRuntimeInstaller {
   }
   private validateArtifact(value: unknown): RuntimeArtifact {
     if (!plain(value) || !exact(value, ["runtimeId", "version", "target", "url", "sha256", "format", "member", "maxBytes"])
-      || !optionalRuntimeId(value.runtimeId) || value.runtimeId === "agy" || typeof value.version !== "string" || !/^\d+\.\d+\.\d+$/.test(value.version)
+      || !optionalRuntimeId(value.runtimeId) || (value.runtimeId === "agy" || !!MANUAL_RUNTIME_INSTALL_URLS[value.runtimeId]) || typeof value.version !== "string" || !/^\d+\.\d+\.\d+$/.test(value.version)
       || !plain(value.target) || !exact(value.target, ["platform", "arch"]) || value.target.platform !== this.target.platform || value.target.arch !== this.target.arch
       || typeof value.url !== "string" || typeof value.sha256 !== "string" || !HASH.test(value.sha256)
       || !["raw", "tar.gz", "zip"].includes(String(value.format)) || (value.member !== null && (typeof value.member !== "string" || !/^[A-Za-z0-9_.+/-]{1,200}$/.test(value.member)))
@@ -171,6 +513,7 @@ export class WorkspaceRuntimeInstaller {
     return fail();
   }
   async propose(runtimeId: OptionalRuntimeId, controllerId: string, assertCurrent: () => void, assertInstallCurrent = () => this.storage.run(() => {})): Promise<RuntimeInstallCard> {
+    if (manualRuntimeInstallation(runtimeId) || MANUAL_RUNTIME_INSTALL_URLS[runtimeId]) throw new Error("This runtime requires manual installation using its official guide; detect and register it afterward");
     if (runtimeId === "agy") throw new Error("Antigravity is local registration only; no official download is configured");
     await this.discover();
     if (this.detected.some(row => row.runtimeId === runtimeId && inspectLocalRuntime(row.path))) throw new Error("A local installation is already available; confirm registration instead of downloading");
@@ -189,17 +532,20 @@ export class WorkspaceRuntimeInstaller {
       target: this.target, expiresAt: new Date(Date.now() + 5 * 60000).toISOString() });
     this.proposals.set(card.id, { card, artifact: Object.freeze(artifact), controllerId, assertCurrent, assertInstallCurrent }); return card;
   }
-  approve(id: string, approved: boolean, controllerId: string): { operationId: string | null; state: string } {
-    if (this.closed || typeof approved !== "boolean" || !UUID.test(id)) return fail();
+  approve(id: string, approved: boolean, controllerId: string, loginSource: RuntimeLoginSource = "host"): { operationId: string | null; state: string } {
+    if (this.closed || typeof approved !== "boolean" || !UUID.test(id) || !isLoginSource(loginSource)) return fail();
     const proposal = this.proposals.get(id);
     if (!proposal || proposal.controllerId !== controllerId || Date.parse(proposal.card.expiresAt) <= Date.now()) return fail();
-    proposal.assertCurrent(); this.proposals.delete(id); // single use, including a refusal
+    proposal.assertCurrent();
+    if (approved && proposal.card.runtimeId === "agy" && loginSource !== "isolated") throw new Error("Agy requires isolated login");
+    if (approved && HOST_LOGIN_ONLY_RUNTIMES.includes(proposal.card.runtimeId) && loginSource !== "host") throw new Error("This runtime requires host login");
+    this.proposals.delete(id); // single use, including a refusal
     if (!approved) return { operationId: null, state: "declined" };
     if (this.active.has(proposal.card.runtimeId)) throw new Error("Runtime installation is already active; do not resend");
     for (const [id, prior] of this.operations) if (this.operations.size >= 64 && prior.state !== "downloading") this.operations.delete(id);
     const operation: Operation = { id: randomUUID(), runtimeId: proposal.card.runtimeId, state: "downloading", controller: new AbortController() };
     this.operations.set(operation.id, operation); this.active.set(operation.runtimeId, operation);
-    void this.install(proposal, operation).finally(() => {
+    void this.install(proposal, operation, loginSource).finally(() => {
       this.active.delete(operation.runtimeId);
       try { this.options.onChange?.(); } catch { /* A disconnected observer cannot invalidate a durable outcome. */ }
     });
@@ -230,7 +576,7 @@ export class WorkspaceRuntimeInstaller {
       this.storage.run(() => {}); return { path, bytes };
     } finally { if (fd !== undefined) closeSync(fd); }
   }
-  private async install(proposal: Proposal, operation: Operation): Promise<void> {
+  private async install(proposal: Proposal, operation: Operation, loginSource: RuntimeLoginSource): Promise<void> {
     try {
       const { artifact } = proposal, signal = operation.controller.signal;
       proposal.assertInstallCurrent();
@@ -255,44 +601,165 @@ export class WorkspaceRuntimeInstaller {
       }
       proposal.assertInstallCurrent(); signal.throwIfAborted(); this.inspect(artifact, registration);
       const current = this.state.read();
-      if (!current.entries.some(row => row.artifact.runtimeId === artifact.runtimeId && row.artifact.sha256 === artifact.sha256 && row.artifact.version === artifact.version)) {
-        this.state.update(current.revision, value => ({ ...value, entries: [...value.entries, registration] }));
-      }
+      this.state.update(current.revision, value => ({ ...value,
+        entries: value.entries.some(row => row.artifact.runtimeId === artifact.runtimeId && row.artifact.sha256 === artifact.sha256 && row.artifact.version === artifact.version)
+          ? value.entries : [...value.entries, registration],
+        loginSources: [...value.loginSources.filter(row => row.runtimeId !== artifact.runtimeId),
+          { runtimeId: artifact.runtimeId, source: loginSource, confirmedAt: new Date().toISOString() }] }));
       operation.state = "registered";
     } catch { operation.state = operation.controller.signal.aborted ? "cancelled" : "failed"; }
   }
+  /** Capture the already trusted executable at the physical launch. This closure is Host-only
+   * diagnostic bookkeeping; it cannot register a binary or turn a discovered version into trust. */
+  captureSuccessfulUse(runtimeId: OptionalRuntimeId, command: string): () => void {
+    let before: ReturnType<WorkspaceRuntimeInstaller["boundVersionIdentity"]> = null;
+    try { before = this.boundVersionIdentity(runtimeId); } catch { /* optional history */ }
+    if (!before || before.command !== command) return () => {};
+    const captured = before;
+    return () => {
+      if (this.closed) return;
+      try {
+        const current = this.boundVersionIdentity(runtimeId);
+        if (!current || current.command !== captured.command || current.realPath !== captured.realPath
+          || current.fingerprint !== captured.fingerprint || current.version !== captured.version) return;
+        new WorkspaceRuntimeVersionStore(this.storage).recordSuccessfulUse(runtimeId, captured.version, captured.fingerprint);
+      } catch { /* Damaged/stale history is preserved and never changes an execution result. */ }
+    };
+  }
+  private boundVersionIdentity(runtimeId: OptionalRuntimeId): { command: string; realPath: string; version: string | null; fingerprint: string } | null {
+    if (!optionalRuntimeId(runtimeId)) return null;
+    const version = (value: string) => value === value.trim() && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(value) ? value : null;
+    const local = this.locals.read().entries.find(row => row.runtimeId === runtimeId);
+    if (local) {
+      const checked = inspectLocalRuntime(local.path, true);
+      if (!checked || checked.realPath !== local.realPath || checked.fingerprint !== local.fingerprint) return null;
+      return { command: local.path, realPath: checked.realPath, version: version(local.version), fingerprint: checked.fingerprint };
+    }
+    const installed = this.state.read().entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
+    const checked = installed && this.inspect(installed.artifact, installed);
+    return installed && checked ? { command: checked.path, realPath: checked.path,
+      version: version(installed.artifact.version), fingerprint: installed.executableSha256 } : null;
+  }
+  private versionProjection() {
+    let history: ReturnType<WorkspaceRuntimeVersionStore["list"]> | null;
+    try { history = new WorkspaceRuntimeVersionStore(this.storage).list(); } catch { history = null; }
+    return (runtimeId: OptionalRuntimeId, current: RuntimeVersionCurrent) => {
+      const projected = projectRuntimeVersionStatus(history?.find(row => row.runtimeId === runtimeId) ?? null, current);
+      return history === null ? { ...projected, change: "unknown" as const, compatibility: "unknown" as const } : projected;
+    };
+  }
+  /** Fresh launch availability for one selected runtime. Display history and unrelated binaries
+   * are not authority for this launch; physical dispatch still resolves its original bound origin. */
+  availability(runtimeId: OptionalRuntimeId): { state: string; generalAgentDriverAvailable: boolean } {
+    if (!optionalRuntimeId(runtimeId)) return fail();
+    const locals = this.locals.read(), local = locals.entries.find(row => row.runtimeId === runtimeId);
+    const detected = this.detected.find(row => row.runtimeId === runtimeId);
+    if (local || detected) {
+      const checked = local && inspectLocalRuntime(local.path);
+      const registered = Boolean(local && (runtimeId !== "kimi" || isKimiCodeExecutable(local.path, local.version)) && checked && checked.realPath === local.realPath && checked.fingerprint === local.fingerprint);
+      const discovered = !registered && detected && (runtimeId !== "kimi" || isKimiCodeExecutable(detected.path, detected.version)) && inspectLocalRuntime(detected.path);
+      const valid = registered || Boolean(detected && discovered && discovered.realPath === detected.realPath && discovered.fingerprint === detected.fingerprint);
+      const selected = registered ? local! : discovered ? detected! : (local ?? detected)!;
+      if (!registered) return { state: runtimeId === "kimi" && !valid && !isKimiCodeExecutable(selected.path, selected.version) ? "legacy_unsupported" : valid ? "detected" : "integrity_failed", generalAgentDriverAvailable: false };
+      const loginSource = locals.loginSources.find(row => row.runtimeId === runtimeId)?.source
+        ?? this.state.read().loginSources.find(row => row.runtimeId === runtimeId)?.source ?? "isolated";
+      return { state: "local_registered", generalAgentDriverAvailable: generalAgentAvailable(runtimeId, true, loginSource) };
+    }
+    const value = this.state.read(), installed = value.entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
+    let verified = false; if (installed && runtimeId !== "kimi") try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* fail closed, no fallback */ }
+    const loginSource = locals.loginSources.find(row => row.runtimeId === runtimeId)?.source
+      ?? value.loginSources.find(row => row.runtimeId === runtimeId)?.source ?? "isolated";
+    return { state: installed && runtimeId === "kimi" ? "legacy_unsupported" : installed ? verified ? "registered" : "integrity_failed" : (runtimeId === "copilot" ? this.copilotProbe?.state : undefined) ?? "not_installed",
+      generalAgentDriverAvailable: generalAgentAvailable(runtimeId, verified, loginSource) };
+  }
+  private downloadedUse(runtimeId: OptionalRuntimeId, installed: boolean, verified: boolean, available: boolean, probe?: "detecting" | "detection_failed") {
+    return projectRuntimeUse(runtimeId, { registered: verified, available, valid: verified, hadConfirmation: installed,
+      legacy: installed && runtimeId === "kimi", missing: false, probe,
+      // Detection never examines Hara-downloaded files, so it cannot make their state "checking".
+      detecting: !installed && this.firstRoundPending(), incomplete: !installed && this.incomplete.has(runtimeId) });
+  }
+  /**
+   * A confirmed file that still passes the file check but has new bytes (typically an auto-update) gets
+   * one automatic recheck so it can be offered for confirmation. Returns whether that check is pending.
+   * The recheck is the ordinary detection round; it never confirms or executes the new file.
+   */
+  private recheckChanged(runtimeId: OptionalRuntimeId, fingerprint: string): boolean {
+    if (this.closed || !this.options.discovery) return false;
+    const key = `${runtimeId}:${fingerprint}`;
+    if (this.rechecked.has(key)) return Boolean(this.discovery || this.scheduledDiscovery);
+    if (this.rechecked.size >= 64) this.rechecked.clear();
+    this.rechecked.add(key); this.scheduleDiscovery(0); return true;
+  }
+  /** Discovery is configured but no round has completed since this Workspace opened. */
+  private firstRoundPending(): boolean { return Boolean(this.options.discovery) && this.discoveredAt === null && !this.closed; }
   list() {
-    const value = this.state.read(), locals = this.locals.read();
+    const value = this.state.read(), locals = this.locals.read(), versionStatus = this.versionProjection();
+    // Local registrations win over an older downloaded install, so their recorded source is the
+    // effective one; merge in that same order instead of letting a stale record shadow it.
+    const loginSources = [...locals.loginSources, ...value.loginSources.filter(row => !locals.loginSources.some(prior => prior.runtimeId === row.runtimeId))];
     return { revision: value.revision, builtIn: "pi", options: OPTIONAL_RUNTIMES.map(runtimeId => {
       const local = locals.entries.find(row => row.runtimeId === runtimeId), detected = this.detected.find(row => row.runtimeId === runtimeId);
+      const loginSource = loginSources.find(row => row.runtimeId === runtimeId)?.source ?? "isolated";
       if (local || detected) {
-        const selected = local ?? detected!, inspected = inspectLocalRuntime(selected.path);
-        const valid = Boolean(inspected && inspected.realPath === selected.realPath && inspected.fingerprint === selected.fingerprint);
-        return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: valid, registered: Boolean(local && valid), version: selected.version,
-          path: selected.path, fingerprint: valid ? selected.fingerprint : null, source: selected.source,
-          generalAgentDriverAvailable: Boolean(local && valid && (runtimeId === "codex" || runtimeId === "claude")), state: valid ? local ? "local_registered" : "detected" : "integrity_failed" };
+        const localCheck = local && inspectLocalRuntime(local.path);
+        const registered = Boolean(local && (runtimeId !== "kimi" || isKimiCodeExecutable(local.path, local.version)) && localCheck && localCheck.realPath === local.realPath && localCheck.fingerprint === local.fingerprint);
+        const detectedCheck = detected && inspectLocalRuntime(detected.path);
+        const discovered = Boolean(detected && (runtimeId !== "kimi" || isKimiCodeExecutable(detected.path, detected.version)) && detectedCheck && detectedCheck.realPath === detected.realPath && detectedCheck.fingerprint === detected.fingerprint);
+        // A newly discovered replacement may be explained/confirmed, but the old binding still
+        // refuses it until registerLocal receives a new explicit human confirmation.
+        const selected = registered ? local! : discovered ? detected! : local ?? detected!;
+        const inspected = registered ? localCheck : discovered ? detectedCheck : localCheck ?? detectedCheck;
+        const valid = registered || discovered, version = valid ? selected.version : null;
+        const legacy = runtimeId === "kimi" && !valid && !isKimiCodeExecutable(selected.path, selected.version);
+        const available = generalAgentAvailable(runtimeId, registered, loginSource);
+        const use = projectRuntimeUse(runtimeId, { registered, available, valid, hadConfirmation: Boolean(local), legacy,
+          missing: runtimeFileMissing(selected.path), incomplete: this.incomplete.has(runtimeId),
+          detecting: this.firstRoundPending() || Boolean(local && localCheck && !valid) && this.recheckChanged(runtimeId, localCheck!.fingerprint) });
+        return { runtimeId, label: RUNTIME_LABELS[runtimeId], ...(["kimi", "copilot", "cursor", "grok"].includes(runtimeId) ? { extensionsIsolation: "inherited" as const } : {}), ...(manualRuntimeInstallation(runtimeId) ? { manualInstallation: manualRuntimeInstallation(runtimeId)! } : {}), ...(MANUAL_RUNTIME_INSTALL_URLS[runtimeId] ? { installUrl: MANUAL_RUNTIME_INSTALL_URLS[runtimeId] } : {}), installed: valid, registered, version,
+          path: selected.path, fingerprint: valid ? selected.fingerprint : null, source: selected.source, loginSource,
+          versionStatus: versionStatus(runtimeId, { version, fingerprint: inspected?.fingerprint ?? null,
+            registered, requiresRetrust: !registered && Boolean(local || discovered) }),
+          generalAgentDriverAvailable: available, ...use, state: legacy ? "legacy_unsupported" : valid ? registered ? "local_registered" : "detected" : "integrity_failed", ...(runtimeId === "kimi" && !valid ? { compatibilityMessage: KIMI_LEGACY_MESSAGE } : {}) };
       }
       const installed = value.entries.filter(row => row.artifact.runtimeId === runtimeId).at(-1);
-      let verified = false; if (installed) try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* tampering revokes use, never repair or fallback */ }
-      return { runtimeId, label: RUNTIME_LABELS[runtimeId], installed: verified, registered: verified, version: installed?.artifact.version ?? null,
-        generalAgentDriverAvailable: Boolean(verified && (runtimeId === "codex" || runtimeId === "claude")), state: installed ? verified ? "registered" : "integrity_failed" : "not_installed" };
-    }), operations: [...this.operations.values()].slice(-64).map(({ controller: _c, ...row }) => row) };
+      let verified = false; if (installed && runtimeId !== "kimi") try { verified = Boolean(this.inspect(installed.artifact, installed)); } catch { /* tampering revokes use, never repair or fallback */ }
+      const version = verified ? installed!.artifact.version : null;
+      const probe = runtimeId === "copilot" ? this.copilotProbe : undefined;
+      return { runtimeId, ...(probe && !installed ? { path: probe.path, source: probe.source } : {}), label: RUNTIME_LABELS[runtimeId], ...(["kimi", "copilot", "cursor", "grok"].includes(runtimeId) ? { extensionsIsolation: "inherited" as const } : {}), ...(manualRuntimeInstallation(runtimeId) ? { manualInstallation: manualRuntimeInstallation(runtimeId)! } : {}), ...(MANUAL_RUNTIME_INSTALL_URLS[runtimeId] ? { installUrl: MANUAL_RUNTIME_INSTALL_URLS[runtimeId] } : {}), installed: verified, registered: verified, version, fingerprint: verified ? installed!.executableSha256 : null,
+        versionStatus: versionStatus(runtimeId, { version, fingerprint: verified ? installed!.executableSha256 : null,
+          registered: verified, requiresRetrust: Boolean(installed && !verified) }),
+        loginSource, generalAgentDriverAvailable: generalAgentAvailable(runtimeId, verified, loginSource),
+        ...this.downloadedUse(runtimeId, Boolean(installed), verified, generalAgentAvailable(runtimeId, verified, loginSource), installed ? undefined : probe?.state),
+        state: installed && runtimeId === "kimi" ? "legacy_unsupported" : installed ? verified ? "registered" : "integrity_failed" : probe?.state ?? "not_installed", ...(installed && runtimeId === "kimi" ? { compatibilityMessage: KIMI_LEGACY_MESSAGE } : {}) };
+    }), detection: this.detectionStatus(), operations: [...this.operations.values()].slice(-64).map(({ controller: _c, ...row }) => row) };
   }
-  resolve(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string): { command: string; env: NodeJS.ProcessEnv } {
+  private resolveUnproxied(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string): { command: string; env: NodeJS.ProcessEnv; loginSource: RuntimeLoginSource } {
     if (runtimeId === "agy") return fail();
+    if (runtimeId === "kimi") throw new Error(KIMI_LEGACY_MESSAGE);
     const row = this.state.read().entries.find(row => row.artifact.runtimeId === runtimeId && row.artifact.version === version && row.artifact.sha256 === artifactSha256);
     if (!row) return fail(); const checked = this.inspect(row.artifact, row); if (!checked) return fail();
+    const loginSource = this.loginSource(runtimeId);
+    if (HOST_LOGIN_ONLY_RUNTIMES.includes(runtimeId) && loginSource !== "host") return fail();
+    if (loginSource === "host") return { command: checked.path, env: this.hostEnv(checked.path), loginSource };
     const privateHome = this.privateHome(runtimeId);
     return { command: checked.path, env: { HOME: privateHome, USERPROFILE: privateHome, CODEX_HOME: join(privateHome, ".codex"),
       CLAUDE_CONFIG_DIR: join(privateHome, ".claude"), XDG_CONFIG_HOME: join(privateHome, "config"), XDG_DATA_HOME: join(privateHome, "data"),
-      XDG_CACHE_HOME: join(privateHome, "cache"), DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" } };
+      XDG_CACHE_HOME: join(privateHome, "cache"), DISABLE_AUTOUPDATER: "1", HARA_UPDATE_CHECK: "0" }, loginSource };
+  }
+  resolve(runtimeId: OptionalRuntimeId, version: string, artifactSha256: string) {
+    const resolved = this.resolveUnproxied(runtimeId, version, artifactSha256);
+    return { ...resolved, ...this.proxy.applyWithEndpoint(resolved.env) };
   }
   async close(): Promise<void> {
-    this.closed = true; this.proposals.clear(); for (const operation of this.active.values()) operation.controller.abort();
+    this.closed = true; this.proposals.clear();
+    if (this.scheduledDiscovery) { clearTimeout(this.scheduledDiscovery); this.scheduledDiscovery = undefined; } for (const operation of this.active.values()) operation.controller.abort();
     for (const controller of this.metadata) controller.abort();
+    for (const controller of this.versionProbes) controller.abort();
+    await Promise.all([...this.nativeResources].map(close => close())); this.nativeResources.clear();
     // Own downloads have a finite deadline; callers can observe incomplete drain rather than delete locks.
     const deadline = Date.now() + 5000;
-    while ((this.active.size || this.metadata.size) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    while ((this.active.size || this.metadata.size || this.versionProbes.size) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
     if (this.active.size || this.metadata.size) throw new Error("Runtime downloads have not drained");
+    if (this.versionProbes.size) throw new Error("Runtime version probes have not drained");
   }
 }

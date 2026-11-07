@@ -36,7 +36,8 @@ test("npm prefix discovery is offline/no-notifier and cannot create the host npm
   globalThis.fetch = () => { networkCalls++; throw new Error("network not allowed"); };
   try {
     const found = await detectInstalledRuntimes({ home, path: "/usr/bin:/bin", systemBins: [], run: async (command, args, env, timeout) => {
-      if (args[0] === "-lc") return null;
+      // Discovery runs `<shell> -lic`; stub it so the host login PATH (and any real CLI on it) is never probed.
+      if (args[0] === "-lic" || args[0] === "-lc") return null;
       calls.push({ command, args, env }); return boundedRuntimeCommand(command, args, env, timeout);
     } });
     assert.equal(found.find(row => row.runtimeId === "opencode")?.path, executable);
@@ -137,7 +138,7 @@ test("blocked migration leaves Workspace roster/history/features available with 
     const conversations = new WorkspaceConversationStore(resource, created.selectedAgentId), previous = conversations.read();
     conversations.save(previous.revision, { ...previous, history: [{ role: "user", content: "Retained fixture history" }, { role: "assistant", text: "Retained reply", toolUses: [] }] });
     const before = fs.readFileSync(path(resource)), view = host.snapshot(id);
-    assert.equal(view.connections.migrationPending, true); assert.equal(view.connections.readOnly, true); assert.equal(view.agents.length, 1); assert.equal(view.runtimes.options.length, 4);
+    assert.equal(view.connections.migrationPending, true); assert.equal(view.connections.readOnly, true); assert.equal(view.agents.length, 1); assert.deepEqual(view.runtimes.options.map(row=>row.runtimeId), ["opencode","codex","claude","agy","gemini","kimi","copilot","cursor","grok"]);
     assert.equal(view.conversation.history[0].content, "Retained fixture history"); assert.equal(view.conversation.usage.modelCalls, 0); assert.equal(host.workspaceFeatures(id).workspaceId, id);
     host.snapshot(id); assert.equal(writes, 1); assert.equal(fs.readFileSync(path(resource)).equals(before), true);
   } finally { await host.close(); }

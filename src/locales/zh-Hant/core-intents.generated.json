@@ -1,0 +1,485 @@
+{
+  "schemaVersion": 1,
+  "locale": "zh-Hant",
+  "derivedFrom": "zh-Hans",
+  "generator": "OpenCC",
+  "openccVersion": "1.3.1",
+  "configurations": [
+    "s2twp.json",
+    "s2tw.json",
+    "s2t.json"
+  ],
+  "sourceHashes": {
+    "en": "41366834bd3e74d04ed856d09a6fbbcb372ee22954625db5b1c772fb611c3aa1",
+    "zh-Hans": "2e97a008a407c8e05d5145b450fdb07e23a2192ce4c37fc31ae1db89e88ce077"
+  },
+  "reviewedCorrectionsSha256": "8eb4edf6466aaaa1b9261f030e77d5cde99af8c9a5ec63f0968c954bc8192fe4",
+  "dictionaryHashes": {
+    "STCharacters.ocd2": "1ec2298310ca5a9151a554ea57bd86a6296ce917e4cdd1dd0884f789c477641b",
+    "STPhrases.ocd2": "0c0231f46757b150932ec04171ecfb1ad40aa83e3406aab1b0ec3eaf84a3bbf3",
+    "TWPhrases.ocd2": "17c8537f58da9900957c14b673cb6d9f7bd142a9a4fa0dad5f47685d63e8d1ea",
+    "TWVariants.ocd2": "390f07a1867ad56aa60a7af23b6e4b3acc96ea48d893c06ede3dffb1c576c2bc",
+    "s2t.json": "710bb970e406d9c0a3dd33c609248686cf1c5578d064b7b7fc89e70fbb9ea75d",
+    "s2tw.json": "67ce1f5aa3d6b21ebb523084b40e66f80bec27bb2dc6b540d44dac2e27f7194e",
+    "s2twp.json": "72d187574510542be608c862d5359d29480ee61f137082df8a06d74f7bcfc79c"
+  },
+  "convertedLexemes": {
+    "电脑使用": {
+      "s2twp.json": "電腦使用",
+      "s2tw.json": "電腦使用",
+      "s2t.json": "電腦使用"
+    },
+    "电脑控制": {
+      "s2twp.json": "電腦控制",
+      "s2tw.json": "電腦控制",
+      "s2t.json": "電腦控制"
+    },
+    "浏览器": {
+      "s2twp.json": "瀏覽器",
+      "s2tw.json": "瀏覽器",
+      "s2t.json": "瀏覽器"
+    },
+    "使用": {
+      "s2twp.json": "使用",
+      "s2tw.json": "使用",
+      "s2t.json": "使用"
+    },
+    "控制": {
+      "s2twp.json": "控制",
+      "s2tw.json": "控制",
+      "s2t.json": "控制"
+    },
+    "交互": {
+      "s2twp.json": "互動",
+      "s2tw.json": "交互",
+      "s2t.json": "交互"
+    },
+    "自动化": {
+      "s2twp.json": "自動化",
+      "s2tw.json": "自動化",
+      "s2t.json": "自動化"
+    },
+    "桌面": {
+      "s2twp.json": "桌面",
+      "s2tw.json": "桌面",
+      "s2t.json": "桌面"
+    },
+    "操作": {
+      "s2twp.json": "操作",
+      "s2tw.json": "操作",
+      "s2t.json": "操作"
+    },
+    "屏幕": {
+      "s2twp.json": "螢幕",
+      "s2tw.json": "屏幕",
+      "s2t.json": "屏幕"
+    },
+    "网页": {
+      "s2twp.json": "網頁",
+      "s2tw.json": "網頁",
+      "s2t.json": "網頁"
+    },
+    "网站": {
+      "s2twp.json": "網站",
+      "s2tw.json": "網站",
+      "s2t.json": "網站"
+    },
+    "页面": {
+      "s2twp.json": "頁面",
+      "s2tw.json": "頁面",
+      "s2t.json": "頁面"
+    },
+    "网址": {
+      "s2twp.json": "網址",
+      "s2tw.json": "網址",
+      "s2t.json": "網址"
+    },
+    "链接": {
+      "s2twp.json": "連結",
+      "s2tw.json": "鏈接",
+      "s2t.json": "鏈接"
+    },
+    "应用": {
+      "s2twp.json": "應用",
+      "s2tw.json": "應用",
+      "s2t.json": "應用"
+    },
+    "窗口": {
+      "s2twp.json": "視窗",
+      "s2tw.json": "窗口",
+      "s2t.json": "窗口"
+    },
+    "按钮": {
+      "s2twp.json": "按鈕",
+      "s2tw.json": "按鈕",
+      "s2t.json": "按鈕"
+    },
+    "输入框": {
+      "s2twp.json": "輸入框",
+      "s2tw.json": "輸入框",
+      "s2t.json": "輸入框"
+    },
+    "表单": {
+      "s2twp.json": "表單",
+      "s2tw.json": "表單",
+      "s2t.json": "表單"
+    },
+    "对话框": {
+      "s2twp.json": "對話方塊",
+      "s2tw.json": "對話框",
+      "s2t.json": "對話框"
+    },
+    "微信": {
+      "s2twp.json": "微信",
+      "s2tw.json": "微信",
+      "s2t.json": "微信"
+    },
+    "飞书": {
+      "s2twp.json": "飛書",
+      "s2tw.json": "飛書",
+      "s2t.json": "飛書"
+    },
+    "打开": {
+      "s2twp.json": "開啟",
+      "s2tw.json": "打開",
+      "s2t.json": "打開"
+    },
+    "进入": {
+      "s2twp.json": "進入",
+      "s2tw.json": "進入",
+      "s2t.json": "進入"
+    },
+    "访问": {
+      "s2twp.json": "訪問",
+      "s2tw.json": "訪問",
+      "s2t.json": "訪問"
+    },
+    "导航": {
+      "s2twp.json": "導航",
+      "s2tw.json": "導航",
+      "s2t.json": "導航"
+    },
+    "点击": {
+      "s2twp.json": "點選",
+      "s2tw.json": "點擊",
+      "s2t.json": "點擊"
+    },
+    "点开": {
+      "s2twp.json": "點開",
+      "s2tw.json": "點開",
+      "s2t.json": "點開"
+    },
+    "输入": {
+      "s2twp.json": "輸入",
+      "s2tw.json": "輸入",
+      "s2t.json": "輸入"
+    },
+    "键入": {
+      "s2twp.json": "鍵入",
+      "s2tw.json": "鍵入",
+      "s2t.json": "鍵入"
+    },
+    "填写": {
+      "s2twp.json": "填寫",
+      "s2tw.json": "填寫",
+      "s2t.json": "填寫"
+    },
+    "选择": {
+      "s2twp.json": "選擇",
+      "s2tw.json": "選擇",
+      "s2t.json": "選擇"
+    },
+    "勾选": {
+      "s2twp.json": "勾選",
+      "s2tw.json": "勾選",
+      "s2t.json": "勾選"
+    },
+    "上传": {
+      "s2twp.json": "上傳",
+      "s2tw.json": "上傳",
+      "s2t.json": "上傳"
+    },
+    "下载": {
+      "s2twp.json": "下載",
+      "s2tw.json": "下載",
+      "s2t.json": "下載"
+    },
+    "提交": {
+      "s2twp.json": "提交",
+      "s2tw.json": "提交",
+      "s2t.json": "提交"
+    },
+    "登录": {
+      "s2twp.json": "登入",
+      "s2tw.json": "登錄",
+      "s2t.json": "登錄"
+    },
+    "截图": {
+      "s2twp.json": "截圖",
+      "s2tw.json": "截圖",
+      "s2t.json": "截圖"
+    },
+    "截屏": {
+      "s2twp.json": "截圖",
+      "s2tw.json": "截屏",
+      "s2t.json": "截屏"
+    },
+    "切换": {
+      "s2twp.json": "切換",
+      "s2tw.json": "切換",
+      "s2t.json": "切換"
+    },
+    "滚动": {
+      "s2twp.json": "滾動",
+      "s2tw.json": "滾動",
+      "s2t.json": "滾動"
+    },
+    "刷新": {
+      "s2twp.json": "重新整理",
+      "s2tw.json": "刷新",
+      "s2t.json": "刷新"
+    },
+    "重载": {
+      "s2twp.json": "過載",
+      "s2tw.json": "重載",
+      "s2t.json": "重載"
+    },
+    "按下": {
+      "s2twp.json": "按下",
+      "s2tw.json": "按下",
+      "s2t.json": "按下"
+    },
+    "拖动": {
+      "s2twp.json": "拖動",
+      "s2tw.json": "拖動",
+      "s2t.json": "拖動"
+    },
+    "演示文稿": {
+      "s2twp.json": "簡報",
+      "s2tw.json": "演示文稿",
+      "s2t.json": "演示文稿"
+    },
+    "幻灯片": {
+      "s2twp.json": "幻燈片",
+      "s2tw.json": "幻燈片",
+      "s2t.json": "幻燈片"
+    },
+    "路演稿": {
+      "s2twp.json": "路演稿",
+      "s2tw.json": "路演稿",
+      "s2t.json": "路演稿"
+    },
+    "汇报材料": {
+      "s2twp.json": "彙報材料",
+      "s2tw.json": "彙報材料",
+      "s2t.json": "彙報材料"
+    },
+    "查看": {
+      "s2twp.json": "檢視",
+      "s2tw.json": "查看",
+      "s2t.json": "查看"
+    },
+    "检查": {
+      "s2twp.json": "檢查",
+      "s2tw.json": "檢查",
+      "s2t.json": "檢查"
+    },
+    "识别": {
+      "s2twp.json": "識別",
+      "s2tw.json": "識別",
+      "s2t.json": "識別"
+    },
+    "分析": {
+      "s2twp.json": "分析",
+      "s2tw.json": "分析",
+      "s2t.json": "分析"
+    },
+    "描述": {
+      "s2twp.json": "描述",
+      "s2tw.json": "描述",
+      "s2t.json": "描述"
+    },
+    "转录": {
+      "s2twp.json": "轉錄",
+      "s2tw.json": "轉錄",
+      "s2t.json": "轉錄"
+    },
+    "图片": {
+      "s2twp.json": "圖片",
+      "s2tw.json": "圖片",
+      "s2t.json": "圖片"
+    },
+    "照片": {
+      "s2twp.json": "照片",
+      "s2tw.json": "照片",
+      "s2t.json": "照片"
+    },
+    "图表": {
+      "s2twp.json": "圖表",
+      "s2tw.json": "圖表",
+      "s2t.json": "圖表"
+    },
+    "里": {
+      "s2twp.json": "裡",
+      "s2tw.json": "裡",
+      "s2t.json": "裏"
+    },
+    "本地预览": {
+      "s2twp.json": "本地預覽",
+      "s2tw.json": "本地預覽",
+      "s2t.json": "本地預覽"
+    },
+    "网页预览": {
+      "s2twp.json": "網頁預覽",
+      "s2tw.json": "網頁預覽",
+      "s2t.json": "網頁預覽"
+    },
+    "扩展屏预览": {
+      "s2twp.json": "擴充套件屏預覽",
+      "s2tw.json": "擴展屏預覽",
+      "s2t.json": "擴展屏預覽"
+    },
+    "视觉预览": {
+      "s2twp.json": "視覺預覽",
+      "s2tw.json": "視覺預覽",
+      "s2t.json": "視覺預覽"
+    },
+    "显示": {
+      "s2twp.json": "顯示",
+      "s2tw.json": "顯示",
+      "s2t.json": "顯示"
+    },
+    "定位": {
+      "s2twp.json": "定位",
+      "s2tw.json": "定位",
+      "s2t.json": "定位"
+    },
+    "访达中显示": {
+      "s2twp.json": "訪達中顯示",
+      "s2tw.json": "訪達中顯示",
+      "s2t.json": "訪達中顯示"
+    },
+    "文件夹": {
+      "s2twp.json": "資料夾",
+      "s2tw.json": "文件夾",
+      "s2t.json": "文件夾"
+    },
+    "目录": {
+      "s2twp.json": "目錄",
+      "s2tw.json": "目錄",
+      "s2t.json": "目錄"
+    },
+    "访达": {
+      "s2twp.json": "訪達",
+      "s2tw.json": "訪達",
+      "s2t.json": "訪達"
+    },
+    "任务池": {
+      "s2twp.json": "任務池",
+      "s2tw.json": "任務池",
+      "s2t.json": "任務池"
+    },
+    "项目任务": {
+      "s2twp.json": "專案任務",
+      "s2tw.json": "項目任務",
+      "s2t.json": "項目任務"
+    },
+    "跨会话任务": {
+      "s2twp.json": "跨會話任務",
+      "s2tw.json": "跨會話任務",
+      "s2t.json": "跨會話任務"
+    },
+    "长期任务": {
+      "s2twp.json": "長期任務",
+      "s2tw.json": "長期任務",
+      "s2t.json": "長期任務"
+    },
+    "待办池": {
+      "s2twp.json": "待辦池",
+      "s2tw.json": "待辦池",
+      "s2t.json": "待辦池"
+    },
+    "记住": {
+      "s2twp.json": "記住",
+      "s2tw.json": "記住",
+      "s2t.json": "記住"
+    },
+    "记下来": {
+      "s2twp.json": "記下來",
+      "s2tw.json": "記下來",
+      "s2t.json": "記下來"
+    },
+    "忘记": {
+      "s2twp.json": "忘記",
+      "s2tw.json": "忘記",
+      "s2t.json": "忘記"
+    },
+    "删除": {
+      "s2twp.json": "刪除",
+      "s2tw.json": "刪除",
+      "s2t.json": "刪除"
+    },
+    "这条": {
+      "s2twp.json": "這條",
+      "s2tw.json": "這條",
+      "s2t.json": "這條"
+    },
+    "记忆": {
+      "s2twp.json": "記憶",
+      "s2tw.json": "記憶",
+      "s2t.json": "記憶"
+    },
+    "创建技能": {
+      "s2twp.json": "建立技能",
+      "s2tw.json": "創建技能",
+      "s2t.json": "創建技能"
+    },
+    "新建技能": {
+      "s2twp.json": "新建技能",
+      "s2tw.json": "新建技能",
+      "s2t.json": "新建技能"
+    },
+    "保存为技能": {
+      "s2twp.json": "儲存為技能",
+      "s2tw.json": "保存為技能",
+      "s2t.json": "保存爲技能"
+    },
+    "写成技能": {
+      "s2twp.json": "寫成技能",
+      "s2tw.json": "寫成技能",
+      "s2t.json": "寫成技能"
+    }
+  },
+  "patterns": {
+    "computer.explicit": [
+      "電腦使用|電腦控制|瀏覽器(?:使用|控制|(?:互動|交互)|自動化)|桌面(?:控制|操作|自動化)|(?:螢幕|屏幕)(?:控制|操作)"
+    ],
+    "computer.surface": [
+      "瀏覽器|網頁|網站|頁面|網址|(?:連結|鏈接)|Chrome|Edge|Safari|Firefox|應用|(?:視窗|窗口)|(?:螢幕|屏幕)|桌面|按鈕|輸入框|表單|(?:對話方塊|對話框)|微信|飛書"
+    ],
+    "computer.interaction": [
+      "(?:開啟|打開)|進入|訪問|導航|(?:點選|點擊)|點開|輸入|鍵入|填寫|選擇|勾選|上傳|下載|提交|(?:登入|登錄)|截圖|(?:截圖|截屏)|操作|控制|切換|滾動|(?:重新整理|刷新)|(?:重新載入|重載)|按下|拖動|(?:互動|交互)"
+    ],
+    "presentation": [
+      "(?:簡報|演示文稿)|幻燈片|路演稿|彙報材料|PPT"
+    ],
+    "image_inspection": [
+      "(?:(?:檢視|查看)|檢查|識別|分析|描述|轉錄)[^\\n]{0,24}(?:圖片|截圖|照片|圖表)|(?:圖片|截圖|照片)(?:裡|裏)"
+    ],
+    "visual_preview": [
+      "本地預覽|網頁預覽|(?:延伸螢幕預覽|擴展屏預覽)|視覺預覽"
+    ],
+    "open_directory": [
+      "(?:(?:開啟|打開)|顯示|定位|訪達中顯示)[^\\n]{0,24}(?:(?:資料夾|文件夾)|目錄|訪達)"
+    ],
+    "persistent_task": [
+      "任務池|(?:專案任務|項目任務)|跨會話任務|長期任務|待辦池"
+    ],
+    "memory_mutation": [
+      "記住|記下來|忘記|刪除(?:這條)?記憶"
+    ],
+    "skill_creation": [
+      "(?:建立技能|創建技能)|新建技能|(?:儲存為技能|保存為技能|保存爲技能)|寫成技能"
+    ]
+  }
+}

@@ -187,6 +187,8 @@ export interface TaskExecution {
   startedAt: string;
   endedAt?: string;
   lastOutcome?: RunOutcome["status"] | "interrupted";
+  /** Host-only provenance for an error before native model submission. Tool checkpoints cannot set it. */
+  nativeControlFailure?: { kind: NonNullable<RunOutcome["nativeControlFailure"]>; turnId: string; blockReasonHash: string };
   /** Cumulative provider rounds across every run/continue within this execution. */
   roundsUsed?: number;
   /** Extended in bounded 100-round tranches after a healthy durable checkpoint or an explicit resume. */
@@ -867,17 +869,23 @@ export function continueTaskExecution(
   }
   const now = iso(at);
   const budget = taskRoundBudget(task);
-  const roundBudgetLimit = budget.used >= budget.limit
-    ? nextTaskRoundBudgetLimit(budget.limit)
-    : budget.limit;
-  const { progress: _previousProgress, ...taskWithoutProgress } = task;
+  const roundBudgetLimit = task.workspaceRunBinding?.budget.mode === "interactive"
+    ? Math.max(budget.limit, Math.ceil((budget.used + 1) / DEFAULT_TASK_ROUND_BUDGET) * DEFAULT_TASK_ROUND_BUDGET)
+    : budget.used >= budget.limit ? nextTaskRoundBudgetLimit(budget.limit) : budget.limit;
+  const { progress: _previousProgress, nativeControlFailure: previousControlFailure, ...taskWithoutProgress } = task;
+  const checkpoint = task.checkpoint ? { ...task.checkpoint, completion: undefined, updatedAt: now } : undefined;
+  // A user continuation retries the preparation, not an accepted model input. Consume only the
+  // exact Host-recorded transient blocker; unrelated business/approval blockers remain intact.
+  if (checkpoint?.blockReason && task.lastOutcome === "error" && previousControlFailure?.turnId === task.turnId
+    && (previousControlFailure.kind === "codex_thread_start_failed" || previousControlFailure.kind === "codex_resume_failed_history_preserved")
+    && previousControlFailure.blockReasonHash === createHash("sha256").update(checkpoint.blockReason).digest("hex")) {
+    delete checkpoint.blockedStep; delete checkpoint.blockReason;
+  }
   return {
     ok: true,
     task: {
       ...taskWithoutProgress,
-      ...(task.checkpoint
-        ? { checkpoint: { ...task.checkpoint, completion: undefined, updatedAt: now } }
-        : {}),
+      ...(checkpoint ? { checkpoint } : {}),
       status: "running",
       turnId: interaction.turnId,
       updatedAt: now,
@@ -938,8 +946,9 @@ export function recordTaskRoundUsage(
   const budget = taskRoundBudget(task);
   return {
     ...task,
-    roundsUsed: Math.min(budget.limit, budget.used + rounds),
-    roundBudgetLimit: budget.limit,
+    roundsUsed: task.workspaceRunBinding?.budget.mode === "interactive" ? budget.used + rounds : Math.min(budget.limit, budget.used + rounds),
+    roundBudgetLimit: task.workspaceRunBinding?.budget.mode === "interactive"
+      ? Math.max(budget.limit, Math.ceil((budget.used + rounds) / DEFAULT_TASK_ROUND_BUDGET) * DEFAULT_TASK_ROUND_BUDGET) : budget.limit,
     updatedAt: iso(at),
   };
 }
@@ -1166,6 +1175,9 @@ export function isRecoverableRunPause(outcome: RunOutcome | undefined): boolean 
     || outcome.stopReason === "no_progress"
     || outcome.stopReason === "repeat_loop"
     || outcome.stopReason === "completion_verification"
+    || outcome.stopReason === "native_context_limit"
+    || outcome.stopReason === "native_prose_only"
+    || outcome.stopReason === "native_resume_timeout"
   );
 }
 
@@ -1211,6 +1223,11 @@ export function finishTaskExecution(
   };
   const progressPause = outcome?.status === "halted"
     && (outcome.stopReason === "no_progress" || outcome.stopReason === "repeat_loop");
+  if (outcome?.status === "halted" && outcome.stopReason === "native_context_limit") {
+    checkpoint.blockedStep = checkpoint.currentStep ?? "continue with the current native context";
+    checkpoint.blockReason = "Native context limit reached. Open a new session to continue.";
+    checkpoint.nextStep = "Open a new session explicitly; the original thread and task history are retained.";
+  }
   if (status === "completed") {
     delete checkpoint.currentStep;
     delete checkpoint.blockedStep;
@@ -1258,9 +1275,15 @@ export function finishTaskExecution(
       );
     }
   }
-  const { progress: _previousProgress, ...taskWithoutProgress } = task;
+  const { progress: _previousProgress, nativeControlFailure: _previousControlFailure, ...taskWithoutProgress } = task;
+  const controlFailure = status === "blocked" && outcome?.status === "error"
+    && (outcome.nativeControlFailure === "codex_thread_start_failed" || outcome.nativeControlFailure === "codex_resume_failed_history_preserved")
+    && checkpoint.blockReason === boundedText(outcome.error ?? "", MAX_TASK_CHECKPOINT_STEP_CHARS)
+    ? { kind: outcome.nativeControlFailure, turnId: task.turnId,
+      blockReasonHash: createHash("sha256").update(checkpoint.blockReason).digest("hex") } : undefined;
   return {
     ...taskWithoutProgress,
+    ...(controlFailure ? { nativeControlFailure: controlFailure } : {}),
     status,
     lastOutcome,
     checkpoint,
@@ -1287,6 +1310,7 @@ export function forkTaskExecution(task: TaskExecution | undefined, at: Date | st
     ...task,
     // A fork is a new task identity, not a second owner of a native Runtime session.
     runtimeBinding: undefined,
+    nativeControlFailure: undefined,
     id: randomUUID(),
     status: "paused",
     turnId: randomUUID(),
@@ -1618,8 +1642,8 @@ export function isTaskExecution(value: unknown): value is TaskExecution {
     (task.endedAt !== undefined && !validTimestamp(task.endedAt)) ||
     (task.lastOutcome !== undefined && task.lastOutcome !== "completed" && task.lastOutcome !== "error" && task.lastOutcome !== "empty" && task.lastOutcome !== "halted" && task.lastOutcome !== "interrupted")
     || ((task.roundsUsed === undefined) !== (task.roundBudgetLimit === undefined))
-    || (task.roundsUsed !== undefined && (!Number.isSafeInteger(task.roundsUsed) || (task.roundsUsed as number) < 0 || (task.roundsUsed as number) > MAX_TASK_ROUND_BUDGET))
-    || (task.roundBudgetLimit !== undefined && (!Number.isSafeInteger(task.roundBudgetLimit) || (task.roundBudgetLimit as number) < DEFAULT_TASK_ROUND_BUDGET || (task.roundBudgetLimit as number) > MAX_TASK_ROUND_BUDGET || (task.roundBudgetLimit as number) % DEFAULT_TASK_ROUND_BUDGET !== 0))
+    || (task.roundsUsed !== undefined && (!Number.isSafeInteger(task.roundsUsed) || (task.roundsUsed as number) < 0 || (task.workspaceRunBinding?.budget.mode !== "interactive" && (task.roundsUsed as number) > MAX_TASK_ROUND_BUDGET)))
+    || (task.roundBudgetLimit !== undefined && (!Number.isSafeInteger(task.roundBudgetLimit) || (task.roundBudgetLimit as number) < DEFAULT_TASK_ROUND_BUDGET || (task.workspaceRunBinding?.budget.mode !== "interactive" && (task.roundBudgetLimit as number) > MAX_TASK_ROUND_BUDGET) || (task.roundBudgetLimit as number) % DEFAULT_TASK_ROUND_BUDGET !== 0))
     || (typeof task.roundsUsed === "number" && typeof task.roundBudgetLimit === "number" && task.roundsUsed > task.roundBudgetLimit)
   ) return false;
   if (task.brief !== undefined) {
@@ -1636,6 +1660,14 @@ export function isTaskExecution(value: unknown): value is TaskExecution {
     ) return false;
   }
   if (task.checkpoint !== undefined && !validTaskCheckpoint(task.checkpoint)) return false;
+  if (task.nativeControlFailure !== undefined) {
+    const failure = task.nativeControlFailure as Record<string, unknown>;
+    const checkpoint = task.checkpoint as TaskCheckpoint | undefined;
+    if (!failure || typeof failure !== "object" || Array.isArray(failure) || Object.keys(failure).length !== 3
+      || (failure.kind !== "codex_thread_start_failed" && failure.kind !== "codex_resume_failed_history_preserved")
+      || failure.turnId !== task.turnId || task.status !== "blocked" || task.lastOutcome !== "error"
+      || !checkpoint?.blockReason || failure.blockReasonHash !== createHash("sha256").update(checkpoint.blockReason).digest("hex")) return false;
+  }
   if (task.progress !== undefined && !validTaskProgress(task.progress)) return false;
   if (task.decisions !== undefined) {
     if (!Array.isArray(task.decisions) || task.decisions.length > MAX_TASK_DECISIONS) return false;
