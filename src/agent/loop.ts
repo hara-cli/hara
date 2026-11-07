@@ -2657,8 +2657,8 @@ async function runAgentInner(
       && intakeTask?.brief?.intent === "change"
       && !freshTaskCompletion(intakeTask)
     ) {
-      if (r.nativeContinuation === "unavailable" && !successfulOwnedActionObserved)
-        return { status: "halted", stopReason: "native_prose_only", error: "The native turn ended without a verified action receipt; continue explicitly or clarify the request." };
+      // Verified native workspace-diff evidence is an action receipt: record it before the native
+      // prose-only guard, which must stop only native turns that changed nothing verifiable.
       if (engineBriefCreated && workspaceChangeTrace && r.text.trim() && opts.workspaceRun
         && simpleChangeObjective(intakeTask.objective)) {
         syncIntakeTask();
@@ -2678,6 +2678,8 @@ async function runAgentInner(
           }
         }
       }
+      if (r.nativeContinuation === "unavailable" && !successfulOwnedActionObserved && !freshTaskCompletion(intakeTask))
+        return { status: "halted", stopReason: "native_prose_only", error: "The native turn ended without a verified action receipt; continue explicitly or clarify the request." };
       if (freshTaskCompletion(intakeTask)) {
         // The normal final-response branch below now sees a durable verified completion.
       } else if (successfulOwnedActionObserved) {
