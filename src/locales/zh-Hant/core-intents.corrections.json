@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "locale": "zh-Hant",
+  "corrections": {
+    "重载": {
+      "s2twp.json": {
+        "expected": "過載",
+        "replacement": "重新載入",
+        "reason": "UI reload is not overloaded; keep overload reports from activating computer tools."
+      }
+    },
+    "扩展屏预览": {
+      "s2twp.json": {
+        "expected": "擴充套件屏預覽",
+        "replacement": "延伸螢幕預覽",
+        "reason": "An extended display is a screen, not a software extension."
+      }
+    }
+  }
+}

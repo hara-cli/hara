@@ -48,7 +48,7 @@
     "node": ">=22.23.1"
   },
   "scripts": {
-    "build": "tsc && node scripts/normalize-dist-modes.mjs && node scripts/check-local-bin-link.mjs",
+    "build": "node scripts/generate-core-intents.mjs --verify && tsc && node scripts/normalize-dist-modes.mjs && node scripts/check-local-bin-link.mjs",
     "eval:feedback": "node scripts/evaluate-feedback-traces.mjs",
     "check:agent-runtimes": "npm run build && node scripts/check-agent-runtimes.mjs",
     "prepare": "npm run build",
@@ -57,7 +57,9 @@
     "start": "node runtime-bootstrap.cjs",
     "test": "npm run build && npm run eval:feedback && node --import ./test/setup-isolated-home.mjs --test --test-concurrency=4 --test-timeout=120000 test/*.test.mjs",
     "build:binary": "npm run build && bun scripts/build-binary.ts dist/bin/hara",
-    "build:binaries": "npm run build && bun scripts/build-binary.ts dist/bin/hara-darwin-arm64 bun-darwin-arm64 && bun scripts/build-binary.ts dist/bin/hara-darwin-x64 bun-darwin-x64-baseline && bun scripts/build-binary.ts dist/bin/hara-linux-x64 bun-linux-x64-baseline && bun scripts/build-binary.ts dist/bin/hara-linux-arm64 bun-linux-arm64"
+    "build:binaries": "npm run build && bun scripts/build-binary.ts dist/bin/hara-darwin-arm64 bun-darwin-arm64 && bun scripts/build-binary.ts dist/bin/hara-darwin-x64 bun-darwin-x64-baseline && bun scripts/build-binary.ts dist/bin/hara-linux-x64 bun-linux-x64-baseline && bun scripts/build-binary.ts dist/bin/hara-linux-arm64 bun-linux-arm64",
+    "generate:core-intents": "node scripts/generate-core-intents.mjs --generate",
+    "check:core-intents": "node scripts/generate-core-intents.mjs --check"
   },
   "publishConfig": {
     "access": "public"

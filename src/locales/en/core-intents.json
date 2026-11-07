@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "locale": "en",
+  "patterns": {
+    "computer.explicit": [
+      "\\b(?:computer|browser|desktop|screen|gui)\\s+(?:use|control|automation)\\b"
+    ],
+    "computer.surface": [
+      "https?:\\/\\/|\\b(?:browser|website|webpage|web\\s+page|chrome|edge|safari|firefox|app|application|window|screen|desktop|button|form|dialog)\\b"
+    ],
+    "computer.interaction": [
+      "\\b(?:open|visit|navigate|click|tap|type|enter|fill|select|check|upload|download|submit|sign\\s*in|log\\s*in|screenshot|capture|operate|control|switch|scroll|refresh|reload|press|drag)\\b"
+    ],
+    "presentation": [
+      "\\b(?:presentation|slide\\s*deck|slides?|pptx?|powerpoint|keynote)\\b"
+    ],
+    "image_inspection": [
+      "\\b(?:inspect|review|read|analy[sz]e|describe|transcribe)\\b[^\\n]{0,40}\\b(?:image|screenshot|photo|picture|diagram|chart)\\b"
+    ],
+    "visual_preview": [
+      "\\b(?:visual\\s+(?:preview|dock)|preview\\s+(?:the\\s+)?(?:site|app|page)|localhost\\s+preview|local\\s+dev\\s+server)\\b"
+    ],
+    "open_directory": [
+      "\\b(?:open|show|reveal)\\b[^\\n]{0,32}\\b(?:folder|directory|finder|file explorer)\\b"
+    ],
+    "persistent_task": [
+      "\\b(?:persistent|project|multi[- ]day|backlog)\\s+(?:task|todo)s?\\b"
+    ],
+    "memory_mutation": [
+      "\\b(?:remember|forget|save\\s+(?:this|that)\\s+(?:preference|fact)|delete\\s+(?:that|this)\\s+memory)\\b"
+    ],
+    "skill_creation": [
+      "\\b(?:create|save|write|make)\\b[^\\n]{0,24}\\b(?:reusable\\s+)?skill\\b"
+    ]
+  }
+}
