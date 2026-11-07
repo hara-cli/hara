@@ -110,6 +110,15 @@ type ApprovalDecision = { approved: true; draft: ColleagueCreateDraft | LocalWor
 interface PendingApproval { card: LocalWorkspaceApproval; clientId: string; selectionEpoch: number; job: LocalJob;
   finish(decision: ApprovalDecision): void; timer: ReturnType<typeof setTimeout> }
 interface MessageTimingEntry { selectionEpoch?: number; recorder: MessageTimingRecorder; identity: MessageTimingIdentity; clientId: string; storage: WorkspaceResourceStorage; store: WorkspaceMessageTimingStore; endedAt?: number }
+export type WorkspaceArchiveFailureReason = "archive_confirmation_required" | "archive_drain_timeout" | "archive_cleanup_failed" | "archive_schedule_rollback_failed";
+export class WorkspaceArchiveError extends Error {
+  constructor(readonly reason: WorkspaceArchiveFailureReason) {
+    super(reason === "archive_confirmation_required" ? "Active tasks changed. Review and confirm which tasks will stop before deleting."
+      : reason === "archive_drain_timeout" ? "Task cleanup did not finish within 10 seconds. The colleague was kept and schedules retain their previous state. Review stopped tasks, then retry."
+      : reason === "archive_schedule_rollback_failed" ? "Deletion did not complete and colleague or scheduled-task state needs review before retrying."
+      : "Colleague deletion did not complete. Schedules retain their previous state; review stopped tasks before retrying.");
+  }
+}
 interface LocalJob {
   id: string; workspaceId: string; agentId: string; clientId: string;
   context: WorkspaceHostContext; store: WorkspaceConversationStore; value: WorkspaceConversation;
@@ -665,6 +674,7 @@ export class LocalWorkspaceHost {
    */
   async applyRuntimeForm(workspaceId: string, input: { agentId: string; runtimeId: AgentRuntimeId; configRevision: number; agentEpoch: number;
     confirm?: { fingerprint: string; loginSource: RuntimeLoginSource }; model?: { modelId: unknown; expectedRevision: unknown; effort?: unknown } }) {
+    this.assertAgentLifecycleWritable(workspaceId, input.agentId);
     const context = this.context(workspaceId), agents = context.resources.agents;
     const agent = agents.list().agents.find(row => row.agentId === input.agentId);
     if (!agent || agent.state !== "active") throw new Error("Colleague unavailable");
@@ -686,6 +696,9 @@ export class LocalWorkspaceHost {
     if (!option || input.runtimeId === "hara" || !option.selectable) throw new Error("Engine cannot be selected");
     if (input.model && form) await context.runtimeModels.checkSelection(input.runtimeId as OptionalRuntimeId, input.model.modelId, input.model.expectedRevision,
       input.model.effort, form.models, form.modelSource === "live" || form.modelSource === "official");
+    this.assertAgentLifecycleWritable(workspaceId, input.agentId);
+    const latest = agents.get(input.agentId);
+    if (!latest || latest.state !== "active" || latest.configRevision !== input.configRevision || latest.agentEpoch !== input.agentEpoch) throw new Error("Colleague settings changed; refresh before applying");
     const applied: ("confirm" | "runtime" | "model")[] = [];
     let step: "confirm" | "runtime" | "model" = "confirm";
     try {
@@ -784,12 +797,16 @@ export class LocalWorkspaceHost {
   }
   deleteSchedule(workspaceId: string, id: string, expected: number, approved: boolean) {
     const context = this.context(workspaceId);
+    const owner = context.features.schedules().find(row => row.id === id)?.definition.agentId;
+    if (typeof owner === "string") this.assertAgentLifecycleWritable(workspaceId, owner);
     if (!approved || context.scheduler!.list().runs.some(run => run.scheduleId === id && ["running", "unknown"].includes(run.state))) throw new Error("Confirm removal after checking the active/unknown run");
     context.features.deleteSchedule(id, expected); this.changed(workspaceId); return this.workspaceFeatures(workspaceId);
   }
   runSchedule(workspaceId: string, id: string, approved: boolean) {
     if (!approved || !this.context(workspaceId).features.schedules().some(row => row.id === id)) throw new Error("Explicit scheduled run confirmation required");
     const context = this.context(workspaceId);
+    const owner = context.features.schedules().find(row => row.id === id)?.definition.agentId;
+    if (typeof owner === "string") this.assertAgentLifecycleWritable(workspaceId, owner);
     void context.scheduler!.tick(context.resources.agents.list().mainAgentId!, Date.now(), id).catch(() => {}).finally(() => this.changed(workspaceId));
     return this.workspaceFeatures(workspaceId);
   }
@@ -809,6 +826,8 @@ export class LocalWorkspaceHost {
   updateFeature(workspaceId: string, kind: unknown, id: unknown, enabled: unknown, expected: number, version?: unknown) {
     if (typeof id !== "string" || typeof enabled !== "boolean" || !["schedule", "skill"].includes(String(kind))) throw new Error("Invalid scoped feature change");
     const context = this.context(workspaceId), features = context.features;
+    if (kind === "schedule") { const owner = features.schedules().find(row => row.id === id)?.definition.agentId;
+      if (typeof owner === "string") this.assertAgentLifecycleWritable(workspaceId, owner); }
     let restoredAgentEpoch: number | undefined;
     if (kind === "schedule" && enabled) {
       const schedule = features.schedules().find(row => row.id === id);
@@ -853,6 +872,7 @@ export class LocalWorkspaceHost {
     if (this.options.usageCollector) void this.refreshRuntimeUsage(workspaceId, this.context(workspaceId));
   }
   setAgentPermissionTier(workspaceId: string, agentId: string, tier: RuntimePermissionTier, configRevision: number, agentEpoch: number): WorkspaceAgentView {
+    this.assertAgentLifecycleWritable(workspaceId, agentId);
     if (!isRuntimePermissionTier(tier)) throw new Error("Invalid runtime permission tier");
     if (this.closing || this.updateLease || [...this.jobs.values()].some(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId)) {
       throw new Error("Colleague is running or draining; change permissions after the attempt ends");
@@ -860,39 +880,73 @@ export class LocalWorkspaceHost {
     const agent = this.context(workspaceId).resources.agents.setPermissionTier(agentId, tier, configRevision, agentEpoch);
     this.changed(workspaceId, agentId); return agent;
   }
-  async setAgentArchived(workspaceId: string, agentId: string, archived: boolean, configRevision: number, agentEpoch: number) {
-    if (typeof archived !== "boolean") throw new Error("Invalid colleague lifecycle update");
+  private assertAgentLifecycleWritable(workspaceId: string, agentId: string) {
+    if (this.lifecycleChanges.has(JSON.stringify([workspaceId, agentId]))) throw new Error("Colleague lifecycle is changing; wait for task cleanup before editing");
+  }
+  agentArchiveStatus(workspaceId: string, agentId: string, configRevision: number, agentEpoch: number) {
+    this.assertAgentLifecycleWritable(workspaceId, agentId);
+    const context = this.context(workspaceId), agent = context.resources.agents.get(agentId);
+    if (!agent || agent.kind !== "colleague" || agent.state !== "active" || agent.configRevision !== configRevision || agent.agentEpoch !== agentEpoch)
+      throw new Error("Workspace Agent changed; refresh the exact colleague before deleting");
+    const jobs = [...this.jobs.values()].filter(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId);
+    if (jobs.length > 1024) throw new Error("Review and stop the active tasks before deleting this colleague");
+    return { workspaceId, resourceGeneration: context.storage.run(() => currentWorkspaceResourceBinding()!.generation), agentId, configRevision, agentEpoch,
+      scheduledTasks: context.features.schedules().filter(row => row.enabled && row.definition.agentId === agentId).length,
+      runs: jobs.map(job => ({ runId: job.id, taskId: job.value.task?.id ?? job.id,
+        title: redactSensitiveText(job.value.task?.objective ?? "").text.replace(/[\u0000-\u001f\u007f]/gu, " ").slice(0, 160),
+        kind: job.channelId ? "group" as const : "chat" as const, state: job.signal.aborted ? "draining" as const : "running" as const })) };
+  }
+  async setAgentArchived(workspaceId: string, agentId: string, archived: boolean, configRevision: number, agentEpoch: number, confirmedRunIds: readonly string[] = []) {
+    if (typeof archived !== "boolean" || !Array.isArray(confirmedRunIds) || confirmedRunIds.length > 1024 || new Set(confirmedRunIds).size !== confirmedRunIds.length
+      || confirmedRunIds.some(id => !text(id, 200)) || !archived && confirmedRunIds.length) throw new Error("Invalid colleague lifecycle update");
     if (this.closing || this.updateLease) throw new Error("Workspace is preparing to restart; retry after reconnecting");
-    const key = JSON.stringify([workspaceId, agentId]);
-    if (this.lifecycleChanges.has(key)) throw new Error("Colleague lifecycle is changing; refresh after the attempt drains");
+    const key = JSON.stringify([workspaceId, agentId]); this.assertAgentLifecycleWritable(workspaceId, agentId);
     const context = this.context(workspaceId), current = context.resources.agents.get(agentId);
     if (!current || current.configRevision !== configRevision || current.agentEpoch !== agentEpoch)
       throw new Error("Workspace Agent changed; refresh the exact colleague before editing");
     if (current.kind === "main") throw new Error("the Workspace main Hara cannot be archived or replaced");
     if ((current.state === "archived") === archived) throw new Error("Workspace Agent lifecycle already changed; refresh before editing");
     if (current.agentEpoch >= Number.MAX_SAFE_INTEGER) throw new Error("Workspace Agent lifecycle epoch exhausted");
+    const jobs = archived ? [...this.jobs.values()].filter(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId) : [];
+    if (jobs.some(job => !confirmedRunIds.includes(job.id))) throw new WorkspaceArchiveError("archive_confirmation_required");
     const generation = context.storage.run(() => currentWorkspaceResourceBinding()!.generation);
+    let pausedBefore: ReturnType<typeof context.features.schedules> = [];
     this.lifecycleChanges.add(key);
     try {
-      // Pause durably, cancel, then drain the exact colleague before changing its epoch. This lets
-      // attempt finalizers commit under the original frozen binding, including native tree cleanup.
-      const pausedSchedules = archived ? context.features.pauseAgentSchedules(agentId) : 0;
-      const jobs = archived ? [...this.jobs.values()].filter(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId) : [];
-      for (const job of jobs) this.cancel(workspaceId, agentId, job.id);
-      if (jobs.length) await Promise.all(jobs.map(job => job.promise));
+      pausedBefore = archived ? context.features.pauseAgentSchedulesWithReceipt(agentId) : [];
+      for (const job of jobs) if (!job.closed) this.cancel(workspaceId, agentId, job.id);
+      if (jobs.length) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try { await Promise.race([Promise.all(jobs.map(job => job.promise)), new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new WorkspaceArchiveError("archive_drain_timeout")), 10000);
+        })]); } finally { if (timer) clearTimeout(timer); }
+      }
       if (this.closing || this.updateLease || this.context(workspaceId) !== context) throw new Error("Workspace view changed during colleague cleanup");
       this.assertGeneration(workspaceId, generation);
-      const agent = context.resources.agents.setArchived(agentId, archived, configRevision, agentEpoch, pausedSchedules);
-      this.changed(workspaceId); return { agent, pausedSchedules };
+      const agent = context.resources.agents.setArchived(agentId, archived, configRevision, agentEpoch, pausedBefore.length);
+      this.changed(workspaceId); return { agent, pausedSchedules: pausedBefore.length, stoppedTasks: jobs.length };
+    } catch (error) {
+      if (pausedBefore.length) {
+        try {
+          const latest = context.resources.agents.get(agentId);
+          if (latest?.state !== "active" || latest.agentEpoch !== agentEpoch || latest.configRevision !== configRevision) throw new Error("Colleague state changed");
+          context.features.restorePausedAgentSchedules(agentId, pausedBefore);
+          this.changed(workspaceId);
+        } catch { throw new WorkspaceArchiveError("archive_schedule_rollback_failed"); }
+      }
+      if (error instanceof WorkspaceArchiveError) throw error;
+      throw new WorkspaceArchiveError("archive_cleanup_failed");
     } finally { this.lifecycleChanges.delete(key); }
   }
   setAgentRuntime(workspaceId: string, agentId: string, runtimeId: AgentRuntimeId, configRevision: number, agentEpoch: number): WorkspaceAgentView {
+    this.assertAgentLifecycleWritable(workspaceId, agentId);
     const agent = this.context(workspaceId).resources.agents.setRuntime(agentId, runtimeId, configRevision, agentEpoch);
     this.context(workspaceId).runtimeModels.warm(runtimeId);
     this.changed(workspaceId, agentId);
     return agent;
   }
   updateAgentPersona(workspaceId: string, agentId: string, input: WorkspaceAgentPersonaInput, configRevision: number, agentEpoch: number): WorkspaceAgentView {
+    this.assertAgentLifecycleWritable(workspaceId, agentId);
     const agents = this.context(workspaceId).resources.agents;
     const current = agents.currentPersona(agentId);
     const agent = agents.updatePersona(agentId, { ...current, profile: { ...current.profile, ...input.profile } }, configRevision, agentEpoch);
@@ -1231,7 +1285,7 @@ export class LocalWorkspaceHost {
           const decision = await host.approval(job, { title: input.title, task: input.task, timing: input.repeat as string, tz: timing.tz }, "schedule_create");
           if (!decision.approved) return JSON.stringify({ created: false, approvalState: decision.state });
         }
-        assertCurrent(); const id = job.context.features.createChatSchedule({ title: input.title, task: input.task, agentId: job.agentId, time: timing, anchor });
+        assertCurrent(); host.assertAgentLifecycleWritable(job.workspaceId, job.agentId); const id = job.context.features.createChatSchedule({ title: input.title, task: input.task, agentId: job.agentId, time: timing, anchor });
         host.changed(job.workspaceId, job.agentId);
         return JSON.stringify({ created: true, id, nextRunAt: job.context.scheduler!.list().schedules.find(row => row.id === id)?.nextRunAt ?? null });
       } });
@@ -1300,6 +1354,7 @@ export class LocalWorkspaceHost {
         assertCurrent();
         const current = job.context.resources.agents.get(input.agentId);
         if (!current || current.kind !== "colleague" || current.state !== "active") throw new Error("rename needs an active colleague of THIS Workspace by exact agentId");
+        host.assertAgentLifecycleWritable(job.workspaceId, current.agentId);
         const renamed = job.context.resources.agents.rename(current.agentId, input.displayName, current.configRevision, current.agentEpoch);
         host.changed(job.workspaceId, job.agentId);
         return JSON.stringify({ renamed: true, agentId: renamed.agentId, previousName: current.identity.displayName, displayName: renamed.identity.displayName });

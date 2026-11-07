@@ -28,6 +28,7 @@ function matchesMime(bytes: Buffer, mime: string): boolean {
   if (mime === "application/zip" || mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") return bytes[0] === 80 && bytes[1] === 75 && [[3, 4], [5, 6], [7, 8]].some(([a, b]) => bytes[2] === a && bytes[3] === b);
   if (mime === "text/markdown" || mime === "text/plain") return !bytes.includes(0) && !/[\x00-\x08\x0b\x0c\x0e-\x1f]/u.test(bytes.toString("utf8"));
   const box = bytes.subarray(4, 8).toString("ascii");
+  if (box === "ftyp" && ["heic", "heix", "hevc", "hevx", "mif1", "msf1", "avif", "avis"].includes(bytes.subarray(8, 12).toString("ascii"))) return false;
   return mime === "video/quicktime" ? ["ftyp", "moov", "mdat", "wide"].includes(box) : mime === "video/mp4" && box === "ftyp";
 }
 /** Ephemeral artifact registrations. Roots come only from the Host's current Workspace/project catalog,
@@ -46,22 +47,29 @@ export class WorkspaceMediaRegistry {
     const roots = this.roots().filter(root => isAbsolute(root) && root !== resolve(sep));
     let matched = false, missing = false;
     for (const candidate of roots.sort((a, b) => b.length - a.length)) {
-      if (!inside(resolve(candidate), path)) continue;
-      matched = true;
+      const logicalRoot = resolve(candidate); let rootMatched = false;
       try {
-        const root = realpathSync.native(candidate), rootInfo = lstatSync(candidate);
-        if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory() || !inside(root, path)) continue;
+        // A registered root (or its ancestors) may be an alias. Only links below that root are denied.
+        const root = realpathSync.native(logicalRoot), rootInfo = lstatSync(root);
+        const prefix = inside(logicalRoot, path) ? logicalRoot : inside(root, path) ? root : null;
+        if (!prefix) continue;
+        matched = true; rootMatched = true;
+        if (!rootInfo.isDirectory()) continue;
         let cursor = root;
-        for (const part of relative(root, path).split(sep)) {
+        for (const part of relative(prefix, path).split(sep)) {
           if (!part || part.startsWith(".") || part.includes(":")) throw denied();
           cursor = resolve(cursor, part); const info = lstatSync(cursor);
           if (info.isSymbolicLink()) throw denied();
         }
-        if (realpathSync.native(path) !== path) throw denied();
-        return { path, root, rootInfo };
+        const canonical = realpathSync.native(cursor);
+        if (!inside(root, canonical) || canonical !== cursor || sensitiveFileError(canonical, "read")
+          || canonical.split(sep).some(part => [".codex", ".claude", ".ssh", "Keychains"].includes(part))) throw denied();
+        return { path: canonical, root, rootInfo };
       } catch (error) {
         if (error instanceof WorkspaceMediaError) throw error;
-        if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") missing = true;
+        // A missing registered root is an unavailable root, not an observable missing outside file.
+        if (rootMatched && error && typeof error === "object" && "code" in error && error.code === "ENOENT") missing = true;
+        else if (inside(logicalRoot, path)) matched = true;
       }
     }
     throw denied(missing ? "missing" : matched ? "failed" : "outside");
@@ -69,10 +77,12 @@ export class WorkspaceMediaRegistry {
   private open(path: string, expected?: Entry) {
     this.assertCurrent(); const checked = this.checkedPath(path);
     if (expected && (checked.root !== expected.root || !sameOpenedFileIdentity(checked.rootInfo, expected.rootInfo))) throw denied();
-    const fd = openSync(checked.path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    let fd: number;
+    try { fd = openSync(checked.path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)); } catch { throw denied("failed"); }
     try {
       const info = fstatSync(fd), mime = MIME[extname(checked.path).toLowerCase()];
-      verifyOpenedRegularFileSync(checked.path, info, { rejectHardLinks: true, protectSensitive: true });
+      const canonical = verifyOpenedRegularFileSync(checked.path, info, { rejectHardLinks: true, protectSensitive: true });
+      if (canonical !== checked.path) throw denied("failed");
       if (!mime || !info.size || info.size > (mime.startsWith("video/") ? MAX_VIDEO_BYTES : MAX_MEDIA_RESPONSE_BYTES) || expected && !sameFile(info, expected.info)) throw denied("failed");
       const prefix = Buffer.alloc(Math.min(32, info.size)); readSync(fd, prefix, 0, prefix.length, 0);
       if (!matchesMime(prefix, mime)) throw denied("failed");
@@ -117,7 +127,8 @@ export class WorkspaceMediaRegistry {
       const partial = range !== undefined || end < file.info.size - 1;
       const bytes = head || pathOnly ? Buffer.alloc(0) : Buffer.alloc(end - start + 1);
       for (let offset = 0; offset < bytes.length;) { const count = readSync(file.fd, bytes, offset, bytes.length - offset, start + offset); if (!count) throw denied(); offset += count; }
-      const latest = fstatSync(file.fd); verifyOpenedRegularFileSync(file.path, latest, { rejectHardLinks: true, protectSensitive: true });
+      const latest = fstatSync(file.fd);
+      if (verifyOpenedRegularFileSync(file.path, latest, { rejectHardLinks: true, protectSensitive: true }) !== file.path) throw denied("failed");
       const checked = this.checkedPath(file.path);
       if (!sameFile(file.info, latest) || checked.root !== entry.root || !sameOpenedFileIdentity(checked.rootInfo, entry.rootInfo)) throw denied();
       this.assertCurrent();

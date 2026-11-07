@@ -104,7 +104,11 @@ test("deleting a running colleague drains its attempt before epoch invalidation 
   const f = await fixture(t, { held: true });
   await f.request("workspace.session.send", { ...f.scope, agentId: f.agent.agentId, message: "synthetic greeting", requestId: randomUUID() });
   await f.reached;
-  const deletion = f.archive(f.agent, true);
+  await assert.rejects(f.archive(f.agent,true),/confirm/);assert.equal(f.aborted(),false);
+  const preview=await f.request("workspace.agents.archiveStatus",{...f.scope,agentId:f.agent.agentId,configRevision:f.agent.configRevision,agentEpoch:f.agent.agentEpoch});
+  assert.equal(preview.runs.length,1);assert.equal(preview.runs[0].kind,"chat");assert(preview.runs[0].title.includes("synthetic greeting"));
+  await assert.rejects(f.archive(f.agent,true,{confirmedRunIds:[randomUUID()]}),/confirm/);assert.equal(f.aborted(),false);
+  const deletion = f.archive(f.agent, true,{confirmedRunIds:preview.runs.map(row=>row.runId)});
   const denied = assert.rejects(f.request("workspace.session.send", { ...f.scope, agentId: f.agent.agentId, message: "must not enter", requestId: randomUUID() }), /lifecycle|unavailable|active/i);
   const result = await deletion; await denied; assert(f.aborted()); assert.equal(result.agent.state, "archived");
   const after = await f.read(f.agent.agentId); assert.notEqual(after.conversation.state, "needs_recovery");

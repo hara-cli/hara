@@ -137,7 +137,7 @@ test("archive drains block a concurrent schedule create or enable only for that 
   f.host.selectAgent("client",f.workspaceId,target.agentId);
   const started=f.host.start("client",f.workspaceId,target.agentId,"Summarize fixture",randomUUID()),job=f.host.jobs.get(started.runId);assert(job);
   const drained=job.promise,gate=new Promise(resolve=>release=resolve);job.promise=Promise.all([drained,gate]).then(()=>{});
-  pending=f.host.setAgentArchived(f.workspaceId,target.agentId,true,target.configRevision,target.agentEpoch);
+  pending=f.host.setAgentArchived(f.workspaceId,target.agentId,true,target.configRevision,target.agentEpoch,[started.runId]);
   assert.equal(agents.get(target.agentId).state,"active");assert.equal(context.features.schedules().find(row=>row.id===existing.id).enabled,false);
   assert.throws(()=>f.host.saveSchedule(f.workspaceId,input(target.agentId),context.features.list().revision,true),/lifecycle/);
   assert.throws(()=>f.host.updateFeature(f.workspaceId,"schedule",existing.id,true,context.features.list().revision),/lifecycle/);
@@ -146,4 +146,43 @@ test("archive drains block a concurrent schedule create or enable only for that 
   assert(context.features.schedules().filter(row=>row.definition.agentId===target.agentId).every(row=>!row.enabled));
   assert.equal(context.features.schedules().find(row=>row.id===other.id).enabled,true);
  }finally{release?.();await pending?.catch(()=>{});await f.host.close();}
+});
+
+test("archive drain fences runtime, permissions and persona, and failed final validation restores only its own paused schedules", async t => {
+ const f=fixture(new EventEmitter(),false);let release,pending;
+ try{
+  const context=f.host.context(f.workspaceId),agents=context.resources.agents;
+  const target=agents.create({username:"rollback",profile:{displayName:"Rollback"},runtimeId:"pi"},agents.list().revision),otherAgent=agents.create({username:"other",profile:{displayName:"Other"},runtimeId:"pi"},agents.list().revision);
+  const input=(agentId,enabled=true)=>({id:randomUUID(),name:"Synthetic future schedule",task:"Summarize fixture",agentId,enabled,schedule:{kind:"once",runAt:Date.now()+3600000,display:"Future fixture"}});
+  const enabled=input(target.agentId),disabled=input(target.agentId,false);for(const row of[enabled,disabled])f.host.saveSchedule(f.workspaceId,row,context.features.list().revision,true);
+  f.host.selectAgent("client",f.workspaceId,target.agentId);const started=f.host.start("client",f.workspaceId,target.agentId,"Summarize fixture",randomUUID()),job=f.host.jobs.get(started.runId),original=job.promise;job.promise=Promise.all([original,new Promise(resolve=>release=resolve)]).then(()=>{});
+  t.mock.method(f.host,"assertGeneration",()=>{throw Error("Synthetic final generation validation rejected")});
+  pending=f.host.setAgentArchived(f.workspaceId,target.agentId,true,target.configRevision,target.agentEpoch,[started.runId]);
+  assert.throws(()=>f.host.setAgentRuntime(f.workspaceId,target.agentId,"pi",target.configRevision,target.agentEpoch),/lifecycle/);
+  assert.throws(()=>f.host.setAgentPermissionTier(f.workspaceId,target.agentId,"controlled",target.configRevision,target.agentEpoch),/lifecycle/);
+  assert.throws(()=>f.host.updateAgentPersona(f.workspaceId,target.agentId,{profile:{displayName:"Must not write"}},target.configRevision,target.agentEpoch),/lifecycle/);
+  await assert.rejects(f.host.applyRuntimeForm(f.workspaceId,{agentId:target.agentId,runtimeId:"pi",configRevision:target.configRevision,agentEpoch:target.agentEpoch}),/lifecycle/);
+  assert.throws(()=>f.host.updateFeature(f.workspaceId,"schedule",enabled.id,false,context.features.list().revision),/lifecycle/);
+  assert.throws(()=>f.host.deleteSchedule(f.workspaceId,enabled.id,context.features.list().revision,true),/lifecycle/);
+  f.host.updateAgentPersona(f.workspaceId,otherAgent.agentId,{profile:{displayName:"Other changed"}},otherAgent.configRevision,otherAgent.agentEpoch);
+  const other=input(otherAgent.agentId);f.host.saveSchedule(f.workspaceId,other,context.features.list().revision,true);
+  release();await assert.rejects(pending,error=>error.reason==="archive_cleanup_failed");t.mock.restoreAll();
+  assert.equal(agents.get(target.agentId).state,"active");assert.equal(agents.get(target.agentId).agentEpoch,target.agentEpoch);
+  const rows=context.features.schedules();assert.equal(rows.find(row=>row.id===enabled.id).enabled,true);assert.equal(rows.find(row=>row.id===disabled.id).enabled,false);assert.equal(rows.find(row=>row.id===other.id).enabled,true);
+  assert(!f.host.lifecycleChanges.has(JSON.stringify([f.workspaceId,target.agentId])));
+  const retry=await f.host.setAgentArchived(f.workspaceId,target.agentId,true,target.configRevision,target.agentEpoch);assert.equal(retry.agent.state,"archived");
+ }finally{release?.();await pending?.catch(()=>{});t.mock.restoreAll();await f.host.close();}
+});
+
+test("archive cleanup deadline releases the fence, restores schedules and never increments epoch", async t => {
+ const f=fixture(new EventEmitter(),false);let release,pending;
+ try{
+  const context=f.host.context(f.workspaceId),agents=context.resources.agents,target=agents.create({username:"timeout",profile:{displayName:"Timeout"},runtimeId:"pi"},agents.list().revision);
+  const schedule={id:randomUUID(),name:"Synthetic schedule",task:"Summarize fixture",agentId:target.agentId,enabled:true,schedule:{kind:"once",runAt:Date.now()+3600000,display:"Fixture"}};f.host.saveSchedule(f.workspaceId,schedule,context.features.list().revision,true);
+  f.host.selectAgent("client",f.workspaceId,target.agentId);const started=f.host.start("client",f.workspaceId,target.agentId,"Summarize fixture",randomUUID()),job=f.host.jobs.get(started.runId),original=job.promise;job.promise=Promise.all([original,new Promise(resolve=>release=resolve)]).then(()=>{});
+  t.mock.timers.enable({apis:["setTimeout"]});pending=f.host.setAgentArchived(f.workspaceId,target.agentId,true,target.configRevision,target.agentEpoch,[started.runId]);
+  const rejected=assert.rejects(pending,error=>error.reason==="archive_drain_timeout");t.mock.timers.tick(10000);await rejected;t.mock.timers.reset();
+  assert(!f.host.lifecycleChanges.has(JSON.stringify([f.workspaceId,target.agentId])));assert.equal(agents.get(target.agentId).state,"active");assert.equal(agents.get(target.agentId).agentEpoch,target.agentEpoch);assert.equal(context.features.schedules().find(row=>row.id===schedule.id).enabled,true);
+  release();await job.promise;const retry=await f.host.setAgentArchived(f.workspaceId,target.agentId,true,target.configRevision,target.agentEpoch);assert.equal(retry.agent.state,"archived");
+ }finally{t.mock.timers.reset();release?.();await pending?.catch(()=>{});await f.host.close();}
 });

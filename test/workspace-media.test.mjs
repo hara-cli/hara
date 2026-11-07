@@ -4,6 +4,7 @@ import fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { syncBuiltinESMExports } from "node:module";
 import { WorkspaceMediaRegistry, MAX_MEDIA_RESPONSE_BYTES } from "../dist/workspace/media.js";
 const gif = Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64");
 function fixture(t) {
@@ -76,4 +77,34 @@ test("passive file cards use closed MIME families and retain all opaque-id and r
 test("file URL decoding cannot hide bidi controls in a registered filename",t=>{
  const f=fixture(t),path=join(f.project,"misleading\u202e.md");fs.writeFileSync(path,"# Synthetic fixture");
  assert.deepEqual(f.registry.describe(path),{state:"outside"});assert.deepEqual(f.registry.describe(pathToFileURL(path).href),{state:"outside"});
+});
+
+test("registered symlink roots and ancestors resolve to one canonical allowed root", t => {
+ const f=fixture(t),actual=join(f.parent,"actual"),alias=join(f.parent,"root-alias");fs.mkdirSync(actual);fs.mkdirSync(join(actual,"nested"));fs.symlinkSync(actual,alias,"dir");
+ fs.writeFileSync(join(actual,"good.gif"),gif);fs.writeFileSync(join(actual,"nested","good.gif"),gif);fs.writeFileSync(join(f.project,"good.gif"),gif);
+ for(const[root,path]of[[alias,join(alias,"good.gif")],[alias,join(actual,"good.gif")],[actual,join(actual,"good.gif")],[join(alias,"nested"),join(alias,"nested","good.gif")]]){
+  const registry=new WorkspaceMediaRegistry(root,()=>[root],()=>{}),value=registry.describe(path);assert.equal(value.state,"ready");assert.deepEqual(registry.read(value.media.id).bytes,gif);
+ }
+ fs.symlinkSync(join(f.project,"good.gif"),join(actual,"outside-link.gif"));
+ const registry=new WorkspaceMediaRegistry(alias,()=>[alias],()=>{});assert.deepEqual(registry.describe(join(alias,"outside-link.gif")),{state:"outside"});
+ fs.symlinkSync(join(actual,"good.gif"),join(actual,"inside-link.gif"));assert.deepEqual(registry.describe(join(alias,"inside-link.gif")),{state:"outside"});
+});
+
+for(const operation of["register","read"])test(operation+" refuses an intermediate-directory swap before reading bytes",t=>{
+ const f=fixture(t),directory=join(f.project,"assets"),moved=join(f.parent,"moved-assets");fs.mkdirSync(directory);const path=join(directory,"swap.gif");fs.writeFileSync(path,gif);
+ const entry=operation==="read"?f.registry.register(path):null,open=fs.openSync,read=fs.readSync;let swapped=false,attackedFd,reads=0;
+ t.mock.method(fs,"openSync",function(file,...args){if(file===path&&!swapped){swapped=true;fs.renameSync(directory,moved);fs.symlinkSync(moved,directory,"dir");const fd=open.call(this,file,...args);attackedFd=fd;return fd;}return open.call(this,file,...args);});
+ t.mock.method(fs,"readSync",function(fd,...args){if(fd===attackedFd)reads++;return read.call(this,fd,...args);});syncBuiltinESMExports();
+ try{if(entry)assert.throws(()=>f.registry.read(entry.id),/media unavailable/);else assert.deepEqual(f.registry.describe(path),{state:"failed"});assert(swapped);assert.equal(reads,0,"no bytes from the redirected descriptor are consumed");}
+ finally{t.mock.restoreAll();syncBuiltinESMExports();}
+});
+
+test("open errno stays behind the closed media error vocabulary",t=>{
+ const f=fixture(t),path=join(f.project,"private-open.gif");fs.writeFileSync(path,gif);const open=fs.openSync;t.mock.method(fs,"openSync",function(file,...args){if(file===path)throw Object.assign(Error("EACCES private-open.gif"),{code:"EACCES"});return open.call(this,file,...args);});syncBuiltinESMExports();
+ try{assert.throws(()=>f.registry.register(path),error=>error.message==="Workspace media unavailable");assert.deepEqual(f.registry.describe(path),{state:"failed"});}finally{t.mock.restoreAll();syncBuiltinESMExports();}
+});
+
+test("HEIC and AVIF brands cannot masquerade as MP4 or QuickTime video",t=>{
+ const f=fixture(t);for(const ext of["mp4","mov"])for(const brand of["heic","mif1","avif","avis"]){const bytes=Buffer.alloc(24);bytes.writeUInt32BE(24);bytes.write("ftyp",4);bytes.write(brand,8);const path=join(f.project,brand+"."+ext);fs.writeFileSync(path,bytes);assert.deepEqual(f.registry.describe(path),{state:"failed"});}
+ const bytes=Buffer.alloc(24);bytes.writeUInt32BE(24);bytes.write("ftyp",4);bytes.write("isom",8);fs.writeFileSync(join(f.project,"valid.mp4"),bytes);assert.equal(f.registry.describe("valid.mp4").state,"ready");
 });

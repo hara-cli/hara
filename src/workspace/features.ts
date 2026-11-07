@@ -67,13 +67,26 @@ export class WorkspaceFeatures {
         row.definition.anchor = { ...row.definition.anchor, agentEpoch: restoredAgentEpoch };
       row.enabled = enabled; return current; });
   }
-  /** One scoped durable write; restoration deliberately never re-enables schedules. */
-  pauseAgentSchedules(agentId: string): number {
+  /** Deletion pauses durably before drain. User restoration never re-enables these schedules. */
+  pauseAgentSchedules(agentId: string): number { return this.pauseAgentSchedulesWithReceipt(agentId).length; }
+  pauseAgentSchedulesWithReceipt(agentId: string): WorkspaceSchedule[] {
     const before = this.state.read(), matches = before.schedules.filter(row => row.enabled && row.definition.agentId === agentId);
-    if (!matches.length) return 0;
+    if (!matches.length) return [];
     const ids = new Set(matches.map(row => row.id));
     this.state.update(before.revision, current => ({ ...current, schedules: current.schedules.map(row => ids.has(row.id) ? { ...row, enabled: false } : row) }));
-    return matches.length;
+    return matches;
+  }
+  /** Only rollback a failed archive's exact pause receipt; preserve unrelated schedule changes. */
+  restorePausedAgentSchedules(agentId: string, receipt: readonly WorkspaceSchedule[]): void {
+    if (!receipt.length) return;
+    const before = this.state.read(), ids = new Set(receipt.map(row => row.id));
+    for (const original of receipt) {
+      const current = before.schedules.find(row => row.id === original.id);
+      if (!original.enabled || original.definition.agentId !== agentId || !current
+        || JSON.stringify({ ...current, enabled: false }) !== JSON.stringify({ ...original, enabled: false }))
+        throw new Error("Paused schedule changed; review before restoring its state");
+    }
+    this.state.update(before.revision, current => ({ ...current, schedules: current.schedules.map(row => ids.has(row.id) ? { ...row, enabled: true } : row) }));
   }
   schedules(): WorkspaceSchedule[] { return this.state.read().schedules; }
   saveSchedule(input: unknown, expected: number) {

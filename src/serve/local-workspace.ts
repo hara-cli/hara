@@ -5,7 +5,7 @@ import type { ReviewedMcpSource } from "../workspace/extension-review.js";
 import { isRuntimePermissionTier } from "../agent-runtime/execution-policy.js";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
-import { LocalWorkspaceHost, type LocalWorkspaceProviderFactory } from "../workspace/local-host.js";
+import { LocalWorkspaceHost, WorkspaceArchiveError, type LocalWorkspaceProviderFactory } from "../workspace/local-host.js";
 import { exact, messageBody, plain, positive, text, UUID } from "../workspace/local-state.js";
 import type { ArkAcceptanceSlice } from "../workspace/real-key-provider.js";
 import { bindPrivateHaraStateFile, readPrivateStateFileSnapshotSync, removePrivateStateFile, writePrivateStateFileSync } from "../security/private-state.js";
@@ -256,11 +256,16 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       if (!text(params.agentId) || !isRuntimePermissionTier(params.permissionTier) || !positive(params.configRevision) || !positive(params.agentEpoch)) throw new Error("Invalid colleague permission update");
       return host.setAgentPermissionTier(workspaceId, params.agentId, params.permissionTier, params.configRevision, params.agentEpoch);
     }
+    if (method === "workspace.agents.archiveStatus") {
+      fields(["workspaceId", "expectedGeneration", "agentId", "configRevision", "agentEpoch"]);
+      if (!text(params.agentId) || !positive(params.configRevision) || !positive(params.agentEpoch)) throw new Error("Invalid colleague archive status");
+      return host.agentArchiveStatus(workspaceId, params.agentId, params.configRevision, params.agentEpoch);
+    }
     if (method === "workspace.agents.setArchived") {
-      fields(["workspaceId", "expectedGeneration", "agentId", "archived", "configRevision", "agentEpoch"]);
+      fields(["workspaceId", "expectedGeneration", "agentId", "archived", "configRevision", "agentEpoch", ...(Object.hasOwn(params, "confirmedRunIds") ? ["confirmedRunIds"] : [])]);
       if (!text(params.agentId) || typeof params.archived !== "boolean" || !positive(params.configRevision) || !positive(params.agentEpoch))
         throw new Error("Invalid colleague lifecycle update");
-      return host.setAgentArchived(workspaceId, params.agentId, params.archived, params.configRevision, params.agentEpoch);
+      return host.setAgentArchived(workspaceId, params.agentId, params.archived, params.configRevision, params.agentEpoch, params.confirmedRunIds as string[] | undefined);
     }
     if (method === "workspace.agents.setRuntime") {
       fields(["workspaceId", "expectedGeneration", "agentId", "runtimeId", "configRevision", "agentEpoch"]);
@@ -354,7 +359,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
           // Fixed classification, not arbitrary provider errors/paths/credentials.
           const safe = message === "unauthorized" ? "unauthorized" : message.includes("真實模型") ? message
             : message.replaceAll(token, "[transport credential]").replaceAll(host.root, "[Dev state]").slice(0, 500);
-          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: "2.0", id, error: { code: message === "unauthorized" ? -32001 : -32602, message: safe } }));
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: "2.0", id, error: { code: message === "unauthorized" ? -32001 : -32602, message: safe, ...(error instanceof WorkspaceArchiveError ? { data: { archiveReason: error.reason, retryable: true } } : {}) } }));
         }
       })();
     });
