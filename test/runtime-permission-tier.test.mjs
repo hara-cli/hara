@@ -73,10 +73,13 @@ test("custom provider keeps host HOME but strips its OAuth/provider environment 
 
 test("protected capture cancellation joins actual close before releasing its owner",async()=>{
  const {EventEmitter}=await import("node:events"),{PassThrough}=await import("node:stream"),{runExternalCommandCapture}=await import("../dist/external-sessions/process.js");
- const child=new EventEmitter();child.stdout=new PassThrough();child.stderr=new PassThrough();child.kill=()=>{setTimeout(()=>child.emit("close",null,"SIGKILL"),20);return true;};
+ // The close is emitted by the test itself, after the not-yet-settled check, so a slow runner cannot reorder it.
+ const child=new EventEmitter();child.stdout=new PassThrough();child.stderr=new PassThrough();child.kill=()=>true;
  const controller=new AbortController();let settled=false;
  const run=runExternalCommandCapture({command:process.execPath,spawnProcess:()=>child},[],{signal:controller.signal,waitForClose:true}).then(value=>{settled=true;return value;});
- setTimeout(()=>child.emit("close",null,"SIGKILL"),20);controller.abort();await new Promise(resolve=>setImmediate(resolve));assert.equal(settled,false);const result=await run;assert.equal(result.errorCode,"interrupted");assert.equal(settled,true);
+ controller.abort();for(let turn=0;turn<5;turn++)await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(settled,false,"cancellation waits for the actual close");
+ child.emit("close",null,"SIGKILL");const result=await run;assert.equal(result.errorCode,"interrupted");assert.equal(settled,true);
 });
 test("OpenCode transient settings do not replace the host login data or import ambient integrations",async()=>{
  const {openCodeRunEnv}=await import("../dist/agent-runtime/opencode-cli.js");const env=openCodeRunEnv({HOME:"/fixture/account",XDG_DATA_HOME:"/fixture/login-data",OPENCODE_CONFIG_CONTENT:"PRIVATE_FAKE_CONFIG",HTTPS_PROXY:"http://127.0.0.1:9999"},{toolNames:["workspace_read"],mcp:{type:"remote",url:"http://127.0.0.1:1/mcp"}},true,"/fixture/owned-temp/config");
