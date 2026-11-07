@@ -774,7 +774,7 @@ export class JsonlRpcClient {
     const evidence = runtimeTransportErrorFirstLine(this.stderr, this.processExit, this.options.env, { beforeFirstResponse: !this.answered });
     // Exit evidence keeps stderr out of classification, except a pre-response startup reason.
     const startupStderr = !this.answered && !this.processExit?.signal && !!this.processExit && this.processExit.code !== 0
-      && !!this.stderr.trim();
+      && /\bERROR\b/iu.test(this.stderr.slice(-65_536));
     const error = new ExternalJsonlRpcTransportError(message, classifyRuntimeFailure({ stderr: this.processExit && !startupStderr ? "" : evidence,
       signal: this.processExit?.signal, timedOut: message.endsWith("timed out") }),
       this.options.captureErrorFirstLine ? evidence : undefined,

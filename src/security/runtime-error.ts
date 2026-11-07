@@ -20,21 +20,20 @@ export function runtimeErrorFirstLine(value: unknown, env: NodeJS.ProcessEnv = p
   return safe ? [...safe].slice(0, 320).join("") : undefined;
 }
 
-const stderrEvidenceLine = (stderr: string): string | undefined => {
-  const lines = stderr.slice(-65_536).split(/\r?\n/u);
-  return [...lines].reverse().find(line => /\bERROR\b/iu.test(line)) ?? lines.find(line => line.trim());
-};
+const stderrLines = (stderr: string) => stderr.slice(-65_536).split(/\r?\n/u);
+const latestErrorLine = (stderr: string): string | undefined => [...stderrLines(stderr)].reverse().find(line => /\bERROR\b/iu.test(line));
 
 /** Transport closure is not an RPC error: prefer observed exit evidence, then the latest ERROR.
  * A process that exits non-zero before answering any RPC never reached a session in which unrelated
- * MCP/plugin noise accumulates (that noise starts at thread/start), so its stderr is the startup reason
- * and outranks a bare exit code. A signal always wins: it identifies who stopped the process. */
+ * MCP/plugin noise accumulates (that noise starts at thread/start), so its latest ERROR line is the
+ * startup reason and outranks a bare exit code. Without an ERROR line (for example a lone WARN) the
+ * exit code is kept. A signal always wins: it identifies who stopped the process. */
 export function runtimeTransportErrorFirstLine(stderr: string, exit: { code: number | null; signal?: string | null } | undefined,
   env: NodeJS.ProcessEnv = process.env, options: { beforeFirstResponse?: boolean } = {}): string | undefined {
   if (exit?.signal) return runtimeErrorFirstLine(`External runtime terminated by signal ${exit.signal}`, env);
   if (exit && exit.code !== null && exit.code !== 0) {
-    const startup = options.beforeFirstResponse ? runtimeErrorFirstLine(stderrEvidenceLine(stderr), env) : undefined;
+    const startup = options.beforeFirstResponse ? runtimeErrorFirstLine(latestErrorLine(stderr), env) : undefined;
     return startup ?? runtimeErrorFirstLine(`External runtime exited with code ${exit.code}`, env);
   }
-  return runtimeErrorFirstLine(stderrEvidenceLine(stderr), env);
+  return runtimeErrorFirstLine(latestErrorLine(stderr) ?? stderrLines(stderr).find(line => line.trim()), env);
 }

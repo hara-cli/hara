@@ -95,6 +95,8 @@ test('transport closure prefers its signal and otherwise the latest ERROR, while
  assert.equal(runtimeTransportErrorFirstLine(noise,undefined,env),'ERROR final failure [path]');
  assert.equal(runtimeTransportErrorFirstLine(noise,{code:7,signal:null},env,{beforeFirstResponse:true}),'ERROR final failure [path]');
  assert.equal(runtimeTransportErrorFirstLine('',{code:7,signal:null},env,{beforeFirstResponse:true}),'External runtime exited with code 7');
+ // A lone non-ERROR line before the first response must not replace the exit code.
+ assert.equal(runtimeTransportErrorFirstLine('WARN optional plugin unavailable\n',{code:7,signal:null},env,{beforeFirstResponse:true}),'External runtime exited with code 7');
  assert.equal(runtimeTransportErrorFirstLine(noise,{code:null,signal:'SIGTERM'},env,{beforeFirstResponse:true}),'External runtime terminated by signal SIGTERM');
  const child=rpcChild(),client=JsonlRpcClient.start({command:process.execPath,env,captureErrorFirstLine:true,spawnProcess:()=>child});
  const pending=client.call('turn/start');child.stderr.write(noise);child.emit('exit',null,'SIGTERM');child.emit('close',null,'SIGTERM');
