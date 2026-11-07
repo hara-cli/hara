@@ -7,10 +7,10 @@ import { sameOpenedFileIdentity } from "../fs-identity.js";
 import { sensitiveFileError } from "../security/sensitive-files.js";
 
 export const MAX_MEDIA_RESPONSE_BYTES = 8 * 1024 * 1024;
-const MAX_VIDEO_BYTES = 256 * 1024 * 1024, MAX_REGISTRATIONS = 512, TTL = 30 * 60 * 1000;
+const MAX_VIDEO_BYTES = 256 * 1024 * 1024, MAX_REGISTRATIONS = 512;
 const MIME: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
   ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm" };
-interface Entry { id: string; path: string; root: string; rootInfo: Stats; info: Stats; mime: string; expires: number }
+interface Entry { id: string; path: string; root: string; rootInfo: Stats; info: Stats; mime: string }
 export interface WorkspaceMediaRegistration { id: string; mime: string; bytes: number }
 const inside = (root: string, path: string) => { const rel = relative(root, path); return !!rel && !isAbsolute(rel) && rel.split(sep).every(part => part !== ".." && part !== ""); };
 const sameFile = (a: Stats, b: Stats) => sameOpenedFileIdentity(a, b) && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
@@ -70,29 +70,30 @@ export class WorkspaceMediaRegistry {
   register(input: string): WorkspaceMediaRegistration {
     const file = this.open(input);
     try {
-      const now = Date.now();
-      for (const [id, entry] of this.entries) if (entry.expires <= now) this.entries.delete(id);
       let entry = [...this.entries.values()].find(row => row.path === file.path && sameFile(row.info, file.info) && sameOpenedFileIdentity(row.rootInfo, file.rootInfo));
       if (!entry) {
         if (this.entries.size >= MAX_REGISTRATIONS) this.entries.delete(this.entries.keys().next().value!);
-        entry = { id: randomBytes(32).toString("hex"), path: file.path, root: file.root, rootInfo: file.rootInfo, info: file.info, mime: file.mime, expires: now + TTL };
+        entry = { id: randomBytes(32).toString("hex"), path: file.path, root: file.root, rootInfo: file.rootInfo, info: file.info, mime: file.mime };
         this.entries.set(entry.id, entry);
-      } else entry.expires = now + TTL;
+      } else { this.entries.delete(entry.id); this.entries.set(entry.id, entry); }
       return { id: entry.id, mime: entry.mime, bytes: entry.info.size };
     } finally { closeSync(file.fd); }
   }
   has(id: string) { return /^[a-f0-9]{64}$/u.test(id) && this.entries.has(id); }
   read(id: string, range?: string, head = false, pathOnly = false) {
-    const entry = this.entries.get(id); if (!entry || entry.expires <= Date.now()) throw denied();
+    const entry = this.entries.get(id); if (!entry) throw denied();
     const file = this.open(entry.path, entry);
     try {
       let start = 0, end = file.info.size - 1;
       if (range !== undefined) {
         const match = /^bytes=(\d*)-(\d*)$/u.exec(range);
         if (!match || !match[1] && !match[2]) throw new RangeError("Invalid media range");
-        if (!match[1]) start = Math.max(0, file.info.size - Number(match[2]));
-        else { start = Number(match[1]); if (match[2]) end = Number(match[2]); }
-        if (![start, end].every(Number.isSafeInteger) || start > end || start >= file.info.size || end >= file.info.size) throw new RangeError("Invalid media range");
+        if (!match[1]) {
+          const suffix = Number(match[2]); if (!Number.isSafeInteger(suffix) || suffix < 1) throw new RangeError("Invalid media range");
+          start = Math.max(0, file.info.size - suffix);
+        } else { start = Number(match[1]); if (match[2]) end = Number(match[2]); }
+        if (![start, end].every(Number.isSafeInteger) || start > end || start >= file.info.size) throw new RangeError("Invalid media range");
+        end = Math.min(end, file.info.size - 1);
       }
       end = Math.min(end, start + MAX_MEDIA_RESPONSE_BYTES - 1);
       const partial = range !== undefined || end < file.info.size - 1;

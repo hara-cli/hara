@@ -40,6 +40,13 @@ test("moved files, generation changes, unsupported MIME and disguised text fail 
 test("videos use bounded byte ranges; invalid and multi-ranges never become file reads",t=>{
  const f=fixture(t),path=join(f.project,"clip.mp4"),fd=fs.openSync(path,"w");fs.writeSync(fd,Buffer.from([0,0,0,24,...Buffer.from("ftypisom")]));fs.ftruncateSync(fd,MAX_MEDIA_RESPONSE_BYTES+64);fs.closeSync(fd);
  const entry=f.registry.register("clip.mp4"),part=f.registry.read(entry.id,"bytes=0-11");assert.equal(part.status,206);assert.equal(part.bytes.length,12);assert.equal(part.headers["Content-Range"],`bytes 0-11/${entry.bytes}`);
+ assert.equal(f.registry.read(entry.id,"bytes=0-999999999").bytes.length,MAX_MEDIA_RESPONSE_BYTES);
  assert.equal(f.registry.read(entry.id,"bytes=-8").bytes.length,8);assert.equal(f.registry.read(entry.id).bytes.length,MAX_MEDIA_RESPONSE_BYTES);
- for(const range of["bytes=999999999-","bytes=3-1","bytes=0-2,4-6","bytes=-0","bad"] )assert.throws(()=>f.registry.read(entry.id,range),RangeError);
+ for(const range of["bytes=999999999-","bytes=3-1","bytes=0-2,4-6","bytes=-0","bytes=-999999999999999999999999","bytes=0-999999999999999999999999","bad"] )assert.throws(()=>f.registry.read(entry.id,range),RangeError);
+});
+
+test("a current registered image survives long pauses without a time-based broken-image state",t=>{
+ const f=fixture(t);fs.writeFileSync(join(f.project,"still.gif"),gif);const entry=f.registry.register("still.gif"),now=Date.now;
+ try{Date.now=()=>now()+2*60*60*1000;assert.deepEqual(f.registry.read(entry.id).bytes,gif);assert.equal(f.registry.register("still.gif").id,entry.id);}finally{Date.now=now;}
+ assert.deepEqual(f.registry.read(entry.id,"bytes=0-99999").bytes,gif);
 });
