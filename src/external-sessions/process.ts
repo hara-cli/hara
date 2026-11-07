@@ -608,6 +608,8 @@ export class JsonlRpcClient {
   private readonly pending = new Map<number, PendingJsonlRequest>();
   private stderr = "";
   private processExit?: { code: number | null; signal?: string | null };
+  /** Set once any RPC response arrives; before that, a non-zero exit is a startup failure. */
+  private answered = false;
   private pendingText = "";
   private outputBytes = 0;
   private nextId = 1;
@@ -738,6 +740,7 @@ export class JsonlRpcClient {
       const pending = this.pending.get(record.id);
       if (!pending) return;
       this.pending.delete(record.id);
+      this.answered = true;
       clearTimeout(pending.timer);
       if (record.error && typeof record.error === "object" && !Array.isArray(record.error)) {
         const providerCode = (record.error as Record<string, unknown>).code;
@@ -768,8 +771,11 @@ export class JsonlRpcClient {
     this.closed = true;
     this.options.signal?.removeEventListener("abort", this.abort);
     const method = timedOutMethod ?? (this.pending.size === 1 ? this.pending.values().next().value?.method : undefined);
-    const evidence = runtimeTransportErrorFirstLine(this.stderr, this.processExit, this.options.env);
-    const error = new ExternalJsonlRpcTransportError(message, classifyRuntimeFailure({ stderr: this.processExit ? "" : evidence,
+    const evidence = runtimeTransportErrorFirstLine(this.stderr, this.processExit, this.options.env, { beforeFirstResponse: !this.answered });
+    // Exit evidence keeps stderr out of classification, except a pre-response startup reason.
+    const startupStderr = !this.answered && !this.processExit?.signal && !!this.processExit && this.processExit.code !== 0
+      && !!this.stderr.trim();
+    const error = new ExternalJsonlRpcTransportError(message, classifyRuntimeFailure({ stderr: this.processExit && !startupStderr ? "" : evidence,
       signal: this.processExit?.signal, timedOut: message.endsWith("timed out") }),
       this.options.captureErrorFirstLine ? evidence : undefined,
       runtimeRpcDiagnostic({ rpcMethod: method, rpcTimeoutMs: this.requestTimeoutMs }));
