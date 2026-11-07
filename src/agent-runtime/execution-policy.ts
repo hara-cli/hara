@@ -2,7 +2,7 @@ import type { ChildProcess } from "node:child_process";
 import { RuntimeProcessBoundary, RUNTIME_GUARD_SCRIPT, type RuntimeDrainReport } from "./process-boundary.js";
 // Host-owned outer process boundary. Native permission switches cannot relax this Seatbelt profile.
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, type BigIntStats } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, type BigIntStats } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -14,6 +14,29 @@ export type RuntimePermissionTier = "full-protected" | "controlled";
 export type RegisteredPolicyRuntime = "pi" | "codex" | "claude" | "opencode" | "gemini" | "copilot" | "cursor" | "kimi" | "grok";
 const RUNTIMES: readonly string[] = ["pi", "codex", "claude", "opencode", "gemini", "copilot", "cursor", "kimi", "grok"];
 export const isRuntimePermissionTier = (value: unknown): value is RuntimePermissionTier => value === "full-protected" || value === "controlled";
+
+/** Jeff 2026-11-08 (decision B): macOS keeps Seatbelt write protection with no unprotected fallback.
+ * Other platforms keep the released 1.0.x behavior: no OS-level write protection, so the full tier is
+ * unavailable and only the controlled tier (native read-only/plan modes plus Hara governance) runs. */
+export type RuntimeWriteProtection = "seatbelt" | "none";
+export const runtimeWriteProtection = (platform: NodeJS.Platform = process.platform): RuntimeWriteProtection => platform === "darwin" ? "seatbelt" : "none";
+export const availableRuntimePermissionTiers = (platform: NodeJS.Platform = process.platform): readonly RuntimePermissionTier[] =>
+  runtimeWriteProtection(platform) === "seatbelt" ? ["full-protected", "controlled"] : ["controlled"];
+export const defaultRuntimePermissionTier = (platform: NodeJS.Platform = process.platform): RuntimePermissionTier =>
+  runtimeWriteProtection(platform) === "seatbelt" ? "full-protected" : "controlled";
+export const RUNTIME_TIER_UNAVAILABLE = "permission_tier_unavailable_on_platform";
+/** A durable full-protected binding reaching a platform without Seatbelt is refused, never silently downgraded. */
+export class RuntimeTierUnavailableError extends Error {
+  readonly code = RUNTIME_TIER_UNAVAILABLE;
+  constructor() { super("Full protection requires macOS Seatbelt. This platform has no system-level write protection; switch this colleague to the controlled tier to run it"); }
+}
+export const NATIVE_ENGINE_UNSUPPORTED = "native_engine_unsupported_on_platform";
+/** Native engines rely on a POSIX process boundary; Windows has no equivalent launcher in this release. */
+export class NativeEngineUnsupportedError extends Error {
+  readonly code = NATIVE_ENGINE_UNSUPPORTED;
+  constructor() { super("Native engines are not supported on Windows in this release; use Pi"); }
+}
+const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 /** The npm Pi SDK imports OpenAI's source named credentials.mjs. This is code, not a login store.
  * Resolve only the trusted installed dependency; this exception applies to the generic basename mask,
  * never to Hara/Keychain/foreign credential directories. Bundled binaries need no filesystem exception. */
@@ -169,8 +192,12 @@ export class RuntimeExecutionPolicy {
   private attemptKey: string = randomUUID();
   private lastEvidence?: NativeWorkspaceEvidence;
   private readonly input: RuntimeExecutionPolicyInput;
-  constructor(input: RuntimeExecutionPolicyInput) {
+  private readonly platform: NodeJS.Platform;
+  /** `options.platform` is an internal test seam only; production always uses the Host process platform. */
+  constructor(input: RuntimeExecutionPolicyInput, options: { platform?: NodeJS.Platform } = {}) {
     if (!RUNTIMES.includes(input.runtimeId) || !isRuntimePermissionTier(input.tier)) throw new Error("Invalid runtime execution policy");
+    this.platform = options.platform ?? process.platform;
+    if (!availableRuntimePermissionTiers(this.platform).includes(input.tier)) throw new RuntimeTierUnavailableError();
     const managed = managedDefaultProject(input);
     this.input = { ...input }; this.key = policyKey(input, managed);
     this.workRoot = physical(input.workRoot); const home = physical(input.accountHome);
@@ -283,14 +310,23 @@ export class RuntimeExecutionPolicy {
   }
   get runtimeId(): RegisteredPolicyRuntime { return this.input.runtimeId; }
   get tier(): RuntimePermissionTier { return this.input.tier; }
+  /** Whether this launch runs inside an OS write sandbox. Callers keep native read-only modes when it does not. */
+  get writeProtection(): RuntimeWriteProtection { return runtimeWriteProtection(this.platform); }
   wrap(input: { command: string; args: readonly string[]; env: NodeJS.ProcessEnv }): { command: string; args: string[]; env: NodeJS.ProcessEnv; onProcess(child: ChildProcess, processGroup: boolean): Promise<void>; drainProcess(): Promise<void> } {
-    if (this.closed || process.platform !== "darwin") throw new Error("Runtime write protection requires macOS Seatbelt; no unprotected fallback");
+    if (this.closed) throw new Error("Runtime write protection requires macOS Seatbelt; no unprotected fallback");
+    const seatbelt = this.writeProtection === "seatbelt";
+    // macOS never falls back: a missing Seatbelt executable refuses the launch.
+    if (seatbelt && !existsSync(SANDBOX_EXEC)) throw new Error("Runtime write protection requires macOS Seatbelt; no unprotected fallback");
+    if (this.platform === "win32") throw new NativeEngineUnsupportedError();
+    // Off macOS the constructor admitted only the controlled tier; there is no OS write sandbox.
+    if (!seatbelt && this.input.tier !== "controlled") throw new RuntimeTierUnavailableError();
     if (!isAbsolute(input.command)) throw new Error("Runtime command must be resolved by the installer");
     this.processes.markWrapped();
     const launchEnv = { ...input.env };
     for (const name of Object.keys(launchEnv)) if (/^(?:BASH_FUNC_|DYLD_|LD_PRELOAD$|LD_LIBRARY_PATH$|NODE_OPTIONS$|NODE_PATH$|ENV$|BASH_ENV$|SHELLOPTS$|BASHOPTS$)/u.test(name)) delete launchEnv[name];
+    const sandbox = seatbelt ? [SANDBOX_EXEC, "-p", this.profile] : [];
     return { onProcess: (child, processGroup) => this.processes.own(child, processGroup), drainProcess: async () => { await this.processes.drain(false); },
-      command: "/bin/sh", args: ["-c", RUNTIME_GUARD_SCRIPT, "hara-native-guard", "/usr/bin/sandbox-exec", "-p", this.profile, input.command, ...input.args], env: { ...launchEnv,
+      command: "/bin/sh", args: ["-c", RUNTIME_GUARD_SCRIPT, "hara-native-guard", ...sandbox, input.command, ...input.args], env: { ...launchEnv,
       ENV: undefined, BASH_ENV: undefined,
       PATH: [dirname(input.command), input.env.PATH].filter(Boolean).join(delimiter),
       TMPDIR: this.tempRoot + sep, TMP: this.tempRoot, TEMP: this.tempRoot, SQLITE_TMPDIR: this.tempRoot } };
@@ -363,4 +399,4 @@ export class RuntimeExecutionPolicy {
   }
   async close(): Promise<void> { if (!this.closed) { await this.processes.close(); this.closed = true; rmSync(this.tempRoot, { recursive: true, force: true }); } }
 }
-export function createRuntimeExecutionPolicy(input: RuntimeExecutionPolicyInput): RuntimeExecutionPolicy { return new RuntimeExecutionPolicy(input); }
+export function createRuntimeExecutionPolicy(input: RuntimeExecutionPolicyInput, options: { platform?: NodeJS.Platform } = {}): RuntimeExecutionPolicy { return new RuntimeExecutionPolicy(input, options); }

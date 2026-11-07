@@ -13,7 +13,7 @@ import type { ReviewedMcpSource } from "./extension-review.js";
 import { approveWorkspaceExtension } from "./extension-binding.js";
 import { WorkspaceNativeRiskStore } from "./runtime-native-risks.js";
 import { workspaceRunNativeEvidence } from "./execution.js";
-import { isRuntimePermissionTier, type RuntimePermissionTier } from "../agent-runtime/execution-policy.js";
+import { defaultRuntimePermissionTier, isRuntimePermissionTier, NativeEngineUnsupportedError, RuntimeTierUnavailableError, type RuntimePermissionTier } from "../agent-runtime/execution-policy.js";
 import { createHash, randomUUID } from "node:crypto";
 import { lstatSync } from "node:fs";
 import { join } from "node:path";
@@ -1340,7 +1340,7 @@ export class LocalWorkspaceHost {
         const defaultRuntime = options.some(row => row.id === "pi") ? "pi" : options[0]?.id;
         if (!defaultRuntime) return JSON.stringify({ created: false, refused: "runtime_unavailable", humanConfirmed: false });
         const decision = await host.approval(job, { username: proposed.username as string, displayName: proposed.displayName as string, title: proposed.title as string, instructions: proposed.instructions as string,
-          project: typeof proposed.project === "string" ? proposed.project : "", runtimeId: defaultRuntime, permissionTier: "full-protected" });
+          project: typeof proposed.project === "string" ? proposed.project : "", runtimeId: defaultRuntime, permissionTier: defaultRuntimePermissionTier() });
         if (!decision.approved) {
           return JSON.stringify({ created: false, humanConfirmed: false, approvalState: decision.state, displayName: proposed.displayName });
         }
@@ -1417,6 +1417,10 @@ export class LocalWorkspaceHost {
     const context = this.context(workspaceId), agent = context.resources.agents.get(agentId);
     if (!agent || agent.state !== "active" || !context.resources.agents.runtimeOptions().some(row => row.id === agent.runtime.id && row.available))
       throw new Error("Agent Runtime unavailable; no fallback selected");
+    // Decision B: a stored full tier on a Host without Seatbelt needs an explicit switch; never downgrade it here.
+    if (agent.permissionTierUnavailable) throw new RuntimeTierUnavailableError();
+    // Jeff 2026-11-08: Windows runs Pi in 1.2.0; native engines are refused explicitly, never launched unprotected.
+    if (process.platform === "win32" && !["pi", "hara"].includes(agent.runtime.id)) throw new NativeEngineUnsupportedError();
     if (channel && !this.localChannels(workspaceId).get(channel.id).memberIds.includes(agentId)) throw new Error("Agent is not a member of this local channel");
     if (parent && (parent.workspaceId !== workspaceId || parent.binding.lineage.depth !== 0)) throw new Error("delegation is limited to one same-Workspace hop");
     const isContinue = message.trim() === "/continue" || (!questionId && requestsTaskContinuation(message));

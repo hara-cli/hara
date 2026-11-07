@@ -23,7 +23,7 @@ import {
   type WorkspaceAgentTaskBinding,
 } from "./agent-binding.js";
 
-import { isRuntimePermissionTier, type RuntimePermissionTier } from "../agent-runtime/execution-policy.js";
+import { availableRuntimePermissionTiers, defaultRuntimePermissionTier, isRuntimePermissionTier, RuntimeTierUnavailableError, type RuntimePermissionTier } from "../agent-runtime/execution-policy.js";
 
 const FILE = "workspace-agents.json";
 const OWNER = "workspace-agents-owner.json";
@@ -90,6 +90,8 @@ export interface WorkspaceAgentView {
   description: string;
   runtime: AgentRuntimeOption;
   permissionTier: RuntimePermissionTier;
+  /** Present only when the stored tier is unavailable on this Host platform (decision B); never silently downgraded. */
+  permissionTierUnavailable?: true;
   /** Main Hara uses the packaged product mark, not a private prompt-supplied path. */
   brand?: "hara";
 }
@@ -122,7 +124,7 @@ function persona(value: unknown, username: string): Omit<WorkspaceAgentConfigura
   }
   return { identity: normalizeAgentPublicIdentityInput(value.profile, username, "global"), description, instructions };
 }
-function configuration(input: ReturnType<typeof persona>, revision: number, runtimeId: AgentRuntimeId, toolPolicy?: WorkspaceLegacyToolPolicy, permissionTier: RuntimePermissionTier | null = "full-protected"): WorkspaceAgentConfiguration {
+function configuration(input: ReturnType<typeof persona>, revision: number, runtimeId: AgentRuntimeId, toolPolicy?: WorkspaceLegacyToolPolicy, permissionTier: RuntimePermissionTier | null = defaultRuntimePermissionTier()): WorkspaceAgentConfiguration {
   const value = { revision, ...input, runtimeId, ...(permissionTier ? { permissionTier } : {}), ...(toolPolicy ? { toolPolicy: validateWorkspaceLegacyToolPolicy(toolPolicy) } : {}) };
   return { ...value, hash: hashConfiguration(value) };
 }
@@ -229,7 +231,8 @@ export class WorkspaceAgentStore {
     return { workspaceId: this.scope.workspaceId, agentId: row.agentId, username: row.username, kind: row.kind,
       state: row.state, agentEpoch: row.epoch, configRevision: config.revision, identity: structuredClone(config.identity),
       ...(row.archivedAt ? { archivedAt: row.archivedAt, pausedScheduleCount: row.pausedScheduleCount ?? 0 } : {}),
-      description: config.description, permissionTier: config.permissionTier ?? "full-protected", runtime: { ...runtimes.find(option => option.id === config.runtimeId)! },
+      description: config.description, permissionTier: config.permissionTier ?? defaultRuntimePermissionTier(), runtime: { ...runtimes.find(option => option.id === config.runtimeId)! },
+      ...(availableRuntimePermissionTiers().includes(config.permissionTier ?? defaultRuntimePermissionTier()) ? {} : { permissionTierUnavailable: true as const }),
       ...(row.kind === "main" ? { brand: "hara" as const } : {}) };
   }
   currentPersona(agentId: string): WorkspaceAgentPersonaInput {
@@ -291,7 +294,9 @@ export class WorkspaceAgentStore {
       || typeof input.username !== "string" || !USERNAME.test(input.username) || ["main", "hara"].includes(input.username)
       || !positive(expectedCatalogRevision)) throw new Error("invalid Workspace Agent creation");
     if (input.permissionTier !== undefined && !isRuntimePermissionTier(input.permissionTier)) throw new Error("invalid Workspace Agent permission tier");
-    const { username, runtimeId = "pi", permissionTier = "full-protected", ...fields } = input;
+    // Decision B: the full tier exists only where the Host has Seatbelt; never accept it elsewhere.
+    if (input.permissionTier !== undefined && !availableRuntimePermissionTiers().includes(input.permissionTier)) throw new RuntimeTierUnavailableError();
+    const { username, runtimeId = "pi", permissionTier = defaultRuntimePermissionTier(), ...fields } = input;
     const normalized = persona(fields, username);
     if (!isAgentRuntimeId(runtimeId)) throw new Error("invalid Workspace Agent Runtime");
     this.runtimes.assertAvailable(runtimeId);
@@ -320,7 +325,7 @@ export class WorkspaceAgentStore {
       return this.view(row);
     });
   }
-  private appendConfiguration(row: AgentRecord, input: ReturnType<typeof persona>, runtimeId: AgentRuntimeId, permissionTier = row.configurations.at(-1)!.permissionTier ?? "full-protected"): void {
+  private appendConfiguration(row: AgentRecord, input: ReturnType<typeof persona>, runtimeId: AgentRuntimeId, permissionTier = row.configurations.at(-1)!.permissionTier ?? defaultRuntimePermissionTier()): void {
     if (row.state !== "active") throw new Error("restore the exact archived Workspace Agent before editing");
     if (row.configurations.length >= MAX_CONFIGS) throw new Error("Workspace Agent configuration history is full; no snapshot was removed");
     row.currentConfigRevision++;
@@ -355,6 +360,7 @@ export class WorkspaceAgentStore {
   }
   setPermissionTier(agentId: string, permissionTier: RuntimePermissionTier, configRevision: number, agentEpoch: number): WorkspaceAgentView {
     if (!isRuntimePermissionTier(permissionTier)) throw new Error("Invalid runtime permission tier");
+    if (!availableRuntimePermissionTiers().includes(permissionTier)) throw new RuntimeTierUnavailableError();
     return this.update(agentId, configRevision, agentEpoch, row => {
       const current = row.configurations[row.currentConfigRevision - 1]!;
       const { identity, description, instructions } = current;
@@ -417,7 +423,7 @@ export class WorkspaceAgentStore {
     const config = row.configurations[row.currentConfigRevision - 1]!;
     this.runtimes.assertAvailable(config.runtimeId);
     return freezeWorkspaceAgentTaskBinding({ schemaVersion: 1, workspaceId: this.scope.workspaceId, resourceBinding: this.binding(),
-      agentId: row.agentId, agentEpoch: row.epoch, configRevision: config.revision, configHash: config.hash, runtimeId: config.runtimeId, permissionTier: config.permissionTier ?? "full-protected", taskId });
+      agentId: row.agentId, agentEpoch: row.epoch, configRevision: config.revision, configHash: config.hash, runtimeId: config.runtimeId, permissionTier: config.permissionTier ?? defaultRuntimePermissionTier(), taskId });
   }
   /** Private snapshot resolution, NOT execution admission. Callers still need live membership, policy,
    * Host/resource grants and fully scoped dependencies. Old runners explicitly refuse this provenance. */
@@ -427,7 +433,7 @@ export class WorkspaceAgentStore {
     const row = this.load().value?.agents.find(entry => entry.agentId === binding.agentId);
     if (!row || row.state !== "active" || row.epoch !== binding.agentEpoch) throw new Error("Workspace Agent task lifecycle is no longer active");
     const config = row.configurations[binding.configRevision - 1];
-    if (binding.permissionTier !== undefined && binding.permissionTier !== (config?.permissionTier ?? "full-protected")) throw new Error("Frozen runtime permission tier does not match its configuration");
+    if (binding.permissionTier !== undefined && binding.permissionTier !== (config?.permissionTier ?? defaultRuntimePermissionTier())) throw new Error("Frozen runtime permission tier does not match its configuration");
     if (!config || config.hash !== binding.configHash || config.runtimeId !== binding.runtimeId) throw new Error("Workspace Agent task configuration snapshot is unavailable; no fallback was selected");
     this.runtimes.assertAvailable(config.runtimeId);
     const result = structuredClone(config);

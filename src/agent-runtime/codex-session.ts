@@ -125,6 +125,10 @@ export class GovernedCodexSession {
   private policy?: RuntimeExecutionPolicy;
   private processKey?: string;
   private exit?: Promise<void>;
+  /** Decision B: Codex's own sandbox is disabled only inside the macOS Seatbelt boundary. Elsewhere it keeps
+   * the released 1.0.x read-only sandbox; without a known Seatbelt policy it is read-only as well. */
+  private nativeSandboxMode(): "danger-full-access" | "read-only" { return this.policy?.writeProtection === "seatbelt" ? "danger-full-access" : "read-only"; }
+  private nativeSandboxType(): "dangerFullAccess" | "readOnly" { return this.nativeSandboxMode() === "danger-full-access" ? "dangerFullAccess" : "readOnly"; }
   private active?: ActiveTurn;
   private maintenance?: CodexContextCompaction;
   private readonly endpointMaintenance = new WeakMap<WorkspaceMcpEndpoint, { suspend(): Promise<boolean>; resume(): void }>();
@@ -435,7 +439,7 @@ export class GovernedCodexSession {
       const nativeArgs = ["app-server", "--stdio", "-c", "thread_unload_delay_secs=0", "-c", "mcp_servers={}",
           "-c", "model_auto_compact_token_limit=9007199254740991", "-c", "model_post_turn_compact_threshold_percent=0",
           "-c", 'shell_environment_policy.set.HARA_WORKSPACE_MCP_TOKEN=""',
-          "-c", 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="never"',
+          "-c", `sandbox_mode="${this.nativeSandboxMode()}"`, "-c", 'approval_policy="never"',
           ...codexHostToolOverrides(resolved.env.HOME!, resolved.env.CODEX_HOME, input.cwd, this.mcpName)];
       if (!this.policy) throw new Error("Codex execution policy is unavailable");
       const launch = this.policy.wrap({ command: resolved.command, env, args: nativeArgs });
@@ -520,7 +524,7 @@ export class GovernedCodexSession {
         input.assertCurrent(); if (input.signal.aborted) throw new Error("interrupted");
         const load = (resume: boolean) => client.call<Record<string, unknown>>(resume ? "thread/resume" : "thread/start", {
           ...(resume ? { threadId: this.value.threadId, excludeTurns: true } : { ephemeral: false }),
-          cwd: input.cwd, sandbox: "danger-full-access", approvalPolicy: "never", approvalsReviewer: "user",
+          cwd: input.cwd, sandbox: this.nativeSandboxMode(), approvalPolicy: "never", approvalsReviewer: "user",
           developerInstructions: standing, config, ...(input.model ? { model: input.model } : {}),
         });
         let resetFrom: string | undefined;
@@ -540,7 +544,7 @@ export class GovernedCodexSession {
         const thread = object(response.thread);
         if (!nativeId(thread.id) || resumed && !resetFrom && thread.id !== this.value.threadId || thread.cwd !== input.cwd
           || response.approvalPolicy !== "never" || response.approvalsReviewer !== "user"
-          || object(response.sandbox).type !== "dangerFullAccess"
+          || object(response.sandbox).type !== this.nativeSandboxType()
           || input.model !== null && response.model !== input.model || input.effort !== null && response.reasoningEffort !== input.effort
           || object(thread.status).type !== "idle") {
           throw new Error("Codex thread confinement or idle origin was not confirmed");
@@ -641,11 +645,11 @@ export class GovernedCodexSession {
       const original = this.value.threadId, beforeTokens = this.value.contextTokens;
       if (input.resumed) {
         const response = await input.client.call<Record<string, unknown>>("thread/start", { ephemeral: false, cwd: input.cwd,
-          sandbox: "danger-full-access", approvalPolicy: "never", approvalsReviewer: "user", developerInstructions: input.standing,
+          sandbox: this.nativeSandboxMode(), approvalPolicy: "never", approvalsReviewer: "user", developerInstructions: input.standing,
           config: input.config, ...(input.model ? { model: input.model } : {}) });
         const thread = object(response.thread);
         if (!nativeId(thread.id) || thread.cwd !== input.cwd || object(thread.status).type !== "idle" || response.approvalPolicy !== "never"
-          || response.approvalsReviewer !== "user" || object(response.sandbox).type !== "dangerFullAccess"
+          || response.approvalsReviewer !== "user" || object(response.sandbox).type !== this.nativeSandboxType()
           || input.model !== null && response.model !== input.model || input.effort !== null && response.reasoningEffort !== input.effort)
           throw new Error("Compacted seed thread confinement was not confirmed");
         input.assertCurrent(); this.value.threadId = thread.id; this.loaded = true;

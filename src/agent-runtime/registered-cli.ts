@@ -2,7 +2,7 @@ import { WorkspaceContextCompactions, compactionSourceKey, type ContextSummary }
 import { workspaceCompactionSource, workspaceRuntimeStorage } from "../workspace/execution.js";
 import { oneShotCompactionPrompt } from "./context-compaction.js";
 import { claudeRuntimeEnvironment, parseClaudeCliOutput } from "./claude-cli.js";
-import { workspaceRunPermissionTier } from "./execution-policy.js";
+import { runtimeWriteProtection, workspaceRunPermissionTier } from "./execution-policy.js";
 import { newWorkspaceNativePolicy, endWorkspaceNativePolicy, observeWorkspaceNativeItem } from "./workspace-native-policy.js";
 import { classifyRuntimeFailure, runtimeFailureMessage } from "./failure-diagnostics.js";
 import { runtimeFailureTracker } from "./failure-tracker.js";
@@ -37,7 +37,11 @@ function claudeEffortArgs(effort: string | null): string[] { return effort ? ["-
 export function registeredCliArgs(input: {
   id: "codex" | "claude"; prompt: string; cwd: string; model: string | null; effort: string | null; skipGitRepoCheck: boolean;
   mcp?: { url: string; timeoutMs: number; serverName?: string }; hostToolOverrides?: string[]; permissionTier?: "full-protected" | "controlled"; claudeStreamJson?: boolean; claudePermissionMode?: "plan" | "bypassPermissions";
+  /** True only when the launch runs inside the macOS Seatbelt boundary. Defaults to the Host platform. */
+  osWriteSandbox?: boolean;
 }): string[] {
+  // Decision B: without an OS write sandbox Codex keeps its own read-only sandbox (the released 1.0.x mode).
+  const codexSandbox = (input.osWriteSandbox ?? runtimeWriteProtection() === "seatbelt") ? ["--dangerously-bypass-approvals-and-sandbox"] : ["--sandbox", "read-only"];
   const bridge = input.mcp;
   const server = bridge?.serverName ?? "hara_workspace";
   if (!/^hara_workspace(?:_[a-f0-9]{24})?$/u.test(server)) throw new Error("Invalid Host MCP namespace");
@@ -55,7 +59,7 @@ export function registeredCliArgs(input: {
     "--allowedTools", "mcp__hara__*"];
   return input.id === "codex"
     ? ["exec", input.prompt, "--cd", input.cwd, ...(input.skipGitRepoCheck ? ["--skip-git-repo-check"] : []),
-      ...(input.model ? ["-m", input.model] : []), ...codexEffortArgs(input.effort), "--dangerously-bypass-approvals-and-sandbox",
+      ...(input.model ? ["-m", input.model] : []), ...codexEffortArgs(input.effort), ...codexSandbox,
       ...(bridge ? input.hostToolOverrides ?? [] : []), ...mcp]
     : ["-p", input.prompt, "--output-format", input.claudeStreamJson ? "stream-json" : "text", ...(input.claudeStreamJson ? ["--verbose"] : []), ...(input.model ? ["--model", input.model] : []),
       ...claudeEffortArgs(input.effort), "--permission-mode", input.permissionTier !== undefined ? input.permissionTier === "full-protected" ? "bypassPermissions" : "plan" : input.claudePermissionMode ?? "plan",
