@@ -2,6 +2,7 @@ import { classifyRuntimeFailure, type RuntimeFailureKind } from "./failure-diagn
 import { runtimeErrorFirstLine } from "../security/runtime-error.js";
 import type { ExpandedRuntimeId } from "./expanded-models.js";
 import type { ExternalCommandCaptureResult } from "../external-sessions/process.js";
+import { runtimeWriteProtection } from "./execution-policy.js";
 
 export interface NativeToolObservation {
   name: string;
@@ -109,13 +110,17 @@ export function parseExpandedRun(id: "copilot" | "cursor", result: ExternalComma
   return { text: (assembled || deltas).trim(), completed: true, tools, failure: null };
 }
 export function expandedCliArgs(input: { id: ExpandedRuntimeId; prompt: string; model: string | null; effort: string | null;
-  fullProtected: boolean; mcpConfigPath?: string }): string[] {
+  fullProtected: boolean; mcpConfigPath?: string;
+  /** True only inside the macOS Seatbelt boundary. Defaults to the Host platform (decision B). */
+  osWriteSandbox?: boolean }): string[] {
   const model = input.model ? ["--model", input.model] : [];
   if (input.id === "copilot") return ["-p", input.prompt, "--output-format", "json", "--no-auto-update", ...(input.fullProtected ? ["--allow-all-tools", "--allow-all-paths"] : ["--allow-tool=read", "--allow-tool=hara", "--deny-tool=write", "--deny-tool=shell"]),
     ...model, ...(input.effort ? ["--effort", input.effort] : []),
     ...(input.mcpConfigPath ? ["--additional-mcp-config=@" + input.mcpConfigPath] : [])];
   if (input.effort) throw new Error("invalid_model");
-  if (input.id === "cursor") return ["--print", "--output-format", "stream-json", ...(input.fullProtected ? ["--force"] : ["--mode", "ask"]), "--sandbox", "disabled", "--approve-mcps", "--trust", ...model, input.prompt];
+  if (input.id === "cursor") return ["--print", "--output-format", "stream-json", ...(input.fullProtected ? ["--force"] : ["--mode", "ask"]),
+    // Cursor's own sandbox is disabled only where the outer Seatbelt boundary governs; elsewhere keep its default.
+    ...((input.osWriteSandbox ?? runtimeWriteProtection() === "seatbelt") ? ["--sandbox", "disabled"] : []), "--approve-mcps", "--trust", ...model, input.prompt];
   return ["agent", "--no-leader", ...(input.fullProtected ? ["--always-approve"] : []), ...model, "stdio"];
 }
 /** Reject foreign-session updates instead of attributing their text/tool effects to this attempt. */

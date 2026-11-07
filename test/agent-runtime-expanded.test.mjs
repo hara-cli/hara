@@ -11,6 +11,7 @@ import { AGENT_RUNTIME_IDS } from "../dist/agent-runtime/bindings.js";
 import { detectInstalledRuntimes } from "../dist/workspace/runtime-detect.js";
 import { runtimeFailureMessage } from "../dist/agent-runtime/failure-diagnostics.js";
 import { createRuntimeStageProcessObserver } from "../dist/agent-runtime/stage-observer.js";
+import { SEATBELT } from "./helpers/platform-tier.mjs";
 
 const ids = ["copilot", "cursor", "grok"], endpoint = { url: "http://127.0.0.1:1/mcp", env: { HARA_WORKSPACE_MCP_TOKEN: "a".repeat(64) } };
 const result = frames => ({ ok: true, stdout: frames.map(value => JSON.stringify(value)).join("\n"), code: 0, timedOut: false });
@@ -23,7 +24,15 @@ for (const id of ids) test(id + " has an explicit ID and full parameters require
   const args = expandedCliArgs({ id, prompt: "fixture", model: null, effort: null, fullProtected: true, mcpConfigPath: "/fixture/mcp.json" });
   for (const forbidden of ["login", "--reauth", "--resume", "--continue"]) assert.equal(args.includes(forbidden), false);
   if (id === "copilot") { assert.ok(args.includes("--allow-all-tools")); assert.ok(args.includes("--allow-all-paths")); assert.ok(args.includes("--additional-mcp-config=@/fixture/mcp.json")); }
-  if (id === "cursor") { assert.ok(args.includes("--force")); assert.ok(args.includes("--approve-mcps")); assert.equal(args[args.indexOf("--sandbox") + 1], "disabled"); assert.equal(controlled[controlled.indexOf("--sandbox") + 1], "disabled"); }
+  if (id === "cursor") { assert.ok(args.includes("--force")); assert.ok(args.includes("--approve-mcps")); for (const launch of [args, controlled]) {
+    // Decision B: Cursor's own sandbox is disabled only inside Seatbelt; without it the flag is omitted (Cursor default).
+    if (SEATBELT) assert.equal(launch[launch.indexOf("--sandbox") + 1], "disabled"); else assert.equal(launch.includes("--sandbox"), false);
+  }
+  for (const fullProtected of [true, false]) {
+    const inside = expandedCliArgs({ id, prompt: "fixture", model: null, effort: null, fullProtected, osWriteSandbox: true });
+    const outside = expandedCliArgs({ id, prompt: "fixture", model: null, effort: null, fullProtected, osWriteSandbox: false });
+    assert.equal(inside[inside.indexOf("--sandbox") + 1], "disabled"); assert.equal(outside.includes("--sandbox"), false); assert.equal(outside.includes("disabled"), false);
+  } }
   if (id === "grok") { assert.deepEqual(args, ["agent", "--no-leader", "--always-approve", "stdio"]); }
 });
 test("Copilot normalizes text and tool effects without retaining tool inputs", () => {

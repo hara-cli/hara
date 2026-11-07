@@ -313,7 +313,7 @@ export class RuntimeExecutionPolicy {
   /** Whether this launch runs inside an OS write sandbox. Callers keep native read-only modes when it does not. */
   get writeProtection(): RuntimeWriteProtection { return runtimeWriteProtection(this.platform); }
   wrap(input: { command: string; args: readonly string[]; env: NodeJS.ProcessEnv }): { command: string; args: string[]; env: NodeJS.ProcessEnv; onProcess(child: ChildProcess, processGroup: boolean): Promise<void>; drainProcess(): Promise<void> } {
-    if (this.closed) throw new Error("Runtime write protection requires macOS Seatbelt; no unprotected fallback");
+    if (this.closed) throw new Error("Runtime execution policy is closed; no launch is admitted");
     const seatbelt = this.writeProtection === "seatbelt";
     // macOS never falls back: a missing Seatbelt executable refuses the launch.
     if (seatbelt && !existsSync(SANDBOX_EXEC)) throw new Error("Runtime write protection requires macOS Seatbelt; no unprotected fallback");
