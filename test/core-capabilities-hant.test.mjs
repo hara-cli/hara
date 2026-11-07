@@ -73,6 +73,7 @@ function verify(dest) {
 
 test('checked-in artifact verifies without an installed OpenCC executable', t => {
   const result = verify(fixture(t)); assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "", "build diagnostics must not corrupt npm pack --json output");
 });
 
 test('build verification rejects stale Simplified Chinese sources', t => {

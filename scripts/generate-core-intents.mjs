@@ -126,7 +126,7 @@ function verify(value) {
 }
 if (mode === '--verify') {
   verify(JSON.parse(fs.readFileSync(generatedJson, 'utf8')));
-  console.log('Intent sources and generated runtime artifact are consistent (no converter needed).');
+  console.error('Intent sources and generated runtime artifact are consistent (no converter needed).');
 } else {
   const value = generate(), output = json(value), runtime = runtimeSource(value.patterns);
   if (mode === '--generate') {
@@ -136,5 +136,5 @@ if (mode === '--verify') {
   } else {
     if (fs.readFileSync(generatedJson, 'utf8') !== output || fs.readFileSync(generatedTs, 'utf8') !== runtime) throw Error('OpenCC regeneration differs from the checked-in artifacts');
   }
-  console.log('OpenCC ' + openccVersion + ' ' + configurations.join(' + ') + ': ' + keys.length + ' intent categories ' + (mode === '--generate' ? 'generated' : 'reproduced') + '.');
+  console.error('OpenCC ' + openccVersion + ' ' + configurations.join(' + ') + ': ' + keys.length + ' intent categories ' + (mode === '--generate' ? 'generated' : 'reproduced') + '.');
 }
