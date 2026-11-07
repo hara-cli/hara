@@ -61,8 +61,19 @@ export class WorkspaceFeatures {
       skills: [...skills.values()].map(row => ({ id: row.id, description: row.description, enabled: row.enabled, version: row.version, source: row.source,
         locked: value.skills.some(pin => pin.id === row.id) || inherited.some(pin => pin.id === row.id), availableVersion: candidates.find(candidate => candidate.id === row.id)?.version ?? row.version })) };
   }
-  setScheduleEnabled(id: string, enabled: boolean, expected: number) {
-    this.state.update(expected, current => { const row = current.schedules.find(row => row.id === id); if (!row) throw new Error("Scoped schedule unavailable"); row.enabled = enabled; return current; });
+  setScheduleEnabled(id: string, enabled: boolean, expected: number, restoredAgentEpoch?: number) {
+    this.state.update(expected, current => { const row = current.schedules.find(row => row.id === id); if (!row) throw new Error("Scoped schedule unavailable");
+      if (enabled && restoredAgentEpoch !== undefined && row.source === "chat" && validChatAnchor(row.definition.anchor, this.workspaceId))
+        row.definition.anchor = { ...row.definition.anchor, agentEpoch: restoredAgentEpoch };
+      row.enabled = enabled; return current; });
+  }
+  /** One scoped durable write; restoration deliberately never re-enables schedules. */
+  pauseAgentSchedules(agentId: string): number {
+    const before = this.state.read(), matches = before.schedules.filter(row => row.enabled && row.definition.agentId === agentId);
+    if (!matches.length) return 0;
+    const ids = new Set(matches.map(row => row.id));
+    this.state.update(before.revision, current => ({ ...current, schedules: current.schedules.map(row => ids.has(row.id) ? { ...row, enabled: false } : row) }));
+    return matches.length;
   }
   schedules(): WorkspaceSchedule[] { return this.state.read().schedules; }
   saveSchedule(input: unknown, expected: number) {

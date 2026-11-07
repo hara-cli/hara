@@ -50,3 +50,30 @@ test("a current registered image survives long pauses without a time-based broke
  try{Date.now=()=>now()+2*60*60*1000;assert.deepEqual(f.registry.read(entry.id).bytes,gif);assert.equal(f.registry.register("still.gif").id,entry.id);}finally{Date.now=now;}
  assert.deepEqual(f.registry.read(entry.id,"bytes=0-99999").bytes,gif);
 });
+
+test("media states distinguish missing in-root artifacts from forbidden paths without exposing outside existence", t => {
+ const f=fixture(t);fs.writeFileSync(join(f.project,"ready.gif"),gif);fs.writeFileSync(join(f.project,"broken.gif"),Buffer.from("not a GIF"));
+ assert.equal(f.registry.describe("ready.gif").state,"ready");
+ assert.deepEqual(f.registry.describe("missing.gif"),{state:"missing"});
+ assert.deepEqual(f.registry.describe("broken.gif"),{state:"failed"});
+ const outside=join(f.parent,"outside.gif");fs.writeFileSync(outside,gif);
+ assert.deepEqual(f.registry.describe(outside),{state:"outside"});assert.deepEqual(f.registry.describe(join(f.parent,"absent.gif")),{state:"outside"});
+ fs.symlinkSync(outside,join(f.project,"link.gif"));assert.deepEqual(f.registry.describe("link.gif"),{state:"outside"});
+ assert.deepEqual(f.registry.describe("../outside.gif"),{state:"outside"});
+ const result=f.registry.describe("ready.gif");fs.renameSync(join(f.project,"ready.gif"),join(f.project,"moved.gif"));
+ assert.deepEqual(f.registry.describe("ready.gif"),{state:"missing"});assert.throws(()=>f.registry.read(result.media.id),/media unavailable/);
+ f.change();assert.throws(()=>f.registry.describe("moved.gif"),/Generation changed/);
+});
+
+test("passive file cards use closed MIME families and retain all opaque-id and root checks", t => {
+ const f=fixture(t), types=[["paper.pdf",Buffer.from("%PDF-1.7\nfixture"),"application/pdf"],["bundle.zip",Buffer.from([80,75,3,4,0,0,0,0]),"application/zip"],["sheet.xlsx",Buffer.from([80,75,3,4,0,0,0,0]),"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],["note.md",Buffer.from("# Fixture\nOnly synthetic text."),"text/markdown"]];
+ for(const[name,bytes,mime]of types){fs.writeFileSync(join(f.project,name),bytes);const result=f.registry.describe(name);assert.equal(result.state,"ready");assert.equal(result.media.mime,mime);assert.deepEqual(f.registry.read(result.media.id).bytes,bytes);assert.equal("path"in result.media,false);}
+ for(const[name,bytes]of[["run.command",Buffer.from("exit 1")],["fake.pdf",Buffer.from("<html>not PDF</html>")],["fake.xlsx",Buffer.from("not zip")],["binary.md",Buffer.from([0,1,2])]]){fs.writeFileSync(join(f.project,name),bytes);assert.deepEqual(f.registry.describe(name),{state:"failed"});}
+ fs.writeFileSync(join(f.parent,"outside.md"),"# Outside");assert.deepEqual(f.registry.describe(join(f.parent,"outside.md")),{state:"outside"});
+ fs.symlinkSync(join(f.parent,"outside.md"),join(f.project,"alias.md"));assert.deepEqual(f.registry.describe("alias.md"),{state:"outside"});
+});
+
+test("file URL decoding cannot hide bidi controls in a registered filename",t=>{
+ const f=fixture(t),path=join(f.project,"misleading\u202e.md");fs.writeFileSync(path,"# Synthetic fixture");
+ assert.deepEqual(f.registry.describe(path),{state:"outside"});assert.deepEqual(f.registry.describe(pathToFileURL(path).href),{state:"outside"});
+});

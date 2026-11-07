@@ -65,6 +65,8 @@ interface AgentRecord {
   currentConfigRevision: number;
   configurations: WorkspaceAgentConfiguration[];
   legacy?: { importId: string; sourceHash: string };
+  archivedAt?: string;
+  pausedScheduleCount?: number;
 }
 interface Owner {
   schemaVersion: 1;
@@ -81,6 +83,8 @@ export interface WorkspaceAgentView {
   kind: "main" | "colleague";
   state: "active" | "archived";
   agentEpoch: number;
+  archivedAt?: string;
+  pausedScheduleCount?: number;
   configRevision: number;
   identity: AgentPublicIdentity;
   description: string;
@@ -177,7 +181,7 @@ export class WorkspaceAgentStore {
     if (canonical(this.parseOwner(rawManifestOwner)) !== canonical(owner)) return invalid();
     const ids = new Set<string>(), usernames = new Set<string>();
     const rows: AgentRecord[] = agents.map(value => {
-      if (!object(value) || !keys(value, ["agentId", "username", "kind", "state", "epoch", "currentConfigRevision", "configurations"], ["legacy"])
+      if (!object(value) || !keys(value, ["agentId", "username", "kind", "state", "epoch", "currentConfigRevision", "configurations"], ["legacy", "archivedAt", "pausedScheduleCount"])
         || !isWorkspaceAgentId(value.agentId) || ids.has(value.agentId)
         || typeof value.username !== "string" || !USERNAME.test(value.username) || usernames.has(value.username)
         || (value.kind !== "main" && value.kind !== "colleague") || (value.state !== "active" && value.state !== "archived")
@@ -187,6 +191,10 @@ export class WorkspaceAgentStore {
         : (value.agentId === owner.mainAgentId || value.username === "hara" || value.username === "main")) return invalid();
       if (value.legacy !== undefined && (!object(value.legacy) || !keys(value.legacy, ["importId", "sourceHash"])
         || !/^[a-f0-9]{64}$/.test(String(value.legacy.importId)) || !/^[a-f0-9]{64}$/.test(String(value.legacy.sourceHash)) || value.kind !== "colleague")) return invalid();
+      if ((value.archivedAt !== undefined || value.pausedScheduleCount !== undefined) && (value.state !== "archived"
+        || typeof value.archivedAt !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value.archivedAt)
+        || !Number.isFinite(Date.parse(value.archivedAt)) || !Number.isSafeInteger(value.pausedScheduleCount)
+        || Number(value.pausedScheduleCount) < 0 || Number(value.pausedScheduleCount) > 4096)) return invalid();
       const configurations = value.configurations.map(entry => parseConfiguration(entry, value.username as string));
       if (configurations.some((entry, index) => entry.revision !== index + 1)
         || value.currentConfigRevision !== configurations.length) return invalid();
@@ -220,6 +228,7 @@ export class WorkspaceAgentStore {
     const config = row.configurations[row.currentConfigRevision - 1]!;
     return { workspaceId: this.scope.workspaceId, agentId: row.agentId, username: row.username, kind: row.kind,
       state: row.state, agentEpoch: row.epoch, configRevision: config.revision, identity: structuredClone(config.identity),
+      ...(row.archivedAt ? { archivedAt: row.archivedAt, pausedScheduleCount: row.pausedScheduleCount ?? 0 } : {}),
       description: config.description, permissionTier: config.permissionTier ?? "full-protected", runtime: { ...runtimes.find(option => option.id === config.runtimeId)! },
       ...(row.kind === "main" ? { brand: "hara" as const } : {}) };
   }
@@ -352,13 +361,16 @@ export class WorkspaceAgentStore {
       this.appendConfiguration(row, { identity, description, instructions }, current.runtimeId, permissionTier);
     });
   }
-  setArchived(agentId: string, archived: boolean, configRevision: number, agentEpoch: number): WorkspaceAgentView {
-    if (typeof archived !== "boolean") throw new Error("invalid Workspace Agent lifecycle update");
+  setArchived(agentId: string, archived: boolean, configRevision: number, agentEpoch: number, pausedScheduleCount = 0): WorkspaceAgentView {
+    if (typeof archived !== "boolean" || !Number.isSafeInteger(pausedScheduleCount) || pausedScheduleCount < 0 || pausedScheduleCount > 4096)
+      throw new Error("invalid Workspace Agent lifecycle update");
     return this.update(agentId, configRevision, agentEpoch, (row, value) => {
       if (row.kind === "main") throw new Error("the Workspace main Hara cannot be archived or replaced");
       if ((row.state === "archived") === archived) throw new Error("Workspace Agent lifecycle already changed; refresh before editing");
       if (row.epoch >= Number.MAX_SAFE_INTEGER) throw new Error("Workspace Agent lifecycle epoch exhausted");
       row.state = archived ? "archived" : "active"; row.epoch++;
+      if (archived) { row.archivedAt = new Date().toISOString(); row.pausedScheduleCount = pausedScheduleCount; }
+      else { delete row.archivedAt; delete row.pausedScheduleCount; }
     });
   }
   /** Explicit owner importer, NOT an Agent/RPC method or ambient roles discovery. All sources are

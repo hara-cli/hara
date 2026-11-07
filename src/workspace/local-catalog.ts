@@ -112,6 +112,11 @@ export class LocalWorkspaceCatalog {
     });
     return next.workspaces.find(row => row.scope.workspaceId === workspaceId)!;
   }
+  rename(workspaceId: string, label: string, expectedRevision: number): void {
+    if (!text(label, 80)) throw new Error("invalid Workspace label");
+    this.update(expectedRevision, state => { const row = state.workspaces.find(row => row.scope.workspaceId === workspaceId && row.active);
+      if (!row) throw new Error("Workspace unavailable"); row.label = label; });
+  }
   select(workspaceId: string, expectedRevision: number): void {
     this.update(expectedRevision, state => {
       if (!state.workspaces.some(row => row.scope.workspaceId === workspaceId && row.active)) throw new Error("Workspace unavailable");

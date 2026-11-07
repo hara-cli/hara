@@ -97,3 +97,53 @@ test("a colleague cannot cancel another colleague's schedule; main Hara can", as
     assert(result && !result.isError); assert.equal(context.features.schedules().some(row => row.id === targetId), false);
   } finally { await host.close(); }
 });
+
+test("restoring a colleague does not run its chat schedule; an explicit enable rebinds only the unchanged owner", async () => {
+  const f = fixture(new EventEmitter(), false);
+  try {
+    const context = f.host.context(f.workspaceId), agents = context.resources.agents;
+    const agent = agents.create({ username: "scheduled", profile: { displayName: "Scheduled" }, runtimeId: "pi" }, agents.list().revision);
+    const id = context.features.createChatSchedule({ title: "Retained", task: "Summarize fixture", agentId: agent.agentId,
+      time: parseChatScheduleTime({ delay_seconds: 60 }, Date.now(), "UTC"),
+      anchor: { workspaceId: f.workspaceId, conversationId: "retained-session", messageId: randomUUID(), agentId: agent.agentId,
+        runtimeId: "pi", configRevision: agent.configRevision, agentEpoch: agent.agentEpoch, connection: context.connections.capture() } });
+    const deleted = await f.host.setAgentArchived(f.workspaceId, agent.agentId, true, agent.configRevision, agent.agentEpoch);
+    const restored = await f.host.setAgentArchived(f.workspaceId, agent.agentId, false, deleted.agent.configRevision, deleted.agent.agentEpoch);
+    assert.equal(context.features.schedules().find(row => row.id === id).enabled, false);
+    await f.host.tickSchedules(Date.now() + 70_000); assert.equal(f.host.workspaceFeatures(f.workspaceId).scheduler.runs.length, 0);
+    f.host.updateFeature(f.workspaceId, "schedule", id, true, context.features.list().revision);
+    assert.equal(context.features.schedules().find(row => row.id === id).definition.anchor.agentEpoch, restored.agent.agentEpoch);
+    await f.host.tickSchedules(Date.now() + 70_000);
+    assert(f.host.workspaceFeatures(f.workspaceId).scheduler.runs.some(row => row.scheduleId === id && row.state !== "unknown"));
+    const second = context.features.createChatSchedule({ title: "Changed", task: "Summarize fixture", agentId: agent.agentId,
+      time: parseChatScheduleTime({ delay_seconds: 60 }, Date.now(), "UTC"),
+      anchor: { workspaceId: f.workspaceId, conversationId: "retained-session", messageId: randomUUID(), agentId: agent.agentId,
+        runtimeId: "pi", configRevision: restored.agent.configRevision, agentEpoch: restored.agent.agentEpoch, connection: context.connections.capture() } });
+    const archivedAgain = await f.host.setAgentArchived(f.workspaceId, agent.agentId, true, restored.agent.configRevision, restored.agent.agentEpoch);
+    const restoredAgain = await f.host.setAgentArchived(f.workspaceId, agent.agentId, false, archivedAgain.agent.configRevision, archivedAgain.agent.agentEpoch);
+    agents.rename(agent.agentId, "Changed persona", restoredAgain.agent.configRevision, restoredAgain.agent.agentEpoch);
+    assert.throws(() => f.host.updateFeature(f.workspaceId, "schedule", second, true, context.features.list().revision), /configuration changed/);
+    assert.equal(context.features.schedules().find(row => row.id === second).enabled, false);
+  } finally { await f.host.close(); }
+});
+
+test("archive drains block a concurrent schedule create or enable only for that colleague", async () => {
+ const f=fixture(new EventEmitter(),false);let release,pending;
+ try{
+  const context=f.host.context(f.workspaceId),agents=context.resources.agents;
+  const target=agents.create({username:"draining",profile:{displayName:"Draining"},runtimeId:"pi"},agents.list().revision);
+  const input=agentId=>({id:randomUUID(),name:"Synthetic future schedule",task:"Summarize fixture",agentId,enabled:true,schedule:{kind:"once",runAt:Date.now()+3600000,display:"Future fixture"}});
+  const existing=input(target.agentId);f.host.saveSchedule(f.workspaceId,existing,context.features.list().revision,true);
+  f.host.selectAgent("client",f.workspaceId,target.agentId);
+  const started=f.host.start("client",f.workspaceId,target.agentId,"Summarize fixture",randomUUID()),job=f.host.jobs.get(started.runId);assert(job);
+  const drained=job.promise,gate=new Promise(resolve=>release=resolve);job.promise=Promise.all([drained,gate]).then(()=>{});
+  pending=f.host.setAgentArchived(f.workspaceId,target.agentId,true,target.configRevision,target.agentEpoch);
+  assert.equal(agents.get(target.agentId).state,"active");assert.equal(context.features.schedules().find(row=>row.id===existing.id).enabled,false);
+  assert.throws(()=>f.host.saveSchedule(f.workspaceId,input(target.agentId),context.features.list().revision,true),/lifecycle/);
+  assert.throws(()=>f.host.updateFeature(f.workspaceId,"schedule",existing.id,true,context.features.list().revision),/lifecycle/);
+  const other=input(f.agentId);f.host.saveSchedule(f.workspaceId,other,context.features.list().revision,true);
+  release();const deleted=await pending;await f.host.setAgentArchived(f.workspaceId,target.agentId,false,deleted.agent.configRevision,deleted.agent.agentEpoch);
+  assert(context.features.schedules().filter(row=>row.definition.agentId===target.agentId).every(row=>!row.enabled));
+  assert.equal(context.features.schedules().find(row=>row.id===other.id).enabled,true);
+ }finally{release?.();await pending?.catch(()=>{});await f.host.close();}
+});

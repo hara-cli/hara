@@ -9,18 +9,24 @@ import { sensitiveFileError } from "../security/sensitive-files.js";
 export const MAX_MEDIA_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_VIDEO_BYTES = 256 * 1024 * 1024, MAX_REGISTRATIONS = 512;
 const MIME: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
+  ".pdf": "application/pdf", ".zip": "application/zip", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".md": "text/markdown", ".txt": "text/plain",
   ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm" };
 interface Entry { id: string; path: string; root: string; rootInfo: Stats; info: Stats; mime: string }
 export interface WorkspaceMediaRegistration { id: string; mime: string; bytes: number }
 const inside = (root: string, path: string) => { const rel = relative(root, path); return !!rel && !isAbsolute(rel) && rel.split(sep).every(part => part !== ".." && part !== ""); };
 const sameFile = (a: Stats, b: Stats) => sameOpenedFileIdentity(a, b) && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
-const denied = () => new Error("Workspace media unavailable");
+export type WorkspaceMediaFailure = "outside" | "missing" | "failed";
+class WorkspaceMediaError extends Error { constructor(readonly kind: WorkspaceMediaFailure) { super("Workspace media unavailable"); } }
+const denied = (kind: WorkspaceMediaFailure = "outside") => new WorkspaceMediaError(kind);
 function matchesMime(bytes: Buffer, mime: string): boolean {
   if (mime === "image/png") return bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
   if (mime === "image/jpeg") return bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
   if (mime === "image/gif") return ["GIF87a", "GIF89a"].includes(bytes.subarray(0, 6).toString("ascii"));
   if (mime === "image/webp") return bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP";
   if (mime === "video/webm") return bytes.subarray(0, 4).equals(Buffer.from([26, 69, 223, 163]));
+  if (mime === "application/pdf") return bytes.subarray(0, 5).toString("ascii") === "%PDF-";
+  if (mime === "application/zip" || mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") return bytes[0] === 80 && bytes[1] === 75 && [[3, 4], [5, 6], [7, 8]].some(([a, b]) => bytes[2] === a && bytes[3] === b);
+  if (mime === "text/markdown" || mime === "text/plain") return !bytes.includes(0) && !/[\x00-\x08\x0b\x0c\x0e-\x1f]/u.test(bytes.toString("utf8"));
   const box = bytes.subarray(4, 8).toString("ascii");
   return mime === "video/quicktime" ? ["ftyp", "moov", "mdat", "wide"].includes(box) : mime === "video/mp4" && box === "ftyp";
 }
@@ -30,14 +36,18 @@ export class WorkspaceMediaRegistry {
   private readonly entries = new Map<string, Entry>();
   constructor(private readonly project: string, private readonly roots: () => readonly string[], private readonly assertCurrent: () => void) {}
   private checkedPath(input: string): { path: string; root: string; rootInfo: Stats } {
-    if (!input || input.length > 4096 || /[\x00-\x1f\x7f]/u.test(input)) throw denied();
+    if (!input || input.length > 4096 || /[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/u.test(input)) throw denied();
     let path = input;
     if (path.startsWith("file:")) { try { path = fileURLToPath(path); } catch { throw denied(); } }
+    if (/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/u.test(path)) throw denied();
     if (path.split(/[\\/]/u).some(part => part === "..") || /[?*<>|]/u.test(path)) throw denied();
     path = resolve(this.project, path);
     if (sensitiveFileError(path, "read") || path.split(sep).some(part => [".codex", ".claude", ".ssh", "Keychains"].includes(part))) throw denied();
     const roots = this.roots().filter(root => isAbsolute(root) && root !== resolve(sep));
+    let matched = false, missing = false;
     for (const candidate of roots.sort((a, b) => b.length - a.length)) {
+      if (!inside(resolve(candidate), path)) continue;
+      matched = true;
       try {
         const root = realpathSync.native(candidate), rootInfo = lstatSync(candidate);
         if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory() || !inside(root, path)) continue;
@@ -49,9 +59,12 @@ export class WorkspaceMediaRegistry {
         }
         if (realpathSync.native(path) !== path) throw denied();
         return { path, root, rootInfo };
-      } catch { /* A missing/replaced/root-escaping path is never an implicit grant. */ }
+      } catch (error) {
+        if (error instanceof WorkspaceMediaError) throw error;
+        if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") missing = true;
+      }
     }
-    throw denied();
+    throw denied(missing ? "missing" : matched ? "failed" : "outside");
   }
   private open(path: string, expected?: Entry) {
     this.assertCurrent(); const checked = this.checkedPath(path);
@@ -60,12 +73,12 @@ export class WorkspaceMediaRegistry {
     try {
       const info = fstatSync(fd), mime = MIME[extname(checked.path).toLowerCase()];
       verifyOpenedRegularFileSync(checked.path, info, { rejectHardLinks: true, protectSensitive: true });
-      if (!mime || !info.size || info.size > (mime.startsWith("video/") ? MAX_VIDEO_BYTES : MAX_MEDIA_RESPONSE_BYTES) || expected && !sameFile(info, expected.info)) throw denied();
+      if (!mime || !info.size || info.size > (mime.startsWith("video/") ? MAX_VIDEO_BYTES : MAX_MEDIA_RESPONSE_BYTES) || expected && !sameFile(info, expected.info)) throw denied("failed");
       const prefix = Buffer.alloc(Math.min(32, info.size)); readSync(fd, prefix, 0, prefix.length, 0);
-      if (!matchesMime(prefix, mime)) throw denied();
+      if (!matchesMime(prefix, mime)) throw denied("failed");
       this.assertCurrent();
       return { fd, ...checked, info, mime };
-    } catch { closeSync(fd); throw denied(); }
+    } catch (error) { closeSync(fd); throw error instanceof WorkspaceMediaError ? error : denied("failed"); }
   }
   register(input: string): WorkspaceMediaRegistration {
     const file = this.open(input);
@@ -78,6 +91,11 @@ export class WorkspaceMediaRegistry {
       } else { this.entries.delete(entry.id); this.entries.set(entry.id, entry); }
       return { id: entry.id, mime: entry.mime, bytes: entry.info.size };
     } finally { closeSync(file.fd); }
+  }
+  describe(input: string): { state: "ready"; media: WorkspaceMediaRegistration } | { state: WorkspaceMediaFailure } {
+    this.assertCurrent();
+    try { return { state: "ready", media: this.register(input) }; }
+    catch (error) { this.assertCurrent(); return { state: error instanceof WorkspaceMediaError ? error.kind : "failed" }; }
   }
   has(id: string) { return /^[a-f0-9]{64}$/u.test(id) && this.entries.has(id); }
   read(id: string, range?: string, head = false, pathOnly = false) {

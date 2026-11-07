@@ -137,6 +137,7 @@ export class LocalWorkspaceHost {
   readonly catalog: LocalWorkspaceCatalog;
   private readonly contexts = new Map<string, WorkspaceHostContext>();
   private readonly jobs = new Map<string, LocalJob>();
+  private readonly lifecycleChanges = new Set<string>();
   private readonly messageTimingEntries = new Map<string, MessageTimingEntry>();
   private readonly pending = new Map<string, PendingApproval>();
   private readonly extensionProposals = new Map<string, { clientId: string; workspaceId: string; generation: string; epoch: number; revision: number; expiresAt: number; change: ExtensionChange; catalogLock: string }>();
@@ -302,7 +303,7 @@ export class LocalWorkspaceHost {
     };
     context.scheduler = new WorkspaceScheduler(storage, context.features, {
       validateAnchor: chatAnchorReason,
-      available: agentId => !this.closing && !this.updateLease && Boolean(resources.agents.get(agentId)?.state === "active")
+      available: agentId => !this.closing && !this.updateLease && !this.lifecycleChanges.has(JSON.stringify([workspaceId, agentId])) && Boolean(resources.agents.get(agentId)?.state === "active")
         && ![...this.jobs.values()].some(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId),
       execute: async (agentId, task, requestId, row) => {
         if (chatAnchorReason(row)) return { runId: "", completed: false };
@@ -366,13 +367,13 @@ export class LocalWorkspaceHost {
     const current = this.context(workspaceId).storage.run(() => currentWorkspaceResourceBinding()!.generation);
     if (typeof generation !== "string" || generation !== current) throw new Error("Workspace resource generation changed; refresh before acting");
   }
-  registerMedia(workspaceId: string, path: string) {
+  registerMedia(workspaceId: string, path: string, describe = false) {
     const context = this.context(workspaceId);
     const generation = context.storage.run(() => currentWorkspaceResourceBinding()!.generation);
     context.media ??= new WorkspaceMediaRegistry(context.project, () => [context.project,
       ...new WorkspaceLegacyResources(context.storage).directoryReferencesForHost().filter(row => row.purposes.some(kind => kind === "project" || kind === "workspace-files")).map(row => row.path)],
     () => { if (this.closing || this.context(workspaceId) !== context) throw new Error("Workspace media unavailable"); this.assertGeneration(workspaceId, generation); });
-    return context.media.register(path);
+    return describe ? context.media.describe(path) : context.media.register(path);
   }
   readMedia(id: string, range?: string, head = false, pathOnly = false) {
     for (const context of this.contexts.values()) if (context.media?.has(id)) return context.media.read(id, range, head, pathOnly);
@@ -389,6 +390,11 @@ export class LocalWorkspaceHost {
     const row = this.catalog.create(label, expectedRevision), context = this.context(row.scope.workspaceId);
     context.resources.agents.initializeMain(); this.changed(row.scope.workspaceId);
     return this.snapshot(row.scope.workspaceId);
+  }
+  renameWorkspace(workspaceId: string, label: string, expectedRevision: number) {
+    if (this.closing || this.updateLease) throw new Error("Workspace is preparing to restart");
+    this.context(workspaceId).storage.run(() => this.catalog.rename(workspaceId, label, expectedRevision));
+    this.changed(workspaceId); return this.list();
   }
   select(clientId: string, workspaceId: string, expectedRevision: number, settingsOnly = false): void {
     if (settingsOnly) { if (this.catalog.read().revision !== expectedRevision) throw new Error("Workspace directory changed"); this.catalog.resolve(workspaceId); }
@@ -772,7 +778,8 @@ export class LocalWorkspaceHost {
     }).slice(-256);
   }
   saveSchedule(workspaceId: string, input: unknown, expected: number, approved: boolean) {
-    if (!approved || !plain(input) || typeof input.agentId !== "string" || !this.context(workspaceId).resources.agents.get(input.agentId)) throw new Error("Scheduled task requires a confirmed same-Workspace colleague");
+    if (!approved || !plain(input) || typeof input.agentId !== "string" || this.context(workspaceId).resources.agents.get(input.agentId)?.state !== "active") throw new Error("Scheduled task requires a confirmed active same-Workspace colleague");
+    if (this.lifecycleChanges.has(JSON.stringify([workspaceId, input.agentId]))) throw new Error("Colleague lifecycle is changing; scheduled tasks stay paused");
     this.context(workspaceId).features.saveSchedule(input, expected); this.changed(workspaceId); return this.workspaceFeatures(workspaceId);
   }
   deleteSchedule(workspaceId: string, id: string, expected: number, approved: boolean) {
@@ -801,9 +808,23 @@ export class LocalWorkspaceHost {
   }
   updateFeature(workspaceId: string, kind: unknown, id: unknown, enabled: unknown, expected: number, version?: unknown) {
     if (typeof id !== "string" || typeof enabled !== "boolean" || !["schedule", "skill"].includes(String(kind))) throw new Error("Invalid scoped feature change");
-    const features = this.context(workspaceId).features;
+    const context = this.context(workspaceId), features = context.features;
+    let restoredAgentEpoch: number | undefined;
+    if (kind === "schedule" && enabled) {
+      const schedule = features.schedules().find(row => row.id === id);
+      const agentId = schedule?.definition.agentId;
+      const owner = typeof agentId === "string" ? context.resources.agents.get(agentId) : null;
+      if (typeof agentId === "string" && this.lifecycleChanges.has(JSON.stringify([workspaceId, agentId]))) throw new Error("Colleague lifecycle is changing; scheduled tasks stay paused");
+      if (typeof agentId === "string" && owner?.state !== "active") throw new Error("Restore the deleted colleague before enabling a scheduled task");
+      const anchor = schedule?.source === "chat" && plain(schedule.definition.anchor) ? schedule.definition.anchor : null;
+      if (owner && anchor && anchor.agentEpoch !== owner.agentEpoch) {
+        if (anchor.configRevision !== owner.configRevision || anchor.runtimeId !== owner.runtime.id)
+          throw new Error("Scheduled colleague configuration changed; review and save the task before enabling");
+        context.connections.resolve(anchor.connection as ScopedRunConnection); restoredAgentEpoch = owner.agentEpoch;
+      }
+    }
     if (version !== undefined && (typeof version !== "string" || !/^[a-f0-9]{64}$/.test(version))) throw new Error("Invalid skill version");
-    if (kind === "skill") features.setSkillEnabled(id, enabled, expected, version as string | undefined); else features.setScheduleEnabled(id, enabled, expected);
+    if (kind === "skill") features.setSkillEnabled(id, enabled, expected, version as string | undefined); else features.setScheduleEnabled(id, enabled, expected, restoredAgentEpoch);
     this.changed(workspaceId); return features.list();
   }
   workspaceSkill(workspaceId: string, id: string) { return this.context(workspaceId).features.skillContent(id); }
@@ -839,6 +860,32 @@ export class LocalWorkspaceHost {
     const agent = this.context(workspaceId).resources.agents.setPermissionTier(agentId, tier, configRevision, agentEpoch);
     this.changed(workspaceId, agentId); return agent;
   }
+  async setAgentArchived(workspaceId: string, agentId: string, archived: boolean, configRevision: number, agentEpoch: number) {
+    if (typeof archived !== "boolean") throw new Error("Invalid colleague lifecycle update");
+    if (this.closing || this.updateLease) throw new Error("Workspace is preparing to restart; retry after reconnecting");
+    const key = JSON.stringify([workspaceId, agentId]);
+    if (this.lifecycleChanges.has(key)) throw new Error("Colleague lifecycle is changing; refresh after the attempt drains");
+    const context = this.context(workspaceId), current = context.resources.agents.get(agentId);
+    if (!current || current.configRevision !== configRevision || current.agentEpoch !== agentEpoch)
+      throw new Error("Workspace Agent changed; refresh the exact colleague before editing");
+    if (current.kind === "main") throw new Error("the Workspace main Hara cannot be archived or replaced");
+    if ((current.state === "archived") === archived) throw new Error("Workspace Agent lifecycle already changed; refresh before editing");
+    if (current.agentEpoch >= Number.MAX_SAFE_INTEGER) throw new Error("Workspace Agent lifecycle epoch exhausted");
+    const generation = context.storage.run(() => currentWorkspaceResourceBinding()!.generation);
+    this.lifecycleChanges.add(key);
+    try {
+      // Pause durably, cancel, then drain the exact colleague before changing its epoch. This lets
+      // attempt finalizers commit under the original frozen binding, including native tree cleanup.
+      const pausedSchedules = archived ? context.features.pauseAgentSchedules(agentId) : 0;
+      const jobs = archived ? [...this.jobs.values()].filter(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId) : [];
+      for (const job of jobs) this.cancel(workspaceId, agentId, job.id);
+      if (jobs.length) await Promise.all(jobs.map(job => job.promise));
+      if (this.closing || this.updateLease || this.context(workspaceId) !== context) throw new Error("Workspace view changed during colleague cleanup");
+      this.assertGeneration(workspaceId, generation);
+      const agent = context.resources.agents.setArchived(agentId, archived, configRevision, agentEpoch, pausedSchedules);
+      this.changed(workspaceId); return { agent, pausedSchedules };
+    } finally { this.lifecycleChanges.delete(key); }
+  }
   setAgentRuntime(workspaceId: string, agentId: string, runtimeId: AgentRuntimeId, configRevision: number, agentEpoch: number): WorkspaceAgentView {
     const agent = this.context(workspaceId).resources.agents.setRuntime(agentId, runtimeId, configRevision, agentEpoch);
     this.context(workspaceId).runtimeModels.warm(runtimeId);
@@ -866,6 +913,7 @@ export class LocalWorkspaceHost {
       connections, runtimes: context.runtimes.list(),
       accountUsage: this.runtimeUsageAccounts(workspaceId, context).map(account => ({ agentId: account.agentId,
         ...this.usageCache.read(account) })), conversation: { revision: value.revision, sessionId: value.sessionId,
+        updatedAt: value.attempt?.endedAt ?? value.attempt?.startedAt,
         state: live ? live.controller.signal.aborted ? "draining" : "running"
           : value.attempt?.state === "running" || value.attempt?.state === "draining" ? "needs_recovery"
           : this.pendingUserQuestion(context, value) ? "awaiting_user"
@@ -1304,6 +1352,7 @@ export class LocalWorkspaceHost {
     origin: WorkspaceRequestOrigin = { source: "host", channel: "internal", clientId }, channel?: { id: string; context: string }, questionId?: string,
     scheduledConnection?: ScopedRunConnection, timing?: { receivedAt: number; client?: MessageTimingInput }) {
     if (this.closing || this.updateLease || !messageBody(message) || !UUID.test(requestId)) throw new Error("invalid Workspace message or closing/updating Host");
+    if (this.lifecycleChanges.has(JSON.stringify([workspaceId, agentId]))) throw new Error("Colleague lifecycle is changing; no new attempt admitted");
     const messageTiming = new MessageTimingRecorder({ receivedAt: timing?.receivedAt, client: timing?.client });
     const context = this.context(workspaceId), agent = context.resources.agents.get(agentId);
     if (!agent || agent.state !== "active" || !context.resources.agents.runtimeOptions().some(row => row.id === agent.runtime.id && row.available))

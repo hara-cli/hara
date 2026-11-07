@@ -15,6 +15,11 @@ test("registered media HTTP requires authentication, current generation and an o
  const rpc=(method,params={})=>new Promise((resolve,reject)=>{const id=++serial;pending.set(id,{resolve,reject});socket.send(JSON.stringify({jsonrpc:"2.0",id,method,params}));});
  const init=await rpc("initialize",{token:handle.token});assert(init.capabilities.includes("workspace.media.v1"));const ws=await rpc("workspace.create",{label:"Media",expectedRevision:init.workspace.revision}),scope={workspaceId:ws.workspaceId,expectedGeneration:ws.resourceGeneration};
  const gif=Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==","base64");fs.writeFileSync(join(root,"project",ws.workspaceId,"test.gif"),gif);
+ assert(init.capabilities.includes("workspace.media.states.v1"));
+ assert.deepEqual(await rpc("workspace.media.describe",{...scope,path:"missing.gif"}),{state:"missing"});
+ assert.deepEqual(await rpc("workspace.media.describe",{...scope,path:"../outside.gif"}),{state:"outside"});
+ await assert.rejects(rpc("workspace.media.describe",{...scope,path:"test.gif",expectedGeneration:"stale"}),/generation/);
+ await assert.rejects(rpc("workspace.media.describe",{...scope,path:"test.gif",roots:[root]}),/unsupported/);
  const entry=await rpc("workspace.media.register",{...scope,path:"test.gif"});assert.equal(entry.mime,"image/gif");assert.equal(JSON.stringify(entry).includes(root),false);
  await assert.rejects(rpc("workspace.media.register",{...scope,expectedGeneration:"stale",path:"test.gif"}),/generation changed/);
  await assert.rejects(rpc("workspace.media.register",{...scope,path:"test.gif",roots:[root]}),/unsupported/);
@@ -27,5 +32,6 @@ test("registered media HTTP requires authentication, current generation and an o
  assert.equal((await fetch(base+"a".repeat(64),{headers})).status,404);
  assert.equal((await fetch(base+entry.id,{headers,method:"HEAD"})).headers.get("Content-Length"),String(gif.length));
  const location=await fetch(base+entry.id+"/path",{headers});assert.deepEqual(await location.json(),{path:join(root,"project",ws.workspaceId,"test.gif")});
+ assert.deepEqual(await rpc("workspace.media.describe",{...scope,path:"test.gif"}),{state:"ready",media:entry});
  fs.renameSync(join(root,"project",ws.workspaceId,"test.gif"),join(root,"project",ws.workspaceId,"moved.gif"));assert.equal((await fetch(base+entry.id,{headers})).status,404);
 });

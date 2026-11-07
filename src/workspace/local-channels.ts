@@ -11,7 +11,7 @@ import { redactSensitiveText } from "../security/secrets.js";
 import { channelRoleUnrelated, type ChannelPrefilterProfile } from "./channel-prefilter.js";
 import { readChannelAutonomy, parseChannelAutonomyUpdate, assertChannelAutonomyProductionDispatch, type ChannelAutonomyPolicy } from "./channel-autonomy.js";
 
-export interface LocalChannel { id: string; name: string; memberIds: string[]; createdAt: string; autonomy?: ChannelAutonomyPolicy }
+export interface LocalChannel { id: string; name: string; memberIds: string[]; createdAt: string; autonomy?: ChannelAutonomyPolicy; lastMessageAt?: string; preview?: string; messageCount?: number; activityAvailable?: boolean }
 interface Catalog { schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; channels: LocalChannel[] }
 type ReplyState = "queued" | "running" | "completed" | "cancelled" | "failed" | "interrupted" | "passed";
 interface Reply {
@@ -92,15 +92,25 @@ export class WorkspaceLocalChannels {
   private accepting() { return !this.closed && this.host.accepting(); }
   private clientKey(channelId: string, turnId: string) { return channelId + ":" + turnId; }
   private view(channel: LocalChannel): LocalChannel { return { ...channel, autonomy: readChannelAutonomy(channel.autonomy, channel.memberIds) }; }
-  list() { const value = this.catalog.read(); return { revision: value.revision, channels: value.channels.map(channel => this.view(channel)) }; }
+  list() {
+    const value = this.catalog.read();
+    return { revision: value.revision, channels: value.channels.map(channel => {
+      try {
+        const messages = this.snapshot(channel.id).messages.filter(row => row.message.role !== "tool"), last = messages.at(-1);
+        const preview = last?.message.role === "assistant" ? last.message.text : last?.message.role === "user" ? last.message.content : "";
+        return { ...this.view(channel), messageCount: messages.length, activityAvailable: true,
+          ...(last ? { lastMessageAt: last.createdAt, preview: redactSensitiveText(preview).text.replace(/\s+/gu, " ").slice(0, 160) } : {}) };
+      } catch { return { ...this.view(channel), activityAvailable: false }; }
+    }) };
+  }
   get(channelId: string): LocalChannel {
     if (!UUID.test(channelId)) throw new Error("invalid local channel identity");
     const row = this.catalog.read().channels.find(row => row.id === channelId);
     if (!row) throw new Error("local channel is not in this Workspace");
     return this.view(row);
   }
-  private members(memberIds: unknown, roster = this.host.agents()): asserts memberIds is string[] {
-    if (!ids(memberIds) || memberIds.some(id => !roster.some(agent => agent.agentId === id && agent.kind === "colleague" && agent.state === "active")))
+  private members(memberIds: unknown, roster = this.host.agents(), retained: readonly string[] = []): asserts memberIds is string[] {
+    if (!ids(memberIds) || memberIds.some(id => !roster.some(agent => agent.agentId === id && agent.kind === "colleague" && (agent.state === "active" || agent.state === "archived" && retained.includes(id)))))
       throw new Error("channel members must be active colleagues in this Workspace");
   }
   create(id: string, name: string, memberIds: unknown, expectedRevision: number) {
@@ -116,7 +126,7 @@ export class WorkspaceLocalChannels {
   }
   update(channelId: string, name: string, memberIds: unknown, expectedRevision: number, autonomy?: unknown) {
     if (!this.accepting() || !text(name, 80)) throw new Error("channel is not accepting changes or name is invalid");
-    const channel = this.get(channelId), active = this.active.get(channelId); this.members(memberIds);
+    const channel = this.get(channelId), active = this.active.get(channelId); this.members(memberIds, this.host.agents(), channel.memberIds);
     if (active && (autonomy === undefined || name !== channel.name || canonical(memberIds) !== canonical(channel.memberIds)))
       throw new Error("channel is busy; only autonomy settings may change while colleagues are replying");
     const policy = autonomy === undefined
