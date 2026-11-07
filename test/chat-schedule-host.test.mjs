@@ -186,3 +186,15 @@ test("archive cleanup deadline releases the fence, restores schedules and never 
   release();await job.promise;const retry=await f.host.setAgentArchived(f.workspaceId,target.agentId,true,target.configRevision,target.agentEpoch);assert.equal(retry.agent.state,"archived");
  }finally{t.mock.timers.reset();release?.();await pending?.catch(()=>{});await f.host.close();}
 });
+
+test("configuration remains fenced for an aborted job after the lifecycle action releases its lock",async()=>{
+ const f=fixture(new EventEmitter(),false);
+ try{
+  const context=f.host.context(f.workspaceId),agents=context.resources.agents,target=agents.create({username:"aborting",profile:{displayName:"Aborting"},runtimeId:"pi"},agents.list().revision);
+  f.host.selectAgent("client",f.workspaceId,target.agentId);const started=f.host.start("client",f.workspaceId,target.agentId,"Summarize fixture",randomUUID()),job=f.host.jobs.get(started.runId);
+  f.host.cancel(f.workspaceId,target.agentId,started.runId);assert(job.signal.aborted);assert(!f.host.lifecycleChanges.has(JSON.stringify([f.workspaceId,target.agentId])));
+  assert.throws(()=>f.host.setAgentRuntime(f.workspaceId,target.agentId,"pi",target.configRevision,target.agentEpoch),/draining/);
+  assert.throws(()=>f.host.updateAgentPersona(f.workspaceId,target.agentId,{profile:{displayName:"Must wait"}},target.configRevision,target.agentEpoch),/draining/);
+  await job.promise;assert.equal(f.host.updateAgentPersona(f.workspaceId,target.agentId,{profile:{displayName:"After cleanup"}},target.configRevision,target.agentEpoch).identity.displayName,"After cleanup");
+ }finally{await f.host.close();}
+});

@@ -674,7 +674,7 @@ export class LocalWorkspaceHost {
    */
   async applyRuntimeForm(workspaceId: string, input: { agentId: string; runtimeId: AgentRuntimeId; configRevision: number; agentEpoch: number;
     confirm?: { fingerprint: string; loginSource: RuntimeLoginSource }; model?: { modelId: unknown; expectedRevision: unknown; effort?: unknown } }) {
-    this.assertAgentLifecycleWritable(workspaceId, input.agentId);
+    this.assertAgentConfigurationWritable(workspaceId, input.agentId);
     const context = this.context(workspaceId), agents = context.resources.agents;
     const agent = agents.list().agents.find(row => row.agentId === input.agentId);
     if (!agent || agent.state !== "active") throw new Error("Colleague unavailable");
@@ -696,7 +696,7 @@ export class LocalWorkspaceHost {
     if (!option || input.runtimeId === "hara" || !option.selectable) throw new Error("Engine cannot be selected");
     if (input.model && form) await context.runtimeModels.checkSelection(input.runtimeId as OptionalRuntimeId, input.model.modelId, input.model.expectedRevision,
       input.model.effort, form.models, form.modelSource === "live" || form.modelSource === "official");
-    this.assertAgentLifecycleWritable(workspaceId, input.agentId);
+    this.assertAgentConfigurationWritable(workspaceId, input.agentId);
     const latest = agents.get(input.agentId);
     if (!latest || latest.state !== "active" || latest.configRevision !== input.configRevision || latest.agentEpoch !== input.agentEpoch) throw new Error("Colleague settings changed; refresh before applying");
     const applied: ("confirm" | "runtime" | "model")[] = [];
@@ -872,7 +872,7 @@ export class LocalWorkspaceHost {
     if (this.options.usageCollector) void this.refreshRuntimeUsage(workspaceId, this.context(workspaceId));
   }
   setAgentPermissionTier(workspaceId: string, agentId: string, tier: RuntimePermissionTier, configRevision: number, agentEpoch: number): WorkspaceAgentView {
-    this.assertAgentLifecycleWritable(workspaceId, agentId);
+    this.assertAgentConfigurationWritable(workspaceId, agentId);
     if (!isRuntimePermissionTier(tier)) throw new Error("Invalid runtime permission tier");
     if (this.closing || this.updateLease || [...this.jobs.values()].some(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId)) {
       throw new Error("Colleague is running or draining; change permissions after the attempt ends");
@@ -882,6 +882,11 @@ export class LocalWorkspaceHost {
   }
   private assertAgentLifecycleWritable(workspaceId: string, agentId: string) {
     if (this.lifecycleChanges.has(JSON.stringify([workspaceId, agentId]))) throw new Error("Colleague lifecycle is changing; wait for task cleanup before editing");
+  }
+  private assertAgentConfigurationWritable(workspaceId: string, agentId: string) {
+    this.assertAgentLifecycleWritable(workspaceId, agentId);
+    if ([...this.jobs.values()].some(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId && job.signal.aborted))
+      throw new Error("Colleague is still draining; wait for cleanup before editing");
   }
   agentArchiveStatus(workspaceId: string, agentId: string, configRevision: number, agentEpoch: number) {
     this.assertAgentLifecycleWritable(workspaceId, agentId);
@@ -939,14 +944,14 @@ export class LocalWorkspaceHost {
     } finally { this.lifecycleChanges.delete(key); }
   }
   setAgentRuntime(workspaceId: string, agentId: string, runtimeId: AgentRuntimeId, configRevision: number, agentEpoch: number): WorkspaceAgentView {
-    this.assertAgentLifecycleWritable(workspaceId, agentId);
+    this.assertAgentConfigurationWritable(workspaceId, agentId);
     const agent = this.context(workspaceId).resources.agents.setRuntime(agentId, runtimeId, configRevision, agentEpoch);
     this.context(workspaceId).runtimeModels.warm(runtimeId);
     this.changed(workspaceId, agentId);
     return agent;
   }
   updateAgentPersona(workspaceId: string, agentId: string, input: WorkspaceAgentPersonaInput, configRevision: number, agentEpoch: number): WorkspaceAgentView {
-    this.assertAgentLifecycleWritable(workspaceId, agentId);
+    this.assertAgentConfigurationWritable(workspaceId, agentId);
     const agents = this.context(workspaceId).resources.agents;
     const current = agents.currentPersona(agentId);
     const agent = agents.updatePersona(agentId, { ...current, profile: { ...current.profile, ...input.profile } }, configRevision, agentEpoch);
@@ -1354,7 +1359,7 @@ export class LocalWorkspaceHost {
         assertCurrent();
         const current = job.context.resources.agents.get(input.agentId);
         if (!current || current.kind !== "colleague" || current.state !== "active") throw new Error("rename needs an active colleague of THIS Workspace by exact agentId");
-        host.assertAgentLifecycleWritable(job.workspaceId, current.agentId);
+        host.assertAgentConfigurationWritable(job.workspaceId, current.agentId);
         const renamed = job.context.resources.agents.rename(current.agentId, input.displayName, current.configRevision, current.agentEpoch);
         host.changed(job.workspaceId, job.agentId);
         return JSON.stringify({ renamed: true, agentId: renamed.agentId, previousName: current.identity.displayName, displayName: renamed.identity.displayName });
