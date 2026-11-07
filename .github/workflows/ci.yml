@@ -113,14 +113,15 @@ jobs:
     # Native Intel candidate-equivalent full coverage at the original deadlines.
     # Windows candidate coverage explicitly uses windows-runtime's shared contract subset.
     # Full output must survive a failure; a tail alone cannot identify the first failed fixture.
-    # The strict suite keeps 35m after the former 25m cap on main 8357c14
-    # (run 40898728754); standalone Intel budgets its later compilation and smokes separately.
+    # The strict suite had 35m after the former 25m cap on main 8357c14 (run 40898728754); at ~34m it
+    # reached that cap as the suite grew, so it keeps 45m. Per-file deadlines stay at the original 120s.
+    # Standalone Intel budgets its later compilation and smokes separately.
     strategy:
       fail-fast: false
       matrix:
         os: [macos-15-intel]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 35
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
