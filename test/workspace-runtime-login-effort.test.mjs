@@ -15,6 +15,7 @@ import { SYNTHETIC_CONNECTION } from "../dist/workspace/synthetic-provider.js";
 import { runExternalCommandCapture } from "../dist/external-sessions/process.js";
 import { registeredCliArgs } from "../dist/agent-runtime/registered-cli.js";
 import { writeFakeCodex } from "./helpers/workspace-cli-mcp.mjs";
+import { DEFAULT_TIER, FULL_TIER_SKIP, SEATBELT } from "./helpers/platform-tier.mjs";
 
 const roots = [];
 after(() => roots.forEach(root => fs.rmSync(root, { recursive: true, force: true })));
@@ -327,6 +328,6 @@ for (const scenario of [
     assert.equal(thread.params.model, "gpt-5.6-sol", "selected model reaches the native thread");
     assert.equal(thread.params.config.model_reasoning_effort, scenario.actual, "selected effort reaches the native thread");
     assert.equal(turn.params.model, "gpt-5.6-sol"); assert.equal(turn.params.effort, scenario.actual);
-    assert.equal(thread.params.sandbox, "danger-full-access"); assert.equal(thread.params.approvalPolicy, "never");
+    assert.equal(thread.params.sandbox, SEATBELT ? "danger-full-access" : "read-only"); assert.equal(thread.params.approvalPolicy, "never");
   } finally { const closed = once(socket, "close"); socket.close(); await closed; await handle.close(); }
 });

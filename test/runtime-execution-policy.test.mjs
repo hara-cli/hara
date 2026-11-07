@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { runExternalCommandCapture } from "../dist/external-sessions/process.js";
 import { createRuntimeExecutionPolicy, runtimeExecutionPolicyKey } from "../dist/agent-runtime/execution-policy.js";
+import { DEFAULT_TIER, FULL_TIER_SKIP, SEATBELT } from "./helpers/platform-tier.mjs";
 
 function fixture(t) {
   const root=fs.realpathSync(fs.mkdtempSync(join(tmpdir(),"runtime-policy-"))),home=join(root,"account"),work=join(root,"work");
@@ -14,7 +15,7 @@ function fixture(t) {
   fs.writeFileSync(join(home,".codex/auth.json"),"FAKE_CODEX_LOGIN");fs.writeFileSync(join(home,".claude/.credentials.json"),"FAKE_CLAUDE_LOGIN");
   fs.writeFileSync(join(home,".hara/serve-v2.json"),"FAKE_HARA_RPC");fs.writeFileSync(join(home,"Library/Keychains/login.keychain-db"),"PLAIN_FIXTURE_NOT_A_KEYCHAIN");
   t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
-  return{root,home,work,policy(tier="full-protected",runtimeId="codex") {const p=createRuntimeExecutionPolicy({runtimeId,tier,accountHome:home,workRoot:work});t.after(()=>p.close());return p;}};
+  return{root,home,work,policy(tier="full-protected",runtimeId="codex",options={}) {const p=createRuntimeExecutionPolicy({runtimeId,tier,accountHome:home,workRoot:work},options);t.after(()=>p.close());return p;}};
 }
 async function execute(p,code,env={}) {
  const launch=p.wrap({command:process.execPath,args:["-e",code],env:{...process.env,...env}});
@@ -42,8 +43,9 @@ test("a directory symlink cannot grant writes outside the working root and linke
   assert.equal(out.status,0,out.stderr);assert.match(out.stdout,/denied/);
   fs.symlinkSync(f.work,join(f.root,"alias"));assert.throws(()=>runtimeExecutionPolicyKey({runtimeId:"codex",tier:"full-protected",workRoot:join(f.root,"alias"),accountHome:f.home}),/symbolic link/);
 });
+// Evidence collection never spawns; the macOS seam exercises it on every platform.
 test("native diff evidence needs actual complete changes; a native event or prose alone is insufficient",t=>{
-  const f=fixture(t),p=f.policy();assert.equal(p.collectWorkspaceEvidence(),null);
+  const f=fixture(t),p=f.policy("full-protected","codex",{platform:"darwin"});assert.equal(p.collectWorkspaceEvidence(),null);
   p.observeNativeEvent({type:"file",status:"completed",path:"invented.txt",operation:"write"});assert.equal(p.collectWorkspaceEvidence(),null);
   fs.writeFileSync(join(f.work,"actual.txt"),"actual");const e=p.collectWorkspaceEvidence();assert.equal(e.verified,true);assert.equal(e.changes.length,1);assert.equal(e.changes[0].path,"actual.txt");
   assert.equal(p.collectWorkspaceEvidence().id,e.id);p.beginAttempt("next-attempt");assert.equal(p.collectWorkspaceEvidence(),null);

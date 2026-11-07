@@ -5,6 +5,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { createWorkspaceMcpEndpoint, WORKSPACE_MCP_TOKEN_ENV } from "../dist/agent-runtime/registered-cli-mcp.js";
 import { registeredCliArgs } from "../dist/agent-runtime/registered-cli.js";
+import { DEFAULT_TIER, FULL_TIER_SKIP, SEATBELT } from "./helpers/platform-tier.mjs";
 
 test("per-attempt MCP binds loopback, rejects wrong/cross-attempt tokens and origins, and expires on close", async t => {
   const a = new AbortController(), b = new AbortController(); let current = true, calls = 0;
@@ -51,7 +52,7 @@ test("per-attempt MCP binds loopback, rejects wrong/cross-attempt tokens and ori
 test("native CLI bridge keeps token values out of argv and trusts only the hara server", () => {
   const common = { prompt: "fixture", cwd: "/fixture", model: null, effort: null, skipGitRepoCheck: true,
     mcp: { url: "http://127.0.0.1:1234/mcp", timeoutMs: 120000 } };
-  const codex = registeredCliArgs({ id: "codex", ...common });
+  const codex = registeredCliArgs({ id: "codex", ...common, osWriteSandbox: true });
   // The reviewed outer Seatbelt owns confinement; nested Codex Seatbelt is disabled.
   assert(codex.includes("--dangerously-bypass-approvals-and-sandbox"));
   assert(codex.includes('approval_policy="never"'));

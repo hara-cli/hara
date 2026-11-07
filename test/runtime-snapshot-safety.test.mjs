@@ -18,7 +18,8 @@ function fixture(t) {
     fs.rmSync(root, { recursive: true, force: true });
   });
   return { root, work, home, outside, policy(tier = "full-protected") {
-    const policy = createRuntimeExecutionPolicy({ runtimeId: "codex", tier, accountHome: home, workRoot: work, lifetime: "resident" });
+    // Snapshot/evidence logic is platform-neutral and never spawns here; the macOS seam keeps it covered off macOS.
+    const policy = createRuntimeExecutionPolicy({ runtimeId: "codex", tier, accountHome: home, workRoot: work, lifetime: "resident" }, { platform: "darwin" });
     policies.push(policy); return policy;
   } };
 }

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { registeredCliArgs } from "../dist/agent-runtime/registered-cli.js";
+import { DEFAULT_TIER, FULL_TIER_SKIP, SEATBELT } from "./helpers/platform-tier.mjs";
 
 const common = { id: "claude", prompt: "probe", cwd: "/fixture", model: "sonnet", effort: "high", skipGitRepoCheck: false,
   mcp: { url: "http://127.0.0.1:1234/mcp", timeoutMs: 120000 } };
@@ -32,7 +33,7 @@ test("legacy arguments without a frozen tier remain plan", () => {
 test("custom providers and native host login share a customization boundary without changing Codex", () => {
   const args = registeredCliArgs({ ...common, claudePermissionMode: "bypassPermissions", claudeCustomProvider: true });
   assert.equal(args[args.indexOf("--setting-sources") + 1], "project,local");
-  const codex = registeredCliArgs({ ...common, id: "codex", claudePermissionMode: "bypassPermissions", claudeCustomProvider: true });
+  const codex = registeredCliArgs({ ...common, id: "codex", claudePermissionMode: "bypassPermissions", claudeCustomProvider: true, osWriteSandbox: true });
   assert(codex.includes("--dangerously-bypass-approvals-and-sandbox"));
   assert(!codex.includes("bypassPermissions") && !codex.includes("--setting-sources"));
 });

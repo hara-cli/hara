@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import {cliMcpFixture,until,waitForNativeRetryWindow} from "./helpers/workspace-cli-mcp.mjs";
+import { DEFAULT_TIER, FULL_TIER_SKIP, SEATBELT } from "./helpers/platform-tier.mjs";
 const done=v=>["completed","blocked","paused","cancelled"].includes(v.conversation.state);
 const cold=v=>v.conversation.runtimeStages.at(-1).events.some(e=>e.kind==="cold_start");
 async function exchange(f,text){await f.send(text);return until(f.read,done);}
@@ -23,7 +24,7 @@ test("initialized launcher child stays warm across fresh permits with one native
  assert.equal(turns.length,3);assert.doesNotMatch(turns[1].params.input[0].text,/WARM-FIRST/);assert.doesNotMatch(turns[2].params.input[0].text,/WARM-FIRST|WARM-SECOND/);
 });
 
-test("launcher resident still recycles on frozen tier change and failed native process without replay",async t=>{
+test("launcher resident still recycles on frozen tier change and failed native process without replay",{skip:FULL_TIER_SKIP},async t=>{
  const f=await cliMcpFixture(t,"list",{launcher:true});
  assert.equal((await exchange(f,"List current colleagues?")).conversation.state,"completed");const first=f.meta();
  const v=await f.read(),a=v.agents.find(r=>r.agentId===f.main.agentId);

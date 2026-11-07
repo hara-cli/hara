@@ -11,6 +11,7 @@ import { WorkspaceResourceStorage,workspaceStateHome } from "../dist/workspace/r
 import { WorkspaceLegacyMemoryImport } from "../dist/workspace/legacy-memory.js";
 import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
 import { piWorkspaceToolName } from "../dist/agent-runtime/pi-native-tools.js";
+import { DEFAULT_TIER, FULL_TIER_SKIP, SEATBELT } from "./helpers/platform-tier.mjs";
 test("memory search projects bounded sanitized text, never source paths or extra result fields",async()=>{let checks=0;const tool=workspaceMemorySearchTool(async()=>Array.from({length:5},()=>({title:"Memo",snippet:'"'.repeat(20000),path:"/must-not-return",permission:"must-not-return"})),()=>checks++);const result=await tool.run({query:"memo"},{});assert(result.length<7800);assert.equal(checks,2);assert.equal(result.includes("must-not-return"),false);assert.equal(JSON.parse(result).historicalContextOnly,true);});
 test("memory query and revocation gates run before any lookup and again after await",async()=>{let calls=0;const tool=workspaceMemorySearchTool(async()=>{calls++;return[];},()=>{throw Error("revoked");});await assert.rejects(tool.run({query:"hello"},{}),/revoked/);assert.equal(calls,0);await assert.rejects(tool.run({query:"hello",path:"/"},{}),/Invalid/);let checks=0;await assert.rejects(workspaceMemorySearchTool(async()=>[],()=>{if(++checks===2)throw Error("revoked after lookup");}).run({query:"hello"},{}),/after lookup/);});
 test("an explicit old allow-list does not gain memory tools unless it already allowed memory_search",()=>{assert.equal(legacyPolicyAllowsTool({allow:["read_file"],deny:[],owns:[],readOnly:true},"workspace_memory_search","read"),false);assert.equal(legacyPolicyAllowsTool({allow:["memory_search"],deny:[],owns:[],readOnly:true},"workspace_memory_search","read"),true);});
@@ -30,7 +31,7 @@ test("actual Pi Host receives only matching inherited memory; greetings and anot
   assert.match(turns[1].system,/confirm the reporting period/,"the matching current question receives its note");
   assert.equal(turns[2].system.includes("confirm the reporting period"),false);
   assert.equal(turns[3].system.includes("confirm the reporting period"),false,"another Workspace cannot receive the matched note");
-  assert(turns[1].tools.some(tool=>tool.name===piWorkspaceToolName("workspace_memory_search")));
+  assert(turns[1].tools.some(tool=>tool.name===(SEATBELT?piWorkspaceToolName("workspace_memory_search"):"workspace_memory_search")));
   // The existing governed environment intentionally includes the authorized fixture project cwd.
   // The new memory projection must not expose its distinct private state namespace/file paths.
   const privateMemoryRoot=storage.run(()=>join(workspaceStateHome(),".hara/memory"));

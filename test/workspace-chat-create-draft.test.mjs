@@ -9,6 +9,7 @@ import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
 import { workspaceOperationSkill } from "../dist/workspace/operation-cards.js";
 import { SYNTHETIC_CONNECTION } from "../dist/workspace/synthetic-provider.js";
 import { planLegacyResources, WorkspaceLegacyResources } from "../dist/workspace/legacy-resources.js";
+import { DEFAULT_TIER, FULL_TIER_SKIP, SEATBELT } from "./helpers/platform-tier.mjs";
 
 async function fixture(t, count = 20, proposal = {
   username: "video-helper", displayName: "Video Helper", title: "Video project", instructions: "Manage video work." }) {
@@ -50,7 +51,7 @@ test("one model call reaches an editable scoped card with 20 long-bio colleagues
   const f = await fixture(t), started = Date.now(), { run, card } = await cardFor(f);
   t.diagnostic(`model calls to card=${f.calls()}, elapsedMs=${Date.now() - started}`);
   assert.equal(f.calls(), 1); assert.equal(card.kind, "agent_create");
-  assert.equal(card.draft.runtimeId, "pi"); assert.equal(card.draft.permissionTier, "full-protected");
+  assert.equal(card.draft.runtimeId, "pi"); assert.equal(card.draft.permissionTier, DEFAULT_TIER);
   assert(card.projectOptions.some(option => option.endsWith(": /known/video")));
   assert(card.projectOptions.some(option => option.endsWith(": /known/design")));
   const pending = f.host.snapshot(f.id, f.main, "client");

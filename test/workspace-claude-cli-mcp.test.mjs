@@ -3,6 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { claudeCliMcpFixture as cliMcpFixture, until } from "./helpers/claude-cli-mcp.mjs";
+import { DEFAULT_TIER, FULL_TIER_SKIP, SEATBELT } from "./helpers/platform-tier.mjs";
 
 const done = view => ["completed", "blocked", "paused", "cancelled"].includes(view.conversation.state);
 async function closed(url) { await until(async () => { try { await fetch(url); return false; } catch { return true; } }, Boolean); }
@@ -15,7 +16,7 @@ test("main Hara Claude uses host home, alias, effort and scoped MCP through sess
   assert.equal(meta.home, join(f.root, "account")); assert.equal(meta.userProfile, meta.home);
   assert.equal(meta.privateClaudeConfig, null);
   assert.equal(meta.model, "sonnet"); assert.equal(meta.effort, "high");
-  assert(meta.full && !meta.plan && meta.strict && meta.haraOnly);
+  assert((SEATBELT ? meta.full && !meta.plan : meta.plan && !meta.full) && meta.strict && meta.haraOnly);
   assert.equal(meta.tokenInArgv, false); assert.equal(meta.tokenPresent, true);
   assert(meta.tools.includes("agent_create") && meta.tools.includes("agent_list"));
   assert.equal(meta.tools.includes("bash"), false);

@@ -17,6 +17,7 @@ import { createWorkspaceRunPermit, bindWorkspaceRunOptions, closeWorkspaceRunPer
 import { AgentRuntimeRegistry } from "../dist/agent-runtime/registry.js";
 import { runConfiguredAgent } from "../dist/agent-runtime/dispatch.js";
 import { finishTaskExecution, createTaskExecution } from "../dist/session/task.js";
+import { SEATBELT } from "./helpers/platform-tier.mjs";
 
 const roots = [];
 function root() { const path = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-cli-driver-"))); roots.push(path); return path; }
@@ -146,7 +147,9 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
     assert.equal(versionStatus.lastSuccessfulVersion, expectedFailure ? null : "1.2.3");
     assert.equal(versionStatus.compatibility, expectedFailure ? "unverified" : "previously_succeeded");
     const args = fs.readFileSync(argv, "utf8");
-    assert.match(args, runtimeId === "codex" ? /danger-full-access/ : /bypassPermissions/);
+    // Decision B: inside Seatbelt the outer boundary governs; elsewhere the native read-only/plan mode does.
+    assert.match(args, runtimeId === "codex" ? (SEATBELT ? /danger-full-access/ : /read-only/) : (SEATBELT ? /bypassPermissions/ : /plan/));
+    if (!SEATBELT) assert.doesNotMatch(args, /danger-full-access|dangerously-bypass|bypassPermissions/);
     assert.equal(args.includes("--skip-git-repo-check"), false, "S3 uses an admitted thread cwd, without an exec trust-check flag");
     assert.equal(fs.existsSync(join(project, ".git")), hasGit);
     const privateEnv = installer.resolveBound(runtimeId).env;
@@ -156,7 +159,7 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
       assert.throws(() => installer.codexLoginInstructions(), /reuses the host login/);
     }
     assert.ok(args.includes(modelId), "native launch uses the existing Workspace runtime model selection");
-    assert.ok(args.includes(runtimeId === "codex" ? "danger-full-access" : "bypassPermissions"));
+    assert.ok(args.includes(runtimeId === "codex" ? (SEATBELT ? "danger-full-access" : "read-only") : (SEATBELT ? "bypassPermissions" : "plan")));
     fs.appendFileSync(command, "# changed after registration\n");
     assert.equal(resources.agents.runtimeOptions().find(option => option.id === runtimeId).available, false);
     assert.equal(installer.list().options.find(option => option.runtimeId === runtimeId).state, "integrity_failed");
@@ -164,13 +167,14 @@ for (const [runtimeId, managed, failure, hasGit = false] of [["codex", false, nu
   } finally { await closeWorkspaceRunPermit(permit); await installer.close(); }
 });
 
+// Seatbelt-wrapped launch arguments; the unprotected (non-macOS) arguments are asserted in runtime-platform-tiers.
 test("native args keep model/effort choices while the outer policy owns both permission tiers", async () => {
   const { registeredCliArgs } = await import("../dist/agent-runtime/registered-cli.js");
   for (const permissionTier of ["controlled", "full-protected"]) {
-    const codex = registeredCliArgs({ id: "codex", permissionTier, prompt: "hi", cwd: "/fixture/project", model: "gpt-5.6-sol", effort: "xhigh", skipGitRepoCheck: true });
+    const codex = registeredCliArgs({ id: "codex", permissionTier, prompt: "hi", cwd: "/fixture/project", model: "gpt-5.6-sol", effort: "xhigh", skipGitRepoCheck: true, osWriteSandbox: true });
     assert.ok(codex.includes('model_reasoning_effort="xhigh"')); assert.ok(codex.includes("gpt-5.6-sol")); assert.ok(codex.includes("--dangerously-bypass-approvals-and-sandbox")); assert.equal(codex.includes("--sandbox"),false);
     const claude = registeredCliArgs({ id: "claude", permissionTier, claudeStreamJson: true, prompt: "hi", cwd: "/fixture/project", model: "claude-sonnet-4-5", effort: "high", skipGitRepoCheck: false });
     assert.ok(claude.includes("claude-sonnet-4-5")); assert.ok(claude.includes("high")); assert.ok(claude.includes(permissionTier === "controlled" ? "plan" : "bypassPermissions")); assert.ok(claude.includes("stream-json")); assert.ok(claude.includes("Cron*")); assert.ok(claude.includes("project,local"));
   }
-  const bare = registeredCliArgs({ id: "codex", prompt: "hi", cwd: "/fixture/project", model: null, effort: null, skipGitRepoCheck: false }); assert(!bare.includes("-c") && !bare.includes("-m"));
+  const bare = registeredCliArgs({ id: "codex", prompt: "hi", cwd: "/fixture/project", model: null, effort: null, skipGitRepoCheck: false, osWriteSandbox: true }); assert(!bare.includes("-c") && !bare.includes("-m"));
 });

@@ -8,6 +8,7 @@ import { defaultEffortForLevels, resolveReasoningEffort } from "../dist/workspac
 import { connectionForObjective } from "../dist/workspace/connection-effort.js";
 import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { scriptedWorkspaceProvider } from "./fixtures/scripted-workspace-provider.mjs";
+import { DEFAULT_TIER, FULL_TIER_SKIP, SEATBELT } from "./helpers/platform-tier.mjs";
 
 const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 test("auto reuses Host objective classification for short replies versus change/investigation/multiple outcomes", () => {
@@ -62,7 +63,8 @@ test("Host freezes Pi's per-turn choice for main and colleague, preserving an ex
     let connections = host.snapshot(workspaceId).connections;
     assert.equal(connections.connections[0].defaultReasoning, null);
     host.selectConnection(workspaceId, connections.connections[0].id, connections.revision, "gpt-5.6-sol", "high");
-    host.setAgentPermissionTier(workspaceId, colleague.agentId, "full-protected", colleague.configRevision, colleague.agentEpoch);
+    // The full tier exists only with Seatbelt; elsewhere the colleague keeps the controlled tier (decision B).
+    if (SEATBELT) host.setAgentPermissionTier(workspaceId, colleague.agentId, "full-protected", colleague.configRevision, colleague.agentEpoch);
     const run = host.start("client", workspaceId, colleague.agentId, "hello", randomUUID()); await host.wait(run.runId);
     assert.deepEqual(choices.at(-1), { effort: "high", agent: colleague.agentId });
     assert.equal(host.snapshot(workspaceId, colleague.agentId).conversation.runtimeStages.at(-1).runtime.effort, "high");

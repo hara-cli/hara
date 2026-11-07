@@ -7,12 +7,13 @@ import { LocalWorkspaceHost } from "../../dist/workspace/local-host.js";
 import { WorkspaceResources } from "../../dist/workspace/resources.js";
 import { MemoryCredentialVault } from "../../dist/workspace/credential-vault.js";
 import { SYNTHETIC_CONNECTION } from "../../dist/workspace/synthetic-provider.js";
+import { DEFAULT_TIER } from "./platform-tier.mjs";
 
 // Shared by the workspace-local-channels*.test.mjs files, which are split so each stays within the
 // per-file test timeout on the slower hosted Intel runner.
 const temporary = [];
 after(() => { for (const p of temporary) fs.rmSync(p, { recursive: true, force: true }); });
-export async function setup(count = 3, providerFactory, permissionTier = "full-protected") {
+export async function setup(count = 3, providerFactory, permissionTier = DEFAULT_TIER) {
   const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "hara-local-channel-"))); temporary.push(root);
   const calls = [], options = { mode: "workspace", credentialVault: new MemoryCredentialVault(), providerFactory: providerFactory ?? ((_connection, binding, context) => ({
     id: "openai", model: binding.model, async turn(args) {

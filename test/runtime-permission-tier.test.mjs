@@ -13,11 +13,12 @@ import {WorkspaceChangeTrace} from "../dist/agent/governance-c-lite.js";
 import {createRuntimeExecutionPolicy} from "../dist/agent-runtime/execution-policy.js";
 import {codexHostToolOverrides} from "../dist/agent-runtime/codex-host-config.js";
 import {registeredCliArgs} from "../dist/agent-runtime/registered-cli.js";
+import { DEFAULT_TIER, FULL_TIER_SKIP, SEATBELT } from "./helpers/platform-tier.mjs";
 const scope={schemaVersion:1,workspaceId:"ws_10000000-0000-4000-8000-000000000001",authority:{kind:"local",localAuthorityId:"20000000-0000-4000-8000-000000000001"}};
 const root=t=>{const p=fs.realpathSync(fs.mkdtempSync(join(tmpdir(),"permission-tier-")));t.after(()=>fs.rmSync(p,{recursive:true,force:true}));return p;};
 const bind=(r,a)=>r.agents.bindTask(createTaskExecution("Edit the fixture file","turn"),a.agentId,a.configRevision,a.agentEpoch).workspaceAgentBinding;
 const canonical=v=>Array.isArray(v)?`[${v.map(canonical).join(',')}]`:v&&typeof v==='object'?`{${Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+canonical(v[k])).join(',')}}`:JSON.stringify(v);
-test("new tasks freeze the default full tier; switching preserves old task and persona/runtime edits preserve the new tier",t=>{
+test("new tasks freeze the default full tier; switching preserves old task and persona/runtime edits preserve the new tier",{skip:FULL_TIER_SKIP},t=>{
  const r=new WorkspaceResources(root(t),scope);r.initialize();let a=r.agents.initializeMain();assert.equal(a.permissionTier,"full-protected");
  const old=bind(r,a);assert.equal(old.permissionTier,"full-protected");
  a=r.agents.setPermissionTier(a.agentId,"controlled",a.configRevision,a.agentEpoch);const next=bind(r,a);assert.equal(next.permissionTier,"controlled");
@@ -33,8 +34,8 @@ test("legacy configuration hashes remain readable; new task freezing does not al
  const file=join(home,".hara/workspace-data/v1",workspaceResourceScopeKey(scope),"state/.hara/workspace-agents.json");
  const raw=JSON.parse(fs.readFileSync(file));for(const c of raw.agents[0].configurations){delete c.permissionTier;delete c.hash;c.hash=createHash('sha256').update('hara-workspace-agent-config-v1\0').update(canonical(c)).digest('hex');}
  fs.writeFileSync(file,JSON.stringify(raw),{mode:0o600});
- const restarted=new WorkspaceResources(home,scope);restarted.initialize();assert.equal(restarted.agents.get(a.agentId).permissionTier,"full-protected");
- const fresh=bind(restarted,restarted.agents.get(a.agentId));assert.equal(fresh.permissionTier,"full-protected");
+ const restarted=new WorkspaceResources(home,scope);restarted.initialize();assert.equal(restarted.agents.get(a.agentId).permissionTier,DEFAULT_TIER);
+ const fresh=bind(restarted,restarted.agents.get(a.agentId));assert.equal(fresh.permissionTier,DEFAULT_TIER);
  const {permissionTier,...legacy}=fresh;assert.equal(restarted.agents.resolveTask(legacy).permissionTier,undefined);assert.equal(Object.hasOwn(legacy,'permissionTier'),false);
 });
 function changeTask(){return applyTaskBrief(createTaskExecution("Edit the fixture file","turn"),{intent:"change",goal:"Edit fixture",constraints:[],acceptance:["file updated"],steps:["edit"]}).task;}
@@ -46,7 +47,7 @@ test("N1 rejects read-only change checks and accepts a current successful write 
 });
 test("native file proof supports C-lite and explicit checks; prose, no diff, stale scope and failed tools cannot",t=>{
  const dir=root(t),work=join(dir,"work"),home=join(dir,"account");fs.mkdirSync(work);fs.mkdirSync(home);
- const p=createRuntimeExecutionPolicy({runtimeId:"codex",tier:"full-protected",accountHome:home,workRoot:work});t.after(()=>p.close());p.beginAttempt("attempt-1");
+ const p=createRuntimeExecutionPolicy({runtimeId:"codex",tier:"full-protected",accountHome:home,workRoot:work},{platform:"darwin"});t.after(()=>p.close());p.beginAttempt("attempt-1");
  const task=changeTask(),scope=completionEvidenceScope(task),ledger=new CompletionEvidenceLedger(),trace=new WorkspaceChangeTrace();
  p.observeNativeEvent({type:"file",status:"completed",path:"file.txt",operation:"write"});assert.equal(p.collectWorkspaceEvidence(),null);assert.equal(trace.evidence(),null);
  fs.writeFileSync(join(work,"file.txt"),"actual");const proof=p.collectWorkspaceEvidence();ledger.observeNative(scope,proof);
@@ -89,7 +90,7 @@ test("OpenCode transient settings do not replace the host login data or import a
 
 test("conversation proof rejects unobserved writes, native calls and invalidated snapshots", t => {
  const dir=root(t),work=join(dir,"work"),home=join(dir,"account");fs.mkdirSync(work);fs.mkdirSync(home);
- const p=createRuntimeExecutionPolicy({runtimeId:"codex",tier:"full-protected",accountHome:home,workRoot:work});t.after(()=>p.close());
+ const p=createRuntimeExecutionPolicy({runtimeId:"codex",tier:"full-protected",accountHome:home,workRoot:work},{platform:"darwin"});t.after(()=>p.close());
  fs.writeFileSync(join(dir,"outside.txt"),"opaque fixture");fs.symlinkSync(join(dir,"outside.txt"),join(work,"unchanged-link"));
  p.beginAttempt("conversation");assert.equal(p.canCompleteConversation(),true);
  fs.writeFileSync(join(work,"native.txt"),"unexpected");assert.equal(p.canCompleteConversation(),false);

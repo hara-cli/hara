@@ -7,8 +7,9 @@ import { LocalWorkspaceHost } from "../../dist/workspace/local-host.js";
 import { MemoryCredentialVault } from "../../dist/workspace/credential-vault.js";
 import { createJsonCliExecutionPolicy } from "../../dist/agent-runtime/json-cli-policy.js";
 import { SYNTHETIC_CONNECTION } from "../../dist/workspace/synthetic-provider.js";
+import { DEFAULT_TIER } from "./platform-tier.mjs";
 
-export async function jsonCliFixture(t, id, { mode = "list", protectedFactory = true, productionPolicy = false, bind = true, recordReceipt = true, tier = "full-protected", helpFailure = false, defaultLayout = false } = {}) {
+export async function jsonCliFixture(t, id, { mode = "list", protectedFactory = true, productionPolicy = false, bind = true, recordReceipt = true, tier = DEFAULT_TIER, helpFailure = false, defaultLayout = false } = {}) {
   const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), `hara-${id}-fixture-`))), account = join(root, "account"); fs.mkdirSync(join(account, ".local/bin"), { recursive: true, mode: 0o700 });
   let host;
   t.after(async () => {

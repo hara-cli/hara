@@ -4,8 +4,9 @@ import {randomUUID} from "node:crypto";
 import {setup} from "./helpers/local-channels.mjs";
 import {WorkspaceConversationStore} from "../dist/workspace/conversations.js";
 import {WorkspaceRuntimeStageStore} from "../dist/workspace/runtime-stage-events.js";
-test("full-protected Pi channel retains native runtime proof for every ordered member", async () => {
-  const f = await setup(2);
+import { DEFAULT_TIER, FULL_TIER_SKIP, SEATBELT } from "./helpers/platform-tier.mjs";
+test("full-protected Pi channel retains native runtime proof for every ordered member", { skip: FULL_TIER_SKIP }, async () => {
+  const f = await setup(2, undefined, "full-protected");
   try {
     const channel = f.create();
     f.host.sendChannel("client", f.id, channel, "hello group", randomUUID(), f.members);

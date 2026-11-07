@@ -2,10 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {cliMcpFixture,until} from "./helpers/workspace-cli-mcp.mjs";
 import {done,exchange,tier} from "./helpers/runtime-permission-process.mjs";
+import { DEFAULT_TIER, FULL_TIER_SKIP, SEATBELT } from "./helpers/platform-tier.mjs";
 test("controlled native tools cannot write; a claimed native write without a diff cannot complete",async t=>{
  const f=await cliMcpFixture(t,"native-write");await tier(f,"controlled");let v=await exchange(f,"Write native-result.txt");
- assert.notEqual(v.conversation.state,"completed");assert.equal(f.meta().writeDenied,true);assert.notEqual(v.conversation.completion?.state,"verified");
- await tier(f,"full-protected");f.mode("native-claim");v=await exchange(f,"Write native-result.txt");assert.notEqual(v.conversation.state,"completed");assert.notEqual(v.conversation.completion?.state,"verified");
+ assert.notEqual(v.conversation.state,"completed");assert.notEqual(v.conversation.completion?.state,"verified");
+ // Inside Seatbelt the OS denies the write; off macOS (decision B) nothing blocks it, but it is never credited.
+ if(SEATBELT)assert.equal(f.meta().writeDenied,true);else assert.doesNotMatch(JSON.stringify(v.conversation.completion??{}),/native-workspace-diff/);
+ if(SEATBELT)await tier(f,"full-protected");f.mode("native-claim");v=await exchange(f,"Write native-result.txt");assert.notEqual(v.conversation.state,"completed");assert.notEqual(v.conversation.completion?.state,"verified");
 });
 test("tier updates reject a running or draining bot and unsupported RPC paths",async t=>{
  const f=await cliMcpFixture(t,"hang");await f.send("List current colleagues?");await until(async()=>f.meta(),Boolean);

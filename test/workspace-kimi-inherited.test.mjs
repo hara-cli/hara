@@ -4,6 +4,7 @@ import fs from "node:fs";
 import { createHash } from "node:crypto";
 import { jsonCliFixture } from "./helpers/json-cli-fixture.mjs";
 import { runtimeFailureMessage } from "../dist/agent-runtime/failure-diagnostics.js";
+import { DEFAULT_TIER, FULL_TIER_SKIP, SEATBELT } from "./helpers/platform-tier.mjs";
 const digest = path => createHash("sha256").update(fs.readFileSync(path)).digest("hex");
 async function until(read) { const deadline = Date.now() + 10000; while (Date.now() < deadline) { if (read()) return; await new Promise(resolve => setTimeout(resolve, 20)); } throw Error("bounded Kimi fixture wait"); }
 
@@ -14,8 +15,8 @@ test("Kimi inherited diagnostics are code-owned even when callers omit or forge 
     assert.equal(row.extensionsIsolation, runtime === "kimi" ? "inherited" : undefined); assert.ok(!raw.includes("forged-private-value"));
   }
 });
-test("Kimi Code ACP full contract preserves host extensions, Hara receipts and protected launch", async t => {
-  const f = await jsonCliFixture(t, "kimi"), sent = f.send(); await f.host.wait(sent.runId); const view = f.read(), meta = f.meta();
+test("Kimi Code ACP full contract preserves host extensions, Hara receipts and protected launch", { skip: FULL_TIER_SKIP }, async t => {
+  const f = await jsonCliFixture(t, "kimi", { tier: "full-protected" }), sent = f.send(); await f.host.wait(sent.runId); const view = f.read(), meta = f.meta();
   assert.equal(view.conversation.state, "completed", JSON.stringify(view.conversation));
   assert.equal(meta.home, f.account); assert.equal(meta.yolo, true); assert.equal(meta.plan, false); assert.equal(meta.inheritedExtensions, true);
   assert.equal(meta.wrapped, true); assert.equal(meta.tokenInArgv, false); assert.deepEqual(meta.mcpNames, ["hara"]);

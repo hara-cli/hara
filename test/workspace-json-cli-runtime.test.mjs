@@ -4,9 +4,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { createServer } from "node:net";
 import { jsonCliFixture } from "./helpers/json-cli-fixture.mjs";
+import { GEMINI_SKIP, OFF_MACOS_ONLY } from "./helpers/platform-tier.mjs";
 async function until(read) { const deadline = Date.now() + 10000; while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 20)); } throw Error("bounded JSON CLI fixture wait"); }
 for (const runtime of ["gemini"]) {
-  test(`${runtime}: host binding, documented model source, MCP governor, stages and successful-version history`, async t => {
+  test(`${runtime}: host binding, documented model source, MCP governor, stages and successful-version history`, { skip: GEMINI_SKIP }, async t => {
     const f = await jsonCliFixture(t, runtime), inventory = await f.host.listRuntimeModels(f.workspaceId, runtime);
     assert.equal(inventory.source, "documented"); assert.ok(inventory.sourceURL.startsWith("https://"));
     assert.ok(inventory.models.some(row => row.id === "default")); assert.ok(inventory.models.every(row => !row.supportedReasoningEfforts?.length));
@@ -22,26 +23,31 @@ for (const runtime of ["gemini"]) {
     assert.equal(view.runtimes.options.find(row => row.runtimeId === runtime).versionStatus.lastSuccessfulVersion, "1.2.3");
     await assert.rejects(fetch(meta.url));
   });
-  test(`${runtime}: missing public protection denies the physical model process without fallback`, async t => {
+  test(`${runtime}: missing public protection denies the physical model process without fallback`, { skip: GEMINI_SKIP }, async t => {
     const f = await jsonCliFixture(t, runtime, { protectedFactory: false }), sent = f.send(); await f.host.wait(sent.runId);
     const view = f.read(); assert.equal(view.conversation.state, "blocked"); assert.equal(fs.existsSync(f.metaPath), false);
     assert.ok(view.conversation.blockReason.includes('"kind":"runtime_permission_denied"'));
     assert.equal(view.runtimes.options.find(row => row.runtimeId === runtime).versionStatus.lastSuccessfulVersion, null);
   });
-  test(`${runtime}: error frames are diagnosed without raw payloads or version success`, async t => {
+  test(`${runtime}: error frames are diagnosed without raw payloads or version success`, { skip: GEMINI_SKIP }, async t => {
     const f = await jsonCliFixture(t, runtime, { mode: "error" }), sent = f.send(); await f.host.wait(sent.runId); const view = f.read();
     assert.equal(view.conversation.state, "blocked"); assert.ok(view.conversation.blockReason.includes('"kind":"runtime_auth_rejected"'));
     assert.ok(!JSON.stringify(view).includes("fixture-private")); assert.equal(view.runtimes.options.find(row => row.runtimeId === runtime).versionStatus.lastSuccessfulVersion, null);
     await assert.rejects(fetch(f.meta().url));
   });
-  test(`${runtime}: cancellation drains the native process before policy close and closes MCP`, async t => {
+  test(`${runtime}: cancellation drains the native process before policy close and closes MCP`, { skip: GEMINI_SKIP }, async t => {
     const f = await jsonCliFixture(t, runtime, { mode: "cancel" }), sent = f.send();
     await until(() => fs.existsSync(f.metaPath)); const url = f.meta().url;
     f.host.cancel(f.workspaceId, f.main, sent.runId); await f.host.wait(sent.runId);
     assert.equal(f.policyCalls.at(-1).kind, "close"); assert.notEqual(f.read().conversation.state, "running"); await assert.rejects(fetch(url));
   });
 }
-test("Gemini controlled adds plan, omits yolo and retains the outer policy before its MCP read", async t => {
+test("Gemini off macOS is refused explicitly before any native model process", { skip: OFF_MACOS_ONLY }, async t => {
+  const f = await jsonCliFixture(t, "gemini", { tier: "controlled" }), sent = f.send(); await f.host.wait(sent.runId); const view = f.read();
+  assert.equal(view.conversation.state, "blocked"); assert.match(view.conversation.blockReason, /"kind":"runtime_permission_denied"/);
+  assert.match(view.conversation.blockReason, /require macOS/); assert.equal(fs.existsSync(f.metaPath), false, "no native Gemini process ran");
+});
+test("Gemini controlled adds plan, omits yolo and retains the outer policy before its MCP read", { skip: GEMINI_SKIP }, async t => {
   const f = await jsonCliFixture(t, "gemini", { tier: "controlled" }), sent = f.send(); await f.host.wait(sent.runId);
   assert.equal(f.read().conversation.state, "completed"); assert.equal(f.meta().yolo, false); assert.ok(f.policyCalls.some(row => row.kind === "wrap"));
 });

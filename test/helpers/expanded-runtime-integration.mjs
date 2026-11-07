@@ -20,6 +20,7 @@ import { createWorkspaceRunPermit, bindWorkspaceRunOptions, closeWorkspaceRunPer
 import { sharedExpandedRuntimeProtection } from "../../dist/agent-runtime/expanded-policy-adapter.js";
 import { AgentRuntimeRegistry } from "../../dist/agent-runtime/registry.js";
 import { runConfiguredAgent } from "../../dist/agent-runtime/dispatch.js";
+import { DEFAULT_TIER, FULL_TIER_SKIP } from "./platform-tier.mjs";
 
 const fixtureRoots = [];
 after(() => fixtureRoots.forEach(value => fs.rmSync(value, { recursive: true, force: true })));
@@ -96,7 +97,7 @@ if(id==="grok"){
 }
 `, { mode: 0o755 });
 }
-async function fixture(t, id, kind = "main", mode = "ok", tier = "full-protected") {
+async function fixture(t, id, kind = "main", mode = "ok", tier = DEFAULT_TIER) {
   const data = root(t), account = root(t), project = root(t), home = join(data, "state"), temp = root(t);
   fs.mkdirSync(home); const command = join(account, ".local/bin", id === "cursor" ? "cursor-agent" : id),
     argv = join(account, "." + id, id === "cursor" ? "chats" : "logs", "argv.json");
@@ -200,8 +201,9 @@ if (selected === "copilot") test("a missing common protector cannot start a full
   assert.match(result.error, /runtime_permission_denied/);
 });
 for (const [id, mode] of [["copilot", "terminal-error"], ["grok", "foreign-permission"], ["grok", "no-mcp"], ["grok", "native-schedule"]].filter(([id]) => id === selected))
-  test(id + " " + mode + " cannot record a successful version or leak a raw account error", async t => {
-    const f = await fixture(t, id, "main", mode), result = await f.run(f.testProtector);
+  // The grok permission/schedule frames are emitted only by a full-tier session (the fake mirrors the native CLI).
+  test(id + " " + mode + " cannot record a successful version or leak a raw account error", { skip: id === "grok" && mode !== "no-mcp" ? FULL_TIER_SKIP : false }, async t => {
+    const f = await fixture(t, id, "main", mode, id === "grok" && mode !== "no-mcp" ? "full-protected" : DEFAULT_TIER), result = await f.run(f.testProtector);
     assert.equal(result.status, "error"); assert.equal(result.error.includes("PRIVATE_ACCOUNT"), false);
     assert.equal(f.state().closed, 1);
     assert.equal(f.installer.list().options.find(row => row.runtimeId === id).versionStatus.lastSuccessfulVersion, null);

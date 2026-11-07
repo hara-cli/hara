@@ -3,6 +3,7 @@ import { governedToolResult, compactRosterIds } from "./helpers/governed-tool-re
 import test from "node:test";
 import assert from "node:assert/strict";
 import { cliMcpFixture, until } from "./helpers/workspace-cli-mcp.mjs";
+import { DEFAULT_TIER, FULL_TIER_SKIP, SEATBELT } from "./helpers/platform-tier.mjs";
 
 const done = view => ["completed", "blocked", "paused", "cancelled"].includes(view.conversation.state);
 test("session.send reaches registered Codex MCP and lists only this Workspace with governed receipts", async t => {
@@ -15,7 +16,7 @@ test("session.send reaches registered Codex MCP and lists only this Workspace wi
   assert.equal(meta.tools.includes("bash"), false); assert.equal(meta.tools.includes("read_file"), false);
   assert.equal(meta.tokenPresent, true); assert.equal(meta.tokenInArgv, false);
   assert.equal(meta.readOnly, false); assert.equal(meta.onRequest, false); assert.equal(meta.nativeSandboxDisabled,true); assert.equal(meta.nativeApprovalDisabled,true); assert.equal(meta.haraOnlyTrust, true);
-  const thread=f.native().find(row=>row.method==="thread/start");assert.equal(thread.params.sandbox,"danger-full-access");assert.equal(thread.params.approvalPolicy,"never");assert.equal(view.conversation.permissionTier,"full-protected");
+  const thread=f.native().find(row=>row.method==="thread/start");assert.equal(thread.params.sandbox,SEATBELT?"danger-full-access":"read-only");assert.equal(thread.params.approvalPolicy,"never");assert.equal(view.conversation.permissionTier,DEFAULT_TIER);
   const result = governedToolResult(meta.listed.text);
   assert.deepEqual(compactRosterIds(result), [f.main.agentId]);
   assert.equal(typeof result.receipt.toolCallId, "string");

@@ -12,6 +12,7 @@ import { WorkspaceTreeBudget } from "../dist/workspace/tree-budget.js";
 import { WorkspaceResourceStorage, workspaceStateHome } from "../dist/workspace/resource-context.js";
 import { intelCaseTimeout } from "../scripts/intel-ci-test-budget.mjs";
 import { captureWorkspaceProjectIdentity } from "../dist/workspace/run-binding.js";
+import { DEFAULT_TIER, FULL_TIER_SKIP, SEATBELT } from "./helpers/platform-tier.mjs";
 
 const temporary=[];
 after(()=>{for(const path of temporary)fs.rmSync(path,{recursive:true,force:true});});
@@ -28,7 +29,7 @@ async function until(check){const deadline=Date.now()+intelCaseTimeout(10000,300
 test("no-key boot, main chat, explicit creation card, colleague task and same-root restart are a real Host flow",async()=>{
  const a=setup();try{
   const hello=a.host.start("client",a.workspaceId,a.main,"hello",randomUUID());await a.host.wait(hello.runId);
-  let snapshot=a.host.snapshot(a.workspaceId,a.main,"client");assert.equal(snapshot.conversation.state,"completed");assert.equal(snapshot.conversation.taskState,"completed");assert.equal(snapshot.conversation.permissionTier,"full-protected");assert.equal(snapshot.conversation.completion.state,"verified");
+  let snapshot=a.host.snapshot(a.workspaceId,a.main,"client");assert.equal(snapshot.conversation.state,"completed");assert.equal(snapshot.conversation.taskState,"completed");assert.equal(snapshot.conversation.permissionTier,DEFAULT_TIER);assert.equal(snapshot.conversation.completion.state,"verified");
   assert.ok(snapshot.conversation.history.some(row=>row.role==="assistant"&&row.text.includes("Hara")));
   const create=a.host.start("client",a.workspaceId,a.main,"建立 Pi 同事 Coder",randomUUID());
   const card=await until(()=>a.host.snapshot(a.workspaceId,a.main,"client").approvals[0]);
