@@ -81,9 +81,9 @@ test("a changed roster rejects the original draft without creating a colleague",
   f.host.answerApproval("client", f.id, card.id, false); await f.host.wait(run.runId);
 });
 
-test("invalid model fields become an empty human-editable draft", async t => {
+test("missing model fields retain a generated handle and an editable draft", async t => {
   const f = await fixture(t, 0, {}), { run, card } = await cardFor(f);
-  assert.equal(f.calls(), 1); assert.equal(card.draft.username, ""); assert.equal(card.draft.displayName, "");
+  assert.equal(f.calls(), 1); assert.equal(card.draft.username, "colleague"); assert.equal(card.draft.displayName, "");
   assert.match(card.draft.instructions, /video/);
   f.host.answerApproval("client", f.id, card.id, true, { ...card.draft,
     username: "video-owner", displayName: "Video Owner", title: "Video lead", instructions: "Own video work." });
@@ -129,4 +129,27 @@ test("explicit colleague creation receives the complete version-locked card befo
   assert.equal(f.host.snapshot(f.id, f.main, "client").agents.length, 1, "preloaded instructions grant no creation authority");
   f.host.answerApproval("client", f.id, card.id, false); await f.host.wait(run.runId);
   assert.equal(f.host.snapshot(f.id, f.main, "client").agents.length, 1);
+});
+
+for (const [label, proposal] of [
+  ["missing username", { displayName: "Video Helper", title: "Video project", instructions: "Keep these instructions", project: "video" }],
+  ["invalid username", { username: "NOT VALID", displayName: "Video Helper", title: "Video project", instructions: "Keep these instructions", project: "video" }],
+  ["one malformed field", { username: "video-helper", displayName: "Video Helper", title: "Video project", instructions: "Keep these instructions", project: { invalid: true } }],
+]) test(`${label} never erases valid colleague fields`, async t => {
+  const f = await fixture(t, 0, proposal), { run, card } = await cardFor(f);
+  assert.equal(card.draft.displayName, proposal.displayName); assert.equal(card.draft.title, proposal.title);
+  assert.equal(card.draft.instructions, proposal.instructions); assert.match(card.draft.username, /^[a-z0-9][a-z0-9_-]{0,63}$/);
+  assert.equal(card.draft.project, typeof proposal.project === "string" ? proposal.project : "");
+  f.host.answerApproval("client", f.id, card.id, true, card.draft); await f.host.wait(run.runId);
+  const created = f.host.snapshot(f.id).agents.find(row => row.kind === "colleague");
+  assert.equal(created.identity.displayName, proposal.displayName); assert.equal(f.calls(), 1);
+});
+test("generated handles avoid active and archived identifiers while duplicate display names remain allowed", async t => {
+  const f = await fixture(t, 0, { displayName: "Dora", title: "Design", instructions: "Own video" }), agents = f.host.context(f.id).resources.agents;
+  const a = agents.create({ username: "dora-design", profile: { displayName: "Dora", title: "Design" } }, agents.list().revision);
+  agents.setArchived(a.agentId, true, a.configRevision, a.agentEpoch);
+  agents.create({ username: "dora-design-2", profile: { displayName: "Dora", title: "Design" } }, agents.list().revision);
+  const { run, card } = await cardFor(f); assert.equal(card.draft.username, "dora-design-3");
+  f.host.answerApproval("client", f.id, card.id, true, card.draft); await f.host.wait(run.runId);
+  assert.equal(agents.list().agents.filter(row => row.state === "active" && row.identity.displayName === "Dora").length, 2);
 });

@@ -1,3 +1,5 @@
+import { WorkspaceMediaRegistry } from "./media.js";
+import { colleagueProposal } from "./colleague-proposal.js";
 import { CodexHistoryBoundaries } from "./codex-history-boundary.js";
 import { parseWorkspaceAssistantPreview, type WorkspaceAssistantPreview } from "./assistant-preview.js";
 import { MessageTimingRecorder, type MessageTimingIdentity, type MessageTimingInput, type MessageTimingReport } from "./message-timing.js";
@@ -89,7 +91,7 @@ const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTo
 export const colleagueCreateIntent = (message: string): boolean =>
   !/(?:不要|别|別|不必|无需|無需|do not|don't|never|without)\s*.{0,12}?(?:建立|建一?[个個位]?|创建|創建|新增|create|add)/iu.test(message)
   && /(?:建立|建一?[个個位]?|创建|創建|新增|create|add)\s*.{0,30}?(?:同事|bot|agent|colleague)/iu.test(message);
-interface WorkspaceHostContext { resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; extensions: WorkspaceExtensions; mcp: WorkspaceMcpManager; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
+interface WorkspaceHostContext { media?: WorkspaceMediaRegistry; resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; extensions: WorkspaceExtensions; mcp: WorkspaceMcpManager; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
 type WorkspaceConnectionSnapshot = ReturnType<WorkspaceConnectionStoreV2["list"]> & {
   readOnly?: boolean; recovered?: boolean; migrationPending?: boolean; unavailable?: boolean; activeConnectionId?: string | null;
 };
@@ -363,6 +365,18 @@ export class LocalWorkspaceHost {
   assertGeneration(workspaceId: string, generation: unknown): void {
     const current = this.context(workspaceId).storage.run(() => currentWorkspaceResourceBinding()!.generation);
     if (typeof generation !== "string" || generation !== current) throw new Error("Workspace resource generation changed; refresh before acting");
+  }
+  registerMedia(workspaceId: string, path: string) {
+    const context = this.context(workspaceId);
+    const generation = context.storage.run(() => currentWorkspaceResourceBinding()!.generation);
+    context.media ??= new WorkspaceMediaRegistry(context.project, () => [context.project,
+      ...new WorkspaceLegacyResources(context.storage).directoryReferencesForHost().filter(row => row.purposes.some(kind => kind === "project" || kind === "workspace-files")).map(row => row.path)],
+    () => { if (this.closing || this.context(workspaceId) !== context) throw new Error("Workspace media unavailable"); this.assertGeneration(workspaceId, generation); });
+    return context.media.register(path);
+  }
+  readMedia(id: string, range?: string, head = false, pathOnly = false) {
+    for (const context of this.contexts.values()) if (context.media?.has(id)) return context.media.read(id, range, head, pathOnly);
+    throw new Error("Workspace media unavailable");
   }
   list() {
     const value = this.catalog.read();
@@ -1208,12 +1222,8 @@ export class LocalWorkspaceHost {
     tools.push({ name: "agent_create", description: "Propose one editable colleague card immediately. The human edits project, runtime and permission tier on the card, then confirms once; the Host creates the colleague. Use the bounded startup roster and project candidates, without extra list/receipt calls or an ask_user question for missing fields. Runtime and permission choices belong to the human, not this tool. Never ask for confirmation again after success.", kind: "edit",
       input_schema: { type: "object", properties: { username: { type: "string" }, displayName: { type: "string" }, title: { type: "string" }, instructions: { type: "string" }, project: { type: "string" } }, required: [] },
       async run(input) {
-        const validProposal = plain(input) && exact(input, ["username", "displayName", "title", "instructions", ...(Object.hasOwn(input, "project") ? ["project"] : [])])
-          && text(input.username, 64) && text(input.displayName, 80) && text(input.title, 180)
-          && typeof input.instructions === "string" && input.instructions.length <= 8000
-          && (input.project === undefined || typeof input.project === "string" && input.project.length <= 240);
-        if (!validProposal && !colleagueCreateIntent(job.value.task?.objective ?? "")) throw new Error("invalid colleague proposal");
-        const proposed = validProposal ? input : { username: "", displayName: "", title: "", instructions: job.value.task?.objective ?? "", project: "" };
+        if (!plain(input) && !colleagueCreateIntent(job.value.task?.objective ?? "")) throw new Error("invalid colleague proposal");
+        const proposed = colleagueProposal(input, job.value.task?.objective ?? "", job.context.resources.agents.list().agents.map(row => row.username));
         assertCurrent();
         if (agentCreateAttempts >= 1) return JSON.stringify({ created: false, refused: "turn_limit", humanConfirmed: false, limit: 1 });
         agentCreateAttempts += 1; // Reserve before approval yields so parallel tool uses cannot show two cards.

@@ -1,3 +1,4 @@
+import { createServer } from "node:http";
 import { parseMessageTimingInput } from "../workspace/message-timing.js";
 import type { WorkspaceMcpLaunchProvider } from "../workspace/extension-candidate.js";
 import type { ReviewedMcpSource } from "../workspace/extension-review.js";
@@ -40,13 +41,27 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     return false;
   } });
   await host.initialize();
-  const wss = new WebSocketServer({ host: opts.host, port: opts.port, maxPayload: 128 * 1024,
+  const server = createServer((request, response) => {
+    response.setHeader("Cache-Control", "no-store"); response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
+    const match = /^\/workspace-media\/([a-f0-9]{64})(\/path)?$/u.exec(request.url ?? "");
+    const authorization = request.headers.authorization;
+    if (closing || !match || !authorization?.startsWith("Bearer ") || !tokenMatches(authorization.slice(7), token) || !["GET", "HEAD"].includes(request.method ?? "")) {
+      response.writeHead(404); response.end(); return;
+    }
+    try {
+      const media = host.readMedia(match[1]!, request.headers.range, request.method === "HEAD", !!match[2]);
+      if (match[2]) { response.writeHead(200, { "Content-Type": "application/json" }); response.end(JSON.stringify({ path: media.path })); }
+      else { response.writeHead(media.status, media.headers); response.end(media.bytes); }
+    } catch (error) { response.writeHead(error instanceof RangeError ? 416 : 404); response.end(); }
+  });
+  const wss = new WebSocketServer({ server, maxPayload: 128 * 1024,
     verifyClient: (info: { origin: string }, done: (allowed: boolean, code?: number, message?: string) => void) => {
       const allowed = !info.origin || origins.has(info.origin); done(allowed, allowed ? undefined : 403, allowed ? undefined : "Forbidden");
     } });
-  try { await new Promise<void>((resolve, reject) => { wss.once("listening", resolve); wss.once("error", reject); }); }
-  catch (error) { wss.close(); await host.close(); throw error; }
-  const port = (wss.address() as { port: number }).port;
+  try { await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(opts.port, opts.host, resolve); }); }
+  catch (error) { wss.close(); server.close(); await host.close(); throw error; }
+  const port = (server.address() as { port: number }).port;
   // Private IPC discovery only. Neither stdout logs nor RPC metadata contain this token.
   const receiptFile = bindPrivateHaraStateFile(host.home, [input.mode === "workspace" ? "workspace-runtime" : "workspace-local-dev"], "serve-v2.json");
   const previous = readPrivateStateFileSnapshotSync(receiptFile.path, 4096);
@@ -54,13 +69,13 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     let pid: number | undefined;
     try { const parsed = JSON.parse(previous.text); if (positive(parsed.pid)) pid = parsed.pid; } catch { /* unknown is not dead */ }
     let dead = false; if (pid) { try { process.kill(pid, 0); } catch (error: any) { dead = error?.code === "ESRCH"; } }
-    if (!dead) { wss.close(); await host.close(); throw new Error("Workspace Dev discovery is already owned or malformed"); }
+    if (!dead) { wss.close(); server.close(); await host.close(); throw new Error("Workspace Dev discovery is already owned or malformed"); }
     removePrivateStateFile(receiptFile.path, previous, receiptFile.directory);
   }
   const receipt = { schemaVersion: 2, instanceId: randomUUID(), pid: process.pid, port, token, capability,
     ...(input.mode === "workspace" ? { executionMode: "workspace" } : input.realKeyFile ? { executionMode: "ark-real-key" } : {}) };
   try { writePrivateStateFileSync(receiptFile, JSON.stringify(receipt) + "\n", { expectedMissing: true }); }
-  catch (error) { wss.close(); await host.close(); throw error; }
+  catch (error) { wss.close(); server.close(); await host.close(); throw error; }
   const ownedReceipt = readPrivateStateFileSnapshotSync(receiptFile.path, 4096)!;
   const dispatch = async (client: { id: string; initialized: boolean }, method: string, params: unknown, rpcId: string | number, receivedAt: number): Promise<unknown> => {
     if (!plain(params)) throw new Error("invalid Workspace RPC parameters");
@@ -75,7 +90,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, capabilities: [capability, "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, capabilities: [capability, "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.media.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
@@ -92,6 +107,10 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (method === "workspace.select" || method === "workspace.settings.select") { fields(["workspaceId", "expectedRevision"]); if (!positive(params.expectedRevision)) throw new Error("invalid Workspace selection"); host.select(client.id, workspaceId, params.expectedRevision, method === "workspace.settings.select"); return host.snapshot(workspaceId, undefined, client.id); }
     if (method === "workspace.snapshot") { fields(["workspaceId", "agentId"]); if (params.agentId !== null && !text(params.agentId)) throw new Error("invalid Agent selection"); return host.snapshot(workspaceId, typeof params.agentId === "string" ? params.agentId : undefined, client.id); }
     host.assertGeneration(workspaceId, params.expectedGeneration);
+    if (method === "workspace.media.register") {
+      fields(["workspaceId", "expectedGeneration", "path"]); if (!text(params.path, 4096)) throw new Error("Invalid Workspace media path");
+      return host.registerMedia(workspaceId, params.path);
+    }
     if (method === "workspace.session.paint") {
       fields(["workspaceId", "expectedGeneration", "agentId", "sessionId", "runId", "attemptId", "timing"]);
       const timing = parseMessageTimingInput(params.timing);
@@ -337,6 +356,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     await host.close();
     for (const client of clients.keys()) client.terminate();
     await new Promise<void>(resolve => wss.close(() => resolve()));
+    await new Promise<void>(resolve => { server.close(() => resolve()); server.closeIdleConnections?.(); });
     try { removePrivateStateFile(receiptFile.path, ownedReceipt, receiptFile.directory); } catch { /* foreign replacement retained */ }
   } };
 }
