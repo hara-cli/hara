@@ -76,6 +76,28 @@ test('checked-in artifact verifies without an installed OpenCC executable', t =>
   assert.equal(result.stdout, "", "build diagnostics must not corrupt npm pack --json output");
 });
 
+test('CRLF checkouts verify while meaningful source changes are still rejected', t => {
+  const dest = fixture(t);
+  function crlf(directory) {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const file = path.join(directory, entry.name);
+      if (entry.isDirectory()) crlf(file);
+      else fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace(/\r?\n/g, '\r\n'));
+    }
+  }
+  crlf(dest);
+  const valid = verify(dest);
+  assert.equal(valid.status, 0, valid.stderr);
+  assert.equal(valid.stdout, '');
+  const file = path.join(dest, 'src/locales/en/core-intents.json');
+  const source = JSON.parse(fs.readFileSync(file, 'utf8'));
+  source.patterns.memory_mutation.push('retain this preference');
+  fs.writeFileSync(file, JSON.stringify(source, null, 2).replace(/\n/g, '\r\n') + '\r\n');
+  const changed = verify(dest);
+  assert.notEqual(changed.status, 0);
+  assert.match(changed.stderr, /Intent source changed/);
+});
+
 test('build verification rejects stale Simplified Chinese sources', t => {
   const dest = fixture(t), file = path.join(dest, 'src/locales/zh-Hans/core-intents.json'), value = JSON.parse(fs.readFileSync(file));
   value.patterns.memory_mutation.push('牢记'); fs.writeFileSync(file, JSON.stringify(value));

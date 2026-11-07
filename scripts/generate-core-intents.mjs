@@ -12,6 +12,8 @@ const generatedTs = path.join(root, 'src/agent/core-intents.generated.ts');
 const openccVersion = '1.3.1';
 const configurations = ['s2twp.json', 's2tw.json', 's2t.json'];
 const hash = value => createHash('sha256').update(value).digest('hex');
+// Git may check text out as CRLF. Normalize text provenance only; binary dictionaries stay byte-exact.
+const normalizedText = value => value.toString().replace(/\r\n/g, '\n');
 const json = value => JSON.stringify(value, null, 2) + '\n';
 const mode = process.argv[2];
 if (process.argv.length !== 3 || !['--generate', '--check', '--verify'].includes(mode)) {
@@ -23,10 +25,10 @@ for (const dir of fs.readdirSync(localesRoot).sort()) {
   const file = path.join(localesRoot, dir, 'core-intents.json');
   if (!fs.existsSync(file)) continue;
   if (!/^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(dir) || dir === 'zh-Hant') throw Error('Invalid or generated source locale: ' + dir);
-  const bytes = fs.readFileSync(file), value = JSON.parse(bytes);
+  const text = normalizedText(fs.readFileSync(file)), value = JSON.parse(text);
   if (value.schemaVersion !== 1 || value.locale !== dir) throw Error('Invalid intent locale schema: ' + dir);
   sources[dir] = value.patterns;
-  sourceHashes[dir] = hash(bytes);
+  sourceHashes[dir] = hash(text);
 }
 if (!sources.en || !sources['zh-Hans']) throw Error('English and Simplified Chinese intent sources are required');
 const keys = Object.keys(sources.en);
@@ -42,7 +44,7 @@ function validatePatterns(patterns, locale) {
 }
 for (const [locale, patterns] of Object.entries(sources)) validatePatterns(patterns, locale);
 
-const correctionsBytes = fs.readFileSync(path.join(localesRoot, 'zh-Hant/core-intents.corrections.json'));
+const correctionsBytes = normalizedText(fs.readFileSync(path.join(localesRoot, 'zh-Hant/core-intents.corrections.json')));
 const corrections = JSON.parse(correctionsBytes);
 const reviewedCorrectionsSha256 = hash(correctionsBytes);
 const lexemes = [...new Set(Object.values(sources['zh-Hans']).flatMap(patterns => patterns.flatMap(source => source.match(/\p{Script=Han}+/gu) || [])))];
@@ -122,7 +124,7 @@ function verify(value) {
   if (!value.dictionaryHashes || JSON.stringify(Object.keys(value.dictionaryHashes).sort()) !== JSON.stringify(expectedDictionaries) || Object.values(value.dictionaryHashes).some(digest => !/^[a-f0-9]{64}$/.test(digest))) throw Error('Missing OpenCC dictionary provenance');
   if (value.reviewedCorrectionsSha256 !== reviewedCorrectionsSha256 || JSON.stringify(value.patterns) !== JSON.stringify(patternsFromLexemes(value.convertedLexemes))) throw Error('Reviewed intent variants changed: regenerate the artifacts');
   validatePatterns(value.patterns, 'zh-Hant');
-  if (fs.readFileSync(generatedTs, 'utf8') !== runtimeSource(value.patterns)) throw Error('Runtime intent artifact is stale; regenerate it');
+  if (normalizedText(fs.readFileSync(generatedTs, 'utf8')) !== runtimeSource(value.patterns)) throw Error('Runtime intent artifact is stale; regenerate it');
 }
 if (mode === '--verify') {
   verify(JSON.parse(fs.readFileSync(generatedJson, 'utf8')));
@@ -134,7 +136,7 @@ if (mode === '--verify') {
     fs.writeFileSync(generatedJson, output);
     fs.writeFileSync(generatedTs, runtime);
   } else {
-    if (fs.readFileSync(generatedJson, 'utf8') !== output || fs.readFileSync(generatedTs, 'utf8') !== runtime) throw Error('OpenCC regeneration differs from the checked-in artifacts');
+    if (normalizedText(fs.readFileSync(generatedJson, 'utf8')) !== output || normalizedText(fs.readFileSync(generatedTs, 'utf8')) !== runtime) throw Error('OpenCC regeneration differs from the checked-in artifacts');
   }
   console.error('OpenCC ' + openccVersion + ' ' + configurations.join(' + ') + ': ' + keys.length + ' intent categories ' + (mode === '--generate' ? 'generated' : 'reproduced') + '.');
 }
