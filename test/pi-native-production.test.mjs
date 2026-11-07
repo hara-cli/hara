@@ -205,10 +205,11 @@ test("the production bundled Pi RPC entry executes native tools and Hara MCP usi
     confirmations++; return { id: "fixture", name: tool.name, content: "Host declined the synthetic mutation", isError: true };
   } }); t.after(() => endpoint.close());
   const specs = piNativeModelTools(work, [tool]);
-  const bridgeStartedAt = performance.now();
+  // A non-interactive bridge's timeoutMs is one dispatch's run-wide budget, so each human turn below
+  // opens its own bridge (as the product does per dispatch) instead of sharing one budget across turns.
   const entryBudget = { ...budget, maxProviderRounds: 8, maxToolCalls: 8 };
-  const b = await bridge(t, { tools: specs, budget: entryBudget,
-    provider: { id: "actual-hara-connection", model: "frozen-fixture-model", async turn(args) {
+  let bridgeStartedAt = 0;
+  const entryProvider = { id: "actual-hara-connection", model: "frozen-fixture-model", async turn(args) {
       calls++;
       assert.equal(args.tools.some(tool => /cron|schedulewakeup|foreign/i.test(tool.name)), false);
       if (calls === 1) return { text: "", toolUses: [{ id: "native-write", name: "write", input: { path: "proof.txt", content: "native effect" } }], stop: "tool_use" };
@@ -216,7 +217,9 @@ test("the production bundled Pi RPC entry executes native tools and Hara MCP usi
       if (calls === 3) return { text: "", toolUses: [{ id: "hara-choice", name: piWorkspaceToolName(tool.name), input: { question: "approve?" } }], stop: "tool_use" };
       assert.ok(args.history.some(message => message.role === "tool" && message.results.some(result => result.content.includes("Host declined"))));
       return reply("native production entry verified");
-    } } });
+    } };
+  const openBridge = () => { bridgeStartedAt = performance.now(); return bridge(t, { tools: specs, budget: entryBudget, provider: entryProvider }); };
+  const b = await openBridge();
   for (const name of ["auth.json", "models.json", "models-store.json"]) writeFileSync(join(root, "agent", name), "{}\n", { mode: 0o600 });
   const config = { schemaVersion: 1, sdkVersion: "1.5.0", root, cwd: work, system: "Synthetic Hara native entry test", model: { baseURL: b.baseURL, token: b.token },
     mcp: { url: endpoint.url, token: endpoint.env.HARA_WORKSPACE_MCP_TOKEN, tools: [tool] }, sessionFile: null };
@@ -257,7 +260,8 @@ test("the production bundled Pi RPC entry executes native tools and Hara MCP usi
   await endpoint.close();
   const resumedEndpoint = await createWorkspaceMcpEndpoint({ signal: new AbortController().signal, assertCurrent() {}, tools: () => [tool],
     async call() { throw new Error("A resumed idle session must not repeat the previous Hara mutation"); } }); t.after(() => resumedEndpoint.close());
-  const resumed = startRpc({...config,sessionFile:result.state.sessionFile,mcp:{...config.mcp,url:resumedEndpoint.url,token:resumedEndpoint.env.HARA_WORKSPACE_MCP_TOKEN}});
+  const resumedBridge = await openBridge();
+  const resumed = startRpc({...config,model:{baseURL:resumedBridge.baseURL,token:resumedBridge.token},sessionFile:result.state.sessionFile,mcp:{...config.mcp,url:resumedEndpoint.url,token:resumedEndpoint.env.HARA_WORKSPACE_MCP_TOKEN}});
   const state = await resumed.state(); assert.equal(state.sessionId,result.state.sessionId);
   const again = await diagnosed("resumed", resumed, resumed.prompt("A new human continuation: do not repeat previous tools."));
   assert.equal(again.state.sessionId,result.state.sessionId); assert.equal(calls,5); assert.equal(confirmations,1);
