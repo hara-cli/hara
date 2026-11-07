@@ -87,7 +87,7 @@ test("Workspace authority lists one connection for main and colleague without re
     assert.equal(host.context(workspaceId).connections.capture().reasoning, "high");
     assert.equal(frozen.reasoning, null, "a new connection remains automatic; existing frozen provenance is unchanged");
     assert.equal(host.context(workspaceId).connections.resolve(frozen).apiKey, key, "model selection leaves the credential generation usable");
-    await assert.rejects(host.listConnectionModels(workspaceId, "ag_00000000-0000-4000-8000-000000000000", connectionId), /Pi agent unavailable/);
+    await assert.rejects(host.listConnectionModels(workspaceId, "ag_00000000-0000-4000-8000-000000000000", connectionId), /Agent unavailable/);
     assert.throws(() => host.selectConnection(workspaceId, connectionId, selected.revision, "gpt-5.6-sol", "ultra"), /reasoning effort/);
     assert(!JSON.stringify(host.snapshot(workspaceId, colleague.agentId)).includes(key));
   } finally { await host.close(); server.close(); await once(server, "close"); }

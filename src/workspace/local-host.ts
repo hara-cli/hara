@@ -716,14 +716,20 @@ export class LocalWorkspaceHost {
   async listConnectionModels(workspaceId: string, agentId: string, connectionId: string) {
     const context = this.context(workspaceId);
     const agent = context.resources.agents.list().agents.find(row => row.agentId === agentId);
-    if (!agent || agent.runtime.id !== "pi") throw new Error("Pi agent unavailable in this workspace");
+    // A form may query Pi's Workspace connection while its saved engine is still a CLI.
+    // Reading this catalog grants no runtime switch; preserve the exact colleague view across await.
+    if (!agent || agent.state !== "active") throw new Error("Agent unavailable in this workspace");
+    const agentRevision = agent.configRevision, agentEpoch = agent.agentEpoch, runtimeId = agent.runtime.id;
     const view = context.connections.list(), row = view.connections.find(item => item.id === connectionId && item.status === "active");
     if (!row) throw new Error("Connection unavailable in this workspace");
     const binding = context.connections.capture(connectionId), connection = context.connections.resolve(binding);
     const key = connection.credentialFile ? resolveWorkspaceFileCredential(connection.credentialFile) : connection.apiKey;
     if (!key) throw new Error("Connection credential unavailable");
     const catalog = await connectionModels(connection, key);
-    if (this.context(workspaceId) !== context || !context.resources.agents.list().agents.some(item => item.agentId === agentId && item.runtime.id === "pi"))
+    if (this.context(workspaceId) !== context) throw new Error("Workspace model view changed; refresh");
+    const currentAgent = context.resources.agents.list().agents.find(item => item.agentId === agentId);
+    if (!currentAgent || currentAgent.state !== "active"
+      || currentAgent.configRevision !== agentRevision || currentAgent.agentEpoch !== agentEpoch || currentAgent.runtime.id !== runtimeId)
       throw new Error("Workspace model view changed; refresh");
     const latest = context.connections.list();
     if (latest.revision !== view.revision || !latest.connections.some(item => item.id === connectionId && item.status === "active" && item.revision === row.revision))
