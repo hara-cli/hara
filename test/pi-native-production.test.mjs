@@ -205,7 +205,9 @@ test("the production bundled Pi RPC entry executes native tools and Hara MCP usi
     confirmations++; return { id: "fixture", name: tool.name, content: "Host declined the synthetic mutation", isError: true };
   } }); t.after(() => endpoint.close());
   const specs = piNativeModelTools(work, [tool]);
-  const b = await bridge(t, { tools: specs, budget: { ...budget, maxProviderRounds: 8, maxToolCalls: 8 },
+  const bridgeStartedAt = performance.now();
+  const entryBudget = { ...budget, maxProviderRounds: 8, maxToolCalls: 8 };
+  const b = await bridge(t, { tools: specs, budget: entryBudget,
     provider: { id: "actual-hara-connection", model: "frozen-fixture-model", async turn(args) {
       calls++;
       assert.equal(args.tools.some(tool => /cron|schedulewakeup|foreign/i.test(tool.name)), false);
@@ -232,7 +234,19 @@ test("the production bundled Pi RPC entry executes native tools and Hara MCP usi
     t.after(async () => { await rpc.close(); await lifecycle.close(); }); return rpc;
   };
   const rpc = startRpc(config);
-  await rpc.state(); const result = await rpc.prompt("Run the fixed synthetic native steps and respect the Host denial.");
+  await rpc.state();
+  // Failure diagnostics only (no prompt, tool or model text): which turn and fixture step was reached, how
+  // the last assistant frame stopped, elapsed time against the bridge's run-wide and Pi's per-turn limits.
+  const diagnosed = (turn, process, run) => run.catch(error => {
+    const last = process.lastAssistant, message = typeof last?.errorMessage === "string" ? last.errorMessage : undefined;
+    t.diagnostic("pi-native-entry " + JSON.stringify({ turn, error: String(error?.message).slice(0, 80), stopReason: last?.stopReason ?? null,
+      providerCalls: calls, hostConfirmations: confirmations, elapsedMs: Math.round(performance.now() - bridgeStartedAt),
+      bridgeRunTimeoutMs: entryBudget.timeoutMs, piTurnTimeoutMs: 15000, errorMessageLength: message?.length ?? null,
+      errorKind: message === undefined ? null : /abort/i.test(message) ? "aborted" : /timeout/i.test(message) ? "timeout"
+        : /connect|fetch|socket|ECONN/i.test(message) ? "connection" : /\b[45]\d\d\b/.test(message) ? "http-status" : "other" }));
+    throw error;
+  });
+  const result = await diagnosed("first", rpc, rpc.prompt("Run the fixed synthetic native steps and respect the Host denial."));
   assert.equal(result.text, "native production entry verified"); assert.equal(confirmations, 1); assert.equal(calls, 4);
   assert.equal(readFileSync(join(work,"proof.txt"),"utf8"),"native effect");
   assert.equal(existsSync(join(work,"unexpected-global-resource")),false);
@@ -245,7 +259,7 @@ test("the production bundled Pi RPC entry executes native tools and Hara MCP usi
     async call() { throw new Error("A resumed idle session must not repeat the previous Hara mutation"); } }); t.after(() => resumedEndpoint.close());
   const resumed = startRpc({...config,sessionFile:result.state.sessionFile,mcp:{...config.mcp,url:resumedEndpoint.url,token:resumedEndpoint.env.HARA_WORKSPACE_MCP_TOKEN}});
   const state = await resumed.state(); assert.equal(state.sessionId,result.state.sessionId);
-  const again = await resumed.prompt("A new human continuation: do not repeat previous tools.");
+  const again = await diagnosed("resumed", resumed, resumed.prompt("A new human continuation: do not repeat previous tools."));
   assert.equal(again.state.sessionId,result.state.sessionId); assert.equal(calls,5); assert.equal(confirmations,1);
   await resumed.close();
   assert.equal(readFileSync(join(work,"env.json"),"utf8").includes(sentinel),false);
