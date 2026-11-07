@@ -36,7 +36,8 @@ test("npm prefix discovery is offline/no-notifier and cannot create the host npm
   globalThis.fetch = () => { networkCalls++; throw new Error("network not allowed"); };
   try {
     const found = await detectInstalledRuntimes({ home, path: "/usr/bin:/bin", systemBins: [], run: async (command, args, env, timeout) => {
-      if (args[0] === "-lc") return null;
+      // Discovery runs `<shell> -lic`; stub it so the host login PATH (and any real CLI on it) is never probed.
+      if (args[0] === "-lic" || args[0] === "-lc") return null;
       calls.push({ command, args, env }); return boundedRuntimeCommand(command, args, env, timeout);
     } });
     assert.equal(found.find(row => row.runtimeId === "opencode")?.path, executable);
