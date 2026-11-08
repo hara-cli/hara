@@ -18,6 +18,8 @@ RUN npm ci --ignore-scripts
 COPY tsconfig.json ./
 COPY src ./src
 COPY runtime-bootstrap.cjs ./
+COPY scripts/generate-i18n.mjs ./scripts/generate-i18n.mjs
+COPY scripts/icu-message.mjs ./scripts/icu-message.mjs
 COPY scripts/generate-core-intents.mjs ./scripts/generate-core-intents.mjs
 COPY scripts/normalize-dist-modes.mjs ./scripts/normalize-dist-modes.mjs
 COPY scripts/check-local-bin-link.mjs ./scripts/check-local-bin-link.mjs
