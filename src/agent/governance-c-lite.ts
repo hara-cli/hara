@@ -7,16 +7,18 @@ import type { ToolResult } from "../providers/types.js";
 // Like route.ts, include CJK action words without relying on whitespace word boundaries.
 const CHANGE = /(?:创建|創建|建立|新建|新增|添加|写入|寫入|修改|编辑|編輯|删除|刪除|移除|重命名|重新命名|发送|發送|委派|安排|定时|定時|执行|執行|部署|安装|安裝|更新|保存|儲存|存储|存儲|同步|推送|合并|合併|生成|设置|設置|設定|关闭|關閉|开启|開啟|修复|修復|实现|實現|开发|開發|编写|編寫|重构|重構|优化|優化|发布|發佈|回滚|回滾|迁移|遷移|导入|導入|导出|導出|匯出|建(?:立)?(?:\s*(?:一|两|兩|几|幾|[0-9]+)?[个個位])?\s*(?:新(?:的)?\s*)?(?:bot|agent|同事|机器人|機器人)|create|add|write|edit|change|delete|remove|rename|send|delegate|schedule|execute|deploy|install|update|save|sync|push|merge|generate|set up|turn on|turn off)/iu;
 
-export function changeTaskObjective(objective: string): boolean { return CHANGE.test(objective); }
+const MEMORY_CHANGE = /^(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?(?:remember\b|(?:share|promote)\b.{0,160}\b(?:fact|note|memory|preference)\b)|^(?:(?:请|請|帮我|幫我|替我|为我|為我|麻烦|麻煩)\s*)*(?:记住|記住|记下|記下|(?:共享|分享|共用).{0,80}(?:记忆|記憶|笔记|筆記|事实|事實))/iu;
+export function changeTaskObjective(objective: string): boolean { return CHANGE.test(objective) || MEMORY_CHANGE.test(objective.trim()); }
 const QUESTION = /[?？]|^(?:\s*(?:list|show|read|describe|explain|what|who|which|how|tell me|find|search|列出|查看|读取|说明|解释|告诉我|查找|搜索|有哪些|是什么|谁是))/iu;
 // Presentation-only prefixes do not change task authority. Keep mutation detection on the original request.
 const ANSWER_PREFIX = /^(?:请|請)?(?:用|以)(?:(?:简体|繁体|簡體|繁體)?中文)?(?:一句话|一句話)?(?:回答|回复|回覆)?[：:，,\s]*/u;
 const CJK_ANSWER = /^(?:请|請)?(?:简单|簡單)?(?:介绍|介紹|简述|簡述|请问|請問|什么|甚麼|如何|为什么|為什麼|怎样|怎樣|怎么|怎麼|多少|是否|能否)|^(?:你|您|这|這)(?:是|能|会|會|可以)|^(?:你好|您好|嗨|早上好|晚上好|晚安)(?:[，,。.！!\s]|$)/u;
 const MULTI_OUTCOME = /(?:并且|同时|另外|以及|之后还|然后再|和|and also|also|then|plus|[,，、;；])/iu;
+const SECOND_ACTION = /(?:\b(?:and|then|also)\s+|(?:并|並|和|及)\s*)(?:write|delete|remove|create|send|share|promote|remember|update|deploy|install|写入|寫入|删除|刪除|建立|发送|發送|共享|修改|更新|记住|記住)/iu;
 // A comma in a short answer/greeting is not itself another task step. This guard is effort-only;
 // simple-change completion keeps its stricter MULTI_OUTCOME check above.
 const MULTI_STEP_ANSWER = /(?:并且|同時|同时|另外|以及|之后还|之後還|然后|然後|接着|接著|and also|also|then|plus|(?:^|\n)\s*\d+[.)、])/iu;
-const SHORT_CHAT = /^(?:(?:hello|hi|hey)(?:\s+there)?|good\s+(?:morning|afternoon|evening|night)|thanks|thank\s+you(?:\s+(?:very much|so much))?|ok(?:ay)?|谢谢|謝謝|好的|早安|晚安)[。.！!?？\s]*$/iu;
+const SHORT_CHAT = /^(?:(?:hello|hi|hey)(?:\s+(?:there|again))?|good\s+(?:morning|afternoon|evening|night)|thanks|thank\s+you(?:\s+(?:very much|so much))?|ok(?:ay)?|谢谢|謝謝|好的|早安|晚安)[。.！!?？\s]*$/iu;
 const SHORT_INTRO = /^(?:(?:hello|hi|hey)[,\s]+)?(?:我是|我叫|my name is|i(?: am|'m))\s*[\p{L}\p{N}][\p{L}\p{N} _'-]{0,39}[。.！!?？\s]*$/iu;
 // A request to investigate remains work even if the user phrases it as a question. This affects
 // effort only; it does not change the engine's completion/side-effect authority classification.
@@ -26,7 +28,7 @@ const INVESTIGATE_REQUEST = /^(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?(?:
 /** Direct engine completion is limited to one stated outcome; richer tasks use explicit checks. */
 export function simpleChangeObjective(objective: string): boolean {
   const text = objective.trim();
-  return text.length > 0 && text.length <= 400 && CHANGE.test(text) && !MULTI_OUTCOME.test(text);
+  return text.length > 0 && text.length <= 400 && changeTaskObjective(text) && !MULTI_OUTCOME.test(text) && !SECOND_ACTION.test(text);
 }
 
 /** Presentation prefixes never add action authority. */
@@ -36,9 +38,9 @@ export function answerQuestionText(objective: string): string {
 }
 /** Tool-free closeout is limited to greetings and the assistant's own identity/capabilities. */
 export function conversationalAnswerObjective(objective: string): boolean {
-  if (CHANGE.test(objective)) return false;
+  if (changeTaskObjective(objective)) return false;
   const value = answerQuestionText(objective);
-  return /^(?:(?:请|請)?(?:简单|簡單)?(?:自我介绍|自我介紹|(?:介绍|介紹)(?:一下)?(?:你自己|自己|你|您))|(?:你|您)(?:是(?:谁|誰|什么助手|什麼助手)|叫什么(?:名字)?|叫什麼(?:名字)?|能做(?:什么|什麼)|可以做(?:什么|什麼))|你好|您好|嗨|hello|hi|(?:please\s+)?(?:introduce yourself|who are you|what(?:'s| is) your name))[。.！!?？\s]*$/iu.test(value);
+  return SHORT_CHAT.test(value) || /^(?:(?:请|請)?(?:简单|簡單)?(?:自我介绍|自我介紹|(?:介绍|介紹)(?:一下)?(?:你自己|自己|你|您))|(?:你|您)(?:是(?:谁|誰|什么助手|什麼助手)|叫什么(?:名字)?|叫什麼(?:名字)?|能做(?:什么|什麼)|可以做(?:什么|什麼))|你好|您好|嗨|hello|hi|(?:please\s+)?(?:introduce yourself|who are you|what(?:'s| is) your name))[。.！!?？\s]*$/iu.test(value);
 }
 /** The user supplied the entire reply; this is an echo, never proof of external facts. */
 export function requestedReplyText(objective: string): string | null {
@@ -63,7 +65,7 @@ export function answerQuestionObjective(objective: string): boolean {
 
 /** Deterministic Host intent from the original user objective, before any model response. */
 export function taskObjectiveIntent(objective: string): TaskBriefInput["intent"] {
-  return CHANGE.test(objective) ? "change" : answerQuestionObjective(objective) ? "answer" : "investigate";
+  return changeTaskObjective(objective) ? "change" : answerQuestionObjective(objective) ? "answer" : "investigate";
 }
 
 /** The same Host classification, bounded to one short outcome for automatic reasoning. */
@@ -116,6 +118,13 @@ export class WorkspaceChangeTrace {
       && item.value.verified === true && item.value.path === write.value.path && item.value.sha256 === write.value.sha256));
     const intrinsic = this.observations.filter(item =>
       (item.name === "agent_create" && item.value.created === true && item.value.humanConfirmed === true)
+      || (item.name === "group_create" && item.value.created === true && item.value.humanConfirmed === true
+        && item.value.approvalState === "consumed" && item.value.messageSent === false)
+      || (item.name === "workspace_instruction_update" && item.value.written === true && item.value.humanConfirmed === true
+        && item.value.approvalState === "consumed" && typeof item.value.sha256 === "string")
+      || (item.name === "workspace_memory_write" && item.value.remembered === true && item.value.scope === "mine" && typeof item.value.appended === "boolean")
+      || (item.name === "workspace_memory_promote" && item.value.remembered === true && item.value.humanConfirmed === true
+        && item.value.approvalState === "consumed" && item.value.scope === "workspace")
       || (item.name === "agent_rename" && item.value.renamed === true)
       || (item.name === "agent_contact" && item.value.completed === true
         && typeof item.value.completion === "object" && item.value.completion !== null

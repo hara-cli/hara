@@ -87,7 +87,8 @@ export function prepareWorkspaceStartContext(input: {
   };
   add("personal_global", personal.text);
   input.storage.run(() => {
-    for (const root of input.workspaceRoots.slice(0, 2)) for (const file of ["MEMORY.md", "USER.md"]) {
+    // Private colleague, related project and Workspace shared notes; all other budgets stay bounded.
+    for (const root of input.workspaceRoots.slice(0, 3)) for (const file of ["MEMORY.md", "USER.md"]) {
       try { add("workspace", readWorkspaceResourceText(join(root, file), 256 * 1024) ?? ""); }
       catch (error: any) { if (error?.code !== "ENOENT") unavailable = true; }
     }

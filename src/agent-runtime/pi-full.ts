@@ -1,5 +1,5 @@
 import { WorkspaceContextCompactions, compactionSourceKey, contextSummaryPrompt } from "../workspace/context-compaction.js";
-import { workspaceCompactionSource } from "../workspace/execution.js";
+import { workspaceCompactionSource, workspaceNativeSessionBoundary } from "../workspace/execution.js";
 import { withWorkspaceModelProxy } from "../network/model-fetch.js";
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -170,12 +170,12 @@ export async function runFullProtectedPi(history: NeutralMsg[], options: RunOpts
         let compactedSeed = "";
         if (sessionStore.resumed) {
           const source = workspaceCompactionSource(permit), tokens = await rpc.contextTokens();
-          const key = compactionSourceKey("pi", sessionStore.sessionFile!);
+          const key = compactionSourceKey("pi", sessionStore.sessionFile!), historyBoundary = source ? workspaceNativeSessionBoundary(permit, source.history.length)?.historyStart ?? 0 : 0;
           const ledger = new WorkspaceContextCompactions(storage, permit.binding.agent.agentId, permit.binding.sessionId);
           const summary = source && ledger.plan(source, { runtimeId: "pi", sourceKey: key, tokens,
-            idle: idle.isStreaming === false && idle.isCompacting === false && idle.pendingMessageCount === 0 });
+            idle: idle.isStreaming === false && idle.isCompacting === false && idle.pendingMessageCount === 0, historyBoundary });
           if (source && summary) {
-            const record = ledger.begin(source, { runtimeId: "pi", method: "pi-native", sourceKey: key, tokens, requests: 0, summary });
+            const record = ledger.begin(source, { runtimeId: "pi", method: "pi-native", sourceKey: key, tokens, requests: 0, summary, historyBoundary });
             maintenance = { requests: 0, input: 0, output: 0, cached: 0, known: true };
             let compacted = false;
             try {

@@ -7,7 +7,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { assertWorkspaceRunContextCurrent, workspaceRunHasManagedProject, type WorkspaceRunPermit } from "../workspace/execution.js";
+import { assertWorkspaceRunContextCurrent, workspaceRunHasManagedProject, workspaceRunManagedProjectRoots, type WorkspaceRunPermit } from "../workspace/execution.js";
 import { redactSensitiveText } from "../security/secrets.js";
 
 export type RuntimePermissionTier = "full-protected" | "controlled";
@@ -159,19 +159,18 @@ export function workspaceRunPermissionTier(permit: WorkspaceRunPermit): RuntimeP
 /** The native App stores user project files beneath .hara, beside (not inside) private Host state.
  * Only the existing unforgeable Host permit can distinguish this exact admitted project from state.
  * Custom/arbitrary Hara paths and serialized bindings remain protected. No free writableRoots API. */
-function managedDefaultProject(input: RuntimeExecutionPolicyInput): readonly [string, string, string] | null {
+function managedDefaultProject(input: RuntimeExecutionPolicyInput) {
   const permit = input.managedProjectPermit;
   if (!permit) return null;
-  // This WeakMap-backed access performs the full live fence once for this synchronous projection.
-  const managed = workspaceRunHasManagedProject(permit);
-  const root = physical(input.workRoot);
+  const managed = workspaceRunHasManagedProject(permit), root = physical(input.workRoot);
   if (permit.binding.project.root !== root || permit.binding.agent.runtimeId !== input.runtimeId
     || frozenPermissionTier(permit) !== input.tier) throw new Error("Managed project policy differs from the admitted binding");
   if (!managed) return null;
-  const id = permit.binding.scope.workspaceId;
-  if (!/^ws_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u.test(id)
-    || root !== join(physical(input.accountHome), ".hara", "workspaces-v1", "project", id)) return null;
-  return [root, permit.binding.agent.resourceBinding.scopeKey, permit.binding.agent.resourceBinding.generation];
+  const paths = workspaceRunManagedProjectRoots(permit)!;
+  if (paths.workRoot !== root) throw new Error("Managed project cwd differs from its Host proof");
+  const expected = join(physical(input.accountHome), ".hara", "workspaces-v1", "project", permit.binding.scope.workspaceId);
+  return Object.freeze({ ...paths, haraException: paths.legacyRoot === expected,
+    scopeKey: permit.binding.agent.resourceBinding.scopeKey, generation: permit.binding.agent.resourceBinding.generation });
 }
 function policyKey(input: RuntimeExecutionPolicyInput, managed: ReturnType<typeof managedDefaultProject>): string {
   return hash(JSON.stringify([input.runtimeId, input.tier, physical(input.workRoot), physical(input.accountHome),
@@ -185,7 +184,10 @@ export class RuntimeExecutionPolicy {
   readonly stateDirectories: readonly string[]; readonly readableCredentialFiles: readonly string[];
   readonly risks: RuntimeRiskEvent[] = [];
   readonly workRoot: string;
+  readonly evidenceRoot: string;
   private readonly processes = new RuntimeProcessBoundary();
+  private readonly colleagueHome?: string;
+  private readonly colleagueNamespace?: string;
   private ambiguous = false;
   private closed = false; private nativeEventCount = 0;
   private baseline: ReturnType<typeof snapshot>;
@@ -200,7 +202,8 @@ export class RuntimeExecutionPolicy {
     if (!availableRuntimePermissionTiers(this.platform).includes(input.tier)) throw new RuntimeTierUnavailableError();
     const managed = managedDefaultProject(input);
     this.input = { ...input }; this.key = policyKey(input, managed);
-    this.workRoot = physical(input.workRoot); const home = physical(input.accountHome);
+    if (managed) { this.colleagueHome = managed.homeRoot; this.colleagueNamespace = join(managed.legacyRoot, "colleagues"); }
+    this.workRoot = physical(input.workRoot); this.evidenceRoot = physical(managed?.legacyRoot ?? this.workRoot); const home = physical(input.accountHome);
     if (!lstatSync(this.workRoot).isDirectory() || this.workRoot === sep || contains(this.workRoot, home)) throw new Error("Unsafe runtime working directory");
     const roots: Record<RegisteredPolicyRuntime, string> = {
       pi: join(home, ".pi/agent"), codex: join(home, ".codex"), claude: join(home, ".claude"), opencode: join(home, ".local/share/opencode"),
@@ -233,11 +236,13 @@ export class RuntimeExecutionPolicy {
       if (!info.isFile() || info.nlink !== 1 || info.size > 3 || readFileSync(piAuth, "utf8").trim() !== "{}") throw new Error("Pi auth must be the dedicated empty object");
       allCredentials.push(piAuth);
     }
-    const haraRoot = physical(join(home, ".hara")), managedWorkRoot = managed?.[0];
+    const haraRoot = physical(join(home, ".hara")), managedWorkRoot = managed?.haraException ? managed.legacyRoot : undefined;
     const stateRoots = (input.protectedStateRoots ?? []).map(physical), forbidden = [haraRoot, ...stateRoots];
-    if (forbidden.some(root => contains(root, this.workRoot) && !(root === haraRoot && managedWorkRoot === this.workRoot))
-      || managedWorkRoot && stateRoots.some(root => contains(managedWorkRoot, root))) throw new Error("Runtime working directory is protected Hara state");
-    this.baseline = snapshot(this.workRoot);
+    const projectRoots = [...new Set([this.workRoot, this.evidenceRoot])];
+    if (projectRoots.some(project => project === sep || contains(project, home)
+      || forbidden.some(root => contains(root, project) && !(root === haraRoot && managedWorkRoot && contains(managedWorkRoot, project)))
+      || stateRoots.some(root => contains(project, root)))) throw new Error("Runtime working directory is protected Hara state");
+    this.baseline = snapshot(this.evidenceRoot);
     if ([...this.baseline.files.values()].some(row => row.kind === "unsafe")) throw new Error("Runtime working directory has unsafe linked files");
     this.stateDirectories = Object.freeze(writes); this.readableCredentialFiles = Object.freeze(ownCredentials);
     const quotedSubpaths = (paths: readonly string[]) => paths.map(path => `(subpath ${quote(path)})`).join("\n  ");
@@ -266,7 +271,7 @@ export class RuntimeExecutionPolicy {
     const protectedPaths = forbidden.map(root => "(require-all (subpath " + quote(root) + ") "
       + (isolated ? "(require-not (subpath " + quote(isolated) + ")) " : "")
       + (root === haraRoot && managedWorkRoot ? "(require-not (subpath " + quote(managedWorkRoot) + "))" : "") + ")").join("\n  ");
-    const writable = [this.tempRoot, ...writes, ...(isolated && input.runtimeId !== "pi" ? [isolated] : []), ...(input.tier === "full-protected" ? [this.workRoot] : [])];
+    const writable = [this.tempRoot, ...writes, ...(isolated && input.runtimeId !== "pi" ? [isolated] : []), ...(input.tier === "full-protected" ? projectRoots : [])];
     const lines = ["(version 1)", "(allow default)", "(deny file-write*)", `(allow file-write*\n  ${quotedSubpaths(writable)}\n  (literal \"/dev/null\") (literal \"/dev/stdout\") (literal \"/dev/stderr\") (literal \"/dev/tty\"))`,
       // Never create hard-link aliases to defeat a path-based read/write boundary.
       "(deny file-link)",
@@ -305,6 +310,18 @@ export class RuntimeExecutionPolicy {
     if (input.runtimeId === "gemini") lines.push(`(deny file-write* ${literals([join(this.workRoot, ".gemini"), join(this.workRoot, ".gemini/settings.json"), join(this.workRoot, ".gemini/.hara-settings.lock")])})`);
     // Denials come last as well: no native state exception may open Hara or credential writes.
     lines.push(`(deny file-write*\n  ${protectedPaths}\n  ${quotedSubpaths([...secretDirs, ...keychains])}\n  ${literals([...allCredentials, ...ownCredentials])}\n  (regex ${generic}))`);
+    if (managed) {
+      const namespace = join(managed.legacyRoot, "colleagues");
+      // A broad legacy compatibility grant must never authorize a sibling home or standing rules.
+      lines.push(`(deny file-write* (require-all (subpath ${quote(namespace)}) (require-not (subpath ${quote(managed.homeRoot)}))))`);
+      lines.push(`(deny file-write-unlink ${literals([...new Set([this.workRoot, managed.legacyRoot, namespace, managed.homeRoot])])})`);
+      const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const fold = (value: string) => [...value].map(char => /[a-z]/iu.test(char) ? `[${char.toLowerCase()}${char.toUpperCase()}]` : escape(char)).join("");
+      for (const root of new Set([managed.legacyRoot, managed.homeRoot])) {
+        const prefix = "^" + escape(root) + "/";
+        lines.push(`(deny file-write* (regex ${quote(prefix + "(" + ["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md"].map(fold).join("|") + ")$")}) (regex ${quote(prefix + "(" + [".claude", ".codex"].map(fold).join("|") + ")(/|$)")}))`);
+      }
+    }
     this.profile = lines.join("\n") + "\n";
     if (Buffer.byteLength(this.profile) > 96 * 1024) { rmSync(this.tempRoot, { recursive: true }); throw new Error("Runtime Seatbelt policy is too large"); }
   }
@@ -335,21 +352,25 @@ export class RuntimeExecutionPolicy {
   beginAttempt(attemptKey: string): void {
     if (this.closed || !/^[a-zA-Z0-9_-]{1,200}$/u.test(attemptKey)) throw new Error("Invalid native attempt boundary");
     this.processes.beginAttempt();
-    this.baseline = snapshot(this.workRoot);
+    this.baseline = snapshot(this.evidenceRoot);
     if ([...this.baseline.files.values()].some(row => row.kind === "unsafe")) throw new Error("Runtime working directory has unsafe linked files");
     this.attemptKey = attemptKey; this.lastEvidence = undefined;
     this.nativeEventCount = 0; this.risks.length = 0; this.ambiguous = false;
+  }
+  private projectPathAllowed(path: string): boolean {
+    return contains(this.evidenceRoot, path) && !(this.colleagueNamespace && contains(this.colleagueNamespace, path)
+      && (!this.colleagueHome || !contains(this.colleagueHome, path)));
   }
   observeNativeEvent(event: NormalizedNativeRuntimeEvent): void {
     if (this.closed || this.nativeEventCount >= 1024) return;
     this.nativeEventCount++;
     let kind: RuntimeRiskEvent["kind"] | undefined;
-    if (event.path && /delete|remove|unlink/u.test(event.operation ?? "") && !contains(this.workRoot, resolve(this.workRoot, event.path))) kind = "outside-workspace-delete";
+    if (event.path && /delete|remove|unlink/u.test(event.operation ?? "") && !this.projectPathAllowed(resolve(this.workRoot, event.path))) kind = "outside-workspace-delete";
     if (event.command && /\b(?:git\s+push|npm\s+publish|pnpm\s+publish|gh\s+(?:release\s+create|pr\s+merge))\b/u.test(event.command)) kind = "external-publish";
     if (!kind && event.command) {
       const deletion = /(?:^|[;&|]\s*)(?:rm|rmdir|unlink)\s+(?:-[a-zA-Z-]+\s+)*(?:"([^"$`]+)"|'([^']+)'|([^\s;&|]+))/u.exec(event.command);
       const target = deletion?.[1] ?? deletion?.[2] ?? deletion?.[3];
-      if (target && !target.includes("$") && !contains(this.workRoot, resolve(this.workRoot, target))) kind = "outside-workspace-delete";
+      if (target && !target.includes("$") && !this.projectPathAllowed(resolve(this.workRoot, target))) kind = "outside-workspace-delete";
     }
     if (!kind || this.risks.length >= 64) return;
     this.risks.push({ id: randomUUID(), kind, state: "observed", summary: kind === "external-publish" ? "Native runtime publication command observed" : "Native runtime deletion outside its working directory observed",
@@ -359,7 +380,7 @@ export class RuntimeExecutionPolicy {
   /** A direct conversational answer cannot hide a native call, incomplete scan or file change. */
   canCompleteConversation(): boolean {
     if (this.closed || this.ambiguous || this.nativeEventCount || !this.baseline.complete) return false;
-    const current = snapshot(this.workRoot);
+    const current = snapshot(this.evidenceRoot);
     if (!current.complete || current.files.size !== this.baseline.files.size) return false;
     return [...this.baseline.files].every(([path, before]) => before.kind !== "unsafe"
       && current.files.get(path)?.kind === before.kind && current.files.get(path)?.digest === before.digest
@@ -367,7 +388,7 @@ export class RuntimeExecutionPolicy {
   }
   collectWorkspaceEvidence(): NativeWorkspaceEvidence | null {
     if (this.closed || this.ambiguous || this.input.tier !== "full-protected" || !this.baseline.complete) return null;
-    const current = snapshot(this.workRoot); if (!current.complete) return null;
+    const current = snapshot(this.evidenceRoot); if (!current.complete) return null;
     const changes: NativeWorkspaceEvidence["changes"] = [];
     for (const path of [...new Set([...this.baseline.files.keys(), ...current.files.keys()])].sort()) {
       const before = this.baseline.files.get(path), after = current.files.get(path);

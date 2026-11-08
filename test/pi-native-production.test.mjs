@@ -1,3 +1,4 @@
+import { WorkspaceNativeSessions } from "../dist/workspace/native-session-boundary.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -75,10 +76,20 @@ test("production Pi model gateway revokes immediately while close drains a provi
 function sessionFixture(t) {
   const root = fixture(t), storage = new WorkspaceResourceStorage(root, { schemaVersion: 1, workspaceId: "ws_" + randomUUID(), authority: { kind: "local", localAuthorityId: randomUUID() } });
   storage.initialize();
-  const binding = { runId: randomUUID(), scope: storage.scope, agent: { agentId: "synthetic-agent" }, connection: { model: "frozen" } };
+  const binding = { runId: randomUUID(), sessionId: randomUUID(), scope: storage.scope, agent: { agentId: "ag_" + randomUUID() }, connection: { model: "frozen" } };
   const history = [{ role: "user", content: "synthetic task" }];
   return { root, storage, binding, history };
 }
+
+test("an explicit Pi reset creates a fresh native session even when the frozen runId is reused", t => {
+  const f = sessionFixture(t), first = new PiNativeSessionStore(f.storage, f.binding, f.history);
+  t.after(() => rmSync(first.root, { recursive: true, force: true }));
+  const file = join(first.root, "agent/sessions/before-reset.jsonl"); writeFileSync(file, "old native context\n"); first.accepted(); first.finished(file, f.history);
+  new WorkspaceNativeSessions(f.storage, f.binding.agent.agentId, f.binding.sessionId).reset(0, randomUUID(), "pi", f.history.length, "tester");
+  const fresh = new PiNativeSessionStore(f.storage, f.binding, f.history); t.after(() => rmSync(fresh.root, { recursive: true, force: true }));
+  assert.notEqual(fresh.root, first.root); assert.equal(fresh.resumed, false); assert.equal(fresh.sessionFile, null); assert.equal(fresh.promptHistoryStart, 0);
+  assert.equal(readFileSync(file, "utf8"), "old native context\n", "reset retains prior native evidence");
+});
 
 test("Host-private Pi session receipts refuse accepted/outcome-unknown recovery rather than replaying", t => {
   const f = sessionFixture(t), first = new PiNativeSessionStore(f.storage, f.binding, f.history);

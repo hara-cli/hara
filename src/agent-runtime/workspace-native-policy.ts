@@ -29,13 +29,14 @@ export function workspaceRuntimeProcessKey(input: RuntimeExecutionPolicyInput, r
 // Two native attempts sharing the directory cannot claim each other's changes as completion proof.
 const writers = new Map<string, Set<RuntimeExecutionPolicy>>();
 const attached = new WeakSet<RuntimeExecutionPolicy>();
+const hostWriters = new Map<string, number>();
 export function beginWorkspaceNativePolicy(permit: WorkspaceRunPermit, policy: RuntimeExecutionPolicy): void {
   if (attached.has(policy)) return;
   policy.beginAttempt(permit.binding.runId);
   attachWorkspaceNativePolicy(permit, policy);
-  const peers = writers.get(policy.workRoot) ?? new Set();
-  if (peers.size) { policy.invalidateEvidence(); for (const peer of peers) peer.invalidateEvidence(); }
-  peers.add(policy); writers.set(policy.workRoot, peers); attached.add(policy);
+  const peers = writers.get(policy.evidenceRoot) ?? new Set();
+  if (peers.size || hostWriters.has(policy.evidenceRoot)) { policy.invalidateEvidence(); for (const peer of peers) peer.invalidateEvidence(); }
+  peers.add(policy); writers.set(policy.evidenceRoot, peers); attached.add(policy);
 }
 export function newWorkspaceNativePolicy(permit: WorkspaceRunPermit, runtimeId: RegisteredPolicyRuntime, resolved: Resolved, installer?: WorkspaceRuntimeInstaller): RuntimeExecutionPolicy {
   const policy = createRuntimeExecutionPolicy(workspaceRuntimePolicyInput(permit, runtimeId, resolved, "attempt", installer));
@@ -45,7 +46,19 @@ export async function endWorkspaceNativePolicy(permit: WorkspaceRunPermit, polic
   if (!attached.has(policy)) return;
   await policy.drainAttempt({ keepResidentRoot: input.keepResidentRoot === true });
   finishWorkspaceNativePolicy(permit, policy);
-  attached.delete(policy); const peers = writers.get(policy.workRoot); peers?.delete(policy); if (!peers?.size) writers.delete(policy.workRoot);
+  attached.delete(policy); const peers = writers.get(policy.evidenceRoot); peers?.delete(policy); if (!peers?.size) writers.delete(policy.evidenceRoot);
+}
+/** Register only a concrete Host file commit, not an idle parent attempt. New native writers see it too. */
+export function beginWorkspaceHostWrite(evidenceRoot: string): () => void {
+  hostWriters.set(evidenceRoot, (hostWriters.get(evidenceRoot) ?? 0) + 1);
+  invalidateWorkspaceNativeEvidenceForHostWrite(evidenceRoot);
+  let closed = false;
+  return () => { if (closed) return; closed = true; invalidateWorkspaceNativeEvidenceForHostWrite(evidenceRoot);
+    const count = (hostWriters.get(evidenceRoot) ?? 1) - 1; if (count) hostWriters.set(evidenceRoot, count); else hostWriters.delete(evidenceRoot); };
+}
+/** Actual Host writes in the shared scan root must never become another native attempt's evidence. */
+export function invalidateWorkspaceNativeEvidenceForHostWrite(evidenceRoot: string): void {
+  for (const policy of writers.get(evidenceRoot) ?? []) policy.invalidateEvidence();
 }
 /** Bounded documented native item events. No arbitrary text is accepted as a write receipt. */
 export function observeWorkspaceNativeItem(permit: WorkspaceRunPermit, policy: RuntimeExecutionPolicy, item: Record<string, unknown>, status: "started" | "completed"): void {

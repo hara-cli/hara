@@ -21,7 +21,8 @@ function validChatAnchor(value: unknown, workspaceId: string): value is ChatSche
     && Number.isSafeInteger(value.configRevision) && Number(value.configRevision) > 0
     && Number.isSafeInteger(value.agentEpoch) && Number(value.agentEpoch) > 0 && isScopedRunConnection(value.connection);
 }
-interface FeatureState { resourceBinding: WorkspaceResourceBinding; revision: number; schedules: WorkspaceSchedule[]; disabledSkills: string[]; skills: WorkspaceSkillBundle[] }
+export interface WorkspaceArchivePauseReceipt { id: string; agentId: string; createdAt: string; schedules: WorkspaceSchedule[] }
+interface FeatureState { archivePauses: WorkspaceArchivePauseReceipt[]; resourceBinding: WorkspaceResourceBinding; revision: number; schedules: WorkspaceSchedule[]; disabledSkills: string[]; skills: WorkspaceSkillBundle[] }
 const safe = (value: string) => redactSensitiveText(value).text;
 export function validWorkspaceSchedule(value: any): value is Schedule {
   return plain(value) && (value.kind === "cron" && typeof value.expr === "string" && Boolean(parseCron(value.expr))
@@ -43,8 +44,22 @@ export class WorkspaceFeatures {
         || item.source === "chat" && (!validChatAnchor(item.definition.anchor, workspaceId) || item.definition.agentId !== item.definition.anchor.agentId)) throw new Error("Invalid scoped schedule");
       const skills = raw.skills === undefined ? [] : Array.isArray(raw.skills) && raw.skills.length <= 128 ? raw.skills.map(validateWorkspaceSkill) : null;
       if (!skills || new Set(skills.map(row => row.id)).size !== skills.length) throw new Error("Invalid skill locks");
-      return { ...structuredClone(raw), skills } as unknown as FeatureState;
-    }, () => ({ resourceBinding: this.state.binding(), revision: 0, schedules: [], disabledSkills: [], skills: [] }));
+      const archivePauses = raw.archivePauses ?? [];
+      if (!Array.isArray(archivePauses) || archivePauses.length > 4096 || new Set(archivePauses.map(row => row?.agentId)).size !== archivePauses.length)
+        throw new Error("Invalid archive pause receipts");
+      for (const receipt of archivePauses) {
+        if (!plain(receipt) || typeof receipt.id !== "string" || !UUID.test(receipt.id) || !text(receipt.agentId)
+          || typeof receipt.createdAt !== "string" || !Number.isFinite(Date.parse(receipt.createdAt)) || !Array.isArray(receipt.schedules)
+          || !receipt.schedules.length || receipt.schedules.length > 4096 || new Set(receipt.schedules.map(row => row?.id)).size !== receipt.schedules.length)
+          throw new Error("Invalid archive pause receipt");
+        for (const row of receipt.schedules) if (!plain(row) || row.workspaceId !== workspaceId || !text(row.id) || !text(row.name, 256)
+          || !validWorkspaceSchedule(row.schedule) || row.enabled !== true || typeof row.migrationId !== "string" || typeof row.source !== "string"
+          || !plain(row.definition) || row.definition.agentId !== receipt.agentId
+          || row.source === "chat" && (!validChatAnchor(row.definition.anchor, workspaceId) || row.definition.anchor.agentId !== receipt.agentId))
+          throw new Error("Invalid archive pause schedule");
+      }
+      return { ...structuredClone(raw), skills, archivePauses: structuredClone(archivePauses) } as unknown as FeatureState;
+    }, () => ({ resourceBinding: this.state.binding(), revision: 0, schedules: [], disabledSkills: [], skills: [], archivePauses: [] }));
   }
   list() {
     const value = this.state.read();
@@ -52,6 +67,7 @@ export class WorkspaceFeatures {
     for (const row of inherited) skills.set(row.id, row);
     for (const row of value.skills) skills.set(row.id, row);
     return { revision: value.revision, workspaceId: this.workspaceId,
+      archiveRecovery: value.archivePauses.map(row => ({ id: row.id, agentId: row.agentId, createdAt: row.createdAt, scheduleIds: row.schedules.map(schedule => schedule.id) })),
       schedules: value.schedules.map(({ definition, ...row }) => ({ ...row, name: safe(row.name),
         ...(row.source === "chat" && validChatAnchor(definition.anchor, this.workspaceId) ? { anchor: {
           conversationId: definition.anchor.conversationId, messageId: definition.anchor.messageId, agentId: definition.anchor.agentId } } : {}),
@@ -65,15 +81,19 @@ export class WorkspaceFeatures {
     this.state.update(expected, current => { const row = current.schedules.find(row => row.id === id); if (!row) throw new Error("Scoped schedule unavailable");
       if (enabled && restoredAgentEpoch !== undefined && row.source === "chat" && validChatAnchor(row.definition.anchor, this.workspaceId))
         row.definition.anchor = { ...row.definition.anchor, agentEpoch: restoredAgentEpoch };
-      row.enabled = enabled; return current; });
+      row.enabled = enabled; current.archivePauses = this.withoutReviewedSchedule(current.archivePauses, id); return current; });
   }
   /** Deletion pauses durably before drain. User restoration never re-enables these schedules. */
   pauseAgentSchedules(agentId: string): number { return this.pauseAgentSchedulesWithReceipt(agentId).length; }
   pauseAgentSchedulesWithReceipt(agentId: string): WorkspaceSchedule[] {
     const before = this.state.read(), matches = before.schedules.filter(row => row.enabled && row.definition.agentId === agentId);
+    if (before.archivePauses.some(row => row.agentId === agentId)) throw new Error("Review the retained archive pause receipt before retrying deletion");
     if (!matches.length) return [];
     const ids = new Set(matches.map(row => row.id));
-    this.state.update(before.revision, current => ({ ...current, schedules: current.schedules.map(row => ids.has(row.id) ? { ...row, enabled: false } : row) }));
+    // The rollback receipt and paused bits share one atomic private-state commit. A crash cannot keep only the bits.
+    this.state.update(before.revision, current => ({ ...current,
+      archivePauses: [...current.archivePauses, { id: randomUUID(), agentId, createdAt: new Date().toISOString(), schedules: structuredClone(matches) }],
+      schedules: current.schedules.map(row => ids.has(row.id) ? { ...row, enabled: false } : row) }));
     return matches;
   }
   /** Only rollback a failed archive's exact pause receipt; preserve unrelated schedule changes. */
@@ -86,7 +106,24 @@ export class WorkspaceFeatures {
         || JSON.stringify({ ...current, enabled: false }) !== JSON.stringify({ ...original, enabled: false }))
         throw new Error("Paused schedule changed; review before restoring its state");
     }
-    this.state.update(before.revision, current => ({ ...current, schedules: current.schedules.map(row => ids.has(row.id) ? { ...row, enabled: true } : row) }));
+    this.state.update(before.revision, current => ({ ...current,
+      archivePauses: this.withoutArchiveReceipt(current.archivePauses, agentId, receipt),
+      schedules: current.schedules.map(row => ids.has(row.id) ? { ...row, enabled: true } : row) }));
+  }
+  /** Host-private recovery data; list() exposes only IDs, never the task bodies in these snapshots. */
+  archivePauseReceipts(): WorkspaceArchivePauseReceipt[] { return structuredClone(this.state.read().archivePauses); }
+  finishArchivePause(agentId: string, receipt: readonly WorkspaceSchedule[]) {
+    if (!receipt.length) return;
+    const before = this.state.read();
+    this.state.update(before.revision, current => ({ ...current, archivePauses: this.withoutArchiveReceipt(current.archivePauses, agentId, receipt) }));
+  }
+  private withoutArchiveReceipt(receipts: WorkspaceArchivePauseReceipt[], agentId: string, schedules: readonly WorkspaceSchedule[]) {
+    const found = receipts.find(row => row.agentId === agentId);
+    if (!found || canonical(found.schedules) !== canonical(schedules)) throw new Error("Archive pause receipt changed; retained for review");
+    return receipts.filter(row => row.id !== found.id);
+  }
+  private withoutReviewedSchedule(receipts: WorkspaceArchivePauseReceipt[], id: string) {
+    return receipts.map(row => ({ ...row, schedules: row.schedules.filter(schedule => schedule.id !== id) })).filter(row => row.schedules.length);
   }
   schedules(): WorkspaceSchedule[] { return this.state.read().schedules; }
   saveSchedule(input: unknown, expected: number) {
@@ -105,7 +142,7 @@ export class WorkspaceFeatures {
       const row: WorkspaceSchedule = { id: input.id as string, name: input.name as string, enabled: input.enabled as boolean, schedule: structuredClone(input.schedule) as Schedule,
         workspaceId: this.workspaceId, migrationId: previous?.migrationId ?? "", source: previous?.source ?? "workspace",
         definition: { ...(previous?.source === "chat" ? { anchor: previous.definition.anchor } : {}), task: input.task, agentId: input.agentId, ...(input.tz ? { tz: input.tz } : {}), mode: "print", createdAt: previous?.definition.createdAt ?? Date.now() } };
-      return { ...current, schedules: [...current.schedules.filter(item => item.id !== row.id), row] };
+      return { ...current, ...(row.enabled ? { archivePauses: this.withoutReviewedSchedule(current.archivePauses, row.id) } : {}), schedules: [...current.schedules.filter(item => item.id !== row.id), row] };
     });
   }
   createChatSchedule(input: { title: string; task: string; agentId: string; time: ChatScheduleTime; anchor: ChatScheduleAnchor }) {
@@ -122,7 +159,7 @@ export class WorkspaceFeatures {
         mode: "print", createdAt: Date.now(), anchor: input.anchor } }] }));
     return id;
   }
-  deleteSchedule(id: string, expected: number) { this.state.update(expected, current => ({ ...current, schedules: current.schedules.filter(row => row.id !== id) })); }
+  deleteSchedule(id: string, expected: number) { this.state.update(expected, current => ({ ...current, archivePauses: this.withoutReviewedSchedule(current.archivePauses, id), schedules: current.schedules.filter(row => row.id !== id) })); }
   removeMigration(ids: readonly string[]) {
     const current = this.state.read(); if (!current.schedules.some(row => ids.includes(row.migrationId))) return;
     this.state.update(current.revision, value => ({ ...value, schedules: value.schedules.filter(row => !ids.includes(row.migrationId)) }));

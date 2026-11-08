@@ -1,3 +1,4 @@
+import { WorkspaceNativeSessions, resettableNativeRuntime } from "./native-session-boundary.js";
 import { runtimeToolTargetLabel } from "./runtime-tool-label.js";
 import type { MessageTimingPoint, MessageTimingRecorder } from "./message-timing.js";
 import { runtimeStageErrorKind } from "../agent-runtime/stage-observer.js";
@@ -40,6 +41,7 @@ interface PermitState {
   options?: RunOpts;
   cwd: string;
   managedProject: boolean;
+  managedLegacyRoot?: string;
   hasLegacyToolPolicy: boolean;
   nativeConversationSafe: boolean;
   stateHome: string;
@@ -107,6 +109,14 @@ export function workspaceRunHasManagedProject(permit: WorkspaceRunPermit): boole
   const state = stateOf(permit); state.assertLive(); return state.managedProject;
 }
 
+/** Closed Host projection: the legacy compatibility root and this exact Agent's home, never caller paths. */
+export function workspaceRunManagedProjectRoots(permit: WorkspaceRunPermit): Readonly<{ workRoot: string; legacyRoot: string; homeRoot: string }> | null {
+  const state = stateOf(permit); state.assertLive();
+  if (!state.managedProject || !state.managedLegacyRoot) return null;
+  return Object.freeze({ workRoot: state.cwd, legacyRoot: state.managedLegacyRoot,
+    homeRoot: join(state.managedLegacyRoot, "colleagues", permit.binding.agent.agentId) });
+}
+
 export function createWorkspaceRunPermit(input: {
   binding: WorkspaceRunBinding;
   catalog: LocalWorkspaceCatalog;
@@ -140,8 +150,13 @@ export function createWorkspaceRunPermit(input: {
   updateUsage(value: Readonly<WorkspaceUsage>): void;
 }): WorkspaceRunPermit {
   const binding = freezeWorkspaceRunBinding(input.binding), cwd = realpathSync.native(input.cwd);
-  const managedProject = input.managedProjectRoot === cwd && basename(input.catalog.home) === "home"
-    && cwd === join(dirname(input.catalog.home), "project", binding.scope.workspaceId);
+  const legacyRoot = join(dirname(input.catalog.home), "project", binding.scope.workspaceId);
+  const homeRoot = join(legacyRoot, "colleagues", binding.agent.agentId);
+  const managedProject = input.managedProjectRoot === legacyRoot && basename(input.catalog.home) === "home"
+    && (cwd === legacyRoot || cwd === homeRoot);
+  const legacyIdentity = managedProject ? lstatSync(legacyRoot, { bigint: true }) : undefined;
+  if (legacyIdentity && (!legacyIdentity.isDirectory() || legacyIdentity.isSymbolicLink() || realpathSync.native(legacyRoot) !== legacyRoot))
+    throw new Error("Invalid managed Workspace project identity");
   if (input.managedProjectRoot !== undefined && !managedProject) throw new Error("Invalid managed Workspace project proof");
   if (cwd !== binding.project.root || canonical(input.resources.scope) !== canonical(binding.scope) || canonical(input.storage.scope) !== canonical(binding.scope)
     || input.lease.sessionId !== binding.sessionId || input.provider.model !== binding.connection.model
@@ -156,6 +171,11 @@ export function createWorkspaceRunPermit(input: {
   const assertLive = (): void => {
     if (state?.retired || input.signal.aborted || (binding.budget.mode !== "interactive" && Date.now() - started >= binding.budget.timeoutMs)) throw new Error("Workspace attempt cancelled or expired");
     input.lease.assertCurrent();
+    if (legacyIdentity) {
+      const currentLegacy = lstatSync(legacyRoot, { bigint: true });
+      if (!currentLegacy.isDirectory() || currentLegacy.isSymbolicLink() || realpathSync.native(legacyRoot) !== legacyRoot
+        || currentLegacy.dev !== legacyIdentity.dev || currentLegacy.ino !== legacyIdentity.ino) throw new Error("Workspace legacy project identity changed");
+    }
     const project = lstatSync(cwd, { bigint: true });
     if (!project.isDirectory() || project.isSymbolicLink() || realpathSync.native(cwd) !== cwd
       || !workspaceFileIdMatches(binding.project.dev, project.dev) || !workspaceFileIdMatches(binding.project.ino, project.ino)) throw new Error("Workspace project grant identity changed");
@@ -255,7 +275,7 @@ export function createWorkspaceRunPermit(input: {
       }
     },
   };
-  state = { completionEvidence: createWorkspaceCompletionEvidence(input.storage, binding, input.completionRecovery), nativeConversationSafe: true, compactionSource: input.compactionSource, onNativeRisks: input.onNativeRisks, storage: input.storage, assertLive, provider, cwd, managedProject, hasLegacyToolPolicy: Boolean(input.resources.agents.resolveTask(binding.agent).toolPolicy), stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
+  state = { completionEvidence: createWorkspaceCompletionEvidence(input.storage, binding, input.completionRecovery), nativeConversationSafe: true, compactionSource: input.compactionSource, onNativeRisks: input.onNativeRisks, storage: input.storage, assertLive, provider, cwd, managedProject, ...(managedProject ? { managedLegacyRoot: legacyRoot } : {}), hasLegacyToolPolicy: Boolean(input.resources.agents.resolveTask(binding.agent).toolPolicy), stateHome, signal: input.signal, tools: new Set(input.toolNames), usage: { ...input.usage },
     updateUsage: input.updateUsage, pending: new Set(), lease: input.lease, retired: false, started: false, wakeChars: 0,
     interaction: input.interaction, onQuestion: input.onQuestion, onInteractionChanged: input.onInteractionChanged, interactionUsage: input.interactionUsage, startedAt: started, toolTail: Promise.resolve(),
     audit: new WorkspaceExecutionAudit(input.storage, binding.runId, binding.agent.agentId),
@@ -340,6 +360,12 @@ export function workspaceRuntimeStorage(permit: WorkspaceRunPermit): WorkspaceRe
 /** Trusted Host facts, rechecked at use. Never exposed as a model/renderer capability. */
 export function workspaceCompactionSource(permit: WorkspaceRunPermit): WorkspaceConversation | null {
   const state = stateOf(permit); state.assertLive(); return state.compactionSource?.() ?? null;
+}
+/** Native context reset is independent from UI history and task budgets. Boundaries retain absolute indices. */
+export function workspaceNativeSessionBoundary(permit: WorkspaceRunPermit, historyLength: number) {
+  const state = stateOf(permit); state.assertLive(); const binding = permit.binding;
+  return resettableNativeRuntime(binding.agent.runtimeId)
+    ? new WorkspaceNativeSessions(state.storage, binding.agent.agentId, binding.sessionId).latest(binding.agent.runtimeId, historyLength) : null;
 }
 /** Reserve the separate native maintenance dispatch before effects; the ordinary turn is already reserved. */
 export function reserveWorkspaceCompaction(permit: WorkspaceRunPermit): ((ok: boolean, kind?: import("../agent-runtime/failure-diagnostics.js").RuntimeFailureKind) => void) | null {

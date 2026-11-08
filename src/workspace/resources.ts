@@ -113,10 +113,15 @@ export class WorkspaceResources {
       roots: bind(memory.memoryRoots), digest: bind(memory.memoryDigest), append: bindAsync(memory.appendMemory, "memory-write"),
       appendOnce: bindAsync(memory.appendMemoryOnce, "memory-write"), replace: bindAsync(memory.replaceMemory, "memory-write"), forget: bindAsync(memory.forgetMemory, "memory-write"),
       recentLogs: bind(memory.readRecentLogs), scaffold: bindAsync(memory.scaffoldMemory, "memory-write"),
-      search: bindAsync(async (query: string, cwd: string, limit: number = 5) => {
+      search: bindAsync(async (query: string, cwd: string, limit: number = 5, scope: "mine" | "workspace" | "all" = "all") => {
         if (typeof query !== "string" || !query.trim() || query.length > 512
           || !Number.isSafeInteger(limit) || limit < 1 || limit > 10) throw new Error("invalid Workspace memory search");
-        const hits = await searchHybrid(query, cwd, { indexName: "memory", roots: memory.memoryRoots(cwd), limit });
+        const roots = memory.memoryRoots(cwd, scope), hits = [];
+        // Private facts are ranked before shared facts; never enumerate other colleagues' roots.
+        for (const root of roots) {
+          hits.push(...await searchHybrid(query, cwd, { indexName: "memory", roots: [root], limit: limit - hits.length }));
+          if (hits.length >= limit) break;
+        }
         return hits.map(hit => ({ ...hit, title: sanitizeMemoryForPrompt(hit.title).text.trim() || "memory",
           snippet: sanitizeMemoryForPrompt(hit.snippet).text.trim() })).filter(hit => hit.snippet);
       }),

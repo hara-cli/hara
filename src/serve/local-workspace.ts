@@ -112,7 +112,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       return host.renameWorkspace(workspaceId, params.label, params.expectedRevision); }
     if (method === "workspace.media.register" || method === "workspace.media.describe") {
       fields(["workspaceId", "expectedGeneration", "path"]); if (!text(params.path, 4096)) throw new Error("Invalid Workspace media path");
-      return host.registerMedia(workspaceId, params.path, method === "workspace.media.describe");
+      return host.registerMedia(workspaceId, params.path, method === "workspace.media.describe", client.id);
     }
     if (method === "workspace.session.paint") {
       fields(["workspaceId", "expectedGeneration", "agentId", "sessionId", "runId", "attemptId", "timing"]);

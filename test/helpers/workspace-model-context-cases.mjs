@@ -133,7 +133,10 @@ if (selected.includes(6)) test("synthetic six-step flow uses per-task context, a
     assert.equal(mainState.taskState, "completed"); assert.equal(mainState.completion.state, "verified");
     assert.equal(child.taskState, "completed"); assert.equal(colleague.runtime.id, "pi");
     assert.ok(child.history.some(m => m.role === "user" && m.content.includes("\n")));
-    assert.equal(fs.readFileSync(join(path, "project", id, "hello.md"), "utf8"), "hello workspace\n");
+    const primary=join(path,"project",id,"colleagues",colleague.agentId),home=host.snapshot(id,colleague.agentId).colleagueHome;
+    assert.equal(home.path,primary);assert.equal(home.available,true);
+    assert.equal(fs.readFileSync(join(primary,"hello.md"),"utf8"),"hello workspace\n");
+    assert.equal(fs.existsSync(join(path,"project",id,"hello.md")),false,"delegation must not fall back to the old shared cwd");
     assert.deepEqual(mainState.history.slice(0, old.length), old);
     for (const call of calls.filter(c => c.objective !== "OLD_CHAT_MARKER")) {
       assert.equal(JSON.stringify(call.history).includes("OLD_CHAT_MARKER"), false);

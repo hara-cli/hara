@@ -1,3 +1,9 @@
+import { WorkspaceColleagueHomes, WorkspacePrimaryDirectoryError } from "./colleague-homes.js";
+import { WorkspaceColleagueInstructions, COLLEAGUE_INSTRUCTION_FILES, type InstructionDraft, type ColleagueInstructionFile } from "./colleague-instructions.js";
+import { WorkspaceNativeSessions, resettableNativeRuntime } from "./native-session-boundary.js";
+import { withWorkspaceAgentMemory, withWorkspaceSharedMemory } from "../memory/agent-scope.js";
+import { invalidateWorkspaceNativeEvidenceForHostWrite, beginWorkspaceHostWrite } from "../agent-runtime/workspace-native-policy.js";
+import { groupCreationAuthorized, singleGroupCreationRequest, type GroupCreateDraft } from "./group-create.js";
 import { WorkspaceMediaRegistry } from "./media.js";
 import { colleagueProposal } from "./colleague-proposal.js";
 import { CodexHistoryBoundaries } from "./codex-history-boundary.js";
@@ -16,7 +22,7 @@ import { workspaceRunNativeEvidence } from "./execution.js";
 import { defaultRuntimePermissionTier, isRuntimePermissionTier, NativeEngineUnsupportedError, RuntimeTierUnavailableError, type RuntimePermissionTier } from "../agent-runtime/execution-policy.js";
 import { createHash, randomUUID } from "node:crypto";
 import { lstatSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { runConfiguredAgent } from "../agent-runtime/dispatch.js";
 import { AgentRuntimeRegistry } from "../agent-runtime/registry.js";
 import { applyTaskBrief, applyTaskCheckpoint, continueTaskExecution, createTaskExecution, finishTaskExecution, freshTaskCompletion, recordAwaitingTaskDecision, requestsTaskContinuation, type TaskExecution } from "../session/task.js";
@@ -91,7 +97,7 @@ const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTo
 export const colleagueCreateIntent = (message: string): boolean =>
   !/(?:不要|别|別|不必|无需|無需|do not|don't|never|without)\s*.{0,12}?(?:建立|建一?[个個位]?|创建|創建|新增|create|add)/iu.test(message)
   && /(?:建立|建一?[个個位]?|创建|創建|新增|create|add)\s*.{0,30}?(?:同事|bot|agent|colleague)/iu.test(message);
-interface WorkspaceHostContext { media?: WorkspaceMediaRegistry; resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; extensions: WorkspaceExtensions; mcp: WorkspaceMcpManager; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
+interface WorkspaceHostContext { media?: WorkspaceMediaRegistry; resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; homes: WorkspaceColleagueHomes; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; extensions: WorkspaceExtensions; mcp: WorkspaceMcpManager; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
 type WorkspaceConnectionSnapshot = ReturnType<WorkspaceConnectionStoreV2["list"]> & {
   readOnly?: boolean; recovered?: boolean; migrationPending?: boolean; unavailable?: boolean; activeConnectionId?: string | null;
 };
@@ -99,14 +105,15 @@ export interface LocalWorkspaceApproval {
   id: string; workspaceId: string; agentId: string; runId: string; expiresAt: string;
   resourceGeneration: string;
   channelId?: string;
-  kind: "agent_create" | "schedule_create" | "extension_call"; draft: { sourceName: string; toolName: string; target: string; action: "read" | "exec" } | ColleagueCreateDraft | { title: string; task: string; timing: string; tz: string };
+  kind: "agent_create" | "group_create" | "schedule_create" | "extension_call" | "instruction_update" | "memory_promote"; draft: { sourceName: string; toolName: string; target: string; action: "read" | "exec" } | InstructionDraft | { content: string; scope: "project" | "global" } | ColleagueCreateDraft | GroupCreateDraft | { title: string; task: string; timing: string; tz: string };
   projectOptions?: string[];
   catalogRevision?: number;
+  channelRevision?: number;
 }
 export interface ColleagueCreateDraft { username: string; displayName: string; title: string; instructions: string;
   project: string; runtimeId: AgentRuntimeId; permissionTier: RuntimePermissionTier }
 type ApprovalSettleState = "declined" | "expired" | "aborted";
-type ApprovalDecision = { approved: true; draft: ColleagueCreateDraft | LocalWorkspaceApproval["draft"]; catalogRevision?: number } | { approved: false; state: ApprovalSettleState };
+type ApprovalDecision = { approved: true; draft: ColleagueCreateDraft | LocalWorkspaceApproval["draft"]; catalogRevision?: number; channelRevision?: number } | { approved: false; state: ApprovalSettleState };
 interface PendingApproval { card: LocalWorkspaceApproval; clientId: string; selectionEpoch: number; job: LocalJob;
   finish(decision: ApprovalDecision): void; timer: ReturnType<typeof setTimeout> }
 interface MessageTimingEntry { selectionEpoch?: number; recorder: MessageTimingRecorder; identity: MessageTimingIdentity; clientId: string; storage: WorkspaceResourceStorage; store: WorkspaceMessageTimingStore; endedAt?: number }
@@ -284,7 +291,7 @@ export class LocalWorkspaceHost {
     const runtimes = new WorkspaceRuntimeInstaller(storage, { ...((this.options.discoveryHome ?? this.options.hostHome) ? { discovery: { home: (this.options.discoveryHome ?? this.options.hostHome)!, probeHome: this.options.hostHome, shell: process.env.HARA_WORKSPACE_HOST_SHELL } } : {}),
       ...this.options.runtimeInstallerOptions, onChange: () => this.changed(workspaceId) });
     const resources = new WorkspaceResources(this.home, row.scope, { assertCurrent: assertAuthority, runtimeInstaller: runtimes }); resources.initialize();
-    const context: WorkspaceHostContext = { storage, resources, connections, project, extensions: new WorkspaceExtensions(storage),
+    const context: WorkspaceHostContext = { storage, resources, connections, project, homes: new WorkspaceColleagueHomes(storage, project), extensions: new WorkspaceExtensions(storage),
       mcp: new WorkspaceMcpManager(storage, { accountHome: this.options.hostHome ?? this.home, invalidateReview: (sourceId, revision) => this.mcpOwnerReview.invalidate(sourceId, revision), proxy: () => runtimes.proxy.read(), onChange: () => this.changed(workspaceId) }),
       features: new WorkspaceFeatures(storage, project, workspaceId, this.options.mode === "workspace" ? this.options.hostHome : undefined),
       runtimes, runtimeModels: new WorkspaceRuntimeModels(storage, runtimes) };
@@ -376,13 +383,18 @@ export class LocalWorkspaceHost {
     const current = this.context(workspaceId).storage.run(() => currentWorkspaceResourceBinding()!.generation);
     if (typeof generation !== "string" || generation !== current) throw new Error("Workspace resource generation changed; refresh before acting");
   }
-  registerMedia(workspaceId: string, path: string, describe = false) {
+  registerMedia(workspaceId: string, path: string, describe = false, clientId?: string) {
     const context = this.context(workspaceId);
     const generation = context.storage.run(() => currentWorkspaceResourceBinding()!.generation);
     context.media ??= new WorkspaceMediaRegistry(context.project, () => [context.project,
       ...new WorkspaceLegacyResources(context.storage).directoryReferencesForHost().filter(row => row.purposes.some(kind => kind === "project" || kind === "workspace-files")).map(row => row.path)],
-    () => { if (this.closing || this.context(workspaceId) !== context) throw new Error("Workspace media unavailable"); this.assertGeneration(workspaceId, generation); });
-    return describe ? context.media.describe(path) : context.media.register(path);
+    () => { if (this.closing || this.context(workspaceId) !== context) throw new Error("Workspace media unavailable"); this.assertGeneration(workspaceId, generation); }, true);
+    const selection = clientId ? this.clients.get(clientId) : undefined;
+    const agent = selection?.workspaceId === workspaceId && !selection.channelId && selection.agentId ? context.resources.agents.get(selection.agentId) : undefined;
+    const project = agent ? this.runProject(context, agent, new WorkspaceConversationStore(context.storage, agent.agentId).read(), false) : context.project;
+    // Preserve traversal/URI validation in the registry, while rebasing relative paths to the selected colleague.
+    const resolved = path.startsWith("file:") || path.split(/[\\/]/u).includes("..") ? path : resolve(project, path);
+    return describe ? context.media.describe(resolved) : context.media.register(resolved);
   }
   readMedia(id: string, range?: string, head = false, pathOnly = false) {
     for (const context of this.contexts.values()) if (context.media?.has(id)) return context.media.read(id, range, head, pathOnly);
@@ -929,7 +941,11 @@ export class LocalWorkspaceHost {
       if (this.closing || this.updateLease || this.context(workspaceId) !== context) throw new Error("Workspace view changed during colleague cleanup");
       this.assertGeneration(workspaceId, generation);
       const agent = context.resources.agents.setArchived(agentId, archived, configRevision, agentEpoch, pausedBefore.length);
-      this.changed(workspaceId); return { agent, pausedSchedules: pausedBefore.length, stoppedTasks: jobs.length };
+      // Agent lifecycle already committed. If receipt cleanup fails, keep its durable recovery record;
+      // never turn a successful deletion into an attempted schedule re-enable.
+      let archiveRecoveryPending = false;
+      try { context.features.finishArchivePause(agentId, pausedBefore); } catch { archiveRecoveryPending = true; }
+      this.changed(workspaceId); return { agent, pausedSchedules: pausedBefore.length, stoppedTasks: jobs.length, archiveRecoveryPending };
     } catch (error) {
       if (pausedBefore.length) {
         try {
@@ -964,11 +980,15 @@ export class LocalWorkspaceHost {
     if (!selected || !catalog.agents.some(agent => agent.agentId === selected)) throw new Error("Workspace Agent unavailable; no legacy roster was selected");
     const value = new WorkspaceConversationStore(context.storage, selected).read();
     const live = [...this.jobs.values()].find(job => !job.closed && job.workspaceId === workspaceId && job.agentId === selected && !job.channelId);
-    const connections = this.connectionSnapshot(context);
+    const connections = this.connectionSnapshot(context), selectedAgent = catalog.agents.find(agent => agent.agentId === selected)!;
+    const selectedNative = selectedAgent.runtime.id === "codex" ? codexThreadState(context.storage, selected, value.sessionId).read() : null;
     return { workspaceId, resourceGeneration: context.storage.run(() => currentWorkspaceResourceBinding()!.generation),
       inheritance: workspaceId === this.inheritanceWorkspaceId ? this.inheritanceState : noLegacyStartup(),
       label: row.label, agentRevision: catalog.revision, agents: catalog.agents,
       runtimeOptions: context.resources.agents.runtimeOptions(), selectedAgentId: selected,
+      ...(selectedAgent.kind === "colleague" ? { colleagueHome: { ...context.homes.view(selected), codexMigrationPending: selectedNative !== null && Boolean(value.history.length || selectedNative.threadId)
+        && !context.homes.codexHomeActivated(selected, value.sessionId, selectedNative.resets)
+        && value.task?.workspaceRunBinding?.project.root !== context.homes.path(selected) } } : {}),
       connections, runtimes: context.runtimes.list(),
       accountUsage: this.runtimeUsageAccounts(workspaceId, context).map(account => ({ agentId: account.agentId,
         ...this.usageCache.read(account) })), conversation: { revision: value.revision, sessionId: value.sessionId,
@@ -990,8 +1010,9 @@ export class LocalWorkspaceHost {
         runtimeStages: this.runtimeStageReports(context, selected, value.sessionId),
         messageTimings: this.messageTimingReports(context, selected, value.sessionId),
         nativeRisks: new WorkspaceNativeRiskStore(context.storage, selected, value.sessionId).read(),
-        ...(catalog.agents.find(agent => agent.agentId === selected)?.runtime.id === "codex"
-          ? { nativeSession: codexThreadView(codexThreadState(context.storage, selected, value.sessionId).read()) } : {}),
+        ...(selectedAgent.runtime.id === "codex"
+          ? { nativeSession: codexThreadView(selectedNative!) }
+          : resettableNativeRuntime(selectedAgent.runtime.id) ? { nativeSession: new WorkspaceNativeSessions(context.storage, selected, value.sessionId).view(selectedAgent.runtime.id, value.history.length) } : {}),
         resumeAdmission: this.resumeAdmission(context, value),
         history: value.history.map(message => message.role === "assistant" ? { role: message.role, text: message.text, tools: message.toolUses.map(tool => tool.name) }
           : message.role === "tool" ? { role: message.role, results: message.results.map(result => ({ id: result.id, name: result.name, content: result.content, isError: result.isError ?? false })) }
@@ -1106,8 +1127,17 @@ export class LocalWorkspaceHost {
       || selection.epoch !== pending.selectionEpoch || pending.job.signal.aborted || Date.parse(pending.card.expiresAt) <= Date.now()) throw new Error("approval expired or belongs to another view");
     assertWorkspaceRunAdmission(pending.job.permit, pending.job.options!, pending.job.binding.agent.runtimeId);
     if (!approved) { pending.finish({ approved: false, state: "declined" }); return; }
+    if (pending.card.kind === "group_create") {
+      if (editedDraft !== undefined) throw new Error("Group approval cannot edit its frozen draft");
+      const context = this.context(workspaceId), draft = pending.card.draft as GroupCreateDraft;
+      if (pending.card.catalogRevision !== context.resources.agents.list().revision
+        || pending.card.channelRevision !== this.localChannels(workspaceId).list().revision)
+        throw new Error("Group or colleague roster changed; review a fresh group card");
+      this.assertGroupMembers(context, draft.memberIds);
+      pending.finish({ approved: true, draft, catalogRevision: pending.card.catalogRevision, channelRevision: pending.card.channelRevision }); return;
+    }
     if (pending.card.kind !== "agent_create") {
-      if (editedDraft !== undefined) throw new Error("Schedule approval cannot edit its frozen draft");
+      if (editedDraft !== undefined) throw new Error("This approval cannot edit its frozen draft");
       pending.finish({ approved: true, draft: pending.card.draft }); return;
     }
     const draft = editedDraft ?? pending.card.draft;
@@ -1125,6 +1155,11 @@ export class LocalWorkspaceHost {
       throw new Error("Project candidate changed; review the current Workspace catalog");
     pending.finish({ approved: true, draft: draft as unknown as ColleagueCreateDraft, catalogRevision: pending.card.catalogRevision });
   }
+  private assertGroupMembers(context: WorkspaceHostContext, members: unknown): void {
+    if (!Array.isArray(members) || members.length < 2 || members.length > 64 || new Set(members).size !== members.length
+      || members.some(id => typeof id !== "string" || !context.resources.agents.list().agents.some(agent => agent.agentId === id && agent.kind === "colleague" && agent.state === "active")))
+      throw new Error("A group needs at least two distinct active colleagues in this Workspace");
+  }
   private approval(job: LocalJob, draft: LocalWorkspaceApproval["draft"], kind: LocalWorkspaceApproval["kind"] = "agent_create"): Promise<ApprovalDecision> {
     const selection = this.clients.get(job.clientId);
     if (this.options.interactiveApprovals === false || !selection || selection.workspaceId !== job.workspaceId
@@ -1135,7 +1170,9 @@ export class LocalWorkspaceHost {
       resourceGeneration: job.binding.agent.resourceBinding.generation, ...(job.channelId ? { channelId: job.channelId } : {}),
       runId: job.binding.runId, kind, expiresAt: new Date((job.binding.budget.mode === "interactive" ? Date.now() : Date.parse(job.value.attempt!.startedAt)) + (typeof this.options.approvalTimeoutMs === "number" && this.options.approvalTimeoutMs > 0 ? this.options.approvalTimeoutMs : job.binding.budget.timeoutMs)).toISOString(), draft: Object.freeze({ ...draft }),
       ...(kind === "agent_create" ? { projectOptions: job.startContext?.projectLocations?.options ?? [],
-        catalogRevision: job.context.resources.agents.list().revision } : {}) };
+        catalogRevision: job.context.resources.agents.list().revision } : {}),
+      ...(kind === "group_create" ? { catalogRevision: job.context.resources.agents.list().revision,
+        channelRevision: this.localChannels(job.workspaceId).list().revision } : {}) };
     return new Promise(resolve => {
       const onAbort = () => finish({ approved: false, state: "aborted" });
       const finish = (decision: ApprovalDecision) => {
@@ -1205,7 +1242,7 @@ export class LocalWorkspaceHost {
   private pendingInteractions(context: WorkspaceHostContext, value: WorkspaceConversation, cards: readonly LocalWorkspaceApproval[]): WorkspaceInteractionRequest[] {
     this.pendingUserQuestion(context, value); // reconcile/materialize the retained sync ask first
     const asks = this.interactionFor(context, value)?.pendingInteractions() ?? [];
-    return [...cards.map(card => workspacePermissionInteraction({ id: card.id, kind: card.kind, runId: card.runId, draft: { displayName: card.kind === "schedule_create" ? (card.draft as { title: string }).title : (card.draft as { displayName: string }).displayName } })), ...asks];
+    return [...cards.map(card => workspacePermissionInteraction({ id: card.id, kind: card.kind, runId: card.runId, draft: { displayName: card.kind === "schedule_create" ? (card.draft as { title: string }).title : card.kind === "group_create" ? (card.draft as GroupCreateDraft).name : card.kind === "instruction_update" ? (card.draft as InstructionDraft).file : card.kind === "memory_promote" ? "Shared memory" : (card.draft as { displayName: string }).displayName } })), ...asks];
   }
   private questionCheckpoint(task: TaskExecution, question: WorkspaceUserQuestion): TaskExecution {
     if (task.status === "paused" && freshTaskCompletion(task)?.state === "awaiting_user"
@@ -1247,9 +1284,38 @@ export class LocalWorkspaceHost {
     if (snapshot.tools.length && this.extensionClients.has(job.clientId)) job.extensionAttempt = job.context.mcp.createAttempt({ snapshot, extensions: job.context.extensions,
       runId: job.binding.runId, deadline: Date.parse(job.value.attempt!.startedAt) + job.binding.budget.timeoutMs,
       signal: job.signal, assertCurrent: () => { assertCurrent(); if (!this.extensionClients.has(job.clientId)) throw new Error("Extension confirmation client unavailable"); } });
-    const tools = [...(job.extensionAttempt?.tools ?? []), ...localWorkspaceFileTools(job.context.project, assertCurrent), job.receipts!.tool(), job.startContext!.tool(assertCurrent),
-      workspaceMemorySearchTool((query, limit) => job.context.resources.memory.search(query, job.context.project, limit), assertCurrent),
+    const tools = [...(job.extensionAttempt?.tools ?? []), ...localWorkspaceFileTools(job.binding.project.root, assertCurrent, { legacyProject: job.context.project,
+      ownHome: job.context.homes.path(agent.agentId), beginWrite: () => beginWorkspaceHostWrite(job.context.project), onWrite: () => invalidateWorkspaceNativeEvidenceForHostWrite(job.context.project) }), job.receipts!.tool(), job.startContext!.tool(assertCurrent),
+      workspaceMemorySearchTool((query, limit, scope) => job.context.resources.memory.search(query, job.context.project, limit, scope), assertCurrent),
       workspaceSkillTool(bundles, (id, version) => { assertCurrent(); if (!isWorkspaceOperationSkill(id, version)) job.context.features.assertSkill(id, version); })];
+    tools.push({ name: "workspace_memory_write", description: "Remember bounded facts for this colleague only. Shared notes require workspace_memory_promote and a human card.", kind: "edit",
+      input_schema: { type: "object", properties: { content: { type: "string" } }, required: ["content"] }, async run(input, ctx) {
+        if (!plain(input) || !exact(input, ["content"]) || !messageBody(input.content, 8000)) throw new Error("Invalid private memory note");
+        assertCurrent(); const saved = await job.context.resources.memory.appendOnce("project", "memory", input.content, job.context.project, ctx.signal);
+        assertCurrent(); if (saved.appended) ctx.verifiedChange?.(createHash("sha256").update(input.content).digest("hex"));
+        return JSON.stringify({ remembered: true, scope: "mine", appended: saved.appended });
+      } });
+    tools.push({ name: "workspace_memory_promote", description: "Propose one exact shared memory note for this Workspace. No shared write happens before a human confirms the frozen note.", kind: "edit",
+      input_schema: { type: "object", properties: { content: { type: "string" }, scope: { type: "string", enum: ["project", "global"] } }, required: ["content", "scope"] }, run: async (input, ctx) => {
+        if (!plain(input) || !exact(input, ["content", "scope"]) || !messageBody(input.content, 8000) || !["project", "global"].includes(String(input.scope))) throw new Error("Invalid shared memory proposal");
+        assertCurrent(); const draft = { content: input.content, scope: input.scope as "project" | "global" }, decision = await this.approval(job, draft, "memory_promote");
+        if (!decision.approved) return JSON.stringify({ remembered: false, approvalState: decision.state });
+        assertCurrent(); await withWorkspaceSharedMemory(() => job.context.resources.memory.appendOnce(draft.scope, "memory", draft.content, job.context.project, ctx.signal));
+        ctx.verifiedChange?.(createHash("sha256").update(draft.content).digest("hex"));
+        return JSON.stringify({ remembered: true, scope: "workspace", humanConfirmed: true, approvalState: "consumed" });
+      } });
+    if (agent.kind === "colleague") tools.push({ name: "workspace_instruction_update", description: "Propose a change to this colleague's managed AGENTS.md or CLAUDE.md guidance. Hara must show and consume a human confirmation card before writing. Native shell and workspace_write cannot edit these files.", kind: "edit",
+      input_schema: { type: "object", properties: { file: { type: "string", enum: [...COLLEAGUE_INSTRUCTION_FILES] }, content: { type: "string" } }, required: ["file", "content"] }, run: async (input, ctx) => {
+        if (!plain(input) || !exact(input, ["file", "content"]) || !(COLLEAGUE_INSTRUCTION_FILES as readonly unknown[]).includes(input.file) || typeof input.content !== "string") throw new Error("Invalid instruction proposal");
+        assertCurrent(); const instructions = new WorkspaceColleagueInstructions(job.context.homes, job.agentId), draft = instructions.prepare(input.file as ColleagueInstructionFile, input.content);
+        const decision = await this.approval(job, draft, "instruction_update");
+        if (!decision.approved) return JSON.stringify({ written: false, approvalState: decision.state });
+        const finishWrite = beginWorkspaceHostWrite(job.context.project);
+        let receipt: Awaited<ReturnType<WorkspaceColleagueInstructions["write"]>>;
+        try { receipt = await instructions.write(draft, assertCurrent, ctx.signal); } finally { finishWrite(); }
+        invalidateWorkspaceNativeEvidenceForHostWrite(job.context.project); ctx.verifiedChange?.(receipt.sha256);
+        return JSON.stringify({ ...receipt, approvalState: "consumed" });
+      } });
     tools.push({ name: "workspace_native_evidence", description: "Read the current Host-observed native file diff evidence for this attempt. No diff, partial sampling, read-only mode or concurrent writers gives no evidence. Native evidence does not prove Hara management effects. Use its ID as native_evidence_ids in completion checks.", kind: "read",
       input_schema: { type: "object", properties: {} }, async run(input) {
         if (!plain(input) || !exact(input, [])) throw new Error("Native evidence takes no paths or claims");
@@ -1325,6 +1391,28 @@ export class LocalWorkspaceHost {
         if (!found) throw new Error("colleague unavailable in THIS Workspace");
         return JSON.stringify({ agentId: found.agentId, identity: found.identity, description: found.description,
           runtime: found.runtime.id, state: found.state });
+      } });
+    let groupCreateAttempts = 0;
+    tools.push({ name: "group_create", description: "Create one local group only after the human explicitly requests it or agrees to your prose suggestion. Show one frozen approval card with a name and at least two active colleagues. Exact memberIds from this Workspace only. No first message is sent; no autonomous conversation is started. Do not call this to make an unsolicited suggestion.", kind: "edit",
+      input_schema: { type: "object", properties: { name: { type: "string", maxLength: 80 }, memberIds: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 64, uniqueItems: true } }, required: ["name", "memberIds"] },
+      async run(input) {
+        if (!plain(input) || !exact(input, ["name", "memberIds"]) || !text(input.name, 80)) throw new Error("Invalid group proposal");
+        assertCurrent();
+        if (job.binding.lineage.depth !== 0 || !groupCreationAuthorized(job.value.history))
+          return JSON.stringify({ created: false, humanConfirmed: false, refused: "human_request_required", next: "Suggest a group in prose and wait for the human to agree." });
+        host.assertGroupMembers(job.context, input.memberIds);
+        if (groupCreateAttempts++) return JSON.stringify({ created: false, humanConfirmed: false, refused: "turn_limit", limit: 1 });
+        const memberIds = [...input.memberIds as string[]], memberNames = memberIds.map(id => job.context.resources.agents.get(id)!.identity.displayName);
+        const decision = await host.approval(job, { name: input.name, memberIds: Object.freeze(memberIds), memberNames: Object.freeze(memberNames) } as unknown as GroupCreateDraft, "group_create");
+        if (!decision.approved) return JSON.stringify({ created: false, humanConfirmed: false, approvalState: decision.state, name: input.name });
+        assertCurrent();
+        const draft = decision.draft as GroupCreateDraft;
+        if (decision.catalogRevision !== job.context.resources.agents.list().revision || decision.channelRevision !== rooms().list().revision)
+          throw new Error("Group or colleague roster changed; review a fresh group card");
+        host.assertGroupMembers(job.context, draft.memberIds);
+        const id = randomUUID(); rooms().create(id, draft.name, draft.memberIds, decision.channelRevision!);
+        host.changed(job.workspaceId, job.agentId);
+        return JSON.stringify({ created: true, humanConfirmed: true, approvalState: "consumed", group: { id, name: draft.name, memberIds: draft.memberIds }, messageSent: false });
       } });
     tools.push({ name: "agent_create", description: "Propose one editable colleague card immediately. The human edits project, runtime and permission tier on the card, then confirms once; the Host creates the colleague. Use the bounded startup roster and project candidates, without extra list/receipt calls or an ask_user question for missing fields. Runtime and permission choices belong to the human, not this tool. Never ask for confirmation again after success.", kind: "edit",
       input_schema: { type: "object", properties: { username: { type: "string" }, displayName: { type: "string" }, title: { type: "string" }, instructions: { type: "string" }, project: { type: "string" } }, required: [] },
@@ -1510,9 +1598,15 @@ export class LocalWorkspaceHost {
           if (!prepared.ok) throw new Error(prepared.reason);
           task = prepared.task;
         }
+        if (!channel && !parent && groupCreationAuthorized([...value.history, { role: "user", content: message }])) {
+          const prepared = applyTaskBrief(task, { intent: "change", goal: message,
+            constraints: ["Create no group before the human confirms its exact name and at least two active colleagues", "Send no first group message"],
+            acceptance: ["The Host confirms the requested group after human approval"], steps: ["Prepare one group card", "Wait for confirmation", "Verify the group receipt"] });
+          if (!prepared.ok) throw new Error(prepared.reason); task = prepared.task;
+        }
         task.workspaceRunBinding = freezeWorkspaceRunBinding({ schemaVersion: 1, scope: row.scope, agent: task.workspaceAgentBinding!,
           agentBindingHash: workspaceAgentBindingHash(task.workspaceAgentBinding!), connection: scheduledConnection ?? context.connections.capture(), runtimeContract: "hara-governed-runtime-v1",
-          project: captureWorkspaceProjectIdentity(context.project), sessionId: store.sessionId, runId: randomUUID(),
+          project: captureWorkspaceProjectIdentity(this.runProject(context, agent, value)), sessionId: store.sessionId, runId: randomUUID(),
           lineage: parent ? { rootRunId: parent.binding.lineage.rootRunId ?? parent.id, parentRunId: parent.id, depth: 1 } : { rootRunId: null, parentRunId: null, depth: 0 },
           createdAt: new Date().toISOString(), host: { hostId: host.hostId, hostEpoch: host.hostEpoch, grantId: row.grantId, grantRevision: row.grantRevision, actorId: row.actorId, policyRevision: row.policyRevision },
           budget: parent ? { ...(parent.binding.budget.mode === "interactive" ? DEFAULT_WORKSPACE_RUN_BUDGET : parent.binding.budget) } : { ...(!this.realKey && !scheduledConnection && origin.source === "ui" && origin.channel === "rpc"
@@ -1523,7 +1617,9 @@ export class LocalWorkspaceHost {
         value.runUsage = ZERO_USAGE();
       }
       const binding = task.workspaceRunBinding!, controller = new AbortController();
-      if (binding.project.root !== context.project) throw new Error("Workspace project root changed; old task retained read-only, no implicit project migration");
+      if (binding.project.root !== context.project && (agent.kind !== "colleague" || binding.project.root !== context.homes.ensure(agentId).project.root))
+        throw new WorkspacePrimaryDirectoryError();
+      if (agent.kind === "colleague") context.homes.ensure(agentId);
       const connection = context.connections.resolve(binding.connection);
       const providerConnection = connectionForObjective(connection, binding.connection, task.objective);
       const selectedProvider = this.realKey ? this.realKey.createProvider(connection, providerConnection)
@@ -1535,7 +1631,7 @@ export class LocalWorkspaceHost {
       const interaction = new WorkspaceUserInteraction(context.storage, binding, task.id, /[\u3400-\u9fff]/u.test(task.objective));
       const startContext = prepareWorkspaceStartContext({ storage: context.storage,
         personalHome: this.options.mode === "workspace" ? this.options.hostHome : undefined,
-        workspaceRoots: context.resources.memory.roots(context.project),
+        workspaceRoots: withWorkspaceAgentMemory(context.storage, agentId, context.project, () => context.resources.memory.roots(context.project)),
         projectLocations: prepareWorkspaceProjectLocations({ storage: context.storage, project: context.project, history: value.history, objective: task.objective }),
         references: new WorkspaceColleagueReferences(context.storage, () => context.resources.agents.references()).read(), objective: task.objective,
         includeProjectLocations: colleagueCreateIntent(task.objective) });
@@ -1579,7 +1675,7 @@ export class LocalWorkspaceHost {
       const configuration = context.resources.agents.resolveTask(binding.agent);
       const tools = this.jobTools(owned, agent).filter(tool => legacyPolicyAllowsTool(configuration.toolPolicy, tool.name, tool.kind));
       owned.permit = createWorkspaceRunPermit({ binding, catalog: this.catalog, resources: context.resources, storage: context.storage, connections: context.connections,
-        completionRecovery, lease, provider, cwd: context.project, managedProjectRoot: context.project, signal: owned.signal, toolNames: ["task_intake", "task_checkpoint", "todo_write", "ask_user", ...tools.map(tool => tool.name)], usage: value.runUsage,
+        completionRecovery, lease, provider, cwd: binding.project.root, managedProjectRoot: context.project, signal: owned.signal, toolNames: ["task_intake", "task_checkpoint", "todo_write", "ask_user", ...tools.map(tool => tool.name)], usage: value.runUsage,
         modelHistory: { history: value.history, start: modelHistoryStart, retain: result => owned.receipts!.retain(result),
           usedTokens: () => { const usage = tree.read().usage; return usage.inputTokens + usage.outputTokens; } },
         observeContext: observation => { owned.lease.assertCurrent(); audit.append(observation); },
@@ -1613,7 +1709,7 @@ export class LocalWorkspaceHost {
       // This is documentation only; the existing approval and tool boundaries still decide authority.
       const preloadedCreationSkill = createColleagueRequest ? workspaceOperationSkill() : undefined;
       const management = prepareWorkspaceManagementContext({ agents: context.resources.agents.list().agents, skills: withWorkspaceOperationSkill(context.features.enabledSkills()), objective: task.objective, preloadedCreationCard: Boolean(preloadedCreationSkill) });
-      owned.options = bindWorkspaceRunOptions(owned.permit, { ctx: { cwd: context.project, sessionId: store.sessionId, todoScope: `workspace-${binding.runId}`, sandbox: "off" },
+      owned.options = bindWorkspaceRunOptions(owned.permit, { ctx: { cwd: binding.project.root, sessionId: store.sessionId, todoScope: `workspace-${binding.runId}`, sandbox: "off" },
         signal: owned.signal, approval: "auto-edit", approvalChannel: true, confirm: async (_question, _signal, offer) => {
           if (!offer?.workspaceExtension || !owned.extensionAttempt) return false;
           const decision = await this.approval(owned, { sourceName: offer.workspaceExtension.sourceName,
@@ -1636,6 +1732,7 @@ export class LocalWorkspaceHost {
           } } catch { /* An optional disconnected view cannot change the run. */ }
         },
         finishOnConfirmedColleagueCreate: createColleagueRequest,
+        finishOnConfirmedGroupCreate: !createColleagueRequest && singleGroupCreationRequest(owned.value.history),
         systemOverrideParts: [{ id: "core", stability: "static", source: "core",
           content: `You are ${configuration.identity.displayName}, a clearly identified Hara AI colleague. ${instructions}${instructionsPolicy}\nUse only this Workspace's supplied tools. Never claim completion without observed evidence.\n` + sharedPolicy
           + `Reply naturally in the user's language. Call AI coworkers 同事, not Pi 同事; pi is only an internal runtime. A greeting needs no tools.\n`
@@ -1644,14 +1741,17 @@ export class LocalWorkspaceHost {
           + "For a genuinely ambiguous project/folder, reuse the evidenced projectLocations.options with its otherOption in ask_user. These catalog-only hints do not grant file access; never invent a path or ask for one already identified.\n"
           + `For an explicit new-colleague request, use the bounded startup roster and projectLocations candidates to call agent_create in your FIRST model response. Do not call workspace_skill, agent_list, workspace_receipt_read or ask_user first merely to fill name, role, project or runtime; the human edits missing fields on the card. A project candidate is only a label and does not grant file access. If an existing active colleague clearly matches, suggest reusing that colleague instead. For delegation use agent_contact with an existing exact agentId.\n`
           + `每轮最多建立一位同事。\n`
+          + `For a group, first suggest it in prose unless the human explicitly asked to create one. Only after agreement call group_create with at least two active colleague IDs. Its card needs human confirmation, creates no first message, and never grants ambient autonomy. A consumed receipt means creation is done; do not ask again.\n`
           + `For a requested rename use agent_rename on the resolved existing colleague; the new name is not a reference to look up.\n`
           + `agent_create returns only AFTER the human has edited and approved the card; created:true/humanConfirmed:true means the card is consumed, not pending. Never ask the human to confirm it again. created:false with approvalState declined/expired/aborted means no colleague was created — tell the human they can ask again; do not re-open a card unless they ask.\n`
           + `Successful Workspace tool results repeat the exact citation ID in receipt.toolCallId. Hara records and checks those receipts automatically for simple completed changes. For an explicit checkpoint, copy observed IDs; never invent them or repeat side effects to fix a rejected citation. After restart, re-observe state with read-only tools.\n`
           + `No workspace_skill prerequisite is needed for this creation proposal.\n`
           + `Hara records the initial brief automatically from the user request and first response BEFORE tools. Do not spend a model round solely on task_intake; use it for material revisions or unresolved intent. Use the startup catalog and preloaded built-in help when relevant.\n`
-          + `Native runtime shell/file tools may change only the admitted working directory under the frozen permission tier. Use workspace_native_evidence to read current Host diff IDs for explicit checks; no diff is no proof. Native file evidence cannot prove Hara colleague, delegation, membership or schedule changes. All scheduled work must use Hara WorkspaceScheduler; do not use runtime-native cron, wakeup or background scheduling tools.\n`
+          + `Native runtime shell/file tools may change only this colleague folder and the fixed related Workspace folder under the frozen permission tier; other colleague folders are read-only. Managed AGENTS.md/CLAUDE.md changes require workspace_instruction_update and human confirmation. Remembered notes default to private; use workspace_memory_promote for confirmed sharing. Use workspace_native_evidence to read current Host diff IDs for explicit checks; no diff is no proof. Native file evidence cannot prove Hara colleague, delegation, membership or schedule changes. All scheduled work must use Hara WorkspaceScheduler; do not use runtime-native cron, wakeup or background scheduling tools.\n`
           + `For file tasks read first; write only if necessary, then workspace_verify. Reply directly after the checks pass; Hara verifies actual tool receipts and records simple completion. Use task_checkpoint for complex acceptance or a typed human-only blocker.` },
           { id: "workspace-catalog", stability: "session", source: "project", content: management.sessionPrompt },
+          ...(agent.kind === "colleague" ? [{ id: "colleague-folder-rules", stability: "session" as const, source: "project" as const,
+            content: new WorkspaceColleagueInstructions(context.homes, agentId).prompt(binding.agent.runtimeId) }] : []),
           { id: "workspace-turn", stability: "turn", source: "task", content: [
             owned.startContext.turnPrompt, instructionsReference, sharedTurn,
             ...(preloadedCreationSkill ? [`Complete code-shipped help already loaded for this request: ${preloadedCreationSkill.id}@${preloadedCreationSkill.version}, cards/create-colleague.md.\n${management.preloadedNotice}\n${preloadedCreationSkill.files["cards/create-colleague.md"]}`] : []),
@@ -1670,9 +1770,22 @@ export class LocalWorkspaceHost {
       throw error;
     }
   }
+  private runProject(context: WorkspaceHostContext, agent: WorkspaceAgentView, conversation: WorkspaceConversation, create = true): string {
+    if (agent.kind !== "colleague") return context.project;
+    const view = context.homes.view(agent.agentId);
+    if (view.created && !view.available) throw new WorkspacePrimaryDirectoryError();
+    const home = create ? context.homes.ensure(agent.agentId).project.root : view.path;
+    if (agent.runtime.id !== "codex") return home;
+    const native = codexThreadState(context.storage, agent.agentId, conversation.sessionId).read();
+    if (context.homes.codexHomeActivated(agent.agentId, conversation.sessionId, native.resets)) return home;
+    const priorCodex = [conversation.task, ...[...conversation.pastTasks].reverse().map(row => row.task)]
+      .find(task => task?.workspaceRunBinding?.agent.runtimeId === "codex")?.workspaceRunBinding;
+    if (priorCodex?.project.root === home) return home;
+    return !conversation.history.length && !native.threadId ? home : context.project;
+  }
   private async run(job: LocalJob): Promise<void> {
     try {
-      job.outcome = await job.context.storage.run(() => runConfiguredAgent(job.value.history, job.options!,
+      job.outcome = await withWorkspaceAgentMemory(job.context.storage, job.agentId, job.context.project, () => runConfiguredAgent(job.value.history, job.options!,
         new AgentRuntimeRegistry(undefined, job.context.runtimes, job.context.runtimeModels, this.options.jsonCliPolicyFactory)));
       this.closeRunInteractions(job);
       if (!job.signal.aborted && job.interaction?.question()) {
@@ -1717,10 +1830,11 @@ export class LocalWorkspaceHost {
   }
   /** Explicit UI action. Hara history, tasks and usage stay intact; reset and audit commit together. */
   async newNativeSession(clientId: string, workspaceId: string, agentId: string, expectedRevision: number, expectedNativeRevision: number, requestId: string) {
-    const context = this.context(workspaceId), selection = this.clients.get(clientId);
+    const context = this.context(workspaceId), selection = this.clients.get(clientId), expectedRuntimeId = context.resources.agents.get(agentId)?.runtime.id;
     const assertCurrent = () => {
       if (this.closing || this.updateLease || !selection || selection.workspaceId !== workspaceId || selection.agentId !== agentId || selection.channelId
-        || this.clients.get(clientId) !== selection || context.resources.agents.get(agentId)?.runtime.id !== "codex") throw new Error("Native session view changed; refresh before resetting");
+        || this.clients.get(clientId) !== selection || !["codex", "pi", "claude"].includes(expectedRuntimeId ?? "")
+        || context.resources.agents.get(agentId)?.runtime.id !== expectedRuntimeId) throw new Error("Native session view changed; refresh before resetting");
       context.storage.run(() => {});
       if ([...this.jobs.values()].some(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId && !job.channelId))
         throw new Error("Agent is still running or draining; native reset refused");
@@ -1729,6 +1843,19 @@ export class LocalWorkspaceHost {
     assertCurrent();
     const store = new WorkspaceConversationStore(context.storage, agentId), lease = WorkspaceSessionLease.acquire(context.storage, store.sessionId);
     try {
+      const runtimeId = context.resources.agents.get(agentId)!.runtime.id;
+      if (resettableNativeRuntime(runtimeId)) {
+        const sessions = new WorkspaceNativeSessions(context.storage, agentId, store.sessionId), previous = sessions.read();
+        const duplicate = previous.entries.find(row => row.requestId === requestId);
+        if (duplicate) { if (duplicate.runtimeId !== runtimeId) throw new Error("Native reset request changed"); return { requestId, revision: duplicate.revision, duplicate: true }; }
+        const conversation = store.read();
+        if (conversation.revision !== expectedRevision || previous.revision !== expectedNativeRevision) throw new Error("Native session state changed; refresh before resetting");
+        if (["running", "draining"].includes(conversation.attempt?.state ?? "") || this.pendingUserQuestion(context, conversation)
+          || this.pendingInteractions(context, conversation, []).length) throw new Error("Recover or stop the pending task before resetting its native session");
+        assertCurrent(); lease.assertCurrent();
+        const result = sessions.reset(expectedNativeRevision, requestId, runtimeId, conversation.history.length, this.catalog.resolve(workspaceId).actorId);
+        this.changed(workspaceId, agentId); return result;
+      }
       const native = codexThreadState(context.storage, agentId, store.sessionId), previous = native.read();
       const duplicate = previous.resets.find(row => row.requestId === requestId);
       if (duplicate) return { requestId, revision: duplicate.revision, duplicate: true };
@@ -1742,6 +1869,7 @@ export class LocalWorkspaceHost {
       if (store.read().revision !== expectedRevision) throw new Error("Conversation changed; native reset refused");
       const actorId = this.catalog.resolve(workspaceId).actorId;
       new CodexHistoryBoundaries(context.storage, agentId, store.sessionId).record(requestId, conversation.history.length, previous.resets);
+      if (context.resources.agents.get(agentId)?.kind === "colleague") context.homes.activateCodexSession(agentId, store.sessionId, requestId);
       const value = native.update(expectedNativeRevision, current => ({ ...current, threadId: null, input: 0, output: 0, cachedInput: 0,
         contextTokens: null, modelContextWindow: null, phase: "idle", contextGeneration: null, standingPromptHash: null,
         lastAttempt: { input: 0, output: 0, cachedInput: 0 },

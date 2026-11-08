@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
-import { WorkspaceChangeTrace, engineTaskBrief, simpleChangeObjective } from "../dist/agent/governance-c-lite.js";
+import { WorkspaceChangeTrace, engineTaskBrief, simpleChangeObjective, conversationalAnswerObjective } from "../dist/agent/governance-c-lite.js";
 
 const roots = [];
 after(() => roots.forEach(path => fs.rmSync(path, { recursive: true, force: true })));
@@ -106,3 +106,22 @@ for(const objective of ["你好，请修改 note.txt", "请用中文回答，然
  test("Chinese presentation and greeting cannot bypass write intent: "+objective,()=>{
   assert.equal(engineTaskBrief({objective},response("已完成。",[])).intent,"change");
  });
+
+test("explicit memory verbs authorize a private note or confirmed share, while questions and refusals do not",()=>{
+ for(const objective of["Remember orchid private Alpha","Share this orchid fact after I confirm","記住我喜歡簡潔回覆","共享這段記憶"])
+  assert.equal(engineTaskBrief({objective},response("",[call("memory","workspace_memory_write")])).intent,"change",objective);
+ for(const objective of["What do you remember about orchid?","不要記住這段資料","Do not share this note","Can colleagues share notes?"])
+  assert.notEqual(engineTaskBrief({objective},response("",[call("memory","workspace_memory_write")])).intent,"change",objective);
+});
+
+test("one private note cannot auto-close a request with a second side effect",()=>{
+ for(const text of["Remember orchid and delete note.txt","Share this fact and create a colleague","記住這段偏好並刪除檔案"])assert.equal(simpleChangeObjective(text),false,text);
+ assert.equal(simpleChangeObjective("Remember orchids and lilies"),true);
+});
+
+test("a second greeting stays an answer while explicit changes after a greeting keep their authority",()=>{
+ assert.equal(engineTaskBrief({objective:"Hello again"},response("Hello",[])).intent,"answer");
+ assert.equal(conversationalAnswerObjective("Hello again"),true);
+ assert.equal(conversationalAnswerObjective("Hello again, delete note.txt"),false);
+ assert.equal(engineTaskBrief({objective:"Hello again, delete note.txt"},response("",[])).intent,"change");
+});

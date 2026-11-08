@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -59,7 +60,7 @@ test("media states distinguish missing in-root artifacts from forbidden paths wi
  assert.deepEqual(f.registry.describe("broken.gif"),{state:"failed"});
  const outside=join(f.parent,"outside.gif");fs.writeFileSync(outside,gif);
  assert.deepEqual(f.registry.describe(outside),{state:"outside"});assert.deepEqual(f.registry.describe(join(f.parent,"absent.gif")),{state:"outside"});
- fs.symlinkSync(outside,join(f.project,"link.gif"));assert.deepEqual(f.registry.describe("link.gif"),{state:"outside"});
+ fs.symlinkSync(outside,join(f.project,"link.gif"));assert.deepEqual(f.registry.describe("link.gif"),{state:"failed",reason:"symlink"});
  assert.deepEqual(f.registry.describe("../outside.gif"),{state:"outside"});
  const result=f.registry.describe("ready.gif");fs.renameSync(join(f.project,"ready.gif"),join(f.project,"moved.gif"));
  assert.deepEqual(f.registry.describe("ready.gif"),{state:"missing"});assert.throws(()=>f.registry.read(result.media.id),/media unavailable/);
@@ -71,7 +72,7 @@ test("passive file cards use closed MIME families and retain all opaque-id and r
  for(const[name,bytes,mime]of types){fs.writeFileSync(join(f.project,name),bytes);const result=f.registry.describe(name);assert.equal(result.state,"ready");assert.equal(result.media.mime,mime);assert.deepEqual(f.registry.read(result.media.id).bytes,bytes);assert.equal("path"in result.media,false);}
  for(const[name,bytes]of[["run.command",Buffer.from("exit 1")],["fake.pdf",Buffer.from("<html>not PDF</html>")],["fake.xlsx",Buffer.from("not zip")],["binary.md",Buffer.from([0,1,2])]]){fs.writeFileSync(join(f.project,name),bytes);assert.deepEqual(f.registry.describe(name),{state:"failed"});}
  fs.writeFileSync(join(f.parent,"outside.md"),"# Outside");assert.deepEqual(f.registry.describe(join(f.parent,"outside.md")),{state:"outside"});
- fs.symlinkSync(join(f.parent,"outside.md"),join(f.project,"alias.md"));assert.deepEqual(f.registry.describe("alias.md"),{state:"outside"});
+ fs.symlinkSync(join(f.parent,"outside.md"),join(f.project,"alias.md"));assert.deepEqual(f.registry.describe("alias.md"),{state:"failed",reason:"symlink"});
 });
 
 test("file URL decoding cannot hide bidi controls in a registered filename",t=>{
@@ -86,8 +87,8 @@ test("registered symlink roots and ancestors resolve to one canonical allowed ro
   const registry=new WorkspaceMediaRegistry(root,()=>[root],()=>{}),value=registry.describe(path);assert.equal(value.state,"ready");assert.deepEqual(registry.read(value.media.id).bytes,gif);
  }
  fs.symlinkSync(join(f.project,"good.gif"),join(actual,"outside-link.gif"));
- const registry=new WorkspaceMediaRegistry(alias,()=>[alias],()=>{});assert.deepEqual(registry.describe(join(alias,"outside-link.gif")),{state:"outside"});
- fs.symlinkSync(join(actual,"good.gif"),join(actual,"inside-link.gif"));assert.deepEqual(registry.describe(join(alias,"inside-link.gif")),{state:"outside"});
+ const registry=new WorkspaceMediaRegistry(alias,()=>[alias],()=>{});assert.deepEqual(registry.describe(join(alias,"outside-link.gif")),{state:"failed",reason:"symlink"});
+ fs.symlinkSync(join(actual,"good.gif"),join(actual,"inside-link.gif"));assert.deepEqual(registry.describe(join(alias,"inside-link.gif")),{state:"failed",reason:"symlink"});
 });
 
 for(const operation of["register","read"])test(operation+" refuses an intermediate-directory swap before reading bytes",t=>{
@@ -107,4 +108,35 @@ test("open errno stays behind the closed media error vocabulary",t=>{
 test("HEIC and AVIF brands cannot masquerade as MP4 or QuickTime video",t=>{
  const f=fixture(t);for(const ext of["mp4","mov"])for(const brand of["heic","mif1","avif","avis"]){const bytes=Buffer.alloc(24);bytes.writeUInt32BE(24);bytes.write("ftyp",4);bytes.write(brand,8);const path=join(f.project,brand+"."+ext);fs.writeFileSync(path,bytes);assert.deepEqual(f.registry.describe(path),{state:"failed"});}
  const bytes=Buffer.alloc(24);bytes.writeUInt32BE(24);bytes.write("ftyp",4);bytes.write("isom",8);fs.writeFileSync(join(f.project,"valid.mp4"),bytes);assert.equal(f.registry.describe("valid.mp4").state,"ready");
+});
+
+
+test("a registered root alias cannot grant the filesystem root", t => {
+ const f=fixture(t),alias=join(f.parent,"root-alias"),outside=join(f.parent,"outside.gif");
+ fs.writeFileSync(outside,gif);fs.symlinkSync("/",alias,"dir");
+ const registry=new WorkspaceMediaRegistry(alias,()=>[alias],()=>{});
+ assert.deepEqual(registry.describe(outside),{state:"outside"});
+ assert.deepEqual(registry.describe(alias+outside),{state:"outside"});
+ assert.throws(()=>registry.register(outside),/media unavailable/);
+});
+
+
+test("canonical filename spelling failures do not claim the file is outside the workspace", t => {
+ const f=fixture(t);
+ for(const name of["Cafe\u0301.gif","UPPER.gif"]){
+  const file=join(f.project,name);fs.writeFileSync(file,gif);
+  // Filesystems differ in normalization/case behavior: drive the actual realpath discrepancy explicitly.
+  const original=fs.realpathSync.native;
+  t.mock.method(fs.realpathSync,"native",function(value,...args){const found=original.call(this,value,...args);return value===file?found.replace(name,name==="UPPER.gif"?"upper.gif":"Caf\u00e9.gif"):found;});
+  try{assert.deepEqual(f.registry.describe(name),{state:"failed",reason:"path_spelling"});}finally{t.mock.restoreAll();}
+ }
+});
+
+test("only the Host managed project exception permits default Hara project media; private state and aliases remain closed",t=>{
+ const root=fs.realpathSync(fs.mkdtempSync(join(tmpdir(),"hara-managed-media-"))),previous=process.env.HOME;process.env.HOME=root;t.after(()=>{if(previous===undefined)delete process.env.HOME;else process.env.HOME=previous;fs.rmSync(root,{recursive:true,force:true});});
+ const project=join(root,".hara","workspaces-v1","project","ws_"+randomUUID());fs.mkdirSync(project,{recursive:true});const file=join(project,"safe.txt");fs.writeFileSync(file,"managed artifact");
+ const outside=join(root,".hara","private.txt");fs.writeFileSync(outside,"private fixture");const legacy=new WorkspaceMediaRegistry(project,()=>[project],()=>{}),managed=new WorkspaceMediaRegistry(project,()=>[project],()=>{},true);
+ assert.equal(legacy.describe("safe.txt").state,"outside");assert.equal(managed.describe("safe.txt").state,"ready");assert.equal(managed.describe(outside).state,"outside");
+ fs.mkdirSync(join(project,".hara","sessions"),{recursive:true});fs.writeFileSync(join(project,".hara","sessions","private.md"),"private nested fixture");assert.equal(managed.describe(".hara/sessions/private.md").state,"outside");
+ fs.symlinkSync(outside,join(project,"alias.txt"));assert.notEqual(managed.describe("alias.txt").state,"ready");fs.linkSync(file,join(project,"hard-link.txt"));assert.notEqual(managed.describe("hard-link.txt").state,"ready");
 });

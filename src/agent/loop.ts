@@ -1,3 +1,4 @@
+import { groupCreatedReply } from "../workspace/group-create.js";
 import { RunModelTranscript } from "./run-model-transcript.js";
 import { createWorkspaceExtensionApproval, isWorkspaceExtensionTool, type WorkspaceExtensionApproval } from "../workspace/extension-binding.js";
 import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult, ImageAttachment, TurnArgs, TurnResult } from "../providers/types.js";
@@ -756,6 +757,7 @@ export interface RunOpts {
   extraTools?: Tool[];
   /** Workspace Host-only: a single confirmed colleague receipt closes an explicit creation request without another model call. */
   finishOnConfirmedColleagueCreate?: boolean;
+  finishOnConfirmedGroupCreate?: boolean;
   /** abort the in-flight LLM request (user interrupt) */
   signal?: AbortSignal;
   /** Total active provider/tool execution ceiling for this run. Engine-owned human question/approval waits
@@ -3961,10 +3963,11 @@ async function runAgentInner(
     if (decisionRetentionError) {
       return interactionFailure("user-decision retention", decisionRetentionError);
     }
-    if (opts.workspaceRun && opts.finishOnConfirmedColleagueCreate && intakeTask?.brief?.intent === "change"
-      && r.toolUses.filter(call => call.name === "agent_create").length === 1
+    const confirmedCreationTool = opts.finishOnConfirmedGroupCreate ? "group_create" : "agent_create";
+    if (opts.workspaceRun && (opts.finishOnConfirmedColleagueCreate || opts.finishOnConfirmedGroupCreate) && intakeTask?.brief?.intent === "change"
+      && r.toolUses.filter(call => call.name === confirmedCreationTool).length === 1
       && results.every(result => result.isError !== true && !looksFailed(result.content, result.name))) {
-      const created = results.find(result => result.name === "agent_create");
+      const created = results.find(result => result.name === confirmedCreationTool);
       let value: Record<string, unknown> | null = null;
       try { const raw: unknown = JSON.parse(created?.content ?? ""); if (raw && typeof raw === "object" && !Array.isArray(raw)) value = raw as Record<string, unknown>; } catch { /* Fail closed. */ }
       const evidence = value?.created === true && value.humanConfirmed === true && value.approvalState === "consumed" ? changeEvidence() : null;
@@ -3976,7 +3979,9 @@ async function runAgentInner(
         const name = typeof value.agent === "object" && value.agent !== null && !Array.isArray(value.agent)
           && typeof (value.agent as { identity?: { displayName?: unknown } }).identity?.displayName === "string"
           ? (value.agent as { identity: { displayName: string } }).identity.displayName : "";
-        history.push({ role: "assistant", text: name ? `已建立同事 ${name}。` : "同事已建立。", toolUses: [] });
+        const groupName = typeof value.group === "object" && value.group !== null && typeof (value.group as { name?: unknown }).name === "string"
+          ? (value.group as { name: string }).name : "";
+        history.push({ role: "assistant", text: confirmedCreationTool === "group_create" ? groupCreatedReply(groupName, runtimeCopyLanguage(history)) : name ? `已建立同事 ${name}。` : "同事已建立。", toolUses: [] });
         return { status: "completed" };
       }
     }

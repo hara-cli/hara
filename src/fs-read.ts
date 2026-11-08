@@ -122,6 +122,8 @@ export interface VerifiedRegularFileReadOptions {
   action?: string;
   rejectHardLinks?: boolean;
   protectSensitive?: boolean;
+  /** Host-derived canonical spelling. Checked against the opened inode before any bytes are read. */
+  expectedCanonicalPath?: string;
 }
 
 /** Resolve a user-facing path once, checking both its lexical name and canonical target. Direct tools then
@@ -143,11 +145,12 @@ export function resolveVerifiedModelPath(path: string, action = "read"): string 
 export function verifyOpenedRegularFileSync(
   path: string,
   opened: Stats,
-  options: { action?: string; rejectHardLinks?: boolean; protectSensitive?: boolean } = {},
+  options: { action?: string; rejectHardLinks?: boolean; protectSensitive?: boolean; expectedCanonicalPath?: string } = {},
 ): string {
   if (!opened.isFile()) throw new NonRegularFileError(path);
   if (options.rejectHardLinks !== false && opened.nlink > 1) throw new HardLinkedFileError(path);
   const canonical = realpathSync.native(path);
+  if (options.expectedCanonicalPath !== undefined && canonical !== options.expectedCanonicalPath) throw new Error("File canonical path changed before read");
   if (options.protectSensitive !== false) {
     const targetDenied = sensitiveFileError(canonical, options.action ?? "read");
     if (targetDenied) throw new ProtectedContextFileError(targetDenied);
@@ -279,6 +282,7 @@ export function readVerifiedRegularFileBytesSync(
       action,
       rejectHardLinks: options.rejectHardLinks !== false,
       protectSensitive: options.protectSensitive !== false,
+      expectedCanonicalPath: options.expectedCanonicalPath,
     });
     const limit = checkedContextLimit(maxBytes);
     if (info.size > limit) throw new FileReadLimitError(path, limit);
@@ -289,6 +293,7 @@ export function readVerifiedRegularFileBytesSync(
       action,
       rejectHardLinks: options.rejectHardLinks !== false,
       protectSensitive: options.protectSensitive !== false,
+      expectedCanonicalPath: options.expectedCanonicalPath,
     });
     if (
       latest.dev !== info.dev

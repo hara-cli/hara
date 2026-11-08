@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { parseChatScheduleTime } from "../dist/workspace/chat-schedule.js";
+import { WorkspaceFeatures } from "../dist/workspace/features.js";
 import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
 import { createWorkspaceSyntheticProvider, SYNTHETIC_CONNECTION } from "../dist/workspace/synthetic-provider.js";
@@ -197,4 +198,24 @@ test("configuration remains fenced for an aborted job after the lifecycle action
   assert.throws(()=>f.host.updateAgentPersona(f.workspaceId,target.agentId,{profile:{displayName:"Must wait"}},target.configRevision,target.agentEpoch),/draining/);
   await job.promise;assert.equal(f.host.updateAgentPersona(f.workspaceId,target.agentId,{profile:{displayName:"After cleanup"}},target.configRevision,target.agentEpoch).identity.displayName,"After cleanup");
  }finally{await f.host.close();}
+});
+
+
+test("archive rollback failure keeps the exact paused IDs in reopened Workspace metadata",async t=>{
+ const f=fixture(new EventEmitter(),false);
+ try{
+  const context=f.host.context(f.workspaceId),agents=context.resources.agents;
+  const target=agents.create({username:"receipt",profile:{displayName:"Receipt"},runtimeId:"pi"},agents.list().revision);
+  const schedule={id:randomUUID(),name:"Retained pause fixture",task:"Synthetic only",agentId:target.agentId,enabled:true,schedule:{kind:"once",runAt:Date.now()+3600000,display:"Future"}};
+  f.host.saveSchedule(f.workspaceId,schedule,context.features.list().revision,true);
+  t.mock.method(f.host,"assertGeneration",()=>{throw Error("Injected final lifecycle validation failure");});
+  t.mock.method(context.features,"restorePausedAgentSchedules",()=>{throw Error("Injected rollback write failure");});
+  await assert.rejects(f.host.setAgentArchived(f.workspaceId,target.agentId,true,target.configRevision,target.agentEpoch),error=>error.reason==="archive_schedule_rollback_failed");
+  const reopened=new WorkspaceFeatures(context.storage,context.project,f.workspaceId);
+  assert.deepEqual(reopened.list().archiveRecovery[0].scheduleIds,[schedule.id]);
+  assert.equal(reopened.schedules().find(row=>row.id===schedule.id).enabled,false);
+  assert.equal(agents.get(target.agentId).state,"active");
+  const [receipt]=reopened.archivePauseReceipts();reopened.restorePausedAgentSchedules(target.agentId,receipt.schedules);
+  assert.equal(reopened.schedules().find(row=>row.id===schedule.id).enabled,true);assert.deepEqual(reopened.archivePauseReceipts(),[]);
+ }finally{t.mock.restoreAll();await f.host.close();}
 });

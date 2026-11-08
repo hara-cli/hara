@@ -27,7 +27,7 @@ function fakeModel(directory) {
   }
 }
 
-function fixture(behavior) {
+function fixture(behavior, { readyDelayMs = 0 } = {}) {
   const home = realpathSync.native(mkdtempSync(join(tmpdir(), "hara-laya-")));
   directories.push(home);
   const directory = join(home, ".hara", "decision", "laya-mlx", LAYA_PACKAGE_VERSION);
@@ -51,7 +51,8 @@ function fixture(behavior) {
       if (behavior) behavior(request, child, reply);
       else setImmediate(() => reply({ model: LAYA_MODEL, answers: { action_guard: { choice: "allow", confidence: 0.99, probabilities: { allow: 0.99, review: 0.005, block: 0.005 } } } }));
     });
-    setImmediate(() => child.stdout.write(JSON.stringify({ ready: true, model: LAYA_MODEL, revision: LAYA_REVISION }) + "\n"));
+    const ready = () => child.stdout.write(JSON.stringify({ ready: true, model: LAYA_MODEL, revision: LAYA_REVISION }) + "\n");
+    if (readyDelayMs) setTimeout(ready, readyDelayMs); else setImmediate(ready);
     children.push(child);
     return child;
   };
@@ -182,12 +183,16 @@ test("late stdout from a cancelled worker cannot stop its replacement", async ()
     }
     setImmediate(() => oldReply({ answers: { action_guard: { choice: "allow", confidence: 1 } } }));
     setImmediate(() => reply({ answers: { action_guard: { choice: "review", confidence: 0.8 } } }));
-  });
+  }, { readyDelayMs: 250 });
   const controller = new AbortController();
-  const pending = runtime.judge(input, { signal: controller.signal, timeoutMs: 200 });
-  await firstStarted;
+  // Exercise cancellation after dispatch, including a startup slower than the old 200ms fixture
+  // budget. Production's default deadline and the original file deadline remain unchanged.
+  const pending = runtime.judge(input, { signal: controller.signal });
+  const cancelled = assert.rejects(pending, /cancelled|timed out/);
+  await Promise.race([firstStarted, pending]);
+  assert.equal(requests.length, 1);
   controller.abort();
-  await assert.rejects(() => pending, /cancelled|timed out/);
+  await cancelled;
   const result = await runtime.judge(input);
   assert.equal(result.choice, "review");
   assert.equal(requests.length, 2);

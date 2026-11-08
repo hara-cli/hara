@@ -1,3 +1,4 @@
+import { runtimeFailureDto } from "./runtime-failure-dto.mjs";
 import { execFileSync } from "node:child_process";
 import { runExternalCommandCapture } from "../../dist/external-sessions/process.js";
 import { createTaskExecution } from "../../dist/session/task.js";
@@ -264,7 +265,7 @@ for (const id of [selected]) test(id + " public attempt clears an inherited back
 for (const id of [selected]) test(id + " startup error first line reaches Host diagnostics with redaction", { skip: process.platform !== "darwin" }, async t => {
   const f = await fixture(t, id, "main", "startup-stderr"), outcome = await f.run();
   assert.equal(outcome.status, "error");
-  const dto = JSON.parse(outcome.error.slice(outcome.error.indexOf("hara_runtime_failure_v1=") + "hara_runtime_failure_v1=".length));
+  const dto = runtimeFailureDto(outcome.error);
   assert.match(dto.errorFirstLine, /Error: native startup rejected \[path\] account=\[redacted\]/);
   assert.equal(dto.extensionsIsolation, "inherited");
   assert.doesNotMatch(outcome.error, /Users\/private|PRIVATE_ACCOUNT|PRIVATE_SECOND_LINE/);
@@ -274,7 +275,7 @@ for (const id of [selected]) test(id + " startup error first line reaches Host d
 for (const id of [selected].filter(id => id !== "grok")) test(id + " typed zero-exit error first line reaches Host diagnostics", { skip: process.platform !== "darwin" }, async t => {
   const f = await fixture(t, id, "main", "terminal-error"), outcome = await f.run();
   assert.equal(outcome.status, "error");
-  const dto = JSON.parse(outcome.error.slice(outcome.error.indexOf("hara_runtime_failure_v1=") + "hara_runtime_failure_v1=".length));
+  const dto = runtimeFailureDto(outcome.error);
   assert.equal(dto.errorFirstLine, "401 account=[redacted]"); assert.equal(dto.kind, "runtime_auth_rejected");
   assert.doesNotMatch(outcome.error, /PRIVATE_ACCOUNT/); assert.equal(f.state().calls, 1);
   assert.equal(f.installer.list().options.find(row => row.runtimeId === id).versionStatus.lastSuccessfulVersion, null);
@@ -282,7 +283,7 @@ for (const id of [selected].filter(id => id !== "grok")) test(id + " typed zero-
 if (selected === "grok") test("grok ACP error first line preserves native classification without RPC data", { skip: process.platform !== "darwin" }, async t => {
   const f = await fixture(t, "grok", "main", "initialize-error"), outcome = await f.run();
   assert.equal(outcome.status, "error");
-  const dto = JSON.parse(outcome.error.slice(outcome.error.indexOf("hara_runtime_failure_v1=") + "hara_runtime_failure_v1=".length));
+  const dto = runtimeFailureDto(outcome.error);
   assert.equal(dto.kind, "runtime_auth_rejected"); assert.match(dto.errorFirstLine, /401 authentication rejected \[path\] account=\[redacted\]/);
   assert.doesNotMatch(outcome.error, /PRIVATE_RPC_DATA|PRIVATE_ACCOUNT|PRIVATE_SECOND_LINE|Users\/private/);
   assert.equal(f.state().calls, 0); assert.equal(f.state().owned, 1); assert.equal(f.state().closed, 1);

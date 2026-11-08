@@ -1,3 +1,4 @@
+import { currentWorkspaceAgentMemory } from "./agent-scope.js";
 // Agent-curated memory — durable facts/decisions/prefs hara records and recalls across sessions.
 // File-backed Markdown (git-versionable, human-readable), two scopes: global ~/.hara/memory and
 // project <root>/.hara/memory. Lexical search reuses recall.ts; no embeddings (local-first).
@@ -34,6 +35,8 @@ function capAtLine(text: string, cap: number): string {
 
 export function memoryDir(scope: Scope, cwd: string): string {
   if (currentWorkspaceResourceBinding()) {
+    const agent = currentWorkspaceAgentMemory();
+    if (agent && !agent.shared) return workspaceResourceDirectory(["memory", "colleagues", agent.agentId]);
     if (scope === "global") return workspaceResourceDirectory(["memory", "global"]);
     if (!isAbsolute(cwd)) throw new Error("Workspace project memory requires an explicit absolute cwd");
     const project = realpathSync.native(findProjectRoot(cwd));
@@ -44,8 +47,14 @@ export function memoryDir(scope: Scope, cwd: string): string {
   return join(findProjectRoot(cwd), ".hara", "memory");
 }
 /** Dirs to search for memory (project first, then global). */
-export function memoryRoots(cwd: string): string[] {
-  return [memoryDir("project", cwd), memoryDir("global", cwd)];
+export function memoryRoots(cwd: string, scope: "mine" | "workspace" | "all" = "all"): string[] {
+  const agent = currentWorkspaceAgentMemory();
+  if (!agent) return scope === "mine" ? [] : [memoryDir("project", cwd), memoryDir("global", cwd)];
+  const own = workspaceResourceDirectory(["memory", "colleagues", agent.agentId]);
+  const project = realpathSync.native(findProjectRoot(agent.legacyCwd));
+  const key = createHash("sha256").update("hara-workspace-project-memory-v1\0").update(project).digest("hex");
+  const shared = [workspaceResourceDirectory(["memory", "projects", key]), workspaceResourceDirectory(["memory", "global"])];
+  return scope === "mine" ? [own] : scope === "workspace" ? shared : [own, ...shared];
 }
 
 function today(): string {
@@ -64,7 +73,8 @@ function memoryLogDir(scope: Scope, cwd: string): string {
   const dir = memoryDir(scope, cwd);
   if (currentWorkspaceResourceBinding()) {
     // memoryDir has verified the complete root; add the log directory through the same private binder.
-    const relativeRoot = scope === "global" ? ["memory", "global"] : ["memory", "projects", basename(dir)];
+    const agent = currentWorkspaceAgentMemory();
+    const relativeRoot = agent && !agent.shared ? ["memory", "colleagues", agent.agentId] : scope === "global" ? ["memory", "global"] : ["memory", "projects", basename(dir)];
     return workspaceResourceDirectory([...relativeRoot, "log"]);
   }
   return join(dir, "log");
@@ -214,9 +224,10 @@ export function memoryDigest(
     ["global", "memory", "global MEMORY"],
     ["global", "user", "USER preferences"],
   ];
-  const parts: string[] = [];
+  const parts: string[] = [], seen = new Set<string>();
   for (const [scope, target, label] of sources) {
     const f = targetFile(scope, target, cwd);
+    if (seen.has(f)) continue; seen.add(f);
     if (!existsSync(f)) continue;
     try {
       const t = sanitizeMemoryForPrompt(readMemoryText(f)).text.trim();

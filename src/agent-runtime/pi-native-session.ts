@@ -1,3 +1,4 @@
+import { WorkspaceNativeSessions } from "../workspace/native-session-boundary.js";
 import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -45,7 +46,8 @@ export class PiNativeSessionStore {
   constructor(storage: WorkspaceResourceStorage, binding: WorkspaceRunBinding, history: readonly NeutralMsg[], private readonly currentPromptHash: string | null = null) {
     if (currentPromptHash !== null && !/^[a-f0-9]{64}$/.test(currentPromptHash)) invalid();
     this.bindingDigest = hash(canonical(binding));
-    this.store = new WorkspaceJsonState(storage, "pi-native-session-" + hash(binding.runId).slice(0, 32) + ".json", parse, () => ({ revision: 0, receipt: null }));
+    const epoch = new WorkspaceNativeSessions(storage, binding.agent.agentId, binding.sessionId).latest("pi", 4000)?.epoch;
+    this.store = new WorkspaceJsonState(storage, "pi-native-session-" + hash(epoch ? binding.runId + "\0" + epoch : binding.runId).slice(0, 32) + ".json", parse, () => ({ revision: 0, receipt: null }));
     this.current = this.store.read();
     const previous = this.current.receipt, temporary = realpathSync.native(tmpdir());
     if (previous) {

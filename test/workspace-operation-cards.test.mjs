@@ -205,6 +205,7 @@ test("proxy card binds the admitted getter/setter and rejects stale revision and
 
 test("permission card binds real file schemas, tool kinds and path/permit rejection", async () => {
   const definition = card("scope-permissions"); await checkRpcFacts(definition); checkTools(definition.tools, mainTools);
+  for(const tools of [mainTools,colleagueTools])for(const name of ["workspace_read","workspace_write","workspace_verify"]){const schema=tools.find(tool=>tool.name===name).input_schema;assert.deepEqual(schema.properties.root.enum,["home","legacy"]);assert.equal(schema.required.includes("root"),false,"root remains an optional closed selector, never an arbitrary path grant");}
   let current = true; const tools = localWorkspaceFileTools(dir(), () => { if (!current) throw new Error("revoked permit"); });
   assert.deepEqual(tools.map(tool => [tool.name, tool.kind]), [["workspace_read", "read"], ["workspace_write", "edit"], ["workspace_verify", "read"]]);
   const read = tools.find(tool => tool.name === definition.tools[0].name);

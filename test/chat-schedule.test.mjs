@@ -72,3 +72,36 @@ test("a missing conversation blocks a repeated schedule once until its definitio
   assert.equal(scheduler.list().runs.filter(row => row.scheduleId === id).length, 1);
   assert.equal(scheduler.list().runs.find(row => row.scheduleId === id).state, "blocked");
 });
+
+
+test("archive pause receipt survives a crash window and supports exact explicit recovery",()=>{
+ const f=fixture(),time=parseChatScheduleTime({repeat:"every:15m",tz:"UTC"});
+ const first=f.features.createChatSchedule(input(f,time)),second=f.features.createChatSchedule(input(f,time,"colleague-two"));
+ const paused=f.features.pauseAgentSchedulesWithReceipt("colleague-one");assert.equal(paused.length,1);
+ // Reopening before lifecycle commit models the durable state left by an abrupt Host exit.
+ const restarted=new WorkspaceFeatures(f.storage,dir(),f.storage.scope.workspaceId);
+ assert.equal(restarted.schedules().find(row=>row.id===first).enabled,false);
+ assert.equal(restarted.schedules().find(row=>row.id===second).enabled,true);
+ const [receipt]=restarted.archivePauseReceipts();assert.deepEqual(receipt.schedules,paused);
+ assert.deepEqual(restarted.list().archiveRecovery,[{id:receipt.id,agentId:"colleague-one",createdAt:receipt.createdAt,scheduleIds:[first]}]);
+ assert.throws(()=>restarted.pauseAgentSchedulesWithReceipt("colleague-one"),/retained archive pause/);
+ restarted.restorePausedAgentSchedules(receipt.agentId,receipt.schedules);
+ assert.equal(restarted.schedules().find(row=>row.id===first).enabled,true);assert.deepEqual(restarted.archivePauseReceipts(),[]);
+});
+
+test("failed recovery retains its receipt across restart and manual schedule review resolves only that ID",()=>{
+ const f=fixture(),time=parseChatScheduleTime({repeat:"every:15m",tz:"UTC"});
+ const first=f.features.createChatSchedule(input(f,time)),second=f.features.createChatSchedule(input(f,time));
+ const paused=f.features.pauseAgentSchedulesWithReceipt("colleague-one");
+ const original=f.features.schedules().find(row=>row.id===first);
+ f.features.saveSchedule({id:first,name:"Edited after pause",task:"Different fixture task",agentId:"colleague-one",schedule:original.schedule,enabled:false},f.features.list().revision);
+ assert.throws(()=>f.features.restorePausedAgentSchedules("colleague-one",paused),/changed/);
+ const restarted=new WorkspaceFeatures(f.storage,dir(),f.storage.scope.workspaceId);
+ assert.deepEqual(restarted.archivePauseReceipts()[0].schedules,paused);
+ assert(restarted.schedules().every(row=>!row.enabled));
+ restarted.setScheduleEnabled(first,false,restarted.list().revision);
+ assert.deepEqual(restarted.list().archiveRecovery[0].scheduleIds,[second]);
+ restarted.setScheduleEnabled(second,true,restarted.list().revision);
+ assert.deepEqual(restarted.archivePauseReceipts(),[]);
+ assert.equal(restarted.schedules().find(row=>row.id===first).enabled,false);
+});

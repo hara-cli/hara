@@ -4,7 +4,7 @@ import { extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { verifyOpenedRegularFileSync } from "../fs-read.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
-import { sensitiveFileError } from "../security/sensitive-files.js";
+import { sensitiveFileError, lexicalSensitiveFileReason } from "../security/sensitive-files.js";
 
 export const MAX_MEDIA_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_VIDEO_BYTES = 256 * 1024 * 1024, MAX_REGISTRATIONS = 512;
@@ -16,8 +16,9 @@ export interface WorkspaceMediaRegistration { id: string; mime: string; bytes: n
 const inside = (root: string, path: string) => { const rel = relative(root, path); return !!rel && !isAbsolute(rel) && rel.split(sep).every(part => part !== ".." && part !== ""); };
 const sameFile = (a: Stats, b: Stats) => sameOpenedFileIdentity(a, b) && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
 export type WorkspaceMediaFailure = "outside" | "missing" | "failed";
-class WorkspaceMediaError extends Error { constructor(readonly kind: WorkspaceMediaFailure) { super("Workspace media unavailable"); } }
-const denied = (kind: WorkspaceMediaFailure = "outside") => new WorkspaceMediaError(kind);
+export type WorkspaceMediaFailureReason = "symlink" | "path_spelling";
+class WorkspaceMediaError extends Error { constructor(readonly kind: WorkspaceMediaFailure, readonly reason?: WorkspaceMediaFailureReason) { super("Workspace media unavailable"); } }
+const denied = (kind: WorkspaceMediaFailure = "outside", reason?: WorkspaceMediaFailureReason) => new WorkspaceMediaError(kind, reason);
 function matchesMime(bytes: Buffer, mime: string): boolean {
   if (mime === "image/png") return bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
   if (mime === "image/jpeg") return bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
@@ -35,7 +36,13 @@ function matchesMime(bytes: Buffer, mime: string): boolean {
  * never from renderer input. Every read repeats the current grant, directory, inode and MIME checks. */
 export class WorkspaceMediaRegistry {
   private readonly entries = new Map<string, Entry>();
-  constructor(private readonly project: string, private readonly roots: () => readonly string[], private readonly assertCurrent: () => void) {}
+  constructor(private readonly project: string, private readonly roots: () => readonly string[], private readonly assertCurrent: () => void, private readonly managedProject = false) {}
+  /** Only the Host's fixed managed project may lift the enclosing Hara-state mask. No other root gains it. */
+  private managedContent(path: string): boolean {
+    return this.managedProject && inside(this.project, path) && !relative(this.project, path).split(sep).some(part => part.startsWith("."))
+      && lexicalSensitiveFileReason(path) === "private Hara state";
+  }
+  private isProtected(path: string) { return Boolean(sensitiveFileError(path, "read") && !this.managedContent(path)); }
   private checkedPath(input: string): { path: string; root: string; rootInfo: Stats } {
     if (!input || input.length > 4096 || /[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/u.test(input)) throw denied();
     let path = input;
@@ -43,7 +50,7 @@ export class WorkspaceMediaRegistry {
     if (/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/u.test(path)) throw denied();
     if (path.split(/[\\/]/u).some(part => part === "..") || /[?*<>|]/u.test(path)) throw denied();
     path = resolve(this.project, path);
-    if (sensitiveFileError(path, "read") || path.split(sep).some(part => [".codex", ".claude", ".ssh", "Keychains"].includes(part))) throw denied();
+    if (this.isProtected(path) || path.split(sep).some(part => [".codex", ".claude", ".ssh", "Keychains"].includes(part))) throw denied();
     const roots = this.roots().filter(root => isAbsolute(root) && root !== resolve(sep));
     let matched = false, missing = false;
     for (const candidate of roots.sort((a, b) => b.length - a.length)) {
@@ -51,6 +58,7 @@ export class WorkspaceMediaRegistry {
       try {
         // A registered root (or its ancestors) may be an alias. Only links below that root are denied.
         const root = realpathSync.native(logicalRoot), rootInfo = lstatSync(root);
+        if (root === resolve(sep)) continue;
         const prefix = inside(logicalRoot, path) ? logicalRoot : inside(root, path) ? root : null;
         if (!prefix) continue;
         matched = true; rootMatched = true;
@@ -59,10 +67,11 @@ export class WorkspaceMediaRegistry {
         for (const part of relative(prefix, path).split(sep)) {
           if (!part || part.startsWith(".") || part.includes(":")) throw denied();
           cursor = resolve(cursor, part); const info = lstatSync(cursor);
-          if (info.isSymbolicLink()) throw denied();
+          if (info.isSymbolicLink()) throw denied("failed", "symlink");
         }
         const canonical = realpathSync.native(cursor);
-        if (!inside(root, canonical) || canonical !== cursor || sensitiveFileError(canonical, "read")
+        if (inside(root, canonical) && canonical !== cursor) throw denied("failed", "path_spelling");
+        if (!inside(root, canonical) || this.isProtected(canonical)
           || canonical.split(sep).some(part => [".codex", ".claude", ".ssh", "Keychains"].includes(part))) throw denied();
         return { path: canonical, root, rootInfo };
       } catch (error) {
@@ -81,7 +90,7 @@ export class WorkspaceMediaRegistry {
     try { fd = openSync(checked.path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)); } catch { throw denied("failed"); }
     try {
       const info = fstatSync(fd), mime = MIME[extname(checked.path).toLowerCase()];
-      const canonical = verifyOpenedRegularFileSync(checked.path, info, { rejectHardLinks: true, protectSensitive: true });
+      const canonical = verifyOpenedRegularFileSync(checked.path, info, { rejectHardLinks: true, protectSensitive: !this.managedContent(checked.path), expectedCanonicalPath: checked.path });
       if (canonical !== checked.path) throw denied("failed");
       if (!mime || !info.size || info.size > (mime.startsWith("video/") ? MAX_VIDEO_BYTES : MAX_MEDIA_RESPONSE_BYTES) || expected && !sameFile(info, expected.info)) throw denied("failed");
       const prefix = Buffer.alloc(Math.min(32, info.size)); readSync(fd, prefix, 0, prefix.length, 0);
@@ -102,10 +111,10 @@ export class WorkspaceMediaRegistry {
       return { id: entry.id, mime: entry.mime, bytes: entry.info.size };
     } finally { closeSync(file.fd); }
   }
-  describe(input: string): { state: "ready"; media: WorkspaceMediaRegistration } | { state: WorkspaceMediaFailure } {
+  describe(input: string): { state: "ready"; media: WorkspaceMediaRegistration } | { state: WorkspaceMediaFailure; reason?: WorkspaceMediaFailureReason } {
     this.assertCurrent();
     try { return { state: "ready", media: this.register(input) }; }
-    catch (error) { this.assertCurrent(); return { state: error instanceof WorkspaceMediaError ? error.kind : "failed" }; }
+    catch (error) { this.assertCurrent(); return { state: error instanceof WorkspaceMediaError ? error.kind : "failed", ...(error instanceof WorkspaceMediaError && error.reason ? { reason: error.reason } : {}) }; }
   }
   has(id: string) { return /^[a-f0-9]{64}$/u.test(id) && this.entries.has(id); }
   read(id: string, range?: string, head = false, pathOnly = false) {

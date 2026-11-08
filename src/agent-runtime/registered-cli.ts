@@ -1,5 +1,5 @@
 import { WorkspaceContextCompactions, compactionSourceKey, type ContextSummary } from "../workspace/context-compaction.js";
-import { workspaceCompactionSource, workspaceRuntimeStorage } from "../workspace/execution.js";
+import { workspaceCompactionSource, workspaceRuntimeStorage, workspaceNativeSessionBoundary } from "../workspace/execution.js";
 import { oneShotCompactionPrompt } from "./context-compaction.js";
 import { claudeRuntimeEnvironment, parseClaudeCliOutput } from "./claude-cli.js";
 import { runtimeWriteProtection, workspaceRunPermissionTier } from "./execution-policy.js";
@@ -92,7 +92,7 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
     }
     let successfulUse: (() => void) | undefined;
     const session = id === "codex" ? await codexSessionPool(installer).acquire(permit, assertCurrent) : undefined;
-    let hostSeed: { ledger: WorkspaceContextCompactions; summary: ContextSummary; source: NonNullable<ReturnType<typeof workspaceCompactionSource>>; tokens: number } | undefined;
+    let hostSeed: { ledger: WorkspaceContextCompactions; summary: ContextSummary; source: NonNullable<ReturnType<typeof workspaceCompactionSource>>; tokens: number; historyBoundary: number; sourceKey: string } | undefined;
     const native = createRegisteredCliMcpTurn({
       signal: options.signal!, assertCurrent, jsonEvents: id === "codex",
       ...(session ? { bearerToken: session.token, createEndpoint: session.createEndpoint.bind(session),
@@ -106,9 +106,11 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
         const source = workspaceCompactionSource(permit);
         if (!source) return original;
         const ledger = new WorkspaceContextCompactions(workspaceRuntimeStorage(permit), permit.binding.agent.agentId, permit.binding.sessionId);
-        const summary = ledger.plan(source, { runtimeId: "claude", sourceKey: compactionSourceKey("claude", permit.binding.runId), tokens, idle: true });
+        const boundary = workspaceNativeSessionBoundary(permit, source.history.length), historyBoundary = boundary?.historyStart ?? 0,
+          sourceKey = compactionSourceKey("claude", boundary ? permit.binding.runId + ":" + boundary.epoch : permit.binding.runId);
+        const summary = ledger.plan(source, { runtimeId: "claude", sourceKey, tokens, idle: true, historyBoundary });
         if (!summary) return original;
-        hostSeed = { ledger, summary, source, tokens };
+        hostSeed = { ledger, summary, source, tokens, historyBoundary, sourceKey };
         return oneShotCompactionPrompt(args, summary);
       } }),
       async launch(endpoint, prompt, activity, turnArgs) {
@@ -159,7 +161,7 @@ export function registeredCliDriver(id: "codex" | "claude", installer: Workspace
         let seedRecord: string | undefined, seedSucceeded = false;
         try {
           if (hostSeed) seedRecord = hostSeed.ledger.begin(hostSeed.source, { runtimeId: "claude", method: "host-seed",
-            sourceKey: compactionSourceKey("claude", permit.binding.runId), tokens: hostSeed.tokens, requests: 0, summary: hostSeed.summary });
+            sourceKey: hostSeed.sourceKey, tokens: hostSeed.tokens, requests: 0, summary: hostSeed.summary, historyBoundary: hostSeed.historyBoundary });
           const launch = policy.wrap({ command: resolved.command, env, args });
           if (id === "claude") launch.env = claudeRuntimeEnvironment(launch.env, policy.tempRoot);
           const result = await runExternalCommandCapture(launch, launch.args, {

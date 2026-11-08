@@ -45,7 +45,11 @@ if (selected.includes(0)) test("formal six-step Host flow uses an explicit mock 
     assert.equal(JSON.parse(receipts[0].content).approvalState, "consumed");
     assert.throws(() => host.answerApproval("client", id, card.id, true), /approval/);
     const task = host.start("client", id, main, "委派 Coder 生成 hello.md 並驗證", randomUUID()); await host.wait(task.runId);
-    const before = host.snapshot(id, main, "client"); assert.equal(before.conversation.completion.state, "verified"); assert.equal(fs.readFileSync(join(root, "project", id, "hello.md"), "utf8"), "hello workspace\n");
+    const before = host.snapshot(id, main, "client"); assert.equal(before.conversation.completion.state, "verified");
+    const colleague=before.agents.find(agent=>agent.kind==="colleague"),child=host.snapshot(id,colleague.agentId),primary=join(root,"project",id,"colleagues",colleague.agentId);
+    assert.equal(child.colleagueHome.path,primary);assert.equal(child.colleagueHome.available,true);assert.equal(child.conversation.completion.state,"verified");
+    assert.equal(fs.readFileSync(join(primary,"hello.md"),"utf8"),"hello workspace\n");
+    assert.equal(fs.existsSync(join(root,"project",id,"hello.md")),false,"formal delegation uses the colleague primary folder");
     assert.equal(fs.existsSync(join(root, ".hara/workspace-dev-fixture.json")), false); assert.equal(JSON.parse(fs.readFileSync(join(root, ".hara/workspace-root-v1.json"))).kind, "hara-workspace");
     await host.close(); restored = new LocalWorkspaceHost(root, { mode: "workspace", providerFactory() { throw new Error("restart/read must not construct a provider"); } });
     assert.deepEqual(restored.snapshot(id, main, "client").conversation, before.conversation); assert.equal(restored.snapshot(id).agents.length, 2);

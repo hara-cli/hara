@@ -6,12 +6,12 @@ import { exact, plain, text } from "./local-state.js";
 
 /** Same-Workspace remembered TEXT only: no arbitrary path API, memory edits, global home discovery
  * or permission recovery. Historical notes are context, never evidence that a fresh action happened. */
-export function workspaceMemorySearchTool(search: (query: string, limit: number) => Promise<{ title: string; snippet: string }[]>, assertCurrent: () => void): Tool {
-  return { name: "workspace_memory_search", kind: "read", description: "Search remembered notes of THIS Workspace. Historical context only, not permissions or proof of newly completed work. No host paths or other Workspace data.",
-    input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+export function workspaceMemorySearchTool(search: (query: string, limit: number, scope?: "mine" | "workspace" | "all") => Promise<{ title: string; snippet: string }[]>, assertCurrent: () => void): Tool {
+  return { name: "workspace_memory_search", kind: "read", description: "Search remembered notes: mine is this colleague only, workspace is explicitly shared notes, all (default) searches private notes first then shared notes. No other colleague private notes. Historical context only, not permissions or proof of newly completed work. No host paths or other Workspace data.",
+    input_schema: { type: "object", properties: { query: { type: "string" }, scope: { type: "string", enum: ["mine", "workspace", "all"] } }, required: ["query"] },
     async run(input) {
-      if (!plain(input) || !exact(input, ["query"]) || !text(input.query, 200)) throw new Error("Invalid Workspace memory query");
-      assertCurrent(); const hits = await search(input.query, 5); assertCurrent();
+      if (!plain(input) || !exact(input, ["query", ...(Object.hasOwn(input, "scope") ? ["scope"] : [])]) || !text(input.query, 200) || input.scope !== undefined && !["mine", "workspace", "all"].includes(String(input.scope))) throw new Error("Invalid Workspace memory query");
+      assertCurrent(); const hits = await search(input.query, 5, input.scope as "mine" | "workspace" | "all" | undefined); assertCurrent();
       const clean = (value: string, cap: number) => redactSensitiveText(sanitizeMemoryForPrompt(value).text).text.slice(0, cap);
       const rows = hits.slice(0, 5).map(row => ({ ref: createHash("sha256").update(row.title + "\0" + row.snippet).digest("hex"),
         title: clean(row.title, 120), snippet: clean(row.snippet, 600) })).filter(row => row.snippet);

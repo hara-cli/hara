@@ -321,7 +321,8 @@ export const WORKSPACE_OPERATION_CARDS = [
       {
         "name": "workspace_read",
         "fields": [
-          "path"
+          "path",
+          "root"
         ],
         "required": [
           "path"
@@ -331,7 +332,8 @@ export const WORKSPACE_OPERATION_CARDS = [
         "name": "workspace_write",
         "fields": [
           "path",
-          "content"
+          "content",
+          "root"
         ],
         "required": [
           "path",
@@ -342,7 +344,8 @@ export const WORKSPACE_OPERATION_CARDS = [
         "name": "workspace_verify",
         "fields": [
           "path",
-          "expectedContent"
+          "expectedContent",
+          "root"
         ],
         "required": [
           "path",
@@ -358,7 +361,7 @@ export const WORKSPACE_OPERATION_CARDS = [
     "steps": [
       "先看本轮实际提供的工具；读取说明不会新增 shell、网络、全局文件或凭据权限，也不能把 scope、云端成员角色与登录身份混成一种权限。",
       "新同事的新任务默认 full-protected（全权＋写保护），可选 controlled（受控）。切档须当前配置版本/epoch，只影响新任务；已有 task binding 冻结，旧绑定缺字段仍受控，运行/收尾中不能切档。",
-      "workspace_read / workspace_write / workspace_verify 只接受当前获授项目内安全相对路径；绝对路径、父目录、隐藏路径、node_modules、符号链接及受保护凭据路径不能绕过。",
+      "workspace_read / workspace_write / workspace_verify 的 path 只接受安全相对路径；省略 root 或 root=home 使用本同事实际工作目录，root=legacy 只选择 Host 固定的关联 Workspace 目录，不接受任意路径授权。绝对路径、父目录、隐藏路径、node_modules、符号链接及受保护凭据路径不能绕过；其他同事主目录只读，守则文件写入须 Hara 确认卡。",
       "文件编辑先按任务治理明确目标，读后按需修改并验证；只读问答不因加载此卡而要求额外授权。",
       "资源已变化或当前许可被撤销时停止旧操作并刷新，不能手改状态文件、伪造 grant 或扩大工具 allowlist。现有明确授权无需再问一次。",
       "full 的原生 shell/文件工具可写本同事工作目录、精确自身状态与专用临时目录；受控保持外层只读。Hara 状态、凭据写入和其它 runtime 凭据仍受保护；自身登录仅沿已准入路径/系统ACL复用，own isolated 状态例外只限精确目录。Pi只有空auth和空lock目录状态，不获Keychain例外。",
@@ -377,7 +380,8 @@ export const WORKSPACE_OPERATION_CARDS = [
         "name": "workspace_verify",
         "fields": [
           "path",
-          "expectedContent"
+          "expectedContent",
+          "root"
         ],
         "required": [
           "path",

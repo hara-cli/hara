@@ -21,7 +21,11 @@ test("an inherited Pi colleague performs an actual synthetic file task and remai
     await host.wait(accepted.runId);clearInterval(watchdog);
     phase("task drained");
     const conversation=host.snapshot(id,a.agentId).conversation;
-    assert.equal(conversation.taskState,"completed",JSON.stringify(conversation));assert.equal(fs.readFileSync(join(f.root,"project",id,"hello.md"),"utf8"),"hello workspace\n");
+    assert.equal(conversation.taskState,"completed",JSON.stringify(conversation));
+    const view=host.snapshot(id,a.agentId),primary=join(f.root,"project",id,"colleagues",a.agentId);
+    assert.equal(view.colleagueHome.path,primary);assert.equal(view.colleagueHome.available,true);
+    assert.equal(fs.readFileSync(join(primary,"hello.md"),"utf8"),"hello workspace\n");
+    assert.equal(fs.existsSync(join(f.root,"project",id,"hello.md")),false,"the inherited Pi colleague must not fall back to the old Workspace root");
     const other=host.createWorkspace("Other",host.list().revision);assert.equal(other.agents.length,1);assert.equal(other.connections.connections.length,0);
     assert.equal(host.workspaceFeatures(other.workspaceId).schedules.length,0);assert.equal(host.workspaceFeatures(other.workspaceId).skills.length,0);
   }finally{clearInterval(watchdog);await host.close();phase("host closed");}

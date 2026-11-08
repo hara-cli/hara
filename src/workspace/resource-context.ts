@@ -78,6 +78,28 @@ interface StorageContext {
   trackDirectory(directory: PrivateStateDirectoryIdentity): void;
 }
 const contexts = new AsyncLocalStorage<StorageContext>();
+interface WorkspaceMemoryAgentScope {
+  readonly binding: WorkspaceResourceBinding; readonly agentId: string; readonly legacyCwd: string; readonly shared: boolean;
+}
+const memoryAgents = new AsyncLocalStorage<WorkspaceMemoryAgentScope>();
+/** Host-only colleague routing. A resource tuple survives same-scope store wrappers, never a foreground switch. */
+export function withWorkspaceMemoryAgentScope<T>(agentId: string, legacyCwd: string, operation: () => T): T {
+  const context = contexts.getStore();
+  if (!context || !agentId.startsWith("ag_") || !UUID.test(agentId.slice(3)) || !isAbsolute(legacyCwd)) throw new Error("Invalid colleague memory context");
+  context.assertCurrent();
+  return memoryAgents.run({ binding: { ...context.binding }, agentId, legacyCwd, shared: false }, operation);
+}
+export function currentWorkspaceMemoryAgentScope(): WorkspaceMemoryAgentScope | undefined {
+  const scope = memoryAgents.getStore();
+  if (scope && !sameWorkspaceResourceBinding(scope.binding, currentWorkspaceResourceBinding()!)) throw new Error("Colleague memory resource changed");
+  return scope;
+}
+/** Only the Host callback for a consumed shared-note approval enters this scope. */
+export function withWorkspaceSharedMemoryScope<T>(operation: () => T): T {
+  const scope = currentWorkspaceMemoryAgentScope();
+  if (!scope) throw new Error("Shared memory promotion requires a colleague context");
+  return memoryAgents.run({ ...scope, shared: true }, operation);
+}
 
 /**
  * A8 synchronous fence frame. Opened by WorkspaceResourceStorage.run immediately after a full
@@ -187,12 +209,18 @@ export function bindWorkspaceMemoryInventory(root: string) {
   if (!context) throw new Error("Workspace memory inventory requires an explicit resource context");
   const home = workspaceStateHome();
   const parts = relative(join(home, ".hara", "memory"), root).split(sep);
-  if (!isAbsolute(root) || ((parts.length !== 1 || parts[0] !== "global")
+  const agent = parts.length === 2 && parts[0] === "colleagues" ? currentWorkspaceMemoryAgentScope() : undefined;
+  const ownPrivate = Boolean(agent && parts[1] === agent.agentId);
+  if (!isAbsolute(root) || (!ownPrivate && (parts.length !== 1 || parts[0] !== "global")
     && (parts.length !== 2 || parts[0] !== "projects" || !HASH.test(parts[1]!)))) {
     throw new Error("Workspace memory inventory requires one exact bound memory bucket");
   }
   const assertDirectory = (path: string): void => {
     if (contexts.getStore() !== context) throw new Error("Workspace memory inventory permit belongs to another resource context");
+    if (ownPrivate) {
+      const current = currentWorkspaceMemoryAgentScope();
+      if (!current || current.agentId !== agent!.agentId || !sameWorkspaceResourceBinding(current.binding, agent!.binding)) throw new Error("Workspace memory inventory belongs to another colleague");
+    }
     context.assertCurrent();
     const rel = relative(root, path);
     if (!isAbsolute(path) || isAbsolute(rel) || rel.split(sep).includes("..")) throw new Error("directory escaped Workspace memory inventory");

@@ -13,6 +13,7 @@ import { WorkspaceResourceStorage, workspaceStateHome } from "../dist/workspace/
 import { intelCaseTimeout } from "../scripts/intel-ci-test-budget.mjs";
 import { captureWorkspaceProjectIdentity } from "../dist/workspace/run-binding.js";
 import { DEFAULT_TIER, FULL_TIER_SKIP, SEATBELT } from "./helpers/platform-tier.mjs";
+import { WorkspacePrimaryDirectoryError } from "../dist/workspace/colleague-homes.js";
 
 const temporary=[];
 after(()=>{for(const path of temporary)fs.rmSync(path,{recursive:true,force:true});});
@@ -42,8 +43,11 @@ test("no-key boot, main chat, explicit creation card, colleague task and same-ro
   const delegated=a.host.start("client",a.workspaceId,a.main,"委派 Coder 生成 hello.md 並驗證",randomUUID());await a.host.wait(delegated.runId);
   snapshot=a.host.snapshot(a.workspaceId,a.main,"client");
   assert.equal(snapshot.conversation.taskState,"completed");assert.equal(snapshot.conversation.completion.state,"verified");
-  assert.equal(fs.readFileSync(join(a.root,"project",a.workspaceId,"hello.md"),"utf8"),"hello workspace\n");
+  const primary=join(a.root,"project",a.workspaceId,"colleagues",colleague.agentId);
+  assert.equal(fs.readFileSync(join(primary,"hello.md"),"utf8"),"hello workspace\n");
+  assert.equal(fs.existsSync(join(a.root,"project",a.workspaceId,"hello.md")),false,"the delegated colleague must use its own primary folder");
   const child=a.host.snapshot(a.workspaceId,colleague.agentId);assert.equal(child.conversation.taskState,"completed");
+  assert.equal(child.colleagueHome.path,primary);assert.equal(child.colleagueHome.available,true);
   assert.equal(child.conversation.completion.state,"verified");assert.ok(child.conversation.history.some(message=>message.role==="tool"));
   assert.equal(JSON.stringify(snapshot).includes(SYNTHETIC_CONNECTION.apiKey),false);assert.equal(JSON.stringify(snapshot).includes("configHash"),false);
   const before=JSON.stringify(snapshot.conversation);await a.host.close();
@@ -78,7 +82,7 @@ test("old shared-project run remains readable but cannot resume or construct a P
   raw.task.workspaceRunBinding.project=captureWorkspaceProjectIdentity(join(a.root,"project"));fs.writeFileSync(path,JSON.stringify(raw)+"\n",{mode:0o600});
   let constructed=0;const restored=new LocalWorkspaceHost(a.root,{providerFactory(){constructed++;throw new Error("must not construct");}});
   try{const history=restored.snapshot(a.workspaceId).conversation.history;
-   assert.throws(()=>restored.start("client",a.workspaceId,a.main,"/continue",randomUUID(),true),/project root changed/);
+   assert.throws(()=>restored.start("client",a.workspaceId,a.main,"/continue",randomUUID(),true),error=>error instanceof WorkspacePrimaryDirectoryError&&error.code==="workspace_primary_unavailable");
    assert.equal(constructed,0);assert.deepEqual(restored.snapshot(a.workspaceId).conversation.history,history);
   }finally{await restored.close();}
  }finally{release();await a.host.close();}

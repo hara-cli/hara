@@ -1,8 +1,9 @@
+import { lexicalSensitiveFileReason } from "../security/sensitive-files.js";
 import { decorateWorkspaceExtensionTool } from "./extension-binding.js";
 import { createHash } from "node:crypto";
-import { lstatSync } from "node:fs";
-import { isAbsolute, relative, resolve, sep } from "node:path";
-import { atomicWriteText, bindAtomicWritePath } from "../fs-write.js";
+import { lstatSync, mkdirSync, realpathSync } from "node:fs";
+import { isAbsolute, relative, resolve, sep, join, dirname } from "node:path";
+import { atomicWriteText, bindAtomicWritePath, bindHaraPrivateStateWritePath } from "../fs-write.js";
 import { readVerifiedRegularFileSnapshotSync } from "../fs-read.js";
 import type { Tool } from "../tools/registry.js";
 import { exact, plain, text } from "./local-state.js";
@@ -19,13 +20,26 @@ export function withWorkspaceToolReceipts(tools: Tool[]): Tool[] {
   } }));
 }
 
-/** Fixture-only project tools. No shell, symlinks, protected files, arbitrary outputs or external IO. */
-export function localWorkspaceFileTools(project: string, assertCurrent: () => void): Tool[] {
-  const target = (value: unknown): string => {
+/** Host-scoped project tools. No shell, links, protected state, caller-defined roots or external IO. */
+export function localWorkspaceFileTools(project: string, assertCurrent: () => void, managed?: { legacyProject: string; ownHome: string; onWrite: () => void; beginWrite?: () => () => void }): Tool[] {
+  const selectedRoot = (root: unknown) => {
+    if (root === undefined || root === "home") return project;
+    if (root === "legacy" && managed) return managed.legacyProject;
+    throw new Error("Unsupported Workspace file root");
+  };
+  const target = (value: unknown, root?: unknown, write = false): string => {
+    const project = selectedRoot(root);
     if (!text(value, 512) || isAbsolute(value)) throw new Error("Workspace file path must be project-relative");
     const path = resolve(project, value), rel = relative(project, path), parts = rel.split(sep);
-    if (!rel || isAbsolute(rel) || parts.some(p => !p || p === ".." || p.startsWith(".") || p === "node_modules")
+    if (!rel || isAbsolute(rel) || parts.some(p => !p || p === ".." || p.startsWith(".") || p === "node_modules" || /[. ]$/.test(p) || p.includes(":"))
       || /(?:^|[\\/])(?:credentials?|secrets?|id_rsa|id_ed25519)(?:\.|[\\/]|$)/i.test(rel)) throw new Error("Workspace file path is outside the granted safe project");
+    if (write && managed) {
+      const inRoot = (base: string, child: string) => { const tail = relative(base, child); return !isAbsolute(tail) && tail !== ".." && !tail.startsWith(".." + sep); };
+      const namespace = join(managed.legacyProject, "colleagues");
+      if (inRoot(namespace, path) && !inRoot(managed.ownHome, path)) throw new Error("Another colleague working folder is read-only");
+      if ([managed.legacyProject, managed.ownHome].some(base => relative(base, path).split(sep).length === 1 && /^(?:agents\.md|claude(?:\.local)?\.md)$/i.test(relative(base, path))))
+        throw new Error("Managed instructions require a Hara confirmation card");
+    }
     let cursor = project;
     for (const part of parts) {
       cursor = resolve(cursor, part);
@@ -34,38 +48,51 @@ export function localWorkspaceFileTools(project: string, assertCurrent: () => vo
     }
     assertCurrent(); return path;
   };
-  const schema = { type: "object" as const, properties: { path: { type: "string" } }, required: ["path"] };
+  // Only this Host-derived managed root can lift the Hara-state classification. Credential names,
+  // symlinks/hard links and every path restriction above remain checked independently.
+  const managedStateFile = (path: string) => Boolean(managed && lexicalSensitiveFileReason(path) === "private Hara state");
+  const snapshotAt = (path: string) => readVerifiedRegularFileSnapshotSync(path, 128 * 1024, { protectSensitive: !managedStateFile(path), ...(managed ? { expectedCanonicalPath: path } : {}) });
+  const writeBoundary = (path: string) => {
+    if (!managedStateFile(path)) return bindAtomicWritePath(path);
+    const missing: string[] = []; let parent = dirname(path);
+    while (true) { try { lstatSync(parent); break; } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; missing.unshift(parent); parent = dirname(parent); } }
+    for (const dir of missing) { assertCurrent(); mkdirSync(dir, { mode: 0o700 }); if (realpathSync.native(dir) !== dir || lstatSync(dir).isSymbolicLink()) throw new Error("Workspace parent alias changed"); }
+    assertCurrent(); return bindHaraPrivateStateWritePath(path, dirname(path), "write managed Workspace project file");
+  };
+  const schema = { type: "object" as const, properties: { path: { type: "string" }, ...(managed ? { root: { type: "string", enum: ["home", "legacy"] } } : {}) }, required: ["path"] };
   const read = (input: unknown) => {
-    if (!plain(input) || !exact(input, ["path"])) throw new Error("invalid Workspace read input");
-    const path = target(input.path), snapshot = readVerifiedRegularFileSnapshotSync(path, 128 * 1024);
+    if (!plain(input) || !exact(input, ["path", ...(Object.hasOwn(input, "root") && managed ? ["root"] : [])])) throw new Error("invalid Workspace read input");
+    const path = target(input.path, input.root), snapshot = snapshotAt(path);
     assertCurrent();
     if (!snapshot) throw new Error("Workspace file does not exist");
     return { path: input.path as string, text: snapshot.text, sha256: createHash("sha256").update(snapshot.text).digest("hex"), bytes: Buffer.byteLength(snapshot.text) };
   };
   return [
-    { name: "workspace_read", description: "Read one safe relative file from the explicitly granted fixture project.", input_schema: schema, kind: "read",
+    { name: "workspace_read", description: "Read one safe relative file from the admitted working folder. Use root=legacy only for the fixed related Workspace folder.", input_schema: schema, kind: "read",
       async run(input) {
         try { return JSON.stringify({ ...read(input), exists: true }); }
         catch (error: any) { if (error?.code === "ENOENT") return JSON.stringify({ exists: false }); throw error; }
       } },
-    { name: "workspace_write", description: "Atomically write UTF-8 to one safe relative project file; then verify it before completion.", kind: "edit",
+    { name: "workspace_write", description: "Atomically write UTF-8 to one safe relative admitted file; managed instructions need their own confirmation card; then verify it before completion.", kind: "edit",
       input_schema: { type: "object", properties: { ...schema.properties, content: { type: "string" } }, required: ["path", "content"] },
       async run(input, ctx) {
-        if (!plain(input) || !exact(input, ["path", "content"]) || typeof input.content !== "string" || input.content.length > 64_000) throw new Error("invalid Workspace write input");
-        const path = target(input.path), boundary = bindAtomicWritePath(path);
+        if (!plain(input) || !exact(input, ["path", "content", ...(Object.hasOwn(input, "root") && managed ? ["root"] : [])]) || typeof input.content !== "string" || input.content.length > 64_000) throw new Error("invalid Workspace write input");
+        const path = target(input.path, input.root, true), boundary = writeBoundary(path);
         let previous: ReturnType<typeof readVerifiedRegularFileSnapshotSync> | undefined;
-        try { previous = readVerifiedRegularFileSnapshotSync(path, 128 * 1024); }
+        try { previous = snapshotAt(path); }
         catch (error: any) { if (error?.code !== "ENOENT") throw error; }
-        await atomicWriteText(path, input.content, { expected: previous?.text ?? null, ...(previous ? { expectedIdentity: previous } : {}), boundary,
-          signal: ctx.signal, assertCurrent: () => { target(input.path); } });
-        const verified = read({ path: input.path }); ctx.verifiedChange?.(verified.sha256);
+        const finishWrite = managed?.beginWrite?.();
+        try { await atomicWriteText(path, input.content, { expected: previous?.text ?? null, ...(previous ? { expectedIdentity: previous } : {}), boundary,
+          signal: ctx.signal, assertCurrent: () => { target(input.path, input.root, true); } }); } finally { finishWrite?.(); }
+        managed?.onWrite();
+        const verified = read({ path: input.path, ...(input.root ? { root: input.root } : {}) }); ctx.verifiedChange?.(verified.sha256);
         return JSON.stringify({ path: verified.path, sha256: verified.sha256, bytes: verified.bytes, written: true });
       } },
     { name: "workspace_verify", description: "Read exact file bytes and compare with expected UTF-8 content; return file hash as evidence.", kind: "read",
       input_schema: { type: "object", properties: { ...schema.properties, expectedContent: { type: "string" } }, required: ["path", "expectedContent"] },
       async run(input) {
-        if (!plain(input) || !exact(input, ["path", "expectedContent"]) || typeof input.expectedContent !== "string" || input.expectedContent.length > 64_000) throw new Error("invalid Workspace verification input");
-        const file = read({ path: input.path });
+        if (!plain(input) || !exact(input, ["path", "expectedContent", ...(Object.hasOwn(input, "root") && managed ? ["root"] : [])]) || typeof input.expectedContent !== "string" || input.expectedContent.length > 64_000) throw new Error("invalid Workspace verification input");
+        const file = read({ path: input.path, ...(input.root ? { root: input.root } : {}) });
         if (file.text !== input.expectedContent) throw new Error("Workspace file content did not match acceptance");
         return JSON.stringify({ path: file.path, sha256: file.sha256, bytes: file.bytes, verified: true });
       } },
