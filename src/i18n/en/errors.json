@@ -98,5 +98,7 @@
   "core.error.archive_confirmation_required": "Review and confirm archiving this colleague.",
   "core.error.archive_drain_timeout": "The colleague is still finishing cleanup. Check its status before trying again.",
   "core.error.archive_cleanup_failed": "Cleanup could not be confirmed. The colleague remains archived; check technical details.",
-  "core.error.archive_schedule_rollback_failed": "Scheduled task restoration could not be confirmed. Check each task before enabling it."
+  "core.error.archive_schedule_rollback_failed": "Scheduled task restoration could not be confirmed. Check each task before enabling it.",
+  "core.error.permission_tier_unavailable_on_platform": "This colleague is set to full access, which needs macOS write protection. It can't run on this platform until you switch it to controlled.",
+  "core.error.native_engine_unsupported_on_platform": "This engine isn't supported on this platform yet. Use Pi."
 }

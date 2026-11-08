@@ -1044,6 +1044,18 @@ export const CORE_MESSAGES: Record<string, Record<string, readonly unknown[]>> =
         "text",
         "Scheduled task restoration could not be confirmed. Check each task before enabling it."
       ]
+    ],
+    "core.error.permission_tier_unavailable_on_platform": [
+      [
+        "text",
+        "This colleague is set to full access, which needs macOS write protection. It can't run on this platform until you switch it to controlled."
+      ]
+    ],
+    "core.error.native_engine_unsupported_on_platform": [
+      [
+        "text",
+        "This engine isn't supported on this platform yet. Use Pi."
+      ]
     ]
   },
   "zh-Hans": {
@@ -2090,6 +2102,18 @@ export const CORE_MESSAGES: Record<string, Record<string, readonly unknown[]>> =
         "text",
         "定时任务恢复未确认，请逐项核对后再启用。"
       ]
+    ],
+    "core.error.permission_tier_unavailable_on_platform": [
+      [
+        "text",
+        "该同事设为全权，需要 macOS 的写保护，在此平台无法运行。改为受控后才能运行。"
+      ]
+    ],
+    "core.error.native_engine_unsupported_on_platform": [
+      [
+        "text",
+        "此平台暂不支持该引擎，请使用 Pi。"
+      ]
     ]
   },
   "zh-Hant": {
@@ -2301,6 +2325,8 @@ export const CORE_MESSAGE_PARAMS = {
   "core.error.archive_confirmation_required": [],
   "core.error.archive_drain_timeout": [],
   "core.error.archive_cleanup_failed": [],
-  "core.error.archive_schedule_rollback_failed": []
+  "core.error.archive_schedule_rollback_failed": [],
+  "core.error.permission_tier_unavailable_on_platform": [],
+  "core.error.native_engine_unsupported_on_platform": []
 } as const;
 export type CoreMessageKey = keyof typeof CORE_MESSAGE_PARAMS;

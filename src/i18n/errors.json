@@ -800,6 +800,22 @@
       "sourceMessages": [
         "archive_schedule_rollback_failed"
       ]
+    },
+    {
+      "code": "permission_tier_unavailable_on_platform",
+      "key": "core.error.permission_tier_unavailable_on_platform",
+      "params": [],
+      "sourceMessages": [
+        "Full protection requires macOS Seatbelt. This platform has no system-level write protection; switch this colleague to the controlled tier to run it"
+      ]
+    },
+    {
+      "code": "native_engine_unsupported_on_platform",
+      "key": "core.error.native_engine_unsupported_on_platform",
+      "params": [],
+      "sourceMessages": [
+        "Native engines are not supported on Windows in this release; use Pi"
+      ]
     }
   ]
 }

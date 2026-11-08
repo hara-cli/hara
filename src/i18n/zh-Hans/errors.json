@@ -98,5 +98,7 @@
   "core.error.archive_confirmation_required": "请核对并确认归档此同事。",
   "core.error.archive_drain_timeout": "同事仍在清理，请先核对状态后再试。",
   "core.error.archive_cleanup_failed": "清理结果未确认，同事保持归档，请查看技术详情。",
-  "core.error.archive_schedule_rollback_failed": "定时任务恢复未确认，请逐项核对后再启用。"
+  "core.error.archive_schedule_rollback_failed": "定时任务恢复未确认，请逐项核对后再启用。",
+  "core.error.permission_tier_unavailable_on_platform": "该同事设为全权，需要 macOS 的写保护，在此平台无法运行。改为受控后才能运行。",
+  "core.error.native_engine_unsupported_on_platform": "此平台暂不支持该引擎，请使用 Pi。"
 }

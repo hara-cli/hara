@@ -10,6 +10,7 @@ import {parseClientLocale,localeDescriptor,currentClientLocale,withClientLocale,
 import {replyCopyLanguage,requestedReplyCopyLanguage} from '../dist/i18n/reply-language.js';
 import {coreText} from '../dist/i18n/messages.js';
 import {PUBLIC_ERROR_CODES,publicErrorData} from '../dist/i18n/errors.js';
+import {RuntimeTierUnavailableError,NativeEngineUnsupportedError} from '../dist/agent-runtime/execution-policy.js';
 import {compileMessage} from '../scripts/icu-message.mjs';
 const root=new URL('../',import.meta.url),json=name=>JSON.parse(fs.readFileSync(new URL(name,root),'utf8'));
 test('registry matches BCP47 language/script, stable selection and same-script fallback',()=>{
@@ -41,11 +42,19 @@ test('ICU compiler handles nested plural/select, quoting and rejects malformed m
  for(const bad of ['{n','{n, plural, one {one}}','{n, unknown}','{x, select, other {a} other {b}}'])assert.throws(()=>compileMessage(bad));
  assert.deepEqual(compileMessage("The task's result: {name}").params,['name']);
 });
-test('100 public codes have en/Hans keys; unknown and secret-bearing errors remain generic and redacted',()=>{
- assert.equal(PUBLIC_ERROR_CODES.length,100);assert.equal(new Set(PUBLIC_ERROR_CODES).size,100);
+test('102 public codes have en/Hans keys; unknown and secret-bearing errors remain generic and redacted',()=>{
+ assert.equal(PUBLIC_ERROR_CODES.length,102);assert.equal(new Set(PUBLIC_ERROR_CODES).size,102);
  const catalog=json('src/i18n/errors.json'),en=json('src/i18n/en/errors.json'),zh=json('src/i18n/zh-Hans/errors.json');
  for(const row of catalog.errors){assert.equal(row.key,'core.error.'+row.code);assert.equal(typeof en[row.key],'string');assert.equal(typeof zh[row.key],'string');for(const source of row.sourceMessages)assert.equal(publicErrorData(new Error(source)).code,row.code);}
  const safe=publicErrorData(new Error('at /fixture/root api_key=sk-secret-token-value'),['/fixture/root','sk-secret-token-value']);assert.equal(safe.code,'request_failed');assert.deepEqual(safe.params,{});assert(!safe.technicalDetail.includes('/fixture/root'));assert(!safe.technicalDetail.includes('sk-secret-token-value'));
+});
+test('decision B platform refusals render through their closed public codes in en and zh-Hans',()=>{
+ const en=json('src/i18n/en/errors.json'),zh=json('src/i18n/zh-Hans/errors.json');
+ for(const error of [new RuntimeTierUnavailableError(),new NativeEngineUnsupportedError()]){
+  const data=publicErrorData(error);assert.equal(data.code,error.code);assert.deepEqual(data.params,{});
+  assert.equal(typeof en['core.error.'+error.code],'string');assert.equal(typeof zh['core.error.'+error.code],'string');
+  assert.doesNotMatch(zh['core.error.'+error.code].replace(/macOS|Pi/gu,''),/[A-Za-z]{4,}/u,'Simplified Chinese copy has no English leftovers');
+ }
 });
 test('generated registry/messages and existing Hant intent artifacts verify with CRLF checkouts',t=>{
  const temp=fs.mkdtempSync(join(tmpdir(),'hara-i18n-crlf-'));t.after(()=>fs.rmSync(temp,{recursive:true,force:true}));
