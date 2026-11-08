@@ -1,35 +1,3 @@
-import test from "node:test";
-import assert from "node:assert/strict";
-import { cliMcpFixture, until } from "./helpers/workspace-cli-mcp.mjs";
-const done = view => ["completed", "blocked", "paused", "cancelled"].includes(view.conversation.state);
-const turns = f => f.native().filter(row => row.method === "turn/start");
-const inventory = defaultReasoningEffort => ({ data: [{ id: "fixture-model", displayName: "Fixture", isDefault: true,
-  supportedReasoningEfforts: ["low", "medium", "high"].map(reasoningEffort => ({ reasoningEffort })),
-  ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}) }] });
-async function select(f, effort) {
-  const models = await f.request("workspace.runtime.listModels", { ...f.scope, runtimeId: "codex" });
-  await f.request("workspace.runtime.selectModel", { ...f.scope, runtimeId: "codex", modelId: "fixture-model", expectedRevision: models.revision, effort });
-  assert.equal((await f.request("workspace.runtime.listModels", { ...f.scope, runtimeId: "codex" })).selectedEffort, effort, "selection is not rewritten into an automatic/fixed level");
-}
-async function hello(f) { await f.send("你好"); return until(f.read, done); }
-test("engine-default stays high on repeated simple turns while auto chooses low, with explicit sticky overrides", async t => {
-  const f = await cliMcpFixture(t, "reply", { inventory: inventory("high") });
-  await select(f, "engine-default"); await hello(f); await hello(f);
-  await select(f, "auto"); await hello(f);
-  assert.deepEqual(turns(f).map(row => [row.params.model, row.params.effort]), [["fixture-model", "high"], ["fixture-model", "high"], ["fixture-model", "low"]]);
-  assert.equal(new Set(turns(f).map(row => row.params.threadId)).size, 1);
-  assert.equal(f.native().some(row => row.method === "thread/resume"), false);
-});
-test("high to engine-default explicitly replaces sticky high with catalog medium", async t => {
-  const f = await cliMcpFixture(t, "reply", { inventory: inventory("medium") });
-  await select(f, "high"); await hello(f); await select(f, "engine-default"); await hello(f);
-  assert.deepEqual(turns(f).map(row => row.params.effort), ["high", "medium"]);
-  assert.equal(new Set(turns(f).map(row => row.params.threadId)).size, 1);
-});
-test("an undeclared catalog default never sends the sentinel or silently inherits sticky high", async t => {
-  const f = await cliMcpFixture(t, "reply", { inventory: inventory(null) });
-  await select(f, "high"); await hello(f); await select(f, "engine-default"); const view = await hello(f);
-  assert.equal(turns(f).length, 1, "no user turn is submitted with unconfirmed defaults");
-  assert.equal(view.conversation.taskState, "blocked");
-  assert.match(view.conversation.blockReason ?? "", /invalid_model|codex_default_settings_unconfirmed/);
-});
+// workspace-codex-engine-default cases, partition 1 of 2 (1 cases). Shared cases live in helpers/workspace-codex-engine-default-cases.mjs.
+import { registerCases } from "./helpers/workspace-codex-engine-default-cases.mjs";
+await registerCases("workspace-codex-engine-default.test.mjs");

@@ -1,0 +1,1035 @@
+// All session-profile-cli cases. Thin test files register disjoint partitions so each stays well under the unchanged
+// 120s per-file deadline on hosted Intel (target <= 60s per file). A case that is not listed in exactly one
+// partition fails registration, so no case can be silently dropped.
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import nodeTest from "node:test";
+import { loadRoles } from "../../dist/org/roles.js";
+import { latestForCwd } from "../../dist/session/store.js";
+import { intelCaseTimeout } from "../../scripts/intel-ci-test-budget.mjs";
+export const PARTITIONS = Object.freeze({
+  "session-profile-cli.test.mjs": Object.freeze([
+    "real headless resume keeps its saved organization profile after the active profile changes",
+    "profile fallback stores an explicit ordered list of authenticated saved accounts",
+    "openai-compatible profile add requires an explicit endpoint",
+    "profile add preserves --model and accepts the explicit OpenAI-compatible alias",
+    "a fresh named-BYOK session uses the temporary provider's default model",
+  ]),
+  "session-profile-cli-doctor.test.mjs": Object.freeze([
+    "doctor reports proxy provenance offline and hides credential-bearing model/proxy URLs",
+    "doctor uses the SDK-selected endpoint for offline proxy diagnosis without printing it",
+    "an open terminal session refuses /model after the same connection is re-enrolled to another company",
+    "doctor reports the active named Token Plan connection instead of stale Personal config",
+    "the first explicit managed-role run seeds the exact profile-scoped bundle",
+    "a legacy invalid active profile fails before creating an unreadable session",
+    "a legacy Personal interactive resume persists its missing Space binding before the first turn",
+    "doctor hides the organization endpoint in expired-access guidance",
+    "profiles registry remains complete under concurrent readers and writers",
+  ]),
+});
+const ASSIGNED = new Map(Object.entries(PARTITIONS).flatMap(([file, cases]) => cases.map(name => [name, file])));
+if (ASSIGNED.size !== Object.values(PARTITIONS).flat().length) throw new Error("a case is listed in more than one partition");
+export async function registerCases(file) {
+  if (!Object.hasOwn(PARTITIONS, file)) throw new Error(`unknown partition ${file}`);
+  const test = (name, ...rest) => {
+    if (!ASSIGNED.has(name)) throw new Error(`case is not assigned to a partition: ${name}`);
+    return ASSIGNED.get(name) === file ? nodeTest(name, ...rest) : undefined;
+  };
+
+function runCli(args, cwd, home, extraEnv = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [join(process.cwd(), "dist", "index.js"), ...args], {
+      cwd,
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        HARA_QUIET: "1",
+        HARA_UPDATE_CHECK: "0",
+        HARA_GUARDIAN: "0",
+        NO_COLOR: "1",
+        ...extraEnv,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    child.once("error", reject);
+    child.once("close", (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+function openInteractiveCli(args, cwd, home, extraEnv = {}) {
+  const child = spawn(process.execPath, [join(process.cwd(), "dist", "index.js"), ...args], {
+    cwd,
+    env: {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      HARA_QUIET: "1",
+      HARA_TUI: "0",
+      HARA_UPDATE_CHECK: "0",
+      HARA_GUARDIAN: "0",
+      NO_COLOR: "1",
+      ...extraEnv,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let output = "";
+  const listeners = new Set();
+  const append = (chunk) => {
+    output += String(chunk);
+    for (const listener of listeners) listener();
+  };
+  child.stdout.on("data", append);
+  child.stderr.on("data", append);
+  return {
+    child,
+    output: () => output,
+    write: (line) => child.stdin.write(`${line}\n`),
+    waitFor(pattern, timeoutMs = 10_000) {
+      return new Promise((resolve, reject) => {
+        let timer;
+        const check = () => {
+          if (!pattern.test(output)) return;
+          clearTimeout(timer);
+          listeners.delete(check);
+          resolve(output);
+        };
+        timer = setTimeout(() => {
+          listeners.delete(check);
+          reject(new Error(`timed out waiting for ${pattern}:\n${output}`));
+        }, timeoutMs);
+        listeners.add(check);
+        check();
+      });
+    },
+    close() {
+      return new Promise((resolve) => child.once("close", (code) => resolve(code)));
+    },
+  };
+}
+
+test("profiles registry remains complete under concurrent readers and writers", { timeout: 60_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-profile-process-race-"));
+  const home = join(root, "home");
+  const haraHome = join(home, ".hara");
+  const profilesPath = join(haraHome, "profiles.json");
+  try {
+    mkdirSync(haraHome, { recursive: true });
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({ provider: "openai", model: "personal-model" }), { mode: 0o600 });
+    writeFileSync(profilesPath, `${JSON.stringify({
+      active: "company",
+      profiles: [
+        { id: "personal", kind: "byok", label: "Personal", provider: "openai" },
+        {
+          id: "company",
+          kind: "gateway",
+          tenantId: "tenant-company",
+          gatewayUrl: "https://gateway.example.test",
+          deviceId: "device-company",
+          deviceToken: "device-token-company",
+          defaultModel: "company-model",
+          enrolledAt: "2026-08-23T00:00:00.000Z",
+        },
+      ],
+    }, null, 2)}\n`, { mode: 0o600 });
+
+    const runChild = (index, mutate) => new Promise((resolve, reject) => {
+      const script = mutate
+        ? `import { getProfile, upsertProfile } from "./dist/profile/profile.js";
+           upsertProfile({ id: "worker-${index}", kind: "byok", label: "Worker ${index}", provider: "openai" });
+           for (let i = 0; i < 30; i++) { if (!getProfile("company")) throw new Error("company profile disappeared"); }`
+        : `import { getProfile } from "./dist/profile/profile.js";
+           for (let i = 0; i < 60; i++) { if (!getProfile("company")) throw new Error("company profile disappeared"); }`;
+      const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+        cwd: process.cwd(),
+        env: { ...process.env, HOME: home, USERPROFILE: home },
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      let stderr = "";
+      child.stderr.on("data", (chunk) => (stderr += String(chunk)));
+      child.once("error", reject);
+      child.once("close", (code) => code === 0 ? resolve() : reject(new Error(`profile child ${index} failed (${code}): ${stderr}`)));
+    });
+
+    const readers = await Promise.allSettled(Array.from({ length: 8 }, (_, index) => runChild(index, false)));
+    assert.deepEqual(readers.filter((result) => result.status === "rejected").map((result) => String(result.reason)), []);
+    const writers = await Promise.allSettled(Array.from({ length: 8 }, (_, index) => runChild(index, true)));
+    assert.deepEqual(writers.filter((result) => result.status === "rejected").map((result) => String(result.reason)), []);
+
+    const stored = JSON.parse(readFileSync(profilesPath, "utf8"));
+    assert.equal(stored.active, "company");
+    assert.ok(stored.profiles.some((profile) => profile.id === "personal"));
+    assert.ok(stored.profiles.some((profile) => profile.id === "company"));
+    for (let index = 0; index < 8; index++) {
+      assert.ok(stored.profiles.some((profile) => profile.id === `worker-${index}`), `worker-${index} update was preserved`);
+    }
+    assert.deepEqual(
+      readdirSync(haraHome).filter((name) => name.includes(".hara-claim-") || name.endsWith(".lock") || name.endsWith(".reclaim")),
+      [],
+      "no claim or mutex artifacts remain after clean process exits",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("doctor reports the active named Token Plan connection instead of stale Personal config", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-doctor-active-profile-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const haraHome = join(home, ".hara");
+  const endpoint = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
+  try {
+    mkdirSync(haraHome, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({
+      provider: "glm",
+      model: "glm-5.2",
+      guardian: "off",
+      updateCheck: false,
+    }), { mode: 0o600 });
+    writeFileSync(join(haraHome, "profiles.json"), `${JSON.stringify({
+      active: "ali-token-plan",
+      profiles: [
+        { id: "personal", kind: "byok", label: "Personal", provider: "glm" },
+        {
+          id: "ali-token-plan",
+          kind: "byok",
+          label: "Ali Token Plan",
+          provider: "qwen",
+          baseURL: endpoint,
+          apiKey: "fixture-token-plan-key",
+          defaultModel: "qwen3.7-plus",
+        },
+      ],
+    }, null, 2)}\n`, { mode: 0o600 });
+
+    const result = await runCli(["doctor"], project, home, {
+      HARA_MODEL_PROXY: "http://fixture-proxy.invalid:8080",
+      no_proxy: "",
+      NO_PROXY: "token-plan.cn-beijing.maas.aliyuncs.com",
+    });
+    assert.equal(result.code, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /provider token-plan · model qwen3\.7-plus/);
+    assert.match(result.stdout, /model-network direct — NO_PROXY matched/);
+    assert.match(result.stdout, /selection only; no request sent/);
+    assert.doesNotMatch(result.stdout, /token-plan\.cn-beijing\.maas\.aliyuncs\.com|compatible-mode\/v1|fixture-proxy/);
+    assert.doesNotMatch(result.stdout, /model glm-5\.2/);
+    assert.doesNotMatch(result.stdout, /fixture-token-plan-key/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("doctor reports proxy provenance offline and hides credential-bearing model/proxy URLs", { timeout: intelCaseTimeout(30_000, 90_000) }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-doctor-private-network-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const haraHome = join(home, ".hara");
+  const baseURL = "https://fixture-endpoint-user:fixture-endpoint-password@fixture-model.invalid/fixture-private-path?token=fixture-query#fixture-fragment";
+  try {
+    mkdirSync(haraHome, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({
+      provider: "openai", model: "fixture-model", apiKey: "fixture-api-key", baseURL,
+      proxy: "http://fixture-config-user:fixture-config-password@fixture-config-proxy.invalid:8080",
+      guardian: "off", updateCheck: false,
+    }), { mode: 0o600 });
+    const clearEnv = {
+      HARA_PROVIDER: "", HARA_BASE_URL: "", HARA_MODEL: "", HARA_API_KEY: "",
+      HARA_MODEL_PROXY: "", http_proxy: "", HTTP_PROXY: "", https_proxy: "", HTTPS_PROXY: "",
+      no_proxy: "", NO_PROXY: "",
+    };
+    for (const [networkEnv, pattern] of [
+      [{ HARA_MODEL_PROXY: "http://fixture-hara-user:fixture-hara-password@fixture-hara-proxy.invalid:8081", HTTPS_PROXY: "http://fixture-env-proxy.invalid:8082" }, /model-network proxy via HARA_MODEL_PROXY \/ --proxy/],
+      [{ HTTPS_PROXY: "http://fixture-env-user:fixture-env-password@fixture-env-proxy.invalid:8082" }, /model-network proxy via HTTP\(S\)_PROXY environment/],
+      [{}, /model-network proxy via Hara user config/],
+      [{ HARA_MODEL_PROXY: "http://fixture-hara-proxy.invalid:8081", NO_PROXY: "fixture-model.invalid" }, /model-network direct — NO_PROXY matched/],
+      [{ HARA_MODEL_PROXY: "http://fixture-invalid-user:fixture-invalid-password@fixture-invalid-proxy.invalid/fixture-proxy-path?token=fixture-proxy-query" }, /model-network invalid proxy configuration/],
+    ]) {
+      const result = await runCli(["doctor"], project, home, { ...clearEnv, ...networkEnv });
+      assert.equal(result.code, 0, result.stderr || result.stdout);
+      assert.match(result.stdout, pattern);
+      assert.match(result.stdout, /selection only; no request sent/);
+      assert.match(result.stdout, /endpoint configured \(address hidden\)/);
+      assert.doesNotMatch(result.stdout + result.stderr, /fixture-(?:endpoint|private-path|query|fragment|api-key|config|hara|env|invalid|proxy-path|proxy-query)|fixture-model\.invalid/);
+      assert.equal(JSON.parse(readFileSync(join(haraHome, "config.json"), "utf8")).baseURL, baseURL, "doctor never rewrites the user's endpoint or proxy settings");
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("doctor uses the SDK-selected endpoint for offline proxy diagnosis without printing it", { timeout: intelCaseTimeout(30_000, 90_000) }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-doctor-sdk-endpoint-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const haraHome = join(home, ".hara");
+  try {
+    mkdirSync(haraHome, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    for (const provider of ["openai", "anthropic", "qwen-oauth"]) {
+      writeFileSync(join(haraHome, "config.json"), JSON.stringify({ provider, model: "fixture-model", apiKey: "fixture-api-key", guardian: "off", updateCheck: false }), { mode: 0o600 });
+      if (provider === "qwen-oauth") {
+        writeFileSync(join(haraHome, "qwen-oauth.json"), JSON.stringify({
+          access: "fixture-access-token", refresh: "fixture-refresh-token", expires: 0,
+          resourceUrl: "http://127.0.0.1:11312/fixture-private-path?token=fixture-query",
+        }), { mode: 0o600 });
+      }
+      const result = await runCli(["doctor"], project, home, {
+        HARA_PROVIDER: "", HARA_BASE_URL: "", HARA_MODEL: "", HARA_API_KEY: "",
+        HARA_MODEL_PROXY: "http://fixture-proxy.invalid:8080", no_proxy: "", NO_PROXY: "",
+        OPENAI_BASE_URL: "http://127.0.0.1:11310/fixture-private-path?token=fixture-query",
+        ANTHROPIC_BASE_URL: "http://127.0.0.1:11311/fixture-private-path?token=fixture-query",
+      });
+      assert.equal(result.code, 0, result.stderr || result.stdout);
+      assert.match(result.stdout, /model-network direct — loopback intentionally bypasses proxies/);
+      assert.match(result.stdout, /selection only; no request sent/);
+      assert.doesNotMatch(result.stdout + result.stderr, /fixture-(?:api-key|proxy|private-path|query|access-token|refresh-token)|127\.0\.0\.1|1131[012]/);
+    }
+    writeFileSync(join(haraHome, "qwen-oauth.json"), JSON.stringify({ access: "fixture-access-token", refresh: "fixture-refresh-token", expires: 0, resourceUrl: 23 }), { mode: 0o600 });
+    const malformedOAuth = await runCli(["doctor"], project, home, { HARA_PROVIDER: "", HARA_BASE_URL: "", HARA_MODEL: "" });
+    assert.equal(malformedOAuth.code, 0, malformedOAuth.stderr || malformedOAuth.stdout);
+    assert.match(malformedOAuth.stdout, /model-network unknown — effective endpoint unavailable/);
+    assert.doesNotMatch(malformedOAuth.stdout + malformedOAuth.stderr, /fixture-(?:access-token|refresh-token)/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("doctor hides the organization endpoint in expired-access guidance", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-doctor-expired-gateway-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const haraHome = join(home, ".hara");
+  try {
+    mkdirSync(haraHome, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({ provider: "openai", model: "fixture-model", guardian: "off", updateCheck: false }), { mode: 0o600 });
+    writeFileSync(join(haraHome, "profiles.json"), JSON.stringify({
+      active: "expired-org",
+      profiles: [
+        { id: "personal", kind: "byok", label: "Personal", provider: "openai" },
+        {
+          id: "expired-org", kind: "gateway", tenantId: "fixture-tenant", deviceId: "fixture-device",
+          gatewayUrl: "https://fixture-gateway-user:fixture-gateway-password@fixture-gateway.invalid/fixture-private-path?token=fixture-query",
+          defaultModel: "fixture-org-model", tokenExpiresAt: "2000-01-01T00:00:00.000Z",
+        },
+      ],
+    }), { mode: 0o600 });
+    const result = await runCli(["doctor"], project, home, {
+      HARA_API_KEY: "", HARA_GATEWAY_TOKEN: "", HARA_MODEL_PROXY: "", http_proxy: "", HTTP_PROXY: "", https_proxy: "", HTTPS_PROXY: "", no_proxy: "", NO_PROXY: "",
+    });
+    assert.equal(result.code, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /expired organization access/);
+    assert.match(result.stdout, /--gateway <url> --code <code>/);
+    assert.doesNotMatch(result.stdout + result.stderr, /fixture-(?:gateway|private-path|query)/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("profile add preserves --model and accepts the explicit OpenAI-compatible alias", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-profile-add-cli-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const haraHome = join(home, ".hara");
+  try {
+    mkdirSync(haraHome, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({
+      provider: "ollama",
+      model: "qwen3",
+      guardian: "off",
+      updateCheck: false,
+    }), { mode: 0o600 });
+
+    const exactReport = await runCli([
+      "profile", "add", "tokenplan-openai", "--byok",
+      "--provider", "openai",
+      "--base-url", "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+      "--model", "deepseek-v4-pro",
+      "--no-key-prompt",
+    ], project, home);
+    assert.equal(exactReport.code, 0, exactReport.stderr || exactReport.stdout);
+    assert.match(exactReport.stdout, /model deepseek-v4-pro/);
+
+    const explicitAlias = await runCli([
+      "profile", "add", "tokenplan-compatible", "--byok",
+      "--provider", "openai-compatible",
+      "--base-url", "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+      "--model", "qwen3.8-max",
+      "--no-key-prompt",
+    ], project, home);
+    assert.equal(explicitAlias.code, 0, explicitAlias.stderr || explicitAlias.stdout);
+    assert.match(explicitAlias.stdout, /provider openai-compatible · model qwen3\.8-max/);
+
+    const stored = JSON.parse(readFileSync(join(haraHome, "profiles.json"), "utf8"));
+    const direct = stored.profiles.find((profile) => profile.id === "tokenplan-openai");
+    const compatible = stored.profiles.find((profile) => profile.id === "tokenplan-compatible");
+    assert.equal(direct.defaultModel, "deepseek-v4-pro", "the root/subcommand option collision must not replace the requested model");
+    assert.equal(compatible.provider, "openai", "the user-facing alias keeps the existing generic dispatch internally");
+    assert.equal(compatible.defaultModel, "qwen3.8-max");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("openai-compatible profile add requires an explicit endpoint", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-profile-add-endpoint-cli-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  try {
+    mkdirSync(join(home, ".hara"), { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    const result = await runCli([
+      "profile", "add", "missing-endpoint", "--byok",
+      "--provider", "openai-compatible",
+      "--model", "fixture-model",
+      "--no-key-prompt",
+    ], project, home);
+    assert.notEqual(result.code, 0);
+    assert.match(result.stdout + result.stderr, /requires --base-url/);
+
+    const unknown = await runCli([
+      "profile", "add", "unknown-provider", "--byok",
+      "--provider", "tokenplan",
+      "--model", "fixture-model",
+      "--no-key-prompt",
+    ], project, home);
+    assert.notEqual(unknown.code, 0);
+    assert.match(unknown.stdout + unknown.stderr, /Unknown provider 'tokenplan'/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("profile fallback stores an explicit ordered list of authenticated saved accounts", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-profile-fallback-cli-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const haraHome = join(home, ".hara");
+  try {
+    mkdirSync(haraHome, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({
+      provider: "ollama",
+      model: "qwen3",
+      guardian: "off",
+      updateCheck: false,
+    }), { mode: 0o600 });
+    writeFileSync(join(haraHome, "profiles.json"), `${JSON.stringify({
+      active: "minimax-one",
+      profiles: [
+        { id: "personal", kind: "byok", label: "Personal", provider: "ollama" },
+        {
+          id: "minimax-one",
+          kind: "byok",
+          label: "MiniMax one",
+          provider: "minimax-token-plan",
+          baseURL: "https://api.minimaxi.com/anthropic",
+          apiKey: "fixture-minimax-key",
+          defaultModel: "MiniMax-M3",
+        },
+        {
+          id: "ark-two",
+          kind: "byok",
+          label: "Ark two",
+          provider: "volcengine-agent-plan",
+          baseURL: "https://ark.cn-beijing.volces.com/api/plan/v3",
+          apiKey: "fixture-ark-key",
+          defaultModel: "glm-5.3-flash",
+        },
+        {
+          id: "deepseek-env",
+          kind: "byok",
+          label: "DeepSeek environment account",
+          provider: "deepseek",
+          baseURL: "https://api.deepseek.com",
+          defaultModel: "deepseek-v4-pro",
+        },
+      ],
+    }, null, 2)}\n`, { mode: 0o600 });
+
+    const saved = await runCli(
+      ["profile", "fallback", "ark-two", "minimax-one", "deepseek-env"],
+      project,
+      home,
+      { DEEPSEEK_API_KEY: "fixture-deepseek-environment-key", HARA_MODEL: "ambient-model-must-not-leak" },
+    );
+    assert.equal(saved.code, 0, saved.stderr || saved.stdout);
+    assert.match(saved.stdout, /1\. ark-two · volcengine-agent-plan · glm-5\.3-flash/);
+    assert.match(saved.stdout, /2\. minimax-one · minimax-token-plan · MiniMax-M3/);
+    assert.match(saved.stdout, /3\. deepseek-env · deepseek · deepseek-v4-pro/);
+    assert.doesNotMatch(saved.stdout, /ambient-model-must-not-leak/);
+    assert.deepEqual(
+      JSON.parse(readFileSync(join(haraHome, "config.json"), "utf8")).fallbackConnectionIds,
+      ["ark-two", "minimax-one", "deepseek-env"],
+    );
+
+    const listed = await runCli(["profile", "fallback"], project, home);
+    assert.equal(listed.code, 0, listed.stderr || listed.stdout);
+    assert.match(listed.stdout, /model capabilities and circuit health must match/);
+
+    const cleared = await runCli(["profile", "fallback", "--clear"], project, home);
+    assert.equal(cleared.code, 0, cleared.stderr || cleared.stdout);
+    assert.equal("fallbackConnectionIds" in JSON.parse(readFileSync(join(haraHome, "config.json"), "utf8")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+async function gatewayFixture(label, roles = []) {
+  const requests = [];
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => (raw += chunk));
+    req.on("end", () => {
+      requests.push({
+        method: req.method,
+        url: req.url,
+        body: raw,
+        authorization: req.headers.authorization,
+      });
+      if (req.url === "/v1/chat/completions") {
+        const body = JSON.parse(raw);
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({
+          id: `chatcmpl-${label}`,
+          object: "chat.completion.chunk",
+          created: 1,
+          model: body.model,
+          choices: [{ index: 0, delta: { role: "assistant", content: `${label}-reply` }, finish_reason: null }],
+        })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          id: `chatcmpl-${label}`,
+          object: "chat.completion.chunk",
+          created: 1,
+          model: body.model,
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+        })}\n\n`);
+        return res.end("data: [DONE]\n\n");
+      }
+      if (req.url === "/v1/roles") {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ version: 1, org_policy: {}, roles }));
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  });
+  server.listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  return {
+    requests,
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}
+
+// This integration intentionally launches seven complete CLI processes. Release-class Intel runners can
+// take more than 20 seconds under the parallel full-suite load even though each bounded child completes.
+test("real headless resume keeps its saved organization profile after the active profile changes", { timeout: 60_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-session-profile-cli-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const sessions = join(home, ".hara", "sessions");
+  const flash = await gatewayFixture("flash", [{
+    name: "flash-auditor",
+    description: "Audits the Flash organization.",
+    system: "Stay within the Flash organization route.",
+  }]);
+  const pro = await gatewayFixture("pro");
+  const sessionId = "profile-bound-session";
+  const profilesPath = join(home, ".hara", "profiles.json");
+  try {
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    writeFileSync(join(home, ".hara", "config.json"), JSON.stringify({
+      provider: "openai",
+      apiKey: "personal-fixture-key",
+      model: "personal-fixture-model",
+      guardian: "off",
+      updateCheck: false,
+    }));
+    const profiles = {
+      active: "pro-org",
+      profiles: [
+        { id: "personal", kind: "byok", label: "Personal", provider: "openai" },
+        {
+          id: "flash-org",
+          kind: "gateway",
+          label: "Flash Org",
+          tenantId: "tenant-flash",
+          gatewayUrl: flash.url,
+          baseURL: `${flash.url}/v1`,
+          deviceId: "flash-device",
+          deviceToken: "flash-device-token",
+          defaultModel: "deepseek-v4-flash",
+          availableModels: ["deepseek-v4-flash"],
+          thinkingEfforts: ["off", "low", "high", "max"],
+          enrolledAt: "2026-07-23T00:00:00.000Z",
+        },
+        {
+          id: "pro-org",
+          kind: "gateway",
+          label: "Pro Org",
+          tenantId: "tenant-pro",
+          gatewayUrl: pro.url,
+          baseURL: `${pro.url}/v1`,
+          deviceId: "pro-device",
+          deviceToken: "pro-device-token",
+          defaultModel: "deepseek-v4-pro",
+          availableModels: ["deepseek-v4-pro"],
+          thinkingEfforts: ["off", "low", "high", "max"],
+          enrolledAt: "2026-07-23T00:00:00.000Z",
+        },
+      ],
+    };
+    writeFileSync(profilesPath, `${JSON.stringify(profiles, null, 2)}\n`, { mode: 0o600 });
+    writeFileSync(join(sessions, `${sessionId}.json`), JSON.stringify({
+      meta: {
+        id: sessionId,
+        cwd: project,
+        profileId: "flash-org",
+        spaceId: "org:tenant-flash",
+        provider: "hara-gateway",
+        model: "deepseek-v4-flash",
+        effort: "high",
+        title: "Bound Flash session",
+        createdAt: "2026-07-23T00:00:00.000Z",
+        updatedAt: "2026-07-23T00:00:00.000Z",
+        source: "interactive",
+      },
+      history: [],
+    }));
+
+    const fresh = await runCli(["-p", "use the active profile default"], project, home);
+    assert.equal(fresh.code, 0, fresh.stderr || fresh.stdout);
+    assert.match(fresh.stdout, /pro-reply/);
+    const freshRequest = pro.requests.find((request) => request.url === "/v1/chat/completions");
+    assert.ok(freshRequest);
+    assert.equal(JSON.parse(freshRequest.body).model, "deepseek-v4-pro");
+    flash.requests.length = 0;
+    pro.requests.length = 0;
+
+    const forbidden = await runCli(
+      ["-p", "must stay scoped", "--resume", sessionId, "--model", "deepseek-v4-pro"],
+      project,
+      home,
+    );
+    assert.equal(forbidden.code, 2, forbidden.stderr || forbidden.stdout);
+    assert.match(forbidden.stderr + forbidden.stdout, /not authorized for organization connection 'flash-org'/);
+    assert.equal(pro.requests.filter((request) => request.url === "/v1/chat/completions").length, 0);
+
+    const resumed = await runCli(["-p", "continue safely", "--resume", sessionId], project, home);
+    assert.equal(resumed.code, 0, resumed.stderr || resumed.stdout);
+    assert.match(resumed.stdout, /flash-reply/);
+    assert.equal(flash.requests.filter((request) => request.url === "/v1/chat/completions").length, 1);
+    assert.equal(pro.requests.filter((request) => request.url === "/v1/chat/completions").length, 0);
+    assert.ok(flash.requests.some((request) => request.url === "/v1/heartbeat"), "heartbeat follows the saved Flash profile");
+    assert.ok(flash.requests.some((request) => request.url === "/v1/roles"), "managed roles follow the saved Flash profile");
+    assert.equal(pro.requests.some((request) => request.url === "/v1/heartbeat"), false, "the active Pro profile receives no resumed-session heartbeat");
+    assert.equal(pro.requests.some((request) => request.url === "/v1/roles"), false, "the active Pro profile cannot supply managed roles");
+    const saved = JSON.parse(readFileSync(join(sessions, `${sessionId}.json`), "utf8"));
+    assert.equal(saved.meta.profileId, "flash-org");
+    assert.equal(saved.meta.model, "deepseek-v4-flash");
+
+    flash.requests.length = 0;
+    const envResumed = await runCli(
+      ["-p", "use a one-process override without changing my saved pin", "--resume", sessionId],
+      project,
+      home,
+      { HARA_MODEL: "deepseek-v4-flash-override" },
+    );
+    assert.equal(envResumed.code, 2, envResumed.stderr || envResumed.stdout);
+    assert.match(
+      envResumed.stderr + envResumed.stdout,
+      /model 'deepseek-v4-flash-override' is not authorized/,
+      "an unauthorized process-local override fails closed",
+    );
+    const afterRejectedEnv = JSON.parse(readFileSync(join(sessions, `${sessionId}.json`), "utf8"));
+    assert.equal(afterRejectedEnv.meta.model, "deepseek-v4-flash", "a rejected environment override cannot rewrite the durable pin");
+
+    profiles.profiles.find((profile) => profile.id === "flash-org").availableModels.push("deepseek-v4-flash-override");
+    writeFileSync(profilesPath, `${JSON.stringify(profiles, null, 2)}\n`, { mode: 0o600 });
+    const allowedEnvResume = await runCli(
+      ["-p", "temporarily use the allowed process override", "--resume", sessionId],
+      project,
+      home,
+      { HARA_MODEL: "deepseek-v4-flash-override" },
+    );
+    assert.equal(allowedEnvResume.code, 0, allowedEnvResume.stderr || allowedEnvResume.stdout);
+    const overrideRequest = flash.requests.find((request) =>
+      request.url === "/v1/chat/completions" && JSON.parse(request.body).model === "deepseek-v4-flash-override");
+    assert.ok(overrideRequest, "the allowed environment model is used for this process");
+    const afterAllowedEnv = JSON.parse(readFileSync(join(sessions, `${sessionId}.json`), "utf8"));
+    assert.equal(afterAllowedEnv.meta.model, "deepseek-v4-flash", "the temporary environment model does not replace the durable pin");
+
+    const previousHome = process.env.HOME;
+    const previousUserProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    try {
+      assert.equal(latestForCwd(project)?.meta.profileId, "flash-org");
+      assert.ok(loadRoles(project, "flash-org").some((role) => role.id === "flash-auditor"));
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = previousUserProfile;
+    }
+    const continued = await runCli(
+      ["-p", "continue through the managed role", "--continue", "--role", "flash-auditor"],
+      project,
+      home,
+    );
+    assert.equal(continued.code, 0, continued.stderr || continued.stdout);
+    assert.match(continued.stdout, /flash-reply/);
+    assert.equal(flash.requests.filter((request) => request.url === "/v1/chat/completions").length, 2);
+    assert.equal(pro.requests.filter((request) => request.url === "/v1/chat/completions").length, 0);
+
+    profiles.profiles = profiles.profiles.filter((profile) => profile.id !== "flash-org");
+    writeFileSync(profilesPath, `${JSON.stringify(profiles, null, 2)}\n`, { mode: 0o600 });
+    const removed = await runCli(["-p", "do not reroute", "--resume", sessionId], project, home);
+    assert.equal(removed.code, 2, removed.stderr || removed.stdout);
+    assert.match(removed.stderr + removed.stdout, /profile 'flash-org' is no longer available/);
+    assert.equal(pro.requests.filter((request) => request.url === "/v1/chat/completions").length, 0);
+  } finally {
+    await Promise.all([flash.close(), pro.close()]);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an open terminal session refuses /model after the same connection is re-enrolled to another company", { timeout: 30_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-terminal-space-guard-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const haraHome = join(home, ".hara");
+  const sessions = join(haraHome, "sessions");
+  const companyA = await gatewayFixture("company-a");
+  const companyB = await gatewayFixture("company-b");
+  const sessionId = "terminal-company-session";
+  const profilesPath = join(haraHome, "profiles.json");
+  let terminal;
+  try {
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "AGENTS.md"), "# Fixture\n");
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({
+      provider: "openai",
+      model: "personal-fixture-model",
+      guardian: "off",
+      updateCheck: false,
+    }), { mode: 0o600 });
+    const profileA = {
+      id: "shared-company",
+      kind: "gateway",
+      label: "Company A",
+      tenantId: "tenant-a",
+      gatewayUrl: companyA.url,
+      baseURL: `${companyA.url}/v1`,
+      deviceId: "device-a",
+      deviceToken: "device-token-a",
+      defaultModel: "deepseek-v4-flash",
+      availableModels: ["deepseek-v4-flash"],
+      enrolledAt: "2026-08-23T00:00:00.000Z",
+    };
+    writeFileSync(profilesPath, `${JSON.stringify({
+      active: "shared-company",
+      profiles: [{ id: "personal", kind: "byok", label: "Personal", provider: "openai" }, profileA],
+    }, null, 2)}\n`, { mode: 0o600 });
+    writeFileSync(join(sessions, `${sessionId}.json`), JSON.stringify({
+      meta: {
+        id: sessionId,
+        cwd: project,
+        profileId: "shared-company",
+        spaceId: "org:tenant-a",
+        provider: "hara-gateway",
+        model: "deepseek-v4-flash",
+        title: "Company A private work",
+        createdAt: "2026-08-23T00:00:00.000Z",
+        updatedAt: "2026-08-23T00:00:00.000Z",
+        source: "interactive",
+      },
+      history: [{ role: "user", content: "Company A confidential context" }],
+    }));
+
+    terminal = openInteractiveCli(["--resume", sessionId], project, home);
+    await terminal.waitFor(/›/);
+    const profileB = {
+      ...profileA,
+      label: "Company B",
+      tenantId: "tenant-b",
+      gatewayUrl: companyB.url,
+      baseURL: `${companyB.url}/v1`,
+      deviceId: "device-b",
+      deviceToken: "device-token-b",
+      enrolledAt: "2026-08-23T00:01:00.000Z",
+    };
+    writeFileSync(profilesPath, `${JSON.stringify({
+      active: "shared-company",
+      profiles: [{ id: "personal", kind: "byok", label: "Personal", provider: "openai" }, profileB],
+    }, null, 2)}\n`, { mode: 0o600 });
+
+    terminal.write("/model deepseek-v4-flash");
+    await terminal.waitFor(/belongs to Space 'org:tenant-a'.*org:tenant-b|old history will not be sent across companies/s);
+    terminal.write("/exit");
+    assert.equal(await terminal.close(), 0, terminal.output());
+    assert.equal(
+      companyB.requests.filter((request) => request.url === "/v1/chat/completions").length,
+      0,
+      "the model switch cannot send Company A history to Company B",
+    );
+  } finally {
+    if (terminal && terminal.child.exitCode === null) terminal.child.kill("SIGTERM");
+    await Promise.all([companyA.close(), companyB.close()]);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a fresh named-BYOK session uses the temporary provider's default model", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-fresh-provider-override-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const haraHome = join(home, ".hara");
+  const sessions = join(haraHome, "sessions");
+  const local = await gatewayFixture("local");
+  try {
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({
+      provider: "openai",
+      apiKey: "personal-fixture-key",
+      model: "personal-fixture-model",
+      guardian: "off",
+      updateCheck: false,
+    }));
+    writeFileSync(join(haraHome, "profiles.json"), JSON.stringify({
+      active: "work",
+      profiles: [
+        { id: "personal", kind: "byok", label: "Personal", provider: "openai" },
+        {
+          id: "work",
+          kind: "byok",
+          label: "Work",
+          provider: "deepseek",
+          apiKey: "work-only-key",
+          baseURL: "https://api.deepseek.com",
+          defaultModel: "deepseek-chat",
+        },
+      ],
+    }), { mode: 0o600 });
+
+    const result = await runCli(
+      ["-p", "use the temporary local provider", "--continue"],
+      project,
+      home,
+      {
+        HARA_PROFILE: "",
+        HARA_PROVIDER: "ollama",
+        HARA_BASE_URL: `${local.url}/v1`,
+        HARA_MODEL: "",
+        HARA_API_KEY: "",
+      },
+    );
+    assert.equal(result.code, 0, result.stderr || result.stdout);
+    const request = local.requests.find((candidate) => candidate.url === "/v1/chat/completions");
+    assert.ok(request);
+    assert.equal(JSON.parse(request.body).model, "qwen3", "the temporary Ollama route keeps its own default model");
+
+    const savedFiles = readdirSync(sessions).filter(
+      (name) => name.endsWith(".json") && !name.endsWith(".meta.json"),
+    );
+    assert.equal(savedFiles.length, 1);
+    const saved = JSON.parse(readFileSync(join(sessions, savedFiles[0]), "utf8"));
+    assert.equal(saved.meta.profileId, "work");
+    assert.equal(saved.meta.model, "qwen3", "the new session pins the resolved provider target, not DeepSeek's old default");
+  } finally {
+    await local.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a legacy invalid active profile fails before creating an unreadable session", { timeout: 10_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-invalid-profile-cli-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const haraHome = join(home, ".hara");
+  try {
+    mkdirSync(haraHome, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({
+      provider: "openai",
+      apiKey: "fixture-only-key",
+      model: "fixture-model",
+      guardian: "off",
+      updateCheck: false,
+    }));
+    writeFileSync(join(haraHome, "profiles.json"), JSON.stringify({
+      active: "legacy\\profile",
+      profiles: [
+        { id: "personal", kind: "byok", label: "Personal", provider: "openai" },
+        {
+          id: "legacy\\profile",
+          kind: "byok",
+          label: "Legacy invalid profile",
+          provider: "openai",
+          apiKey: "fixture-only-key",
+          defaultModel: "fixture-model",
+        },
+      ],
+    }), { mode: 0o600 });
+
+    const result = await runCli(["-p", "must fail before provider traffic"], project, home);
+    assert.equal(result.code, 2, result.stderr || result.stdout);
+    assert.match(result.stderr + result.stdout, /legacy invalid id/);
+    assert.equal(
+      readFileSync(join(haraHome, "profiles.json"), "utf8").includes("legacy\\\\profile"),
+      true,
+      "the CLI reports the migration boundary without silently renaming stored identities",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a legacy Personal interactive resume persists its missing Space binding before the first turn", { timeout: 10_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-legacy-session-profile-cli-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const haraHome = join(home, ".hara");
+  const sessions = join(haraHome, "sessions");
+  const sessionId = "legacy-unbound-session";
+  try {
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "AGENTS.md"), "# Fixture\n");
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({
+      provider: "openai",
+      apiKey: "fixture-only-key",
+      model: "fixture-model",
+      guardian: "off",
+      updateCheck: false,
+    }));
+    writeFileSync(join(haraHome, "profiles.json"), JSON.stringify({
+      active: "personal",
+      profiles: [
+        {
+          id: "personal",
+          kind: "byok",
+          label: "Personal",
+          provider: "openai",
+          apiKey: "fixture-only-key",
+          defaultModel: "fixture-model",
+        },
+      ],
+    }), { mode: 0o600 });
+    writeFileSync(join(sessions, `${sessionId}.json`), JSON.stringify({
+      meta: {
+        id: sessionId,
+        cwd: project,
+        profileId: "personal",
+        provider: "openai",
+        model: "fixture-model",
+        title: "Legacy unbound session",
+        createdAt: "2026-07-23T00:00:00.000Z",
+        updatedAt: "2026-07-23T00:00:00.000Z",
+        source: "interactive",
+      },
+      history: [],
+    }));
+
+    const opened = await runCli(["--resume", sessionId], project, home);
+    assert.equal(opened.code, 0, opened.stderr || opened.stdout);
+    const saved = JSON.parse(readFileSync(join(sessions, `${sessionId}.json`), "utf8"));
+    assert.equal(saved.meta.profileId, "personal");
+    assert.equal(saved.meta.spaceId, "personal");
+    assert.deepEqual(saved.history, [], "opening and exiting adds no synthetic turn");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the first explicit managed-role run seeds the exact profile-scoped bundle", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-first-role-profile-cli-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const haraHome = join(home, ".hara");
+  const gateway = await gatewayFixture("role", [{
+    name: "release-auditor",
+    description: "Checks the release route.",
+    system: "You are the exact organization release auditor.",
+  }]);
+  try {
+    mkdirSync(haraHome, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({
+      provider: "openai",
+      apiKey: "personal-fixture-key",
+      model: "personal-fixture-model",
+      guardian: "off",
+      updateCheck: false,
+    }));
+    writeFileSync(join(haraHome, "profiles.json"), JSON.stringify({
+      active: "release-org",
+      profiles: [
+        { id: "personal", kind: "byok", label: "Personal", provider: "openai" },
+        {
+          id: "release-org",
+          kind: "gateway",
+          label: "Release Org",
+          gatewayUrl: gateway.url,
+          baseURL: `${gateway.url}/v1`,
+          deviceId: "release-device",
+          deviceToken: "release-device-token",
+          defaultModel: "deepseek-v4-pro",
+          availableModels: ["deepseek-v4-pro"],
+          thinkingEfforts: ["off", "low", "high", "max"],
+          enrolledAt: "2026-07-23T00:00:00.000Z",
+        },
+      ],
+    }), { mode: 0o600 });
+
+    const result = await runCli(
+      ["-p", "audit this release", "--role", "release-auditor"],
+      project,
+      home,
+    );
+    assert.equal(result.code, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /role-reply/);
+    const roleRequest = gateway.requests.find((request) => request.url === "/v1/roles");
+    assert.ok(roleRequest, "the missing scoped directory triggers a first-use role sync");
+    assert.equal(roleRequest.authorization, "Bearer release-device-token");
+    const chatRequest = gateway.requests.find((request) => request.url === "/v1/chat/completions");
+    assert.ok(chatRequest);
+    assert.match(chatRequest.body, /exact organization release auditor/);
+  } finally {
+    await gateway.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+}

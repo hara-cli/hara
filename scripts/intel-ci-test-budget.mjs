@@ -20,6 +20,8 @@ export const INTEL_SLOW_FILES = Object.freeze([
   "workspace-production-create.test.mjs",
   "workspace-production-create-refusal.test.mjs",
   "workspace-production-loopback.test.mjs",
+  "session-profile-cli-doctor.test.mjs",
+  "workspace-local-host-isolation.test.mjs",
 ]);
 // These fixtures compete for the hosted Mac's durable disk, browser or process-start capacity.
 // Isolate them without increasing their original 120s file deadline or any product/case deadline.
