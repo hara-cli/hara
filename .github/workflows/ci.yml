@@ -114,14 +114,15 @@ jobs:
     # Windows candidate coverage explicitly uses windows-runtime's shared contract subset.
     # Full output must survive a failure; a tail alone cannot identify the first failed fixture.
     # The strict suite had 35m after the former 25m cap on main 8357c14 (run 40898728754); at ~34m it
-    # reached that cap as the suite grew, so it keeps 45m. Per-file deadlines stay at the original 120s.
+    # reached that cap as the suite grew. 45m then ran at 39m (87%) on 7702281, so it keeps 55m.
+    # Per-file deadlines stay at the original 120s.
     # Standalone Intel budgets its later compilation and smokes separately.
     strategy:
       fail-fast: false
       matrix:
         os: [macos-15-intel]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 55
     permissions:
       contents: read
     env:
@@ -182,7 +183,8 @@ jobs:
 
   standalone-runtime:
     # Intel's full durable-I/O suite is required; heavy fixtures run serially, not skipped.
-    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 40 || 30 }}
+    # Intel took 39m58s of 40m on 7702281 (suite, compile and smokes in one job), so it keeps 55m.
+    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 55 || 30 }}
     strategy:
       matrix:
         include:
