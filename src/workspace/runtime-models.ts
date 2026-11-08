@@ -269,7 +269,7 @@ export class WorkspaceRuntimeModels {
     const bound = this.runtimes.list().options.find(row => row.runtimeId === "claude");
     const key = JSON.stringify([resolved.command, bound?.fingerprint ?? bound?.version ?? null]);
     if (this.claudeEfforts?.key === key) return this.claudeEfforts.levels;
-    const result = await protectedInventory(this.storage, this.runtimes, "claude", resolved, ["--setting-sources", "project,local", "--settings", JSON.stringify({ disableAllHooks: true, sandbox: { enabled: false } }), "--help"],
+    const result = await protectedInventory(this.storage, this.runtimes, "claude", resolved, ["--setting-sources", "", "--settings", JSON.stringify({ disableAllHooks: true, sandbox: { enabled: false } }), "--help"],
       launch => runExternalCommandCapture(launch, launch.args, { cwd: resolved.env.HOME, waitForClose: true, timeoutMs: 10_000, maxOutputBytes: 256 * 1024 }));
     const levels = claudeHelpEfforts(result.ok ? result.stdout : "");
     this.claudeEfforts = { key, levels };

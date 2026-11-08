@@ -110,6 +110,16 @@ test("Cursor new overlay cleans up, but symlinks and concurrent edits are never 
   rmSync(join(dir, ".cursor/mcp.json")); const next = overlayCursorMcpConfig(dir, endpoint); writeFileSync(next.path, '{"changed":true}');
   assert.throws(() => next.close(), /permission/); assert.equal(readFileSync(next.path, "utf8"), '{"changed":true}');
 });
+test("Cursor overlay never leaves its bearer token behind when another writer changed the file", t => {
+  const dir = root(t), overlay = overlayCursorMcpConfig(dir, endpoint), token = endpoint.env.HARA_WORKSPACE_MCP_TOKEN;
+  const edited = JSON.parse(readFileSync(overlay.path, "utf8")); edited.addedByCursor = true; writeFileSync(overlay.path, JSON.stringify(edited));
+  assert.ok(readFileSync(overlay.path, "utf8").includes(token));
+  assert.throws(() => overlay.close(), /permission/, "the concurrent change is still reported");
+  const after = readFileSync(overlay.path, "utf8"), value = JSON.parse(after);
+  assert.equal(after.includes(token), false, "the per-attempt token is redacted");
+  assert.equal(value.addedByCursor, true, "the other writer's change is kept"); assert.equal(value.mcpServers.hara.url, endpoint.url);
+  assert.equal(existsSync(join(dir, ".cursor/.hara-mcp.lock")), false);
+});
 test("discovery never runs a missing CLI, and the generic agent alias must identify Cursor", async t => {
   const dir = root(t), calls = [], run = async (command, args) => { calls.push([command, args]); return args[0] === "-lic" ? null : "Unrelated Agent 1.2.3"; };
   const options = { home: dir, probeHome: dir, path: "/usr/bin:/bin", systemBins: [], run };

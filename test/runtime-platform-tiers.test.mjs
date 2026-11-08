@@ -72,14 +72,20 @@ test("macOS never falls back: without Seatbelt the launch is refused, with it ev
   }
 });
 
-test("Codex keeps its own read-only sandbox whenever there is no OS write sandbox", () => {
+test("Codex keeps its own read-only sandbox for the controlled tier and whenever there is no OS write sandbox", () => {
   const common = { id: "codex", prompt: "fixture", cwd: "/fixture/project", model: null, effort: null, skipGitRepoCheck: false, permissionTier: "controlled" };
   const unprotected = registeredCliArgs({ ...common, osWriteSandbox: false }).join(" ");
   assert.match(unprotected, /--sandbox read-only/);
   assert.doesNotMatch(unprotected, /danger-full-access|--dangerously-bypass/);
   const seatbelt = registeredCliArgs({ ...common, osWriteSandbox: true }).join(" ");
-  assert.match(seatbelt, /--dangerously-bypass-approvals-and-sandbox/, "inside Seatbelt the outer boundary governs, unchanged on macOS");
+  assert.match(seatbelt, /--sandbox read-only/, "controlled is read-only even inside Seatbelt");
+  assert.doesNotMatch(seatbelt, /danger-full-access|--dangerously-bypass/);
+  const full = registeredCliArgs({ ...common, permissionTier: "full-protected", osWriteSandbox: true }).join(" ");
+  assert.match(full, /--dangerously-bypass-approvals-and-sandbox/, "only full-protected inside Seatbelt hands confinement to the outer boundary");
+  const fullUnprotected = registeredCliArgs({ ...common, permissionTier: "full-protected", osWriteSandbox: false }).join(" ");
+  assert.match(fullUnprotected, /--sandbox read-only/);
+  const untiered = registeredCliArgs({ ...common, permissionTier: undefined, osWriteSandbox: true }).join(" ");
+  assert.match(untiered, /--sandbox read-only/, "an unknown tier never bypasses");
   const hostDefault = registeredCliArgs(common).join(" ");
-  if (process.platform === "darwin") assert.match(hostDefault, /--dangerously-bypass-approvals-and-sandbox/);
-  else { assert.match(hostDefault, /--sandbox read-only/); assert.doesNotMatch(hostDefault, /danger-full-access|--dangerously-bypass/); }
+  assert.match(hostDefault, /--sandbox read-only/); assert.doesNotMatch(hostDefault, /danger-full-access|--dangerously-bypass/);
 });

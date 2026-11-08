@@ -30,10 +30,13 @@ for (const platform of ["linux", "win32", "darwin"]) test(`${platform}: Host fil
   await onPlatform(platform, async () => {
     await assert.rejects(f.write({ root: "legacy", path: "colleagues/ag_other/notes.md" }), /Another colleague working folder is read-only/);
     assert.equal(fs.existsSync(join(f.sibling, "notes.md")), false);
-    for (const name of ["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", "agents.md"]) for (const root of ["legacy", "home"]) {
+    // Engines load instruction files from subdirectories too, so every depth needs the confirmation card.
+    for (const name of ["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", "agents.md", "docs/CLAUDE.md", "notes/deep/AGENTS.md", "src/claude.local.md"]) for (const root of ["legacy", "home"]) {
       await assert.rejects(f.write({ root, path: name }), /Managed instructions require a Hara confirmation card/, `${root}/${name}`);
       assert.equal(fs.existsSync(join(root === "legacy" ? f.legacy : f.ownHome, name)), false, `${root}/${name}`);
     }
+    await assert.rejects(f.write({ root: "legacy", path: "colleagues/ag_self/docs/CLAUDE.md" }), /Managed instructions require a Hara confirmation card/);
+    assert.equal(JSON.parse(await f.write({ root: "home", path: "docs/claude-notes.md" })).written, true, "similar names stay writable");
     for (const path of [".claude/settings.json", ".codex/config.toml"]) {
       await assert.rejects(f.write({ root: "home", path }), /outside the granted safe project/, path);
       assert.equal(fs.existsSync(join(f.ownHome, path.split("/")[0])), false, path);
@@ -42,5 +45,5 @@ for (const platform of ["linux", "win32", "darwin"]) test(`${platform}: Host fil
     assert.equal(JSON.parse(await f.write({ root: "legacy", path: "colleagues/ag_self/shared.md" })).written, true);
     assert.equal(fs.readFileSync(join(f.ownHome, "shared.md"), "utf8"), "fixture");
   });
-  assert.equal(f.writes.length, 2, "only the two permitted writes reach the Host write hook");
+  assert.equal(f.writes.length, 3, "only the three permitted writes reach the Host write hook");
 });

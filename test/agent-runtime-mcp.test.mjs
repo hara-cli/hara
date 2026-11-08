@@ -52,8 +52,8 @@ test("per-attempt MCP binds loopback, rejects wrong/cross-attempt tokens and ori
 test("native CLI bridge keeps token values out of argv and trusts only the hara server", () => {
   const common = { prompt: "fixture", cwd: "/fixture", model: null, effort: null, skipGitRepoCheck: true,
     mcp: { url: "http://127.0.0.1:1234/mcp", timeoutMs: 120000 } };
-  const codex = registeredCliArgs({ id: "codex", ...common, osWriteSandbox: true });
-  // The reviewed outer Seatbelt owns confinement; nested Codex Seatbelt is disabled.
+  const codex = registeredCliArgs({ id: "codex", ...common, permissionTier: "full-protected", osWriteSandbox: true });
+  // For the full-protected tier the reviewed outer Seatbelt owns confinement; nested Codex Seatbelt is disabled.
   assert(codex.includes("--dangerously-bypass-approvals-and-sandbox"));
   assert(codex.includes('approval_policy="never"'));
   assert(codex.includes('shell_environment_policy.set.HARA_WORKSPACE_MCP_TOKEN=""'));

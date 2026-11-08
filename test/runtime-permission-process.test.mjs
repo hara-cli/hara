@@ -10,7 +10,7 @@ test("S3 reuses an outer sandbox per tier and recycles it on a new frozen tier w
  await tier(f,"controlled");v=await f.read();assert.equal(v.conversation.permissionTier,"full-protected","old task remains frozen");
  v=await exchange(f,"List current colleagues with controlled access?");assert.equal(v.conversation.state,"completed");assert.equal(v.conversation.permissionTier,"controlled");assert.notEqual(f.meta().pid,a.pid);
  const requests=f.native().filter(x=>["thread/start","thread/resume"].includes(x.method));assert.deepEqual(requests.map(x=>x.method),["thread/start","thread/resume"]);
- const turns=f.native().filter(x=>x.method==="turn/start");assert.equal(turns.length,3);assert.ok(turns.every(x=>x.params.threadId===turns[0].params.threadId));assert.equal(requests.at(-1).params.threadId,turns[0].params.threadId);assert.equal(requests[0].params.sandbox,"danger-full-access");assert.equal(requests.at(-1).params.sandbox,"danger-full-access");assert.equal(requests.at(-1).params.approvalPolicy,"never");
+ const turns=f.native().filter(x=>x.method==="turn/start");assert.equal(turns.length,3);assert.ok(turns.every(x=>x.params.threadId===turns[0].params.threadId));assert.equal(requests.at(-1).params.threadId,turns[0].params.threadId);assert.equal(requests[0].params.sandbox,"danger-full-access");assert.equal(requests.at(-1).params.sandbox,"read-only");assert.equal(requests.at(-1).params.approvalPolicy,"never");
  assert.ok(f.native().filter(x=>x.method==="turn/start").every(x=>!Object.hasOwn(x.params,"sandboxPolicy")));
 });
 test("actual native file change closes a simple file task and persists observed risk separately",{skip:FULL_TIER_SKIP},async t=>{

@@ -172,9 +172,11 @@ test("native args keep model/effort choices while the outer policy owns both per
   const { registeredCliArgs } = await import("../dist/agent-runtime/registered-cli.js");
   for (const permissionTier of ["controlled", "full-protected"]) {
     const codex = registeredCliArgs({ id: "codex", permissionTier, prompt: "hi", cwd: "/fixture/project", model: "gpt-5.6-sol", effort: "xhigh", skipGitRepoCheck: true, osWriteSandbox: true });
-    assert.ok(codex.includes('model_reasoning_effort="xhigh"')); assert.ok(codex.includes("gpt-5.6-sol")); assert.ok(codex.includes("--dangerously-bypass-approvals-and-sandbox")); assert.equal(codex.includes("--sandbox"),false);
+    assert.ok(codex.includes('model_reasoning_effort="xhigh"')); assert.ok(codex.includes("gpt-5.6-sol")); // Only the full-protected tier bypasses Codex's own sandbox inside Seatbelt; controlled stays read-only.
+    if (permissionTier === "full-protected") { assert.ok(codex.includes("--dangerously-bypass-approvals-and-sandbox")); assert.equal(codex.includes("--sandbox"),false); }
+    else { assert.equal(codex[codex.indexOf("--sandbox") + 1], "read-only"); assert.equal(codex.includes("--dangerously-bypass-approvals-and-sandbox"),false); }
     const claude = registeredCliArgs({ id: "claude", permissionTier, claudeStreamJson: true, prompt: "hi", cwd: "/fixture/project", model: "claude-sonnet-4-5", effort: "high", skipGitRepoCheck: false });
-    assert.ok(claude.includes("claude-sonnet-4-5")); assert.ok(claude.includes("high")); assert.ok(claude.includes(permissionTier === "controlled" ? "plan" : "bypassPermissions")); assert.ok(claude.includes("stream-json")); assert.ok(claude.includes("Cron*")); assert.ok(claude.includes("project,local"));
+    assert.ok(claude.includes("claude-sonnet-4-5")); assert.ok(claude.includes("high")); assert.ok(claude.includes(permissionTier === "controlled" ? "plan" : "bypassPermissions")); assert.ok(claude.includes("stream-json")); assert.ok(claude.includes("Cron*")); assert.equal(claude[claude.indexOf("--setting-sources") + 1], ""); assert.ok(!claude.includes("project,local"));
   }
   const bare = registeredCliArgs({ id: "codex", prompt: "hi", cwd: "/fixture/project", model: null, effort: null, skipGitRepoCheck: false, osWriteSandbox: true }); assert(!bare.includes("-c") && !bare.includes("-m"));
 });

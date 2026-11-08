@@ -129,6 +129,9 @@ function persona(value: unknown, username: string): Omit<WorkspaceAgentConfigura
   }
   return { identity: normalizeAgentPublicIdentityInput(value.profile, username, "global"), description, instructions };
 }
+/** A configuration that never stored a tier (pre-1.2.0) is controlled, matching frozen task bindings. Only new
+ * colleagues receive the platform default; an old configuration is never silently upgraded to full-protected. */
+const storedPermissionTier = (config: { permissionTier?: RuntimePermissionTier }): RuntimePermissionTier => config.permissionTier ?? "controlled";
 function configuration(input: ReturnType<typeof persona>, revision: number, runtimeId: AgentRuntimeId, toolPolicy?: WorkspaceLegacyToolPolicy, permissionTier: RuntimePermissionTier | null = defaultRuntimePermissionTier()): WorkspaceAgentConfiguration {
   const value = { revision, ...input, runtimeId, ...(permissionTier ? { permissionTier } : {}), ...(toolPolicy ? { toolPolicy: validateWorkspaceLegacyToolPolicy(toolPolicy) } : {}) };
   return { ...value, hash: hashConfiguration(value) };
@@ -262,8 +265,8 @@ export class WorkspaceAgentStore {
     return { workspaceId: this.scope.workspaceId, agentId: row.agentId, username: row.username, kind: row.kind,
       state: row.state, agentEpoch: row.epoch, configRevision: config.revision, identity: structuredClone(config.identity),
       ...(row.archivedAt ? { archivedAt: row.archivedAt, pausedScheduleCount: row.pausedScheduleCount ?? 0 } : {}),
-      description: config.description, permissionTier: config.permissionTier ?? defaultRuntimePermissionTier(), runtime: { ...runtimes.find(option => option.id === config.runtimeId)! },
-      ...(availableRuntimePermissionTiers().includes(config.permissionTier ?? defaultRuntimePermissionTier()) ? {} : { permissionTierUnavailable: true as const }),
+      description: config.description, permissionTier: storedPermissionTier(config), runtime: { ...runtimes.find(option => option.id === config.runtimeId)! },
+      ...(availableRuntimePermissionTiers().includes(storedPermissionTier(config)) ? {} : { permissionTierUnavailable: true as const }),
       ...(row.kind === "main" ? { brand: "hara" as const, ...(row.titleSource ? { titleSource: row.titleSource, titleKey: row.titleKey } : {}) } : {}) };
   }
   currentPersona(agentId: string): WorkspaceAgentPersonaInput {
@@ -356,7 +359,7 @@ export class WorkspaceAgentStore {
       return this.view(row);
     });
   }
-  private appendConfiguration(row: AgentRecord, input: ReturnType<typeof persona>, runtimeId: AgentRuntimeId, permissionTier = row.configurations.at(-1)!.permissionTier ?? defaultRuntimePermissionTier()): void {
+  private appendConfiguration(row: AgentRecord, input: ReturnType<typeof persona>, runtimeId: AgentRuntimeId, permissionTier = storedPermissionTier(row.configurations.at(-1)!)): void {
     if (row.state !== "active") throw new Error("restore the exact archived Workspace Agent before editing");
     if (row.configurations.length >= MAX_CONFIGS) throw new Error("Workspace Agent configuration history is full; no snapshot was removed");
     row.currentConfigRevision++;
@@ -423,7 +426,8 @@ export class WorkspaceAgentStore {
         || typeof row.importId !== "string" || typeof row.sourceHash !== "string"
         || !/^[a-f0-9]{64}$/.test(row.importId) || !/^[a-f0-9]{64}$/.test(row.sourceHash)) throw new Error("Invalid legacy Agent identity");
       const { username, state, importId, sourceHash, toolPolicy, ...fields } = row;
-      const config = configuration(persona(fields, username), 1, "pi", validateWorkspaceLegacyToolPolicy(toolPolicy));
+      // Imported 1.0.x colleagues predate permission tiers: they stay controlled and are never silently upgraded.
+      const config = configuration(persona(fields, username), 1, "pi", validateWorkspaceLegacyToolPolicy(toolPolicy), "controlled");
       if (!scanMemory(config.instructions).ok || redactSensitiveText(JSON.stringify(config)).redactions.length) throw new Error("Legacy Agent source requires quarantine");
       return { username, state: state as "active" | "archived", importId, sourceHash, config };
     });
@@ -455,7 +459,7 @@ export class WorkspaceAgentStore {
     const config = row.configurations[row.currentConfigRevision - 1]!;
     this.runtimes.assertAvailable(config.runtimeId);
     return freezeWorkspaceAgentTaskBinding({ schemaVersion: 1, workspaceId: this.scope.workspaceId, resourceBinding: this.binding(),
-      agentId: row.agentId, agentEpoch: row.epoch, configRevision: config.revision, configHash: config.hash, runtimeId: config.runtimeId, permissionTier: config.permissionTier ?? defaultRuntimePermissionTier(), taskId });
+      agentId: row.agentId, agentEpoch: row.epoch, configRevision: config.revision, configHash: config.hash, runtimeId: config.runtimeId, permissionTier: storedPermissionTier(config), taskId });
   }
   /** Private snapshot resolution, NOT execution admission. Callers still need live membership, policy,
    * Host/resource grants and fully scoped dependencies. Old runners explicitly refuse this provenance. */
@@ -465,7 +469,7 @@ export class WorkspaceAgentStore {
     const row = this.load().value?.agents.find(entry => entry.agentId === binding.agentId);
     if (!row || row.state !== "active" || row.epoch !== binding.agentEpoch) throw new Error("Workspace Agent task lifecycle is no longer active");
     const config = row.configurations[binding.configRevision - 1];
-    if (binding.permissionTier !== undefined && binding.permissionTier !== (config?.permissionTier ?? defaultRuntimePermissionTier())) throw new Error("Frozen runtime permission tier does not match its configuration");
+    if (binding.permissionTier !== undefined && binding.permissionTier !== (config ? storedPermissionTier(config) : "controlled")) throw new Error("Frozen runtime permission tier does not match its configuration");
     if (!config || config.hash !== binding.configHash || config.runtimeId !== binding.runtimeId) throw new Error("Workspace Agent task configuration snapshot is unavailable; no fallback was selected");
     this.runtimes.assertAvailable(config.runtimeId);
     const result = structuredClone(config);

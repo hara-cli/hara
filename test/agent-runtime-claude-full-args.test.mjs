@@ -10,7 +10,7 @@ test("Claude full candidate enables native tools, blocks plan and scheduling, an
   const args = registeredCliArgs({ ...common, claudePermissionMode: "bypassPermissions" });
   assert.equal(args[args.indexOf("--permission-mode") + 1], "bypassPermissions");
   assert(!args.includes("dontAsk") && !args.includes("--tools"));
-  assert.equal(args[args.indexOf("--setting-sources") + 1], "project,local");
+  assert.equal(args[args.indexOf("--setting-sources") + 1], "", "no repository or user settings files are loaded");
   assert.deepEqual(JSON.parse(args[args.indexOf("--settings") + 1]), { disableAllHooks: true, sandbox: { enabled: false } });
   for (const name of ["EnterPlanMode", "ExitPlanMode", "ScheduleWakeup", "CronCreate", "CronList", "CronDelete", "Cron*", "Monitor"])
     assert(args.includes(name));
@@ -32,8 +32,8 @@ test("legacy arguments without a frozen tier remain plan", () => {
 
 test("custom providers and native host login share a customization boundary without changing Codex", () => {
   const args = registeredCliArgs({ ...common, claudePermissionMode: "bypassPermissions", claudeCustomProvider: true });
-  assert.equal(args[args.indexOf("--setting-sources") + 1], "project,local");
-  const codex = registeredCliArgs({ ...common, id: "codex", claudePermissionMode: "bypassPermissions", claudeCustomProvider: true, osWriteSandbox: true });
+  assert.equal(args[args.indexOf("--setting-sources") + 1], "", "no repository or user settings files are loaded");
+  const codex = registeredCliArgs({ ...common, id: "codex", permissionTier: "full-protected", claudePermissionMode: "bypassPermissions", claudeCustomProvider: true, osWriteSandbox: true });
   assert(codex.includes("--dangerously-bypass-approvals-and-sandbox"));
   assert(!codex.includes("bypassPermissions") && !codex.includes("--setting-sources"));
 });

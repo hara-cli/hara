@@ -125,9 +125,11 @@ export class GovernedCodexSession {
   private policy?: RuntimeExecutionPolicy;
   private processKey?: string;
   private exit?: Promise<void>;
-  /** Decision B: Codex's own sandbox is disabled only inside the macOS Seatbelt boundary. Elsewhere it keeps
-   * the released 1.0.x read-only sandbox; without a known Seatbelt policy it is read-only as well. */
-  private nativeSandboxMode(): "danger-full-access" | "read-only" { return this.policy?.writeProtection === "seatbelt" ? "danger-full-access" : "read-only"; }
+  /** Codex's own sandbox is disabled only for the full-protected tier inside the macOS Seatbelt boundary. The controlled
+   * tier is read-only everywhere (like every other engine's controlled mode), as is any launch without a known policy. */
+  private nativeSandboxMode(): "danger-full-access" | "read-only" {
+    return this.policy?.writeProtection === "seatbelt" && this.policy.tier === "full-protected" ? "danger-full-access" : "read-only";
+  }
   private nativeSandboxType(): "dangerFullAccess" | "readOnly" { return this.nativeSandboxMode() === "danger-full-access" ? "dangerFullAccess" : "readOnly"; }
   private active?: ActiveTurn;
   private maintenance?: CodexContextCompaction;

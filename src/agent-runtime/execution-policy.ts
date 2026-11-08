@@ -319,8 +319,18 @@ export class RuntimeExecutionPolicy {
       const fold = (value: string) => [...value].map(char => /[a-z]/iu.test(char) ? `[${char.toLowerCase()}${char.toUpperCase()}]` : escape(char)).join("");
       for (const root of new Set([managed.legacyRoot, managed.homeRoot])) {
         const prefix = "^" + escape(root) + "/";
-        lines.push(`(deny file-write* (regex ${quote(prefix + "(" + ["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md"].map(fold).join("|") + ")$")}) (regex ${quote(prefix + "(" + [".claude", ".codex"].map(fold).join("|") + ")(/|$)")}))`);
+        lines.push(`(deny file-write* (regex ${quote(prefix + "(.+/)?(" + ["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md"].map(fold).join("|") + ")$")}) (regex ${quote(prefix + "(" + [".claude", ".codex"].map(fold).join("|") + ")(/|$)")}))`);
       }
+    }
+    if (input.tier === "full-protected") {
+      // Full-protected may write the project, but not the Git files that run code later outside this sandbox: hooks,
+      // the repository config (core.hooksPath, core.fsmonitor, filter drivers) and info/attributes. Any depth, so a
+      // nested repository is covered; case-folded for case-insensitive volumes. Ordinary commits still write objects,
+      // refs, the index and logs.
+      const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const fold = (value: string) => [...value].map(char => /[a-z]/iu.test(char) ? `[${char.toLowerCase()}${char.toUpperCase()}]` : escape(char)).join("");
+      for (const root of projectRoots)
+        lines.push(`(deny file-write* (regex ${quote("^" + escape(root) + "/(.+/)?" + fold(".git") + "/(" + fold("hooks") + "(/.*)?|" + fold("config") + "|" + fold("info") + "/" + fold("attributes") + ")$")}))`);
     }
     this.profile = lines.join("\n") + "\n";
     if (Buffer.byteLength(this.profile) > 96 * 1024) { rmSync(this.tempRoot, { recursive: true }); throw new Error("Runtime Seatbelt policy is too large"); }

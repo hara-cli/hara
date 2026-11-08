@@ -29,13 +29,19 @@ test("new tasks freeze the default full tier; switching preserves old task and p
  const {permissionTier,...legacy}=old;assert.equal(isWorkspaceAgentTaskBinding(legacy),true);assert.equal(r.agents.resolveTask(legacy).permissionTier,"full-protected");
  assert.equal(isWorkspaceAgentTaskBinding({...legacy,permissionTier:"unrestricted"}),false);
 });
-test("legacy configuration hashes remain readable; new task freezing does not alter a legacy binding",t=>{
+test("legacy configuration hashes remain readable; a tierless legacy colleague is controlled and stays controlled",t=>{
  const home=root(t),r=new WorkspaceResources(home,scope);r.initialize();const a=r.agents.initializeMain(),old=bind(r,a);
  const file=join(home,".hara/workspace-data/v1",workspaceResourceScopeKey(scope),"state/.hara/workspace-agents.json");
  const raw=JSON.parse(fs.readFileSync(file));for(const c of raw.agents[0].configurations){delete c.permissionTier;delete c.hash;c.hash=createHash('sha256').update('hara-workspace-agent-config-v1\0').update(canonical(c)).digest('hex');}
  fs.writeFileSync(file,JSON.stringify(raw),{mode:0o600});
- const restarted=new WorkspaceResources(home,scope);restarted.initialize();assert.equal(restarted.agents.get(a.agentId).permissionTier,DEFAULT_TIER);
- const fresh=bind(restarted,restarted.agents.get(a.agentId));assert.equal(fresh.permissionTier,DEFAULT_TIER);
+ const restarted=new WorkspaceResources(home,scope);restarted.initialize();
+ // A configuration that never stored a tier (pre-1.2.0) is controlled on every platform, like a frozen tierless task;
+ // only new colleagues receive the platform default. Editing it keeps controlled instead of writing full-protected.
+ assert.equal(restarted.agents.get(a.agentId).permissionTier,"controlled");assert.equal(restarted.agents.get(a.agentId).permissionTierUnavailable,undefined);
+ const fresh=bind(restarted,restarted.agents.get(a.agentId));assert.equal(fresh.permissionTier,"controlled");
+ const current=restarted.agents.get(a.agentId),edited=restarted.agents.updatePersona(a.agentId,{profile:{displayName:"Hara"},description:"edited",instructions:""},current.configRevision,current.agentEpoch);
+ assert.equal(edited.permissionTier,"controlled");
+ const stored=JSON.parse(fs.readFileSync(file)).agents[0].configurations.at(-1);assert.equal(stored.permissionTier,"controlled");
  const {permissionTier,...legacy}=fresh;assert.equal(restarted.agents.resolveTask(legacy).permissionTier,undefined);assert.equal(Object.hasOwn(legacy,'permissionTier'),false);
 });
 function changeTask(){return applyTaskBrief(createTaskExecution("Edit the fixture file","turn"),{intent:"change",goal:"Edit fixture",constraints:[],acceptance:["file updated"],steps:["edit"]}).task;}
@@ -61,7 +67,7 @@ test("native configuration disables global integrations and schedulers without c
  const before=fs.readFileSync(cfg),args=codexHostToolOverrides(home);assert.ok(args.includes('mcp_servers."personal"={enabled=false,command="hara-disabled-global-mcp"}'));assert.ok(args.includes('features.hooks=false'));assert.ok(args.includes('features.plugins=false'));assert.ok(args.includes('features.in_app_local_automation=false'));assert.deepEqual(fs.readFileSync(cfg),before);
  fs.writeFileSync(cfg,'[mcp_servers.hara_workspace_000000000000000000000000]\ncommand="do-not-run"');assert.throws(()=>codexHostToolOverrides(home,undefined,undefined,"hara_workspace_000000000000000000000000"),/private Hara namespace/);
  fs.writeFileSync(cfg,'mcp_servers={personal={command="do-not-run"}}');assert.throws(()=>codexHostToolOverrides(home),/Inline/);
- for(const permissionTier of ["full-protected","controlled"]){const a=registeredCliArgs({id:"claude",permissionTier,prompt:"fixture",cwd:home,model:null,effort:null,skipGitRepoCheck:false});assert.ok(a.includes("Cron*"));assert.ok(a.includes("project,local"));assert.ok(a.some(v=>v.includes('"disableAllHooks":true')));assert.ok(a.some(v=>v.includes('"enabled":false')));}
+ for(const permissionTier of ["full-protected","controlled"]){const a=registeredCliArgs({id:"claude",permissionTier,prompt:"fixture",cwd:home,model:null,effort:null,skipGitRepoCheck:false});assert.ok(a.includes("Cron*"));assert.equal(a[a.indexOf("--setting-sources")+1],"");assert.ok(!a.includes("project,local"));assert.ok(a.some(v=>v.includes('"disableAllHooks":true')));assert.ok(a.some(v=>v.includes('"enabled":false')));}
 });
 
 test("custom provider keeps host HOME but strips its OAuth/provider environment and uses a separate config",async()=>{
@@ -96,4 +102,11 @@ test("conversation proof rejects unobserved writes, native calls and invalidated
  fs.writeFileSync(join(work,"native.txt"),"unexpected");assert.equal(p.canCompleteConversation(),false);
  fs.unlinkSync(join(work,"native.txt"));p.observeNativeEvent({type:"tool",status:"completed",operation:"read"});assert.equal(p.canCompleteConversation(),false);
  p.beginAttempt("fresh-conversation");assert.equal(p.canCompleteConversation(),true);p.invalidateEvidence();assert.equal(p.canCompleteConversation(),false);
+});
+test("imported 1.0.x colleagues are controlled; a new colleague still receives the platform default",t=>{
+ const home=root(t),r=new WorkspaceResources(home,scope);r.initialize();r.agents.initializeMain();
+ const row={username:"legacy-one",profile:{displayName:"Legacy One"},state:"active",importId:"a".repeat(64),sourceHash:"b".repeat(64),toolPolicy:{allow:["read_file"],deny:[],readOnly:false,owns:[]}};
+ const imported=r.agents.importLegacy([row],r.agents.list().revision);
+ assert.equal(imported.agents.find(x=>x.username==="legacy-one").permissionTier,"controlled");
+ assert.equal(r.agents.create({username:"new-one",profile:{displayName:"New One"}},r.agents.list().revision).permissionTier,DEFAULT_TIER);
 });

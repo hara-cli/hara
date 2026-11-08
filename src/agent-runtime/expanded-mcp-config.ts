@@ -63,12 +63,23 @@ export function overlayCursorMcpConfig(cwd: string, endpoint: WorkspaceMcpEndpoi
     atomic(path, Buffer.from(JSON.stringify({ ...value, mcpServers: { ...(value.mcpServers as object ?? {}), hara: (({ type: _type, ...remote }) => remote)(server(endpoint)) } }) + "\n"), 0o600);
     installed = snapshot(path);
   } catch (error) { release(); if (createdDirectory) try { rmdirSync(directory); } catch { /* retain existing files */ } throw error; }
+  const token = endpoint.env[WORKSPACE_MCP_TOKEN_ENV]!;
+  /** When another writer changed the overlay, Hara cannot restore the original bytes, but its per-attempt bearer
+   * token must not stay in the project (where it could be committed). Redact it in place, keeping the other
+   * writer's changes; a file that can no longer be read safely (link, replaced, foreign owner) is left untouched. */
+  const scrub = () => {
+    try {
+      const current = snapshot(path);
+      if (!current || !current.bytes.includes(token)) return;
+      atomic(path, Buffer.from(current.bytes.toString("utf8").split(token).join("[redacted-by-hara]")), current.mode);
+    } catch { /* never mask the original refusal */ }
+  };
   return { path, close() {
     if (closed) return;
     closed = true;
     try {
       const current = snapshot(path);
-      if (!current || current.ino !== installed?.ino || current.hash !== installed?.hash) throw new Error("runtime_permission_denied");
+      if (!current || current.ino !== installed?.ino || current.hash !== installed?.hash) { scrub(); throw new Error("runtime_permission_denied"); }
       if (before) atomic(path, before.bytes, before.mode); else unlinkSync(path);
     } finally { release(); if (createdDirectory) try { rmdirSync(directory); } catch { /* runtime-created project state stays */ } }
   } };

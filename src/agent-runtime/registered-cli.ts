@@ -40,8 +40,10 @@ export function registeredCliArgs(input: {
   /** True only when the launch runs inside the macOS Seatbelt boundary. Defaults to the Host platform. */
   osWriteSandbox?: boolean;
 }): string[] {
-  // Decision B: without an OS write sandbox Codex keeps its own read-only sandbox (the released 1.0.x mode).
-  const codexSandbox = (input.osWriteSandbox ?? runtimeWriteProtection() === "seatbelt") ? ["--dangerously-bypass-approvals-and-sandbox"] : ["--sandbox", "read-only"];
+  // Codex bypasses its own sandbox only for the full-protected tier inside the macOS Seatbelt boundary. The controlled
+  // tier, a launch without an OS write sandbox, or an unknown tier keeps Codex's read-only sandbox (the 1.0.x mode).
+  const codexFull = (input.osWriteSandbox ?? runtimeWriteProtection() === "seatbelt") && input.permissionTier === "full-protected";
+  const codexSandbox = codexFull ? ["--dangerously-bypass-approvals-and-sandbox"] : ["--sandbox", "read-only"];
   const bridge = input.mcp;
   const server = bridge?.serverName ?? "hara_workspace";
   if (!/^hara_workspace(?:_[a-f0-9]{24})?$/u.test(server)) throw new Error("Invalid Host MCP namespace");
@@ -64,7 +66,10 @@ export function registeredCliArgs(input: {
     : ["-p", input.prompt, "--output-format", input.claudeStreamJson ? "stream-json" : "text", ...(input.claudeStreamJson ? ["--verbose"] : []), ...(input.model ? ["--model", input.model] : []),
       ...claudeEffortArgs(input.effort), "--permission-mode", input.permissionTier !== undefined ? input.permissionTier === "full-protected" ? "bypassPermissions" : "plan" : input.claudePermissionMode ?? "plan",
       ...(input.permissionTier === "full-protected" ? ["--allow-dangerously-skip-permissions", "--dangerously-skip-permissions"] : []),
-      "--setting-sources", "project,local", "--settings", JSON.stringify({ disableAllHooks: true, sandbox: { enabled: false } }),
+      // No file-based settings: a repository's .claude/settings(.local).json must not inject env (for example a base URL
+      // that would carry the host login elsewhere), an apiKeyHelper or permissions. Claude still loads --settings (flag)
+      // and managed policy; an empty source list is what Claude's own --restricted mode uses.
+      "--setting-sources", "", "--settings", JSON.stringify({ disableAllHooks: true, sandbox: { enabled: false } }),
       "--disallowedTools", "EnterPlanMode", "ExitPlanMode", "ScheduleWakeup", "CronCreate", "CronList", "CronDelete", "Cron*", "Monitor", "Agent", "Task", ...mcp];
 }
 

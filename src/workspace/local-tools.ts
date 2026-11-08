@@ -37,7 +37,9 @@ export function localWorkspaceFileTools(project: string, assertCurrent: () => vo
       const inRoot = (base: string, child: string) => { const tail = relative(base, child); return !isAbsolute(tail) && tail !== ".." && !tail.startsWith(".." + sep); };
       const namespace = join(managed.legacyProject, "colleagues");
       if (inRoot(namespace, path) && !inRoot(managed.ownHome, path)) throw new Error("Another colleague working folder is read-only");
-      if ([managed.legacyProject, managed.ownHome].some(base => relative(base, path).split(sep).length === 1 && /^(?:agents\.md|claude(?:\.local)?\.md)$/i.test(relative(base, path))))
+      // Engines also load instruction files from subdirectories (Claude reads a nested CLAUDE.md when it works there),
+      // so these names need the confirmation card at any depth, not only at a root.
+      if ([managed.legacyProject, managed.ownHome].some(base => inRoot(base, path)) && /^(?:agents\.md|claude(?:\.local)?\.md)$/i.test(parts[parts.length - 1]!))
         throw new Error("Managed instructions require a Hara confirmation card");
     }
     let cursor = project;
