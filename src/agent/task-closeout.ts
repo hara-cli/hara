@@ -1,3 +1,5 @@
+import { coreText } from "../i18n/messages.js";
+import type { Locale as CloseoutLanguage } from "../i18n/locale.js";
 import { freshTaskCompletion, isRecoverableRunPause, type TaskExecution, type TaskUserDependency } from "../session/task.js";
 import { redactSensitiveText, requestsCredentialDisclosure } from "../security/secrets.js";
 import type { Todo } from "../tools/todo.js";
@@ -5,7 +7,6 @@ import type { RunOutcome } from "./loop.js";
 import { sanitizeAssistantText } from "./assistant-text.js";
 import { redactOwnedToolImageText } from "../tools/tool-images.js";
 
-type CloseoutLanguage = "en" | "zh-Hans";
 
 // Only durable task state is summarized here, never raw tool output or a model's unaccepted success
 // claim. A receipt still attests to the accepted checks, not to every unrelated transcript action.
@@ -24,12 +25,12 @@ function section(label: string, values: readonly string[]): string {
   return values.length ? `\n\n${label}\n${values.map((value) => `- ${value}`).join("\n")}` : "";
 }
 
-function manualActionText(action: TaskUserDependency["manualAction"], zh: boolean): string {
+function manualActionText(action: TaskUserDependency["manualAction"], language: CloseoutLanguage): string {
   if (!action) return "";
   const commands: string[] = [];
   for (const [label, value] of [
-    [zh ? "操作命令" : "Action command", action.command],
-    [zh ? "核验命令" : "Verification command", action.verifyCommand],
+    [coreText("core.closeout.action_command", language), action.command],
+    [coreText("core.closeout.verification_command", language), action.verifyCommand],
   ]) {
     if (!value) continue;
     const text = safeLine(value);
@@ -37,9 +38,7 @@ function manualActionText(action: TaskUserDependency["manualAction"], zh: boolea
     // Never present a truncated or whitespace-rewritten shell command as ready to copy. The summary
     // remains bounded, while a longer/multiline command must be reviewed in its complete form first.
     const complete = redactSensitiveText(redactOwnedToolImageText(sanitizeAssistantText(value))).text.trim();
-    commands.push(`${label}: ${complete === text ? text : (zh
-      ? "本摘要未展示完整命令，请先获取并核对完整命令后再操作。"
-      : "The complete command is not shown here; obtain and review it before acting.")}`);
+    commands.push(`${label}: ${complete === text ? text : (coreText("core.closeout.the_complete_command_is_not_shown_here_obtain_and", language))}`);
   }
   const resumePhrase = safeLine(action.resumePhrase ?? "");
   const hints = lines((action.hints ?? []).map((hint) => {
@@ -47,9 +46,9 @@ function manualActionText(action: TaskUserDependency["manualAction"], zh: boolea
     const detail = safeLine(hint.detail);
     return term && detail ? `${term}: ${detail}` : "";
   }));
-  return section(zh ? "人工操作命令（仅供复制，不会自动执行）：" : "Manual commands (copy only; never executed automatically):", commands)
-    + section(zh ? "操作完成后可回复：" : "After completing the action, reply with:", resumePhrase ? [resumePhrase] : [])
-    + section(zh ? "操作提示：" : "Action hints:", hints);
+  return section(coreText("core.closeout.manual_commands_copy_only_never_executed_automatically", language), commands)
+    + section(coreText("core.closeout.after_completing_the_action_reply_with", language), resumePhrase ? [resumePhrase] : [])
+    + section(coreText("core.closeout.action_hints", language), hints);
 }
 
 /** An accepted receipt without authored prose must still close the turn, without another model call.
@@ -57,82 +56,73 @@ function manualActionText(action: TaskUserDependency["manualAction"], zh: boolea
 export function completionCloseoutText(task: TaskExecution | undefined, todos: readonly Todo[], language: CloseoutLanguage): string | undefined {
   const completion = freshTaskCompletion(task);
   if (!completion) return undefined;
-  const zh = language === "zh-Hans";
   const unfinished = todos.filter((todo) => todo.status !== "done");
   const pending = lines(unfinished.map((todo) => todo.text));
-  if (unfinished.length && !pending.length) pending.push(zh ? "仍有待处理的步骤。" : "There are unfinished steps.");
+  if (unfinished.length && !pending.length) pending.push(coreText("core.closeout.there_are_unfinished_steps", language));
   const evidence = lines(completion.evidence);
   const artifacts = lines(task?.checkpoint?.artifacts ?? []);
   if (completion.state === "awaiting_user") {
     const dependency = safeLine(completion.dependency?.detail ?? completion.waitingFor ?? "");
-    return (zh ? "任务已安全暂停，还没有全部完成。" : "The task is safely paused, not fully complete.")
-      + `\n\n${zh ? "需要你处理：" : "Your input is needed: "}${dependency || (zh ? "请查看当前的确认卡片或受保护登录入口。" : "Check the current decision card or trusted sign-in surface.")}`
-      + section(zh ? "可选项：" : "Options:", lines(completion.dependency?.options ?? [], 8))
-      + manualActionText(completion.dependency?.manualAction, zh)
-      + section(zh ? "已记录的情况：" : "Recorded observations:", evidence)
-      + section(zh ? "已保存的产物：" : "Saved artifacts:", artifacts);
+    return (coreText("core.closeout.the_task_is_safely_paused_not_fully_complete", language))
+      + `\n\n${coreText("core.closeout.your_input_is_needed", language)}${dependency || (coreText("core.closeout.check_the_current_decision_card_or_trusted_sign_in", language))}`
+      + section(coreText("core.closeout.options", language), lines(completion.dependency?.options ?? [], 8))
+      + manualActionText(completion.dependency?.manualAction, language)
+      + section(coreText("core.closeout.recorded_observations", language), evidence)
+      + section(coreText("core.closeout.saved_artifacts", language), artifacts);
   }
   return (pending.length
-    ? zh ? "本次执行已结束，但任务仍有未完成步骤，尚未全部完成。" : "This run has ended, but the task still has unfinished steps and is not fully complete."
-    : zh ? "任务已完成。" : "The task is complete.")
-    + section(zh ? "验收记录：" : "Acceptance evidence:", evidence)
-    + section(zh ? "已保存的产物：" : "Saved artifacts:", artifacts)
-    + section(zh ? "尚未完成：" : "Still unfinished:", pending);
+    ? coreText("core.closeout.this_run_has_ended_but_the_task_still_has", language)
+    : coreText("core.closeout.the_task_is_complete", language))
+    + section(coreText("core.closeout.acceptance_evidence", language), evidence)
+    + section(coreText("core.closeout.saved_artifacts", language), artifacts)
+    + section(coreText("core.closeout.still_unfinished", language), pending);
 }
 
 /** A stopped action needs a visible handoff, but never an invented completion receipt or an automatic
  * replay of uploads/messages. Completed checklist entries and artifacts are partial records only. */
 export function pausedCloseoutText(task: TaskExecution, todos: readonly Todo[], language: CloseoutLanguage, outcome?: RunOutcome): string {
-  const zh = language === "zh-Hans";
   const done = lines(todos.filter((todo) => todo.status === "done").map((todo) => todo.text));
   const pending = lines(todos.filter((todo) => todo.status !== "done").map((todo) => todo.text));
   const checkpoint = task.checkpoint;
   const progress = outcome?.progress ?? task.progress;
   const progressReason = outcome?.stopReason === "no_progress" && progress?.trigger === "unattended_token_budget"
     && [progress.tokens.total, progress.rounds, progress.checkpointStaleRounds].every((value) => Number.isSafeInteger(value) && value >= 0)
-    ? (zh
-      ? `耗量保护：第 ${progress.rounds} 轮，累计模型 I/O ${progress.tokens.total.toLocaleString("en-US")} token，连续 ${progress.checkpointStaleRounds} 个工作回合没有新增可核验进展。这是引擎停止继续消耗，不是已判断缺少你的授权或信息；模型 I/O 不等于实际账单或订阅抵扣。`
-      : `Usage guard: round ${progress.rounds}, ${progress.tokens.total.toLocaleString("en-US")} cumulative model I/O tokens, ${progress.checkpointStaleRounds} working rounds without new verifiable progress. The engine stopped further consumption; this is not a finding of missing permission or information from you. Model I/O is not a bill or subscription deduction.`)
+    ? (coreText("core.closeout.usage_guard_round_cumulative_model_i_o_tokens_working", language, { p1: progress.rounds, p2: progress.tokens.total.toLocaleString("en-US"), p3: progress.checkpointStaleRounds }))
     : undefined;
   const remaining = pending.length ? pending : lines([checkpoint?.nextStep ?? checkpoint?.currentStep ?? ""]);
   const blocked = outcome !== undefined && (outcome.status === "error" || outcome.status === "empty"
     || (outcome.status === "halted" && !isRecoverableRunPause(outcome)));
   const boundaryReasons: Partial<Record<NonNullable<RunOutcome["stopReason"]>, string>> = {
-    deadline: zh ? "本次执行已达到有效执行时限。" : "The active-execution deadline was reached.",
-    task_round_budget: zh ? "任务已达到累计执行回合预算。" : "The task's cumulative execution-round budget was reached.",
-    max_rounds: zh ? "本次执行已达到回合上限。" : "This run reached its execution-round limit.",
-    strategy_stall: zh ? "当前策略没有继续取得可核验进展。" : "The current strategy stopped making verifiable progress.",
-    no_progress: zh ? "近期没有取得新的可核验进展。" : "Recent work produced no new verifiable progress.",
-    repeat_loop: zh ? "检测到重复执行，已停止以避免再次操作。" : "Repeated execution was detected and stopped to avoid repeating actions.",
-    native_context_limit: zh ? "上下文已达上限，请开新会话。" : "The context limit was reached. Open a new session.",
-    native_prose_only: zh ? "引擎本轮已结束，尚未取得操作回执。你可以补充说明或继续执行。" : "The engine finished this turn without a verified action receipt. Clarify or continue explicitly.",
-    native_resume_timeout: zh ? "加载已有对话超时，本条消息尚未提交给引擎。原历史已保留，可重试加载或开新会话。" : "Loading the existing conversation timed out before this message was submitted. History was kept; retry loading or open a new session.",
+    deadline: coreText("core.closeout.the_active_execution_deadline_was_reached", language),
+    task_round_budget: coreText("core.closeout.the_task_s_cumulative_execution_round_budget_was_reached", language),
+    max_rounds: coreText("core.closeout.this_run_reached_its_execution_round_limit", language),
+    strategy_stall: coreText("core.closeout.the_current_strategy_stopped_making_verifiable_progress", language),
+    no_progress: coreText("core.closeout.recent_work_produced_no_new_verifiable_progress", language),
+    repeat_loop: coreText("core.closeout.repeated_execution_was_detected_and_stopped_to_avoid_repeating", language),
+    native_context_limit: coreText("core.closeout.the_context_limit_was_reached_open_a_new_session", language),
+    native_prose_only: coreText("core.closeout.the_engine_finished_this_turn_without_a_verified_action", language),
+    native_resume_timeout: coreText("core.closeout.loading_the_existing_conversation_timed_out_before_this_message", language),
   };
   const reason = outcome?.status === "error"
-    ? zh ? "本次执行发生错误，已停止。" : "This run stopped after an error."
+    ? coreText("core.closeout.this_run_stopped_after_an_error", language)
     : outcome?.status === "empty"
-      ? zh ? "模型未返回可用响应，本次执行已停止。" : "The model returned no usable response, so this run stopped."
+      ? coreText("core.closeout.the_model_returned_no_usable_response_so_this_run", language)
       : blocked
-        ? zh ? "安全检查或执行条件阻止了本次执行。" : "A safety or execution gate stopped this run."
+        ? coreText("core.closeout.a_safety_or_execution_gate_stopped_this_run", language)
         : outcome?.stopReason === "completion_verification"
-          ? zh ? "操作已有结果，但最终验收记录不完整。" : "Work produced a result, but its final acceptance record is incomplete."
+          ? coreText("core.closeout.work_produced_a_result_but_its_final_acceptance_record", language)
           : progressReason || (outcome?.stopReason && boundaryReasons[outcome.stopReason])
-            || (zh ? "已到达安全停止边界。" : "A safe stopping boundary was reached.");
+            || (coreText("core.closeout.a_safe_stopping_boundary_was_reached", language));
   return (blocked
-    ? zh ? "任务受阻，执行已停止，尚未确认全部完成。" : "The task is blocked and execution has stopped; full completion has not been verified."
-    : zh ? "任务已暂停，尚未确认全部完成。" : "The task is paused; full completion has not been verified.")
+    ? coreText("core.closeout.the_task_is_blocked_and_execution_has_stopped_full", language)
+    : coreText("core.closeout.the_task_is_paused_full_completion_has_not_been", language))
     + `\n${reason}`
-    + section(zh ? "已登记完成的步骤：" : "Steps recorded as done:", done)
-    + section(zh ? "已保存的产物（不代表全部验收通过）：" : "Saved artifacts (not proof of full completion):", lines(checkpoint?.artifacts ?? []))
-    + section(zh ? "尚待处理或核验：" : "Still to do or verify:", remaining)
+    + section(coreText("core.closeout.steps_recorded_as_done", language), done)
+    + section(coreText("core.closeout.saved_artifacts_not_proof_of_full_completion", language), lines(checkpoint?.artifacts ?? []))
+    + section(coreText("core.closeout.still_to_do_or_verify", language), remaining)
     + (outcome?.stopReason === "native_context_limit"
-      ? zh ? "\n\n请点击「开新会话」，由你明确重置会话后再发送新消息。原会话和已有结果会保留。"
-        : "\n\nChoose Open new session, then send a new message. The original session and recorded results are retained."
+      ? coreText("core.closeout.choose_open_new_session_then_send_a_new_message", language)
       : blocked
-      ? zh
-        ? "\n\n请先核对已有回执并排查、解决上方错误或拦截原因，再请求重试。不要重复上传或发送；不能仅靠继续执行来消除该阻碍。"
-        : "\n\nCheck existing receipts and diagnose and resolve the error or blocking condition above before requesting a retry. Do not repeat uploads or messages; resuming alone does not resolve this blocker."
-      : zh
-        ? "\n\n已记录的结果会保留。请先核对回执和上方暂停原因，不要重复上传或发送；解决阻碍后可在当前对话输入 /continue 继续。"
-        : "\n\nRecorded results are retained. Check existing receipts and the pause reason above before resuming; do not repeat uploads or messages. Use /continue in this conversation after resolving the boundary.");
+      ? coreText("core.closeout.check_existing_receipts_and_diagnose_and_resolve_the_error", language)
+      : coreText("core.closeout.recorded_results_are_retained_check_existing_receipts_and_the", language));
 }

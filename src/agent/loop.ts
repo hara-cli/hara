@@ -1,3 +1,7 @@
+import { coreText } from "../i18n/messages.js";
+import { currentClientLocale, type Locale as RuntimeCopyLanguage } from "../i18n/locale.js";
+import { replyLanguageInstruction, requestedReplyCopyLanguage } from "../i18n/reply-language.js";
+export { replyLanguageInstruction } from "../i18n/reply-language.js";
 import { groupCreatedReply } from "../workspace/group-create.js";
 import { RunModelTranscript } from "./run-model-transcript.js";
 import { createWorkspaceExtensionApproval, isWorkspaceExtensionTool, type WorkspaceExtensionApproval } from "../workspace/extension-binding.js";
@@ -239,36 +243,6 @@ export function needsConfirm(kind: string | undefined, mode: ApprovalMode): bool
   return true; // suggest: confirm edits and exec
 }
 
-export function replyLanguageInstruction(env: NodeJS.ProcessEnv = process.env): string {
-  const requested = String(env.HARA_REPLY_LANGUAGE ?? "").trim();
-  if (/^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8}){0,3}$/u.test(requested)) {
-    return `Reply in ${requested} unless the user explicitly asks for another language;`;
-  }
-  return "Reply in the same language as the user's latest message unless they explicitly ask for another language;";
-}
-
-type RuntimeCopyLanguage = "en" | "zh-Hans";
-
-const RETAINED_QUESTION_COPY = Object.freeze({
-  en: Object.freeze({
-    defaultQuestion: "A user decision is required to continue.",
-    defaultHeader: "Need your answer",
-    footer: "Reply in this same conversation and Hara will continue the retained task. Never send credentials here; use Hara's masked Settings/login surface.",
-    blockedStep: "answer the pending user question",
-    nextStep: "continue automatically after the next reply in this persisted conversation",
-    waitingEvidence: "The current persisted run has no live interactive answer channel, so no answer was inferred.",
-    dependencyEvidence: "The model invoked ask_user without an explicit deterministic default.",
-  }),
-  "zh-Hans": Object.freeze({
-    defaultQuestion: "需要你的确认后才能继续。",
-    defaultHeader: "需要你确认",
-    footer: "请直接在当前对话中回复，Hara 会继续执行已保留的任务。请勿在这里发送凭据；请使用 Hara 设置或登录界面的受保护输入框。",
-    blockedStep: "回答待确认问题",
-    nextStep: "收到当前对话的下一条回复后自动继续",
-    waitingEvidence: "当前保留的任务没有实时交互回答通道，因此没有推断用户答案。",
-    dependencyEvidence: "模型调用 ask_user 时没有提供明确且确定的默认值。",
-  }),
-});
 
 /** Post a Workspace delivery:"async" ask_user card and return its pending receipt immediately. */
 function postAsyncWorkspaceAsk(permit: WorkspaceRunPermit, input: unknown): string {
@@ -284,28 +258,13 @@ function postAsyncWorkspaceAsk(permit: WorkspaceRunPermit, input: unknown): stri
     note: "The question card is shown to the user. Continue only with work that does not depend on the answer; the answer arrives later as a user message. An unanswered async question is dismissed when this run ends — never assume an answer." });
 }
 
-export function runtimeCopyLanguage(
-  history: NeutralMsg[],
-  env: NodeJS.ProcessEnv = process.env,
-): RuntimeCopyLanguage {
-  const requested = String(env.HARA_REPLY_LANGUAGE ?? "").trim().toLowerCase();
-  if (/^[a-z]{2,8}(?:-[a-z0-9]{1,8}){0,3}$/u.test(requested)) {
-    return requested === "zh" || requested.startsWith("zh-") ? "zh-Hans" : "en";
-  }
-  for (let index = history.length - 1; index >= 0; index -= 1) {
-    const message = history[index];
-    if (message.role !== "user") continue;
-    const visibleText = message.displayContent ?? message.content;
-    return /\p{Script=Han}/u.test(visibleText) ? "zh-Hans" : "en";
-  }
-  return "en";
+export function runtimeCopyLanguage(history: NeutralMsg[], env: NodeJS.ProcessEnv = process.env): RuntimeCopyLanguage {
+  const latest = [...history].reverse().find(message => message.role === "user");
+  return requestedReplyCopyLanguage(latest?.role === "user" ? latest.displayContent ?? latest.content : "", env);
 }
-
-export function retainedQuestionCopy(
-  history: NeutralMsg[],
-  env: NodeJS.ProcessEnv = process.env,
-) {
-  return RETAINED_QUESTION_COPY[runtimeCopyLanguage(history, env)];
+export function retainedQuestionCopy(history: NeutralMsg[], env: NodeJS.ProcessEnv = process.env) {
+  const language = runtimeCopyLanguage(history, env);
+  return { defaultQuestion: coreText("core.retained.defaultQuestion", language), defaultHeader: coreText("core.retained.defaultHeader", language), footer: coreText("core.retained.footer", language), blockedStep: coreText("core.retained.blockedStep", language), nextStep: coreText("core.retained.nextStep", language), waitingEvidence: coreText("core.retained.waitingEvidence", language), dependencyEvidence: coreText("core.retained.dependencyEvidence", language) };
 }
 
 const HARA_SYSTEM = () =>
@@ -322,7 +281,7 @@ to do and how to handle missing evidence. Ask only for missing material details,
 confirmation card authorize creation. Never claim a colleague exists before the tool returns created:true;
 created:false means an existing colleague was found. Do not use spawn_agent or a coding runtime to populate
 the contact list. Creating a colleague never grants credentials, computer control or coding authority.
-Be concise and direct. ${replyLanguageInstruction()} Keep that language consistent in every user-visible
+Be concise and direct. ${replyLanguageInstruction({})} Keep that language consistent in every user-visible
 progress sentence, tool-round preamble, and final response; never switch languages merely because tools,
 logs, or source text use another language. Keep code, commands, paths, and technical identifiers unchanged.
 Treat the user's explicit response shape as a binding contract: requests such as "brief", "one sentence", "only answer",
@@ -661,7 +620,8 @@ export function composeSystem(
   for (const part of suppliedParts.filter(part => part.stability === "turn")) {
     assembler.add(part.id, part.stability, part.source, part.content);
   }
-  assembler.add("task-intake", "turn", "task", intakeContext)
+  assembler.add("reply-language", "turn", "runtime", `Interface language: ${currentClientLocale().tag}. Follow the latest user message’s language and writing system; use this interface language only for ambiguous input.`)
+    .add("task-intake", "turn", "task", intakeContext)
     .add("task-checkpoint", "turn", "task", checkpointContext)
     // Keep the changing clock at the very end: stable core/session prefixes remain cacheable, while every
     // provider request (including later tool rounds and a long-lived session's next turn) gets a fresh value.
@@ -2860,7 +2820,7 @@ async function runAgentInner(
     };
     const headlessQuestionWithoutDefault = !ctx.ask && r.toolUses.some(isPendingHeadlessQuestion);
     if (headlessQuestionWithoutDefault) {
-      const questionCopy = RETAINED_QUESTION_COPY[life.language];
+      const questionCopy = retainedQuestionCopy(history);
       if (!opts.taskIntake || !intakeTask || !ctx.sessionId) {
         history.push({
           role: "tool",
@@ -3981,7 +3941,7 @@ async function runAgentInner(
           ? (value.agent as { identity: { displayName: string } }).identity.displayName : "";
         const groupName = typeof value.group === "object" && value.group !== null && typeof (value.group as { name?: unknown }).name === "string"
           ? (value.group as { name: string }).name : "";
-        history.push({ role: "assistant", text: confirmedCreationTool === "group_create" ? groupCreatedReply(groupName, runtimeCopyLanguage(history)) : name ? `已建立同事 ${name}。` : "同事已建立。", toolUses: [] });
+        history.push({ role: "assistant", text: confirmedCreationTool === "group_create" ? groupCreatedReply(groupName, runtimeCopyLanguage(history)) : name ? coreText("core.created.colleague_named", runtimeCopyLanguage(history), { name }) : coreText("core.created.colleague", runtimeCopyLanguage(history)), toolUses: [] });
         return { status: "completed" };
       }
     }

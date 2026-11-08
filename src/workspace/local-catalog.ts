@@ -1,3 +1,4 @@
+import { migrateDefaultLabels, markDefaultWorkspaces, validDefaultLabel, type DefaultLabel } from "../i18n/default-labels.js";
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { realpathSync } from "node:fs";
@@ -8,7 +9,7 @@ import { parseWorkspaceResourceScope, type WorkspaceResourceScope } from "./reso
 import { exact, plain, positive, text, UUID } from "./local-state.js";
 import { isWorkspaceId } from "./registry.js";
 
-export interface LocalWorkspaceRecord {
+export interface LocalWorkspaceRecord extends DefaultLabel {
   scope: WorkspaceResourceScope;
   label: string;
   actorId: string;
@@ -36,8 +37,8 @@ function parse(value: unknown): LocalWorkspaceCatalogState {
     || !text(value.hostId) || !positive(value.hostEpoch) || !Array.isArray(value.workspaces) || value.workspaces.length > 128) return fail();
   const seen = new Set<string>();
   for (const row of value.workspaces) {
-    if (!plain(row) || !exact(row, ["scope", "label", "actorId", "policyRevision", "grantId", "grantRevision", "active", ...(row.personal !== undefined ? ["personal"] : [])])
-      || !text(row.label, 80) || !text(row.actorId) || !text(row.grantId) || !positive(row.policyRevision)
+    if (!plain(row) || !exact(row, ["scope", "label", "actorId", "policyRevision", "grantId", "grantRevision", "active", ...(row.personal !== undefined ? ["personal"] : []), ...["labelSource", "labelKey"].filter(key => Object.hasOwn(row, key))])
+      || !validDefaultLabel(row) || !text(row.label, 80) || !text(row.actorId) || !text(row.grantId) || !positive(row.policyRevision)
       || !positive(row.grantRevision) || typeof row.active !== "boolean" || row.personal !== undefined && (row.personal !== true || !row.active)) return fail();
     const scope = parseWorkspaceResourceScope(row.scope);
     if (scope.authority.kind !== "local" || scope.authority.localAuthorityId !== value.localAuthorityId || seen.has(scope.workspaceId)) return fail();
@@ -67,6 +68,15 @@ export class LocalWorkspaceCatalog {
       return state;
     });
     this.registration = { localAuthorityId: initial.localAuthorityId, hostId: initial.hostId };
+    this.migrateDefaultLabels();
+  }
+  /** Host-only metadata migration. Existing labels and all authority fields remain byte values. */
+  migrateDefaultLabels(rollback = false): boolean {
+    return withPrivateStateLockSync(this.home, ["workspace-local-dev"], "catalog", () => migrateDefaultLabels({
+      file: this.file(), backup: bindPrivateHaraStateFile(this.home, ["workspace-local-dev"], "default-labels-v1.json"),
+      parse: raw => { const value = parse(raw); if (value.localAuthorityId !== this.registration.localAuthorityId || value.hostId !== this.registration.hostId) throw new Error("local Workspace registration changed"); return value; }, rollback, assertCurrent: () => { assertPrivateStateDirectory(this.privateRoot!); assertPrivateStateDirectory(this.boundFile!.directory); },
+      mark: value => { if (!markDefaultWorkspaces(value.workspaces)) return false; if (value.revision >= Number.MAX_SAFE_INTEGER) throw new Error("Workspace revision exhausted"); value.revision++; return true; },
+    }));
   }
   private file() {
     // Catalog reads occur at every authority fence. Retain namespace identities, never grant data.
@@ -107,7 +117,7 @@ export class LocalWorkspaceCatalog {
     const workspaceId = `ws_${randomUUID()}`;
     const next = this.update(expectedRevision, state => {
       state.workspaces.push({ scope: { schemaVersion: 1, workspaceId, authority: { kind: "local", localAuthorityId: state.localAuthorityId } },
-        label, actorId: `owner_${randomUUID()}`, policyRevision: 1, grantId: `grant_${randomUUID()}`, grantRevision: 1, active: true });
+        label, ...(markDefaultWorkspaces([{ label }]) ? { labelSource: "default" as const, labelKey: "core.name.workspace" as const } : {}), actorId: `owner_${randomUUID()}`, policyRevision: 1, grantId: `grant_${randomUUID()}`, grantRevision: 1, active: true });
       state.activeWorkspaceId ??= workspaceId;
     });
     return next.workspaces.find(row => row.scope.workspaceId === workspaceId)!;
@@ -115,7 +125,7 @@ export class LocalWorkspaceCatalog {
   rename(workspaceId: string, label: string, expectedRevision: number): void {
     if (!text(label, 80)) throw new Error("invalid Workspace label");
     this.update(expectedRevision, state => { const row = state.workspaces.find(row => row.scope.workspaceId === workspaceId && row.active);
-      if (!row) throw new Error("Workspace unavailable"); row.label = label; });
+      if (!row) throw new Error("Workspace unavailable"); row.label = label; delete row.labelSource; delete row.labelKey; });
   }
   select(workspaceId: string, expectedRevision: number): void {
     this.update(expectedRevision, state => {

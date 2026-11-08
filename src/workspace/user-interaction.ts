@@ -1,3 +1,5 @@
+import { coreText } from "../i18n/messages.js";
+import { type Locale } from "../i18n/locale.js";
 import { randomUUID } from "node:crypto";
 import { redactSensitiveText } from "../security/secrets.js";
 import { scanMemory } from "../memory/guard.js";
@@ -12,7 +14,7 @@ export type WorkspaceQuestionIntent = "rename_target";
 export interface WorkspaceUserQuestion {
   id: string; reason: WorkspaceQuestionReason; question: string; options: string[];
   taskId: string; runId: string;
-  header?: string; delivery?: "async"; intent?: WorkspaceQuestionIntent;
+  header?: string; delivery?: "async"; intent?: WorkspaceQuestionIntent; messageKey?: `core.question.${WorkspaceQuestionReason}`;
 }
 
 // Unified Workspace interaction contract (Hara-owned; modelled on a request/decision pair). Every
@@ -66,7 +68,7 @@ interface State {
   asyncQuestions: WorkspaceUserQuestion[]; asyncAnswers: WorkspaceAsyncAnswer[]; decisions: Decision[];
 }
 const LEGACY_KEYS = ["revision", "resourceBinding", "runId", "prepared", "answeredQuestionIds", "dismissed", "referenceAcknowledged", "misses", "failures", "budgetAcknowledged", "question"];
-const QUESTION_KEYS = ["id", "reason", "question", "options", "taskId", "runId"], QUESTION_OPTIONAL = ["header", "delivery", "intent"];
+const QUESTION_KEYS = ["id", "reason", "question", "options", "taskId", "runId"], QUESTION_OPTIONAL = ["header", "delivery", "intent", "messageKey"];
 const OUTCOMES = ["answered", "paused", "aborted", "run_ended", "superseded"];
 /** Unanswered async questions that may coexist in one run. */
 export const MAX_ASYNC_QUESTIONS = 3;
@@ -79,9 +81,9 @@ function safe(value: string, cap: number): string {
   const result = redactSensitiveText(value).text.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim().slice(0, cap);
   return scanMemory(result).ok ? result : "Please clarify the missing context.";
 }
-export function workspaceRenameTargetQuestion(newName: string, chinese: boolean): string {
+export function workspaceRenameTargetQuestion(newName: string, language: boolean | Locale): string {
   const name = safe(newName, 120);
-  return chinese ? `有多位同事符合，要把哪一位改名为「${name}」？请选一位。` : `Several colleagues match. Which one should be renamed to "${name}"?`;
+  return coreText("core.question.rename", typeof language === "boolean" ? language ? "zh-Hans" : "en" : language, { name });
 }
 
 /** A run-bound gate, independent of model instructions. The caller owns the session lease; the JSON
@@ -89,12 +91,15 @@ export function workspaceRenameTargetQuestion(newName: string, chinese: boolean)
 export class WorkspaceUserInteraction {
   private readonly state: WorkspaceJsonState<State>;
   private lookupBatch = false;
+  private readonly locale: Locale;
   constructor(storage: WorkspaceResourceStorage, private readonly binding: Readonly<WorkspaceRunBinding>,
-    private readonly taskId: string, private readonly chinese: boolean) {
+    private readonly taskId: string, language: boolean | Locale) {
+    this.locale = typeof language === "boolean" ? language ? "zh-Hans" : "en" : language;
     const validQuestion = (q: unknown, delivery: "sync" | "async"): boolean => plain(q)
       && Object.keys(q).every(key => QUESTION_KEYS.includes(key) || QUESTION_OPTIONAL.includes(key)) && QUESTION_KEYS.every(key => Object.hasOwn(q, key))
       && typeof q.id === "string" && UUID.test(q.id) && REASONS.includes(String(q.reason)) && text(q.question, 800)
       && q.taskId === taskId && q.runId === binding.runId && Array.isArray(q.options) && q.options.length <= 8 && q.options.every(item => text(item, 300))
+      && (q.messageKey === undefined || q.messageKey === `core.question.${q.reason}`)
       && (q.header === undefined || text(q.header, 120)) && (q.intent === undefined || q.intent === "rename_target")
       && (delivery === "async" ? q.delivery === "async" : q.delivery === undefined);
     this.state = new WorkspaceJsonState(storage, `interaction-${binding.runId}.json`, raw => {
@@ -187,24 +192,10 @@ export class WorkspaceUserInteraction {
   request(reason: WorkspaceQuestionReason, question?: string, options: string[] = [],
     meta: { header?: string; intent?: WorkspaceQuestionIntent } = {}): WorkspaceUserQuestion {
     const s = this.state.read();
-    const copy = this.chinese ? {
-      lookup_missing: "两次查找仍未确认目标。你指的是哪位同事或哪项内容？请补充名字、原名或位置。",
-      lookup_ambiguous: "找到了多个可能的对象。你指的是哪一个？",
-      tool_problem: "当前步骤连续遇到问题，进度已保留。你希望先处理哪个卡点，或补充什么信息？",
-      budget_warning: "本次任务快到预算上限，已保留当前位置。是否在原剩余额度内继续？回答不会重置预算。",
-      runaway_guard: "连续执行已达到防死循环熔断点，进度已保留。请检查是否仍在推进，再选择继续或停止。",
-      explicit: "请补充继续当前步骤所需的信息。",
-    } : {
-      lookup_missing: "Two lookups did not identify the target. Which colleague or item do you mean? Please provide its name, former name or location.",
-      lookup_ambiguous: "Several evidenced matches remain. Which one do you mean?",
-      tool_problem: "This step failed twice. Progress is saved. What should be corrected or clarified before continuing?",
-      budget_warning: "This task is near its budget limit. Continue from the saved point within the original remaining allowance? Your answer will not reset the budget.",
-      runaway_guard: "Execution reached the runaway-loop safety checkpoint. Progress is saved. Check whether it is advancing, then choose Continue or Stop.",
-      explicit: "Please provide the information needed to continue this step.",
-    };
+    const messageKey = `core.question.${reason}` as const;
     const label = meta.header ? safe(meta.header, 120) : "";
-    const q: WorkspaceUserQuestion = { id: randomUUID(), reason, question: safe(question ?? copy[reason], 800),
-      options: (reason === "runaway_guard" ? (this.chinese ? ["继续", "停止"] : ["Continue", "Stop"]) : options).slice(0, 8).map(option => safe(option, 300)).filter(Boolean), taskId: this.taskId, runId: this.binding.runId,
+    const q: WorkspaceUserQuestion = { id: randomUUID(), reason, question: safe(question ?? coreText(messageKey, this.locale), 800), ...(question === undefined ? { messageKey } : {}),
+      options: (reason === "runaway_guard" ? [coreText("core.question.continue", this.locale), coreText("core.question.stop", this.locale)] : options).slice(0, 8).map(option => safe(option, 300)).filter(Boolean), taskId: this.taskId, runId: this.binding.runId,
       ...(label ? { header: label } : {}), ...(meta.intent ? { intent: meta.intent } : {}) };
     const old = s.question;
     if (old && (old.reason !== "explicit" || reason !== "explicit"
@@ -258,7 +249,7 @@ export class WorkspaceUserInteraction {
           .map(row => typeof row.label === "string" ? row.label : typeof row.name === "string" ? row.name : "").filter(Boolean) : [];
         // A rename whose current colleague matches several people is a choice card, then agent_rename.
         const renameTo = typeof parsed.renameTo === "string" ? parsed.renameTo : "";
-        this.request("lookup_ambiguous", renameTo ? workspaceRenameTargetQuestion(renameTo, this.chinese) : undefined, candidates,
+        this.request("lookup_ambiguous", renameTo ? workspaceRenameTargetQuestion(renameTo, this.locale) : undefined, candidates,
           renameTo ? { intent: "rename_target" } : {}); return;
       }
       lookupMissing = name === "workspace_read" ? parsed.exists === false

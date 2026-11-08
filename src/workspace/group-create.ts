@@ -1,3 +1,5 @@
+import { coreText } from "../i18n/messages.js";
+import type { Locale } from "../i18n/locale.js";
 import type { NeutralMsg } from "../providers/types.js";
 
 const group = /(?:群(?:聊|组|組)?|\b(?:group|room)\b)/iu;
@@ -35,7 +37,6 @@ export function singleGroupCreationRequest(history: readonly NeutralMsg[]): bool
   const value = typeof text === "string" ? text : text?.role === "assistant" ? text.text : "";
   return value.length <= 400 && !/(?:并且|並且|然后|然後|同时|同時|另外|顺便|順便|發送|发送|寫入|写入|\b(?:also|then|send|write|delete|deploy|publish)\b)/iu.test(value);
 }
-export function groupCreatedReply(name: string, language: "en" | "zh-Hans" | "zh-Hant"): string {
-  const copy = { en: `Created group ${name}.`, "zh-Hans": `已建立群聊 ${name}。`, "zh-Hant": `已建立群聊 ${name}。` };
-  return copy[language];
+export function groupCreatedReply(name: string, language: Locale): string {
+  return coreText("core.created.group", language, { name });
 }

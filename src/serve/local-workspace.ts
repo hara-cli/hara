@@ -1,3 +1,5 @@
+import { withClientLocale } from "../i18n/locale.js";
+import { publicErrorData } from "../i18n/errors.js";
 import { createServer } from "node:http";
 import { parseMessageTimingInput } from "../workspace/message-timing.js";
 import type { WorkspaceMcpLaunchProvider } from "../workspace/extension-candidate.js";
@@ -27,6 +29,11 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
   const token = opts.token ?? randomBytes(32).toString("hex");
   if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("invalid Workspace Dev transport token");
   const origins = new Set(["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost", ...(input.allowedOrigins ?? [])]);
+  const dispatch: typeof dispatchMethod = (client, method, params, rpcId, receivedAt) => {
+    if (!plain(params)) return Promise.reject(new Error("invalid Workspace RPC parameters"));
+    const { clientLocale, ...businessParams } = params;
+    return withClientLocale(clientLocale, () => dispatchMethod(client, method, businessParams, rpcId, receivedAt));
+  };
   const clients = new Map<WebSocket, { id: string; initialized: boolean }>();
   let closing = false;
   const capability = input.mode === "workspace" ? "workspace.v1" : CAPABILITY;
@@ -77,7 +84,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
   try { writePrivateStateFileSync(receiptFile, JSON.stringify(receipt) + "\n", { expectedMissing: true }); }
   catch (error) { wss.close(); server.close(); await host.close(); throw error; }
   const ownedReceipt = readPrivateStateFileSnapshotSync(receiptFile.path, 4096)!;
-  const dispatch = async (client: { id: string; initialized: boolean }, method: string, params: unknown, rpcId: string | number, receivedAt: number): Promise<unknown> => {
+  const dispatchMethod = async (client: { id: string; initialized: boolean }, method: string, params: unknown, rpcId: string | number, receivedAt: number): Promise<unknown> => {
     if (!plain(params)) throw new Error("invalid Workspace RPC parameters");
     if (method === "initialize") {
       if (!tokenMatches(params.token, token)) throw new Error("unauthorized");
@@ -90,7 +97,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, runtimePlatform: { writeProtection: runtimeWriteProtection(), permissionTiers: availableRuntimePermissionTiers() }, capabilities: [capability, "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.media.v1", "workspace.media.states.v1", "workspace.agents.archive.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, runtimePlatform: { writeProtection: runtimeWriteProtection(), permissionTiers: availableRuntimePermissionTiers() }, capabilities: [capability, "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.media.v1", "workspace.media.states.v1", "workspace.i18n.v1", "workspace.agents.archive.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
@@ -359,7 +366,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
           // Fixed classification, not arbitrary provider errors/paths/credentials.
           const safe = message === "unauthorized" ? "unauthorized" : message.includes("真實模型") ? message
             : message.replaceAll(token, "[transport credential]").replaceAll(host.root, "[Dev state]").slice(0, 500);
-          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: "2.0", id, error: { code: message === "unauthorized" ? -32001 : -32602, message: safe, ...(error instanceof WorkspaceArchiveError ? { data: { archiveReason: error.reason, retryable: true } } : {}), ...(error instanceof RuntimeTierUnavailableError || error instanceof NativeEngineUnsupportedError ? { data: { platformReason: error.code } } : {}) } }));
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: "2.0", id, error: { code: message === "unauthorized" ? -32001 : -32602, message: safe, data: { ...publicErrorData(error, [token, host.root]), ...(error instanceof WorkspaceArchiveError ? { archiveReason: error.reason, retryable: true } : {}), ...(error instanceof RuntimeTierUnavailableError || error instanceof NativeEngineUnsupportedError ? { platformReason: error.code } : {}) } } }));
         }
       })();
     });

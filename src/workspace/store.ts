@@ -1,3 +1,4 @@
+import { migrateDefaultLabels, markDefaultWorkspaces } from "../i18n/default-labels.js";
 import { isAbsolute } from "node:path";
 import {
   bindPrivateHaraStateFile,
@@ -39,7 +40,15 @@ export class WorkspaceRegistryStore {
     return this.readSnapshot()?.value ?? null;
   }
 
+  migrateDefaultLabels(rollback = false): boolean {
+    return withPrivateStateLockSync(this.home, [], "workspace-registry", () => migrateDefaultLabels({
+      file: bindPrivateHaraStateFile(this.home, [], FILENAME), backup: bindPrivateHaraStateFile(this.home, [], "workspaces-default-labels-v1.json"),
+      parse: parseWorkspaceRegistry, rollback,
+      mark: value => { if (!markDefaultWorkspaces(value.workspaces)) return false; if (value.revision >= Number.MAX_SAFE_INTEGER) throw new Error("Workspace registry revision is exhausted"); value.revision++; return true; },
+    }));
+  }
   initialize(legacy: readonly LegacyWorkspaceConnection[], activeProfileId: string | null): WorkspaceRegistry {
+    this.migrateDefaultLabels();
     return withPrivateStateLockSync(this.home, [], "workspace-registry", () => {
       const current = this.readSnapshot();
       if (current) return current.value;

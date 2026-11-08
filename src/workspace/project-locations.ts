@@ -1,3 +1,5 @@
+import { coreText } from "../i18n/messages.js";
+import { replyCopyLanguage } from "../i18n/reply-language.js";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { NeutralMsg } from "../providers/types.js";
 import { redactSensitiveText } from "../security/secrets.js";
@@ -5,16 +7,8 @@ import { WorkspaceLegacyResources } from "./legacy-resources.js";
 import { plain } from "./local-state.js";
 import type { WorkspaceResourceStorage } from "./resource-context.js";
 
-const COPY = {
-  en: { project: "Project", root: "Resource root", current: "Current Workspace directory", recent: "Recent directory", other: "Other (type an answer)" },
-  "zh-Hans": { project: "项目", root: "资源根", current: "当前空间目录", recent: "最近目录", other: "其它（输入）" },
-  "zh-Hant": { project: "專案", root: "資源根", current: "目前空間目錄", recent: "最近目錄", other: "其它（輸入）" },
-} as const;
 export interface WorkspaceProjectLocations {
   historicalContextOnly: true; access: "catalog_only"; options: string[]; otherOption: string; truncated: boolean;
-}
-function locale(objective: string): keyof typeof COPY {
-  return /[個嗎負責項專錄夾請說體裡]/u.test(objective) ? "zh-Hant" : /[\u3400-\u9fff]/u.test(objective) ? "zh-Hans" : "en";
 }
 function safePath(value: string): boolean {
   return value.length <= 240 && isAbsolute(value) && resolve(value) === value && value !== sep
@@ -25,7 +19,9 @@ function safePath(value: string): boolean {
 export function prepareWorkspaceProjectLocations(input: {
   storage: WorkspaceResourceStorage; project: string; history: readonly NeutralMsg[]; objective: string;
 }): WorkspaceProjectLocations {
-  const copy = COPY[locale(input.objective)], rows = new WorkspaceLegacyResources(input.storage).directoryReferencesForHost();
+  const language = replyCopyLanguage(input.objective);
+  const copy = { project: coreText("core.location.project", language), root: coreText("core.location.root", language), current: coreText("core.location.current", language), recent: coreText("core.location.recent", language), other: coreText("core.location.other", language) };
+  const rows = new WorkspaceLegacyResources(input.storage).directoryReferencesForHost();
   const words = [...new Set(input.objective.slice(0, 2000).toLocaleLowerCase().match(/[a-z0-9][a-z0-9_-]{1,79}|[\u3400-\u9fff]{2,40}/gu) ?? [])].slice(0, 32);
   const score = (path: string) => words.reduce((sum, word) => sum + Number(path.toLocaleLowerCase().includes(word)), 0);
   const ranked = rows.map(row => ({ ...row, score: score(row.path) })).sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));

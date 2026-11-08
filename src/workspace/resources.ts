@@ -52,6 +52,7 @@ export class WorkspaceResources {
       this.storage.run(() => { actionCheck(action); return fn(...args); });
     const agents = new WorkspaceAgentStore(this.storage.scope, options.runtimeInstaller ?? new WorkspaceRuntimeInstaller(this.storage));
     this.agents = Object.freeze({
+      migrateDefaultLabels: bind(agents.migrateDefaultLabels.bind(agents), "configure"),
       list: bind(agents.list.bind(agents)), references: bind(agents.references.bind(agents)), get: bind(agents.get.bind(agents)),
       currentPersona: bind(agents.currentPersona.bind(agents)),
       channelPrefilterProfiles: bind(agents.channelPrefilterProfiles.bind(agents)),

@@ -1,3 +1,4 @@
+import { markDefaultWorkspaces, validDefaultLabel, type DefaultLabel } from "../i18n/default-labels.js";
 import { randomUUID } from "node:crypto";
 import { isValidProfileId, isValidSpaceId } from "../profile/profile.js";
 
@@ -8,7 +9,7 @@ const CONNECTION_ID = new RegExp(`^mc_${UUID}$`);
 const GENERATION_ID = new RegExp(`^gen_${UUID}$`);
 const FINGERPRINT = /^[a-f0-9]{64}$/;
 
-export interface WorkspaceRecord {
+export interface WorkspaceRecord extends DefaultLabel {
   id: string;
   label: string;
   createdAt: string;
@@ -84,8 +85,8 @@ export function parseWorkspaceRegistry(value: unknown): WorkspaceRegistry {
   const workspaces = new Map<string, WorkspaceRecord>();
   const aliases = new Set<string>();
   for (const row of value.workspaces) {
-    if (!object(row) || !exactKeys(row, ["id", "label", "createdAt", "defaultConnectionId"], ["legacySpaceId"])
-      || !isWorkspaceId(row.id) || workspaces.has(row.id) || !validWorkspaceLabel(row.label)
+    if (!object(row) || !exactKeys(row, ["id", "label", "createdAt", "defaultConnectionId"], ["legacySpaceId", "labelSource", "labelKey"])
+      || !validDefaultLabel(row) || !isWorkspaceId(row.id) || workspaces.has(row.id) || !validWorkspaceLabel(row.label)
       || typeof row.createdAt !== "string" || !Number.isFinite(Date.parse(row.createdAt))
       || (row.defaultConnectionId !== null && !connectionId(row.defaultConnectionId))) return fail();
     if (Object.hasOwn(row, "legacySpaceId")) {
@@ -164,6 +165,7 @@ export function bootstrapWorkspaceRegistry(
   } else if (!registry.activeWorkspaceId) {
     throw new Error("legacy active connection is unavailable; Workspace ownership needs confirmation");
   }
+  markDefaultWorkspaces(registry.workspaces);
   return parseWorkspaceRegistry(registry);
 }
 

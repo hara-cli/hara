@@ -72,7 +72,7 @@ test("Hara prompt keeps core/session identities stable when the accepted task br
       "only the turn-level task boundary changes",
     );
     assert.match(after.text, /Working directory: \/workspace\/project/);
-    assert.match(after.text, /Reply in the same language as the user's latest message/);
+    assert.match(after.text, /Reply in the same language and writing system as the user's latest message/);
     assert.match(after.text, /Keep that language consistent in every user-visible/);
     assert.match(after.text, /explicit response shape as a binding contract/);
     assert.match(after.text, /ask only for the missing fields in one short sentence/);
@@ -127,11 +127,11 @@ test("runtime clock uses the requested zone across a UTC date boundary", () => {
 });
 
 test("reply language follows the latest message by default and accepts an explicit language tag", () => {
-  assert.match(replyLanguageInstruction({}), /same language as the user's latest message/);
+  assert.match(replyLanguageInstruction({}), /same language and writing system as the user's latest message/);
   assert.match(replyLanguageInstruction({ HARA_REPLY_LANGUAGE: "zh-CN" }), /Reply in zh-CN/);
   assert.match(
     replyLanguageInstruction({ HARA_REPLY_LANGUAGE: "not_a_language" }),
-    /same language as the user's latest message/,
+    /same language and writing system as the user's latest message/,
     "invalid environment values fail back to automatic language matching",
   );
 });

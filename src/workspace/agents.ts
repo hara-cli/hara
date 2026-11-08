@@ -1,3 +1,4 @@
+import { migrateDefaultLabels, DEFAULT_ORCHESTRATOR_TITLES } from "../i18n/default-labels.js";
 // Host-private Agent catalog. No ambient role discovery, constructor IO, cloud actor provisioning,
 // execution activation or automatic migration. Imported prompts never become configuration authority.
 import { createHash, randomUUID } from "node:crypto";
@@ -57,6 +58,8 @@ export interface WorkspaceLegacyAgentInput extends WorkspaceAgentPersonaInput {
   username: string; state: "active" | "archived"; importId: string; sourceHash: string; toolPolicy: WorkspaceLegacyToolPolicy;
 }
 interface AgentRecord {
+  titleSource?: "default";
+  titleKey?: "core.name.orchestrator";
   agentId: string;
   username: string;
   kind: "main" | "colleague";
@@ -77,6 +80,8 @@ interface Owner {
 interface Manifest extends Owner { revision: number; agents: AgentRecord[] }
 
 export interface WorkspaceAgentView {
+  titleSource?: "default";
+  titleKey?: "core.name.orchestrator";
   workspaceId: string;
   agentId: string;
   username: string;
@@ -177,13 +182,18 @@ export class WorkspaceAgentStore {
     let raw: unknown, rawOwner: unknown;
     try { raw = JSON.parse(file.snapshot.text); rawOwner = JSON.parse(ownerFile.snapshot.text); } catch { return invalid(); }
     const owner = this.parseOwner(rawOwner);
+    const value = this.parseManifest(raw, owner);
+    file.assertCurrent(); ownerFile.assertCurrent();
+    return { file, ownerFile, value };
+  }
+  private parseManifest(raw: unknown, owner: Owner): Manifest {
     if (!object(raw) || !keys(raw, ["schemaVersion", "resourceBinding", "workspaceId", "mainAgentId", "revision", "agents"])
       || !positive(raw.revision) || !Array.isArray(raw.agents) || raw.agents.length < 1) return invalid();
     const { revision, agents, ...rawManifestOwner } = raw;
     if (canonical(this.parseOwner(rawManifestOwner)) !== canonical(owner)) return invalid();
     const ids = new Set<string>(), usernames = new Set<string>();
     const rows: AgentRecord[] = agents.map(value => {
-      if (!object(value) || !keys(value, ["agentId", "username", "kind", "state", "epoch", "currentConfigRevision", "configurations"], ["legacy", "archivedAt", "pausedScheduleCount"])
+      if (!object(value) || !keys(value, ["agentId", "username", "kind", "state", "epoch", "currentConfigRevision", "configurations"], ["legacy", "archivedAt", "pausedScheduleCount", "titleSource", "titleKey"])
         || !isWorkspaceAgentId(value.agentId) || ids.has(value.agentId)
         || typeof value.username !== "string" || !USERNAME.test(value.username) || usernames.has(value.username)
         || (value.kind !== "main" && value.kind !== "colleague") || (value.state !== "active" && value.state !== "archived")
@@ -200,12 +210,14 @@ export class WorkspaceAgentStore {
       const configurations = value.configurations.map(entry => parseConfiguration(entry, value.username as string));
       if (configurations.some((entry, index) => entry.revision !== index + 1)
         || value.currentConfigRevision !== configurations.length) return invalid();
+      if ((value.titleSource !== undefined || value.titleKey !== undefined) && (value.kind !== "main"
+        || value.titleSource !== "default" || value.titleKey !== "core.name.orchestrator"
+        || !DEFAULT_ORCHESTRATOR_TITLES.includes(configurations.at(-1)!.identity.title ?? ""))) return invalid();
       ids.add(value.agentId); usernames.add(value.username);
       return { ...value, configurations } as unknown as AgentRecord;
     });
     if (rows.filter(row => row.kind === "main").length !== 1) return invalid();
-    file.assertCurrent(); ownerFile.assertCurrent();
-    return { file, ownerFile, value: { ...owner, revision, agents: rows } as Manifest };
+    return { ...owner, revision, agents: rows } as Manifest;
   }
   private persist(loaded: ReturnType<WorkspaceAgentStore["load"]>, value: Manifest): void {
     const text = JSON.stringify(value) + "\n";
@@ -226,6 +238,25 @@ export class WorkspaceAgentStore {
       assertCurrent,
     });
   }
+  /** Presentation metadata only. Config hashes, epochs and frozen task bindings do not change. */
+  migrateDefaultLabels(rollback = false): boolean {
+    this.binding();
+    return withPrivateStateLockSync(workspaceStateHome(), [], "workspace-agents", () => {
+      const loaded = this.load(); if (!loaded.value) return false;
+      const owner = this.parseOwner(JSON.parse(loaded.ownerFile.snapshot!.text));
+      return migrateDefaultLabels({ file: loaded.file, backup: this.file("workspace-agents-default-labels-v1.json", MAX_BYTES * 3), maxBytes: MAX_BYTES,
+        parse: raw => this.parseManifest(raw, owner), rollback,
+        assertCurrent: () => { workspaceResourceCommitGuard()?.(); loaded.file.assertCurrent(); loaded.ownerFile.assertCurrent();
+          if (this.file(OWNER, 4096).snapshot?.text !== loaded.ownerFile.snapshot!.text) throw new Error("Workspace Agent owner marker changed; state preserved"); },
+        mark: value => {
+          const row = value.agents.find(row => row.kind === "main");
+          if (!row || row.titleSource || !DEFAULT_ORCHESTRATOR_TITLES.includes(row.configurations.at(-1)!.identity.title ?? "")) return false;
+          row.titleSource = "default"; row.titleKey = "core.name.orchestrator";
+          if (value.revision >= Number.MAX_SAFE_INTEGER) throw new Error("Workspace Agent catalog revision exhausted"); value.revision++; return true;
+        },
+      });
+    });
+  }
   private view(row: AgentRecord, runtimes: readonly AgentRuntimeOption[] = this.runtimes.options()): WorkspaceAgentView {
     const config = row.configurations[row.currentConfigRevision - 1]!;
     return { workspaceId: this.scope.workspaceId, agentId: row.agentId, username: row.username, kind: row.kind,
@@ -233,7 +264,7 @@ export class WorkspaceAgentStore {
       ...(row.archivedAt ? { archivedAt: row.archivedAt, pausedScheduleCount: row.pausedScheduleCount ?? 0 } : {}),
       description: config.description, permissionTier: config.permissionTier ?? defaultRuntimePermissionTier(), runtime: { ...runtimes.find(option => option.id === config.runtimeId)! },
       ...(availableRuntimePermissionTiers().includes(config.permissionTier ?? defaultRuntimePermissionTier()) ? {} : { permissionTierUnavailable: true as const }),
-      ...(row.kind === "main" ? { brand: "hara" as const } : {}) };
+      ...(row.kind === "main" ? { brand: "hara" as const, ...(row.titleSource ? { titleSource: row.titleSource, titleKey: row.titleKey } : {}) } : {}) };
   }
   currentPersona(agentId: string): WorkspaceAgentPersonaInput {
     this.binding();
@@ -282,7 +313,7 @@ export class WorkspaceAgentStore {
       if (loaded.value) return this.view(loaded.value.agents.find(row => row.kind === "main")!);
       const owner: Owner = { schemaVersion: 1, resourceBinding: { ...this.binding() }, workspaceId: this.scope.workspaceId, mainAgentId: `ag_${randomUUID()}` };
       const main: AgentRecord = { agentId: owner.mainAgentId, username: "hara", kind: "main", state: "active", epoch: 1,
-        currentConfigRevision: 1, configurations: [configuration(normalized, 1, "pi")] };
+        currentConfigRevision: 1, ...(DEFAULT_ORCHESTRATOR_TITLES.includes(normalized.identity.title ?? "") ? { titleSource: "default" as const, titleKey: "core.name.orchestrator" as const } : {}), configurations: [configuration(normalized, 1, "pi")] };
       writePrivateStateFileSync(loaded.ownerFile, JSON.stringify(owner) + "\n", { expectedMissing: true, assertCurrent: workspaceResourceCommitGuard() });
       this.persist(loaded, { ...owner, revision: 1, agents: [main] });
       return this.view(main);
@@ -335,6 +366,7 @@ export class WorkspaceAgentStore {
     const normalized = persona(input, "agent");
     return this.update(agentId, configRevision, agentEpoch, row => {
       this.appendConfiguration(row, normalized, row.configurations[row.currentConfigRevision - 1]!.runtimeId);
+      if (!DEFAULT_ORCHESTRATOR_TITLES.includes(normalized.identity.title ?? "")) { delete row.titleSource; delete row.titleKey; }
     });
   }
   /** A display-name change only: a new configuration snapshot keeps every other persona field, so the

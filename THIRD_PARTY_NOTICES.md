@@ -151,3 +151,14 @@ the embedded stdio bridge; it does not execute a separately checked-out Laya rep
 
 Use the license and notice files accompanying the resolved package/model distributions for full terms
 and attribution. The Laya backend is independent of Jev/TypeSafe and does not imply their endorsement.
+
+## OpenCC derived character statistics
+
+`src/i18n/han-script.generated.json` contains simplified-only and traditional-only single-character
+key sets derived from OpenCC 1.3.1 STCharacters / TSCharacters dictionaries. The data is modified
+by taking the set difference; user text is never converted at runtime. Dictionary SHA-256 values
+and the reproducible generator are retained with the source.
+
+- Upstream: https://github.com/BYVoid/OpenCC
+- Copyright: OpenCC contributors (BYVoid / Carbo Kuo and contributors)
+- License: Apache-2.0; the full Apache License, Version 2.0 is in this repository's `LICENSE`.

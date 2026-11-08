@@ -1,0 +1,805 @@
+{
+  "schemaVersion": 1,
+  "errors": [
+    {
+      "code": "request_failed",
+      "key": "core.error.request_failed",
+      "params": [],
+      "sourceMessages": [
+        "Workspace request failed"
+      ]
+    },
+    {
+      "code": "unauthorized",
+      "key": "core.error.unauthorized",
+      "params": [],
+      "sourceMessages": [
+        "unauthorized"
+      ]
+    },
+    {
+      "code": "locale_invalid",
+      "key": "core.error.locale_invalid",
+      "params": [],
+      "sourceMessages": [
+        "invalid client locale"
+      ]
+    },
+    {
+      "code": "request_invalid",
+      "key": "core.error.request_invalid",
+      "params": [],
+      "sourceMessages": [
+        "invalid Workspace RPC request"
+      ]
+    },
+    {
+      "code": "parameters_invalid",
+      "key": "core.error.parameters_invalid",
+      "params": [],
+      "sourceMessages": [
+        "invalid Workspace RPC parameters"
+      ]
+    },
+    {
+      "code": "fields_unsupported",
+      "key": "core.error.fields_unsupported",
+      "params": [],
+      "sourceMessages": [
+        "unsupported Workspace RPC fields"
+      ]
+    },
+    {
+      "code": "method_unsupported",
+      "key": "core.error.method_unsupported",
+      "params": [],
+      "sourceMessages": [
+        "unsupported Workspace method; no legacy route or authority fallback"
+      ]
+    },
+    {
+      "code": "capabilities_invalid",
+      "key": "core.error.capabilities_invalid",
+      "params": [],
+      "sourceMessages": [
+        "invalid client capabilities"
+      ]
+    },
+    {
+      "code": "workspace_create_invalid",
+      "key": "core.error.workspace_create_invalid",
+      "params": [],
+      "sourceMessages": [
+        "invalid Workspace creation"
+      ]
+    },
+    {
+      "code": "workspace_required",
+      "key": "core.error.workspace_required",
+      "params": [],
+      "sourceMessages": [
+        "Workspace must be explicit"
+      ]
+    },
+    {
+      "code": "workspace_select_invalid",
+      "key": "core.error.workspace_select_invalid",
+      "params": [],
+      "sourceMessages": [
+        "invalid Workspace selection"
+      ]
+    },
+    {
+      "code": "workspace_rename_invalid",
+      "key": "core.error.workspace_rename_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid Workspace rename"
+      ]
+    },
+    {
+      "code": "workspace_unavailable",
+      "key": "core.error.workspace_unavailable",
+      "params": [],
+      "sourceMessages": [
+        "Workspace unavailable"
+      ]
+    },
+    {
+      "code": "workspace_revoked",
+      "key": "core.error.workspace_revoked",
+      "params": [],
+      "sourceMessages": [
+        "Workspace is unavailable or revoked"
+      ]
+    },
+    {
+      "code": "workspace_generation_changed",
+      "key": "core.error.workspace_generation_changed",
+      "params": [],
+      "sourceMessages": [
+        "Workspace resource generation changed; refresh before acting"
+      ]
+    },
+    {
+      "code": "workspace_catalog_changed",
+      "key": "core.error.workspace_catalog_changed",
+      "params": [],
+      "sourceMessages": [
+        "local Workspace catalog changed; refresh"
+      ]
+    },
+    {
+      "code": "workspace_directory_changed",
+      "key": "core.error.workspace_directory_changed",
+      "params": [],
+      "sourceMessages": [
+        "Workspace directory changed"
+      ]
+    },
+    {
+      "code": "workspace_closing",
+      "key": "core.error.workspace_closing",
+      "params": [],
+      "sourceMessages": [
+        "Workspace Host is closing"
+      ]
+    },
+    {
+      "code": "workspace_restarting",
+      "key": "core.error.workspace_restarting",
+      "params": [],
+      "sourceMessages": [
+        "Workspace is preparing to restart"
+      ]
+    },
+    {
+      "code": "restart_approval_required",
+      "key": "core.error.restart_approval_required",
+      "params": [],
+      "sourceMessages": [
+        "Explicit restart approval required"
+      ]
+    },
+    {
+      "code": "restart_busy",
+      "key": "core.error.restart_busy",
+      "params": [],
+      "sourceMessages": [
+        "Colleagues are working; restart postponed"
+      ]
+    },
+    {
+      "code": "update_lease_changed",
+      "key": "core.error.update_lease_changed",
+      "params": [],
+      "sourceMessages": [
+        "Update lease changed"
+      ]
+    },
+    {
+      "code": "update_lease_invalid",
+      "key": "core.error.update_lease_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid update lease"
+      ]
+    },
+    {
+      "code": "agent_select_invalid",
+      "key": "core.error.agent_select_invalid",
+      "params": [],
+      "sourceMessages": [
+        "invalid Agent selection"
+      ]
+    },
+    {
+      "code": "agent_unavailable",
+      "key": "core.error.agent_unavailable",
+      "params": [],
+      "sourceMessages": [
+        "Workspace Agent unavailable"
+      ]
+    },
+    {
+      "code": "agent_catalog_changed",
+      "key": "core.error.agent_catalog_changed",
+      "params": [],
+      "sourceMessages": [
+        "Workspace Agent catalog changed; reload before creating"
+      ]
+    },
+    {
+      "code": "agent_username_retained",
+      "key": "core.error.agent_username_retained",
+      "params": [],
+      "sourceMessages": [
+        "Workspace Agent username is retained; restore the exact archived colleague or choose another"
+      ]
+    },
+    {
+      "code": "agent_changed",
+      "key": "core.error.agent_changed",
+      "params": [],
+      "sourceMessages": [
+        "Workspace Agent changed; refresh the exact colleague before editing"
+      ]
+    },
+    {
+      "code": "agent_archived",
+      "key": "core.error.agent_archived",
+      "params": [],
+      "sourceMessages": [
+        "restore the exact archived Workspace Agent before editing"
+      ]
+    },
+    {
+      "code": "agent_name_invalid",
+      "key": "core.error.agent_name_invalid",
+      "params": [],
+      "sourceMessages": [
+        "invalid Workspace Agent display name"
+      ]
+    },
+    {
+      "code": "agent_name_unchanged",
+      "key": "core.error.agent_name_unchanged",
+      "params": [],
+      "sourceMessages": [
+        "the colleague already has this display name"
+      ]
+    },
+    {
+      "code": "agent_main_protected",
+      "key": "core.error.agent_main_protected",
+      "params": [],
+      "sourceMessages": [
+        "the Workspace main Hara cannot be archived or replaced"
+      ]
+    },
+    {
+      "code": "agent_lifecycle_changed",
+      "key": "core.error.agent_lifecycle_changed",
+      "params": [],
+      "sourceMessages": [
+        "Workspace Agent lifecycle already changed; refresh before editing"
+      ]
+    },
+    {
+      "code": "agent_permission_invalid",
+      "key": "core.error.agent_permission_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid colleague permission update"
+      ]
+    },
+    {
+      "code": "agent_form_invalid",
+      "key": "core.error.agent_form_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid colleague engine form"
+      ]
+    },
+    {
+      "code": "agent_runtime_unavailable",
+      "key": "core.error.agent_runtime_unavailable",
+      "params": [],
+      "sourceMessages": [
+        "Agent Runtime unavailable; no fallback selected"
+      ]
+    },
+    {
+      "code": "agent_lifecycle_busy",
+      "key": "core.error.agent_lifecycle_busy",
+      "params": [],
+      "sourceMessages": [
+        "Colleague lifecycle is changing; no new attempt admitted"
+      ]
+    },
+    {
+      "code": "agent_running",
+      "key": "core.error.agent_running",
+      "params": [],
+      "sourceMessages": [
+        "Agent is still running or draining"
+      ]
+    },
+    {
+      "code": "run_draining",
+      "key": "core.error.run_draining",
+      "params": [],
+      "sourceMessages": [
+        "Workspace work is still draining"
+      ]
+    },
+    {
+      "code": "view_changed",
+      "key": "core.error.view_changed",
+      "params": [],
+      "sourceMessages": [
+        "Agent selection belongs to another Workspace view"
+      ]
+    },
+    {
+      "code": "question_changed",
+      "key": "core.error.question_changed",
+      "params": [],
+      "sourceMessages": [
+        "Workspace question changed; refresh before answering"
+      ]
+    },
+    {
+      "code": "question_pause_changed",
+      "key": "core.error.question_pause_changed",
+      "params": [],
+      "sourceMessages": [
+        "Workspace question changed; refresh before pausing"
+      ]
+    },
+    {
+      "code": "question_specific_answer",
+      "key": "core.error.question_specific_answer",
+      "params": [],
+      "sourceMessages": [
+        "Workspace is waiting for a specific answer; use the current question card"
+      ]
+    },
+    {
+      "code": "question_answer_missing",
+      "key": "core.error.question_answer_missing",
+      "params": [],
+      "sourceMessages": [
+        "Workspace question changed or has no answer; refresh before answering"
+      ]
+    },
+    {
+      "code": "question_async_expired",
+      "key": "core.error.question_async_expired",
+      "params": [],
+      "sourceMessages": [
+        "Workspace async question expired with its run; ask again if still needed"
+      ]
+    },
+    {
+      "code": "question_async_empty",
+      "key": "core.error.question_async_empty",
+      "params": [],
+      "sourceMessages": [
+        "Workspace async answer is empty"
+      ]
+    },
+    {
+      "code": "question_async_changed",
+      "key": "core.error.question_async_changed",
+      "params": [],
+      "sourceMessages": [
+        "Workspace async question was answered, dismissed or expired; refresh before answering"
+      ]
+    },
+    {
+      "code": "message_invalid",
+      "key": "core.error.message_invalid",
+      "params": [],
+      "sourceMessages": [
+        "invalid Workspace message"
+      ]
+    },
+    {
+      "code": "message_duplicate_changed",
+      "key": "core.error.message_duplicate_changed",
+      "params": [],
+      "sourceMessages": [
+        "message id already belongs to another request"
+      ]
+    },
+    {
+      "code": "message_outcome_unknown",
+      "key": "core.error.message_outcome_unknown",
+      "params": [],
+      "sourceMessages": [
+        "Workspace request outcome is unknown; inspect its receipt, do not resend"
+      ]
+    },
+    {
+      "code": "message_source_invalid",
+      "key": "core.error.message_source_invalid",
+      "params": [],
+      "sourceMessages": [
+        "invalid Workspace request source"
+      ]
+    },
+    {
+      "code": "resume_unavailable",
+      "key": "core.error.resume_unavailable",
+      "params": [],
+      "sourceMessages": [
+        "no interrupted Workspace task to resume"
+      ]
+    },
+    {
+      "code": "runaway_choice_required",
+      "key": "core.error.runaway_choice_required",
+      "params": [],
+      "sourceMessages": [
+        "Choose Continue or Stop at the runaway safety checkpoint"
+      ]
+    },
+    {
+      "code": "connection_invalid",
+      "key": "core.error.connection_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid connection"
+      ]
+    },
+    {
+      "code": "connection_select_invalid",
+      "key": "core.error.connection_select_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid connection selection"
+      ]
+    },
+    {
+      "code": "connection_models_invalid",
+      "key": "core.error.connection_models_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid connection model request"
+      ]
+    },
+    {
+      "code": "connection_unavailable",
+      "key": "core.error.connection_unavailable",
+      "params": [],
+      "sourceMessages": [
+        "model connection is unavailable in this Workspace"
+      ]
+    },
+    {
+      "code": "connection_reauthorization",
+      "key": "core.error.connection_reauthorization",
+      "params": [],
+      "sourceMessages": [
+        "Workspace model connection changed or is unavailable; explicit reauthorization is required"
+      ]
+    },
+    {
+      "code": "connection_expired",
+      "key": "core.error.connection_expired",
+      "params": [],
+      "sourceMessages": [
+        "managed Workspace connection expired; no fallback was selected"
+      ]
+    },
+    {
+      "code": "connection_delete_approval",
+      "key": "core.error.connection_delete_approval",
+      "params": [],
+      "sourceMessages": [
+        "Explicit connection deletion approval required"
+      ]
+    },
+    {
+      "code": "credential_cleanup_approval",
+      "key": "core.error.credential_cleanup_approval",
+      "params": [],
+      "sourceMessages": [
+        "Explicit credential cleanup approval required"
+      ]
+    },
+    {
+      "code": "connection_import_approval",
+      "key": "core.error.connection_import_approval",
+      "params": [],
+      "sourceMessages": [
+        "Invalid import approval"
+      ]
+    },
+    {
+      "code": "connection_migration_approval",
+      "key": "core.error.connection_migration_approval",
+      "params": [],
+      "sourceMessages": [
+        "Explicit migration retry approval required"
+      ]
+    },
+    {
+      "code": "runtime_approval_required",
+      "key": "core.error.runtime_approval_required",
+      "params": [],
+      "sourceMessages": [
+        "Explicit local runtime approval required"
+      ]
+    },
+    {
+      "code": "runtime_login_source_invalid",
+      "key": "core.error.runtime_login_source_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid runtime login source"
+      ]
+    },
+    {
+      "code": "runtime_approval_invalid",
+      "key": "core.error.runtime_approval_invalid",
+      "params": [],
+      "sourceMessages": [
+        "invalid runtime approval"
+      ]
+    },
+    {
+      "code": "runtime_operation_invalid",
+      "key": "core.error.runtime_operation_invalid",
+      "params": [],
+      "sourceMessages": [
+        "invalid runtime operation"
+      ]
+    },
+    {
+      "code": "runtime_form_colleague_invalid",
+      "key": "core.error.runtime_form_colleague_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid runtime form colleague"
+      ]
+    },
+    {
+      "code": "runtime_confirmation_invalid",
+      "key": "core.error.runtime_confirmation_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid engine confirmation"
+      ]
+    },
+    {
+      "code": "runtime_model_invalid",
+      "key": "core.error.runtime_model_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid engine model choice"
+      ]
+    },
+    {
+      "code": "native_reset_approval",
+      "key": "core.error.native_reset_approval",
+      "params": [],
+      "sourceMessages": [
+        "Explicit native session reset approval and current revisions required"
+      ]
+    },
+    {
+      "code": "native_view_changed",
+      "key": "core.error.native_view_changed",
+      "params": [],
+      "sourceMessages": [
+        "Native session view changed; refresh before resetting"
+      ]
+    },
+    {
+      "code": "native_reset_busy",
+      "key": "core.error.native_reset_busy",
+      "params": [],
+      "sourceMessages": [
+        "Agent is still running or draining; native reset refused"
+      ]
+    },
+    {
+      "code": "native_state_changed",
+      "key": "core.error.native_state_changed",
+      "params": [],
+      "sourceMessages": [
+        "Native session state changed; refresh before resetting"
+      ]
+    },
+    {
+      "code": "native_pending_task",
+      "key": "core.error.native_pending_task",
+      "params": [],
+      "sourceMessages": [
+        "Recover or stop the pending task before resetting its native session"
+      ]
+    },
+    {
+      "code": "native_audit_full",
+      "key": "core.error.native_audit_full",
+      "params": [],
+      "sourceMessages": [
+        "Native session audit is full; history was preserved"
+      ]
+    },
+    {
+      "code": "native_conversation_changed",
+      "key": "core.error.native_conversation_changed",
+      "params": [],
+      "sourceMessages": [
+        "Conversation changed; native reset refused"
+      ]
+    },
+    {
+      "code": "media_path_invalid",
+      "key": "core.error.media_path_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid Workspace media path"
+      ]
+    },
+    {
+      "code": "media_unavailable",
+      "key": "core.error.media_unavailable",
+      "params": [],
+      "sourceMessages": [
+        "Workspace media unavailable"
+      ]
+    },
+    {
+      "code": "group_members_invalid",
+      "key": "core.error.group_members_invalid",
+      "params": [],
+      "sourceMessages": [
+        "A group needs at least two distinct active colleagues in this Workspace"
+      ]
+    },
+    {
+      "code": "group_roster_changed",
+      "key": "core.error.group_roster_changed",
+      "params": [],
+      "sourceMessages": [
+        "Group or colleague roster changed; review a fresh group card"
+      ]
+    },
+    {
+      "code": "group_proposal_invalid",
+      "key": "core.error.group_proposal_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid group proposal"
+      ]
+    },
+    {
+      "code": "channel_invalid",
+      "key": "core.error.channel_invalid",
+      "params": [],
+      "sourceMessages": [
+        "invalid local channel"
+      ]
+    },
+    {
+      "code": "channel_view_changed",
+      "key": "core.error.channel_view_changed",
+      "params": [],
+      "sourceMessages": [
+        "local channel belongs to another view"
+      ]
+    },
+    {
+      "code": "channel_member_required",
+      "key": "core.error.channel_member_required",
+      "params": [],
+      "sourceMessages": [
+        "Agent is not a member of this local channel"
+      ]
+    },
+    {
+      "code": "schedule_invalid",
+      "key": "core.error.schedule_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid schedule"
+      ]
+    },
+    {
+      "code": "schedule_colleague_unavailable",
+      "key": "core.error.schedule_colleague_unavailable",
+      "params": [],
+      "sourceMessages": [
+        "Schedule unavailable to this colleague"
+      ]
+    },
+    {
+      "code": "schedule_running",
+      "key": "core.error.schedule_running",
+      "params": [],
+      "sourceMessages": [
+        "Schedule run is active or outcome-unknown"
+      ]
+    },
+    {
+      "code": "skill_invalid",
+      "key": "core.error.skill_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid skill"
+      ]
+    },
+    {
+      "code": "skill_fork_approval",
+      "key": "core.error.skill_fork_approval",
+      "params": [],
+      "sourceMessages": [
+        "Private skill fork requires confirmation"
+      ]
+    },
+    {
+      "code": "extension_source_invalid",
+      "key": "core.error.extension_source_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid extension source"
+      ]
+    },
+    {
+      "code": "extension_colleague_changed",
+      "key": "core.error.extension_colleague_changed",
+      "params": [],
+      "sourceMessages": [
+        "Extension colleague changed; refresh before editing"
+      ]
+    },
+    {
+      "code": "extension_view_unavailable",
+      "key": "core.error.extension_view_unavailable",
+      "params": [],
+      "sourceMessages": [
+        "Extension settings view unavailable"
+      ]
+    },
+    {
+      "code": "extension_review_invalid",
+      "key": "core.error.extension_review_invalid",
+      "params": [],
+      "sourceMessages": [
+        "Invalid review decision"
+      ]
+    },
+    {
+      "code": "state_changed",
+      "key": "core.error.state_changed",
+      "params": [],
+      "sourceMessages": [
+        "Workspace state changed; refresh before writing"
+      ]
+    },
+    {
+      "code": "state_full",
+      "key": "core.error.state_full",
+      "params": [],
+      "sourceMessages": [
+        "Workspace state is full"
+      ]
+    },
+    {
+      "code": "archive_confirmation_required",
+      "key": "core.error.archive_confirmation_required",
+      "params": [],
+      "sourceMessages": [
+        "archive_confirmation_required"
+      ]
+    },
+    {
+      "code": "archive_drain_timeout",
+      "key": "core.error.archive_drain_timeout",
+      "params": [],
+      "sourceMessages": [
+        "archive_drain_timeout"
+      ]
+    },
+    {
+      "code": "archive_cleanup_failed",
+      "key": "core.error.archive_cleanup_failed",
+      "params": [],
+      "sourceMessages": [
+        "archive_cleanup_failed"
+      ]
+    },
+    {
+      "code": "archive_schedule_rollback_failed",
+      "key": "core.error.archive_schedule_rollback_failed",
+      "params": [],
+      "sourceMessages": [
+        "archive_schedule_rollback_failed"
+      ]
+    }
+  ]
+}

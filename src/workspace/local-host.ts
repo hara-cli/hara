@@ -1,3 +1,5 @@
+import { publicErrorData } from "../i18n/errors.js";
+import { replyCopyLanguage } from "../i18n/reply-language.js";
 import { WorkspaceColleagueHomes, WorkspacePrimaryDirectoryError } from "./colleague-homes.js";
 import { WorkspaceColleagueInstructions, COLLEAGUE_INSTRUCTION_FILES, type InstructionDraft, type ColleagueInstructionFile } from "./colleague-instructions.js";
 import { WorkspaceNativeSessions, resettableNativeRuntime } from "./native-session-boundary.js";
@@ -290,7 +292,7 @@ export class LocalWorkspaceHost {
     }
     const runtimes = new WorkspaceRuntimeInstaller(storage, { ...((this.options.discoveryHome ?? this.options.hostHome) ? { discovery: { home: (this.options.discoveryHome ?? this.options.hostHome)!, probeHome: this.options.hostHome, shell: process.env.HARA_WORKSPACE_HOST_SHELL } } : {}),
       ...this.options.runtimeInstallerOptions, onChange: () => this.changed(workspaceId) });
-    const resources = new WorkspaceResources(this.home, row.scope, { assertCurrent: assertAuthority, runtimeInstaller: runtimes }); resources.initialize();
+    const resources = new WorkspaceResources(this.home, row.scope, { assertCurrent: assertAuthority, runtimeInstaller: runtimes }); resources.initialize(); resources.agents.migrateDefaultLabels();
     const context: WorkspaceHostContext = { storage, resources, connections, project, homes: new WorkspaceColleagueHomes(storage, project), extensions: new WorkspaceExtensions(storage),
       mcp: new WorkspaceMcpManager(storage, { accountHome: this.options.hostHome ?? this.home, invalidateReview: (sourceId, revision) => this.mcpOwnerReview.invalidate(sourceId, revision), proxy: () => runtimes.proxy.read(), onChange: () => this.changed(workspaceId) }),
       features: new WorkspaceFeatures(storage, project, workspaceId, this.options.mode === "workspace" ? this.options.hostHome : undefined),
@@ -403,7 +405,7 @@ export class LocalWorkspaceHost {
   list() {
     const value = this.catalog.read();
     return { revision: value.revision, activeWorkspaceId: value.activeWorkspaceId,
-      workspaces: value.workspaces.map(row => ({ workspaceId: row.scope.workspaceId, label: row.label, role: "owner", active: row.active })),
+      workspaces: value.workspaces.map(row => ({ workspaceId: row.scope.workspaceId, label: row.label, ...(row.labelSource ? { labelSource: row.labelSource, labelKey: row.labelKey } : {}), role: "owner", active: row.active })),
       inheritance: this.inheritanceState ?? noLegacyStartup(), ...this.modelMode() };
   }
   createWorkspace(label: string, expectedRevision: number) {
@@ -722,7 +724,7 @@ export class LocalWorkspaceHost {
       if (input.model) { await this.selectRuntimeModel(workspaceId, input.runtimeId, input.model.modelId, input.model.expectedRevision, input.model.effort); applied.push("model"); }
     } catch (error) {
       if (!applied.length) throw error;
-      return { applied, failed: { step, message: error instanceof Error ? error.message.slice(0, 300) : "failed" },
+      return { applied, failed: { step, message: error instanceof Error ? error.message.slice(0, 300) : "failed", data: publicErrorData(error, [this.root]) },
         agent: agents.list().agents.find(row => row.agentId === input.agentId) ?? null };
     }
     return { applied, agent: agents.list().agents.find(row => row.agentId === input.agentId) ?? null };
@@ -984,7 +986,7 @@ export class LocalWorkspaceHost {
     const selectedNative = selectedAgent.runtime.id === "codex" ? codexThreadState(context.storage, selected, value.sessionId).read() : null;
     return { workspaceId, resourceGeneration: context.storage.run(() => currentWorkspaceResourceBinding()!.generation),
       inheritance: workspaceId === this.inheritanceWorkspaceId ? this.inheritanceState : noLegacyStartup(),
-      label: row.label, agentRevision: catalog.revision, agents: catalog.agents,
+      label: row.label, ...(row.labelSource ? { labelSource: row.labelSource, labelKey: row.labelKey } : {}), agentRevision: catalog.revision, agents: catalog.agents,
       runtimeOptions: context.resources.agents.runtimeOptions(), selectedAgentId: selected,
       ...(selectedAgent.kind === "colleague" ? { colleagueHome: { ...context.homes.view(selected), codexMigrationPending: selectedNative !== null && Boolean(value.history.length || selectedNative.threadId)
         && !context.homes.codexHomeActivated(selected, value.sessionId, selectedNative.resets)
@@ -1190,7 +1192,7 @@ export class LocalWorkspaceHost {
   }
   private interactionFor(context: WorkspaceHostContext, value: WorkspaceConversation): WorkspaceUserInteraction | undefined {
     const binding = value.task?.workspaceRunBinding;
-    return binding ? new WorkspaceUserInteraction(context.storage, binding, value.task!.id, /[\u3400-\u9fff]/u.test(value.task!.objective)) : undefined;
+    return binding ? new WorkspaceUserInteraction(context.storage, binding, value.task!.id, replyCopyLanguage(value.task!.objective)) : undefined;
   }
   private pendingUserQuestion(context: WorkspaceHostContext, value: WorkspaceConversation): (WorkspaceUserQuestion & { step: string }) | null {
     const interaction = this.interactionFor(context, value); if (!interaction) return null;
@@ -1628,7 +1630,7 @@ export class LocalWorkspaceHost {
       const provider = new WorkspaceProviderRecovery(context.storage, agentId, channel?.id).observe(selectedProvider, binding.runId);
       // Prepare every mandatory dependency before publishing an accepted request/attempt. A malformed
       // context index is an explicit admission failure, not an accepted job that never starts.
-      const interaction = new WorkspaceUserInteraction(context.storage, binding, task.id, /[\u3400-\u9fff]/u.test(task.objective));
+      const interaction = new WorkspaceUserInteraction(context.storage, binding, task.id, replyCopyLanguage(task.objective));
       const startContext = prepareWorkspaceStartContext({ storage: context.storage,
         personalHome: this.options.mode === "workspace" ? this.options.hostHome : undefined,
         workspaceRoots: withWorkspaceAgentMemory(context.storage, agentId, context.project, () => context.resources.memory.roots(context.project)),
