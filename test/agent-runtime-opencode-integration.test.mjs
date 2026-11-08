@@ -23,16 +23,27 @@ const roots = [];
 function root() { const path = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-opencode-general-"))); roots.push(path); return path; }
 after(() => roots.forEach(path => fs.rmSync(path, { recursive: true, force: true })));
 
+/** Failure message only: what the fake runtime itself recorded, with fixture roots and bearer values masked. */
+function fixtureDiagnostics(error, argv, privateRoots) {
+  const read = suffix => fs.existsSync(argv + suffix) ? fs.readFileSync(argv + suffix, "utf8").slice(0, 2000) : "none";
+  let text = `${error} | argvWritten=${fs.existsSync(argv)} | fixtureExit=${read(".exit")} | fixtureError=${read(".error")}`;
+  for (const value of privateRoots) text = text.replaceAll(value, "[fixture-root]");
+  return text.replace(/Bearer\s+[A-Za-z0-9._~+\/=-]+/gu, "Bearer [redacted]");
+}
 function fakeOpenCode(path, output) {
   fs.mkdirSync(dirname(path), { recursive: true });
   const script = `#!${process.execPath}
 const fs = require("node:fs");
 if (process.argv[2] === "--version") { process.stdout.write("opencode 1.2.3\\n"); process.exit(0); }
 if (process.argv[2] === "models") { process.stdout.write("fixture/model\\n"); process.exit(0); }
-if (process.argv[2] !== "run") process.exit(2);
+// Diagnostics only: record why the fixture stops early (booleans, never values) so a failed assertion can name it.
+const exitWith = (code, reason) => { try { fs.writeFileSync(${JSON.stringify(output.argv)} + ".exit", JSON.stringify({ code, ...reason })); } catch {} process.exit(code); };
+process.on("uncaughtException", error => { try { fs.writeFileSync(${JSON.stringify(output.argv)} + ".error", "uncaught: " + String(error?.stack ?? error)); } catch {} process.exit(4); });
+if (process.argv[2] !== "run") exitWith(2, { subcommand: String(process.argv[2]).slice(0, 20) });
 const config = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT || "{}");
-if (config.permission["*"] !== "deny" || config.tools.bash !== ${JSON.stringify(output.full)} || config.tools.write !== ${JSON.stringify(output.full)} ||
-    !config.mcp?.hara?.headers?.Authorization || process.env.HOME !== ${JSON.stringify(output.home)}) process.exit(3);
+const checks = { denyAll: config.permission?.["*"] === "deny", bash: config.tools?.bash === ${JSON.stringify(output.full)}, write: config.tools?.write === ${JSON.stringify(output.full)},
+  mcpAuthorization: Boolean(config.mcp?.hara?.headers?.Authorization), home: process.env.HOME === ${JSON.stringify(output.home)} };
+if (!Object.values(checks).every(Boolean)) exitWith(3, { checks });
 fs.writeFileSync(${JSON.stringify(output.argv)}, JSON.stringify({ args: process.argv.slice(2), home: process.env.HOME,
   config: { permission: config.permission, tools: config.tools, mcpUrl: config.mcp.hara.url } }));
 const send = async (method, params, session) => {
@@ -110,7 +121,7 @@ for (const permissionTier of ["full-protected", "controlled"]) for (const kind o
   try {
     const history = [{ role: "user", content: "List colleagues" }];
     const result = await storage.run(() => runConfiguredAgent(history, options, new AgentRuntimeRegistry(undefined, installer, models)));
-    assert.equal(result.status, "completed", result.error + " " + (fs.existsSync(argv + ".error") ? fs.readFileSync(argv + ".error", "utf8") : ""));
+    assert.equal(result.status, "completed", fixtureDiagnostics(result.error, argv, [data, account, project]));
     assert.equal(calls, 1);
     const versionStatus = installer.list().options.find(row => row.runtimeId === "opencode").versionStatus;
     assert.equal(versionStatus.lastSuccessfulVersion, "1.2.3");
