@@ -17,8 +17,9 @@ import {createWorkspaceRunPermit,closeWorkspaceRunPermit,workspaceRunManagedProj
 import {createRuntimeExecutionPolicy} from "../dist/agent-runtime/execution-policy.js";
 import {beginWorkspaceNativePolicy,endWorkspaceNativePolicy} from "../dist/agent-runtime/workspace-native-policy.js";
 import {runExternalCommandCapture} from "../dist/external-sessions/process.js";
+import {DEFAULT_TIER,FULL_TIER_SKIP} from "./helpers/platform-tier.mjs";
 
-function fixture(t,tier="full-protected"){
+function fixture(t,tier=DEFAULT_TIER){
  const root=fs.realpathSync(fs.mkdtempSync(join(tmpdir(),"hara-home-policy-"))),account=join(root,"account"),host=join(account,".hara/workspaces-v1"),home=join(host,"home"),policies=[],permits=[];
  t.after(async()=>{for(const p of policies)await p.close();for(const p of permits)await closeWorkspaceRunPermit(p);fs.rmSync(root,{recursive:true,force:true});});
  fs.mkdirSync(home,{recursive:true,mode:0o700});const catalog=new LocalWorkspaceCatalog(home),row=catalog.create("Fixture",1);
@@ -66,7 +67,7 @@ test("controlled tier denies both cwd and legacy writes even when they share a v
  const result=await execute(p,`const fs=require('fs'),o={};for(const[k,path]of Object.entries(${JSON.stringify({own:join(a.primary,"no.txt"),legacy:join(f.legacy,"no.txt")})})){try{fs.writeFileSync(path,'no');o[k]=true}catch{o[k]=false}}console.log(JSON.stringify(o));`,f.account);
  assert.equal(result.code,0,result.errorFirstLine);assert.deepEqual(JSON.parse(result.stdout),{own:false,legacy:false});assert.equal(p.collectWorkspaceEvidence(),null);
 });
-test("different cwd writers sharing the legacy root invalidate each other's native evidence",async t=>{
+test("different cwd writers sharing the legacy root invalidate each other's native evidence",{skip:FULL_TIER_SKIP},async t=>{
  const f=fixture(t),a=f.make(),b=f.make(),one=a.policy(),two=b.policy();
  beginWorkspaceNativePolicy(a.permit,one);beginWorkspaceNativePolicy(b.permit,two);
  fs.writeFileSync(join(a.primary,"one.txt"),"One");fs.writeFileSync(join(b.primary,"two.txt"),"Two");
@@ -75,7 +76,7 @@ test("different cwd writers sharing the legacy root invalidate each other's nati
  await endWorkspaceNativePolicy(a.permit,one);await endWorkspaceNativePolicy(b.permit,two);
 });
 
-test("only actual Host write lifetimes invalidate overlapping native evidence, including a native attempt that starts during the write",async t=>{
+test("only actual Host write lifetimes invalidate overlapping native evidence, including a native attempt that starts during the write",{skip:FULL_TIER_SKIP},async t=>{
  const f=fixture(t),a=f.make(),one=a.policy();beginWorkspaceNativePolicy(a.permit,one);
  const finish=beginWorkspaceHostWrite(f.legacy),b=f.make(),two=b.policy();beginWorkspaceNativePolicy(b.permit,two);
  for(const[row,policy]of[[a,one],[b,two]]){fs.writeFileSync(join(row.primary,"native.txt"),"fixture");policy.observeNativeEvent({type:"command",status:"completed",command:"touch native.txt"});assert.equal(policy.collectWorkspaceEvidence(),null);}

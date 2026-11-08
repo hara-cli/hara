@@ -28,6 +28,9 @@ const PUBLIC_FILES = new Set([
   "docs/jev-action-guard-experience.md", "docs/wechat-agent-scenes.md",
   // Build-verified generated intent table; its dotted module name is outside the generic module pattern.
   "dist/agent/core-intents.generated.js",
+  // Build-checked i18n resources imported at runtime by dist/i18n/{errors,locale,messages,reply-language}.js.
+  "dist/i18n/errors.json", "dist/i18n/han-script.generated.json",
+  "dist/i18n/messages.generated.js", "dist/i18n/registry.generated.js",
 ]);
 
 function expectedFilename(pkg) {
