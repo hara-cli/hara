@@ -1,4 +1,4 @@
-// Test-only budgets retained for the measured slow Intel CI files in 1.0.1/1.0.2.
+// Test-only budgets retained for the measured slow Intel CI files in 1.0.1/1.0.2/1.2.0.
 // All files/assertions still run; Linux, arm64 and every other file retain their original budgets.
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
@@ -49,7 +49,7 @@ export const NATIVE_CONTENTION_FILES = Object.freeze([
   "workspace-local-channels-native.test.mjs",
 ]);
 export function usesIntelBudget({ platform = process.platform, arch = process.arch, env = process.env, release = version } = {}) {
-  return ["1.0.1", "1.0.2"].includes(release) && platform === "darwin" && arch === "x64"
+  return ["1.0.1", "1.0.2", "1.2.0"].includes(release) && platform === "darwin" && arch === "x64"
     && env.GITHUB_ACTIONS === "true" && env.HARA_INTEL_TEST_BUDGET === release;
 }
 export function intelCaseTimeout(normal, intel, options) { return usesIntelBudget(options) ? intel : normal; }
@@ -69,7 +69,7 @@ export function intelTestGroups(batch) {
   return batch.isolated ? batch.files.map(file => [file]) : [batch.files];
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  assert(["1.0.1", "1.0.2"].includes(version), "temporary Intel budget needs an explicitly reviewed release");
+  assert(["1.0.1", "1.0.2", "1.2.0"].includes(version), "temporary Intel budget needs an explicitly reviewed release");
   assert(process.platform === "darwin" && process.arch === "x64" && process.env.GITHUB_ACTIONS === "true", "Intel CI only");
   const run = (args, env = process.env) => {
     const result = spawnSync(process.execPath, args, { env, stdio: "inherit" });

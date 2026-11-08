@@ -5,7 +5,7 @@ import { INTEL_SLOW_FILES, NATIVE_CONTENTION_FILES, usesIntelBudget, intelCaseTi
 import { nativeTestBatches, strictNativeTestBatches, runNativeTestGroups } from "../scripts/native-ci-tests.mjs";
 
 test("temporary slow budgets require the exact Intel CI platform, matching flag and reviewed release", () => {
-  const approved = { platform: "darwin", arch: "x64", release: "1.0.2", env: { GITHUB_ACTIONS: "true", HARA_INTEL_TEST_BUDGET: "1.0.2" } };
+  const approved = { platform: "darwin", arch: "x64", release: "1.2.0", env: { GITHUB_ACTIONS: "true", HARA_INTEL_TEST_BUDGET: "1.2.0" } };
   assert.equal(intelCaseTimeout(5000, 30000, approved), 30000);
   for (const changed of [{ platform: "linux" }, { arch: "arm64" }, { release: "1.0.3" }, { release: "1.0.1" }, { env: {} }, { env: { ...approved.env, GITHUB_ACTIONS: "false" } }]) {
     assert.equal(usesIntelBudget({ ...approved, ...changed }), false);
