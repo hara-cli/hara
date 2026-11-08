@@ -5,6 +5,29 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 1.2.0 — 2026-11-08 — Local workspace, more engines and two interface languages
+
+Version 1.1.0 was never published; 1.2.0 is the first release after 1.0.2 and carries the work planned
+for it. Hara 1.2.0 runs entirely on your computer and is open source and free; cloud collaboration and
+multiple devices will come later as an optional service.
+
+- Workspace colleagues can run on more engines (Codex, Claude Code, Gemini CLI, Kimi Code, Grok,
+  Copilot, Cursor, OpenCode) with a per-colleague permission tier, model and reasoning effort, chat
+  scheduling, governed MCP sources, long-chat compaction and wait timing. Channel replies route to
+  @-mentioned colleagues, skip unrelated ones and queue while a colleague is busy (autonomous
+  interjection stays off).
+- Each colleague works in its own working folder with private memory. The Host's own file tools refuse
+  writes to other colleagues' folders and managed instruction files on every platform.
+- Platform write protection: the full permission tier requires macOS Seatbelt. Elsewhere colleagues run
+  in the controlled tier and full-tier requests are refused with public error codes; engines that are
+  not supported on a platform say so instead of starting unprotected.
+  Native engines are not supported on Windows in this release; Pi is available.
+- Interface language: public error codes and Core copy in English and Simplified Chinese, selected per
+  client, with the language registry owned by Core.
+- Release engineering: required Intel and ARM64 suites with every Intel test file under its 120-second
+  limit (slow files partitioned, no assertion relaxed), Docker and npm artifact checks for the i18n
+  resources, and test-only diagnostics for fixture early exits.
+
 ## 1.0.2 — 2026-10-20 — Required ARM64 and Intel pre-tag acceptance
 
 - Resolve a legacy schedule batch from one fresh, guarded resource index rather than reopening the

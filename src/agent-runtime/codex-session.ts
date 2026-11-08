@@ -462,7 +462,7 @@ export class GovernedCodexSession {
         },
       });
       this.client = client; this.exit = client.waitForClose(); void this.exit.catch(() => {});
-      await client.call("initialize", { clientInfo: { name: "hara", version: "1.0.2" }, capabilities: { experimentalApi: true } });
+      await client.call("initialize", { clientInfo: { name: "hara", version: "1.2.0" }, capabilities: { experimentalApi: true } });
       client.notify("initialized");
       try { endCold?.("completed"); } catch { /* Diagnostic only. */ }
       return client;
