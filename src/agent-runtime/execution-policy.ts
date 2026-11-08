@@ -324,13 +324,19 @@ export class RuntimeExecutionPolicy {
     }
     if (input.tier === "full-protected") {
       // Full-protected may write the project, but not the Git files that run code later outside this sandbox: hooks,
-      // the repository config (core.hooksPath, core.fsmonitor, filter drivers) and info/attributes. Any depth, so a
-      // nested repository is covered; case-folded for case-insensitive volumes. Ordinary commits still write objects,
-      // refs, the index and logs.
+      // repository and worktree config (core.hooksPath, core.fsmonitor, filter drivers) and info/attributes, including
+      // those of submodules (.git/modules/**) and linked worktrees (.git/worktrees/**). Any depth, case-folded for
+      // case-insensitive volumes. A .git *file or link* (a gitdir pointer) is denied too, so a project folder cannot
+      // become a substitute Git directory with its own hooks. Commits still write objects, refs, the index and logs,
+      // and branch names such as "config" stay writable.
       const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const fold = (value: string) => [...value].map(char => /[a-z]/iu.test(char) ? `[${char.toLowerCase()}${char.toUpperCase()}]` : escape(char)).join("");
-      for (const root of projectRoots)
-        lines.push(`(deny file-write* (regex ${quote("^" + escape(root) + "/(.+/)?" + fold(".git") + "/(" + fold("hooks") + "(/.*)?|" + fold("config") + "|" + fold("info") + "/" + fold("attributes") + ")$")}))`);
+      const gitFiles = "(" + fold("hooks") + "(/.*)?|" + fold("config") + "|" + fold("config.worktree") + "|" + fold("info") + "/" + fold("attributes") + ")";
+      for (const root of projectRoots) {
+        const prefix = "^" + escape(root) + "/(.+/)?" + fold(".git");
+        lines.push(`(deny file-write* (regex ${quote(prefix + "/((" + fold("modules") + "|" + fold("worktrees") + ")/.+/)?" + gitFiles + "$")}))`,
+          `(deny file-write* (require-all (regex ${quote(prefix + "$")}) (vnode-type REGULAR-FILE SYMLINK)))`);
+      }
     }
     this.profile = lines.join("\n") + "\n";
     if (Buffer.byteLength(this.profile) > 96 * 1024) { rmSync(this.tempRoot, { recursive: true }); throw new Error("Runtime Seatbelt policy is too large"); }
