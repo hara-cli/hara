@@ -75,8 +75,14 @@ const send = async (method, params, session) => {
   fs.writeFileSync(path, script, { mode: 0o755 });
 }
 
-for (const permissionTier of ["full-protected", "controlled"]) for (const kind of ["main", "colleague"]) test(`OpenCode ${kind} ${permissionTier} calls agent_list through the governed Workspace MCP bridge`, { skip: permissionTier === "full-protected" ? FULL_TIER_SKIP : false }, async () => {
+for (const permissionTier of ["full-protected", "controlled"]) for (const kind of ["main", "colleague"]) test(`OpenCode ${kind} ${permissionTier} calls agent_list through the governed Workspace MCP bridge`, { skip: permissionTier === "full-protected" ? FULL_TIER_SKIP : false }, async t => {
   const data = root(), account = root(), home = join(data, "home"), project = root();
+  // Core honours an inherited XDG_DATA_HOME as OpenCode's data root (runtime-install.ts, workspace-native-policy.ts). The fixture
+  // lives under this account's default data root, so point XDG_DATA_HOME there for the test instead of inheriting the caller's
+  // (the candidate private environment sets it to its synthetic home); the original value is restored afterwards.
+  const inheritedDataHome = process.env.XDG_DATA_HOME;
+  process.env.XDG_DATA_HOME = join(account, ".local/share");
+  t.after(() => { if (inheritedDataHome === undefined) delete process.env.XDG_DATA_HOME; else process.env.XDG_DATA_HOME = inheritedDataHome; });
   fs.mkdirSync(home, { recursive: true });
   const catalog = new LocalWorkspaceCatalog(home), row = catalog.create("Fixture", 1);
   const storage = new WorkspaceResourceStorage(home, row.scope); storage.initialize();
