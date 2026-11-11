@@ -363,7 +363,8 @@ export interface AgentHubBoundaryContractV1 {
 /** Pure adapter for Hub's mandatory factory/validator injection. Captures a copied binding;
  * the Host must authenticate a connection and supply its frozen registered agent/instance.
  * Raw `from` and external request claims must never be passed as the registered identity.
- * savedReceipt must only be called for the Store's successfully committed save facts. */
+ * savedReceipt may prepare a candidate inside the Store transaction; persist it with
+ * the idempotency record and publish/ACK it only after that transaction commits. */
 export function createAgentHubBoundaryContract(expected: HubResourceBindingV1): AgentHubBoundaryContractV1 {
   jsonOnly(expected); const binding = freeze(hubBinding(expected, "hub.binding"));
   const matches = <K extends AgentHubDocumentV1["kind"]>(value: unknown, kind: K): value is Extract<AgentHubDocumentV1, { kind: K }> => {

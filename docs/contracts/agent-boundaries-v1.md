@@ -225,6 +225,8 @@ is projected into the C0 source. No Hub source or human contract is duplicated.
 The inbound `hub-ingress-receipt` accepts status=saved only and exactly five save
 facts: messageId, requestId, connectionId, positive safe-integer seq and canonical
 UTC savedAt. savedAt is the Store's record timestamp, not independent fsync proof.
+The factory may prepare a candidate inside the transaction, so the receipt and
+idempotency record can commit together; it must not be published before commit.
 The Store emits this ACK only after its durable transaction for the message,
 attachment references, idempotency record and sequence. Parsing or calling the
 factory does not commit anything. Retries resolve the original binding +
