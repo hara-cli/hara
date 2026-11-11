@@ -1,3 +1,4 @@
+import { bindWorkspaceScopedFileTool } from "./scoped-tool-binding.js";
 import { assertAgentBoundaryEffectCurrent, assertAgentBoundaryFileAccess } from "./agent-boundary-execution.js";
 import { lexicalSensitiveFileReason } from "../security/sensitive-files.js";
 import { decorateWorkspaceExtensionTool } from "./extension-binding.js";
@@ -73,7 +74,7 @@ export function localWorkspaceFileTools(project: string, assertCurrent: () => vo
     if (!snapshot) throw new Error("Workspace file does not exist");
     return { path: input.path as string, text: snapshot.text, sha256: createHash("sha256").update(snapshot.text).digest("hex"), bytes: Buffer.byteLength(snapshot.text) };
   };
-  return [
+  const tools: Tool[] = [
     { name: "workspace_read", description: "Read one safe relative file from the admitted working folder. Use root=legacy only for the fixed related Workspace folder.", input_schema: schema, kind: "read",
       async run(input) {
         try { return JSON.stringify({ ...read(input), exists: true }); }
@@ -103,4 +104,5 @@ export function localWorkspaceFileTools(project: string, assertCurrent: () => vo
         return JSON.stringify({ path: file.path, sha256: file.sha256, bytes: file.bytes, verified: true });
       } },
   ];
+  return tools.map(bindWorkspaceScopedFileTool);
 }

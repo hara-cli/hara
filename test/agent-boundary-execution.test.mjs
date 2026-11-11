@@ -44,16 +44,25 @@ function fixture(t, config = {}) {
     budget: { maxRounds: 12, maxToolCalls: 32, maxTokens: 32000, timeoutMs: 60000 } });
   task.workspaceRunBinding = binding;
   let permit, held = false, resourceLive = true, beforeWrite, requests = 0;
-  const files = localWorkspaceFileTools(project, () => { if (permit) assertWorkspaceRunContextCurrent(permit); },
-    { legacyProject: config.legacyOutside ? outside : project, ownHome: project, onWrite() {}, beginWrite() { beforeWrite?.(); return () => {}; } });
+  const resourceProject = config.separateResource ? join(base, "resource") : project;
+  if (config.separateResource) fs.mkdirSync(resourceProject, { mode: 0o700 });
+  const files = localWorkspaceFileTools(resourceProject, () => { if (permit) assertWorkspaceRunContextCurrent(permit); },
+    { legacyProject: config.legacyOutside ? outside : resourceProject, ownHome: resourceProject, onWrite() {}, beginWrite() { beforeWrite?.(); return () => {}; } });
   const tools = [...files, ...(config.extraTools ?? [])], ref = name => ({ toolId: name, connectorId: null, catalogRevision: 1 });
-  const refs = [...bookkeeping, ...tools.map(tool => tool.name)].map(ref), root = captureWorkspaceProjectIdentity(project);
+  const refs = [...bookkeeping, ...tools.map(tool => tool.name)].map(ref), root = captureWorkspaceProjectIdentity(resourceProject);
   const credential = randomBytes(32).toString("hex"), transports = new AgentBoundaryTransports(credential), transport = transports.connect("owner", credential);
-  const authority = new WorkspaceAgentBoundaryAuthority({ catalog, resources, storage, transports,
+  // Test-only stricter projection isolates the C2 deny defense. Production C1 invariants stay intact.
+  const Authority = config.c2DenyTool ? class extends WorkspaceAgentBoundaryAuthority {
+    executionPolicyFacts(handle) {
+      const facts = super.executionPolicyFacts(handle), denied = facts.boundary.tools.allow.find(ref => ref.toolId === config.c2DenyTool);
+      return { ...facts, boundary: { ...facts.boundary, tools: { ...facts.boundary.tools, deny: [denied] } } };
+    }
+  } : WorkspaceAgentBoundaryAuthority;
+  const authority = new Authority({ catalog, resources, storage, transports,
     toolsForAgent: () => refs.map(item => ({ ...item, assertCurrent() {} })),
     resourcesForAgent: () => [{ resourceId: "files", agentId: agent.agentId, revision: 1, binding: binding.agent.resourceBinding, project: root,
       access: ["read", "write", "execute"], assertCurrent() {
-        if (!resourceLive || JSON.stringify(captureWorkspaceProjectIdentity(project)) !== JSON.stringify(root)) throw new AgentBoundaryContractError("STALE_REVISION", "fixture.resource");
+        if (!resourceLive || !config.skipC1Inode && JSON.stringify(captureWorkspaceProjectIdentity(resourceProject)) !== JSON.stringify(root)) throw new AgentBoundaryContractError("STALE_REVISION", "fixture.resource");
       } }] });
   const view = authority.view(transport, agent.agentId), source = name => structuredClone(fixtures.valid.find(item => item.name === name).document);
   const duty = source("duty"), boundary = source("boundary");
@@ -89,7 +98,7 @@ function fixture(t, config = {}) {
   };
   t.after(async () => { try { if (permit) await closeWorkspaceRunPermit(permit); else lease.release(); authority.close(); transports.close(); } finally { fs.rmSync(base, { recursive: true, force: true }); } });
   const call = async (name, input, id = randomUUID(), execute) => executeWorkspaceTool(permit, name, execute ?? (frozen => tools.find(tool => tool.name === name).run(frozen, { cwd: project, signal: controller.signal })), undefined, input, id);
-  return { base, home, project, outside, catalog, row, resources, storage, connections, agent, binding, command, grant, authority, transports, transport,
+  return { base, home, project, resourceProject, outside, catalog, row, resources, storage, connections, agent, binding, command, grant, authority, transports, transport,
     files, tools, gateInput, permitInput, optionsInput, setup, call, get permit() { return permit; }, get requests() { return requests; }, get usage() { return usage; },
     start() { const opts = setup(); beginWorkspaceGovernedRun(permit, opts, "pi"); return opts; },
     hold() { held = true; }, unhold() { held = false; }, revokeResource() { resourceLive = false; }, beforeWrite(fn) { beforeWrite = fn; } };
@@ -235,7 +244,7 @@ test("C2 clones and freezes the dispatched input, and never evaluates input gett
   assert.equal(fs.readFileSync(join(f.project, "frozen.txt"), "utf8"), "yes");
 });
 
-for (const name of ["mcp_fixture", "agent_delegate"]) test(`C2 rejects unsupported ${name} before server call or child creation`, async t => {
+for (const name of ["mcp_fixture", "agent_delegate", "agent", "spawn_agent", "innocent_name"]) test(`C2 rejects unsupported ${name} before server call or child creation`, async t => {
   let called = 0; const tool = { name, description: "unsupported fixture", kind: "read", input_schema: { type: "object", properties: {} },
     ...(name.startsWith("mcp") ? { trustBoundary: "external" } : {}), async run() { called++; return "bad"; } };
   const f = fixture(t, { extraTools: [tool] }); f.start();
@@ -336,4 +345,26 @@ test("C2 journal cannot retarget an accepted run to a different command authorit
   const f = fixture(t); f.start(); const ledger = createWorkspaceCompletionEvidence(f.storage, f.binding);
   assert.throws(() => ledger.bindAgentBoundary("0".repeat(64)), code("CONTEXT_MISMATCH"));
   assert.equal(ledger.requiresAgentBoundary, true);
+});
+
+
+test("C3 isolated C2 explicit-deny guard wins even when a trusted test projection also allows the tool", async t => {
+  const f = fixture(t, { c2DenyTool: "workspace_write" }); f.start();
+  await assert.rejects(f.call("workspace_write", { path: "denied.txt", content: "no" }), code("AUTHORIZATION_DENIED"));
+  assert.equal(fs.existsSync(join(f.project, "denied.txt")), false);
+});
+
+test("C3 isolated C2 root inode guard rejects replacement independently of C1 and the run cwd", async t => {
+  const f = fixture(t, { separateResource: true, skipC1Inode: true }); f.start();
+  fs.renameSync(f.resourceProject, join(f.base, "retained-resource")); fs.mkdirSync(f.resourceProject, { mode: 0o700 });
+  await assert.rejects(f.call("workspace_write", { path: "swapped.txt", content: "no" }), code("STALE_REVISION"));
+  assert.equal(fs.existsSync(join(f.resourceProject, "swapped.txt")), false); assert.ok(fs.statSync(f.project).isDirectory());
+});
+
+test("C3 scope adapter identity cannot be copied by tool name, kind or a plain object clone", async t => {
+  const f = fixture(t), gate = createAgentBoundaryExecutionGate({ ...f.gateInput,
+    tools: f.gateInput.tools.map(item => ({ ...item, tool: { ...item.tool } })) });
+  const options = f.setup(gate); beginWorkspaceGovernedRun(f.permit, options, "pi");
+  await assert.rejects(f.call("workspace_write", { path: "cloned.txt", content: "no" }), code("RUNTIME_UNSUPPORTED"));
+  assert.equal(fs.existsSync(join(f.project, "cloned.txt")), false);
 });

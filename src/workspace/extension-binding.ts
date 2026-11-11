@@ -1,3 +1,4 @@
+import { decorateWorkspaceScopedTool } from "./scoped-tool-binding.js";
 // Unforgeable Host tool/approval identities. Serialized DTOs never carry authority.
 import { redactSensitiveText } from "../security/secrets.js";
 import { canonical } from "./local-state.js";
@@ -24,7 +25,7 @@ export function decorateWorkspaceExtensionTool(original: Tool, decorated: Tool):
     if (decorated.name !== original.name || decorated.kind !== original.kind || decorated.trustBoundary !== "external" || decorated.input_schema !== original.input_schema) throw new WorkspaceMcpError("mcp_source_unreviewed");
     return bindWorkspaceExtensionTool(decorated, binding);
   }
-  return decorated;
+  return decorateWorkspaceScopedTool(original, decorated);
 }
 export function createWorkspaceExtensionApproval(tool: Tool, callId: string, input: unknown): WorkspaceExtensionApproval {
   const binding = tools.get(tool); if (!binding || !callId) throw new WorkspaceMcpError("mcp_source_unreviewed");

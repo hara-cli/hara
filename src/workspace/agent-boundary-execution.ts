@@ -1,10 +1,11 @@
+import { isWorkspaceScopedFileTool } from "./scoped-tool-binding.js";
 // C2 trusted composition only. DTOs and C1 grants cannot construct a runtime permit or C3 decision.
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { isAbsolute, relative, sep } from "node:path";
 import type { CompletionEvidenceLedger } from "../agent/completion-evidence.js";
 import { toolOperationTraits, type Tool } from "../tools/registry.js";
-import { isWorkspaceExtensionTool } from "./extension-binding.js";
+import { decorateWorkspaceExtensionTool, isWorkspaceExtensionTool } from "./extension-binding.js";
 import { AgentBoundaryContractError, type AgentBoundaryCommand, type AgentBoundaryErrorCode } from "./agent-boundaries-contract.js";
 import type { AgentCommandGrant, AgentExecutionPolicy, AgentBoundaryResource, AgentBoundaryTool, WorkspaceAgentBoundaryAuthority } from "./agent-boundary-authority.js";
 import { canonical, deepFreeze } from "./local-state.js";
@@ -101,7 +102,7 @@ export function createAgentBoundaryExecutionGate(input: {
   const tools = input.tools.map(item => {
     if (!item || !item.tool || names.has(item.tool.name) || bookkeeping.has(item.tool.name) || typeof item.resources !== "function") return fail("INVALID_DOCUMENT", "execution.tool");
     names.add(item.tool.name);
-    return Object.freeze({ tool: Object.freeze({ ...item.tool }), reference: Object.freeze({ ...item.reference }), resources: item.resources });
+    return Object.freeze({ tool: Object.freeze(decorateWorkspaceExtensionTool(item.tool, { ...item.tool })), reference: Object.freeze({ ...item.reference }), resources: item.resources });
   });
   const state: GateState = { binding, authority: input.authority, policy: input.authority.captureExecutionPolicy(input.grant),
     control: Object.freeze({ commandId: control.commandId, runId: control.runId, controlEpoch: control.controlEpoch,
@@ -153,8 +154,7 @@ export function bindAgentBoundaryExecution(gate: unknown, binding: WorkspaceRunB
     async runTool<T>(name: string, input: unknown, callId: string | undefined, execute: (input: unknown) => Promise<T>, failed?: (value: T) => boolean): Promise<T> {
       const facts = current(state), item = state.tools.find(item => item.tool.name === name);
       if (!item && !bookkeeping.has(name)) return fail("RUNTIME_UNSUPPORTED", "execution.tool");
-      if (item && (item.reference.connectorId !== null || isWorkspaceExtensionTool(item.tool) || item.tool.trustBoundary === "external" || ["exec", "computer"].includes(item.tool.kind ?? "")
-        || /(?:delegate|spawn|child_agent)/.test(name))) return fail("RUNTIME_UNSUPPORTED", "execution.tool");
+      if (item && (!isWorkspaceScopedFileTool(item.tool) || !["read", "edit"].includes(item.tool.kind ?? "") || item.reference.connectorId !== null || isWorkspaceExtensionTool(item.tool) || item.tool.trustBoundary === "external")) return fail("RUNTIME_UNSUPPORTED", "execution.tool");
       const reference = item?.reference ?? { toolId: name, connectorId: null, catalogRevision: 1 };
       if (!facts.boundary.tools.allow.some(ref => canonical(ref) === canonical(reference))
         || facts.boundary.tools.deny.some(ref => ref.toolId === reference.toolId && ref.connectorId === reference.connectorId)) return fail("AUTHORIZATION_DENIED", "execution.tool");
