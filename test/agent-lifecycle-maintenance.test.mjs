@@ -38,8 +38,9 @@ test("C4 pause/resume retires the old epoch permanently and never enables its sc
 });
 
 test("C4 a cut after durable schedule pause preserves its receipt and retries publication without rollback", t => {
-  const f = lifecycleFixture(t), store = features(f), main = f.resources.agents.list().mainAgentId;
-  const id = schedule(store, f.agent.agentId), other = schedule(store, "another_agent");
+  const f = lifecycleFixture(t, { colleague: true }), store = features(f), main = f.resources.agents.list().mainAgentId;
+  assert.notEqual(main, f.agent.agentId);
+  const id = schedule(store, f.agent.agentId), other = schedule(store, main);
   const pause = f.draft({ action: "agent.pause", reason: "human_request" }); f.apply(pause);
   const observe = f.authority.observeCommandControl.bind(f.authority); let interrupted = false;
   f.authority.observeCommandControl = (...args) => { if (!interrupted && store.archivePauseReceipts().length) { interrupted = true; throw new AgentBoundaryContractError("STALE_REVISION", "synthetic.cross_file_cut"); } return observe(...args); };

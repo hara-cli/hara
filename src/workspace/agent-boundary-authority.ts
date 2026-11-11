@@ -429,6 +429,10 @@ export class WorkspaceAgentBoundaryAuthority {
   assertLifecycleHistory() { const snapshot = this.commandControlState(); if (snapshot.lifecycle) this.history().verify(snapshot.lifecycle); }
   lifecycleHistoricalRun(lifecycle: AgentLifecycleState, runId: string) { return this.history().historicalRun(lifecycle, runId); }
   lifecycleHistoricalCommand(lifecycle: AgentLifecycleState, commandId: string) { return this.history().historicalCommand(lifecycle, commandId); }
+  lifecycleHistoricalRuns(lifecycle: AgentLifecycleState, agentId: string) {
+    return this.history().verify(lifecycle).flatMap(body => body.control.runs.filter(row => row.agentId === agentId)
+      .map(run => ({ run, execution: body.lifecycle.executions.find(row => row.runId === run.runId)! })));
+  }
   lifecycleHistoricalAudit(lifecycle: AgentLifecycleState, agentId: string) {
     return this.history().verify(lifecycle).flatMap(body => body.control.audit.filter(row => row.agentId === agentId));
   }

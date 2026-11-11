@@ -625,7 +625,12 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
       }
       assertAgentCommandCapacity(state, true); return state;
     });
-    } catch (error) { this.available = false; throw error; }
+    } catch (error) {
+      // A competing observation can win the CAS after the genuine physical drain. Keep the
+      // original proof for publication retry; a normal rejection must not poison sibling runs.
+      if (!this.authority.commandControlSourceHealthy() || !(error instanceof AgentBoundaryContractError)) this.available = false;
+      throw error;
+    }
     this.authority.retire(live.grant);
     this.pendingDrainProofs.delete(facts.binding.runId);
     this.live.delete(facts.binding.runId);
@@ -684,22 +689,33 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
     const snapshot = this.authority.commandControlForReader(transport, agentId), lifecycle = snapshot.lifecycle;
     if (!lifecycle) return fail("AUTHORITY_UNVERIFIED", "lifecycle.bootstrap");
     const agent = snapshot.control.agents.find(row => row.agentId === agentId);
-    return deepFreeze({ schemaVersion: 1, kind: "agent-lifecycle-projection", agentId, revision: snapshot.revision,
-      accepting: !agent?.hold && !agent?.dismissed && this.authority.commandControlSourceHealthy(), dismissed: agent?.dismissed ?? false, holdId: agent?.hold?.holdId ?? null,
+    let permitted = false, management = false;
+    try { const rights = this.authority.lifecycleRights(transport, agentId); permitted = rights.invoke && rights.nodeUse; management = rights.manage; } catch { /* Metadata never supplies a missing allow. */ }
+    const canClaim = (run: AgentCommandRun, execution: AgentLifecycleRun) => permitted && management && !agent?.hold && !agent?.dismissed && this.available
+      && this.authority.commandControlSourceHealthy() && execution.terminal !== null && execution.leaseReleased && run.effect === "none"
+      && run.claimRevision === Math.max(...snapshot.control.runs.filter(row => row.agentId === agentId && row.taskId === run.taskId).map(row => row.claimRevision),
+        ...lifecycle.retiredRuns.filter(row => row.agentId === agentId && row.taskId === run.taskId).map(row => row.claimRevision));
+    return deepFreeze({ schemaVersion: 1, kind: "agent-lifecycle-projection", context: snapshot.context, agentId, revision: snapshot.revision, controlEpoch: agent?.epoch ?? 0,
+      accepting: permitted && !agent?.hold && !agent?.dismissed && this.available && this.authority.commandControlSourceHealthy(), dismissed: agent?.dismissed ?? false, holdId: agent?.hold?.holdId ?? null,
       runs: snapshot.control.runs.filter(run => run.agentId === agentId).map(run => {
         const row = lifecycle.executions.find(row => row.runId === run.runId)!;
-        const recovery: AgentLifecycleProjectionV1["runs"][number]["recovery"] = row.terminal && row.leaseReleased ? ["query_original", "new_explicit_claim"]
-          : row.quiescence ? ["query_original", "publish_observation"] : ["query_original", "request_stop"];
-        return { runId: run.runId, taskId: run.taskId, claimRevision: run.claimRevision, execution: row.phase,
+        const recovery: AgentLifecycleProjectionV1["runs"][number]["recovery"] = canClaim(run, row) ? ["query_original", "new_explicit_claim"]
+          : management && !row.leaseReleased && (row.quiescence || row.terminal) ? ["query_original", "publish_observation"]
+          : management && !row.leaseReleased ? ["query_original", "request_stop"] : ["query_original"];
+        return { commandId: run.commandId, rootRequestId: run.rootRequestId, requestId: run.requestId, runId: run.runId, taskId: run.taskId, claimRevision: run.claimRevision,
+          runEpoch: run.epoch, agentControlEpoch: run.agentControlEpoch, terminalReason: row.terminal?.reason ?? null, execution: row.phase,
           physical: row.leaseReleased ? "lease_released" as const : row.quiescence || row.terminal ? "quiescent_lease_pending" as const : "unconfirmed" as const, effect: run.effect, recovery };
-      }), operations: lifecycle.operations.filter(row => row.agentId === agentId), archivedRuns: lifecycle.retiredRuns.filter(run => run.agentId === agentId).length, productionEnabled: false });
+      }), operations: lifecycle.operations.filter(row => row.agentId === agentId), archivedRuns: lifecycle.retiredRuns.filter(run => run.agentId === agentId).length,
+      archived: this.authority.lifecycleHistoricalRuns(lifecycle, agentId).map(({ run, execution }) => ({ runId: run.runId, taskId: run.taskId, commandId: run.commandId,
+        claimRevision: run.claimRevision, effect: run.effect, execution: execution.phase, leaseReleased: true as const,
+        recovery: canClaim(run, execution) ? ["query_original", "new_explicit_claim"] as const : ["query_original"] as const })), productionEnabled: false });
   }
   inspect(transport: Intake["transport"], agentId: string) {
     const { control } = this.authority.commandControlForReader(transport, agentId), agent = control.agents.find(row => row.agentId === agentId);
     return deepFreeze({ ...(this.authority.commandLifecycleConfigured() ? { lifecycle: this.lifecycleProjection(transport, agentId) } : {}), sourceAvailableHere: this.available && this.authority.commandControlSourceHealthy(), pendingDrainObservations: this.pendingDrainProofs.size, agent: agent ?? { agentId, epoch: 0, hold: null, dismissed: false },
       runs: control.runs.filter(run => run.agentId === agentId).map(run => ({ runId: run.runId, taskId: run.taskId, commandId: run.commandId,
         claimRevision: run.claimRevision, epoch: run.epoch, state: run.state, effect: run.effect, controlledHere: this.live.has(run.runId), hold: run.hold, drainProofRef: run.drainProofRef,
-        recovery: run.effect === "unknown" || !run.drainProofRef && !this.live.has(run.runId) || ["unknown", "draining"].includes(run.state) ? ["query_original", "request_stop", "await_physical_drain"] : [] })) });
+        recovery: this.authority.commandLifecycleConfigured() ? ["query_original"] : run.effect === "unknown" || !run.drainProofRef && !this.live.has(run.runId) || ["unknown", "draining"].includes(run.state) ? ["query_original", "request_stop", "await_physical_drain"] : [] })) });
   }
   audit(transport: Intake["transport"], agentId: string) {
     const snapshot = this.authority.commandControlForReader(transport, agentId);

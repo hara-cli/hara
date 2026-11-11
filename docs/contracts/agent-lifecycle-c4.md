@@ -55,3 +55,30 @@ History uses deterministic, immutable private `workspace-agent-history-<id>.json
 Only positive lease-released components are retired. Physically unconfirmed historical UNKNOWN stays bounded and held in the active aggregate; it cannot be moved to immutable history while a genuine original runtime may still publish observations. UNKNOWN business outcomes after actual physical closure remain UNKNOWN in history and never qualify for next-claim recovery. A connected component exceeding512KiB, the exact-index/byte caps or64 physical files refuses this maintenance request and preserves active state. Unpublished files count toward the same physical bound; no automatic age eviction, ID clearing or business replay is provided. These conservative holds require explicit future recovery engineering before any broader production admission.
 
 An unpublished file/CAS failure preserves every active row. A referenced file/hash/index failure refuses dependent history reads and new intents, while existing unrelated active effects retain their independent synchronous C1/C2/C3 fences. Genuine active authority corruption still permanently fences that source. Lifecycle admission reserves closure bytes and restrictive-operation slots. A verified retired original gate is refused locally without poisoning a healthy sibling as missing active data.
+
+## C5 consumption and private RPC surface
+
+Capability `workspace.agent-lifecycle.v1` requires the trusted C3+C4 bootstrap and an independent owner credential. Neither ordinary transport discovery nor CLI/native production defaults enables it. A lifecycle-only bootstrap is rejected before opening a source. All lifecycle methods authenticate the actual connection before lookup, require the exact resource generation and reject extra fields. Their only private endpoints are:
+
+| Method under `workspace.boundaries.lifecycle` | Fields in addition to workspaceId/expectedGeneration/agentId | Result |
+| --- | --- | --- |
+| `get` | none | `AgentLifecycleProjectionV1` |
+| `reconcile` | none | retry original positive observations/maintenance; no business start |
+| `history.archive` | maximum (1–8 connected components) | bounded publication counts/revision |
+| `recovery.draft` | input: operationId, previousRunId, expectedClaimRevision, commandId, rootRequestId, message, lifetimeMs | proposed private recovery plus existing C0 dispatch |
+| `recovery.submit` | recovery, command, message | original C0 acceptance/receipt; retransmission is read-only |
+
+The projection includes the original C0 context/resource generation, authority revision/control epoch, command/root/request/task/run/claim identities, run epoch, issuance/terminal reason, physical stage, business effect, per-operation phases and verified archived summaries. It contains no conversation, memory, tool argument or credential. Available recovery actions require current rights, current Agent hold/dismissal, the latest claim and positive facts. An older terminal claim does not offer another recovery when its successor exists. This projection is observation, never an execution or release permit.
+
+C5 must separately display acceptance, notification, capability revocation, physical lease closure, schedule pause, logical archive and business UNKNOWN. An accepted C0 pause/dismiss is not a physical completion claim. A genuine never-issued termination retains the original C0 accepted receipt and adds its private terminal/lease facts. No C0 v1 field/action, source rule, fixture or lock changes. Generic resume never starts an old run or enables an old schedule. Archived audit stays immutable; acknowledge only active C3 events, with a client cursor for historical display.
+
+Support remains controlled in-process Pi, scoped files and existing bookkeeping. Native/full-protected engines, child/delegation, MCP, external effects and arbitrary exec keep their C2 unsupported gate. This slice adds no cloud/mobile/remote or production admission. Production activation and any broader owner-loss recovery remain separate reviewed work.
+
+## Verification and handoff
+
+The focused fixtures use genuine C1/C2/C3 factories, actual bound Host/WS requests, two independent Hosts/Workspaces, real pending Promises and original approval objects. Independent child processes exit at terminal-before-release, quiescence-before-release and issued-without-proof cuts. Restart reconciliation must preserve every original proof and UNKNOWN; no fake approval or JSON capability substitutes for those factories.
+
+`test/helpers/agent-lifecycle-mutations.mjs --verify` is an explicit author-only runner under the standard private HOME/TMP guard. Its import loader changes only in-memory module text, verifies one unambiguous target and requires the named assertion to fail for each of nine removed defenses. Product files on disk remain untouched. Ordinary `npm test` does not import that loader. The exact final source must pass full `npm test` (build and feedback evaluation included), the mutation check and the cross-repository C0 lock check before review. Author acceptance and independent review remain distinct; merge and production approval belong to the coordinator/Jeff.
+
+
+Final-drain publication retains its original genuine proof when a different authority wins a normal CAS. That conflict affects only this publication and must not mark the whole controller unavailable. Reconciliation retries only the original receipt, without replaying effects; actual source/IO failure remains fail-closed. The regression inserts a real independent-authority write between snapshot and CAS, verifies the losing STALE result, then executes a healthy sibling file effect and publishes the original drain proof. Its separate mutation restores the old global-poison catch and must turn that assertion red.

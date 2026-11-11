@@ -29,6 +29,7 @@ function tokenMatches(actual: unknown, expected: string): boolean {
 }
 export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; hostHome?: string; discoveryHome?: string; legacySourceHome?: string; credentialVault?: CredentialVault; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; extensionCatalog?: ExtensionCatalogProvider; reviewedMcpSources?: () => readonly ReviewedMcpSource[]; mcpReviewHome?: string; mcpLaunchCandidate?: WorkspaceMcpLaunchProvider; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1]; backgroundRuntimeDetectionMs?: number; agentBoundaries?: { commandControl?: boolean; lifecycleControl?: boolean; ownerCredential: string; maxCommandLifetimeMs?: number; externalDirectory?: AgentHubDirectory } }): Promise<ServeHandle> {
   if (opts.host !== "127.0.0.1" || !Number.isSafeInteger(opts.port) || opts.port < 0 || opts.port > 65535) throw new Error("Workspace Dev listens only on explicit IPv4 loopback");
+  if (input.agentBoundaries?.lifecycleControl && !input.agentBoundaries.commandControl) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "lifecycle.bootstrap");
   const token = opts.token ?? randomBytes(32).toString("hex");
   if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("invalid Workspace Dev transport token");
   // Separate owner capability supplied only by a trusted native bootstrap. It is never included
@@ -135,6 +136,31 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
         fields(["workspaceId", "agentId"]); return host.agentBoundaryView(client.boundaryTransport, workspaceId, params.agentId as string);
       }
       host.assertGeneration(workspaceId, params.expectedGeneration);
+      if (method.startsWith("workspace.boundaries.lifecycle.")) {
+        if (!input.agentBoundaries?.lifecycleControl) throw new AgentBoundaryContractError("RUNTIME_UNSUPPORTED", "lifecycle.bootstrap");
+        const common = ["workspaceId", "expectedGeneration", "agentId"];
+        if (method === "workspace.boundaries.lifecycle.get") {
+          fields(common); return host.agentLifecycleStatus(client.boundaryTransport, workspaceId, params.agentId as string);
+        }
+        if (method === "workspace.boundaries.lifecycle.reconcile") {
+          fields(common); return host.reconcileAgentLifecycle(client.boundaryTransport, workspaceId, params.agentId as string);
+        }
+        if (method === "workspace.boundaries.lifecycle.history.archive") {
+          fields([...common, "maximum"]); if (!Number.isSafeInteger(params.maximum) || Number(params.maximum) < 1 || Number(params.maximum) > 8) throw new AgentBoundaryContractError("INVALID_DOCUMENT", "lifecycle.archiveLimit");
+          return host.archiveAgentLifecycleHistory(client.boundaryTransport, workspaceId, params.agentId as string, params.maximum as number);
+        }
+        if (method === "workspace.boundaries.lifecycle.recovery.draft") {
+          fields([...common, "input"]); return host.draftAgentLifecycleRecovery(client.boundaryTransport, workspaceId, params.agentId as string,
+            params.input as Parameters<LocalWorkspaceHost["draftAgentLifecycleRecovery"]>[3]);
+        }
+        if (method === "workspace.boundaries.lifecycle.recovery.submit") {
+          fields([...common, "recovery", "command", "message"]);
+          if (!plain(params.recovery) || params.recovery.agentId !== params.agentId || !plain(params.command) || params.command.agentId !== params.agentId || !messageBody(params.message))
+            throw new AgentBoundaryContractError("INVALID_DOCUMENT", "lifecycle.recovery");
+          return host.submitAgentLifecycleRecovery(client.id, client.boundaryTransport, workspaceId, params.agentId as string, params.recovery, params.command, { message: params.message });
+        }
+        throw new AgentBoundaryContractError("INVALID_DOCUMENT", "lifecycle.method");
+      }
       if (method === "workspace.boundaries.control.initialize") {
         fields(["workspaceId", "expectedGeneration", "agentId"]); return host.initializeAgentCommandControl(client.boundaryTransport, workspaceId, params.agentId as string);
       }

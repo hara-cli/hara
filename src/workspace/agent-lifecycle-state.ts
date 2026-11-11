@@ -1,6 +1,6 @@
 // C4 Host-private persistence and projections. These JSON facts are never execution/release capabilities.
 import { AGENT_BOUNDARY_ERRORS, AgentBoundaryContractError, parseAgentBoundaryDocument,
-  type AgentBoundaryErrorCode, type AgentBoundaryReceipt } from "./agent-boundaries-contract.js";
+  type AgentBoundaryErrorCode, type AgentBoundaryReceipt, type AgentBoundaryContext } from "./agent-boundaries-contract.js";
 import { commandDigest, commandEpoch, commandId, type AgentCommandRun, type AgentCommandState } from "./agent-command-state.js";
 import { canonical, plain, positive, UUID } from "./local-state.js";
 
@@ -56,12 +56,16 @@ export interface AgentLifecycleState {
   retiredCommands: AgentLifecycleRetiredCommand[]; retiredRuns: AgentLifecycleRetiredRun[];
 }
 export interface AgentLifecycleProjectionV1 {
-  schemaVersion: 1; kind: "agent-lifecycle-projection"; agentId: string; revision: number;
+  schemaVersion: 1; kind: "agent-lifecycle-projection"; context: AgentBoundaryContext; agentId: string; revision: number; controlEpoch: number;
   accepting: boolean; dismissed: boolean; holdId: string | null;
-  runs: { runId: string; taskId: string; claimRevision: number; execution: AgentLifecycleRun["phase"];
+  runs: { commandId: string; rootRequestId: string; requestId: string; runId: string; taskId: string; claimRevision: number;
+    runEpoch: number; agentControlEpoch: number; terminalReason: AgentBoundaryErrorCode | null; execution: AgentLifecycleRun["phase"];
     physical: "unconfirmed" | "quiescent_lease_pending" | "lease_released"; effect: AgentCommandRun["effect"];
     recovery: readonly ("query_original" | "request_stop" | "publish_observation" | "new_explicit_claim")[] }[];
-  operations: AgentLifecycleOperation[]; archivedRuns: number; productionEnabled: false;
+  operations: AgentLifecycleOperation[]; archivedRuns: number;
+  archived: { runId: string; taskId: string; commandId: string; claimRevision: number; effect: AgentCommandRun["effect"];
+    execution: AgentLifecycleRun["phase"]; leaseReleased: true; recovery: readonly ("query_original" | "new_explicit_claim")[] }[];
+  productionEnabled: false;
 }
 const fail = (field = "lifecycle.store"): never => { throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", field); };
 const hash = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);

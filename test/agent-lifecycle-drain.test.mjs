@@ -19,7 +19,8 @@ test("C4 persistence fences issuance before the first real gate and publishes qu
     assert.equal(f.snapshot().lifecycle.executions[0].phase, "issued");
     assert.ok(f.snapshot().lifecycle.executions[0].issuanceRef); return capture(grant);
   };
-  const r = d.runtime(); await r.call("workspace_write", { path: "once.txt", content: "one effect" });
+  let r; assert.doesNotThrow(() => { r = d.runtime(); }, "genuine persisted issuance must construct the real runtime");
+  await r.call("workspace_write", { path: "once.txt", content: "one effect" });
   const observe = f.control.observeQuiescence.bind(f.control); let published = 0;
   f.control.observeQuiescence = proof => {
     d.lease.assertCurrent(); observe(proof); published++;
@@ -106,4 +107,26 @@ test("C4 a second genuine Host persists exact stop and the owning Host actually 
     release(); await until(async () => (await f.receipt(stop)).execution.drain === "observed");
     const before = f.calls(); await f.submit(d.command, d.message); assert.equal(f.calls(), before);
   } finally { release(); await peer.close(); transportOwner.close(); }
+});
+
+test("C4 stale final-drain publication keeps sibling effects and genuine proof reconciliation live", async t => {
+  const { WorkspaceAgentBoundaryAuthority } = await import("../dist/workspace/agent-boundary-authority.js");
+  const f = lifecycleFixture(t), d = f.dispatch("original"), sibling = f.dispatch("healthy sibling"); d.accept(); sibling.accept(); const r = d.runtime(), s = sibling.runtime();
+  await r.call("workspace_write", { path: "once-before-cas.txt", content: "one" }); await closeWorkspaceRunPermit(r.permit);
+  const peer = new WorkspaceAgentBoundaryAuthority(f.authorityOptions); t.after(() => peer.close());
+  const publish = f.authority.observeCommandControl.bind(f.authority); let interleaved = false;
+  f.authority.observeCommandControl = (expected, change) => {
+    if (!interleaved) { interleaved = true; const snapshot = peer.commandControlState(); peer.observeCommandControl(snapshot.revision, state => state); }
+    return publish(expected, change); // Real CAS loses to the independent authority's persisted revision.
+  };
+  assert.throws(() => f.control.observeDrained(workspaceRunDrainProof(r.permit)), code("STALE_REVISION"));
+  assert.equal(interleaved, true); assert.equal(f.authority.commandControlSourceHealthy(), true);
+  assert.equal(f.snapshot().lifecycle.executions.find(row => row.runId === d.binding.runId).leaseReleased, false);
+  f.authority.observeCommandControl = publish;
+  await assert.doesNotReject(s.call("workspace_write", { path: "sibling-after-cas.txt", content: "still current" }), "ordinary CAS conflict must not poison a sibling's genuine gate");
+  f.control.reconcileDrainObservations(f.transport, f.agent.agentId);
+  assert.equal(f.control.readReceipt(f.transport, f.agent.agentId, d.command.commandId).execution.drain, "observed");
+  assert.equal(f.control.inspect(f.transport, f.agent.agentId).sourceAvailableHere, true);
+  assert.equal(fs.readFileSync(join(f.project, "once-before-cas.txt"), "utf8"), "one");
+  assert.equal(fs.readFileSync(join(f.project, "sibling-after-cas.txt"), "utf8"), "still current");
 });

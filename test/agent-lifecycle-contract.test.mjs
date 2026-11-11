@@ -82,6 +82,7 @@ test("C4 a partial downgrade retaining lifecycle can never fall through the lega
   const f = lifecycleFixture(t), original = fs.readFileSync(f.file, "utf8"), partial = JSON.parse(original);
   partial.schemaVersion = 1; delete partial.control;
   fs.writeFileSync(f.file, JSON.stringify(partial) + "\n");
+  assert.equal(JSON.parse(fs.readFileSync(f.file, "utf8")).schemaVersion, 1);
   assert.throws(() => f.storage.run(() => workspaceAgentCommandProtected(f.storage)), code("AUTHORITY_UNVERIFIED"));
   fs.writeFileSync(f.file, original);
 });

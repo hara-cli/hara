@@ -231,6 +231,7 @@ export class LocalWorkspaceHost {
     /** Trusted native/owner composition only; never supplied by an RPC or imported instructions. */
     legacyBusinessFactory?: (input: { storage: WorkspaceResourceStorage; features: WorkspaceFeatures; resources: WorkspaceLegacyResources }) => WorkspaceLegacyBusiness;
   } = {}) {
+    if (options.boundaryLifecycleControl && !options.boundaryCommandControl) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "lifecycle.bootstrap");
     this.usageCache = new WorkspaceRuntimeUsageCache(options.usageCollector);
     if (options.usageCollector) {
       this.usageTimer = setInterval(() => {
@@ -371,9 +372,19 @@ export class LocalWorkspaceHost {
     const control = this.commandAuthority(transport, workspaceId);
     return this.submitAgentCommandIntake(clientId, transport!, workspaceId, agentId, control, control.begin(transport!, command, input), input);
   }
+  private lifecycleAuthority(transport: AgentBoundaryTransport | undefined, workspaceId: string) {
+    if (!this.options.boundaryLifecycleControl) throw new AgentBoundaryContractError("RUNTIME_UNSUPPORTED", "lifecycle.bootstrap");
+    return this.commandAuthority(transport, workspaceId);
+  }
+  agentLifecycleStatus(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string) {
+    return this.lifecycleAuthority(transport, workspaceId).lifecycleProjection(transport!, agentId);
+  }
+  archiveAgentLifecycleHistory(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string, maximum: number) {
+    return this.lifecycleAuthority(transport, workspaceId).archiveLifecycleHistory(transport!, agentId, maximum);
+  }
   draftAgentLifecycleRecovery(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string,
     input: Parameters<WorkspaceAgentCommandControl["draftRecovery"]>[2]) {
-    return this.commandAuthority(transport, workspaceId).draftRecovery(transport!, agentId, input);
+    return this.lifecycleAuthority(transport, workspaceId).draftRecovery(transport!, agentId, input);
   }
   submitAgentLifecycleRecovery(clientId: string, transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string,
     recovery: unknown, command: unknown, input: { message: string }) {
@@ -382,7 +393,7 @@ export class LocalWorkspaceHost {
     return this.submitAgentCommandIntake(clientId, transport!, workspaceId, agentId, control, control.beginRecovery(transport!, recovery, command, input), input);
   }
   reconcileAgentLifecycle(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string) {
-    const result = this.commandAuthority(transport, workspaceId).reconcileLifecycleObservations(transport!, agentId); this.kickLifecycleObserver(); return result;
+    const result = this.lifecycleAuthority(transport, workspaceId).reconcileLifecycleObservations(transport!, agentId); this.kickLifecycleObserver(); return result;
   }
   private submitAgentCommandIntake(clientId: string, transport: AgentBoundaryTransport, workspaceId: string, agentId: string,
     control: WorkspaceAgentCommandControl, begun: ReturnType<WorkspaceAgentCommandControl["begin"]>, input: { message?: string; proposal?: unknown }) {
