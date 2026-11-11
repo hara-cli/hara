@@ -8,6 +8,9 @@ import { availableRuntimePermissionTiers, isRuntimePermissionTier, NativeEngineU
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import { LocalWorkspaceHost, WorkspaceArchiveError, type LocalWorkspaceProviderFactory } from "../workspace/local-host.js";
+import { AGENT_BOUNDARIES_CONTRACT, AGENT_BOUNDARY_ERRORS, AgentBoundaryContractError } from "../workspace/agent-boundaries-contract.js";
+import { AgentBoundaryTransports, type AgentBoundaryTransport } from "../workspace/agent-boundary-transport.js";
+import type { AgentHubDirectory } from "../agent-hub/contracts.js";
 import { exact, messageBody, plain, positive, text, UUID } from "../workspace/local-state.js";
 import type { ArkAcceptanceSlice } from "../workspace/real-key-provider.js";
 import { bindPrivateHaraStateFile, readPrivateStateFileSnapshotSync, removePrivateStateFile, writePrivateStateFileSync } from "../security/private-state.js";
@@ -24,20 +27,25 @@ function tokenMatches(actual: unknown, expected: string): boolean {
   if (typeof actual !== "string" || !/^[a-f0-9]{64}$/.test(actual) || actual.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
 }
-export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; hostHome?: string; discoveryHome?: string; legacySourceHome?: string; credentialVault?: CredentialVault; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; extensionCatalog?: ExtensionCatalogProvider; reviewedMcpSources?: () => readonly ReviewedMcpSource[]; mcpReviewHome?: string; mcpLaunchCandidate?: WorkspaceMcpLaunchProvider; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1]; backgroundRuntimeDetectionMs?: number }): Promise<ServeHandle> {
+export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; hostHome?: string; discoveryHome?: string; legacySourceHome?: string; credentialVault?: CredentialVault; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; extensionCatalog?: ExtensionCatalogProvider; reviewedMcpSources?: () => readonly ReviewedMcpSource[]; mcpReviewHome?: string; mcpLaunchCandidate?: WorkspaceMcpLaunchProvider; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1]; backgroundRuntimeDetectionMs?: number; agentBoundaries?: { ownerCredential: string; maxCommandLifetimeMs?: number; externalDirectory?: AgentHubDirectory } }): Promise<ServeHandle> {
   if (opts.host !== "127.0.0.1" || !Number.isSafeInteger(opts.port) || opts.port < 0 || opts.port > 65535) throw new Error("Workspace Dev listens only on explicit IPv4 loopback");
   const token = opts.token ?? randomBytes(32).toString("hex");
   if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("invalid Workspace Dev transport token");
+  // Separate owner capability supplied only by a trusted native bootstrap. It is never included
+  // in the generic transport discovery receipt or returned ServeHandle. CLI defaults stay closed.
+  if (input.agentBoundaries?.ownerCredential === token) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "authority.bootstrap");
+  const boundaryTransports = input.agentBoundaries ? new AgentBoundaryTransports(input.agentBoundaries.ownerCredential) : undefined;
+  type Client = { id: string; initialized: boolean; boundaryTransport?: AgentBoundaryTransport };
   const origins = new Set(["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost", ...(input.allowedOrigins ?? [])]);
   const dispatch: typeof dispatchMethod = (client, method, params, rpcId, receivedAt) => {
     if (!plain(params)) return Promise.reject(new Error("invalid Workspace RPC parameters"));
     const { clientLocale, ...businessParams } = params;
     return withClientLocale(clientLocale, () => dispatchMethod(client, method, businessParams, rpcId, receivedAt));
   };
-  const clients = new Map<WebSocket, { id: string; initialized: boolean }>();
+  const clients = new Map<WebSocket, Client>();
   let closing = false;
   const capability = input.mode === "workspace" ? "workspace.v1" : CAPABILITY;
-  const host = new LocalWorkspaceHost(input.root, { mode: input.mode, hostHome: input.hostHome, discoveryHome: input.discoveryHome, legacySourceHome: input.legacySourceHome, credentialVault: input.credentialVault, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, extensionCatalog: input.extensionCatalog, reviewedMcpSources: input.reviewedMcpSources, mcpReviewHome: input.mcpReviewHome, mcpLaunchCandidate: input.mcpLaunchCandidate, runtimeInstallerOptions: input.runtimeInstallerOptions, backgroundRuntimeDetectionMs: input.backgroundRuntimeDetectionMs, onChange(event) {
+  const host = new LocalWorkspaceHost(input.root, { boundaryTransports, boundaryMaxCommandLifetimeMs: input.agentBoundaries?.maxCommandLifetimeMs, boundaryExternalDirectory: input.agentBoundaries?.externalDirectory, mode: input.mode, hostHome: input.hostHome, discoveryHome: input.discoveryHome, legacySourceHome: input.legacySourceHome, credentialVault: input.credentialVault, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, extensionCatalog: input.extensionCatalog, reviewedMcpSources: input.reviewedMcpSources, mcpReviewHome: input.mcpReviewHome, mcpLaunchCandidate: input.mcpLaunchCandidate, runtimeInstallerOptions: input.runtimeInstallerOptions, backgroundRuntimeDetectionMs: input.backgroundRuntimeDetectionMs, onChange(event) {
     for (const [client, state] of clients) if (state.initialized && client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ jsonrpc: "2.0", method: "workspace.changed", params: event }));
   }, onAssistantPreview(clientId, frame) {
     for (const [client, state] of clients) if (state.id === clientId && state.initialized && client.readyState === WebSocket.OPEN) {
@@ -84,12 +92,15 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
   try { writePrivateStateFileSync(receiptFile, JSON.stringify(receipt) + "\n", { expectedMissing: true }); }
   catch (error) { wss.close(); server.close(); await host.close(); throw error; }
   const ownedReceipt = readPrivateStateFileSnapshotSync(receiptFile.path, 4096)!;
-  const dispatchMethod = async (client: { id: string; initialized: boolean }, method: string, params: unknown, rpcId: string | number, receivedAt: number): Promise<unknown> => {
+  const dispatchMethod = async (client: Client, method: string, params: unknown, rpcId: string | number, receivedAt: number): Promise<unknown> => {
     if (!plain(params)) throw new Error("invalid Workspace RPC parameters");
     if (method === "initialize") {
+      // Every reauthentication first retires the old connection authority, including failures.
+      boundaryTransports?.disconnect(client.boundaryTransport); client.boundaryTransport = undefined; client.initialized = false;
       if (!tokenMatches(params.token, token)) throw new Error("unauthorized");
       if (params.clientCapabilities !== undefined && (!Array.isArray(params.clientCapabilities) || params.clientCapabilities.length > 32
         || !params.clientCapabilities.every(value => typeof value === "string" && value.length <= 100))) throw new Error("invalid client capabilities");
+      client.boundaryTransport = boundaryTransports?.connect(client.id, params.boundaryCredential);
       host.setAssistantPreviewCapability(client.id, Array.isArray(params.clientCapabilities) && params.clientCapabilities.includes("workspace.assistant-preview.v1"));
       host.setExtensionClientCapability(client.id, Array.isArray(params.clientCapabilities) && params.clientCapabilities.includes("workspace.extensions.manager.v1"));
       host.setExtensionOwnerReviewCapability(client.id, Array.isArray(params.clientCapabilities) && params.clientCapabilities.includes("workspace.extensions.owner-review.v1"));
@@ -97,7 +108,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, runtimePlatform: { writeProtection: runtimeWriteProtection(), permissionTiers: availableRuntimePermissionTiers() }, capabilities: [capability, "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.media.v1", "workspace.media.states.v1", "workspace.i18n.v1", "workspace.agents.archive.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, runtimePlatform: { writeProtection: runtimeWriteProtection(), permissionTiers: availableRuntimePermissionTiers() }, capabilities: [capability, ...(boundaryTransports ? ["workspace.agent-boundaries.authority.v1"] : []), "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.media.v1", "workspace.media.states.v1", "workspace.i18n.v1", "workspace.agents.archive.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
@@ -109,6 +120,40 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (method === "workspace.activity") { fields([]); return host.activity(); }
     if (method === "workspace.update.prepare") { fields(["approved"]); if (params.approved !== true) throw new Error("Explicit restart approval required"); return host.prepareUpdate(client.id); }
     if (method === "workspace.update.release") { fields(["id"]); if (!text(params.id)) throw new Error("Invalid update lease"); host.releaseUpdate(client.id, params.id); return { released: true }; }
+    if (method.startsWith("workspace.boundaries.")) {
+      // Authenticate the actual connection before any Workspace lookup, parser or metadata read.
+      host.assertBoundaryTransport(client.boundaryTransport);
+      if (!text(params.workspaceId) || (method !== "workspace.boundaries.linkExternal" && !text(params.agentId))) throw new AgentBoundaryContractError("INVALID_DOCUMENT", "authority.request");
+      const workspaceId = params.workspaceId;
+      if (method === "workspace.boundaries.get") {
+        fields(["workspaceId", "agentId"]); return host.agentBoundaryView(client.boundaryTransport, workspaceId, params.agentId as string);
+      }
+      host.assertGeneration(workspaceId, params.expectedGeneration);
+      if (method === "workspace.boundaries.prepareProject") {
+        fields(["workspaceId", "expectedGeneration", "agentId"]); return host.prepareAgentBoundaryProject(client.boundaryTransport, workspaceId, params.agentId as string);
+      }
+      if (method === "workspace.boundaries.configure") {
+        fields(["workspaceId", "expectedGeneration", "agentId", "expectedRevision", "duty", "boundary", "rights"]);
+        return host.configureAgentBoundary(client.boundaryTransport, workspaceId, params.agentId as string,
+          { expectedRevision: params.expectedRevision, duty: params.duty, boundary: params.boundary, rights: params.rights });
+      }
+      if (method === "workspace.boundaries.linkExternal") {
+        fields(["workspaceId", "expectedGeneration", "expectedRevision", "externalAgentId", "instanceId", "agentId", "resourceId"]);
+        return host.linkAgentBoundaryExecutor(client.boundaryTransport, workspaceId,
+          { expectedRevision: params.expectedRevision, externalAgentId: params.externalAgentId, instanceId: params.instanceId, agentId: params.agentId, resourceId: params.resourceId });
+      }
+      if (method === "workspace.boundaries.draft") {
+        fields(["workspaceId", "expectedGeneration", "agentId", "commandId", "rootRequestId", "operation", "lifetimeMs"]);
+        return host.draftAgentBoundaryCommand(client.boundaryTransport, workspaceId, params.agentId as string,
+          { commandId: params.commandId, rootRequestId: params.rootRequestId, operation: params.operation, lifetimeMs: params.lifetimeMs });
+      }
+      if (method === "workspace.boundaries.check") {
+        fields(["workspaceId", "expectedGeneration", "agentId", "command"]);
+        if (!plain(params.command) || params.command.agentId !== params.agentId) throw new AgentBoundaryContractError("INVALID_DOCUMENT", "authority.target");
+        return host.checkAgentBoundaryCommand(client.boundaryTransport, workspaceId, params.command);
+      }
+      throw new AgentBoundaryContractError("INVALID_DOCUMENT", "authority.method");
+    }
     const workspaceId = params.workspaceId;
     if (!text(workspaceId)) throw new Error("Workspace must be explicit");
     if (method === "workspace.select" || method === "workspace.settings.select") { fields(["workspaceId", "expectedRevision"]); if (!positive(params.expectedRevision)) throw new Error("invalid Workspace selection"); host.select(client.id, workspaceId, params.expectedRevision, method === "workspace.settings.select"); return host.snapshot(workspaceId, undefined, client.id); }
@@ -348,9 +393,9 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     throw new Error("unsupported Workspace method; no legacy route or authority fallback");
   };
   wss.on("connection", ws => {
-    const client = { id: randomUUID(), initialized: false }; clients.set(ws, client);
+    const client: Client = { id: randomUUID(), initialized: false }; clients.set(ws, client);
     ws.on("error", () => {});
-    ws.on("close", () => { host.disconnect(client.id); clients.delete(ws); });
+    ws.on("close", () => { boundaryTransports?.disconnect(client.boundaryTransport); host.disconnect(client.id); clients.delete(ws); });
     ws.on("message", raw => {
       const receivedAt = performance.now();
       void (async () => {
@@ -365,15 +410,15 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
           const message = error instanceof Error ? error.message : "Workspace request failed";
           // Fixed classification, not arbitrary provider errors/paths/credentials.
           const safe = message === "unauthorized" ? "unauthorized" : message.includes("真實模型") ? message
-            : message.replaceAll(token, "[transport credential]").replaceAll(host.root, "[Dev state]").slice(0, 500);
-          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: "2.0", id, error: { code: message === "unauthorized" ? -32001 : -32602, message: safe, data: { ...publicErrorData(error, [token, host.root]), ...(error instanceof WorkspaceArchiveError ? { archiveReason: error.reason, retryable: true } : {}), ...(error instanceof RuntimeTierUnavailableError || error instanceof NativeEngineUnsupportedError ? { platformReason: error.code } : {}) } } }));
+            : message.replaceAll(token, "[transport credential]").replaceAll(input.agentBoundaries?.ownerCredential ?? token, "[owner credential]").replaceAll(host.root, "[Dev state]").slice(0, 500);
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: "2.0", id, error: { code: message === "unauthorized" ? -32001 : -32602, message: safe, data: { ...publicErrorData(error, [token, host.root, ...(input.agentBoundaries ? [input.agentBoundaries.ownerCredential] : [])]), ...(error instanceof AgentBoundaryContractError ? { boundary: { contract: AGENT_BOUNDARIES_CONTRACT, code: error.code, retry: AGENT_BOUNDARY_ERRORS[error.code] } } : {}), ...(error instanceof WorkspaceArchiveError ? { archiveReason: error.reason, retryable: true } : {}), ...(error instanceof RuntimeTierUnavailableError || error instanceof NativeEngineUnsupportedError ? { platformReason: error.code } : {}) } } }));
         }
       })();
     });
   });
   host.startScheduler();
   return { port, token, async close() {
-    if (closing) return; closing = true;
+    if (closing) return; closing = true; boundaryTransports?.close();
     await host.close();
     for (const client of clients.keys()) client.terminate();
     await new Promise<void>(resolve => wss.close(() => resolve()));
