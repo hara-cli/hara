@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { HaraStorageQuota } from "../dist/storage/quota.js";
+import { spawn } from "node:child_process";
 import { request as httpRequest } from "node:http";
-import { mkdtempSync, realpathSync, readdirSync, readFileSync, statSync, writeFileSync, symlinkSync, linkSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, readdirSync, readFileSync, statSync, writeFileSync, mkdirSync, symlinkSync, linkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentHubStore } from "../dist/agent-hub/store.js";
@@ -11,7 +13,7 @@ import { AgentHubError } from "../dist/agent-hub/errors.js";
 import { parseHubAttachments, HUB_LIMITS } from "../dist/agent-hub/attachments.js";
 import { startAgentHubIngress } from "../dist/agent-hub/ingress.js";
 import { writeAgentHubCredential } from "../dist/agent-hub/credentials.js";
-import { ensurePrivateStateSubdirectory } from "../dist/security/private-state.js";
+import { bindPrivateHaraStateFile, writePrivateStateBytesOnceSync, ensurePrivateStateSubdirectory } from "../dist/security/private-state.js";
 
 // Test-only shapes exercise the storage port while C0 owns production actor/receipt definitions.
 const boundary = {
@@ -28,7 +30,8 @@ function fixture(t, extra = {}) {
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const agents = new Map([[agentA.agentId, { ...agentA }], [agentB.agentId, { ...agentB }]]);
   const directory = { registeredAgent: id => agents.get(id) ?? null };
-  const options = { home, directory, boundary, assertCurrent() {}, scopeKey: "a".repeat(64), generation: "b4c24374-7200-4e28-9373-1df781c606e8", ...extra }, hub = new AgentHubStore(options);
+  const globalQuota = new HaraStorageQuota({ home, limitBytes: extra.globalQuotaBytes ?? 64 * 1024 * 1024 });
+  const options = { home, directory, boundary, globalQuota, assertCurrent() {}, scopeKey: "a".repeat(64), generation: "b4c24374-7200-4e28-9373-1df781c606e8", ...extra }, hub = new AgentHubStore(options);
   return { home, hub, agents, options, state: join(home, ".hara", "agent-hub", options.scopeKey) };
 }
 const post = (from = "agent-a", text = "display only", requestId = randomUUID(), attachments = []) => ({ requestId, from, text, attachments });
@@ -41,14 +44,15 @@ test("passive mailbox stores approval-looking text, derived source, unread and p
   const receipt = hub.receive(grant.token, body);
   assert.equal(receipt.seq, 1); assert.equal(hub.unread(grant.connectionId), 1);
   const visible = hub.messages(grant.connectionId);
-  assert.deepEqual(visible[0].source, boundary.externalSource(agentA)); assert.equal(visible[0].text, body.text);
+  assert.deepEqual(visible[0].source, boundary.externalSource(agentA)); assert.equal(hub.readText(grant.connectionId, receipt.messageId), body.text);
+  assert.equal(Object.hasOwn(visible[0], "text"), false);
   assert.equal(hub.receipt(grant.token, body.requestId).messageId, receipt.messageId);
   for (const name of readdirSync(state)) {
     assert.equal(readFileSync(join(state, name), "utf8").includes(grant.token), false);
     if (process.platform !== "win32") assert.equal(statSync(join(state, name)).mode & 0o777, 0o600);
   }
   if (process.platform !== "win32") assert.equal(statSync(state).mode & 0o777, 0o700);
-  assert.deepEqual(readdirSync(join(home, ".hara")), ["agent-hub"]);
+  assert.deepEqual(readdirSync(join(home, ".hara")).sort(), ["agent-hub", "storage-quota"]);
   visible[0].source.testExternalSource = "forged";
   assert.equal(hub.messages(grant.connectionId)[0].source.testExternalSource, agentA.agentId);
 });
@@ -153,6 +157,7 @@ test("narrow HTTP authenticates before body processing and exposes no Workspace/
   assert.equal((await request("/v1/agent-hub/messages", body, { Origin: "https://untrusted.example" })).status, 401);
   assert.equal((await request("/workspace.session.send")).status, 400);
   assert.equal((await request("/workspace.agentHub.connections.create")).status, 400);
+  assert.equal((await request("/v1/agent-hub/cleanup", { approved: true })).status, 400);
   assert.equal((await request("/v1/agent-hub/messages")).status, 200);
   const receipt = await (await request("/v1/agent-hub/receipts", { requestId: body.requestId })).json();
   assert.equal(receipt.testSavedReceipt, true); assert.equal(hub.unread(grant.connectionId), 1);
@@ -179,7 +184,7 @@ test("revocation while an authenticated request body is streaming prevents commi
   assert.equal(await response, 401); assert.equal(hub.unread(grant.connectionId), 0);
 });
 
-test("attachment bytes survive source deletion; display projection never includes inline base64", t => {
+test("attachment bytes survive source deletion; display projection never includes inline base64", async t => {
   const f = fixture(t), grant = f.hub.issueGrant(agentA.agentId), source = join(f.home, "report.txt");
   writeFileSync(source, "explicit report");
   const body = post("agent-a", "", randomUUID(), [{ name: "report.txt", mime: "text/plain", base64: readFileSync(source).toString("base64") }]);
@@ -187,8 +192,9 @@ test("attachment bytes survive source deletion; display projection never include
   const message = new AgentHubStore(f.options).messages(grant.connectionId)[0];
   assert.equal(message.attachments[0].bytes, Buffer.byteLength("explicit report"));
   assert.equal(Object.hasOwn(message.attachments[0], "base64"), false);
-  const files = readdirSync(f.state).filter(name => name.startsWith("message-"));
-  assert.equal(JSON.parse(readFileSync(join(f.state, files[0]), "utf8")).attachments[0].base64, body.attachments[0].base64);
+  const chunks = [];
+  for await (const chunk of f.hub.readAttachment(grant.connectionId, message.messageId, message.attachments[0].attachmentId)) chunks.push(chunk);
+  assert.equal(Buffer.concat(chunks).toString(), "explicit report");
 });
 
 
@@ -242,4 +248,261 @@ test("authority loss at the atomic publication fence leaves no visible message",
   finally { AgentHubPrivateStore.prototype.write = original; }
   current = true; assert.equal(f.hub.unread(grant.connectionId), 0);
   assert.equal(readdirSync(f.state).filter(name => name.startsWith("message-")).length, 0);
+});
+
+
+function cleaningFixture(t, extra = {}) {
+  const protectedIds = new Set(); const approvals = [];
+  const cleanupAuthority = {
+    canDelete: candidate => !protectedIds.has(candidate.fileId),
+    authorize: (digest, proof) => { assert.equal(proof?.nativeDigest, digest); approvals.push(digest); },
+  };
+  return { ...fixture(t, { cleanupAuthority, ...extra }), protectedIds, approvals };
+}
+const report = (name = "report.txt", bytes = Buffer.from("owned attachment")) => ({ name, mime: "text/plain", base64: bytes.toString("base64") });
+
+test("M1: metadata pagination never reads any body/blob and enforces a serialized page-byte ceiling", t => {
+  const longBoundary = { ...boundary, externalSource: agent => ({ testExternalSource: agent.agentId + "x".repeat(16 * 1024), instance: agent.instanceId }) };
+  const f = fixture(t, { boundary: longBoundary }), grant = f.hub.issueGrant(agentA.agentId);
+  for (let i = 0; i < 20; i++) f.hub.receive(grant.token, post("agent-a", "body " + i, randomUUID(), [report()]));
+  const read = AgentHubPrivateStore.prototype.read, chunk = AgentHubPrivateStore.prototype.readChunk;
+  AgentHubPrivateStore.prototype.read = function(name, ...args) { assert.equal(name.endsWith(".bin"), false); return read.call(this, name, ...args); };
+  AgentHubPrivateStore.prototype.readChunk = () => { throw new Error("a page must never read payload bytes"); };
+  try {
+    const first = f.hub.messages(grant.connectionId, 0, 50, 64 * 1024);
+    assert.ok(first.length > 0 && first.length < 20);
+    assert.ok(Buffer.byteLength(JSON.stringify(first)) <= 64 * 1024);
+    assert.equal(Object.hasOwn(first[0], "text"), false);
+    assert.equal(Object.hasOwn(first[0].attachments[0], "base64"), false);
+    const second = f.hub.messages(grant.connectionId, first.at(-1).seq, 50, 64 * 1024);
+    assert.equal(second[0].seq, first.at(-1).seq + 1);
+    denies(() => f.hub.messages(grant.connectionId, 0, 50, HUB_LIMITS.pageBytes + 1), "invalid_request");
+  } finally { AgentHubPrivateStore.prototype.read = read; AgentHubPrivateStore.prototype.readChunk = chunk; }
+});
+
+test("lazy text has its own bound/hash and legacy inline storage is retained rather than silently migrated", t => {
+  const f = fixture(t), grant = f.hub.issueGrant(agentA.agentId), body = post("agent-a", "z".repeat(HUB_LIMITS.textBytes));
+  const receipt = f.hub.receive(grant.token, body), message = f.hub.messages(grant.connectionId)[0];
+  assert.equal(message.textPreview.length, 160); assert.equal(f.hub.readText(grant.connectionId, receipt.messageId).length, HUB_LIMITS.textBytes);
+  const path = join(f.state, "catalog.json"), raw = readFileSync(path, "utf8"), old = { ...JSON.parse(raw), schema: 1 };
+  writeFileSync(path, JSON.stringify(old), { mode: 0o600 });
+  denies(() => f.hub.unread(grant.connectionId), "store_unavailable");
+  assert.equal(JSON.parse(readFileSync(path, "utf8")).schema, 1);
+});
+
+test("home-wide quota is shared across scopes and cannot be widened by opening another scope", t => {
+  const f = fixture(t, { globalQuotaBytes: 24 * 1024 }), a = f.hub.issueGrant(agentA.agentId);
+  const other = new AgentHubStore({ ...f.options, scopeKey: "b".repeat(64) }), b = other.issueGrant(agentB.agentId);
+  let accepted = 0, refused = false;
+  for (let i = 0; i < 10; i++) {
+    try { (i % 2 ? other : f.hub).receive(i % 2 ? b.token : a.token, post(i % 2 ? "agent-b" : "agent-a", "x".repeat(5000))); accepted++; }
+    catch (error) { assert.equal(error.code, "quota_exceeded"); refused = true; break; }
+  }
+  assert.ok(accepted > 0 && refused); assert.ok(f.options.globalQuota.usageBytes() <= 24 * 1024);
+  const wider = new AgentHubStore({ ...f.options, globalQuota: new HaraStorageQuota({ home: f.home, limitBytes: 128 * 1024 * 1024 }) });
+  denies(() => wider.authorize(a.token), "store_unavailable");
+});
+
+test("global quota includes existing non-Hub Hara storage; full global storage still permits revocation", t => {
+  const f = fixture(t, { globalQuotaBytes: 16 * 1024 }), grant = f.hub.issueGrant(agentA.agentId);
+  const other = join(f.home, ".hara", "other-domain"); mkdirSync(other, { mode: 0o700 });
+  const retained = join(other, "retained.bin"); writeFileSync(retained, Buffer.alloc(20 * 1024, 65), { mode: 0o600 });
+  denies(() => f.hub.receive(grant.token, post()), "quota_exceeded");
+  f.hub.revokeGrant(grant.connectionId); denies(() => f.hub.authorize(grant.token), "unauthorized");
+  assert.equal(statSync(retained).size, 20 * 1024);
+});
+
+test("global census refuses unknown symbolic links without reading or cleaning their targets", t => {
+  const f = fixture(t), grant = f.hub.issueGrant(agentA.agentId), outside = join(f.home, "outside-retained");
+  writeFileSync(outside, "retained", { mode: 0o600 }); symlinkSync(outside, join(f.home, ".hara", "unknown-alias"));
+  denies(() => f.hub.receive(grant.token, post()), "store_unavailable"); assert.equal(readFileSync(outside, "utf8"), "retained");
+});
+
+test("cleanup requires native exact-plan confirmation, leaves tombstones and preserves text, receipts and originals", t => {
+  const f = cleaningFixture(t), grant = f.hub.issueGrant(agentA.agentId), source = join(f.home, "original.txt");
+  writeFileSync(source, "original stays", { mode: 0o600 });
+  const body = post("agent-a", "retained text", randomUUID(), [report("a.txt", Buffer.alloc(4096, 65)), report("b.txt", Buffer.alloc(4096, 66))]);
+  const receipt = f.hub.receive(grant.token, body), plan = f.hub.planAttachmentCleanup(8192);
+  assert.equal(plan.candidates.length, 2); assert.equal(f.approvals.length, 0);
+  denies(() => f.hub.cleanupAttachments(plan, { approved: true }), "unauthorized");
+  assert.equal(f.hub.messages(grant.connectionId)[0].attachments[0].state, "available");
+  const result = f.hub.cleanupAttachments(plan, { nativeDigest: plan.digest });
+  assert.equal(result.complete, true); assert.equal(result.processedFiles, 2); assert.equal(result.removedPayloadBytes, 8192);
+  assert.deepEqual(f.hub.cleanupAttachments(plan, null), result); assert.equal(f.approvals.length, 1);
+  const visible = f.hub.messages(grant.connectionId)[0]; assert.deepEqual(visible.attachments.map(row => row.state), ["expired", "expired"]);
+  assert.equal(f.hub.readText(grant.connectionId, receipt.messageId), "retained text");
+  assert.deepEqual(f.hub.receive(grant.token, body), receipt); assert.equal(readFileSync(source, "utf8"), "original stays");
+});
+
+test("cleanup picks oldest eligible copies and rechecks active/protected references after preview", t => {
+  let time = new Date("2026-11-11T00:00:00.000Z");
+  const f = cleaningFixture(t, { now: () => time }), grant = f.hub.issueGrant(agentA.agentId);
+  f.hub.receive(grant.token, post("agent-a", "old", randomUUID(), [report("old.txt", Buffer.alloc(2048, 65))]));
+  time = new Date("2026-11-11T00:01:00.000Z");
+  f.hub.receive(grant.token, post("agent-a", "new", randomUUID(), [report("new.txt", Buffer.alloc(2048, 66))]));
+  const plan = f.hub.planAttachmentCleanup(1); assert.equal(plan.candidates[0].name, "old.txt");
+  f.protectedIds.add(plan.candidates[0].fileId);
+  denies(() => f.hub.cleanupAttachments(plan, { nativeDigest: plan.digest }), "unauthorized");
+  assert.equal(f.hub.planAttachmentCleanup(1).candidates[0].name, "new.txt");
+  assert.equal(f.hub.messages(grant.connectionId)[0].attachments[0].state, "available");
+});
+
+test("a durable read lease prevents cleanup while an attachment streams in bounded chunks", async t => {
+  const f = cleaningFixture(t), grant = f.hub.issueGrant(agentA.agentId), bytes = Buffer.alloc(150 * 1024, 65);
+  const receipt = f.hub.receive(grant.token, post("agent-a", "", randomUUID(), [report("large.txt", bytes)]));
+  const attachment = f.hub.messages(grant.connectionId)[0].attachments[0];
+  const reader = f.hub.readAttachment(grant.connectionId, receipt.messageId, attachment.attachmentId);
+  const first = await reader.next(); assert.equal(first.value.length, HUB_LIMITS.chunkBytes);
+  assert.equal(new AgentHubStore(f.options).planAttachmentCleanup(1).candidates.length, 0);
+  const chunks = [first.value]; for await (const chunk of reader) { assert.ok(chunk.length <= HUB_LIMITS.chunkBytes); chunks.push(chunk); }
+  assert.deepEqual(Buffer.concat(chunks), bytes); assert.equal(readdirSync(f.state).filter(name => name.startsWith("reader-")).length, 0);
+  assert.equal(f.hub.planAttachmentCleanup(1).candidates.length, 1);
+});
+
+test("cleanup handles unpublished attachment orphans, and a retry restores only the required immutable copy", t => {
+  const f = cleaningFixture(t), grant = f.hub.issueGrant(agentA.agentId), body = post("agent-a", "recovery text", randomUUID(), [report("orphan.txt", Buffer.alloc(4096, 65))]);
+  const write = AgentHubPrivateStore.prototype.write;
+  AgentHubPrivateStore.prototype.write = function(name, ...args) { if (name === "catalog.json") throw new Error("interrupted publication"); return write.call(this, name, ...args); };
+  try { denies(() => f.hub.receive(grant.token, body), "store_unavailable"); } finally { AgentHubPrivateStore.prototype.write = write; }
+  const plan = f.hub.planAttachmentCleanup(1); assert.equal(plan.candidates[0].unpublished, true);
+  const cleared = f.hub.cleanupAttachments(plan, { nativeDigest: plan.digest });
+  assert.equal(readdirSync(f.state).filter(name => name.startsWith("body-")).length, 1);
+  const receipt = new AgentHubStore(f.options).receive(grant.token, body);
+  assert.equal(receipt.seq, 1); assert.equal(f.hub.messages(grant.connectionId)[0].attachments[0].state, "available");
+  assert.deepEqual(f.hub.cleanupAttachments(plan, null), cleared);
+  assert.equal(f.hub.messages(grant.connectionId)[0].attachments[0].state, "available");
+});
+
+test("an interrupted cleanup reconciles its exact journal without re-deleting or losing the message", t => {
+  const f = cleaningFixture(t), grant = f.hub.issueGrant(agentA.agentId);
+  f.hub.receive(grant.token, post("agent-a", "keep", randomUUID(), [report("large.txt", Buffer.alloc(4096, 65))]));
+  const plan = f.hub.planAttachmentCleanup(1), remove = AgentHubPrivateStore.prototype.remove;
+  AgentHubPrivateStore.prototype.remove = function(name, ...args) { remove.call(this, name, ...args); throw new Error("crash after unlink"); };
+  try { denies(() => f.hub.cleanupAttachments(plan, { nativeDigest: plan.digest }), "store_unavailable"); }
+  finally { AgentHubPrivateStore.prototype.remove = remove; }
+  const restarted = new AgentHubStore(f.options), result = restarted.cleanupAttachments(plan, { nativeDigest: plan.digest });
+  assert.equal(result.complete, true); assert.equal(result.alreadyMissingFiles, 1);
+  assert.equal(restarted.messages(grant.connectionId)[0].attachments[0].state, "expired");
+});
+
+test("cleanup refuses stale catalogs and replaced inodes without deleting replacement data", t => {
+  const f = cleaningFixture(t), grant = f.hub.issueGrant(agentA.agentId);
+  f.hub.receive(grant.token, post("agent-a", "first", randomUUID(), [report("large.txt", Buffer.alloc(4096, 65))]));
+  const stale = f.hub.planAttachmentCleanup(1);
+  f.hub.receive(grant.token, post("agent-a", "new arrival"));
+  denies(() => f.hub.cleanupAttachments(stale, { nativeDigest: stale.digest }), "conflict");
+  const plan = f.hub.planAttachmentCleanup(1), target = join(f.state, plan.candidates[0].fileId);
+  rmSync(target); writeFileSync(target, Buffer.alloc(4096, 66), { mode: 0o600 });
+  denies(() => f.hub.cleanupAttachments(plan, { nativeDigest: plan.digest }), "conflict");
+  assert.equal(readFileSync(target)[0], 66);
+});
+
+
+test("confirmed cleanup can reduce an already-full global budget without touching another Hara domain", t => {
+  const f = cleaningFixture(t, { globalQuotaBytes: 24 * 1024 }), grant = f.hub.issueGrant(agentA.agentId);
+  f.hub.receive(grant.token, post("agent-a", "keep", randomUUID(), [report("owned.txt", Buffer.alloc(8192, 65))]));
+  const retained = join(f.home, ".hara", "retained-other.bin"); writeFileSync(retained, Buffer.alloc(30 * 1024, 66), { mode: 0o600 });
+  const before = f.hub.storageUsage().globalBytes;
+  const plan = f.hub.planAttachmentCleanup(1); f.hub.cleanupAttachments(plan, { nativeDigest: plan.digest });
+  assert.ok(f.hub.storageUsage().globalBytes < before); assert.equal(statSync(retained).size, 30 * 1024);
+});
+
+test("unpublished blob cleanup before metadata exists preserves text recovery and accepts the same retry", t => {
+  const f = cleaningFixture(t), grant = f.hub.issueGrant(agentA.agentId), body = post("agent-a", "retained orphan text", randomUUID(), [report("orphan.txt", Buffer.alloc(4096, 65))]);
+  const write = AgentHubPrivateStore.prototype.write;
+  AgentHubPrivateStore.prototype.write = function(name, ...args) { if (name.startsWith("message-")) throw new Error("crash before metadata"); return write.call(this, name, ...args); };
+  try { denies(() => f.hub.receive(grant.token, body), "store_unavailable"); } finally { AgentHubPrivateStore.prototype.write = write; }
+  const plan = f.hub.planAttachmentCleanup(1); assert.equal(plan.candidates[0].messageKey, null);
+  const original = f.hub.cleanupAttachments(plan, { nativeDigest: plan.digest });
+  const receipt = f.hub.receive(grant.token, body);
+  assert.equal(f.hub.readText(grant.connectionId, receipt.messageId), body.text);
+  assert.deepEqual(f.hub.cleanupAttachments(plan, null), original);
+  assert.equal(f.hub.messages(grant.connectionId)[0].attachments[0].state, "available");
+});
+
+test("attachment checksum failure releases its read lease and never lifts preview quarantine", async t => {
+  const f = cleaningFixture(t), grant = f.hub.issueGrant(agentA.agentId);
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64");
+  const receipt = f.hub.receive(grant.token, post("agent-a", "", randomUUID(), [{ name: "blob.png", mime: "image/png", base64: png.toString("base64") }]));
+  const message = f.hub.messages(grant.connectionId)[0], candidate = f.hub.planAttachmentCleanup(1).candidates[0];
+  const corrupt = Buffer.from(png); corrupt[corrupt.length - 1] ^= 1;
+  writeFileSync(join(f.state, candidate.fileId), corrupt, { mode: 0o600 });
+  await assert.rejects(async () => { for await (const _ of f.hub.readAttachment(grant.connectionId, receipt.messageId, message.attachments[0].attachmentId)) {} }, error => error.code === "store_unavailable");
+  assert.equal(readdirSync(f.state).filter(name => name.startsWith("reader-")).length, 0);
+  assert.equal(f.hub.messages(grant.connectionId)[0].attachments[0].preview, "quarantined");
+});
+
+test("two Core processes share one quota lock instead of each accepting a full independent budget", async t => {
+  const limit = 30 * 1024, f = fixture(t, { globalQuotaBytes: limit }), a = f.hub.issueGrant(agentA.agentId);
+  const other = new AgentHubStore({ ...f.options, scopeKey: "b".repeat(64) }), b = other.issueGrant(agentB.agentId);
+  const program = `
+    import { AgentHubStore } from './dist/agent-hub/store.js';
+    import { HaraStorageQuota } from './dist/storage/quota.js';
+    const fixture = JSON.parse(process.env.HUB_QUOTA_FIXTURE);
+    const boundary = {
+      externalSource: agent => ({ testExternalSource: agent.agentId, instance: agent.instanceId }),
+      isExternalSource: value => !!value && typeof value.testExternalSource === 'string' && typeof value.instance === 'string' && Object.keys(value).length === 2,
+      savedReceipt: facts => ({ testSavedReceipt: true, ...facts }),
+      isSavedReceipt: value => !!value && value.testSavedReceipt === true && typeof value.messageId === 'string' && Number.isSafeInteger(value.seq)
+    };
+    const store = new AgentHubStore({ home: fixture.home, scopeKey: fixture.scopeKey, generation: fixture.generation,
+      directory: { registeredAgent: id => id === fixture.agent.agentId ? fixture.agent : null }, boundary, assertCurrent() {},
+      globalQuota: new HaraStorageQuota({ home: fixture.home, limitBytes: fixture.limit }) });
+    let result;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try { store.receive(fixture.token, fixture.body); result = 'saved'; break; }
+      catch (error) { result = error.code; if (result !== 'store_unavailable') break; await new Promise(resolve => setTimeout(resolve, 40)); }
+    }
+    process.stdout.write(result);
+  `;
+  const child = (scopeKey, grant, agent) => new Promise((resolve, reject) => {
+    const fixture = { home: f.home, scopeKey, generation: f.options.generation, limit, token: grant.token, agent,
+      body: post(agent.alias, "x".repeat(18 * 1024)) };
+    const processChild = spawn(process.execPath, ["--input-type=module", "-e", program], { cwd: new URL("..", import.meta.url),
+      env: { PATH: process.env.PATH ?? "", TMPDIR: process.env.TMPDIR ?? tmpdir(), HOME: f.home, USERPROFILE: f.home, HUB_QUOTA_FIXTURE: JSON.stringify(fixture) }, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = ""; processChild.stdout.on("data", data => { stdout += data; }); processChild.stderr.on("data", data => { stderr += data; });
+    processChild.on("error", reject); processChild.on("exit", code => code === 0 ? resolve(stdout) : reject(new Error(stderr.slice(0, 300))));
+  });
+  const results = await Promise.all([child("a".repeat(64), a, agentA), child("b".repeat(64), b, agentB)]);
+  assert.deepEqual(results.sort(), ["quota_exceeded", "saved"]); assert.ok(f.options.globalQuota.usageBytes() <= limit);
+});
+
+
+test("the global policy also meters registered Hara-owned storage outside the default private home", t => {
+  const home = realpathSync.native(mkdtempSync(join(tmpdir(), "hara-quota-home-")));
+  const owned = realpathSync.native(mkdtempSync(join(tmpdir(), "hara-quota-owned-")));
+  t.after(() => { rmSync(home, { recursive: true, force: true }); rmSync(owned, { recursive: true, force: true }); });
+  const info = statSync(owned), root = { path: owned, dev: info.dev, ino: info.ino };
+  const quota = new HaraStorageQuota({ home, limitBytes: 16 * 1024, additionalRoots: [root] });
+  quota.run(() => quota.admitGrowth(0));
+  writeFileSync(join(owned, "owned-retained.bin"), Buffer.alloc(20 * 1024), { mode: 0o600 });
+  assert.throws(() => quota.run(() => quota.admitGrowth(1)), error => error.code === "quota_exceeded");
+  const missingRoot = new HaraStorageQuota({ home, limitBytes: 16 * 1024 });
+  assert.throws(() => missingRoot.run(() => {}), error => error.code === "configuration_conflict");
+  assert.equal(statSync(join(owned, "owned-retained.bin")).size, 20 * 1024);
+});
+
+
+test("binary staging rechecks authority after fsync and refuses async fences before publication", t => {
+  const f = fixture(t), binding = bindPrivateHaraStateFile(f.home, ["binary-fence"], "asset.bin");
+  let checks = 0;
+  assert.throws(() => writePrivateStateBytesOnceSync(binding, Buffer.from("must not publish"), {
+    assertCurrent() { if (++checks === 2) throw new Error("revoked after staging"); },
+  }), /revoked after staging/);
+  assert.equal(checks, 2); assert.deepEqual(readdirSync(binding.directory.path), []);
+  assert.throws(() => writePrivateStateBytesOnceSync(binding, Buffer.from("must not publish"), { assertCurrent: async () => {} }), /synchronous/);
+  assert.deepEqual(readdirSync(binding.directory.path), []);
+});
+
+
+test("revocation of a large catalog remains possible at both full local and full global quotas", t => {
+  const padded = { ...boundary, savedReceipt: facts => ({ testSavedReceipt: true, ...facts, fixturePadding: "x".repeat(96 * 1024) }) };
+  const f = fixture(t, { globalQuotaBytes: 256 * 1024, boundary: padded }), grant = f.hub.issueGrant(agentA.agentId);
+  f.hub.receive(grant.token, post());
+  assert.ok(statSync(join(f.state, "catalog.json")).size > 64 * 1024);
+  const retained = join(f.home, ".hara", "other-retained.bin"); writeFileSync(retained, Buffer.alloc(200 * 1024), { mode: 0o600 });
+  assert.ok(f.hub.storageUsage().globalBytes > f.options.globalQuota.limitBytes);
+  const limited = new AgentHubStore({ ...f.options, quotaBytes: 4096 });
+  limited.revokeGrant(grant.connectionId); denies(() => limited.authorize(grant.token), "unauthorized");
+  assert.equal(statSync(retained).size, 200 * 1024);
 });

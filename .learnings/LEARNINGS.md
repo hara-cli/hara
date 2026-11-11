@@ -1452,3 +1452,22 @@ Classify native runtime evidence at the process boundary and project only closed
 When combining reviewed slices, update shipped operation cards and exact-schema fixtures together: the compact roster is a five-column row table, agent_create accepts an editable optional project draft, and safe failure diagnostics may carry the bounded first line. Codex adds a separate system reminder after tool JSON; parse the receipt boundary without weakening receipt ownership checks. Explicit colleague creation now ends on the consumed Host receipt, while generic creation tests must retain the native second-create refusal. Cover the next message after early completion independently.
 
 Node's file deadline is cumulative. Partition unchanged multi-turn cases into exhaustive tracked entry files with shared registrars rather than increasing deadlines or skipping cases. Test a large mock roster's ordering on the controlled transport and retain separate full Pi channel coverage using its channel-scoped conversation and native stage evidence; a direct-message snapshot is a different session. Keep process-inventory and descendant-drain failures closed, and retain original failure logs when correcting fixture or harness issues.
+
+
+## [LRN-20261111-HUB-METADATA] best_practice
+
+**Priority**: high
+**Status**: resolved
+**Area**: backend
+
+### Summary
+A metadata projection must not first deserialize every attachment payload in a page.
+
+### Details
+The Agent Hub first draft removed base64 only after reading message envelopes. Review M1 identified that a bounded item count still permits excessive decoding and transient memory. Store text/attachments separately, page only bounded metadata, enforce serialized byte budgets, and stream one explicitly selected payload. Instrument payload readers to fail during list tests instead of relying only on the returned DTO shape.
+
+### Metadata
+- Source: user_feedback
+- Related Files: src/agent-hub/store.ts, src/agent-hub/private-store.ts
+- Pattern-Key: storage.metadata_pages_never_read_blobs
+- Resolution: PR #44 follow-up implements metadata-only pages and on-demand chunked payload reads.

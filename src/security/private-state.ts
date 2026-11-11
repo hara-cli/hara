@@ -816,8 +816,11 @@ function syncPrivateDirectory(path: string): void {
 export function writePrivateStateBytesOnceSync(
   binding: PrivateStateFileBinding,
   bytes: Uint8Array,
+  options: Pick<PrivateStateWriteOptions, "assertCurrent"> = {},
 ): void {
   privateStateMutations++;
+  const assertCurrent = () => { if (options.assertCurrent?.() !== undefined) throw new Error("private state authority fence must be synchronous and return void"); };
+  assertCurrent();
   const { directory, path } = binding;
   if (currentPrivateWriteObserver()) throw new Error("Binary writes are not part of a text inheritance transaction");
   verifyPrivateDirectory(directory);
@@ -853,6 +856,7 @@ export function writePrivateStateBytesOnceSync(
     fd = undefined;
 
     verifyPrivateDirectory(directory);
+    assertCurrent();
     try {
       linkSync(temp, path);
     } catch (error: any) {

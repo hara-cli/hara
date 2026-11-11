@@ -1,7 +1,10 @@
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { AgentHubPrivateStore } from "./private-store.js";
 import { AgentHubError, exact, hubAssert, plain } from "./errors.js";
 import { HUB_LIMITS, parseHubAttachments, sha256 } from "./attachments.js";
+import { payloadDigest, parseHubMetadata, storedAttachments, textPreview } from "./metadata.js";
+import { planHubCleanup, applyHubCleanup, type HubCleanupAuthority, type HubCleanupPlan } from "./cleanup.js";
+import type { HaraStorageQuota } from "../storage/quota.js";
 import type { AgentHubBoundaryContract, AgentHubDirectory, HubStoredMessage, HubVisibleMessage, RegisteredHubAgent } from "./contracts.js";
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -9,7 +12,7 @@ const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/;
 const HEX = /^[a-f0-9]{64}$/;
 interface Grant { connectionId: string; agent: RegisteredHubAgent; epoch: number; generation: string; tokenHash: string; revoked: boolean }
 interface Entry<R> { key: string; connectionId: string; requestId: string; messageId: string; digest: string; seq: number; receipt: R }
-interface Catalog<R> { schema: 1; nextSeq: number; grants: Grant[]; entries: Entry<R>[]; read: Record<string, number> }
+interface Catalog<R> { schema: 2; nextSeq: number; grants: Grant[]; entries: Entry<R>[]; read: Record<string, number> }
 export interface AgentHubOptions<S, R> {
   /** Explicit Host-owned home, never derived from an ingress request. */
   home: string;
@@ -18,6 +21,7 @@ export interface AgentHubOptions<S, R> {
   /** C1 Host authority check. A C0 syntax parser or client-declared capability is not this proof. */
   assertCurrent(): void;
   directory: AgentHubDirectory; boundary: AgentHubBoundaryContract<S, R>;
+  globalQuota: HaraStorageQuota; cleanupAuthority?: HubCleanupAuthority;
   quotaBytes?: number; now?: () => Date;
 }
 function validAgent(value: unknown): value is RegisteredHubAgent {
@@ -34,7 +38,7 @@ export class AgentHubStore<S, R> {
   private readonly quota: number;
   constructor(private readonly options: AgentHubOptions<S, R>) {
     hubAssert(HEX.test(options.scopeKey) && UUID.test(options.generation));
-    this.disk = new AgentHubPrivateStore(options.home, options.scopeKey);
+    this.disk = new AgentHubPrivateStore(options.home, options.scopeKey, options.globalQuota);
     this.quota = options.quotaBytes ?? HUB_LIMITS.quotaBytes;
     hubAssert(Number.isSafeInteger(this.quota) && this.quota >= 4096 && this.quota <= HUB_LIMITS.quotaBytes);
   }
@@ -49,10 +53,10 @@ export class AgentHubStore<S, R> {
     const text = this.disk.read("catalog.json");
     if (text === null) {
       hubAssert(this.disk.usage().messages === 0, "store_unavailable");
-      return { text, value: { schema: 1, nextSeq: 1, grants: [], entries: [], read: {} } };
+      return { text, value: { schema: 2, nextSeq: 1, grants: [], entries: [], read: {} } };
     }
     const value: unknown = JSON.parse(text);
-    hubAssert(plain(value) && exact(value, ["schema", "nextSeq", "grants", "entries", "read"]) && value.schema === 1
+    hubAssert(plain(value) && exact(value, ["schema", "nextSeq", "grants", "entries", "read"]) && value.schema === 2
       && Number.isSafeInteger(value.nextSeq) && Number(value.nextSeq) >= 1 && plain(value.read)
       && Array.isArray(value.grants) && value.grants.length <= HUB_LIMITS.connections
       && Array.isArray(value.entries) && value.entries.length <= HUB_LIMITS.messages, "store_unavailable");
@@ -84,7 +88,7 @@ export class AgentHubStore<S, R> {
     hubAssert(Buffer.byteLength(next) <= HUB_LIMITS.catalogBytes, "quota_exceeded");
     // Include the replacement staging file in the peak budget; do not silently evict user content.
     if (!revoking) hubAssert(this.disk.usage().bytes + additionalBytes + Buffer.byteLength(next) <= this.quota, "quota_exceeded");
-    this.disk.write("catalog.json", next, previous, fence);
+    this.disk.write("catalog.json", next, previous, fence, revoking);
   }
   private registered(agentId: string): RegisteredHubAgent {
     let agent: RegisteredHubAgent | null;
@@ -141,48 +145,53 @@ export class AgentHubStore<S, R> {
         && Buffer.from(input.text).toString("utf8") === input.text);
       const attachments = parseHubAttachments(input.attachments);
       hubAssert(input.text.trim().length > 0 || attachments.length > 0);
-      const digest = sha256(JSON.stringify({ text: input.text, attachments }));
-      // Stable across credential rotation: an ACK lost before rotation must not create a second message.
-      const key = sha256(`${grant.connectionId}:${input.requestId}`);
+      const textHash = sha256(input.text), digest = payloadDigest(textHash, attachments), key = sha256(`${grant.connectionId}:${input.requestId}`);
       const prior = value.entries.find(row => row.key === key);
       if (prior) { hubAssert(prior.digest === digest, "conflict"); return copy(prior.receipt); }
-      hubAssert(value.entries.length < HUB_LIMITS.messages, "quota_exceeded");
+      hubAssert(value.entries.length < HUB_LIMITS.messages && value.nextSeq < Number.MAX_SAFE_INTEGER, "quota_exceeded");
       const filename = `message-${key}.json`, orphan = this.disk.read(filename);
       let message: HubStoredMessage<S>;
       if (orphan !== null) {
-        message = this.parseMessage(orphan);
+        message = parseHubMetadata(orphan, key, this.options.boundary);
         hubAssert(message.connectionId === grant.connectionId && message.requestId === input.requestId && message.digest === digest, "conflict");
       } else {
         const source = this.options.boundary.externalSource(copy(grant.agent));
         hubAssert(this.options.boundary.isExternalSource(source), "store_unavailable");
-        message = { schema: 1, messageId: randomUUID(), requestId: input.requestId, connectionId: grant.connectionId,
-          digest, source, receivedAt: (this.options.now?.() ?? new Date()).toISOString(), text: input.text, attachments };
+        message = { schema: 2, messageId: randomUUID(), requestId: input.requestId, connectionId: grant.connectionId, digest, source,
+          receivedAt: (this.options.now?.() ?? new Date()).toISOString(),
+          text: { fileId: `body-${key}.bin`, bytes: Buffer.byteLength(input.text), sha256: textHash, preview: textPreview(input.text) },
+          attachments: storedAttachments(key, attachments) };
       }
+      const encoded = JSON.stringify(message); hubAssert(Buffer.byteLength(encoded) <= HUB_LIMITS.metadataBytes, "quota_exceeded");
       const seq = value.nextSeq++, receipt = this.options.boundary.savedReceipt({ messageId: message.messageId,
         requestId: message.requestId, connectionId: grant.connectionId, seq, savedAt: message.receivedAt });
       hubAssert(this.options.boundary.isSavedReceipt(receipt), "store_unavailable");
       value.entries.push({ key, connectionId: grant.connectionId, requestId: message.requestId, messageId: message.messageId, digest, seq, receipt });
-      const encoded = JSON.stringify(message), additional = orphan === null ? Buffer.byteLength(encoded) : 0;
-      hubAssert(this.disk.usage().bytes + additional + Buffer.byteLength(JSON.stringify(value)) <= this.quota, "quota_exceeded");
-      this.current(grant);
-      if (orphan === null) this.disk.write(filename, encoded, null, () => this.current(grant));
-      // A crash here leaves one deterministic orphan. Retry verifies/reuses it; it is quota-accounted.
-      this.write(value, previous, 0, false, () => this.current(grant));
-      return copy(receipt);
+      const blobs = [{ fileId: message.text.fileId, bytes: Buffer.from(input.text), digest: textHash },
+        ...message.attachments.map((row, index) => ({ fileId: row.fileId, bytes: Buffer.from(attachments[index].base64, "base64"), digest: row.sha256 }))];
+      const additional = (orphan === null ? Buffer.byteLength(encoded) : 0)
+        + blobs.reduce((sum, row) => sum + (this.disk.inspect(row.fileId) ? 0 : row.bytes.length), 0);
+      const peak = additional + Buffer.byteLength(JSON.stringify(value));
+      hubAssert(this.disk.usage().bytes + peak <= this.quota, "quota_exceeded");
+      this.options.globalQuota.admitGrowth(peak);
+      const fence = () => this.current(grant);
+      for (const blob of blobs) this.disk.writeBlob(blob.fileId, blob.bytes, blob.digest, fence);
+      if (orphan === null) this.disk.write(filename, encoded, null, fence);
+      // Assets/metadata may be orphaned by a crash; deterministic names permit bounded verified reuse.
+      this.write(value, previous, 0, false, fence); return copy(receipt);
     });
   }
-  private parseMessage(text: string): HubStoredMessage<S> {
-    const value: unknown = JSON.parse(text);
-    hubAssert(plain(value) && exact(value, ["schema", "messageId", "requestId", "connectionId", "digest", "source", "receivedAt", "text", "attachments"])
-      && value.schema === 1 && typeof value.messageId === "string" && UUID.test(value.messageId)
-      && typeof value.connectionId === "string" && UUID.test(value.connectionId) && typeof value.requestId === "string" && UUID.test(value.requestId)
-      && typeof value.digest === "string" && HEX.test(value.digest) && this.options.boundary.isExternalSource(value.source)
-      && typeof value.receivedAt === "string" && Number.isFinite(Date.parse(value.receivedAt))
-      && typeof value.text === "string" && Buffer.byteLength(value.text) <= HUB_LIMITS.textBytes && Array.isArray(value.attachments), "store_unavailable");
-    const attachments = parseHubAttachments(value.attachments.map(raw => { hubAssert(plain(raw), "store_unavailable"); return { name: raw.name, mime: raw.mime, base64: raw.base64 }; }));
-    hubAssert(JSON.stringify(attachments) === JSON.stringify(value.attachments)
-      && sha256(JSON.stringify({ text: value.text, attachments })) === value.digest, "store_unavailable");
-    return value as unknown as HubStoredMessage<S>;
+  private metadata(key: string): { value: HubStoredMessage<S>; text: string } {
+    const text = this.disk.read(`message-${key}.json`); hubAssert(text !== null, "store_unavailable");
+    return { text, value: parseHubMetadata(text, key, this.options.boundary) };
+  }
+  private selected(connectionId: string, messageId: string) {
+    hubAssert(UUID.test(connectionId) && UUID.test(messageId));
+    const entry = this.catalog().value.entries.find(row => row.connectionId === connectionId && row.messageId === messageId);
+    hubAssert(entry, "invalid_request"); const meta = this.metadata(entry.key);
+    hubAssert(meta.value.messageId === entry.messageId && meta.value.connectionId === entry.connectionId
+      && meta.value.requestId === entry.requestId && meta.value.digest === entry.digest, "store_unavailable");
+    return { entry, ...meta };
   }
   receipt(token: unknown, requestId: string): R | null {
     return this.transaction(() => {
@@ -190,20 +199,74 @@ export class AgentHubStore<S, R> {
       return copy(value.entries.find(row => row.connectionId === grant.connectionId && row.requestId === requestId)?.receipt ?? null);
     });
   }
-  /** Trusted read side for later Desktop wiring; ingress credentials have no route to these methods. */
-  messages(connectionId: string, afterSeq = 0, limit = 50): HubVisibleMessage<S>[] {
+  /** Metadata only; a page cannot trigger any body/attachment read or exceed its UTF-8 byte budget. */
+  messages(connectionId: string, afterSeq = 0, limit = 50, pageBytes = HUB_LIMITS.pageBytes): HubVisibleMessage<S>[] {
     return this.transaction(() => {
       hubAssert(UUID.test(connectionId) && Number.isSafeInteger(afterSeq) && afterSeq >= 0
-        && Number.isSafeInteger(limit) && limit >= 1 && limit <= 50);
-      return this.catalog().value.entries.filter(row => row.connectionId === connectionId && row.seq > afterSeq).slice(0, limit).map(row => {
-        const raw = this.disk.read(`message-${row.key}.json`); hubAssert(raw !== null, "store_unavailable");
-        const stored = this.parseMessage(raw);
-        hubAssert(stored.messageId === row.messageId && stored.connectionId === row.connectionId && stored.requestId === row.requestId && stored.digest === row.digest, "store_unavailable");
-        const { digest: _, ...visible } = stored;
-        return { ...visible, seq: row.seq, attachments: stored.attachments.map(({ base64: _, ...attachment }) => attachment) };
-      });
+        && Number.isSafeInteger(limit) && limit >= 1 && limit <= 50
+        && Number.isSafeInteger(pageBytes) && pageBytes >= HUB_LIMITS.metadataBytes && pageBytes <= HUB_LIMITS.pageBytes);
+      const results: HubVisibleMessage<S>[] = []; let bytes = 2;
+      for (const row of this.catalog().value.entries.filter(row => row.connectionId === connectionId && row.seq > afterSeq)) {
+        const stored = this.metadata(row.key).value;
+        hubAssert(stored.messageId === row.messageId && stored.connectionId === row.connectionId
+          && stored.requestId === row.requestId && stored.digest === row.digest, "store_unavailable");
+        const item: HubVisibleMessage<S> = { schema: 2, messageId: stored.messageId, requestId: stored.requestId,
+          connectionId: stored.connectionId, source: stored.source, receivedAt: stored.receivedAt, seq: row.seq,
+          textPreview: stored.text.preview, textBytes: stored.text.bytes,
+          attachments: stored.attachments.map(({ fileId: _, ...attachment }) => attachment) };
+        const cost = Buffer.byteLength(JSON.stringify(item)) + (results.length ? 1 : 0);
+        if (bytes + cost > pageBytes) { hubAssert(results.length > 0, "quota_exceeded"); break; }
+        results.push(item); bytes += cost; if (results.length === limit) break;
+      }
+      return results;
     });
   }
+  readText(connectionId: string, messageId: string): string {
+    return this.transaction(() => {
+      const meta = this.selected(connectionId, messageId).value;
+      const bytes = this.disk.readChunk(meta.text.fileId, 0, HUB_LIMITS.chunkBytes, meta.text.bytes);
+      const text = bytes.toString("utf8");
+      hubAssert(Buffer.from(text).equals(bytes) && sha256(bytes) === meta.text.sha256 && textPreview(text) === meta.text.preview, "store_unavailable");
+      return text;
+    });
+  }
+  /** One authorized attachment, streamed in <=64 KiB chunks. A durable lease protects in-flight reads.
+   * Caller verifies stream completion before saving/previewing; quarantine is not lifted by this API. */
+  async *readAttachment(connectionId: string, messageId: string, attachmentId: string): AsyncGenerator<Buffer> {
+    const lease = this.transaction(() => {
+      const attachment = this.selected(connectionId, messageId).value.attachments.find(row => row.attachmentId === attachmentId);
+      hubAssert(attachment && attachment.state === "available", "invalid_request");
+      hubAssert(this.disk.names().filter(name => name.startsWith("reader-")).length < 8, "quota_exceeded");
+      const name = `reader-${randomUUID()}.json`;
+      this.disk.write(name, JSON.stringify({ schemaVersion: 1, fileId: attachment.fileId, readerId: name }), null, () => this.assertCurrent(), true);
+      const snapshot = this.disk.inspect(name); hubAssert(snapshot, "store_unavailable"); return { name, snapshot, attachment };
+    });
+    const hash = createHash("sha256");
+    try {
+      for (let offset = 0; offset < lease.attachment.bytes; offset += HUB_LIMITS.chunkBytes) {
+        const bytes = this.transaction(() => {
+          const current = this.selected(connectionId, messageId).value.attachments.find(row => row.attachmentId === attachmentId);
+          hubAssert(current?.state === "available" && current.fileId === lease.attachment.fileId, "invalid_request");
+          return this.disk.readChunk(current.fileId, offset, HUB_LIMITS.chunkBytes, current.bytes);
+        });
+        hash.update(bytes); yield bytes;
+      }
+      hubAssert(hash.digest("hex") === lease.attachment.sha256, "store_unavailable");
+    } finally {
+      // Releasing this exact private lease does not grant authority or require restoring a revoked scope.
+      this.disk.transaction(() => this.disk.remove(lease.name, lease.snapshot));
+    }
+  }
+  private cleanupAccess() {
+    return { disk: this.disk, scopeKey: this.options.scopeKey, generation: this.options.generation,
+      now: () => this.options.now?.() ?? new Date(), assertCurrent: () => this.assertCurrent(), authority: this.options.cleanupAuthority,
+      catalog: () => { const { value, text } = this.catalog(); return { text, entries: value.entries }; },
+      metadata: (key: string) => this.metadata(key) };
+  }
+  planAttachmentCleanup(targetBytes: number) { return this.transaction(() => planHubCleanup(this.cleanupAccess(), targetBytes)); }
+  cleanupAttachments(plan: HubCleanupPlan, proof: unknown) { return this.transaction(() => applyHubCleanup(this.cleanupAccess(), plan, proof)); }
+  storageUsage() { return this.transaction(() => ({ scopeBytes: this.disk.usage().bytes, scopeLimitBytes: this.quota,
+    globalBytes: this.options.globalQuota.usageBytes(), globalLimitBytes: this.options.globalQuota.limitBytes })); }
   markRead(connectionId: string, throughSeq: number): void {
     this.transaction(() => {
       const { value, text } = this.catalog();

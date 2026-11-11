@@ -19,13 +19,20 @@ export interface AgentHubBoundaryContract<ExternalSource, SavedReceipt> {
   savedReceipt(facts: HubSavedFacts): SavedReceipt;
   isSavedReceipt(value: unknown): value is SavedReceipt;
 }
-export interface HubStoredMessage<ExternalSource> {
-  schema: 1; messageId: string; requestId: string; connectionId: string; digest: string;
-  source: ExternalSource; receivedAt: string; text: string; attachments: HubAttachment[];
+export interface HubStoredAttachment extends Omit<HubAttachment, "base64"> {
+  attachmentId: string; fileId: string; state: "available" | "expired";
 }
-export type HubVisibleMessage<ExternalSource> = Omit<HubStoredMessage<ExternalSource>, "digest" | "attachments"> & {
-  seq: number; attachments: Omit<HubAttachment, "base64">[];
-};
+export interface HubStoredMessage<ExternalSource> {
+  schema: 2; messageId: string; requestId: string; connectionId: string; digest: string;
+  source: ExternalSource; receivedAt: string;
+  text: { fileId: string; bytes: number; sha256: string; preview: string };
+  attachments: HubStoredAttachment[];
+}
+export interface HubVisibleMessage<ExternalSource> {
+  schema: 2; messageId: string; requestId: string; connectionId: string; source: ExternalSource;
+  receivedAt: string; seq: number; textPreview: string; textBytes: number;
+  attachments: Omit<HubStoredAttachment, "fileId">[];
+}
 /** Future G0 egress consumes C0's receipt. No implementation, tmux control or autonomous dispatch here. */
 export interface AgentHubEgressContract<TransportReceipt, UserAction> {
   sendText(input: { operationId: string; agentId: string; instanceId: string; text: string; userAction: UserAction }): Promise<TransportReceipt>;

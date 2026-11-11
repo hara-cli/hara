@@ -3,6 +3,7 @@ import { extname } from "node:path";
 import { AgentHubError, exact, hubAssert, plain } from "./errors.js";
 
 export const HUB_LIMITS = Object.freeze({ textBytes: 32 * 1024, fileBytes: 8 * 1024 * 1024,
+  metadataBytes: 64 * 1024, pageBytes: 256 * 1024, chunkBytes: 64 * 1024,
   files: 4, attachmentBytes: 16 * 1024 * 1024, pixels: 20_000_000, dimension: 8192,
   quotaBytes: 128 * 1024 * 1024, connections: 256, messages: 4096, catalogBytes: 4 * 1024 * 1024 });
 export const HUB_BODY_BYTES = Math.ceil(HUB_LIMITS.attachmentBytes / 3) * 4 + HUB_LIMITS.textBytes * 6 + 64 * 1024;
