@@ -59,7 +59,8 @@ export function lifecycleFixture(t, input = {}) {
     const unbound = createTaskExecution(message, randomUUID()); if (recoveryFrom) unbound.id = recoveryFrom.task.id;
     let task = resources.agents.bindTask(unbound, agent.agentId, agent.configRevision, agent.agentEpoch);
     const sessionId = recoveryFrom?.binding.sessionId ?? (input.fixedSession ? agent.agentId.slice(3) : randomUUID());
-    const expectedClaimRevision = recoveryFrom ? control.inspect(transport, agent.agentId).runs.find(row => row.runId === recoveryFrom.binding.runId).claimRevision : 0;
+    const expectedClaimRevision = recoveryFrom ? (control.inspect(transport, agent.agentId).runs.find(row => row.runId === recoveryFrom.binding.runId)
+      ?? authority.commandControlState().lifecycle?.retiredRuns.find(row => row.runId === recoveryFrom.binding.runId)).claimRevision : 0;
     const recoveryIntent = recoveryFrom ? control.draftRecovery(transport, agent.agentId, { operationId: extras.operationId ?? randomUUID(), previousRunId: recoveryFrom.binding.runId,
       expectedClaimRevision: extras.expectedClaimRevision ?? expectedClaimRevision, commandId: extras.commandId ?? randomUUID(), rootRequestId: extras.rootRequestId ?? randomUUID(), message, lifetimeMs: extras.lifetimeMs ?? 30000 }) : null;
     const command = recoveryIntent?.command ?? draft({ action: "task.dispatch", taskId: task.id, conversationId: sessionId, messageDigest: agentCommandMessageDigest(sessionId, message) }, extras);

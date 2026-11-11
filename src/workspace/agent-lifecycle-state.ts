@@ -101,10 +101,14 @@ export function migrateAgentLifecycleState(control: AgentCommandState, sourceDig
       leaseReleased: run.state === "drained" && run.drainProofRef !== null, recovery: null })),
     operations: [], segments: [], retiredCommands: [], retiredRuns: [] };
 }
-export function assertAgentLifecycleCapacity(state: AgentLifecycleState): void {
-  if (state.executions.length > 128 || state.operations.length > LIFECYCLE_OPERATION_LIMIT || state.segments.length > LIFECYCLE_SEGMENT_LIMIT
+export function assertAgentLifecycleCapacity(state: AgentLifecycleState, control?: AgentCommandState, reserveClosure = false): void {
+  const unfenced = reserveClosure && control ? control.runs.filter(run => !run.hold && !["drained", "unknown", "draining"].includes(run.state)
+    && control.agents.some(agent => agent.agentId === run.agentId && !agent.hold && !agent.dismissed && agent.epoch === run.agentControlEpoch)) : [];
+  const slots = unfenced.length + new Set(unfenced.map(run => run.agentId)).size;
+  const reserve = reserveClosure ? unfenced.length * 8192 + new Set(unfenced.map(run => run.agentId)).size * 4096 + 16384 : 0;
+  if (state.executions.length > 128 || state.operations.length + slots > LIFECYCLE_OPERATION_LIMIT || state.segments.length > LIFECYCLE_SEGMENT_LIMIT
     || state.retiredCommands.length > LIFECYCLE_COMMAND_INDEX_LIMIT || state.retiredRuns.length > LIFECYCLE_RUN_INDEX_LIMIT
-    || Buffer.byteLength(canonical(state)) > LIFECYCLE_STATE_BYTES) return fail("lifecycle.capacity");
+    || Buffer.byteLength(canonical(state)) + reserve > LIFECYCLE_STATE_BYTES) return fail("lifecycle.capacity");
 }
 export function parseAgentLifecycleState(raw: unknown, control: AgentCommandState): AgentLifecycleState {
   fields(raw, ["schemaVersion", "migration", "executions", "operations", "segments", "retiredCommands", "retiredRuns"]);

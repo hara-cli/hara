@@ -101,9 +101,20 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
         || agentPolicyProposalDigest(input.proposal) !== (op.action === "duty.update" ? op.proposedDutyDigest : op.proposedBoundaryDigest))) return fail("COMMAND_ID_CONFLICT", "control.proposal");
       return { receipt: this.currentReceipt(existing.command, existing.receipt, snapshot.control) }; // Fresh reader authentication; never re-admit an expired intent.
     }
+    if (snapshot.lifecycle?.retiredCommands.some(row => row.commandId === parsed.commandId)) {
+      const archived = this.authority.lifecycleHistoricalCommand(snapshot.lifecycle, parsed.commandId);
+      if (canonical(archived.record.command) !== canonical(parsed)) return fail("COMMAND_ID_CONFLICT", "control.command");
+      const op = parsed.operation;
+      if (input.message !== undefined && (op.action !== "task.dispatch" || !messageBody(input.message)
+        || agentCommandMessageDigest(op.conversationId, input.message) !== op.messageDigest)) return fail("COMMAND_ID_CONFLICT", "control.message");
+      if (input.proposal !== undefined && (op.action !== "duty.update" && op.action !== "boundary.update"
+        || agentPolicyProposalDigest(input.proposal) !== (op.action === "duty.update" ? op.proposedDutyDigest : op.proposedBoundaryDigest))) return fail("COMMAND_ID_CONFLICT", "control.proposal");
+      return { receipt: this.currentReceipt(parsed, archived.record.receipt, archived.control, archived.lifecycle) };
+    }
     if (!this.authority.commandControlSourceHealthy()) this.available = false;
     if (!this.available && !restrictive(parsed.operation.action)) return fail("AUTHORITY_UNVERIFIED", "control.source");
     const command = this.authority.authenticateCommandIntent(transport, parsed);
+    if (!restrictive(command.operation.action)) this.authority.assertLifecycleHistory();
     if (command.operation.action === "task.dispatch") {
       if (!messageBody(input.message) || agentCommandMessageDigest(command.operation.conversationId, input.message) !== command.operation.messageDigest) return fail("AUTHORITY_UNVERIFIED", "control.message");
     } else if (input.message !== undefined) return fail("INVALID_DOCUMENT", "control.message");
@@ -143,7 +154,12 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
       if (existing.commandId !== command.commandId || existing.recovery?.requestDigest !== digest) return fail("COMMAND_ID_CONFLICT", "lifecycle.recovery");
       return this.begin(transport, command, input); // Original acceptance only, even after expiry/reconnect.
     }
-    if (lifecycle.retiredRuns.some(row => row.recoveryOperationId === recovery.operationId)) return this.authority.lifecycleHistoricalRecovery(transport, recovery, command, input);
+    const retired = lifecycle.retiredRuns.find(row => row.recoveryOperationId === recovery.operationId);
+    if (retired) {
+      const historical = this.authority.lifecycleHistoricalRun(lifecycle, retired.runId);
+      if (historical.execution.commandId !== command.commandId || historical.execution.recovery?.requestDigest !== digest) return fail("COMMAND_ID_CONFLICT", "lifecycle.recovery");
+      return this.begin(transport, command, input);
+    }
     this.recoveryAnchor(snapshot.control, lifecycle, recovery, this.authority.lifecycleRights(transport, recovery.agentId));
     const begun = this.begin(transport, command, input);
     if ("receipt" in begun) return fail("COMMAND_ID_CONFLICT", "lifecycle.recovery");
@@ -448,6 +464,9 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
     catch (error) { this.available = false; throw error; }
     const record = state.commands.find(row => row.command.commandId === live.command.commandId);
     const run = state.runs.find(row => row.runId === live.binding.runId), agent = state.agents.find(row => row.agentId === live.command.agentId);
+    if (!run && lifecycle?.retiredRuns.some(row => row.runId === live.binding.runId)) {
+      this.authority.lifecycleHistoricalRun(lifecycle, live.binding.runId); return fail("CONTROL_HELD", "lifecycle.retired");
+    }
     if (!run || !agent || !record || canonical(record.command) !== canonical(live.command)
       || canonical(agentCommandRunIdentity(run)) !== canonical(agentCommandRunIdentity(live.accepted)) || run.commandId !== live.command.commandId || run.issuerId !== this.issuerId || run.leaseAttemptId !== live.lease.attemptId
       || run.bindingDigest !== commandDigest(live.binding) || !workspaceRunBindingsEqual(run.binding, live.binding)) { this.available = false; return fail("AUTHORITY_UNVERIFIED", "control.run"); }
@@ -467,12 +486,13 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
     return Object.freeze({ commandId: command.commandId, runId: binding.runId, controlEpoch: command.expected.controlEpoch,
       assertCurrent: () => { this.assertRunCurrent(live); }, ...(this.authority.commandControlState().lifecycle ? { prepareQuiescence: (proof: unknown) => this.observeQuiescence(proof) } : {}) });
   }
-  private currentReceipt(command: AgentBoundaryCommand, original: AgentBoundaryReceipt, state: AgentCommandState): AgentBoundaryReceipt {
+  private currentReceipt(command: AgentBoundaryCommand, original: AgentBoundaryReceipt, state: AgentCommandState,
+    lifecycle = this.authority.commandControlState().lifecycle): AgentBoundaryReceipt {
     const operation = command.operation;
     const found = operation.action === "task.dispatch" ? state.runs.find(run => run.commandId === command.commandId)
       : operation.action === "task.stop" ? state.runs.find(run => run.runId === operation.runId && run.agentId === command.agentId) : undefined;
     if (!found || original.status === "rejected") return original;
-    const terminal = this.authority.commandControlState().lifecycle?.executions.find(row => row.runId === found.runId);
+    const terminal = lifecycle?.executions.find(row => row.runId === found.runId);
     if (terminal?.phase === "aborted_before_execution") return receipt(command, found.epoch, found.hold?.holdId ?? null, "accepted", null, found);
     const run = { ...found }, agent = state.agents.find(row => row.agentId === command.agentId), live = this.live.get(run.runId);
     let started = false;
@@ -652,8 +672,14 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
   readReceipt(transport: Intake["transport"], agentId: string, id: string): AgentBoundaryReceipt {
     if (!commandId(id)) return fail("INVALID_DOCUMENT");
     const snapshot = this.authority.commandControlForReader(transport, agentId), row = snapshot.control.commands.find(row => row.command.commandId === id && row.command.agentId === agentId);
-    if (!row) return fail("AUTHORIZATION_DENIED", "control.receipt"); return this.currentReceipt(row.command, row.receipt, snapshot.control);
+    if (!row) {
+      if (!snapshot.lifecycle?.retiredCommands.some(row => row.commandId === id && row.agentId === agentId)) return fail("AUTHORIZATION_DENIED", "control.receipt");
+      const archived = this.authority.lifecycleHistoricalCommand(snapshot.lifecycle, id);
+      return this.currentReceipt(archived.record.command, archived.record.receipt, archived.control, archived.lifecycle);
+    }
+    return this.currentReceipt(row.command, row.receipt, snapshot.control);
   }
+  archiveLifecycleHistory(transport: Intake["transport"], agentId: string, maximum = 8) { return this.authority.archiveClosedLifecycle(transport, agentId, maximum); }
   lifecycleProjection(transport: Intake["transport"], agentId: string): Readonly<AgentLifecycleProjectionV1> {
     const snapshot = this.authority.commandControlForReader(transport, agentId), lifecycle = snapshot.lifecycle;
     if (!lifecycle) return fail("AUTHORITY_UNVERIFIED", "lifecycle.bootstrap");
@@ -676,6 +702,7 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
         recovery: run.effect === "unknown" || !run.drainProofRef && !this.live.has(run.runId) || ["unknown", "draining"].includes(run.state) ? ["query_original", "request_stop", "await_physical_drain"] : [] })) });
   }
   audit(transport: Intake["transport"], agentId: string) {
-    return this.authority.commandControlForReader(transport, agentId).control.audit.filter(row => row.agentId === agentId);
+    const snapshot = this.authority.commandControlForReader(transport, agentId);
+    return [...snapshot.control.audit.filter(row => row.agentId === agentId), ...(snapshot.lifecycle ? this.authority.lifecycleHistoricalAudit(snapshot.lifecycle, agentId) : [])].sort((a, b) => a.sequence - b.sequence);
   }
 }

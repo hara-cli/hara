@@ -1,9 +1,10 @@
+import { WorkspaceAgentLifecycleHistory } from "./agent-lifecycle-history.js";
 import { assertAgentLifecycleCapacity, assertAgentLifecycleTransition, migrateAgentLifecycleState, parseAgentLifecycleState, type AgentLifecycleState, type AgentLifecycleRun, type AgentLifecycleRecoveryV1 } from "./agent-lifecycle-state.js";
 import { WorkspaceFeatures } from "./features.js";
 import { assertNoWorkspaceLegacyEffects } from "./agent-command-protection.js";
 import { assertNoWorkspaceSessionLeases, withWorkspaceSessionAdmission } from "./session-lease.js";
 import type { WorkspaceRunBinding } from "./run-binding.js";
-import { assertAgentCommandTransition, agentCommandTargetEpoch, agentPolicyProposalDigest, commandDigest, emptyAgentCommandState, parseAgentCommandState, type AgentCommandState, type AgentCommandRun } from "./agent-command-state.js";
+import { assertAgentCommandTransition, agentCommandTargetEpoch, agentPolicyProposalDigest, commandDigest, emptyAgentCommandState, parseAgentCommandState, type AgentCommandState, type AgentCommandRun, type AgentCommandRetirement } from "./agent-command-state.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   AgentBoundaryContractError, agentBoundaryCommandSigningText, assertAgentBoundaryContext, parseAgentBoundaryDocument,
@@ -204,18 +205,19 @@ export class WorkspaceAgentBoundaryAuthority {
       else if (this.controlledStateSeen) { this.controlStorageFailed = true; return fail("AUTHORITY_UNVERIFIED", "control.migrationRecovery"); }
       if (state.schemaVersion === 3) this.lifecycleStateSeen = true;
       else if (this.lifecycleStateSeen) { this.controlStorageFailed = true; return fail("AUTHORITY_UNVERIFIED", "lifecycle.migrationRecovery"); }
-      let next: State;
+      let next: State, retirement: AgentCommandRetirement | undefined;
       try {
         if (state.schemaVersion === 3 && !this.options.lifecycleControl) return fail("AUTHORITY_UNVERIFIED", "lifecycle.bootstrap");
         next = change(state);
         if (next.lifecycle) {
-          assertAgentLifecycleCapacity(next.lifecycle);
+          assertAgentLifecycleCapacity(next.lifecycle, next.control, action !== undefined && !["task.stop", "agent.pause", "agent.dismiss"].includes(action));
+          if (state.lifecycle && state.control && next.control) retirement = this.history().retirement(state.control, state.lifecycle, next.control, next.lifecycle);
           if (Buffer.byteLength(canonical(next)) > 3.75 * 1024 * 1024) fail("AUTHORITY_UNVERIFIED", "lifecycle.capacity");
         }
       }
       catch (error) { rejectedChange = { error }; throw error; }
       if (state.lifecycle) { if (!next.lifecycle) return fail("AUTHORITY_UNVERIFIED", "lifecycle.transition"); assertAgentLifecycleTransition(state.lifecycle, next.lifecycle); }
-      if (state.control) { if (!next.control) return fail("AUTHORITY_UNVERIFIED", "control.transition"); assertAgentCommandTransition(state.control, next.control, action); }
+      if (state.control) { if (!next.control) return fail("AUTHORITY_UNVERIFIED", "control.transition"); assertAgentCommandTransition(state.control, next.control, action, retirement); }
       return next;
     }); }
     catch (error) {
@@ -423,12 +425,40 @@ export class WorkspaceAgentBoundaryAuthority {
   }
   /** Trusted Host composition only, never an RPC-returned object. */
   lifecycleStorage(): WorkspaceResourceStorage { this.assertHostCurrent(); return this.options.storage; }
-  /** Narrow history ports remain closed until immutable segment verification is installed. */
-  lifecycleHistoricalRun(_lifecycle: AgentLifecycleState, _runId: string): { run: AgentCommandRun; execution: AgentLifecycleRun } {
-    return fail("AUTHORITY_UNVERIFIED", "lifecycle.historyUnavailable");
+  private history() { return new WorkspaceAgentLifecycleHistory(this.options.storage, this.parent.context); }
+  assertLifecycleHistory() { const snapshot = this.commandControlState(); if (snapshot.lifecycle) this.history().verify(snapshot.lifecycle); }
+  lifecycleHistoricalRun(lifecycle: AgentLifecycleState, runId: string) { return this.history().historicalRun(lifecycle, runId); }
+  lifecycleHistoricalCommand(lifecycle: AgentLifecycleState, commandId: string) { return this.history().historicalCommand(lifecycle, commandId); }
+  lifecycleHistoricalAudit(lifecycle: AgentLifecycleState, agentId: string) {
+    return this.history().verify(lifecycle).flatMap(body => body.control.audit.filter(row => row.agentId === agentId));
   }
-  lifecycleHistoricalRecovery(_transport: AgentBoundaryTransport, _recovery: AgentLifecycleRecoveryV1, _command: AgentBoundaryCommand, _input: { message: string }): { receipt: import("./agent-boundaries-contract.js").AgentBoundaryReceipt } {
-    return fail("AUTHORITY_UNVERIFIED", "lifecycle.historyUnavailable");
+  private assertLifecycleHistoryManager(transport: AgentBoundaryTransport, agentId: string) {
+    this.source(transport); if (!this.commandControlSourceHealthy()) return fail("AUTHORITY_UNVERIFIED", "lifecycle.source");
+    const state = this.read(), policy = state.policies.find(row => row.agentId === agentId), agent = this.options.resources.agents.get(agentId);
+    if (!policy?.rights.manage || !agent || agent.workspaceId !== this.options.storage.scope.workspaceId) return fail("AUTHORIZATION_DENIED", "lifecycle.history");
+    if (agent.state === "active") this.currentPolicy(agentId, policy);
+    else {
+      const operations = [...(state.lifecycle?.operations ?? []), ...(state.lifecycle ? this.history().verify(state.lifecycle).flatMap(body => body.lifecycle.operations) : [])];
+      if (!operations.some(row => row.agentId === agentId && row.archive === "archived"
+        && row.archivedResource?.agentEpoch === agent.agentEpoch && row.archivedResource.configRevision === agent.configRevision)) return fail("CONTROL_HELD", "lifecycle.archiveIdentity");
+    }
+  }
+  /** Explicit bounded maintenance. Immutable file first, then exact manifest/prune in the
+   * original authority CAS. A failed publication never discards the active identities. */
+  archiveClosedLifecycle(transport: AgentBoundaryTransport, agentId: string, maximum = 8) {
+    if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 8) return fail("INVALID_DOCUMENT", "lifecycle.archiveLimit");
+    this.assertLifecycleHistoryManager(transport, agentId); let published = 0;
+    for (; published < maximum; published++) {
+      const before = this.commandControlState(); if (!before.lifecycle) return fail("AUTHORITY_UNVERIFIED", "lifecycle.bootstrap");
+      const candidate = this.history().prepare(before.control, before.lifecycle, agentId); if (!candidate) break;
+      this.history().publish(candidate);
+      this.update(before.revision, state => {
+        this.assertLifecycleHistoryManager(transport, agentId);
+        return { ...state, control: candidate.control, lifecycle: candidate.lifecycle };
+      });
+    }
+    const after = this.commandControlState(); return { published, revision: after.revision, segments: after.lifecycle!.segments.length,
+      archivedRuns: after.lifecycle!.retiredRuns.filter(row => row.agentId === agentId).length };
   }
   lifecycleRights(transport: AgentBoundaryTransport, agentId: string): Readonly<AgentBoundaryRights> {
     this.source(transport); const state = this.read(), policy = this.currentPolicy(agentId, state.policies.find(row => row.agentId === agentId));
@@ -466,6 +496,8 @@ export class WorkspaceAgentBoundaryAuthority {
     this.update(before.revision, state => {
       this.source(transport); this.authenticateCommandIntent(transport, command);
       if (state.schemaVersion === 1 || !state.control || state.schemaVersion === 3 && !this.options.lifecycleControl) return fail("AUTHORITY_UNVERIFIED", "control.source");
+      if (state.lifecycle && !["task.stop", "agent.pause", "agent.dismiss"].includes(command.operation.action)
+        && !state.control.commands.some(row => row.command.commandId === command.commandId)) this.history().verify(state.lifecycle);
       let authorizationError: AgentBoundaryErrorCode | null = null, proposed: Policy | undefined;
       const policy = state.policies.find(row => row.agentId === command.agentId);
       try {
