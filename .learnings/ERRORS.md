@@ -11437,3 +11437,23 @@ Fixtures now wait for the actual observed failure receipt's retryAtMs before an 
 **Area**: tests
 
 The C0 adapter test import insertion also matched an embedded quota-child script, whose import base is the repository root rather than test/. The combined focused run had 158 passes and one fixture module-resolution failure. Restrict the import edit to the top-level test module; keep the child's original ./dist imports. Production modules and the real C0 adapter cases passed. Re-run the combined focused group after the targeted correction. No model/service calls occurred.
+
+
+## [ERR-20261111-HUB-PREFLIGHT-V1] focus/performance gate
+
+**Status**: resolved
+**Area**: backend
+
+First preflight group: 42/44 passed. The unchanged 200ms hot-message gate failed at text max201.09ms / four-64KiB attachments max240.35ms, despite removing global scans. Preserve preflight-focused-v1.log; continue optimizing redundant path binding/verification setup without weakening identity/publication guards or raising the gate. One legacy-write fixture also expected an immediate census after directly writing an unmanaged file; update it to call the new explicit refresh API while keeping the full-budget/revocation assertion.
+
+Resolution: retained the 200ms gate and all identity/publication checks, cached frozen directory bindings, and explicitly refreshed the legacy-write fixture. Preflight-focused-v4 at that stage: 56/56, no skips; 20,848-entry/15-link profile hot text max48.96ms, four64KiB attachments max77.32ms, cold startup548.44ms (reported separately). Build-v4 and canonical contract lock passed.
+
+
+## [ERR-20261111-HUB-COLD-POLICY] cold policy migration
+
+**Status**: resolved
+**Area**: backend
+
+A new regression on 4fc706d reproduced configuration_conflict when a restarted Host already had the new configured limit: policy inspection itself refused before native authorization could run. preflight-cold-policy-before.log retains the failure. Read-only inspection now exposes the existing policy without widening it, legacy accounting upgrade preserves the old limit, and only the immutable revision/limit CAS can authorize migration. The regression exercises both old schema-1 and version-2 policies.
+
+Final verification after the cold migration fix: preflight-focused-v5 57/57, no skips; build-v5 and contract lock passed. Same synthetic20,848 entries/15links: text max98.09ms, four64KiB attachment max155.98ms under the unchanged200ms gate; initial census330.21ms separately before listening.

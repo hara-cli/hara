@@ -4,6 +4,7 @@ import { AgentHubError, hubAssert, plain } from "./errors.js";
 import type { HubStoredMessage } from "./contracts.js";
 import type { AgentHubPrivateStore, HubFileSnapshot } from "./private-store.js";
 import { HUB_UUID } from "./metadata.js";
+import { activeHubReadFiles } from "./reader-leases.js";
 
 export interface HubCleanupCandidate {
   fileId: string; messageKey: string | null; messageId: string | null; connectionId: string | null;
@@ -28,16 +29,8 @@ export interface CleanupAccess<S> {
   catalog(): { text: string | null; entries: { key: string; connectionId: string; messageId: string }[] };
   metadata(key: string): { value: HubStoredMessage<S>; text: string };
 }
-function leasedFiles(disk: AgentHubPrivateStore): Set<string> {
-  const leases = disk.names().filter(name => name.startsWith("reader-")); hubAssert(leases.length <= 8, "store_unavailable");
-  return new Set(leases.map(name => {
-    const raw = disk.read(name); hubAssert(raw !== null, "store_unavailable"); const value: unknown = JSON.parse(raw);
-    hubAssert(plain(value) && value.schemaVersion === 1 && typeof value.fileId === "string" && /^attachment-[a-f0-9]{64}-[0-3]\.bin$/.test(value.fileId), "store_unavailable");
-    return value.fileId;
-  }));
-}
 function allowed<S>(access: CleanupAccess<S>, candidate: HubCleanupCandidate): boolean {
-  if (leasedFiles(access.disk).has(candidate.fileId)) return false;
+  if (activeHubReadFiles(access.disk, access.now()).has(candidate.fileId)) return false;
   try { return access.authority?.canDelete(structuredClone(candidate)) === true; } catch { return false; }
 }
 const metadataDigest = <S>(value: HubStoredMessage<S>) => sha256(JSON.stringify({ ...value, attachments: value.attachments.map(row => ({ ...row, state: "available" })) }));

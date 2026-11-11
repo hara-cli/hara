@@ -1471,3 +1471,22 @@ The Agent Hub first draft removed base64 only after reading message envelopes. R
 - Related Files: src/agent-hub/store.ts, src/agent-hub/private-store.ts
 - Pattern-Key: storage.metadata_pages_never_read_blobs
 - Resolution: PR #44 follow-up implements metadata-only pages and on-demand chunked payload reads.
+
+
+## [LRN-20261111-HUB-QUOTA-PREFLIGHT] correction
+
+**Priority**: high
+**Status**: resolved
+**Area**: backend
+
+### Summary
+Quota admission needs bounded metadata accounting, not a recursive home census under the global lock.
+
+### Details
+Review N1/N2 found 15 normal links and 20,848 real-scale entries made the original scanner reject all ingress or take seconds per message. Charge links by lstat without resolving them; reserve peak bytes durably with a short shared lock, write under the scope lock, and settle exact deltas. Cache baseline usage with explicit/background revision-fenced reconciliation and a finite stale-data limit. Reuse frozen private directory identities without caching authority or accepting a replacement inode. Policy limits need an authorized revision CAS, and reader protection needs a finite renewable lease that stale readers must check before every chunk.
+
+### Metadata
+- Source: user_feedback
+- Related Files: src/storage/quota.ts, src/agent-hub/private-store.ts, src/agent-hub/reader-leases.ts
+- Pattern-Key: storage.bounded_admission_and_expiring_read_protection
+- Verification: preflight-focused-v5 57/57 (including cold schema1/2 policy migration), build-v5, 200ms gate with the reviewed synthetic scale; real Host/CLI/Desk not enabled.

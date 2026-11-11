@@ -12,6 +12,7 @@ export async function startAgentHubIngress<S, R>(options: {
   /** C0 adapter supplies the public error document; no raw caught exception reaches it. */
   errorBody(code: AgentHubErrorCode): unknown;
 }) {
+  await options.store.prepare();
   const sockets = new Set<Socket>(); let closing = false, activeBodies = 0;
   const server = createServer({ maxHeaderSize: 4096, connectionsCheckingInterval: 1000 }, (request, response) => {
     void handle(request, response).catch(() => { if (!response.writableEnded) response.destroy(); });

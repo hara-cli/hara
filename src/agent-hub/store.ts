@@ -4,6 +4,7 @@ import { AgentHubError, exact, hubAssert, plain } from "./errors.js";
 import { HUB_LIMITS, parseHubAttachments, sha256 } from "./attachments.js";
 import { payloadDigest, parseHubMetadata, storedAttachments, textPreview } from "./metadata.js";
 import { planHubCleanup, applyHubCleanup, type HubCleanupAuthority, type HubCleanupPlan } from "./cleanup.js";
+import { activeHubReadFiles, startHubRead, renewHubRead, releaseHubRead } from "./reader-leases.js";
 import type { HaraStorageQuota } from "../storage/quota.js";
 import type { AgentHubBoundaryContract, AgentHubDirectory, HubStoredMessage, HubVisibleMessage, RegisteredHubAgent } from "./contracts.js";
 
@@ -42,6 +43,8 @@ export class AgentHubStore<S, R> {
     this.quota = options.quotaBytes ?? HUB_LIMITS.quotaBytes;
     hubAssert(Number.isSafeInteger(this.quota) && this.quota >= 4096 && this.quota <= HUB_LIMITS.quotaBytes);
   }
+  /** Cold/expired census belongs to listener startup, before any request deadline starts. */
+  async prepare(): Promise<void> { this.assertCurrent(); await this.options.globalQuota.prepare(); this.assertCurrent(); }
   private assertCurrent(): void {
     try { hubAssert(this.options.assertCurrent() === undefined, "unauthorized"); }
     catch { throw new AgentHubError("unauthorized"); }
@@ -236,15 +239,14 @@ export class AgentHubStore<S, R> {
     const lease = this.transaction(() => {
       const attachment = this.selected(connectionId, messageId).value.attachments.find(row => row.attachmentId === attachmentId);
       hubAssert(attachment && attachment.state === "available", "invalid_request");
-      hubAssert(this.disk.names().filter(name => name.startsWith("reader-")).length < 8, "quota_exceeded");
-      const name = `reader-${randomUUID()}.json`;
-      this.disk.write(name, JSON.stringify({ schemaVersion: 1, fileId: attachment.fileId, readerId: name }), null, () => this.assertCurrent(), true);
-      const snapshot = this.disk.inspect(name); hubAssert(snapshot, "store_unavailable"); return { name, snapshot, attachment };
+      const handle = startHubRead(this.disk, attachment.fileId, this.options.now?.() ?? new Date(), () => this.assertCurrent());
+      return { ...handle, attachment };
     });
     const hash = createHash("sha256");
     try {
       for (let offset = 0; offset < lease.attachment.bytes; offset += HUB_LIMITS.chunkBytes) {
         const bytes = this.transaction(() => {
+          renewHubRead(this.disk, lease, this.options.now?.() ?? new Date(), () => this.assertCurrent());
           const current = this.selected(connectionId, messageId).value.attachments.find(row => row.attachmentId === attachmentId);
           hubAssert(current?.state === "available" && current.fileId === lease.attachment.fileId, "invalid_request");
           return this.disk.readChunk(current.fileId, offset, HUB_LIMITS.chunkBytes, current.bytes);
@@ -254,8 +256,11 @@ export class AgentHubStore<S, R> {
       hubAssert(hash.digest("hex") === lease.attachment.sha256, "store_unavailable");
     } finally {
       // Releasing this exact private lease does not grant authority or require restoring a revoked scope.
-      this.disk.transaction(() => this.disk.remove(lease.name, lease.snapshot));
+      this.disk.transaction(() => releaseHubRead(this.disk, lease));
     }
+  }
+  reapExpiredReadLeases(): void {
+    this.transaction(() => { activeHubReadFiles(this.disk, this.options.now?.() ?? new Date()); });
   }
   private cleanupAccess() {
     return { disk: this.disk, scopeKey: this.options.scopeKey, generation: this.options.generation,

@@ -6,7 +6,7 @@ import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { HaraStorageQuota, StorageQuotaError } from "../storage/quota.js";
 import { assertPrivateStateDirectory, bindPrivateHaraStateFile, readPrivateStateFileSnapshotSync,
   withPrivateStateLockSync, writePrivateStateFileSync, writePrivateStateBytesOnceSync, removePrivateStateFile,
-  type PrivateStateFileSnapshot } from "../security/private-state.js";
+  type PrivateStateFileSnapshot, type PrivateStateDirectoryIdentity } from "../security/private-state.js";
 import { AgentHubError } from "./errors.js";
 import { HUB_LIMITS } from "./attachments.js";
 
@@ -17,13 +17,17 @@ export interface HubFileSnapshot { dev: number; ino: number; mode: number; nlink
 /** All mutations share the home-wide quota lock before the per-scope state lock. */
 export class AgentHubPrivateStore {
   private readonly namespace: readonly string[];
+  private directory?: PrivateStateDirectoryIdentity;
   constructor(private readonly home: string, scopeKey: string, readonly globalQuota: HaraStorageQuota) {
     if (!/^[a-f0-9]{64}$/.test(scopeKey)) throw new AgentHubError("invalid_request");
     globalQuota.assertHome(home); this.namespace = ["agent-hub", scopeKey];
   }
   private binding(filename: string) {
     if (filename !== "catalog.json" && !META.test(filename) && !BLOB.test(filename) && !CONTROL.test(filename)) throw new AgentHubError("store_unavailable");
-    return bindPrivateHaraStateFile(this.home, this.namespace, filename);
+    this.directory ??= bindPrivateHaraStateFile(this.home, this.namespace, "catalog.json").directory;
+    // Reuse the frozen directory identity, never its authority: readers/writers still revalidate
+    // canonical path/dev/ino/mode at every IO/publication fence and reject replacement directories.
+    return { directory: this.directory, path: join(this.directory.path, filename) };
   }
   transaction<T>(fn: () => T): T {
     try { return this.globalQuota.run(() => withPrivateStateLockSync(this.home, this.namespace, "hub", fn, { attempts: 10, waitMs: 5 })); }
@@ -50,9 +54,22 @@ export class AgentHubPrivateStore {
       if (expectedText === null) throw new AgentHubError("store_unavailable");
       this.globalQuota.admitControlReplacement(Buffer.byteLength(text), Buffer.byteLength(expectedText));
     } else this.globalQuota.admitGrowth(Buffer.byteLength(text), control);
-    writePrivateStateFileSync(bound, text, { ...(expectedText === null ? { expectedMissing: true } : { expectedText }), assertCurrent: () => {
+    this.mutation(filename, () => writePrivateStateFileSync(bound, text, { ...(expectedText === null ? { expectedMissing: true } : { expectedText }), assertCurrent: () => {
       assertCurrent?.(); this.globalQuota.admitGrowth(0, control);
-    } });
+    } }));
+  }
+  private mutation<T>(filename: string, action: () => T): T {
+    const bound = this.binding(filename); assertPrivateStateDirectory(bound.directory);
+    const size = () => {
+      try { const info = lstatSync(bound.path); if (!info.isFile() || info.isSymbolicLink()) throw new AgentHubError("store_unavailable"); return info.size; }
+      catch (error: any) { if (error?.code === "ENOENT") return 0; throw error; }
+    };
+    const before = size();
+    try { return action(); }
+    finally {
+      try { this.globalQuota.recordChange(size() - before); }
+      catch (error) { this.globalQuota.uncertainMutation(); throw error; }
+    }
   }
   private opened<T>(filename: string, action: (fd: number, info: HubFileSnapshot) => T): T {
     const bound = this.binding(filename); assertPrivateStateDirectory(bound.directory);
@@ -92,11 +109,11 @@ export class AgentHubPrivateStore {
       return;
     }
     this.globalQuota.admitGrowth(bytes.length); const bound = this.binding(filename);
-    writePrivateStateBytesOnceSync(bound, bytes, { assertCurrent: () => { assertCurrent(); this.globalQuota.admitGrowth(0); } });
+    this.mutation(filename, () => writePrivateStateBytesOnceSync(bound, bytes, { assertCurrent: () => { assertCurrent(); this.globalQuota.admitGrowth(0); } }));
   }
   remove(filename: string, expected: HubFileSnapshot): void {
     const bound = this.binding(filename); assertPrivateStateDirectory(bound.directory);
-    removePrivateStateFile(bound.path, { ...expected, text: "" } satisfies PrivateStateFileSnapshot, bound.directory);
+    this.mutation(filename, () => removePrivateStateFile(bound.path, { ...expected, text: "" } satisfies PrivateStateFileSnapshot, bound.directory));
   }
   usage(): { bytes: number; messages: number } {
     const bound = this.binding("catalog.json"), lock = lstatSync(join(bound.directory.path, "hub.lock"));
