@@ -13,6 +13,14 @@ export interface AgentPublicIdentity {
   theme?: string;
   /** Optional CSS-friendly color token. */
   accent?: string;
+  /**
+   * Immutable colour assigned when the colleague was created, so "restore initial colour" has a
+   * real target instead of the first value a client happened to observe. Projection only: it is
+   * not part of the editable profile and never changes after creation.
+   */
+  initialAccent?: string;
+  /** Avatar silhouette. Persisted separately from the art-direction `theme` and `character`. */
+  avatarStyle?: AgentAvatarStyle;
   /** Stable character/sprite archetype slug. */
   character?: string;
   source: "hara" | "openclaw" | "hermes" | "claude" | "organization" | "plugin" | "derived";
@@ -27,6 +35,7 @@ export interface AgentPublicIdentityInput {
   avatar?: string;
   theme?: string;
   accent?: string;
+  avatarStyle?: AgentAvatarStyle;
   character?: string;
 }
 
@@ -41,6 +50,61 @@ const TEXT_CAPS = {
 const TRAIT_LIMIT = 6;
 const DATA_AVATAR_LIMIT = 128 * 1024;
 const DATA_AVATAR_TEXT_LIMIT = Math.ceil(DATA_AVATAR_LIMIT * 4 / 3) + 128;
+/**
+ * The eight colleague colours the product designs for. Desk's `AGENT_ACCENT_PALETTE`
+ * (agent-visual.ts) must list exactly these values; a fourth colour outside this set is
+ * rejected on write so a stray hex cannot reach a client as a "theme".
+ */
+export const AGENT_ACCENT_PALETTE = Object.freeze([
+  "#ff695f", "#4f9c8f", "#d99a32", "#6e88c8", "#a67bc2", "#d1667b", "#438db3", "#7f9a45",
+] as const);
+export type AgentAccent = (typeof AGENT_ACCENT_PALETTE)[number];
+
+/** Avatar silhouettes. `portrait` means the illustrated/uploaded image; the rest are geometric crops. */
+export const AGENT_AVATAR_STYLES = Object.freeze(["circle", "squircle", "hex", "portrait"] as const);
+export type AgentAvatarStyle = (typeof AGENT_AVATAR_STYLES)[number];
+
+/**
+ * FNV-1a over the same inputs Desk uses (`agentId \0 character`), so a colleague created without
+ * an explicit colour lands on the same palette slot in Core and in the client. Kept here, next to
+ * the palette, because the assignment must be stable before any client can observe it.
+ */
+export function stableAgentHash(value: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index++) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+/** Least-used colour at creation time, deterministic per agent so the result is reproducible. */
+export function assignAgentAccent(agentId: string, character: string | undefined, inUse: readonly string[] = []): AgentAccent {
+  const counts = new Map<string, number>();
+  for (const value of inUse) {
+    const normalised = value.trim().toLowerCase();
+    counts.set(normalised, (counts.get(normalised) ?? 0) + 1);
+  }
+  const start = stableAgentHash(`${agentId}\0${character ?? ""}`) % AGENT_ACCENT_PALETTE.length;
+  let best = AGENT_ACCENT_PALETTE[start];
+  let bestCount = counts.get(best) ?? 0;
+  // Prefer a colour nobody has yet; on a tie the hash-derived slot wins, so the choice does not
+  // depend on creation order beyond the actual usage counts.
+  for (let step = 1; step < AGENT_ACCENT_PALETTE.length; step++) {
+    const candidate = AGENT_ACCENT_PALETTE[(start + step) % AGENT_ACCENT_PALETTE.length];
+    const count = counts.get(candidate) ?? 0;
+    if (count < bestCount) { best = candidate; bestCount = count; }
+  }
+  return best;
+}
+
+export function isAgentAccent(value: unknown): value is AgentAccent {
+  return typeof value === "string" && (AGENT_ACCENT_PALETTE as readonly string[]).includes(value.trim().toLowerCase());
+}
+export function isAgentAvatarStyle(value: unknown): value is AgentAvatarStyle {
+  return typeof value === "string" && (AGENT_AVATAR_STYLES as readonly string[]).includes(value.trim().toLowerCase());
+}
+
 const SAFE_CHARACTER = /^[a-z0-9](?:[a-z0-9._-]{0,31})?$/;
 const SAFE_ACCENT = /^#[0-9a-f]{6}$/i;
 const SAFE_DATA_AVATAR = /^data:image\/(?:png|jpeg|webp|gif);base64,[a-z0-9+/=]+$/i;
@@ -123,7 +187,8 @@ export function agentIdentityFromMetadata(
   const emoji = compactText(field(metadata, "emoji"), TEXT_CAPS.emoji);
   const avatar = safeAvatar(field(metadata, "avatar", "logo"));
   const theme = compactText(field(metadata, "identity-theme", "theme", "vibe-theme"), TEXT_CAPS.theme);
-  const accentValue = compactText(field(metadata, "accent", "accent-color"), 7);
+  const accentValue = compactText(field(metadata, "accent", "accent-color"), 7)?.toLowerCase();
+  const avatarStyleValue = compactText(field(metadata, "avatarStyle", "avatar-style"), 16)?.toLowerCase();
   const characterValue = compactText(field(metadata, "character", "sprite", "creature"), 32)?.toLowerCase();
   return {
     version: 1,
@@ -134,7 +199,10 @@ export function agentIdentityFromMetadata(
     ...(emoji ? { emoji } : {}),
     ...(avatar ? { avatar } : {}),
     ...(theme ? { theme } : {}),
-    ...(accentValue && SAFE_ACCENT.test(accentValue) ? { accent: accentValue.toLowerCase() } : {}),
+    // Imported role files keep their historical six-digit hex so existing catalogs stay readable;
+    // the designed palette is enforced where a client *writes* a profile (strict mode below).
+    ...(accentValue && SAFE_ACCENT.test(accentValue) ? { accent: accentValue } : {}),
+    ...(avatarStyleValue && isAgentAvatarStyle(avatarStyleValue) ? { avatarStyle: avatarStyleValue } : {}),
     ...(characterValue && SAFE_CHARACTER.test(characterValue) ? { character: characterValue } : {}),
     source: identitySource(field(metadata, "identity-source", "identitySource"), roleSource),
   };
@@ -143,11 +211,25 @@ export function agentIdentityFromMetadata(
 /** Validate a user-authored public profile before it is persisted. Normalization keeps display data
  * bounded, while unsafe avatar sources and malformed CSS/sprite tokens fail explicitly instead of being
  * silently stored and later interpreted by a client. */
+export interface IdentityNormalizeMode {
+  /**
+   * `strict` is used when a client writes a profile: only the eight designed colours and the
+   * four avatar styles are accepted, and anything else is an explicit error.
+   *
+   * `compat` (the default) is used when reading already-persisted state. Older colleagues may
+   * carry an arbitrary six-digit accent or none at all; those reads must keep working, so an
+   * out-of-palette accent is preserved verbatim instead of making the catalog invalid.
+   */
+  presentation?: "strict" | "compat";
+}
+
 export function normalizeAgentPublicIdentityInput(
   value: unknown,
   fallbackId: string,
   roleSource: string,
+  mode: IdentityNormalizeMode = {},
 ): AgentPublicIdentity {
+  const strict = mode.presentation === "strict";
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("agent profile must be an object");
   }
@@ -155,7 +237,7 @@ export function normalizeAgentPublicIdentityInput(
   if (typeof input.displayName !== "string" || !input.displayName.trim()) {
     throw new Error("agent display name is required");
   }
-  for (const key of ["title", "bio", "emoji", "avatar", "theme", "accent", "character"] as const) {
+  for (const key of ["title", "bio", "emoji", "avatar", "theme", "accent", "avatarStyle", "character"] as const) {
     if (input[key] !== undefined && typeof input[key] !== "string") {
       throw new Error(`agent profile ${key} must be a string`);
     }
@@ -163,12 +245,26 @@ export function normalizeAgentPublicIdentityInput(
   if (input.traits !== undefined && (!Array.isArray(input.traits) || input.traits.some((trait) => typeof trait !== "string"))) {
     throw new Error("agent profile traits must be a string array");
   }
+  // Reject a non-palette colour up front in strict mode: `agentIdentityFromMetadata` accepts any
+  // six-digit hex for imported role files, so checking after it would let `#123456` through as if
+  // it were a designed colour.
+  if (strict && typeof input.accent === "string" && input.accent.trim() && !isAgentAccent(input.accent.trim())) {
+    throw new Error(`agent accent must be one of ${AGENT_ACCENT_PALETTE.join(", ")}`);
+  }
+  if (strict && typeof input.avatarStyle === "string" && input.avatarStyle.trim() && !isAgentAvatarStyle(input.avatarStyle.trim())) {
+    throw new Error(`agent avatarStyle must be one of ${AGENT_AVATAR_STYLES.join(", ")}`);
+  }
   const identity = agentIdentityFromMetadata(input, fallbackId, "", roleSource);
   if (typeof input.avatar === "string" && input.avatar.trim() && !identity.avatar) {
     throw new Error("agent avatar must be a packaged /avatars or /pets path, or a bounded PNG/JPEG/WebP/GIF data image");
   }
-  if (typeof input.accent === "string" && input.accent.trim() && !identity.accent) {
-    throw new Error("agent accent must be a six-digit hex color");
+  if (strict && typeof input.accent === "string" && input.accent.trim() && !identity.accent) {
+    // A client must send one of the eight designed colours; a stray hex is an error rather than
+    // a silently recoloured colleague or a half-applied profile.
+    throw new Error(`agent accent must be one of ${AGENT_ACCENT_PALETTE.join(", ")}`);
+  }
+  if (strict && typeof input.avatarStyle === "string" && input.avatarStyle.trim() && !identity.avatarStyle) {
+    throw new Error(`agent avatarStyle must be one of ${AGENT_AVATAR_STYLES.join(", ")}`);
   }
   if (typeof input.character === "string" && input.character.trim() && !identity.character) {
     throw new Error("agent character must use 1-32 lowercase letters, numbers, dots, underscores, or dashes");

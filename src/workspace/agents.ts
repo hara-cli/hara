@@ -10,7 +10,8 @@ import { AgentRuntimeRegistry, type AgentRuntimeOption } from "../agent-runtime/
 import type { WorkspaceRuntimeInstaller } from "./runtime-install.js";
 import { isAgentRuntimeId, type AgentRuntimeId } from "../agent-runtime/bindings.js";
 import {
-  normalizeAgentPublicIdentityInput, type AgentPublicIdentity, type AgentPublicIdentityInput,
+  assignAgentAccent, isAgentAccent, normalizeAgentPublicIdentityInput,
+  type AgentAccent, type AgentPublicIdentity, type AgentPublicIdentityInput,
 } from "../org/agent-identity.js";
 import { withPrivateStateLockSync, writePrivateStateFileSync } from "../security/private-state.js";
 import {
@@ -31,7 +32,7 @@ const OWNER = "workspace-agents-owner.json";
 const MAX_BYTES = 2 * 1024 * 1024;
 const MAX_CONFIGS = 64;
 const USERNAME = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-const PROFILE_FIELDS = ["displayName", "title", "bio", "traits", "emoji", "avatar", "theme", "accent", "character"];
+const PROFILE_FIELDS = ["displayName", "title", "bio", "traits", "emoji", "avatar", "theme", "accent", "avatarStyle", "character"];
 
 export interface WorkspaceAgentPersonaInput {
   profile: AgentPublicIdentityInput;
@@ -60,6 +61,12 @@ export interface WorkspaceLegacyAgentInput extends WorkspaceAgentPersonaInput {
 interface AgentRecord {
   titleSource?: "default";
   titleKey?: "core.name.orchestrator";
+  /**
+   * Colour fixed at creation and never rewritten. Kept on the record (not the configuration
+   * snapshot) so editing a colleague's palette cannot move the "restore initial colour" target,
+   * and so an older catalog without it stays valid.
+   */
+  initialAccent?: AgentAccent;
   agentId: string;
   username: string;
   kind: "main" | "colleague";
@@ -97,6 +104,8 @@ export interface WorkspaceAgentView {
   permissionTier: RuntimePermissionTier;
   /** Present only when the stored tier is unavailable on this Host platform (decision B); never silently downgraded. */
   permissionTierUnavailable?: true;
+  /** Immutable creation colour; clients use it for "restore initial colour" and cannot edit it. */
+  initialAccent?: AgentAccent;
   /** Main Hara uses the packaged product mark, not a private prompt-supplied path. */
   brand?: "hara";
 }
@@ -119,7 +128,7 @@ function canonical(value: unknown): string {
 function hashConfiguration(config: Omit<WorkspaceAgentConfiguration, "hash">): string {
   return createHash("sha256").update("hara-workspace-agent-config-v1\0").update(canonical(config)).digest("hex");
 }
-function persona(value: unknown, username: string): Omit<WorkspaceAgentConfiguration, "revision" | "runtimeId" | "hash"> {
+function persona(value: unknown, username: string, presentation: "strict" | "compat" = "compat"): Omit<WorkspaceAgentConfiguration, "revision" | "runtimeId" | "hash"> {
   if (!object(value) || !keys(value, ["profile"], ["description", "instructions"]) || !object(value.profile)
     || !keys(value.profile, ["displayName"], PROFILE_FIELDS.slice(1))) throw new Error("invalid Workspace Agent persona input");
   const description = value.description ?? "", instructions = value.instructions ?? "";
@@ -127,7 +136,7 @@ function persona(value: unknown, username: string): Omit<WorkspaceAgentConfigura
     || typeof instructions !== "string" || instructions.length > 32_000 || instructions.includes("\0")) {
     throw new Error("Workspace Agent persona exceeds its safe limits");
   }
-  return { identity: normalizeAgentPublicIdentityInput(value.profile, username, "global"), description, instructions };
+  return { identity: normalizeAgentPublicIdentityInput(value.profile, username, "global", { presentation }), description, instructions };
 }
 /** A configuration that never stored a tier (pre-1.2.0) is controlled, matching frozen task bindings. Only new
  * colleagues receive the platform default; an old configuration is never silently upgraded to full-protected. */
@@ -196,10 +205,11 @@ export class WorkspaceAgentStore {
     if (canonical(this.parseOwner(rawManifestOwner)) !== canonical(owner)) return invalid();
     const ids = new Set<string>(), usernames = new Set<string>();
     const rows: AgentRecord[] = agents.map(value => {
-      if (!object(value) || !keys(value, ["agentId", "username", "kind", "state", "epoch", "currentConfigRevision", "configurations"], ["legacy", "archivedAt", "pausedScheduleCount", "titleSource", "titleKey"])
+      if (!object(value) || !keys(value, ["agentId", "username", "kind", "state", "epoch", "currentConfigRevision", "configurations"], ["legacy", "archivedAt", "pausedScheduleCount", "titleSource", "titleKey", "initialAccent"])
         || !isWorkspaceAgentId(value.agentId) || ids.has(value.agentId)
         || typeof value.username !== "string" || !USERNAME.test(value.username) || usernames.has(value.username)
         || (value.kind !== "main" && value.kind !== "colleague") || (value.state !== "active" && value.state !== "archived")
+        || (value.initialAccent !== undefined && !isAgentAccent(value.initialAccent))
         || !positive(value.epoch) || !positive(value.currentConfigRevision) || !Array.isArray(value.configurations)
         || value.configurations.length < 1 || value.configurations.length > MAX_CONFIGS) return invalid();
       if (value.kind === "main" ? (value.agentId !== owner.mainAgentId || value.username !== "hara" || value.state !== "active")
@@ -217,7 +227,15 @@ export class WorkspaceAgentStore {
         || value.titleSource !== "default" || value.titleKey !== "core.name.orchestrator"
         || !DEFAULT_ORCHESTRATOR_TITLES.includes(configurations.at(-1)!.identity.title ?? ""))) return invalid();
       ids.add(value.agentId); usernames.add(value.username);
-      return { ...value, configurations } as unknown as AgentRecord;
+      // Older catalogs have no `initialAccent`. Derive a deterministic stand-in from the agent id and
+      // character using the same hash Desk uses, so "restore initial colour" is stable and
+      // reproducible rather than whatever value a client happened to observe first. It is derived,
+      // not invented: the same inputs always produce the same palette slot.
+      const stored = value.initialAccent as AgentAccent | undefined;
+      const legacy = configurations.at(-1)?.identity;
+      const derived = stored ?? assignAgentAccent(value.agentId, legacy?.character,
+        legacy && isAgentAccent(legacy.accent) ? [legacy.accent] : []);
+      return { ...value, ...(stored ? { initialAccent: stored } : { initialAccent: derived }), configurations } as unknown as AgentRecord;
     });
     if (rows.filter(row => row.kind === "main").length !== 1) return invalid();
     return { ...owner, revision, agents: rows } as Manifest;
@@ -266,6 +284,7 @@ export class WorkspaceAgentStore {
       state: row.state, agentEpoch: row.epoch, configRevision: config.revision, identity: structuredClone(config.identity),
       ...(row.archivedAt ? { archivedAt: row.archivedAt, pausedScheduleCount: row.pausedScheduleCount ?? 0 } : {}),
       description: config.description, permissionTier: storedPermissionTier(config), runtime: { ...runtimes.find(option => option.id === config.runtimeId)! },
+      ...(row.initialAccent ? { initialAccent: row.initialAccent } : {}),
       ...(availableRuntimePermissionTiers().includes(storedPermissionTier(config)) ? {} : { permissionTierUnavailable: true as const }),
       ...(row.kind === "main" ? { brand: "hara" as const, ...(row.titleSource ? { titleSource: row.titleSource, titleKey: row.titleKey } : {}) } : {}) };
   }
@@ -309,13 +328,14 @@ export class WorkspaceAgentStore {
   /** Explicit first creation only. A partial/missing catalog is never healed or imported from legacy. */
   initializeMain(input: WorkspaceAgentPersonaInput = { profile: { displayName: "Hara", title: "Root Orchestrator" } }): WorkspaceAgentView {
     this.binding();
-    const normalized = persona(input, "hara");
+    const normalized = persona(input, "hara", "strict");
     this.runtimes.assertAvailable("pi");
     return withPrivateStateLockSync(workspaceStateHome(), [], "workspace-agents", () => {
       const loaded = this.load();
       if (loaded.value) return this.view(loaded.value.agents.find(row => row.kind === "main")!);
       const owner: Owner = { schemaVersion: 1, resourceBinding: { ...this.binding() }, workspaceId: this.scope.workspaceId, mainAgentId: `ag_${randomUUID()}` };
       const main: AgentRecord = { agentId: owner.mainAgentId, username: "hara", kind: "main", state: "active", epoch: 1,
+        initialAccent: assignAgentAccent(owner.mainAgentId, normalized.identity.character),
         currentConfigRevision: 1, ...(DEFAULT_ORCHESTRATOR_TITLES.includes(normalized.identity.title ?? "") ? { titleSource: "default" as const, titleKey: "core.name.orchestrator" as const } : {}), configurations: [configuration(normalized, 1, "pi")] };
       writePrivateStateFileSync(loaded.ownerFile, JSON.stringify(owner) + "\n", { expectedMissing: true, assertCurrent: workspaceResourceCommitGuard() });
       this.persist(loaded, { ...owner, revision: 1, agents: [main] });
@@ -331,15 +351,28 @@ export class WorkspaceAgentStore {
     // Decision B: the full tier exists only where the Host has Seatbelt; never accept it elsewhere.
     if (input.permissionTier !== undefined && !availableRuntimePermissionTiers().includes(input.permissionTier)) throw new RuntimeTierUnavailableError();
     const { username, runtimeId = "pi", permissionTier = defaultRuntimePermissionTier(), ...fields } = input;
-    const normalized = persona(fields, username);
+    const normalized = persona(fields, username, "strict");
     if (!isAgentRuntimeId(runtimeId)) throw new Error("invalid Workspace Agent Runtime");
     this.runtimes.assertAvailable(runtimeId);
     return withPrivateStateLockSync(workspaceStateHome(), [], "workspace-agents", () => {
       const loaded = this.load(), value = loaded.value;
       if (!value || value.revision !== expectedCatalogRevision) throw new Error("Workspace Agent catalog changed; reload before creating");
       if (value.agents.some(row => row.username === username)) throw new Error("Workspace Agent username is retained; restore the exact archived colleague or choose another");
-      const row: AgentRecord = { agentId: `ag_${randomUUID()}`, username, kind: "colleague", state: "active", epoch: 1,
-        currentConfigRevision: 1, configurations: [configuration(normalized, 1, runtimeId, undefined, permissionTier)] };
+      const agentId = `ag_${randomUUID()}`;
+      // Fix the creation colour once. An explicit palette choice is the initial colour; otherwise
+      // pick the least-used palette slot for this agent so "restore initial colour" has a real target.
+      const identity = normalized.identity;
+      // A client that already picked a palette colour sets the initial colour explicitly.
+      const explicitAccent = isAgentAccent(identity.accent) ? identity.accent : undefined;
+      const inUse = value.agents
+        .map(row => row.initialAccent ?? row.configurations.at(-1)?.identity.accent)
+        .filter((colour): colour is string => typeof colour === "string");
+      const initialAccent: AgentAccent = explicitAccent ?? assignAgentAccent(agentId, identity.character, inUse);
+      // Persist the assigned colour so a client reading the new colleague sees the same value that
+      // "restore initial colour" will return.
+      const configured = explicitAccent ? normalized : { ...normalized, identity: { ...identity, accent: initialAccent } };
+      const row: AgentRecord = { agentId, username, kind: "colleague", state: "active", epoch: 1, initialAccent,
+        currentConfigRevision: 1, configurations: [configuration(configured, 1, runtimeId, undefined, permissionTier)] };
       value.agents.push(row); this.advance(value); this.persist(loaded, value);
       return this.view(row);
     });
@@ -366,7 +399,8 @@ export class WorkspaceAgentStore {
     row.configurations.push(configuration(input, row.currentConfigRevision, runtimeId, row.configurations.at(-1)!.toolPolicy, permissionTier));
   }
   updatePersona(agentId: string, input: WorkspaceAgentPersonaInput, configRevision: number, agentEpoch: number): WorkspaceAgentView {
-    const normalized = persona(input, "agent");
+    // A client write is strict: only the eight designed colours and four avatar styles are accepted.
+    const normalized = persona(input, "agent", "strict");
     return this.update(agentId, configRevision, agentEpoch, row => {
       this.appendConfiguration(row, normalized, row.configurations[row.currentConfigRevision - 1]!.runtimeId);
       if (!DEFAULT_ORCHESTRATOR_TITLES.includes(normalized.identity.title ?? "")) { delete row.titleSource; delete row.titleKey; }
