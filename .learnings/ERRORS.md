@@ -11428,3 +11428,12 @@ Fixtures now wait for the actual observed failure receipt's retryAtMs before an 
 - Node 2.4.1 has no legacy print/MCP-file/work-dir dialect and rejects prompt with plan/yolo. Its native ACP supports per-session HTTP MCP, auto/plan mode and model config options without changing global provider settings. Keep client filesystem/terminal capabilities disabled under the shared execution policy.
 - Session creation atomically writes workspaces.json.tmp.<pid>.<8 lower-hex>; allow only that transaction plus documented session/index/lock state, not the data root. Root mkdir permission must not authorize rename/unlink of configuration/credential parents.
 - Keep inherited personal extensions explicit, set KIMI_DISABLE_CRON=1 and keep-alive false per process, and retain physical process ownership/drain. A zero-model session with fake provider/MCP data does not establish a real account/model acceptance.
+
+
+## [ERR-20261111-HUB-CHILD-IMPORT] mechanical import edit
+
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+The C0 adapter test import insertion also matched an embedded quota-child script, whose import base is the repository root rather than test/. The combined focused run had 158 passes and one fixture module-resolution failure. Restrict the import edit to the top-level test module; keep the child's original ./dist imports. Production modules and the real C0 adapter cases passed. Re-run the combined focused group after the targeted correction. No model/service calls occurred.

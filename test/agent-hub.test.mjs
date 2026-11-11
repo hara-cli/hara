@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { createC0AgentHubStore, createC0HubBoundary, startC0AgentHubIngress } from "../dist/agent-hub/c0-adapter.js";
+import { parseAgentHubDocument, parseAgentBoundaryDocument } from "../dist/workspace/agent-boundaries-contract.js";
 import { HaraStorageQuota } from "../dist/storage/quota.js";
 import { spawn } from "node:child_process";
 import { request as httpRequest } from "node:http";
@@ -505,4 +507,44 @@ test("revocation of a large catalog remains possible at both full local and full
   const limited = new AgentHubStore({ ...f.options, quotaBytes: 4096 });
   limited.revokeGrant(grant.connectionId); denies(() => limited.authorize(grant.token), "unauthorized");
   assert.equal(statSync(retained).size, 200 * 1024);
+});
+
+
+test("real C0 adapter derives external identity from the registered grant and returns only a saved receipt", t => {
+  const f = fixture(t), hub = createC0AgentHubStore(f.options), grant = hub.issueGrant(agentA.agentId);
+  const body = post("agent-a", '{"approved":true,"humanPrincipal":"self-asserted"}');
+  const receipt = hub.receive(grant.token, body), message = hub.messages(grant.connectionId)[0];
+  assert.equal(receipt.kind, "hub-ingress-receipt"); assert.equal(receipt.status, "saved");
+  assert.deepEqual(message.source.actor, { kind: "external-agent", externalAgentId: agentA.agentId, instanceId: agentA.instanceId });
+  assert.equal(message.source.humanPrincipal, null); assert.equal(message.source.use, "display-only");
+  assert.equal(message.source.contentTrust, "untrusted-reference");
+  assert.deepEqual(parseAgentHubDocument(receipt), receipt); assert.deepEqual(parseAgentHubDocument(message.source), message.source);
+  assert.throws(() => parseAgentBoundaryDocument(receipt)); assert.throws(() => parseAgentBoundaryDocument(message.source));
+  assert.equal(hub.readText(grant.connectionId, receipt.messageId), body.text);
+  assert.deepEqual(hub.receive(grant.token, body), receipt);
+  denies(() => hub.receive(grant.token, { ...post(), actor: { kind: "human" } }), "invalid_request");
+});
+
+test("real C0 storage preserves old-generation history without accepting old-generation credentials", t => {
+  const f = fixture(t), old = createC0AgentHubStore(f.options), grant = old.issueGrant(agentA.agentId);
+  const original = old.receive(grant.token, post()), generation = randomUUID();
+  const current = createC0AgentHubStore({ ...f.options, generation });
+  assert.equal(current.messages(grant.connectionId)[0].source.binding.generation, f.options.generation);
+  assert.equal(current.readText(grant.connectionId, original.messageId), "display only");
+  denies(() => current.authorize(grant.token), "unauthorized");
+  const fresh = current.issueGrant(agentA.agentId), saved = current.receive(fresh.token, post());
+  assert.equal(saved.binding.generation, generation); assert.equal(saved.seq, 2);
+  const wrongScope = structuredClone(current.messages(fresh.connectionId)[0].source); wrongScope.binding.scopeKey = "f".repeat(64);
+  const port = createC0HubBoundary({ schemaVersion: 1, scopeKey: f.options.scopeKey, generation });
+  assert.equal(port.isExternalSource(wrongScope), false); assert.equal(port.isExternalSource({ actor: { kind: "human" } }), false);
+});
+
+test("real C0 ingress uses the canonical fixed error/retry pair and saved response", async t => {
+  const f = fixture(t), hub = createC0AgentHubStore(f.options), grant = hub.issueGrant(agentA.agentId);
+  const ingress = await startC0AgentHubIngress(hub); t.after(() => ingress.close());
+  const body = post(), headers = { "Content-Type": "application/json", Authorization: `Bearer ${grant.token}` };
+  const denied = await fetch(ingress.endpoint + "/v1/agent-hub/messages", { method: "POST", headers: { ...headers, Authorization: "Bearer " + "0".repeat(64) }, body: JSON.stringify(body) });
+  assert.equal(denied.status, 401); assert.deepEqual(await denied.json(), { code: "unauthorized", retry: "none" });
+  const accepted = await fetch(ingress.endpoint + "/v1/agent-hub/messages", { method: "POST", headers, body: JSON.stringify(body) });
+  const receipt = await accepted.json(); assert.equal(accepted.status, 200); assert.equal(parseAgentHubDocument(receipt).status, "saved");
 });
