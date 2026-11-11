@@ -21,7 +21,7 @@ export interface AgentCommandRun {
 }
 export interface AgentCommandRecord { command: AgentBoundaryCommand; receipt: AgentBoundaryReceipt; sequence: number }
 export interface AgentCommandAudit {
-  eventId: string; sequence: number; commandId: string; agentId: string; action: AgentBoundaryAction | "runtime.bound" | "runtime.started" | "runtime.drained" | "runtime.unknown" | "recovery.ack";
+  eventId: string; sequence: number; commandId: string; agentId: string; action: AgentBoundaryAction | "runtime.bound" | "runtime.started" | "runtime.issued" | "runtime.quiescent" | "runtime.aborted" | "runtime.drained" | "runtime.unknown" | "recovery.ack";
   decision: "allowed" | "rejected" | "observed"; code: AgentBoundaryErrorCode | null;
   actorId: string; nodeId: string; at: string; oldEpoch: number; newEpoch: number; policyRevision: number; acknowledged: boolean;
 }
@@ -98,7 +98,7 @@ export function parseAgentCommandState(raw: unknown, context: AgentBoundaryConte
       || item.actorId !== context.humanSubjectId || item.nodeId !== context.nodeId || typeof item.at !== "string" || !Number.isFinite(Date.parse(item.at))
       || !commandEpoch(item.oldEpoch) || !commandEpoch(item.newEpoch) || !commandEpoch(item.policyRevision) || typeof item.acknowledged !== "boolean") return invalid();
     const command = commands.get(item.commandId)!;
-    if (item.action !== command.operation.action && !["runtime.bound", "runtime.started", "runtime.drained", "runtime.unknown", "recovery.ack"].includes(String(item.action))) return invalid();
+    if (item.action !== command.operation.action && !["runtime.bound", "runtime.started", "runtime.issued", "runtime.quiescent", "runtime.aborted", "runtime.drained", "runtime.unknown", "recovery.ack"].includes(String(item.action))) return invalid();
     previousSequence = Number(item.sequence); eventIds.add(item.eventId);
   }
   if (Buffer.byteLength(canonical(raw)) > CONTROL_BYTES) return invalid();

@@ -1,3 +1,4 @@
+import type { AgentLifecycleLease } from "./agent-lifecycle-state.js";
 import { workspaceAgentCommandProtected } from "./agent-command-protection.js";
 import { bindAgentBoundaryExecution, type AgentBoundaryExecutionGate } from "./agent-boundary-execution.js";
 import { WorkspaceNativeSessions, resettableNativeRuntime } from "./native-session-boundary.js";
@@ -37,6 +38,12 @@ import type { WorkspaceUserInteraction, WorkspaceUserQuestion } from "./user-int
 export interface WorkspaceRunPermit { readonly binding: Readonly<WorkspaceRunBinding> }
 declare const drainBrand: unique symbol;
 export interface WorkspaceRunDrainProof { readonly [drainBrand]: true }
+declare const quiescenceBrand: unique symbol;
+export interface WorkspaceRunQuiescenceProof { readonly [quiescenceBrand]: true }
+interface WorkspaceRunQuiescenceFacts {
+  binding: Readonly<WorkspaceRunBinding>; attemptId: string; proofRef: string; drainProofRef: string;
+  effectDigest: string; lease: Readonly<AgentLifecycleLease>;
+}
 interface PermitState {
   boundaryExecution?: ReturnType<typeof bindAgentBoundaryExecution>;
   resetRoundClock?: () => void;
@@ -59,6 +66,7 @@ interface PermitState {
   lease: WorkspaceSessionLease;
   retired: boolean;
   drainProof?: WorkspaceRunDrainProof;
+  quiescenceProof?: WorkspaceRunQuiescenceProof;
   closing?: Promise<void>;
   started: boolean;
   nativePolicy?: RuntimeExecutionPolicy;
@@ -530,6 +538,16 @@ export function workspaceRunEffectFacts(permit: WorkspaceRunPermit) {
     modelCalls: state.usage.modelCalls, toolCalls: state.usage.toolCalls,
     effects: state.completionEvidence.effectReceipts(), operations });
 }
+const quiescenceOwners = new WeakMap<object, WorkspaceRunPermit>();
+const quiescenceProofs = new WeakMap<object, Readonly<WorkspaceRunQuiescenceFacts>>();
+export function workspaceRunQuiescenceFacts(proof: unknown) {
+  const facts = proof && typeof proof === "object" ? quiescenceProofs.get(proof) : undefined;
+  if (!facts) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "lifecycle.quiescenceProof"); return facts;
+}
+export function assertWorkspaceRunQuiescenceOwner(proof: unknown, permit: WorkspaceRunPermit): void {
+  if (!proof || typeof proof !== "object" || quiescenceOwners.get(proof) !== permit)
+    throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "lifecycle.quiescenceOwner");
+}
 const drainOwners = new WeakMap<object, WorkspaceRunPermit>();
 const drainProofs = new WeakMap<object, Readonly<ReturnType<typeof workspaceRunEffectFacts> & { proofRef: string }>>();
 export function workspaceRunDrainProof(permit: WorkspaceRunPermit): WorkspaceRunDrainProof {
@@ -558,9 +576,22 @@ export async function closeWorkspaceRunPermit(permit: WorkspaceRunPermit): Promi
     state.lease.setDraining(false);
   }
   state.boundaryExecution?.close();
+  if (state.boundaryExecution?.requiresQuiescence) {
+    if (!state.quiescenceProof) {
+      // All operations/native teardown are finished and the retired permit cannot issue another effect.
+      const proof = Object.freeze({}) as WorkspaceRunQuiescenceProof, facts = workspaceRunEffectFacts(permit);
+      quiescenceProofs.set(proof, deepFreeze({ binding: facts.binding, attemptId: facts.attemptId,
+        proofRef: `quiet_${randomUUID()}`, drainProofRef: `drain_${randomUUID()}`,
+        effectDigest: createHash("sha256").update(canonical(facts)).digest("hex"), lease: state.lease.captureOwner() }));
+      quiescenceOwners.set(proof, permit); state.quiescenceProof = proof;
+    }
+    // This synchronous durable publication must succeed BEFORE releasing the original lease.
+    state.boundaryExecution.prepareQuiescence(state.quiescenceProof);
+  }
   state.lease.release();
   const proof = Object.freeze({}) as WorkspaceRunDrainProof;
-  drainProofs.set(proof, deepFreeze({ ...workspaceRunEffectFacts(permit), proofRef: `drain_${randomUUID()}` }));
+  drainProofs.set(proof, deepFreeze({ ...workspaceRunEffectFacts(permit), proofRef: state.quiescenceProof
+    ? workspaceRunQuiescenceFacts(state.quiescenceProof).drainProofRef : `drain_${randomUUID()}` }));
   drainOwners.set(proof, permit);
   state.drainProof = proof;
   })();

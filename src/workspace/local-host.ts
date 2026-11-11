@@ -179,6 +179,8 @@ export class LocalWorkspaceHost {
   private closing = false;
   private updateLease: { clientId: string; id: string } | null = null;
   private scheduleTimer?: ReturnType<typeof setInterval>;
+  private lifecycleTimer?: ReturnType<typeof setInterval>;
+  private lifecycleObserverUntil = 0;
   private usageTimer?: ReturnType<typeof setInterval>;
   private readonly usageCache: WorkspaceRuntimeUsageCache;
   private schedulerTicking = false;
@@ -204,6 +206,8 @@ export class LocalWorkspaceHost {
     boundaryTransports?: AgentBoundaryTransports;
     /** Trusted native/test bootstrap only; CLI and production composition remain disabled. */
     boundaryCommandControl?: boolean;
+    /** C4 Host-only bootstrap, separately closed in production. */
+    boundaryLifecycleControl?: boolean;
     boundaryMaxCommandLifetimeMs?: number;
     boundaryExternalDirectory?: AgentHubDirectory;
     /** Trusted Host/test composition only; never exposed through RPC or a persisted setting. */
@@ -312,7 +316,7 @@ export class LocalWorkspaceHost {
   private authorityForContext(context: WorkspaceHostContext): WorkspaceAgentBoundaryAuthority {
     context.boundaryAuthority ??= new WorkspaceAgentBoundaryAuthority({ catalog: this.catalog, resources: context.resources,
       storage: context.storage, transports: this.options.boundaryTransports ?? this.boundaryReadTransports,
-      commandControl: this.options.boundaryCommandControl,
+      commandControl: this.options.boundaryCommandControl, lifecycleControl: this.options.boundaryLifecycleControl,
       assertHostLive: () => { if (this.updateLease) throw new AgentBoundaryContractError("GRANT_REVOKED", "authority.host"); },
       resourcesForAgent: agentId => this.boundaryResources(context, agentId),
       ...(this.options.boundaryCommandControl ? { toolsForAgent: () => [...WORKSPACE_SCOPED_FILE_TOOLS, ...AGENT_BOUNDARY_BOOKKEEPING_TOOLS]
@@ -343,7 +347,9 @@ export class LocalWorkspaceHost {
     const context = this.context(workspaceId); return context.commandControl ??= new WorkspaceAgentCommandControl(authority);
   }
   initializeAgentCommandControl(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string) {
-    const control = this.commandAuthority(transport, workspaceId); control.initialize(transport!); return control.inspect(transport!, agentId);
+    const control = this.commandAuthority(transport, workspaceId); control.initialize(transport!);
+    if (this.options.boundaryLifecycleControl) control.initializeLifecycle(transport!);
+    this.kickLifecycleObserver(); return control.inspect(transport!, agentId);
   }
   agentCommandReceipt(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string, commandId: string) {
     return this.commandAuthority(transport, workspaceId).readReceipt(transport!, agentId, commandId);
@@ -383,7 +389,34 @@ export class LocalWorkspaceHost {
       for (const job of this.jobs.values()) if (job.workspaceId === workspaceId && job.agentId === agentId && !job.closed
         && (op.action !== "task.stop" || job.id === op.runId)) this.cancelOwnedJob(job);
     }
+    this.kickLifecycleObserver();
     return result;
+  }
+  /** Persisted targets wake only existing owned jobs. This never dispatches or rebinds a run. */
+  private pollLifecycleControls(): void {
+    if (this.closing || !this.options.boundaryLifecycleControl) return;
+    for (const [workspaceId, context] of this.contexts) {
+      const control = context.commandControl; if (!control) continue;
+      try {
+        for (const operation of control.lifecycleOperations()) for (const runId of operation.targetRunIds) {
+          const job = this.jobs.get(runId);
+          if (!job || job.closed || job.workspaceId !== workspaceId || job.agentId !== operation.agentId || !job.permit || job.commandControl !== control) continue;
+          this.cancelOwnedJob(job);
+          if (!operation.notifiedRunIds.includes(runId)) control.observeLifecycleNotification(operation.commandId, runId, job.permit);
+        }
+      } catch { /* Unconfirmed state remains held. C2 independently re-reads its synchronous gate. */ }
+    }
+    const owned = [...this.jobs.values()].some(job => !job.closed && job.commandControl);
+    if (!owned && Date.now() >= this.lifecycleObserverUntil && this.lifecycleTimer) {
+      clearInterval(this.lifecycleTimer); this.lifecycleTimer = undefined;
+    }
+  }
+  private kickLifecycleObserver(): void {
+    if (!this.options.boundaryLifecycleControl || this.closing) return;
+    // Bounded after an explicit reconcile; actual owned runs keep their observer until closure.
+    this.lifecycleObserverUntil = Date.now() + 30_000;
+    this.pollLifecycleControls();
+    if (!this.lifecycleTimer) { this.lifecycleTimer = setInterval(() => this.pollLifecycleControls(), 250); this.lifecycleTimer.unref(); }
   }
   agentBoundaryView(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string) {
     return this.boundaryAuthority(transport, workspaceId).view(transport!, agentId);
@@ -1934,7 +1967,7 @@ export class LocalWorkspaceHost {
         continuationSession: false, // Workspace recovery has its own bounded, fresh-observation wake brief.
         taskIntake: { task, current: () => owned.value.task!, onUpdate: next => { owned.value.task = next; },
           onCheckpoint: next => this.commit(owned, next), onRoundUsage: next => this.commit(owned, next) } });
-      this.jobs.set(owned.id, owned);
+      this.jobs.set(owned.id, owned); this.kickLifecycleObserver();
       // Yield the transport ACK before beginning model/tool preparation. The job is already
       // durably accepted and cancellable; the promise still owns/drains the entire execution.
       owned.promise = new Promise<void>(resolve => setImmediate(resolve)).then(() => this.run(owned)); this.changed(workspaceId, agentId);
@@ -2067,6 +2100,7 @@ export class LocalWorkspaceHost {
   }
   async wait(runId: string): Promise<void> { const job = this.jobs.get(runId); if (job) await job.promise; }
   async close(): Promise<void> {
+    if (this.lifecycleTimer) { clearInterval(this.lifecycleTimer); this.lifecycleTimer = undefined; }
     if (this.scheduleTimer) clearInterval(this.scheduleTimer);
     if (this.usageTimer) clearInterval(this.usageTimer);
     this.extensionProposals.clear();

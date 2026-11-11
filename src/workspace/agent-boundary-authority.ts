@@ -418,6 +418,25 @@ export class WorkspaceAgentBoundaryAuthority {
     if (!policy || !policy.rights.manage && !policy.rights.invoke) return fail("AUTHORIZATION_DENIED", "control.read");
     return this.commandControlState();
   }
+  /** Trusted Host composition only, never an RPC-returned object. */
+  lifecycleStorage(): WorkspaceResourceStorage { this.assertHostCurrent(); return this.options.storage; }
+  /** Current human management rights; independent of invoke/privateRead/nodeUse. */
+  assertLifecycleManager(transport: AgentBoundaryTransport, agentId: string): void {
+    this.source(transport); const state = this.read(), policy = this.currentPolicy(agentId, state.policies.find(row => row.agentId === agentId));
+    this.permission(policy, "agent.pause");
+  }
+  /** Positive persisted closure only; the lease reconciler calls this again under its own lock. */
+  lifecycleLeaseReleaseFacts(transport: AgentBoundaryTransport, runId: string) {
+    if (!this.commandControlSourceHealthy()) return fail("AUTHORITY_UNVERIFIED", "lifecycle.source");
+    const snapshot = this.commandControlState(), run = snapshot.control.runs.find(row => row.runId === runId);
+    if (!snapshot.lifecycle || !run) return fail("AUTHORITY_UNVERIFIED", "lifecycle.release");
+    this.assertLifecycleManager(transport, run.agentId);
+    const execution = snapshot.lifecycle.executions.find(row => row.runId === runId);
+    const proof = execution?.terminal ?? execution?.quiescence;
+    if (!execution?.lease || !proof || canonical(proof.lease) !== canonical(execution.lease)
+      || execution.bindingDigest !== run.bindingDigest || execution.claimRevision !== run.claimRevision) return fail("CONTROL_HELD", "lifecycle.release");
+    return deepFreeze({ context: this.parent.context, runId, bindingDigest: run.bindingDigest, proofRef: proof.proofRef, lease: execution.lease });
+  }
   /** Host preparation liveness only; this method does not issue an execution permit. */
   assertCommandRunBinding(binding: Readonly<WorkspaceRunBinding>): void {
     this.assertHostCurrent(); const context = this.parent.context;

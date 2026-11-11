@@ -25,3 +25,11 @@ Unpublished archive failure retains active state. Referenced history failure ref
 ## Gates
 
 The implementation requires exact-run and sibling isolation, genuine pending-Promise drain, explicit pre-issuance failures/crash cuts, two-Host notification, claim CAS, main/legacy guards, scoped approvals/grants, bounded archive/dedup and fault-domain tests. Exact final source gets the standard private HOME/TMP guard full test/build before the single draft PR is handed to review. Production/native/MCP/child/mobile activation remains out of scope.
+
+## Runtime/Host closure ports
+
+The genuine C4 control source supplies the C2 gate's synchronous `prepareQuiescence` sink. The real runtime alone mints the opaque proof after tracked Promise/native teardown/retirement, while its captured lease is still current. A failed publication keeps the lease. The final drain proof uses the same prepublished drain reference. Exact duplicate publication after completed reconciliation is read-only and still requires the genuine original runtime proof, original issuer and complete persisted tuple. Serialized facts are never accepted as proofs.
+
+`reconcileQuiescentRelease` requires a genuine C1 authority and current authenticated management rights; it re-reads the positive persisted closure inside physical admission/lease locks, checks the complete owner digest/inode/times/scope and proves the old owner dead (or the exact current process instance). It never acquires an execution. Missing ownership alone proves nothing. Its in-process WeakRef table only marks an original receipt released after those checks; it supplies no permission or epoch. Recovered business outcomes become UNKNOWN conservatively.
+
+The actual owning Host observes persisted exact target IDs every250ms while it has owned work. Explicit reconciliation gets a bounded30s observer window; the timer is unref'ed and closes with that Host. A second Host with an empty jobs map cannot report notification or drain. Notifications may only abort an already-owned matching job, and never start/rebind business. Independent synchronous C2 gates reject effects immediately without waiting for this notification interval.
