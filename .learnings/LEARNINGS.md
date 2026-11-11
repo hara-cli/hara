@@ -1498,3 +1498,7 @@ Review N1/N2 found 15 normal links and 20,848 real-scale entries made the origin
 **Area**: backend
 
 Historical shape validation must not be the admission predicate for resuming an unpublished record. Compare its full canonical provenance to the current factory result for the authenticated frozen pair/binding before any repair publication, while retaining independent Host/grant fences. Reject-and-preserve mismatches; JSON key reordering alone is harmless. Source: C0 joint review J-HIST-ORPHAN; related: src/agent-hub/store.ts, c0-adapter.ts.
+
+
+## LRN-20261111-HUB-PREFLIGHT (best_practice)
+Credential preflight must not start maintenance before authentication or perturb metadata being measured by a shared census. Use a verified atomic snapshot for preliminary checks, retain read-only policy validation, then authenticate again in the real write transaction. Deadlines bound admission waits, not mutation replay: a shared accounting-only job may outlive an aborted waiter, but its message must never publish afterward. Source: W0/N3 regression; related: src/agent-hub/ingress.ts, private-store.ts, store.ts, src/storage/quota.ts.
