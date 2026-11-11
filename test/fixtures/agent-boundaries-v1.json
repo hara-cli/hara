@@ -42,7 +42,7 @@
         "dutyRevision": 1,
         "publicProfile": {
           "title": "Fixture colleague",
-          "description": "Synthetic duty.\n合成职责；描述不授予执行权限。",
+          "description": "Synthetic duty.\n\u5408\u6210\u804c\u8d23\uff1b\u63cf\u8ff0\u4e0d\u6388\u4e88\u6267\u884c\u6743\u9650\u3002",
           "owns": [
             "fixture-finance"
           ],
@@ -1733,6 +1733,645 @@
       "sourceText": " {\"schemaVersion\":2,\"owns\":[\"/synthetic/legacy/project\"],\"allow\":[\"*\"],\"unknownExecution\":{\"receipt\":\"preserve-fixture\"},\"uniqueField\":{\"keep\":true}}\n",
       "sourceRef": "legacy-fixture",
       "expectedDocument": "migration"
+    }
+  ],
+  "hubValid": [
+    {
+      "name": "external-source",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+          "generation": "22222222-2222-4222-8222-222222222222"
+        },
+        "kind": "external-agent-source",
+        "actor": {
+          "kind": "external-agent",
+          "externalAgentId": "registered-a",
+          "instanceId": "boot-a"
+        },
+        "identityBasis": "registered-credential",
+        "humanPrincipal": null,
+        "contentTrust": "untrusted-reference",
+        "use": "display-only"
+      }
+    },
+    {
+      "name": "saved",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+          "generation": "22222222-2222-4222-8222-222222222222"
+        },
+        "kind": "hub-ingress-receipt",
+        "status": "saved",
+        "messageId": "message-fixture",
+        "requestId": "request-fixture",
+        "connectionId": "connection-fixture",
+        "seq": 1,
+        "savedAt": "2026-11-11T00:00:00.000Z"
+      }
+    },
+    {
+      "name": "transport-accepted",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+          "generation": "22222222-2222-4222-8222-222222222222"
+        },
+        "kind": "hub-transport-receipt",
+        "operationId": "operation-fixture",
+        "target": {
+          "externalAgentId": "registered-a",
+          "instanceId": "boot-a"
+        },
+        "receiptRevision": 1,
+        "status": "accepted",
+        "evidenceRef": null,
+        "error": null
+      }
+    },
+    {
+      "name": "transport-queued",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+          "generation": "22222222-2222-4222-8222-222222222222"
+        },
+        "kind": "hub-transport-receipt",
+        "operationId": "operation-fixture",
+        "target": {
+          "externalAgentId": "registered-a",
+          "instanceId": "boot-a"
+        },
+        "receiptRevision": 1,
+        "status": "queued",
+        "evidenceRef": "g0-proof-fixture",
+        "error": null
+      }
+    },
+    {
+      "name": "transport-delivered",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+          "generation": "22222222-2222-4222-8222-222222222222"
+        },
+        "kind": "hub-transport-receipt",
+        "operationId": "operation-fixture",
+        "target": {
+          "externalAgentId": "registered-a",
+          "instanceId": "boot-a"
+        },
+        "receiptRevision": 1,
+        "status": "delivered",
+        "evidenceRef": "g0-proof-fixture",
+        "error": null
+      }
+    },
+    {
+      "name": "transport-rejected",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+          "generation": "22222222-2222-4222-8222-222222222222"
+        },
+        "kind": "hub-transport-receipt",
+        "operationId": "operation-fixture",
+        "target": {
+          "externalAgentId": "registered-a",
+          "instanceId": "boot-a"
+        },
+        "receiptRevision": 1,
+        "status": "rejected",
+        "evidenceRef": null,
+        "error": {
+          "code": "draft_present",
+          "retry": "explicit_user_only"
+        }
+      }
+    },
+    {
+      "name": "transport-unknown",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+          "generation": "22222222-2222-4222-8222-222222222222"
+        },
+        "kind": "hub-transport-receipt",
+        "operationId": "operation-fixture",
+        "target": {
+          "externalAgentId": "registered-a",
+          "instanceId": "boot-a"
+        },
+        "receiptRevision": 1,
+        "status": "unknown",
+        "evidenceRef": null,
+        "error": {
+          "code": "dispatch_unknown",
+          "retry": "query_original"
+        }
+      }
+    }
+  ],
+  "hubInvalid": [
+    {
+      "name": "human-impersonation",
+      "from": "external-source",
+      "edits": [
+        {
+          "path": [
+            "humanPrincipal"
+          ],
+          "delete": false,
+          "value": "human-fixture"
+        }
+      ],
+      "errorCode": "PERSONAL_MODE_ONLY"
+    },
+    {
+      "name": "human-actor-kind",
+      "from": "external-source",
+      "edits": [
+        {
+          "path": [
+            "actor",
+            "kind"
+          ],
+          "delete": false,
+          "value": "human"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "command-actor-chain",
+      "from": "external-source",
+      "edits": [
+        {
+          "path": [
+            "actorChain"
+          ],
+          "delete": false,
+          "value": {
+            "requestedBy": "human-fixture"
+          }
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "trusted-content",
+      "from": "external-source",
+      "edits": [
+        {
+          "path": [
+            "contentTrust"
+          ],
+          "delete": false,
+          "value": "trusted"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "executable-use",
+      "from": "external-source",
+      "edits": [
+        {
+          "path": [
+            "use"
+          ],
+          "delete": false,
+          "value": "execute"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "from-is-not-identity",
+      "from": "external-source",
+      "edits": [
+        {
+          "path": [
+            "from"
+          ],
+          "delete": false,
+          "value": "registered-a"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "credential-in-source",
+      "from": "external-source",
+      "edits": [
+        {
+          "path": [
+            "token"
+          ],
+          "delete": false,
+          "value": "synthetic-never-log"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "missing-instance",
+      "from": "external-source",
+      "edits": [
+        {
+          "path": [
+            "actor",
+            "instanceId"
+          ],
+          "delete": true,
+          "value": null
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "source-missing-binding",
+      "from": "external-source",
+      "edits": [
+        {
+          "path": [
+            "binding"
+          ],
+          "delete": true,
+          "value": null
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "future-generation-format",
+      "from": "external-source",
+      "edits": [
+        {
+          "path": [
+            "binding",
+            "generation"
+          ],
+          "delete": false,
+          "value": "not-a-generation"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "team-mode",
+      "from": "external-source",
+      "edits": [
+        {
+          "path": [
+            "mode"
+          ],
+          "delete": false,
+          "value": "team"
+        }
+      ],
+      "errorCode": "PERSONAL_MODE_ONLY"
+    },
+    {
+      "name": "future-schema",
+      "from": "external-source",
+      "edits": [
+        {
+          "path": [
+            "schemaVersion"
+          ],
+          "delete": false,
+          "value": 2
+        }
+      ],
+      "errorCode": "CONTRACT_VERSION_UNSUPPORTED"
+    },
+    {
+      "name": "saved-as-applied",
+      "from": "saved",
+      "edits": [
+        {
+          "path": [
+            "status"
+          ],
+          "delete": false,
+          "value": "applied"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "save-acceptance-is-not-commit",
+      "from": "saved",
+      "edits": [
+        {
+          "path": [
+            "status"
+          ],
+          "delete": false,
+          "value": "accepted"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "unsafe-seq",
+      "from": "saved",
+      "edits": [
+        {
+          "path": [
+            "seq"
+          ],
+          "delete": false,
+          "value": 9007199254740992
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "zero-seq",
+      "from": "saved",
+      "edits": [
+        {
+          "path": [
+            "seq"
+          ],
+          "delete": false,
+          "value": 0
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "saved-missing-connection",
+      "from": "saved",
+      "edits": [
+        {
+          "path": [
+            "connectionId"
+          ],
+          "delete": true,
+          "value": null
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "noncanonical-save-time",
+      "from": "saved",
+      "edits": [
+        {
+          "path": [
+            "savedAt"
+          ],
+          "delete": false,
+          "value": "2026-11-11T00:00:00Z"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "command-context-in-save",
+      "from": "saved",
+      "edits": [
+        {
+          "path": [
+            "context"
+          ],
+          "delete": false,
+          "value": {
+            "scope": {
+              "schemaVersion": 1,
+              "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+              "authority": {
+                "kind": "local",
+                "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+              }
+            },
+            "resourceBinding": {
+              "schemaVersion": 1,
+              "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+              "generation": "22222222-2222-4222-8222-222222222222"
+            },
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture",
+            "deviceId": null,
+            "localGrant": {
+              "grantId": "grant-fixture",
+              "grantRevision": 1,
+              "humanSubjectId": "human-fixture",
+              "nodeId": "node-fixture"
+            },
+            "collaboration": {
+              "organizationId": null,
+              "membershipId": null,
+              "membershipVersion": null,
+              "role": null,
+              "delegation": null
+            }
+          }
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "delivered-needs-proof",
+      "from": "transport-delivered",
+      "edits": [
+        {
+          "path": [
+            "evidenceRef"
+          ],
+          "delete": false,
+          "value": null
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "queued-needs-proof",
+      "from": "transport-queued",
+      "edits": [
+        {
+          "path": [
+            "evidenceRef"
+          ],
+          "delete": false,
+          "value": null
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "acceptance-not-delivery-proof",
+      "from": "transport-accepted",
+      "edits": [
+        {
+          "path": [
+            "evidenceRef"
+          ],
+          "delete": false,
+          "value": "g0-proof-fixture"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "execution-status-in-transport",
+      "from": "transport-delivered",
+      "edits": [
+        {
+          "path": [
+            "status"
+          ],
+          "delete": false,
+          "value": "applied"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "saved-is-not-egress",
+      "from": "transport-accepted",
+      "edits": [
+        {
+          "path": [
+            "status"
+          ],
+          "delete": false,
+          "value": "saved"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "unknown-cannot-retry-new",
+      "from": "transport-unknown",
+      "edits": [
+        {
+          "path": [
+            "error",
+            "retry"
+          ],
+          "delete": false,
+          "value": "same_request_only"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "unknown-needs-unknown-error",
+      "from": "transport-unknown",
+      "edits": [
+        {
+          "path": [
+            "error"
+          ],
+          "delete": false,
+          "value": null
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "error-pair-mismatch",
+      "from": "transport-rejected",
+      "edits": [
+        {
+          "path": [
+            "error",
+            "retry"
+          ],
+          "delete": false,
+          "value": "same_request_only"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "command-error-is-not-hub-error",
+      "from": "transport-rejected",
+      "edits": [
+        {
+          "path": [
+            "error"
+          ],
+          "delete": false,
+          "value": {
+            "code": "AUTHORIZATION_DENIED",
+            "retry": "never"
+          }
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "error-no-free-text",
+      "from": "transport-rejected",
+      "edits": [
+        {
+          "path": [
+            "error",
+            "message"
+          ],
+          "delete": false,
+          "value": "private-value-must-not-leak"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "zero-receipt-revision",
+      "from": "transport-accepted",
+      "edits": [
+        {
+          "path": [
+            "receiptRevision"
+          ],
+          "delete": false,
+          "value": 0
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "rejected-cannot-hide-unknown",
+      "from": "transport-rejected",
+      "edits": [
+        {
+          "path": [
+            "error"
+          ],
+          "delete": false,
+          "value": {
+            "code": "dispatch_unknown",
+            "retry": "query_original"
+          }
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
     }
   ]
 }

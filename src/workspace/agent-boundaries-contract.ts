@@ -285,3 +285,114 @@ export async function draftAgentBoundaryMigration(sourceText: string, sourceRef:
   if (value.kind !== "migration-draft") return fail("INVALID_DOCUMENT", "migration");
   return value;
 }
+
+
+/** Agent Hub display/transport data is deliberately NOT an AgentBoundaryDocument.
+ * No human context, actorChain, grant, command action or execution state is implied. */
+const hubBinding = form({ schemaVersion: version, scopeKey: digest, generation: uuid });
+export type HubResourceBindingV1 = Immutable<Value<typeof hubBinding>>;
+const hubBase = { schemaVersion: version, mode: personal, binding: hubBinding };
+const hubActor = form({ kind: literal("external-agent"), externalAgentId: id, instanceId: id });
+export type HubExternalActorV1 = Immutable<Value<typeof hubActor>>;
+const externalSource = form({ ...hubBase, kind: literal("external-agent-source"), actor: hubActor,
+  identityBasis: literal("registered-credential"), humanPrincipal: future,
+  contentTrust: literal("untrusted-reference"), use: literal("display-only"),
+});
+export type ExternalAgentSourceV1 = Immutable<Value<typeof externalSource>>;
+/** These are recovery hints, never authority to auto-send or replay a message. */
+export const AGENT_HUB_ERRORS = Object.freeze({
+  invalid_request: "none", unauthorized: "none", conflict: "query_original",
+  quota_exceeded: "explicit_user_only", unsupported_attachment: "none",
+  registry_unavailable: "same_request_only", store_unavailable: "same_request_only",
+  draft_present: "explicit_user_only", target_unavailable: "explicit_user_only",
+  transport_unavailable: "explicit_user_only", dispatch_unknown: "query_original",
+} as const);
+export type HubErrorCodeV1 = keyof typeof AGENT_HUB_ERRORS;
+const hubError = form({ code: choices(Object.keys(AGENT_HUB_ERRORS) as HubErrorCodeV1[]),
+  retry: choices(["none", "same_request_only", "query_original", "explicit_user_only"]),
+});
+export type HubErrorV1 = Immutable<Value<typeof hubError>>;
+const hubSavedFacts = form({ messageId: id, requestId: id, connectionId: id, seq: revision, savedAt: timestamp });
+export type HubSavedFactsV1 = Immutable<Value<typeof hubSavedFacts>>;
+const hubSavedReceipt = form({ ...hubBase, kind: literal("hub-ingress-receipt"), status: literal("saved"),
+  messageId: id, requestId: id, connectionId: id, seq: revision, savedAt: timestamp,
+});
+export type HubSavedReceiptV1 = Immutable<Value<typeof hubSavedReceipt>>;
+const hubTransportBase = { ...hubBase, kind: literal("hub-transport-receipt"), operationId: id,
+  target: form({ externalAgentId: id, instanceId: id }), receiptRevision: revision,
+};
+const hubTransportReceipt = tagged("status", {
+  accepted: form({ ...hubTransportBase, status: literal("accepted"), evidenceRef: literal(null), error: literal(null) }),
+  queued: form({ ...hubTransportBase, status: literal("queued"), evidenceRef: id, error: literal(null) }),
+  delivered: form({ ...hubTransportBase, status: literal("delivered"), evidenceRef: id, error: literal(null) }),
+  rejected: form({ ...hubTransportBase, status: literal("rejected"), evidenceRef: literal(null), error: hubError }),
+  unknown: form({ ...hubTransportBase, status: literal("unknown"), evidenceRef: nullable(id),
+    error: form({ code: literal("dispatch_unknown"), retry: literal("query_original") }),
+  }),
+});
+export type HubTransportReceiptV1 = Immutable<Value<typeof hubTransportReceipt>>;
+export type HubReceiptV1 = HubSavedReceiptV1 | HubTransportReceiptV1;
+export type AgentHubDocumentV1 = ExternalAgentSourceV1 | HubReceiptV1;
+const hubDocument = tagged("kind", { "external-agent-source": externalSource,
+  "hub-ingress-receipt": hubSavedReceipt, "hub-transport-receipt": hubTransportReceipt,
+});
+/** Syntax only: neither token authentication nor proof of storage/queue/delivery/execution. */
+export function parseAgentHubDocument(raw: unknown): AgentHubDocumentV1 {
+  jsonOnly(raw);
+  if (!plain(raw)) return fail("INVALID_DOCUMENT", "hub.document");
+  version(raw.schemaVersion, "hub.schemaVersion"); personal(raw.mode, "hub.mode");
+  const value = hubDocument(raw, "hub.document");
+  if (value.kind === "hub-transport-receipt" && value.error !== null) {
+    if (AGENT_HUB_ERRORS[value.error.code] !== value.error.retry
+      || (value.status === "rejected" && value.error.code === "dispatch_unknown")) return fail("INVALID_DOCUMENT", "hub.error");
+  }
+  return freeze(value);
+}
+/** Namespace comparison only; expected must come from the trusted Host's fixed Store binding. */
+export function assertAgentHubBinding(value: AgentHubDocumentV1, expected: HubResourceBindingV1): void {
+  jsonOnly(expected); const binding = hubBinding(expected, "hub.binding");
+  const parsed = parseAgentHubDocument(value);
+  if (canonical(parsed.binding) !== canonical(binding)) fail("CONTEXT_MISMATCH", "hub.binding");
+}
+export interface AgentHubBoundaryContractV1 {
+  readonly externalSource: (agent: Readonly<{ agentId: string; instanceId: string }>) => ExternalAgentSourceV1;
+  readonly isExternalSource: (value: unknown) => value is ExternalAgentSourceV1;
+  readonly savedReceipt: (facts: HubSavedFactsV1) => HubSavedReceiptV1;
+  readonly isSavedReceipt: (value: unknown) => value is HubSavedReceiptV1;
+}
+/** Pure adapter for Hub's mandatory factory/validator injection. Captures a copied binding;
+ * the Host must authenticate a connection and supply its frozen registered agent/instance.
+ * Raw `from` and external request claims must never be passed as the registered identity.
+ * savedReceipt must only be called for the Store's successfully committed save facts. */
+export function createAgentHubBoundaryContract(expected: HubResourceBindingV1): AgentHubBoundaryContractV1 {
+  jsonOnly(expected); const binding = freeze(hubBinding(expected, "hub.binding"));
+  const matches = <K extends AgentHubDocumentV1["kind"]>(value: unknown, kind: K): value is Extract<AgentHubDocumentV1, { kind: K }> => {
+    try {
+      const parsed = parseAgentHubDocument(value);
+      return parsed.kind === kind && canonical(parsed.binding) === canonical(binding);
+    } catch (error) {
+      if (error instanceof AgentBoundaryContractError) return false;
+      throw error;
+    }
+  };
+  return Object.freeze({
+    externalSource(agent) {
+      jsonOnly(agent);
+      if (!plain(agent)) return fail("INVALID_DOCUMENT", "hub.agent");
+      const parsed = parseAgentHubDocument({ schemaVersion: 1, mode: "personal", binding,
+        kind: "external-agent-source", actor: { kind: "external-agent", externalAgentId: agent.agentId, instanceId: agent.instanceId },
+        identityBasis: "registered-credential", humanPrincipal: null, contentTrust: "untrusted-reference", use: "display-only" });
+      if (parsed.kind !== "external-agent-source") return fail("INVALID_DOCUMENT", "hub.source");
+      return parsed;
+    },
+    isExternalSource(value): value is ExternalAgentSourceV1 { return matches(value, "external-agent-source"); },
+    savedReceipt(facts) {
+      jsonOnly(facts); const parsedFacts = hubSavedFacts(facts, "hub.savedFacts");
+      const parsed = parseAgentHubDocument({ schemaVersion: 1, mode: "personal", binding,
+        kind: "hub-ingress-receipt", status: "saved", ...parsedFacts });
+      if (parsed.kind !== "hub-ingress-receipt") return fail("INVALID_DOCUMENT", "hub.receipt");
+      return parsed;
+    },
+    isSavedReceipt(value): value is HubSavedReceiptV1 { return matches(value, "hub-ingress-receipt"); },
+  } satisfies AgentHubBoundaryContractV1);
+}

@@ -29,7 +29,7 @@ hashes together; the checker must reject drift.
 
 ## Identity and personal-only mode
 
-Every document has `schemaVersion: 1`, `mode: personal` and a complete `context`:
+Every agent-boundary document has `schemaVersion: 1`, `mode: personal` and a complete `context`:
 
 - `scope` preserves the existing WorkspaceResourceScope tuple: local authority UUID
   or Account issuer/region/Realm UUID, plus the Workspace UUID. No implicit cwd,
@@ -107,6 +107,12 @@ references, never credentials embedded in JSON.
 Identical command identity returns its original receipt in C3; same ID with a
 different context/root/target/operation/revision/digest is a conflict, not a retry.
 Refreshing UI metadata cannot resubmit, restart or enlarge the original command.
+C1 derives provenance from the genuine authenticated transport first, then
+requires the command claim to match exactly; a request body cannot select
+local_human or signed_device authority. An external message containing a
+syntactically valid human command stays display content and never enters the
+command route. Intent digests remain unverified wire claims after parsing; C1
+must compute the signing input digest and verify the actual source proof.
 The issuedAt/notAfter interval is syntactically canonical UTC; C1 must verify the
 current clock, actual expiry and configured limits. C0 never reads the wall clock
 or extends a deadline. Cloud queue lifetime and approval windows remain governed
@@ -178,3 +184,77 @@ second-human reservations, wrong subject/Agent/node, missing stop/hold identity,
 unsafe versions, deferred commands and invented success/permission shortcuts.
 The same fixtures run against compiled Core and the actual Desktop consumer seam.
 This C0 evidence does not claim runtime, multiuser, OS sandbox or release acceptance.
+
+## Agent Hub external source and transport extension (C0 only)
+
+The Hub family is frozen alongside the human family under the same C0 v1 source,
+fixture corpus and lock; it does not define a competing Hub-owned wire format.
+This independent `AgentHubDocumentV1` union is not an `AgentBoundaryDocument`.
+It adds no command origin, human actorChain, grant, execution status, RPC, token
+issuer, transport adapter or model/tool/task entry point. Human command v1 bytes
+and validation remain unchanged. Hub ingress remains a passive mailbox.
+
+Core and Desktop export the same types: `ExternalAgentSourceV1`,
+`HubSavedFactsV1`, `HubSavedReceiptV1`, `HubTransportReceiptV1`, `HubReceiptV1`,
+`HubErrorV1` and `HubResourceBindingV1`. `parseAgentHubDocument` strictly parses
+only these distinct shapes. Its local parse failures use the existing
+AgentBoundaryContractError; the serialized lower-case Hub error domain is separate.
+Both parsers reject each other's documents, including superficially similar ACKs.
+
+All Hub documents require schemaVersion=1, mode=personal and a fixed Host binding
+of schemaVersion/scopeKey/generation. They do not carry the human command context.
+The external source kind is `external-agent-source`; actor.kind is
+`external-agent`, with externalAgentId and exact registered instanceId.
+identityBasis=registered-credential is a claim label, not token verification.
+humanPrincipal must be null, contentTrust=untrusted-reference and use=display-only.
+No token, token digest, arbitrary from, display metadata or native transcript is
+serialized. The Host authenticates a revocable per-connection credential and
+selects that connection's frozen registered agent/instance. Raw from is lookup
+only, never the source of authority, even if it names a real registered Agent.
+
+`createAgentHubBoundaryContract(binding)` returns Hub's four mandatory ports:
+externalSource(registeredAgent), isExternalSource(unknown), savedReceipt(facts),
+isSavedReceipt(unknown). It copies the binding and makes immutable outputs.
+Validators require the exact captured scope and generation as well as strict
+shape/kind; they do not check live generation, registration, token validity,
+connection ownership or whether an actual commit occurred. That remains Hub/Host
+work. A caller supplying a forged binding or identity has not authenticated it.
+Registered metadata may include alias/displayName/engine; only the registered pair
+is projected into the C0 source. No Hub source or human contract is duplicated.
+
+The inbound `hub-ingress-receipt` accepts status=saved only and exactly five save
+facts: messageId, requestId, connectionId, positive safe-integer seq and canonical
+UTC savedAt. savedAt is the Store's record timestamp, not independent fsync proof.
+The Store emits this ACK only after its durable transaction for the message,
+attachment references, idempotency record and sequence. Parsing or calling the
+factory does not commit anything. Retries resolve the original binding +
+connectionId + requestId across token rotation; same identity/different digest is
+conflict. Credential epoch is revocation/audit state, not a new dedupe identity.
+
+The separate `hub-transport-receipt` has operationId, exact target pair and positive
+safe receiptRevision. States are accepted, queued, delivered, rejected or unknown:
+
+- accepted means the Host recorded intent, with null evidenceRef/error; no delivery.
+- queued and delivered require a non-null opaque G0 evidenceRef and null error.
+  Evidence must come from the precise transport operation; neither state means
+  read, approved, model started, task accepted or an execution effect completed.
+- rejected has a stable non-null error and null evidenceRef. It cannot hide an
+  uncertain dispatch under a known rejection.
+- unknown requires dispatch_unknown/query_original, with optional evidenceRef.
+  Keep the original operationId, query its original receipt and never automatically
+  redispatch, create a replacement operation or fall back to human commands.
+
+AGENT_HUB_ERRORS freezes these lower-case code/retry pairs:
+invalid_request/none, unauthorized/none, conflict/query_original,
+quota_exceeded/explicit_user_only, unsupported_attachment/none,
+registry_unavailable/same_request_only, store_unavailable/same_request_only,
+draft_present/explicit_user_only, target_unavailable/explicit_user_only,
+transport_unavailable/explicit_user_only, dispatch_unknown/query_original.
+The error is only {code,retry}, with no free text, private paths, content, stack,
+credential or hash. Unauthorized responses do not reveal whether a token was
+revoked or a connection exists. Retry values are recovery hints only:
+same_request_only permits the same inbound idempotency lookup/retry, never an
+autonomous egress send. A failed/ambiguous store write must consult the original
+record; explicit_user_only still requires a genuine new human action when safe.
+Human UserAction proof for any future egress is separate from ExternalAgentSourceV1
+and from the inbound credential. This C0 slice does not implement that proof or G0.
