@@ -4,11 +4,12 @@ C2 composes three independent authorities: the existing opaque WorkspaceRunPermi
 and a trusted C3 accepted-command/control source. Parsing C0, receiving a Hub message, checking C1,
 setting an approval boolean or possessing a serialized RunBinding grants none of these.
 
-This slice supplies the **consumer and in-process Pi adapter**. It does not implement C3's durable
-command ledger, stop/resume arbitration, C4 physical lifecycle, C9 approvals or C12 product ingress.
-No default C3 issuer, RPC option, desktop bootstrap, native credential change or production enablement
-is added. Released runs without an explicit Host-composed gate retain their existing behavior and must
-not be presented as C2-enforced. C1 views continue to report runtimeEnforced=false.
+The original C2 slice supplied the **consumer and in-process Pi adapter**; it did not implement the
+durable C3 source. The C3 extension below now supplies trusted opt-in Host composition. C4 physical
+lifecycle, C9 approvals, C12 product ingress, default production/Desktop activation and native
+credential changes remain separate. Unprotected legacy runs retain their existing behavior and must
+not be presented as C2-enforced; a C3-protected scope refuses legacy downgrade. C1 views continue
+to report runtimeEnforced=false.
 
 ## Host composition and C3 port
 
@@ -95,3 +96,12 @@ fixture and cross-repository lock remain unchanged.
 
 Production activation remains pending actual C3 integration and joint review. Passing the consumer
 fixture tests does not establish real C3/Host/desktop/native joint acceptance.
+
+
+## C3 source and reviewed adapter identity
+
+[C3 command authority](agent-command-control-c3.md) now implements the persistent source through
+trusted opt-in Host composition. The default product/bootstrap remains disabled. Scoped file tools
+require the reviewed factory's opaque registration; names/regex and JSON copies cannot register an
+adapter. New tools, including an innocently named `agent`, remain unsupported. A protected scope and
+its existing completion authority cannot be reopened through an unmediated legacy RunPermit.

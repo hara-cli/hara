@@ -61,3 +61,11 @@ The library issues `AgentCommandGrant` as an opaque, issuer-local WeakMap handle
 `test/agent-boundary-host.test.mjs` tests the actual loopback WebSocket Host and HTTP C0 Hub with synthetic private homes. It proves Host-generated provenance; a normal connection on the same endpoint cannot gain human authority through body claims; a valid human command in a real Hub message remains passive external text. Both paths assert zero provider activations, zero model calls, no conversation history and no approval creation. The Hub uses the real C1 catalog/grant/generation fence and rejects new admissions after parent revocation.
 
 The tests also cover discovery secrecy, default-off composition, failed reauthentication, connection replay and actual project-inode replacement. `test/agent-boundary-authority.test.mjs` covers independent rights, same-name isolation (including two Workspaces on one Host/connection), CAS/revision limits, accessor rejection, missing/corrupt policy preservation, resource/tool revocation, registered external metadata and opaque grant lifetime. These tests are C1 acceptance, not C2 native isolation, C3 ledger, cloud/mobile or release acceptance.
+
+
+## C3 extension
+
+[C3 command authority](agent-command-control-c3.md) extends this same private aggregate to schema 2.
+Portable C0 v1 remains unchanged. In the explicit protected lane C1 drafts the actual target epoch,
+policy updates require the original command, and current C1 policy stays only one input to C2/C3.
+The original C1-only bootstrap/default remains disabled for execution; it cannot downgrade a protected scope.
