@@ -1,0 +1,9 @@
+{
+  "contract": "hara.agent-boundaries.v1",
+  "canonicalRepository": "hara-cli/hara",
+  "canonicalSource": "src/workspace/agent-boundaries-contract.ts",
+  "sourceSha256": "99d15c570925b9df17c13096c9501070d560bba6dbcaaaf7180e6a2d8342f1c1",
+  "fixturesSha256": "846c5e58f31533fbab421c200b75f68ec869f08a4a7c8c623a8a06529a6c2fa9",
+  "stage": "C0-contract-only",
+  "runtimeEnabled": false
+}

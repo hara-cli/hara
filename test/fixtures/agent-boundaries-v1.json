@@ -1,0 +1,1738 @@
+{
+  "contract": "hara.agent-boundaries.v1",
+  "valid": [
+    {
+      "name": "duty",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "duty-profile",
+        "agentId": "agent-fixture",
+        "dutyRevision": 1,
+        "publicProfile": {
+          "title": "Fixture colleague",
+          "description": "Synthetic duty.\n合成职责；描述不授予执行权限。",
+          "owns": [
+            "fixture-finance"
+          ],
+          "rejects": [
+            "fixture-production"
+          ]
+        }
+      }
+    },
+    {
+      "name": "boundary",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "execution-boundary",
+        "agentId": "agent-fixture",
+        "boundaryRevision": 1,
+        "resources": [
+          {
+            "resourceId": "project-fixture",
+            "access": [
+              "read"
+            ]
+          }
+        ],
+        "tools": {
+          "allow": [
+            {
+              "toolId": "file.read",
+              "connectorId": null,
+              "catalogRevision": 1
+            }
+          ],
+          "deny": [
+            {
+              "toolId": "shell.execute",
+              "connectorId": null,
+              "catalogRevision": 1
+            }
+          ],
+          "readOnly": true
+        },
+        "budget": {
+          "budgetRef": "budget-fixture",
+          "maxModelCalls": 8,
+          "maxToolEffects": 16
+        },
+        "approvalRequired": [
+          "write",
+          "execute",
+          "external_send",
+          "paid",
+          "publish",
+          "credentials",
+          "policy_expand"
+        ],
+        "runtimeRequirements": [
+          "resource_isolation",
+          "effect_journal",
+          "current_grant_check"
+        ]
+      }
+    },
+    {
+      "name": "dispatch",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "command",
+        "commandId": "command-dispatch",
+        "rootRequestId": "request-fixture",
+        "agentId": "agent-fixture",
+        "actorChain": {
+          "requestedBy": "human-fixture",
+          "actingAgent": "agent-fixture",
+          "approvedBy": null,
+          "executingNode": "node-fixture"
+        },
+        "provenance": {
+          "channel": "local_human",
+          "proofRef": "human-transport-fixture"
+        },
+        "expected": {
+          "dutyRevision": 1,
+          "boundaryRevision": 1,
+          "controlEpoch": 0
+        },
+        "issuedAt": "2026-11-11T00:00:00.000Z",
+        "notAfter": "2026-11-11T00:05:00.000Z",
+        "operation": {
+          "action": "task.dispatch",
+          "taskId": "task-fixture",
+          "conversationId": "conversation-fixture",
+          "messageDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "intentDigest": "05b5747afdcf6c898d07f494bd992e557a8158baa14a090432c768c27b9e73c8"
+      }
+    },
+    {
+      "name": "stop",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "command",
+        "commandId": "command-stop",
+        "rootRequestId": "request-fixture",
+        "agentId": "agent-fixture",
+        "actorChain": {
+          "requestedBy": "human-fixture",
+          "actingAgent": "agent-fixture",
+          "approvedBy": null,
+          "executingNode": "node-fixture"
+        },
+        "provenance": {
+          "channel": "local_human",
+          "proofRef": "human-transport-fixture"
+        },
+        "expected": {
+          "dutyRevision": 1,
+          "boundaryRevision": 1,
+          "controlEpoch": 0
+        },
+        "issuedAt": "2026-11-11T00:00:00.000Z",
+        "notAfter": "2026-11-11T00:05:00.000Z",
+        "operation": {
+          "action": "task.stop",
+          "taskId": "task-fixture",
+          "runId": "run-fixture",
+          "claimRevision": 1
+        },
+        "intentDigest": "fb01a70b9f3b8666fd039adc7e9d63bd8b8457d03a2eec67b06bd645aae2bf6b"
+      }
+    },
+    {
+      "name": "pause",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "command",
+        "commandId": "command-pause",
+        "rootRequestId": "request-fixture",
+        "agentId": "agent-fixture",
+        "actorChain": {
+          "requestedBy": "human-fixture",
+          "actingAgent": "agent-fixture",
+          "approvedBy": null,
+          "executingNode": "node-fixture"
+        },
+        "provenance": {
+          "channel": "local_human",
+          "proofRef": "human-transport-fixture"
+        },
+        "expected": {
+          "dutyRevision": 1,
+          "boundaryRevision": 1,
+          "controlEpoch": 0
+        },
+        "issuedAt": "2026-11-11T00:00:00.000Z",
+        "notAfter": "2026-11-11T00:05:00.000Z",
+        "operation": {
+          "action": "agent.pause",
+          "reason": "human_request"
+        },
+        "intentDigest": "54bae50e16c67fe3fc61d0f0fbf83488b78e67abb39b0b130749086be2da9fba"
+      }
+    },
+    {
+      "name": "resume",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "command",
+        "commandId": "command-resume",
+        "rootRequestId": "request-fixture",
+        "agentId": "agent-fixture",
+        "actorChain": {
+          "requestedBy": "human-fixture",
+          "actingAgent": "agent-fixture",
+          "approvedBy": null,
+          "executingNode": "node-fixture"
+        },
+        "provenance": {
+          "channel": "local_human",
+          "proofRef": "human-transport-fixture"
+        },
+        "expected": {
+          "dutyRevision": 1,
+          "boundaryRevision": 1,
+          "controlEpoch": 0
+        },
+        "issuedAt": "2026-11-11T00:00:00.000Z",
+        "notAfter": "2026-11-11T00:05:00.000Z",
+        "operation": {
+          "action": "agent.resume",
+          "holdId": "hold-fixture"
+        },
+        "intentDigest": "6a6d8b3818481af44f12b73528438daca66c7d9f8c17773bafbcaabda368ca21"
+      }
+    },
+    {
+      "name": "dismiss",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "command",
+        "commandId": "command-dismiss",
+        "rootRequestId": "request-fixture",
+        "agentId": "agent-fixture",
+        "actorChain": {
+          "requestedBy": "human-fixture",
+          "actingAgent": "agent-fixture",
+          "approvedBy": null,
+          "executingNode": "node-fixture"
+        },
+        "provenance": {
+          "channel": "local_human",
+          "proofRef": "human-transport-fixture"
+        },
+        "expected": {
+          "dutyRevision": 1,
+          "boundaryRevision": 1,
+          "controlEpoch": 0
+        },
+        "issuedAt": "2026-11-11T00:00:00.000Z",
+        "notAfter": "2026-11-11T00:05:00.000Z",
+        "operation": {
+          "action": "agent.dismiss",
+          "retention": "keep_records_and_recovery"
+        },
+        "intentDigest": "07da2deeeb832d786c778977d4feb204168398272d4e51fc25016bdb81ea925a"
+      }
+    },
+    {
+      "name": "duty-update",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "command",
+        "commandId": "command-duty-update",
+        "rootRequestId": "request-fixture",
+        "agentId": "agent-fixture",
+        "actorChain": {
+          "requestedBy": "human-fixture",
+          "actingAgent": "agent-fixture",
+          "approvedBy": null,
+          "executingNode": "node-fixture"
+        },
+        "provenance": {
+          "channel": "local_human",
+          "proofRef": "human-transport-fixture"
+        },
+        "expected": {
+          "dutyRevision": 1,
+          "boundaryRevision": 1,
+          "controlEpoch": 0
+        },
+        "issuedAt": "2026-11-11T00:00:00.000Z",
+        "notAfter": "2026-11-11T00:05:00.000Z",
+        "operation": {
+          "action": "duty.update",
+          "proposedDutyDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "intentDigest": "9fc46f2a5b4271b6aea7977b135863ee082c591a6d20cadcf86ea9a27c22a5ef"
+      }
+    },
+    {
+      "name": "boundary-update",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "command",
+        "commandId": "command-boundary-update",
+        "rootRequestId": "request-fixture",
+        "agentId": "agent-fixture",
+        "actorChain": {
+          "requestedBy": "human-fixture",
+          "actingAgent": "agent-fixture",
+          "approvedBy": null,
+          "executingNode": "node-fixture"
+        },
+        "provenance": {
+          "channel": "local_human",
+          "proofRef": "human-transport-fixture"
+        },
+        "expected": {
+          "dutyRevision": 1,
+          "boundaryRevision": 1,
+          "controlEpoch": 0
+        },
+        "issuedAt": "2026-11-11T00:00:00.000Z",
+        "notAfter": "2026-11-11T00:05:00.000Z",
+        "operation": {
+          "action": "boundary.update",
+          "proposedBoundaryDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "intentDigest": "939e547b6d656f7356972ff95711ab61b1d27ce3cb4e1023bc201319380a241f"
+      }
+    },
+    {
+      "name": "stop-offline",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "command-receipt",
+        "commandId": "command-stop",
+        "rootRequestId": "request-fixture",
+        "agentId": "agent-fixture",
+        "intentDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "control": {
+          "epoch": 1,
+          "holdId": "hold-fixture"
+        },
+        "status": "queued",
+        "execution": {
+          "drain": "pending",
+          "drainProofRef": null,
+          "effect": "none",
+          "effectId": null
+        },
+        "error": null
+      }
+    },
+    {
+      "name": "process-drained-effect-unknown",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "command-receipt",
+        "commandId": "command-stop",
+        "rootRequestId": "request-fixture",
+        "agentId": "agent-fixture",
+        "intentDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "control": {
+          "epoch": 1,
+          "holdId": "hold-fixture"
+        },
+        "status": "unknown",
+        "execution": {
+          "drain": "observed",
+          "drainProofRef": "process-proof-fixture",
+          "effect": "unknown",
+          "effectId": "effect-fixture"
+        },
+        "error": {
+          "code": "EFFECT_OUTCOME_UNKNOWN",
+          "retry": "original_receipt_only"
+        }
+      }
+    },
+    {
+      "name": "stop-drained",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "command-receipt",
+        "commandId": "command-stop",
+        "rootRequestId": "request-fixture",
+        "agentId": "agent-fixture",
+        "intentDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "control": {
+          "epoch": 1,
+          "holdId": "hold-fixture"
+        },
+        "status": "drained",
+        "execution": {
+          "drain": "observed",
+          "drainProofRef": "process-proof-fixture",
+          "effect": "none",
+          "effectId": null
+        },
+        "error": null
+      }
+    },
+    {
+      "name": "stale-rejected",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "command-receipt",
+        "commandId": "command-stop",
+        "rootRequestId": "request-fixture",
+        "agentId": "agent-fixture",
+        "intentDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "control": {
+          "epoch": 1,
+          "holdId": "hold-fixture"
+        },
+        "status": "rejected",
+        "execution": {
+          "drain": "not_requested",
+          "drainProofRef": null,
+          "effect": "none",
+          "effectId": null
+        },
+        "error": {
+          "code": "STALE_REVISION",
+          "retry": "refresh_state"
+        }
+      }
+    },
+    {
+      "name": "claim-unknown",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "work-claim",
+        "rootRequestId": "request-fixture",
+        "taskId": "task-fixture",
+        "agentId": "agent-fixture",
+        "claimRevision": 1,
+        "attemptId": "attempt-fixture",
+        "effect": "unknown",
+        "effectId": "effect-fixture"
+      }
+    },
+    {
+      "name": "ambiguous",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "owner-decision",
+        "rootRequestId": "request-fixture",
+        "dutyRevision": 1,
+        "state": "needs_owner",
+        "ownerAgentId": null,
+        "reason": "ambiguous"
+      }
+    },
+    {
+      "name": "explicit-owner",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "owner-decision",
+        "rootRequestId": "request-fixture",
+        "dutyRevision": 1,
+        "state": "owned",
+        "ownerAgentId": "agent-fixture",
+        "reason": "explicit_human"
+      }
+    },
+    {
+      "name": "blocked-unknown",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "owner-decision",
+        "rootRequestId": "request-fixture",
+        "dutyRevision": 1,
+        "state": "blocked",
+        "ownerAgentId": null,
+        "reason": "unknown_effect"
+      }
+    },
+    {
+      "name": "migration",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "local",
+              "localAuthorityId": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "6e3d43c3b95830e485050d1cdd61f110b535a4efa37c2ec153d6cab46f532297",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "migration-draft",
+        "sourceFormat": "legacy-workspace",
+        "sourceRef": "legacy-fixture",
+        "sourceDigest": "0c3f6dc971b4b2d377b9bd38f40a8322eafd04b76b4fa3fb724fe8ed43b9027b",
+        "state": "confirmation_required",
+        "runnable": false,
+        "issuedGrant": null,
+        "reason": "BOUNDARY_CONFIRMATION_REQUIRED"
+      }
+    },
+    {
+      "name": "account-cn-contract-only",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "account",
+              "accountRegion": "CN",
+              "issuer": "https://accounts.example.test",
+              "realmId": "33333333-3333-4333-8333-333333333333"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "8750108c71072b8b41cfd8181ff241075fb4855d8468a7ce48ef1dee1b049a3e",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "duty-profile",
+        "agentId": "agent-fixture",
+        "dutyRevision": 1,
+        "publicProfile": {
+          "title": "Fixture colleague",
+          "description": "Synthetic duty; never an execution grant.",
+          "owns": [
+            "fixture-finance"
+          ],
+          "rejects": [
+            "fixture-production"
+          ]
+        }
+      }
+    },
+    {
+      "name": "account-global-contract-only",
+      "document": {
+        "schemaVersion": 1,
+        "mode": "personal",
+        "context": {
+          "scope": {
+            "schemaVersion": 1,
+            "workspaceId": "ws_11111111-1111-4111-8111-111111111111",
+            "authority": {
+              "kind": "account",
+              "accountRegion": "GLOBAL",
+              "issuer": "https://accounts.example.test",
+              "realmId": "33333333-3333-4333-8333-333333333333"
+            }
+          },
+          "resourceBinding": {
+            "schemaVersion": 1,
+            "scopeKey": "62d5d3046f0f98c94606018219e40c561f02a28375ebd5dcab5087d0ab007928",
+            "generation": "22222222-2222-4222-8222-222222222222"
+          },
+          "humanSubjectId": "human-fixture",
+          "nodeId": "node-fixture",
+          "deviceId": null,
+          "localGrant": {
+            "grantId": "grant-fixture",
+            "grantRevision": 1,
+            "humanSubjectId": "human-fixture",
+            "nodeId": "node-fixture"
+          },
+          "collaboration": {
+            "organizationId": null,
+            "membershipId": null,
+            "membershipVersion": null,
+            "role": null,
+            "delegation": null
+          }
+        },
+        "kind": "duty-profile",
+        "agentId": "agent-fixture",
+        "dutyRevision": 1,
+        "publicProfile": {
+          "title": "Fixture colleague",
+          "description": "Synthetic duty; never an execution grant.",
+          "owns": [
+            "fixture-finance"
+          ],
+          "rejects": [
+            "fixture-production"
+          ]
+        }
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "future-version",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "schemaVersion"
+          ],
+          "delete": false,
+          "value": 2
+        }
+      ],
+      "errorCode": "CONTRACT_VERSION_UNSUPPORTED"
+    },
+    {
+      "name": "unknown-authority-flag",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "authorized"
+          ],
+          "delete": false,
+          "value": true
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "organization-mode",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "mode"
+          ],
+          "delete": false,
+          "value": "organization"
+        }
+      ],
+      "errorCode": "PERSONAL_MODE_ONLY"
+    },
+    {
+      "name": "role-cannot-be-enabled",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "context",
+            "collaboration",
+            "role"
+          ],
+          "delete": false,
+          "value": "owner"
+        }
+      ],
+      "errorCode": "PERSONAL_MODE_ONLY"
+    },
+    {
+      "name": "second-human-membership",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "context",
+            "collaboration",
+            "membershipId"
+          ],
+          "delete": false,
+          "value": "member-forged"
+        }
+      ],
+      "errorCode": "PERSONAL_MODE_ONLY"
+    },
+    {
+      "name": "local-grant-subject-mismatch",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "context",
+            "localGrant",
+            "humanSubjectId"
+          ],
+          "delete": false,
+          "value": "other-human"
+        }
+      ],
+      "errorCode": "CONTEXT_MISMATCH"
+    },
+    {
+      "name": "local-grant-node-mismatch",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "context",
+            "localGrant",
+            "nodeId"
+          ],
+          "delete": false,
+          "value": "other-node"
+        }
+      ],
+      "errorCode": "CONTEXT_MISMATCH"
+    },
+    {
+      "name": "actor-chain-subject-mismatch",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "actorChain",
+            "requestedBy"
+          ],
+          "delete": false,
+          "value": "other-human"
+        }
+      ],
+      "errorCode": "CONTEXT_MISMATCH"
+    },
+    {
+      "name": "actor-chain-agent-mismatch",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "actorChain",
+            "actingAgent"
+          ],
+          "delete": false,
+          "value": "other-agent"
+        }
+      ],
+      "errorCode": "CONTEXT_MISMATCH"
+    },
+    {
+      "name": "actor-chain-node-mismatch",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "actorChain",
+            "executingNode"
+          ],
+          "delete": false,
+          "value": "other-node"
+        }
+      ],
+      "errorCode": "CONTEXT_MISMATCH"
+    },
+    {
+      "name": "agent-self-approval",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "actorChain",
+            "approvedBy"
+          ],
+          "delete": false,
+          "value": "agent-fixture"
+        }
+      ],
+      "errorCode": "PERSONAL_MODE_ONLY"
+    },
+    {
+      "name": "external-source-not-human",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "provenance",
+            "channel"
+          ],
+          "delete": false,
+          "value": "external_agent"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "signed-device-without-device",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "provenance",
+            "channel"
+          ],
+          "delete": false,
+          "value": "signed_device"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "stop-missing-run",
+      "from": "stop",
+      "edits": [
+        {
+          "path": [
+            "operation",
+            "runId"
+          ],
+          "delete": true
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "resume-missing-hold",
+      "from": "resume",
+      "edits": [
+        {
+          "path": [
+            "operation",
+            "holdId"
+          ],
+          "delete": false,
+          "value": null
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "dismiss-cannot-delete-records",
+      "from": "dismiss",
+      "edits": [
+        {
+          "path": [
+            "operation",
+            "retention"
+          ],
+          "delete": false,
+          "value": "delete_everything"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "unsafe-revision",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "expected",
+            "boundaryRevision"
+          ],
+          "delete": false,
+          "value": 9007199254740992
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "expired-interval",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "notAfter"
+          ],
+          "delete": false,
+          "value": "2026-11-10T00:00:00.000Z"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "extension-in-command",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "operation",
+            "extra"
+          ],
+          "delete": false,
+          "value": true
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "deferred-task.reprioritize",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "operation",
+            "action"
+          ],
+          "delete": false,
+          "value": "task.reprioritize"
+        }
+      ],
+      "errorCode": "ACTION_DEFERRED"
+    },
+    {
+      "name": "deferred-task.handoff",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "operation",
+            "action"
+          ],
+          "delete": false,
+          "value": "task.handoff"
+        }
+      ],
+      "errorCode": "ACTION_DEFERRED"
+    },
+    {
+      "name": "deferred-agent.memory.read",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "operation",
+            "action"
+          ],
+          "delete": false,
+          "value": "agent.memory.read"
+        }
+      ],
+      "errorCode": "ACTION_DEFERRED"
+    },
+    {
+      "name": "deferred-approval.decide",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "operation",
+            "action"
+          ],
+          "delete": false,
+          "value": "approval.decide"
+        }
+      ],
+      "errorCode": "ACTION_DEFERRED"
+    },
+    {
+      "name": "deferred-agent.share",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "operation",
+            "action"
+          ],
+          "delete": false,
+          "value": "agent.share"
+        }
+      ],
+      "errorCode": "ACTION_DEFERRED"
+    },
+    {
+      "name": "deferred-task.report.route",
+      "from": "dispatch",
+      "edits": [
+        {
+          "path": [
+            "operation",
+            "action"
+          ],
+          "delete": false,
+          "value": "task.report.route"
+        }
+      ],
+      "errorCode": "ACTION_DEFERRED"
+    },
+    {
+      "name": "unknown-effect-not-complete",
+      "from": "process-drained-effect-unknown",
+      "edits": [
+        {
+          "path": [
+            "status"
+          ],
+          "delete": false,
+          "value": "drained"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "drain-needs-observation",
+      "from": "stop-drained",
+      "edits": [
+        {
+          "path": [
+            "execution",
+            "drainProofRef"
+          ],
+          "delete": false,
+          "value": null
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "rejection-needs-code",
+      "from": "stale-rejected",
+      "edits": [
+        {
+          "path": [
+            "error"
+          ],
+          "delete": false,
+          "value": null
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "unknown-no-auto-retry",
+      "from": "process-drained-effect-unknown",
+      "edits": [
+        {
+          "path": [
+            "error",
+            "retry"
+          ],
+          "delete": false,
+          "value": "refresh_state"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "ambiguous-not-first-owner",
+      "from": "ambiguous",
+      "edits": [
+        {
+          "path": [
+            "ownerAgentId"
+          ],
+          "delete": false,
+          "value": "agent-fixture"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "unknown-routing-must-block",
+      "from": "blocked-unknown",
+      "edits": [
+        {
+          "path": [
+            "state"
+          ],
+          "delete": false,
+          "value": "needs_owner"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "migration-not-runnable",
+      "from": "migration",
+      "edits": [
+        {
+          "path": [
+            "runnable"
+          ],
+          "delete": false,
+          "value": true
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "migration-cannot-mint-grant",
+      "from": "migration",
+      "edits": [
+        {
+          "path": [
+            "issuedGrant"
+          ],
+          "delete": false,
+          "value": {
+            "all": true
+          }
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "raw-directory-not-resource",
+      "from": "boundary",
+      "edits": [
+        {
+          "path": [
+            "resources",
+            0,
+            "path"
+          ],
+          "delete": false,
+          "value": "/synthetic/escape"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "wildcard-tool-not-grant",
+      "from": "boundary",
+      "edits": [
+        {
+          "path": [
+            "tools",
+            "allow",
+            0,
+            "toolId"
+          ],
+          "delete": false,
+          "value": "*"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "private-persona-not-public-duty",
+      "from": "duty",
+      "edits": [
+        {
+          "path": [
+            "publicProfile",
+            "systemPrompt"
+          ],
+          "delete": false,
+          "value": "synthetic-private"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "duplicate-resource-identity",
+      "from": "boundary",
+      "edits": [
+        {
+          "path": [
+            "resources"
+          ],
+          "delete": false,
+          "value": [
+            {
+              "resourceId": "project-fixture",
+              "access": [
+                "read"
+              ]
+            },
+            {
+              "resourceId": "project-fixture",
+              "access": [
+                "write"
+              ]
+            }
+          ]
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    },
+    {
+      "name": "accepted-cannot-contain-denial",
+      "from": "stale-rejected",
+      "edits": [
+        {
+          "path": [
+            "status"
+          ],
+          "delete": false,
+          "value": "accepted"
+        }
+      ],
+      "errorCode": "INVALID_DOCUMENT"
+    }
+  ],
+  "migrationSources": [
+    {
+      "name": "legacy-preserved",
+      "sourceText": " {\"schemaVersion\":2,\"owns\":[\"/synthetic/legacy/project\"],\"allow\":[\"*\"],\"unknownExecution\":{\"receipt\":\"preserve-fixture\"},\"uniqueField\":{\"keep\":true}}\n",
+      "sourceRef": "legacy-fixture",
+      "expectedDocument": "migration"
+    }
+  ]
+}
