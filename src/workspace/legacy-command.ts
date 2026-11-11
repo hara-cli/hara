@@ -1,3 +1,4 @@
+import { withUnprotectedWorkspaceAdmission } from "./agent-command-protection.js";
 // Host-only command occurrence boundary. A copied cwd/role/planner DTO is NOT an execution permit.
 // No default launcher, process.env, OS vault, global hara, transport or scheduler activation exists here.
 import { createHash, randomUUID } from "node:crypto";
@@ -116,25 +117,27 @@ export class WorkspaceLegacyCommands {
     return row;
   }
   execute(id: string, requestId: string, signal?: AbortSignal): Promise<LegacyCommandReceipt> {
-    if (typeof requestId !== "string" || !UUID.test(requestId)) return Promise.reject(new Error("Invalid command request identity"));
-    const row = this.row(id), definitionHash = hash(row), before = this.state.read();
-    const previous = before.runs.find(item => item.requestId === requestId);
-    if (previous) {
-      if (previous.scheduleId !== id || previous.definitionHash !== definitionHash) return Promise.reject(new Error("Command request identity conflicts; no work replayed"));
-      const pending = this.active.get(requestId); if (pending) return pending;
-      return Promise.resolve(previous.state === "running" ? { ...previous, state: "unknown", reason: "execution_outcome_unconfirmed" } : previous);
-    }
-    if (signal?.aborted) return Promise.reject(new Error("Command cancelled before admission; no occurrence or model call created"));
-    if (before.runs.some(row => row.scheduleId === id && (row.state === "running" || row.state === "unknown"))) return Promise.reject(new Error("This command has unconfirmed work; no new occurrence launched"));
-    // Never discard dedupe identities to make room. A separate, reviewed archive protocol is needed
-    // before production retention can advance; silently forgetting an old request permits replay.
-    if (before.runs.length >= MAX_RUNS || before.runs.filter(row => row.state === "running" || row.state === "unknown").length >= 128) return Promise.reject(new Error("Command receipt capacity requires inspection; no new command launched"));
-    const run: LegacyCommandReceipt = { requestId, runId: randomUUID(), scheduleId: id, definitionHash, occurredAt: Date.now(), state: "running", code: null, reason: null, output: "", truncated: false, hadStdout: false };
-    this.state.update(before.revision, old => ({ ...old, runs: [...old.runs, run] }));
-    // Defer the operation so the in-flight map is installed even for a synchronous authorization path.
-    const pending = Promise.resolve().then(() => this.run(row, run, signal)); this.active.set(requestId, pending);
-    void pending.finally(() => this.active.delete(requestId)).catch(() => {});
-    return pending;
+    return withUnprotectedWorkspaceAdmission(this.storage, () => {
+      if (typeof requestId !== "string" || !UUID.test(requestId)) return Promise.reject(new Error("Invalid command request identity"));
+      const row = this.row(id), definitionHash = hash(row), before = this.state.read();
+      const previous = before.runs.find(item => item.requestId === requestId);
+      if (previous) {
+        if (previous.scheduleId !== id || previous.definitionHash !== definitionHash) return Promise.reject(new Error("Command request identity conflicts; no work replayed"));
+        const pending = this.active.get(requestId); if (pending) return pending;
+        return Promise.resolve(previous.state === "running" ? { ...previous, state: "unknown", reason: "execution_outcome_unconfirmed" } : previous);
+      }
+      if (signal?.aborted) return Promise.reject(new Error("Command cancelled before admission; no occurrence or model call created"));
+      if (before.runs.some(row => row.scheduleId === id && (row.state === "running" || row.state === "unknown"))) return Promise.reject(new Error("This command has unconfirmed work; no new occurrence launched"));
+      // Never discard dedupe identities to make room. A separate, reviewed archive protocol is needed
+      // before production retention can advance; silently forgetting an old request permits replay.
+      if (before.runs.length >= MAX_RUNS || before.runs.filter(row => row.state === "running" || row.state === "unknown").length >= 128) return Promise.reject(new Error("Command receipt capacity requires inspection; no new command launched"));
+      const run: LegacyCommandReceipt = { requestId, runId: randomUUID(), scheduleId: id, definitionHash, occurredAt: Date.now(), state: "running", code: null, reason: null, output: "", truncated: false, hadStdout: false };
+      this.state.update(before.revision, old => ({ ...old, runs: [...old.runs, run] }));
+      // Defer the operation so the in-flight map is installed even for a synchronous authorization path.
+      const pending = Promise.resolve().then(() => this.run(row, run, signal)); this.active.set(requestId, pending);
+      void pending.finally(() => this.active.delete(requestId)).catch(() => {});
+      return pending;
+    });
   }
   private finish(run: LegacyCommandReceipt, patch: Partial<LegacyCommandReceipt>): LegacyCommandReceipt {
     const next = { ...run, ...patch, finishedAt: Date.now() }, old = this.state.read();

@@ -1,3 +1,5 @@
+import { assertNoWorkspaceLegacyEffects } from "./agent-command-protection.js";
+import { assertNoWorkspaceSessionLeases, withWorkspaceSessionAdmission } from "./session-lease.js";
 import type { WorkspaceRunBinding } from "./run-binding.js";
 import { assertAgentCommandTransition, agentCommandTargetEpoch, agentPolicyProposalDigest, commandDigest, emptyAgentCommandState, parseAgentCommandState, type AgentCommandState } from "./agent-command-state.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -83,6 +85,8 @@ export class WorkspaceAgentBoundaryAuthority {
   private readonly executionPolicies = new WeakMap<object, ExecutionPolicyState>();
   private readonly parent: { hostId: string; hostEpoch: number; row: string; context: AgentBoundaryContext };
   private closed = false;
+  private controlStorageFailed = false;
+  private controlledStateSeen = false;
   private readonly now: () => number;
   private readonly lifetime: number;
   constructor(private readonly options: {
@@ -171,8 +175,15 @@ export class WorkspaceAgentBoundaryAuthority {
   }
   private read(): State {
     this.assertHostCurrent();
-    try { return this.state.read(); }
-    catch (error) { if (error instanceof AgentBoundaryContractError) throw error; return fail("AUTHORITY_UNVERIFIED", "authority.policy"); }
+    try {
+      const state = this.state.read();
+      if (state.schemaVersion === 2) this.controlledStateSeen = true;
+      else if (this.controlledStateSeen) this.controlStorageFailed = true;
+      return state;
+    } catch (error) {
+      if (this.options.commandControl || this.controlledStateSeen) this.controlStorageFailed = true;
+      if (error instanceof AgentBoundaryContractError) throw error; return fail("AUTHORITY_UNVERIFIED", "authority.policy");
+    }
   }
   private update(expectedRevision: unknown, change: (state: State) => State, action?: AgentBoundaryAction): State {
     if (!Number.isSafeInteger(expectedRevision) || Number(expectedRevision) < 0) return fail("INVALID_DOCUMENT", "authority.revision");
@@ -185,6 +196,7 @@ export class WorkspaceAgentBoundaryAuthority {
       if (error instanceof AgentBoundaryContractError) throw error;
       if (error instanceof Error && error.message === "Workspace state changed; refresh before writing") return fail("STALE_REVISION");
       if (error instanceof Error && error.message === "Workspace revision exhausted") return fail("COUNTER_EXHAUSTED");
+      if (this.options.commandControl || this.controlledStateSeen) this.controlStorageFailed = true;
       return fail("AUTHORITY_UNVERIFIED", "authority.policy");
     }
   }
@@ -322,16 +334,23 @@ export class WorkspaceAgentBoundaryAuthority {
   /** Explicit owner setup; no absent/corrupt store is adopted as an execution history. */
   initializeCommandControl(transport: AgentBoundaryTransport) {
     this.source(transport); if (!this.options.commandControl) return fail("AUTHORITY_UNVERIFIED", "control.source");
-    const state = this.read(); if (state.schemaVersion === 2) return this.commandControlState();
-    if (!state.policies.length) return fail("BOUNDARY_CONFIRMATION_REQUIRED");
-    const policies = state.policies.map(policy => {
-      if (policy.revision >= Number.MAX_SAFE_INTEGER) return fail("COUNTER_EXHAUSTED"); return { ...policy, revision: policy.revision + 1 };
+    return withWorkspaceSessionAdmission(this.options.storage, () => {
+      const state = this.read(); if (state.schemaVersion === 2) return this.commandControlState();
+      if (this.controlStorageFailed || this.controlledStateSeen) return fail("AUTHORITY_UNVERIFIED", "control.migrationRecovery");
+      try { assertNoWorkspaceSessionLeases(this.options.storage); assertNoWorkspaceLegacyEffects(this.options.storage); } catch { return fail("CONTROL_HELD", "control.migrationDrain"); }
+      if (!state.policies.length) return fail("BOUNDARY_CONFIRMATION_REQUIRED");
+      const policies = state.policies.map(policy => {
+        if (policy.revision >= Number.MAX_SAFE_INTEGER) return fail("COUNTER_EXHAUSTED"); return { ...policy, revision: policy.revision + 1 };
     });
     const control = emptyAgentCommandState(policies.map(policy => policy.agentId), { sourceRevision: state.revision,
       sourceDigest: commandDigest(state), initializedAt: new Date(this.now()).toISOString(), humanSubjectId: this.parent.context.humanSubjectId, nodeId: this.parent.context.nodeId });
     this.update(state.revision, current => { this.source(transport); return { ...current, schemaVersion: 2, policies, control }; });
     return this.commandControlState();
+    });
   }
+  /** Presence is checked even with bootstrap disabled: a protected scope cannot fall back to legacy. */
+  commandControlSourceHealthy(): boolean { return !this.closed && !this.controlStorageFailed; }
+  commandControlInitialized(): boolean { return this.read().schemaVersion === 2; }
   /** Trusted library read used by the C3 source after the original UI disconnects. */
   commandControlState() {
     const state = this.read();
@@ -420,6 +439,7 @@ export class WorkspaceAgentBoundaryAuthority {
     return policy;
   }
   executionPolicyFacts(handle: unknown) {
+    if (this.controlStorageFailed) return fail("AUTHORITY_UNVERIFIED", "control.storage");
     const captured = handle && typeof handle === "object" ? this.executionPolicies.get(handle) : undefined;
     if (!captured?.live) return fail("AUTHORITY_UNVERIFIED", "authority.executionPolicy");
     this.assertHostCurrent(); assertAgentBoundaryContext(captured.command, this.parent.context);

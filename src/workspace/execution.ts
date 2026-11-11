@@ -1,3 +1,4 @@
+import { workspaceAgentCommandProtected } from "./agent-command-protection.js";
 import { bindAgentBoundaryExecution, type AgentBoundaryExecutionGate } from "./agent-boundary-execution.js";
 import { WorkspaceNativeSessions, resettableNativeRuntime } from "./native-session-boundary.js";
 import { runtimeToolTargetLabel } from "./runtime-tool-label.js";
@@ -58,6 +59,7 @@ interface PermitState {
   lease: WorkspaceSessionLease;
   retired: boolean;
   drainProof?: WorkspaceRunDrainProof;
+  closing?: Promise<void>;
   started: boolean;
   nativePolicy?: RuntimeExecutionPolicy;
   nativeEvidence?: NativeWorkspaceEvidence;
@@ -177,6 +179,7 @@ export function createWorkspaceRunPermit(input: {
   const stateHome = input.storage.run(() => workspaceStateHome());
   let state: PermitState;
   const assertLive = (): void => {
+    if (!input.agentBoundary && workspaceAgentCommandProtected(input.storage)) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "control.commandRequired");
     if (state?.retired || input.signal.aborted || (binding.budget.mode !== "interactive" && Date.now() - started >= binding.budget.timeoutMs)) throw new Error("Workspace attempt cancelled or expired");
     input.lease.assertCurrent();
     state?.boundaryExecution?.assertCurrent();
@@ -527,6 +530,7 @@ export function workspaceRunEffectFacts(permit: WorkspaceRunPermit) {
     modelCalls: state.usage.modelCalls, toolCalls: state.usage.toolCalls,
     effects: state.completionEvidence.effectReceipts(), operations });
 }
+const drainOwners = new WeakMap<object, WorkspaceRunPermit>();
 const drainProofs = new WeakMap<object, Readonly<ReturnType<typeof workspaceRunEffectFacts> & { proofRef: string }>>();
 export function workspaceRunDrainProof(permit: WorkspaceRunPermit): WorkspaceRunDrainProof {
   const proof = stateOf(permit).drainProof;
@@ -536,8 +540,14 @@ export function workspaceRunDrainFacts(proof: unknown) {
   const facts = proof && typeof proof === "object" ? drainProofs.get(proof) : undefined;
   if (!facts) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "control.drainProof"); return facts;
 }
+export function assertWorkspaceRunDrainOwner(proof: unknown, permit: WorkspaceRunPermit): void {
+  if (!proof || typeof proof !== "object" || drainOwners.get(proof) !== permit) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "control.drainOwner");
+}
 export async function closeWorkspaceRunPermit(permit: WorkspaceRunPermit): Promise<void> {
-  const state = stateOf(permit); if (state.drainProof) return; state.retired = true;
+  const state = stateOf(permit); if (state.drainProof) return;
+  if (state.closing) return state.closing;
+  state.retired = true;
+  state.closing = (async () => {
   while (state.pending.size) await Promise.allSettled([...state.pending]);
   if (state.nativePolicy) {
     state.lease.setDraining(true);
@@ -551,7 +561,10 @@ export async function closeWorkspaceRunPermit(permit: WorkspaceRunPermit): Promi
   state.lease.release();
   const proof = Object.freeze({}) as WorkspaceRunDrainProof;
   drainProofs.set(proof, deepFreeze({ ...workspaceRunEffectFacts(permit), proofRef: `drain_${randomUUID()}` }));
+  drainOwners.set(proof, permit);
   state.drainProof = proof;
+  })();
+  try { await state.closing; } catch (error) { state.closing = undefined; throw error; }
 }
 
 /** Observation only. Callers retain the original live checks at protected boundaries. */

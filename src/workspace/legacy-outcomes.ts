@@ -1,3 +1,4 @@
+import { withUnprotectedWorkspaceAdmission } from "./agent-command-protection.js";
 // Host-private terminal outcomes + durable notification effects. No SDK/global credentials/tick here.
 import { createHash } from "node:crypto";
 import { parseDeliver } from "../cron/deliver.js";
@@ -127,12 +128,14 @@ export class WorkspaceLegacyOutcomes {
     return newEffects.map(row => row.id);
   }
   flush(id: string): Promise<LegacyNotificationEffect> {
-    const pending = this.active.get(id); if (pending) return pending;
-    const effect = this.list().effects.find(row => row.id === id); if (!effect) return Promise.reject(new Error("Scoped notification unavailable"));
-    if (effect.state !== "pending") return Promise.resolve(effect);
-    const before = this.state.read(); this.state.update(before.revision, value => ({ ...value, effects: value.effects.map(row => row.id === id ? { ...row, state: "sending" } : row) }));
-    const operation = Promise.resolve().then(() => this.send(effect)); this.active.set(id, operation);
-    void operation.finally(() => this.active.delete(id)).catch(() => {}); return operation;
+    return withUnprotectedWorkspaceAdmission(this.storage, () => {
+      const pending = this.active.get(id); if (pending) return pending;
+      const effect = this.list().effects.find(row => row.id === id); if (!effect) return Promise.reject(new Error("Scoped notification unavailable"));
+      if (effect.state !== "pending") return Promise.resolve(effect);
+      const before = this.state.read(); this.state.update(before.revision, value => ({ ...value, effects: value.effects.map(row => row.id === id ? { ...row, state: "sending" } : row) }));
+      const operation = Promise.resolve().then(() => this.send(effect)); this.active.set(id, operation);
+      void operation.finally(() => this.active.delete(id)).catch(() => {}); return operation;
+    });
   }
   private async send(effect: LegacyNotificationEffect) {
     let next: LegacyNotificationEffect["state"] = "blocked", receiptId: string | null = null, invoked = false;

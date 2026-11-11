@@ -1,16 +1,17 @@
-import { workspaceRunEffectFacts, workspaceRunDrainFacts, type WorkspaceRunPermit } from "./execution.js";
+import { workspaceRunDrainProof, assertWorkspaceRunDrainOwner, workspaceRunEffectFacts, workspaceRunDrainFacts, type WorkspaceRunPermit } from "./execution.js";
 // C3 trusted Host composition. There is no default issuer and no renderer callback/approved boolean.
 import { createHash, randomUUID } from "node:crypto";
 import { AGENT_BOUNDARY_ERRORS, AgentBoundaryContractError, assertAgentBoundaryContext, parseAgentBoundaryDocument,
   type AgentBoundaryCommand, type AgentBoundaryErrorCode, type AgentBoundaryReceipt } from "./agent-boundaries-contract.js";
 import { WorkspaceAgentBoundaryAuthority, type AgentCommandGrant, type AgentCommandMutation } from "./agent-boundary-authority.js";
 import { assertAgentBoundaryRuntimeSupported, type AgentBoundaryControlSource } from "./agent-boundary-execution.js";
-import { agentCommandTargetEpoch, assertAgentCommandCapacity, commandDigest, commandId, nextCommandEpoch,
+import { agentPolicyProposalDigest, agentCommandRunIdentity, agentCommandTargetEpoch, assertAgentCommandCapacity, commandDigest, commandId, nextCommandEpoch,
   type AgentCommandAudit, type AgentCommandControl, type AgentCommandHold, type AgentCommandRun, type AgentCommandState } from "./agent-command-state.js";
 import { canonical, deepFreeze, messageBody, UUID } from "./local-state.js";
 import { captureWorkspaceProjectIdentity, freezeWorkspaceRunBinding, workspaceRunBindingsEqual, type WorkspaceRunBinding } from "./run-binding.js";
 import { WorkspaceSessionLease } from "./session-lease.js";
 
+const restrictive = (action: string) => ["task.stop", "agent.pause", "agent.dismiss"].includes(action);
 const fail = (code: AgentBoundaryErrorCode, field = "control.authority"): never => { throw new AgentBoundaryContractError(code, field); };
 export const agentCommandMessageDigest = (conversationId: string, message: string): string => createHash("sha256")
   .update("hara-agent-command-message-v1\0").update(canonical({ conversationId, message })).digest("hex");
@@ -20,11 +21,11 @@ declare const preparationBrand: unique symbol;
 export interface AgentCommandRunPreparation { readonly [preparationBrand]: true }
 interface Intake { owner: WorkspaceAgentCommandControl; transport: Parameters<WorkspaceAgentBoundaryAuthority["admit"]>[0]; command: AgentBoundaryCommand; proposal?: unknown; consumed: boolean }
 interface Preparation { intake: AgentCommandIntake; binding: Readonly<WorkspaceRunBinding>; lease: WorkspaceSessionLease; requestId: string }
-interface LiveRun extends Preparation { command: AgentBoundaryCommand; grant: AgentCommandGrant; bound: boolean; permit?: WorkspaceRunPermit }
+interface LiveRun extends Preparation { accepted: Readonly<AgentCommandRun>; command: AgentBoundaryCommand; grant: AgentCommandGrant; bound: boolean; permit?: WorkspaceRunPermit }
 const intakes = new WeakMap<object, Intake>(), preparations = new WeakMap<object, Preparation>();
-export function agentCommandIntakeFacts(handle: unknown) {
+export function agentCommandIntakeFacts(handle: unknown, owner?: WorkspaceAgentCommandControl) {
   const state = handle && typeof handle === "object" ? intakes.get(handle) : undefined;
-  if (!state || state.consumed) return fail("AUTHORITY_UNVERIFIED", "control.intake");
+  if (!state || state.consumed || owner && state.owner !== owner) return fail("AUTHORITY_UNVERIFIED", "control.intake");
   return deepFreeze({ command: state.command, workspaceId: state.command.context.scope.workspaceId });
 }
 function receipt(command: AgentBoundaryCommand, epoch: number, holdId: string | null, status: AgentBoundaryReceipt["status"], code: AgentBoundaryErrorCode | null = null,
@@ -59,12 +60,13 @@ function addAudit(state: AgentCommandState, command: AgentBoundaryCommand, input
 export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource {
   private readonly live = new Map<string, LiveRun>();
   private available = true;
+  private readonly pendingDrainProofs = new Map<string, unknown>();
   private readonly issuerId = randomUUID();
   constructor(private readonly authority: WorkspaceAgentBoundaryAuthority, private readonly now: () => number = Date.now) {}
   initialize(transport: Intake["transport"]) { return this.authority.initializeCommandControl(transport); }
   private intake(handle: unknown): Intake {
     const state = handle && typeof handle === "object" ? intakes.get(handle) : undefined;
-    if (!this.available || !state || state.owner !== this || state.consumed) return fail("AUTHORITY_UNVERIFIED", "control.intake"); return state;
+    if (!state || state.owner !== this || state.consumed || !this.available && !restrictive(state.command.operation.action)) return fail("AUTHORITY_UNVERIFIED", "control.intake"); return state;
   }
   begin(transport: Intake["transport"], raw: unknown, input: { message?: string; proposal?: unknown } = {}): { receipt: AgentBoundaryReceipt } | { intake: AgentCommandIntake } {
     const parsed = parseAgentBoundaryDocument(raw);
@@ -74,9 +76,15 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
     const existing = snapshot.control.commands.find(row => row.command.commandId === parsed.commandId);
     if (existing) {
       if (canonical(parsed) !== canonical(existing.command)) return fail("COMMAND_ID_CONFLICT", "control.command");
+      const op = parsed.operation;
+      if (input.message !== undefined && (op.action !== "task.dispatch" || !messageBody(input.message)
+        || agentCommandMessageDigest(op.conversationId, input.message) !== op.messageDigest)) return fail("COMMAND_ID_CONFLICT", "control.message");
+      if (input.proposal !== undefined && (op.action !== "duty.update" && op.action !== "boundary.update"
+        || agentPolicyProposalDigest(input.proposal) !== (op.action === "duty.update" ? op.proposedDutyDigest : op.proposedBoundaryDigest))) return fail("COMMAND_ID_CONFLICT", "control.proposal");
       return { receipt: this.currentReceipt(existing.command, existing.receipt, snapshot.control) }; // Fresh reader authentication; never re-admit an expired intent.
     }
-    if (!this.available) return fail("AUTHORITY_UNVERIFIED", "control.source");
+    if (!this.authority.commandControlSourceHealthy()) this.available = false;
+    if (!this.available && !restrictive(parsed.operation.action)) return fail("AUTHORITY_UNVERIFIED", "control.source");
     const command = this.authority.authenticateCommandIntent(transport, parsed);
     if (command.operation.action === "task.dispatch") {
       if (!messageBody(input.message) || agentCommandMessageDigest(command.operation.conversationId, input.message) !== command.operation.messageDigest) return fail("AUTHORITY_UNVERIFIED", "control.message");
@@ -84,6 +92,22 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
     const handle = Object.freeze({}) as AgentCommandIntake;
     intakes.set(handle, { owner: this, transport, command, ...(input.proposal !== undefined ? { proposal: structuredClone(input.proposal) } : {}), consumed: false });
     return { intake: handle };
+  }
+  /** Denials are committed before Host opens private model context or prepares an execution. */
+  rejectBlocked(handle: AgentCommandIntake): AgentBoundaryReceipt | null {
+    const intake = this.intake(handle), { command, transport } = intake, operation = command.operation;
+    let grant: AgentCommandGrant | undefined;
+    try {
+      grant = this.authority.admit(transport, command);
+      const { control } = this.authority.commandControlState(), agent = control.agents.find(row => row.agentId === command.agentId);
+      if (command.expected.controlEpoch !== agentCommandTargetEpoch(control, command)
+        || command.operation.action === "task.dispatch" && (agent?.hold || agent?.dismissed
+          || control.runs.some(run => run.rootRequestId === command.rootRequestId || operation.action === "task.dispatch" && run.taskId === operation.taskId))) return this.accept(handle);
+      return null;
+    } catch (error) {
+      if (error instanceof AgentBoundaryContractError) return this.accept(handle);
+      throw error;
+    } finally { if (grant) this.authority.retire(grant); }
   }
   prepareRun(handle: AgentCommandIntake, bindingInput: WorkspaceRunBinding, lease: WorkspaceSessionLease, requestId: string): AgentCommandRunPreparation {
     const state = this.intake(handle), command = state.command, binding = freezeWorkspaceRunBinding(bindingInput);
@@ -99,7 +123,7 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
     if (prepared && (!preparation || preparation.intake !== handle)) return fail("AUTHORITY_UNVERIFIED", "control.preparation");
     let acceptedNew = false;
     try {
-      this.authority.transactCommand(intake.transport, intake.command, facts => {
+      const transact = () => this.authority.transactCommand(intake.transport, intake.command, facts => {
         const state = facts.control, command = facts.command, op = command.operation;
         const existing = state.commands.find(row => row.command.commandId === command.commandId);
         if (existing) {
@@ -117,8 +141,8 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
         if (!code && agent.dismissed && op.action !== "task.stop") code = "CONTROL_HELD";
         if (!code && op.action === "task.dispatch" && agent.hold) code = "CONTROL_HELD";
         if (!code && op.action === "task.dispatch") {
-          if (!preparation) code = "AUTHORITY_UNVERIFIED";
-          else if (state.runs.some(run => run.rootRequestId === command.rootRequestId || run.taskId === op.taskId || run.runId === preparation.binding.runId)) code = "COMMAND_ID_CONFLICT";
+          if (state.runs.some(run => run.rootRequestId === command.rootRequestId || run.taskId === op.taskId || preparation && run.runId === preparation.binding.runId)) code = "COMMAND_ID_CONFLICT";
+          else if (!preparation) code = "AUTHORITY_UNVERIFIED";
           else {
             this.authority.assertCommandRunBinding(preparation.binding); preparation.lease.assertCurrent();
             const run: AgentCommandRun = { commandId: command.commandId, rootRequestId: command.rootRequestId, agentId: command.agentId, taskId: op.taskId,
@@ -148,12 +172,20 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
         assertAgentCommandCapacity(state, !code && drain);
         return { control: state, applyPolicy };
       }, intake.proposal);
+      for (let attempt = 0; ; attempt++) {
+        acceptedNew = false;
+        try { transact(); break; }
+        catch (error) {
+          // Only a pre-commit CAS conflict is re-evaluated, with the original expected epoch/intent.
+          if (!(error instanceof AgentBoundaryContractError && error.code === "STALE_REVISION" && attempt < 2)) throw error;
+        }
+      }
       intake.consumed = true;
       const snapshot = this.authority.commandControlState(), record = snapshot.control.commands.find(row => row.command.commandId === intake.command.commandId)!;
       if (acceptedNew && preparation && record.receipt.status === "accepted") {
         try {
           const grant = this.authority.admit(intake.transport, intake.command);
-          this.live.set(preparation.binding.runId, { ...preparation, command: intake.command, grant, bound: false });
+          this.live.set(preparation.binding.runId, { ...preparation, accepted: snapshot.control.runs.find(run => run.runId === preparation.binding.runId)!, command: intake.command, grant, bound: false });
         } catch { this.available = false; } // Accepted intent stays original; no fallback/start or new identity.
       }
       return record.receipt;
@@ -168,12 +200,16 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
     this.assertRunCurrent(live); return live.grant;
   }
   private assertRunCurrent(live: LiveRun): AgentCommandRun {
-    if (!this.available) return fail("AUTHORITY_UNVERIFIED", "control.source");
+    if (!this.available || !this.authority.commandControlSourceHealthy()) { this.available = false; return fail("AUTHORITY_UNVERIFIED", "control.source"); }
     live.lease.assertCurrent();
-    const state = this.authority.commandControlState().control;
+    let state: Readonly<AgentCommandState>;
+    try { state = this.authority.commandControlState().control; }
+    catch (error) { this.available = false; throw error; }
+    const record = state.commands.find(row => row.command.commandId === live.command.commandId);
     const run = state.runs.find(row => row.runId === live.binding.runId), agent = state.agents.find(row => row.agentId === live.command.agentId);
-    if (!run || !agent || run.commandId !== live.command.commandId || run.issuerId !== this.issuerId || run.leaseAttemptId !== live.lease.attemptId
-      || run.bindingDigest !== commandDigest(live.binding) || !workspaceRunBindingsEqual(run.binding, live.binding)) return fail("AUTHORITY_UNVERIFIED", "control.run");
+    if (!run || !agent || !record || canonical(record.command) !== canonical(live.command)
+      || canonical(agentCommandRunIdentity(run)) !== canonical(agentCommandRunIdentity(live.accepted)) || run.commandId !== live.command.commandId || run.issuerId !== this.issuerId || run.leaseAttemptId !== live.lease.attemptId
+      || run.bindingDigest !== commandDigest(live.binding) || !workspaceRunBindingsEqual(run.binding, live.binding)) { this.available = false; return fail("AUTHORITY_UNVERIFIED", "control.run"); }
     if (agent.hold || agent.dismissed || run.hold || ["draining", "drained", "unknown"].includes(run.state)) return fail("CONTROL_HELD", "control.hold");
     if (agent.epoch !== run.agentControlEpoch || run.epoch !== live.command.expected.controlEpoch) return fail("STALE_REVISION", "control.epoch");
     return run;
@@ -191,14 +227,15 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
       : operation.action === "task.stop" ? state.runs.find(run => run.runId === operation.runId && run.agentId === command.agentId) : undefined;
     if (!found || original.status === "rejected") return original;
     const run = { ...found }, agent = state.agents.find(row => row.agentId === command.agentId), live = this.live.get(run.runId);
+    let started = false;
     if (live?.permit && !run.drainProofRef && run.effect !== "unknown") {
       try {
-        const facts = workspaceRunEffectFacts(live.permit);
+        const facts = workspaceRunEffectFacts(live.permit); started = facts.started;
         if (facts.effects.some(effect => effect.state === "unknown") || facts.operations?.some(row => row.outcome === "error" || row.outcome === "cancelled")) run.effect = "unknown";
       } catch { if (run.effect !== "none") run.effect = "unknown"; }
     }
     const blocked = Boolean(run.hold || agent?.hold || agent?.dismissed || agent?.epoch !== run.agentControlEpoch);
-    const phase = run.drainProofRef ? "drained" : run.state === "unknown" ? "unknown" : blocked ? "draining" : run.state === "running" ? "applying" : "accepted";
+    const phase = run.drainProofRef ? "drained" : !live || !this.available || !this.authority.commandControlSourceHealthy() || run.state === "unknown" ? "unknown" : blocked ? "draining" : started || run.state === "running" ? "applying" : "accepted";
     return receipt(command, run.hold ? run.epoch : agent?.epoch ?? run.epoch, run.hold?.holdId ?? agent?.hold?.holdId ?? null, phase,
       phase === "unknown" && run.effect !== "unknown" ? "AUTHORITY_UNVERIFIED" : null, run, blocked);
   }
@@ -221,12 +258,19 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
   }
   /** The proof is minted only after all actual Promises/native teardown and the physical lease drain. */
   observeDrained(proof: unknown): void {
-    const facts = workspaceRunDrainFacts(proof), live = this.live.get(facts.binding.runId), before = this.authority.commandControlState();
+    const facts = workspaceRunDrainFacts(proof), live = this.live.get(facts.binding.runId);
+    if (live?.permit) {
+      assertWorkspaceRunDrainOwner(proof, live.permit);
+      if (facts.attemptId !== live.lease.attemptId || !workspaceRunBindingsEqual(facts.binding, live.binding)) return fail("AUTHORITY_UNVERIFIED", "control.drainProof");
+      this.pendingDrainProofs.set(facts.binding.runId, proof);
+    }
+    let before: ReturnType<WorkspaceAgentBoundaryAuthority["commandControlState"]>;
+    try { before = this.authority.commandControlState(); } catch (error) { this.available = false; throw error; }
     const prior = before.control.runs.find(run => run.runId === facts.binding.runId);
-    if (prior?.drainProofRef === facts.proofRef) return;
+    if (prior?.drainProofRef === facts.proofRef) { this.pendingDrainProofs.delete(facts.binding.runId); this.live.delete(facts.binding.runId); return; }
     if (!live || !live.permit || !prior || prior.issuerId !== this.issuerId || facts.attemptId !== prior.leaseAttemptId
       || !workspaceRunBindingsEqual(facts.binding, prior.binding)) return fail("AUTHORITY_UNVERIFIED", "control.drainProof");
-    this.authority.observeCommandControl(before.revision, state => {
+    try { this.authority.observeCommandControl(before.revision, state => {
       const run = state.runs.find(run => run.runId === facts.binding.runId)!;
       run.state = "drained"; run.drainProofRef = facts.proofRef;
       const unknown = run.effect === "unknown" || facts.effects.some(effect => effect.state !== "completed") || facts.operations === null
@@ -240,7 +284,31 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
       }
       assertAgentCommandCapacity(state, true); return state;
     });
+    } catch (error) { this.available = false; throw error; }
+    this.pendingDrainProofs.delete(facts.binding.runId);
     this.live.delete(facts.binding.runId);
+  }
+  /** Explicit owner reconciliation retries only publication of retained genuine proofs, never work. */
+  reconcileDrainObservations(transport: Intake["transport"], agentId: string) {
+    this.authority.commandControlForReader(transport, agentId);
+    for (const live of this.live.values()) if (live.command.agentId === agentId && live.permit) {
+      try { this.pendingDrainProofs.set(live.binding.runId, workspaceRunDrainProof(live.permit)); } catch { /* Not physically drained; no substitute proof. */ }
+    }
+    for (const proof of [...this.pendingDrainProofs.values()]) if (workspaceRunDrainFacts(proof).binding.agent.agentId === agentId) this.observeDrained(proof);
+    return this.inspect(transport, agentId);
+  }
+  /** A consumer acknowledges stable event IDs after persisting its projection; this changes no control/effect fact. */
+  acknowledgeAudit(transport: Intake["transport"], agentId: string, eventIds: unknown) {
+    const before = this.authority.commandControlForReader(transport, agentId);
+    if (!Array.isArray(eventIds) || eventIds.length > 64 || eventIds.some(id => !commandId(id)) || new Set(eventIds).size !== eventIds.length) return fail("INVALID_DOCUMENT", "control.auditAck");
+    const selected = eventIds.map(id => before.control.audit.find(row => row.eventId === id && row.agentId === agentId));
+    if (selected.some(row => !row)) return fail("AUTHORIZATION_DENIED", "control.auditAck");
+    if (selected.some(row => !row!.acknowledged)) this.authority.observeCommandControl(before.revision, state => {
+      this.authority.commandControlForReader(transport, agentId);
+      for (const row of state.audit) if (eventIds.includes(row.eventId) && row.agentId === agentId) row.acknowledged = true;
+      return state;
+    });
+    return this.audit(transport, agentId).filter(row => eventIds.includes(row.eventId));
   }
   runForIntake(handle: AgentCommandIntake) {
     const intake = intakes.get(handle); if (!intake || intake.owner !== this) return fail("AUTHORITY_UNVERIFIED", "control.intake");
@@ -253,10 +321,10 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
   }
   inspect(transport: Intake["transport"], agentId: string) {
     const { control } = this.authority.commandControlForReader(transport, agentId), agent = control.agents.find(row => row.agentId === agentId);
-    return deepFreeze({ sourceAvailableHere: this.available, agent: agent ?? { agentId, epoch: 0, hold: null, dismissed: false },
+    return deepFreeze({ sourceAvailableHere: this.available && this.authority.commandControlSourceHealthy(), pendingDrainObservations: this.pendingDrainProofs.size, agent: agent ?? { agentId, epoch: 0, hold: null, dismissed: false },
       runs: control.runs.filter(run => run.agentId === agentId).map(run => ({ runId: run.runId, taskId: run.taskId, commandId: run.commandId,
-        claimRevision: run.claimRevision, epoch: run.epoch, state: run.state, effect: run.effect, hold: run.hold, drainProofRef: run.drainProofRef,
-        recovery: run.effect === "unknown" || ["unknown", "draining"].includes(run.state) ? ["query_original", "request_stop", "await_physical_drain"] : [] })) });
+        claimRevision: run.claimRevision, epoch: run.epoch, state: run.state, effect: run.effect, controlledHere: this.live.has(run.runId), hold: run.hold, drainProofRef: run.drainProofRef,
+        recovery: run.effect === "unknown" || !run.drainProofRef && !this.live.has(run.runId) || ["unknown", "draining"].includes(run.state) ? ["query_original", "request_stop", "await_physical_drain"] : [] })) });
   }
   audit(transport: Intake["transport"], agentId: string) {
     return this.authority.commandControlForReader(transport, agentId).control.audit.filter(row => row.agentId === agentId);

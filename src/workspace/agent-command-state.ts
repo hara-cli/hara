@@ -121,6 +121,10 @@ export function agentCommandTargetEpoch(state: AgentCommandState, command: Pick<
   return state.agents.find(agent => agent.agentId === command.agentId)?.epoch ?? 0;
 }
 
+export function agentCommandRunIdentity(run: AgentCommandRun) {
+  const { epoch: _epoch, hold: _hold, state: _state, effect: _effect, effectId: _effectId, drainProofRef: _drainProofRef, ...identity } = run;
+  return identity;
+}
 /** Append-only identity/recovery facts. A trusted observation may advance an outcome, never erase
  * the original acceptance, clear UNKNOWN or resume a held Agent behind the human command path. */
 export function assertAgentCommandTransition(before: AgentCommandState, next: AgentCommandState, action?: AgentBoundaryAction): void {
@@ -132,12 +136,9 @@ export function assertAgentCommandTransition(before: AgentCommandState, next: Ag
     if (!row || canonical(old.command) !== canonical(row.command) || old.sequence !== row.sequence
       || old.receipt.status === "rejected" && canonical(old.receipt) !== canonical(row.receipt)) return deny();
   }
-  const runIdentity = (run: AgentCommandRun) => {
-    const { epoch: _epoch, hold: _hold, state: _state, effect: _effect, effectId: _effectId, drainProofRef: _drainProofRef, ...identity } = run; return identity;
-  };
   for (let i = 0; i < before.runs.length; i++) {
     const old = before.runs[i]!, row = next.runs[i];
-    if (!row || canonical(runIdentity(old)) !== canonical(runIdentity(row)) || row.epoch < old.epoch
+    if (!row || canonical(agentCommandRunIdentity(old)) !== canonical(agentCommandRunIdentity(row)) || row.epoch < old.epoch
       || old.hold !== null && canonical(row.hold) !== canonical(old.hold)
       || old.state === "drained" && row.state !== "drained" || old.effect === "unknown" && row.effect !== "unknown"
       || old.effectId !== null && row.effectId !== old.effectId || old.drainProofRef !== null && row.drainProofRef !== old.drainProofRef) return deny();

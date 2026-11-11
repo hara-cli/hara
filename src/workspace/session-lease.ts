@@ -1,6 +1,7 @@
+import { readdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import {
-  bindPrivateHaraStateFile, readPrivateStateFileSnapshotSync, removePrivateStateFile,
+  assertPrivateStateDirectory, ensurePrivateStateSubdirectory, bindPrivateHaraStateFile, readPrivateStateFileSnapshotSync, removePrivateStateFile,
   withPrivateStateLockSync, writePrivateStateFileSync, type PrivateStateFileBinding, type PrivateStateFileSnapshot,
 } from "../security/private-state.js";
 import { currentWorkspaceResourceBinding, isWorkspaceResourceBinding, sameWorkspaceResourceBinding, workspaceResourceCommitGuard,
@@ -25,6 +26,18 @@ function decode(snapshot: PrivateStateFileSnapshot): Owner {
   return parsed;
 }
 
+/** Serializes the first C3 migration with physical attempt acquisition across Host processes. */
+export function withWorkspaceSessionAdmission<T>(storage: WorkspaceResourceStorage, operation: () => T): T {
+  return storage.run(() => withPrivateStateLockSync(workspaceStateHome(), [], "workspace-command-admission", operation));
+}
+/** No age/death heuristic authorizes migration over an existing or ambiguous physical owner. */
+export function assertNoWorkspaceSessionLeases(storage: WorkspaceResourceStorage): void {
+  storage.run(() => {
+    const directory = ensurePrivateStateSubdirectory(workspaceStateHome(), [".hara", "workspace-run-locks"]);
+    const entries = readdirSync(directory.path); assertPrivateStateDirectory(directory);
+    if (entries.length) throw new Error("Workspace has physical attempt ownership; command migration refused");
+  });
+}
 /** Only this receipt can release the exact captured owner inode. It grants no business write authority. */
 export class WorkspaceSessionLease {
   private released = false;
@@ -35,7 +48,7 @@ export class WorkspaceSessionLease {
     if (!UUID.test(sessionId) || !UUID.test(attemptId)) throw new Error("invalid Workspace session lease identity");
     let acquired: WorkspaceSessionLease | undefined;
     try {
-      return storage.run(() => withPrivateStateLockSync(workspaceStateHome(), ["workspace-run-locks"], `lease-${sessionId}`, () => {
+      return withWorkspaceSessionAdmission(storage, () => withPrivateStateLockSync(workspaceStateHome(), ["workspace-run-locks"], `lease-${sessionId}`, () => {
         const file = bindPrivateHaraStateFile(workspaceStateHome(), ["workspace-run-locks"], `${sessionId}.json`);
         const previous = readPrivateStateFileSnapshotSync(file.path, 4096);
         if (previous) {
