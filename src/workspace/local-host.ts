@@ -34,6 +34,10 @@ import type { Tool } from "../tools/registry.js";
 import { redactSensitiveText } from "../security/secrets.js";
 import { ensurePrivateStateSubdirectory } from "../security/private-state.js";
 import { LocalWorkspaceCatalog } from "./local-catalog.js";
+import { AgentBoundaryContractError } from "./agent-boundaries-contract.js";
+import { WorkspaceAgentBoundaryAuthority, type AgentBoundaryResource } from "./agent-boundary-authority.js";
+import type { AgentBoundaryTransport, AgentBoundaryTransports } from "./agent-boundary-transport.js";
+import type { AgentHubDirectory } from "../agent-hub/contracts.js";
 import { WorkspaceResources } from "./resources.js";
 import { currentWorkspaceResourceBinding, workspaceStateHome, WorkspaceResourceStorage } from "./resource-context.js";
 import { WorkspaceConnectionStoreV2, type ScopedConnection, type ScopedRunConnection } from "./scoped-connections.js";
@@ -99,7 +103,7 @@ const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTo
 export const colleagueCreateIntent = (message: string): boolean =>
   !/(?:不要|别|別|不必|无需|無需|do not|don't|never|without)\s*.{0,12}?(?:建立|建一?[个個位]?|创建|創建|新增|create|add)/iu.test(message)
   && /(?:建立|建一?[个個位]?|创建|創建|新增|create|add)\s*.{0,30}?(?:同事|bot|agent|colleague)/iu.test(message);
-interface WorkspaceHostContext { media?: WorkspaceMediaRegistry; resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; homes: WorkspaceColleagueHomes; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; extensions: WorkspaceExtensions; mcp: WorkspaceMcpManager; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
+interface WorkspaceHostContext { boundaryAuthority?: WorkspaceAgentBoundaryAuthority; media?: WorkspaceMediaRegistry; resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; homes: WorkspaceColleagueHomes; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; extensions: WorkspaceExtensions; mcp: WorkspaceMcpManager; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
 type WorkspaceConnectionSnapshot = ReturnType<WorkspaceConnectionStoreV2["list"]> & {
   readOnly?: boolean; recovered?: boolean; migrationPending?: boolean; unavailable?: boolean; activeConnectionId?: string | null;
 };
@@ -189,6 +193,10 @@ export class LocalWorkspaceHost {
     /** Operator entry only: detect installed engines in the background this long after a Workspace opens. */
     backgroundRuntimeDetectionMs?: number;
     providerFactory?: LocalWorkspaceProviderFactory;
+    /** Host composition only: no RPC/config can construct authenticated connection handles. */
+    boundaryTransports?: AgentBoundaryTransports;
+    boundaryMaxCommandLifetimeMs?: number;
+    boundaryExternalDirectory?: AgentHubDirectory;
     /** Trusted Host/test composition only; never exposed through RPC or a persisted setting. */
     jsonCliPolicyFactory?: JsonCliPolicyFactory;
     /** Host-owned native account reader; never accepted from a renderer or model tool argument. */
@@ -269,6 +277,58 @@ export class LocalWorkspaceHost {
   modelMode() { return this.options.mode === "workspace" ? { syntheticOnly: false, executionMode: "workspace" as const }
     : this.realKey ? { syntheticOnly: false, executionMode: "ark-real-key" as const, budget: this.realKey.summary() }
     : { syntheticOnly: true, executionMode: "synthetic" as const }; }
+  /** Reject the transport before looking up a Workspace or exposing any policy metadata. */
+  assertBoundaryTransport(transport: AgentBoundaryTransport | undefined): void {
+    if (!this.options.boundaryTransports || !transport) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "authority.transport");
+    this.options.boundaryTransports.provenance(transport);
+    if (this.closing || this.updateLease) throw new AgentBoundaryContractError("GRANT_REVOKED", "authority.host");
+  }
+  private boundaryResources(context: WorkspaceHostContext, agentId: string): readonly AgentBoundaryResource[] {
+    const agent = context.resources.agents.get(agentId), home = context.homes.view(agentId);
+    if (!agent || agent.state !== "active" || !home.created || !home.available) return [];
+    const identity = captureWorkspaceProjectIdentity(home.path), binding = context.storage.run(() => currentWorkspaceResourceBinding()!);
+    return [{ resourceId: `project_${agentId}`, agentId, revision: agent.agentEpoch, binding,
+      access: ["read", "write", "execute"], assertCurrent: () => {
+        context.storage.run(() => {
+          const current = context.resources.agents.get(agentId), currentHome = context.homes.view(agentId);
+          if (!current || current.state !== "active" || current.agentEpoch !== agent.agentEpoch || current.configRevision !== agent.configRevision
+            || !currentHome.created || !currentHome.available || canonical(captureWorkspaceProjectIdentity(currentHome.path)) !== canonical(identity)) {
+            throw new AgentBoundaryContractError("STALE_REVISION", "authority.resource");
+          }
+        });
+      } }];
+  }
+  private boundaryAuthority(transport: AgentBoundaryTransport | undefined, workspaceId: string): WorkspaceAgentBoundaryAuthority {
+    this.assertBoundaryTransport(transport);
+    const context = this.context(workspaceId);
+    context.boundaryAuthority ??= new WorkspaceAgentBoundaryAuthority({ catalog: this.catalog, resources: context.resources,
+      storage: context.storage, transports: this.options.boundaryTransports!,
+      assertHostLive: () => { if (this.closing || this.updateLease) throw new AgentBoundaryContractError("GRANT_REVOKED", "authority.host"); },
+      resourcesForAgent: agentId => this.boundaryResources(context, agentId),
+      maxCommandLifetimeMs: this.options.boundaryMaxCommandLifetimeMs, externalDirectory: this.options.boundaryExternalDirectory });
+    return context.boundaryAuthority;
+  }
+  agentBoundaryView(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string) {
+    return this.boundaryAuthority(transport, workspaceId).view(transport!, agentId);
+  }
+  prepareAgentBoundaryProject(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string) {
+    const authority = this.boundaryAuthority(transport, workspaceId);
+    authority.view(transport!, agentId); // Actual, active registered Agent; no name-based registration.
+    const context = this.context(workspaceId); context.homes.ensure(agentId);
+    return { ...authority.view(transport!, agentId), resources: this.boundaryResources(context, agentId).map(({ resourceId, revision, access }) => ({ resourceId, revision, access })) };
+  }
+  configureAgentBoundary(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string, input: unknown) {
+    return this.boundaryAuthority(transport, workspaceId).configure(transport!, agentId, input);
+  }
+  linkAgentBoundaryExecutor(transport: AgentBoundaryTransport | undefined, workspaceId: string, input: unknown) {
+    return this.boundaryAuthority(transport, workspaceId).linkExternal(transport!, input);
+  }
+  draftAgentBoundaryCommand(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string, input: unknown) {
+    return this.boundaryAuthority(transport, workspaceId).draft(transport!, agentId, input);
+  }
+  checkAgentBoundaryCommand(transport: AgentBoundaryTransport | undefined, workspaceId: string, command: unknown) {
+    return this.boundaryAuthority(transport, workspaceId).check(transport!, command);
+  }
   private context(workspaceId: string): WorkspaceHostContext {
     const row = this.catalog.resolve(workspaceId);
     const found = this.contexts.get(workspaceId);
@@ -1889,7 +1949,8 @@ export class LocalWorkspaceHost {
     if (this.scheduleTimer) clearInterval(this.scheduleTimer);
     if (this.usageTimer) clearInterval(this.usageTimer);
     this.extensionProposals.clear();
-    this.closing = true; for (const pending of [...this.pending.values()]) pending.finish({ approved: false, state: "aborted" });
+    this.closing = true; for (const context of this.contexts.values()) context.boundaryAuthority?.close();
+    for (const pending of [...this.pending.values()]) pending.finish({ approved: false, state: "aborted" });
     for (const job of this.jobs.values()) if (!job.closed) job.controller.abort();
     await Promise.all([...this.channels.values()].map(rooms => rooms.close()));
     await Promise.all([...this.jobs.values()].map(job => job.promise));
