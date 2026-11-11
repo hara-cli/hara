@@ -1,3 +1,5 @@
+import type { WorkspaceRunBinding } from "./run-binding.js";
+import { assertAgentCommandTransition, agentCommandTargetEpoch, agentPolicyProposalDigest, commandDigest, emptyAgentCommandState, parseAgentCommandState, type AgentCommandState } from "./agent-command-state.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   AgentBoundaryContractError, agentBoundaryCommandSigningText, assertAgentBoundaryContext, parseAgentBoundaryDocument,
@@ -33,7 +35,12 @@ interface Executor {
   executorRef: string; externalAgentId: string; instanceId: string; agentId: string | null;
   resourceId: string | null; controlled: false;
 }
-interface State { schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; policies: Policy[]; executors: Executor[] }
+interface State { schemaVersion: 1 | 2; revision: number; resourceBinding: WorkspaceResourceBinding; policies: Policy[]; executors: Executor[]; control?: AgentCommandState }
+export interface AgentCommandMutation {
+  command: AgentBoundaryCommand; control: AgentCommandState; authorizationError: AgentBoundaryErrorCode | null;
+  policyRevision: number; proposedPolicyRevision: number | null;
+}
+export interface AgentCommandMutationResult { control: AgentCommandState; applyPolicy?: boolean }
 declare const grantBrand: unique symbol;
 /** C1 intent authority only. It is neither a runtime ExecutionPermit nor a C3 receipt. */
 export interface AgentCommandGrant { readonly [grantBrand]: true }
@@ -83,7 +90,7 @@ export class WorkspaceAgentBoundaryAuthority {
     transports: AgentBoundaryTransports; assertHostLive?(): void;
     resourcesForAgent?(agentId: string): readonly AgentBoundaryResource[];
     toolsForAgent?(agentId: string): readonly AgentBoundaryTool[];
-    externalDirectory?: AgentHubDirectory; now?: () => number; maxCommandLifetimeMs?: number;
+    externalDirectory?: AgentHubDirectory; commandControl?: boolean; now?: () => number; maxCommandLifetimeMs?: number;
   }) {
     const catalog = options.catalog.read(), row = options.catalog.resolve(options.storage.scope.workspaceId);
     if (canonical(row.scope) !== canonical(options.storage.scope) || canonical(row.scope) !== canonical(options.resources.scope)) fail("CONTEXT_MISMATCH");
@@ -96,7 +103,7 @@ export class WorkspaceAgentBoundaryAuthority {
       row: canonical([row.scope, row.actorId, row.policyRevision, row.grantId, row.grantRevision]), context };
     this.now = options.now ?? Date.now; this.lifetime = options.maxCommandLifetimeMs ?? 300_000;
     if (!Number.isSafeInteger(this.lifetime) || this.lifetime < 1 || this.lifetime > 300_000) fail("INVALID_DOCUMENT");
-    this.state = new WorkspaceJsonState(options.storage, "workspace-agent-authority-v1.json", raw => this.parse(raw),
+    this.state = new WorkspaceJsonState<State>(options.storage, "workspace-agent-authority-v1.json", raw => this.parse(raw),
       () => ({ schemaVersion: 1, revision: 0, resourceBinding: this.state.binding(), policies: [], executors: [] }));
     this.assertHostCurrent();
   }
@@ -128,8 +135,9 @@ export class WorkspaceAgentBoundaryAuthority {
     return agent;
   }
   private parse(raw: unknown): State {
-    fields(raw, ["schemaVersion", "revision", "resourceBinding", "policies", "executors"]);
-    if (raw.schemaVersion !== 1 || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 0
+    const controlled = plain(raw) && Object.getOwnPropertyDescriptor(raw, "schemaVersion")?.value === 2;
+    fields(raw, ["schemaVersion", "revision", "resourceBinding", "policies", "executors", ...(controlled ? ["control"] : [])]);
+    if (raw.schemaVersion !== 1 && raw.schemaVersion !== 2 || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 0
       || !sameWorkspaceResourceBinding(raw.resourceBinding as WorkspaceResourceBinding, this.state.binding())
       || !Array.isArray(raw.policies) || raw.policies.length > 4096 || !Array.isArray(raw.executors) || raw.executors.length > 4096) fail("INVALID_DOCUMENT", "authority.policy");
     const seen = new Set<string>();
@@ -158,6 +166,7 @@ export class WorkspaceAgentBoundaryAuthority {
         || value.controlled !== false || value.agentId === null && value.resourceId !== null) fail("INVALID_DOCUMENT");
       executors.add(value.executorRef as string);
     }
+    if (controlled) parseAgentCommandState(raw.control, this.parent.context);
     return structuredClone(raw) as unknown as State;
   }
   private read(): State {
@@ -165,14 +174,18 @@ export class WorkspaceAgentBoundaryAuthority {
     try { return this.state.read(); }
     catch (error) { if (error instanceof AgentBoundaryContractError) throw error; return fail("AUTHORITY_UNVERIFIED", "authority.policy"); }
   }
-  private update(expectedRevision: unknown, change: (state: State) => State): void {
+  private update(expectedRevision: unknown, change: (state: State) => State, action?: AgentBoundaryAction): State {
     if (!Number.isSafeInteger(expectedRevision) || Number(expectedRevision) < 0) return fail("INVALID_DOCUMENT", "authority.revision");
-    try { this.state.update(expectedRevision as number, change); }
+    try { return this.state.update(expectedRevision as number, state => {
+      const next = change(state);
+      if (state.control) { if (!next.control) return fail("AUTHORITY_UNVERIFIED", "control.transition"); assertAgentCommandTransition(state.control, next.control, action); }
+      return next;
+    }); }
     catch (error) {
       if (error instanceof AgentBoundaryContractError) throw error;
       if (error instanceof Error && error.message === "Workspace state changed; refresh before writing") return fail("STALE_REVISION");
       if (error instanceof Error && error.message === "Workspace revision exhausted") return fail("COUNTER_EXHAUSTED");
-      fail("AUTHORITY_UNVERIFIED", "authority.policy");
+      return fail("AUTHORITY_UNVERIFIED", "authority.policy");
     }
   }
   private resourceVersions(agentId: string, boundary: AgentExecutionBoundary) {
@@ -227,20 +240,25 @@ export class WorkspaceAgentBoundaryAuthority {
       executors: state.executors.filter(row => row.agentId === agentId || row.agentId === null).map(row => this.executorView(row)),
       identityReservations: { account: null, device: null, membership: null, remoteExecution: false }, runtimeEnforced: false });
   }
-  configure(transport: AgentBoundaryTransport, agentId: string, input: unknown) {
-    this.source(transport); const agent = this.agent(agentId); fields(input, ["expectedRevision", "duty", "boundary", "rights"]);
+  private proposedPolicy(state: State, agentId: string, input: unknown): Policy {
+    const agent = this.agent(agentId); fields(input, ["duty", "boundary", "rights"]);
     const duty = parseAgentBoundaryDocument(input.duty), boundary = parseAgentBoundaryDocument(input.boundary);
     if (duty.kind !== "duty-profile" || boundary.kind !== "execution-boundary" || duty.agentId !== agentId || boundary.agentId !== agentId) return fail("INVALID_DOCUMENT");
     assertAgentBoundaryContext(duty, this.parent.context); assertAgentBoundaryContext(boundary, this.parent.context);
-    const access = rights(input.rights), state = this.read(), old = state.policies.find(row => row.agentId === agentId);
+    const access = rights(input.rights), old = state.policies.find(row => row.agentId === agentId);
     nextRevision(old?.duty, duty); nextRevision(old?.boundary, boundary);
     if (old && old.revision >= Number.MAX_SAFE_INTEGER) fail("COUNTER_EXHAUSTED");
     const resources = this.resourceVersions(agentId, boundary); this.checkTools(agentId, boundary);
-    const value: Policy = { agentId, revision: (old?.revision ?? 0) + 1, agentEpoch: agent.agentEpoch,
+    return { agentId, revision: (old?.revision ?? 0) + 1, agentEpoch: agent.agentEpoch,
       configRevision: agent.configRevision, rights: access, duty, boundary, resources };
-    this.source(transport);
+  }
+  configure(transport: AgentBoundaryTransport, agentId: string, input: unknown) {
+    this.source(transport); fields(input, ["expectedRevision", "duty", "boundary", "rights"]);
+    const state = this.read(); if (state.schemaVersion === 2) return fail("AUTHORITY_UNVERIFIED", "control.commandRequired");
+    const value = this.proposedPolicy(state, agentId, { duty: input.duty, boundary: input.boundary, rights: input.rights });
     this.update(input.expectedRevision, current => {
       this.source(transport); this.agent(agentId);
+      if (current.schemaVersion !== 1) return fail("AUTHORITY_UNVERIFIED", "control.commandRequired");
       return { ...current, policies: [...current.policies.filter(row => row.agentId !== agentId), value] };
     });
     return this.view(transport, agentId);
@@ -275,21 +293,109 @@ export class WorkspaceAgentBoundaryAuthority {
       provenance, expected: { dutyRevision: policy.duty.dutyRevision, boundaryRevision: policy.boundary.boundaryRevision, controlEpoch: 0 },
       issuedAt: new Date(issued).toISOString(), notAfter: new Date(issued + Number(input.lifetimeMs)).toISOString(), operation: input.operation, intentDigest: "0".repeat(64) });
     if (parsed.kind !== "command") return fail("INVALID_DOCUMENT"); this.permission(policy, parsed.operation.action);
-    const intentDigest = createHash("sha256").update(agentBoundaryCommandSigningText(parsed)).digest("hex");
-    const command = parseAgentBoundaryDocument({ ...parsed, intentDigest });
+    if (this.options.commandControl && state.schemaVersion !== 2 || state.schemaVersion === 2 && !this.options.commandControl) return fail("AUTHORITY_UNVERIFIED", "control.source");
+    const current = state.control ? parseAgentBoundaryDocument({ ...parsed, expected: { ...parsed.expected,
+      controlEpoch: agentCommandTargetEpoch(state.control, parsed) } }) : parsed;
+    if (current.kind !== "command") return fail("INVALID_DOCUMENT");
+    const intentDigest = createHash("sha256").update(agentBoundaryCommandSigningText(current)).digest("hex");
+    const command = parseAgentBoundaryDocument({ ...current, intentDigest });
     if (command.kind !== "command") return fail("INVALID_DOCUMENT"); this.source(transport); return command;
   }
-  private verify(transport: AgentBoundaryTransport, raw: unknown) {
-    const provenance = this.source(transport); const command = parseAgentBoundaryDocument(raw);
+  /** Authenticated original intent only. Returning a parsed document does not issue permission. */
+  authenticateCommandIntent(transport: AgentBoundaryTransport, raw: unknown): AgentBoundaryCommand {
+    const provenance = this.source(transport), command = parseAgentBoundaryDocument(raw);
     if (command.kind !== "command") return fail("INVALID_DOCUMENT");
     if (canonical(command.provenance) !== canonical(provenance)) return fail("AUTHORITY_UNVERIFIED", "authority.provenance");
     assertAgentBoundaryContext(command, this.parent.context);
-    const state = this.read(), policy = this.currentPolicy(command.agentId, state.policies.find(row => row.agentId === command.agentId));
-    if (command.expected.dutyRevision !== policy.duty.dutyRevision || command.expected.boundaryRevision !== policy.boundary.boundaryRevision) fail("STALE_REVISION");
     const now = this.now(), issued = Date.parse(command.issuedAt), expires = Date.parse(command.notAfter);
     if (!Number.isSafeInteger(now) || issued > now + 30_000 || expires <= now || expires - issued > this.lifetime) fail("AUTHORITY_UNVERIFIED", "authority.deadline");
     if (createHash("sha256").update(agentBoundaryCommandSigningText(command)).digest("hex") !== command.intentDigest) fail("AUTHORITY_UNVERIFIED", "authority.digest");
+    this.source(transport); return command;
+  }
+  private verify(transport: AgentBoundaryTransport, raw: unknown) {
+    const command = this.authenticateCommandIntent(transport, raw), state = this.read();
+    if (this.options.commandControl && state.schemaVersion !== 2 || state.schemaVersion === 2 && !this.options.commandControl) return fail("AUTHORITY_UNVERIFIED", "control.source");
+    const policy = this.currentPolicy(command.agentId, state.policies.find(row => row.agentId === command.agentId));
+    if (command.expected.dutyRevision !== policy.duty.dutyRevision || command.expected.boundaryRevision !== policy.boundary.boundaryRevision) fail("STALE_REVISION");
     this.permission(policy, command.operation.action); this.source(transport); return { command, policy };
+  }
+  /** Explicit owner setup; no absent/corrupt store is adopted as an execution history. */
+  initializeCommandControl(transport: AgentBoundaryTransport) {
+    this.source(transport); if (!this.options.commandControl) return fail("AUTHORITY_UNVERIFIED", "control.source");
+    const state = this.read(); if (state.schemaVersion === 2) return this.commandControlState();
+    if (!state.policies.length) return fail("BOUNDARY_CONFIRMATION_REQUIRED");
+    const policies = state.policies.map(policy => {
+      if (policy.revision >= Number.MAX_SAFE_INTEGER) return fail("COUNTER_EXHAUSTED"); return { ...policy, revision: policy.revision + 1 };
+    });
+    const control = emptyAgentCommandState(policies.map(policy => policy.agentId), { sourceRevision: state.revision,
+      sourceDigest: commandDigest(state), initializedAt: new Date(this.now()).toISOString(), humanSubjectId: this.parent.context.humanSubjectId, nodeId: this.parent.context.nodeId });
+    this.update(state.revision, current => { this.source(transport); return { ...current, schemaVersion: 2, policies, control }; });
+    return this.commandControlState();
+  }
+  /** Trusted library read used by the C3 source after the original UI disconnects. */
+  commandControlState() {
+    const state = this.read();
+    if (!this.options.commandControl || state.schemaVersion !== 2 || !state.control) return fail("AUTHORITY_UNVERIFIED", "control.source");
+    return deepFreeze({ revision: state.revision, context: this.parent.context, control: state.control });
+  }
+  commandControlForReader(transport: AgentBoundaryTransport, agentId: string) {
+    this.source(transport); const state = this.read(), policy = state.policies.find(policy => policy.agentId === agentId);
+    if (!policy || !policy.rights.manage && !policy.rights.invoke) return fail("AUTHORIZATION_DENIED", "control.read");
+    return this.commandControlState();
+  }
+  /** Host preparation liveness only; this method does not issue an execution permit. */
+  assertCommandRunBinding(binding: Readonly<WorkspaceRunBinding>): void {
+    this.assertHostCurrent(); const context = this.parent.context;
+    if (canonical(binding.scope) !== canonical(context.scope) || canonical(binding.agent.resourceBinding) !== canonical(context.resourceBinding)
+      || binding.host.actorId !== context.humanSubjectId || binding.host.hostId !== context.nodeId
+      || binding.host.grantId !== context.localGrant.grantId || binding.host.grantRevision !== context.localGrant.grantRevision) fail("CONTEXT_MISMATCH");
+    this.options.resources.agents.resolveTask(binding.agent);
+  }
+  /** C1 policy + C3 command/claim/control/audit publish under the original single authority CAS. */
+  transactCommand(transport: AgentBoundaryTransport, raw: unknown,
+    change: (input: AgentCommandMutation) => AgentCommandMutationResult, proposal?: unknown) {
+    const command = this.authenticateCommandIntent(transport, raw), before = this.commandControlState();
+    this.update(before.revision, state => {
+      this.source(transport); this.authenticateCommandIntent(transport, command);
+      if (state.schemaVersion !== 2 || !state.control) return fail("AUTHORITY_UNVERIFIED", "control.source");
+      let authorizationError: AgentBoundaryErrorCode | null = null, proposed: Policy | undefined;
+      const policy = state.policies.find(row => row.agentId === command.agentId);
+      try {
+        const current = this.currentPolicy(command.agentId, policy);
+        if (command.expected.dutyRevision !== current.duty.dutyRevision || command.expected.boundaryRevision !== current.boundary.boundaryRevision) fail("STALE_REVISION");
+        this.permission(current, command.operation.action);
+        const updating = command.operation.action === "duty.update" || command.operation.action === "boundary.update";
+        if (updating) {
+          proposed = this.proposedPolicy(state, command.agentId, proposal);
+          const digest = command.operation.action === "duty.update" ? command.operation.proposedDutyDigest : command.operation.proposedBoundaryDigest;
+          if (agentPolicyProposalDigest(proposal) !== digest) fail("AUTHORITY_UNVERIFIED", "control.proposal");
+          if (command.operation.action === "duty.update" && (canonical(proposed.boundary) !== canonical(current.boundary) || canonical(proposed.rights) !== canonical(current.rights))
+            || command.operation.action === "boundary.update" && canonical(proposed.duty) !== canonical(current.duty)) fail("AUTHORIZATION_DENIED", "control.proposal");
+        } else if (proposal !== undefined) fail("INVALID_DOCUMENT", "control.proposal");
+      } catch (error) { authorizationError = error instanceof AgentBoundaryContractError ? error.code : "AUTHORITY_UNVERIFIED"; }
+      const result = change({ command, control: structuredClone(state.control), authorizationError,
+        policyRevision: policy?.revision ?? 0, proposedPolicyRevision: proposed?.revision ?? null });
+      if (result.applyPolicy && (authorizationError || !proposed)) return fail("AUTHORITY_UNVERIFIED", "control.proposal");
+      this.source(transport);
+      return { ...state, control: result.control,
+        ...(result.applyPolicy && proposed ? { policies: [...state.policies.filter(row => row.agentId !== command.agentId), proposed] } : {}) };
+    }, command.operation.action);
+    return this.commandControlState();
+  }
+  /** Existing-runtime observations only; never exposed as a body callback or a generic RPC write. */
+  observeCommandControl(expectedRevision: number, change: (control: AgentCommandState) => AgentCommandState) {
+    this.commandControlState();
+    this.update(expectedRevision, state => {
+      this.assertHostCurrent(); if (state.schemaVersion !== 2 || !state.control) return fail("AUTHORITY_UNVERIFIED", "control.source");
+      const next = change(structuredClone(state.control));
+      if (canonical(next.agents) !== canonical(state.control.agents)) return fail("AUTHORIZATION_DENIED", "control.observation");
+      for (const old of state.control.commands) {
+        const row = next.commands.find(row => row.command.commandId === old.command.commandId);
+        if (!row || canonical(row.command) !== canonical(old.command)) return fail("COMMAND_ID_CONFLICT", "control.observation");
+      }
+      return { ...state, control: next };
+    });
+    return this.commandControlState();
   }
   admit(transport: AgentBoundaryTransport, raw: unknown): AgentCommandGrant {
     const { command, policy } = this.verify(transport, raw), handle = Object.freeze({}) as AgentCommandGrant;

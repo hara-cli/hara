@@ -79,13 +79,16 @@ function resource(state: GateState, demand: AgentBoundaryEffectResource): void {
 }
 /** Only controlled in-process Pi has complete effect mediation in C2. Native/full-protected engines
  * and delegated children need separate adapters that can enforce the same live per-effect fences. */
+export function assertAgentBoundaryRuntimeSupported(binding: Readonly<WorkspaceRunBinding>): void {
+  if (binding.agent.runtimeId !== "pi" || binding.agent.permissionTier !== "controlled" || binding.lineage.depth !== 0
+    || binding.lineage.parentRunId !== null) return fail("RUNTIME_UNSUPPORTED", "execution.runtime");
+}
 export function createAgentBoundaryExecutionGate(input: {
   binding: WorkspaceRunBinding; authority: WorkspaceAgentBoundaryAuthority; grant: AgentCommandGrant;
   control: AgentBoundaryControlSource; tools: readonly AgentBoundaryEffectTool[];
 }): AgentBoundaryExecutionGate {
   const binding = freezeWorkspaceRunBinding(input.binding);
-  if (binding.agent.runtimeId !== "pi" || binding.agent.permissionTier !== "controlled" || binding.lineage.depth !== 0
-    || binding.lineage.parentRunId !== null) return fail("RUNTIME_UNSUPPORTED", "execution.runtime");
+  assertAgentBoundaryRuntimeSupported(binding);
   if (!input.control || typeof input.control.bind !== "function") return fail("AUTHORITY_UNVERIFIED", "execution.control");
   const command = input.authority.grantFacts(input.grant).command, control = input.control.bind(command, binding);
   if (!control || typeof control.assertCurrent !== "function") {
