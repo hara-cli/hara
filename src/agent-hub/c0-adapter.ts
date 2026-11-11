@@ -20,6 +20,8 @@ export function createC0HubBoundary(binding: HubResourceBindingV1): AgentHubBoun
     savedReceipt: current.savedReceipt,
     // Old-generation display records stay readable in their exact scope. Every new admission still
     // uses current factories, the live C1 fence and the grant's current-generation/registered pair.
+    // These guards are historical readers, never C1/UserAction/current-credential proofs. Store
+    // recovery separately compares the orphan source with the current factory's exact provenance.
     isExternalSource: (value: unknown): value is ExternalAgentSourceV1 => history(value, "external-agent-source"),
     isSavedReceipt: (value: unknown): value is HubSavedReceiptV1 => history(value, "hub-ingress-receipt"),
   });

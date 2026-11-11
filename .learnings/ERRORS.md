@@ -11457,3 +11457,13 @@ Resolution: retained the 200ms gate and all identity/publication checks, cached 
 A new regression on 4fc706d reproduced configuration_conflict when a restarted Host already had the new configured limit: policy inspection itself refused before native authorization could run. preflight-cold-policy-before.log retains the failure. Read-only inspection now exposes the existing policy without widening it, legacy accounting upgrade preserves the old limit, and only the immutable revision/limit CAS can authorize migration. The regression exercises both old schema-1 and version-2 policies.
 
 Final verification after the cold migration fix: preflight-focused-v5 57/57, no skips; build-v5 and contract lock passed. Same synthetic20,848 entries/15links: text max98.09ms, four64KiB attachment max155.98ms under the unchanged200ms gate; initial census330.21ms separately before listening.
+
+
+## [ERR-20261111-HUB-HISTORY-ORPHAN] historical parse reused for publication
+
+**Status**: resolved
+**Area**: backend
+
+C0 author J-HIST-ORPHAN identified that ordinary orphan repair reused a same-scope history validator without separately checking current source generation/registered pair. On f33e2c3, targeted synthetic metadata with matching connection/request/digest reproduced three missing rejections (old generation, other agent, other instance); matching-current recovery passed. hist-orphan-before.log is retained. This is a provenance recovery boundary gap, not a demonstrated old-token or HTTP authority bypass. Require semantic equality with the current canonical source factory plus the independent current-grant/Host fences; reject and preserve mismatches without silently relabeling history.
+
+J-HIST-ORPHAN verification: three negative/current-source positive cases and the existing historical-read/old-token checks pass in the 61/61 focused group. Build and canonical C0 lock pass; final hot max93.86ms text /122.91ms four64KiB attachments, initial calibration325.23ms. Production remains disabled.

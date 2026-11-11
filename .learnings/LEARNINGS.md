@@ -1490,3 +1490,11 @@ Review N1/N2 found 15 normal links and 20,848 real-scale entries made the origin
 - Related Files: src/storage/quota.ts, src/agent-hub/private-store.ts, src/agent-hub/reader-leases.ts
 - Pattern-Key: storage.bounded_admission_and_expiring_read_protection
 - Verification: preflight-focused-v5 57/57 (including cold schema1/2 policy migration), build-v5, 200ms gate with the reviewed synthetic scale; real Host/CLI/Desk not enabled.
+
+
+## [LRN-20261111-HUB-HISTORY-ADMISSION] correction
+
+**Status**: resolved
+**Area**: backend
+
+Historical shape validation must not be the admission predicate for resuming an unpublished record. Compare its full canonical provenance to the current factory result for the authenticated frozen pair/binding before any repair publication, while retaining independent Host/grant fences. Reject-and-preserve mismatches; JSON key reordering alone is harmless. Source: C0 joint review J-HIST-ORPHAN; related: src/agent-hub/store.ts, c0-adapter.ts.

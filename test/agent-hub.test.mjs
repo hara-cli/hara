@@ -677,3 +677,53 @@ test("cached private directory identities reject a replaced scope instead of reb
   rmSync(f.state, { recursive: true }); fs.renameSync(old, f.state);
   f.hub.authorize(grant.token);
 });
+
+function realC0Orphan(t) {
+  const f = fixture(t), hub = createC0AgentHubStore(f.options), grant = hub.issueGrant(agentA.agentId);
+  const body = post("agent-a", "unpublished retained text", randomUUID(), [report("retained.txt", Buffer.from("unpublished attachment"))]);
+  const write = AgentHubPrivateStore.prototype.write;
+  AgentHubPrivateStore.prototype.write = function(filename, ...args) {
+    if (filename === "catalog.json") throw new Error("simulated lost C0 catalog commit");
+    return write.call(this, filename, ...args);
+  };
+  try { denies(() => hub.receive(grant.token, body), "store_unavailable"); }
+  finally { AgentHubPrivateStore.prototype.write = write; }
+  const name = readdirSync(f.state).find(name => /^message-/.test(name)), path = join(f.state, name);
+  return { ...f, hub, grant, body, path, metadata: JSON.parse(readFileSync(path, "utf8")) };
+}
+for (const [label, alter] of [
+  ["old source generation", source => { source.binding.generation = randomUUID(); }],
+  ["different external agent", source => { source.actor.externalAgentId = agentB.agentId; }],
+  ["different registered instance", source => { source.actor.instanceId = "different-boot"; }],
+]) {
+  test(`J-HIST-ORPHAN rejects and preserves an orphan with ${label} despite matching request facts`, t => {
+    const f = realC0Orphan(t); alter(f.metadata.source);
+    assert.equal(f.metadata.connectionId, f.grant.connectionId); assert.equal(f.metadata.requestId, f.body.requestId);
+    const boundary = createC0HubBoundary({ schemaVersion: 1, scopeKey: f.options.scopeKey, generation: f.options.generation });
+    assert.equal(boundary.isExternalSource(f.metadata.source), true, "history parsing alone accepts this well-shaped same-scope source");
+    writeFileSync(f.path, JSON.stringify(f.metadata), { mode: 0o600 });
+    const files = readdirSync(f.state).sort(), before = files.map(name => readFileSync(join(f.state, name)));
+    const restarted = createC0AgentHubStore(f.options);
+    denies(() => restarted.receive(f.grant.token, f.body), "conflict");
+    denies(() => restarted.receive(f.grant.token, f.body), "conflict");
+    assert.equal(restarted.receipt(f.grant.token, f.body.requestId), null);
+    assert.equal(restarted.messages(f.grant.connectionId).length, 0); assert.equal(restarted.unread(f.grant.connectionId), 0);
+    assert.equal(JSON.parse(readFileSync(join(f.state, "catalog.json"), "utf8")).nextSeq, 1);
+    assert.deepEqual(readdirSync(f.state).sort(), files);
+    for (let i = 0; i < files.length; i++) assert.ok(readFileSync(join(f.state, files[i])).equals(before[i]), `preserve ${files[i]}`);
+    restarted.authorize(f.grant.token);
+  });
+}
+
+test("J-HIST-ORPHAN recovers a semantically identical current source without rewriting original provenance", t => {
+  const f = realC0Orphan(t), originalSource = structuredClone(f.metadata.source);
+  f.metadata.source = Object.fromEntries(Object.entries(f.metadata.source).reverse());
+  const original = JSON.stringify(f.metadata); writeFileSync(f.path, original, { mode: 0o600 });
+  const assets = readdirSync(f.state).filter(name => name.endsWith(".bin")), before = assets.map(name => readFileSync(join(f.state, name)));
+  const restarted = createC0AgentHubStore(f.options), receipt = restarted.receive(f.grant.token, f.body);
+  assert.equal(receipt.status, "saved"); assert.equal(receipt.seq, 1); assert.equal(receipt.messageId, f.metadata.messageId);
+  assert.equal(receipt.savedAt, f.metadata.receivedAt); assert.equal(readFileSync(f.path, "utf8"), original);
+  assert.deepEqual(restarted.messages(f.grant.connectionId)[0].source, originalSource);
+  assert.deepEqual(restarted.receive(f.grant.token, f.body), receipt);
+  for (let i = 0; i < assets.length; i++) assert.ok(readFileSync(join(f.state, assets[i])).equals(before[i]));
+});

@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { AgentHubPrivateStore } from "./private-store.js";
 import { AgentHubError, exact, hubAssert, plain } from "./errors.js";
 import { HUB_LIMITS, parseHubAttachments, sha256 } from "./attachments.js";
@@ -157,6 +158,11 @@ export class AgentHubStore<S, R> {
       if (orphan !== null) {
         message = parseHubMetadata(orphan, key, this.options.boundary);
         hubAssert(message.connectionId === grant.connectionId && message.requestId === input.requestId && message.digest === digest, "conflict");
+        // The parser above admits historical display records. Recovery is a new publication:
+        // preserve only provenance equal to the current factory for this authenticated grant.
+        const expectedSource = this.options.boundary.externalSource(copy(grant.agent));
+        hubAssert(this.options.boundary.isExternalSource(expectedSource), "store_unavailable");
+        hubAssert(isDeepStrictEqual(message.source, expectedSource), "conflict");
       } else {
         const source = this.options.boundary.externalSource(copy(grant.agent));
         hubAssert(this.options.boundary.isExternalSource(source), "store_unavailable");

@@ -14,7 +14,9 @@ export interface HubSavedFacts {
 }
 /** C0 supplies these factories/validators. Hub defines no competing actor or receipt discriminant. */
 export interface AgentHubBoundaryContract<ExternalSource, SavedReceipt> {
+  /** Canonical deterministic source for the current Host binding and authenticated frozen pair. */
   externalSource(agent: RegisteredHubAgent): ExternalSource;
+  /** Stored historical shape only; does not authenticate or authorize a new publication. */
   isExternalSource(value: unknown): value is ExternalSource;
   savedReceipt(facts: HubSavedFacts): SavedReceipt;
   isSavedReceipt(value: unknown): value is SavedReceipt;
