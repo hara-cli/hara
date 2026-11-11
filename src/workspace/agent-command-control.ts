@@ -186,12 +186,16 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
         try {
           const grant = this.authority.admit(intake.transport, intake.command);
           this.live.set(preparation.binding.runId, { ...preparation, accepted: snapshot.control.runs.find(run => run.runId === preparation.binding.runId)!, command: intake.command, grant, bound: false });
-        } catch { this.available = false; } // Accepted intent stays original; no fallback/start or new identity.
+        } catch (error) {
+          if (!this.authority.commandControlSourceHealthy() || !(error instanceof AgentBoundaryContractError)) this.available = false;
+          // This acceptance remains original and has no live grant; only that run is unknown.
+          // A command-local deadline/permission rejection must not fence healthy sibling runs.
+        }
       }
       return record.receipt;
     } catch (error) {
       intake.consumed = true;
-      if (!(error instanceof AgentBoundaryContractError && ["STALE_REVISION", "COMMAND_ID_CONFLICT"].includes(error.code))) this.available = false;
+      if (!this.authority.commandControlSourceHealthy() || !(error instanceof AgentBoundaryContractError)) this.available = false;
       throw error;
     }
   }

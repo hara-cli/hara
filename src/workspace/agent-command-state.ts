@@ -140,7 +140,9 @@ export function assertAgentCommandTransition(before: AgentCommandState, next: Ag
     const old = before.runs[i]!, row = next.runs[i];
     if (!row || canonical(agentCommandRunIdentity(old)) !== canonical(agentCommandRunIdentity(row)) || row.epoch < old.epoch
       || old.hold !== null && canonical(row.hold) !== canonical(old.hold)
-      || old.state === "drained" && row.state !== "drained" || old.effect === "unknown" && row.effect !== "unknown"
+      || old.state === "drained" && row.state !== "drained"
+      || ["unknown", "draining", "drained"].includes(old.state) && ["accepted", "bound", "running"].includes(row.state)
+      || old.effect === "unknown" && row.effect !== "unknown"
       || old.effectId !== null && row.effectId !== old.effectId || old.drainProofRef !== null && row.drainProofRef !== old.drainProofRef) return deny();
   }
   for (const old of before.agents) {

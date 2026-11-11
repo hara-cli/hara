@@ -33,6 +33,13 @@ policy configure cannot write schema 2; later policy changes require original co
 The aggregate is bounded: 256 retained commands, 128 runs, 768 audit events and 2 MiB control state,
 inside the existing 4 MiB private writer. No accepted/UNKNOWN identity is evicted or reset. New
 admission reserves capacity for restrictive control/observations and fails closed at the limit.
+Capacity refusal and command-local deadline, binding, permission or preparation-lease rejection
+leave the shared source and healthy sibling runs available. A callback that rejects before candidate
+validation/publication is not a storage failure. Read/parse, transition, validation and actual write
+faults still permanently fence the source; restoring the file cannot revive old permits. If a command
+is already committed when its fresh grant fails, that original acceptance remains queryable without a
+live run grant or automatic restart; healthy siblings are not fenced by that command-local rejection.
+
 Stop/pause/dismiss may use the reserve. A later reviewed archival/migration is needed to reclaim
 history; this slice offers no destructive reset, automatic pruning or business retry.
 
@@ -91,6 +98,9 @@ report `execution.drain: observed`. The existing RunPermit must await all tracke
 native teardown where applicable, retire policy and release its original physical lease. Only then
 can it mint a private proof bound to that exact permit/attempt. Concurrent close shares one drain.
 C3 observes that genuine proof and can publish `drained`; it never adopts an arbitrary binding/proofRef.
+
+An `unknown` or `draining` run cannot transition back to accepted/bound/running. It may still receive
+a hold or a genuine final drain observation; the independent UNKNOWN-effect guard remains in force.
 
 Unknown/failed physical effects remain `status: unknown` + `EFFECT_OUTCOME_UNKNOWN` after drain or
 manual stop. Drain proves physical quiescence, not successful business completion. Completed effects

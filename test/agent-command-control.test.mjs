@@ -15,7 +15,7 @@ import { WorkspaceAgentBoundaryAuthority } from "../dist/workspace/agent-boundar
 import { AgentBoundaryTransports } from "../dist/workspace/agent-boundary-transport.js";
 import { AgentBoundaryContractError, agentBoundaryCommandSigningText } from "../dist/workspace/agent-boundaries-contract.js";
 import { WorkspaceAgentCommandControl, agentCommandMessageDigest } from "../dist/workspace/agent-command-control.js";
-import { agentPolicyProposalDigest } from "../dist/workspace/agent-command-state.js";
+import { agentPolicyProposalDigest, assertAgentCommandTransition } from "../dist/workspace/agent-command-state.js";
 import { captureWorkspaceProjectIdentity, freezeWorkspaceRunBinding, workspaceAgentBindingHash } from "../dist/workspace/run-binding.js";
 import { createTaskExecution } from "../dist/session/task.js";
 import { localWorkspaceFileTools } from "../dist/workspace/local-tools.js";
@@ -144,6 +144,35 @@ test("C3 stop after dispatch durably fences only the exact run; sibling work can
   assert.equal(fs.existsSync(join(f.project, "blocked.txt")), false); assert.equal(fs.readFileSync(join(f.project, "sibling.txt"), "utf8"), "yes");
 });
 
+for (const failure of ["expired intake", "released preparation lease", "post-accept grant expiry"]) test(`C3 ${failure} rejection preserves healthy sibling effects and fresh stop/pause`, async t => {
+  const f = fixture(t), healthy = f.dispatch("healthy sibling"); healthy.accept(); const runtime = healthy.runtime();
+  const rejected = f.dispatch("only this command must fail", { lifetimeMs: 1000 }), before = fs.readFileSync(f.file, "utf8");
+  if (failure === "expired intake") f.advance(1001);
+  else if (failure === "released preparation lease") rejected.lease.release();
+  if (failure === "post-accept grant expiry") {
+    const admit = f.authority.admit.bind(f.authority);
+    f.authority.admit = (transport, command) => { if (command.commandId === rejected.command.commandId) f.advance(1001); return admit(transport, command); };
+    try { assert.equal(rejected.accept().status, "accepted"); } finally { f.authority.admit = admit; }
+    const original = f.control.begin(f.transport, rejected.command, { message: rejected.message });
+    assert.equal(original.receipt.status, "unknown"); assert.equal(original.intake, undefined);
+    assert.throws(() => f.control.executionGrant(rejected.binding.runId), code("AUTHORITY_UNVERIFIED"));
+    assert.equal(f.snapshot().control.runs.find(run => run.runId === rejected.binding.runId).state, "accepted");
+  } else {
+    assert.throws(() => rejected.accept(), code("AUTHORITY_UNVERIFIED"));
+    assert.equal(fs.readFileSync(f.file, "utf8"), before);
+  }
+  assert.equal(f.authority.commandControlSourceHealthy(), true);
+  assert.equal(f.control.inspect(f.transport, f.agent.agentId).sourceAvailableHere, true);
+  await runtime.call("workspace_write", { path: "healthy-after-rejection.txt", content: failure });
+  assert.equal(fs.readFileSync(join(f.project, "healthy-after-rejection.txt"), "utf8"), failure);
+  const stopped = f.apply(f.draft({ action: "task.stop", taskId: healthy.task.id, runId: healthy.binding.runId, claimRevision: 1 }));
+  assert.ok(stopped.control.holdId); assert.notEqual(stopped.status, "rejected");
+  const paused = f.apply(f.draft({ action: "agent.pause", reason: "human_request" }));
+  assert.ok(paused.control.holdId); assert.notEqual(paused.status, "rejected");
+  await assert.rejects(runtime.call("workspace_write", { path: "held-after-rejection.txt", content: "no" }), code("CONTROL_HELD"));
+  assert.equal(fs.existsSync(join(f.project, "held-after-rejection.txt")), false);
+});
+
 test("C3 pause before dispatch rejects the old command, while resume only permits fresh dispatch", async t => {
   const f = fixture(t), old = f.dispatch("old");
   const pause = f.draft({ action: "agent.pause", reason: "human_request" }), held = f.apply(pause);
@@ -237,6 +266,44 @@ test("C3 drained requires a genuine post-drain runtime proof; JSON and abort are
   assert.equal(f.snapshot().control.audit.filter(row => row.action === "runtime.drained").length, 1);
 });
 
+test("C3 drain owner alone rejects a genuine proof paired with another genuine permit", async t => {
+  const f = fixture(t), a = f.dispatch("original drain"), b = f.dispatch("different permit"); a.accept(); b.accept();
+  const first = a.runtime(), other = b.runtime(); await closeWorkspaceRunPermit(first.permit);
+  const proof = workspaceRunDrainProof(first.permit), before = fs.readFileSync(f.file, "utf8");
+  // Fault injection isolates the owner defense: binding/attempt still match A, only its private permit slot is B.
+  // Both handles are real. No test capability or production injection API is introduced.
+  const live = f.control.live.get(a.binding.runId); live.permit = other.permit;
+  try { assert.throws(() => f.control.observeDrained(proof), code("AUTHORITY_UNVERIFIED")); }
+  finally { live.permit = first.permit; }
+  assert.equal(fs.readFileSync(f.file, "utf8"), before);
+  assert.equal(f.control.inspect(f.transport, f.agent.agentId).pendingDrainObservations, 0);
+});
+
+test("C3 transition independently refuses erasing UNKNOWN effect with the drained state unchanged", async t => {
+  const f = fixture(t), d = f.dispatch(); d.accept(); const runtime = d.runtime();
+  await assert.rejects(executeWorkspaceTool(runtime.permit, "workspace_write", async () => { throw new Error("synthetic unknown outcome"); }, undefined,
+    { path: "unknown-transition.txt", content: "no replay" }, "unknown-transition"));
+  await closeWorkspaceRunPermit(runtime.permit); f.control.observeDrained(workspaceRunDrainProof(runtime.permit));
+  const before = f.snapshot().control, next = structuredClone(before); assert.equal(before.runs[0].state, "drained");
+  assert.equal(before.runs[0].effect, "unknown"); next.runs[0].effect = "completed";
+  assert.throws(() => assertAgentCommandTransition(before, next), code("AUTHORITY_UNVERIFIED"));
+});
+
+test("C3 persisted unknown run cannot return to execution but genuine drain remains observable", async t => {
+  const f = fixture(t), d = f.dispatch(); d.accept(); const runtime = d.runtime(), state = f.snapshot();
+  state.control.runs[0].state = "unknown"; fs.writeFileSync(f.file, JSON.stringify(state)+"\n", { mode: 0o600 });
+  const before = f.authority.commandControlState().control;
+  for (const oldPhase of ["unknown", "draining"]) for (const phase of ["accepted", "bound", "running"]) {
+    const original = structuredClone(before); original.runs[0].state = oldPhase;
+    const next = structuredClone(original); next.runs[0].state = phase;
+    assert.throws(() => assertAgentCommandTransition(original, next), code("AUTHORITY_UNVERIFIED"));
+  }
+  await assert.rejects(runtime.call("workspace_write", { path: "unknown-state-no.txt", content: "no" }), code("CONTROL_HELD"));
+  assert.equal(fs.existsSync(join(f.project, "unknown-state-no.txt")), false);
+  await closeWorkspaceRunPermit(runtime.permit); f.control.observeDrained(workspaceRunDrainProof(runtime.permit));
+  assert.equal(f.snapshot().control.runs[0].state, "drained");
+});
+
 test("C3 UNKNOWN can be queried and manually stopped; drain/ack cannot erase or replay it", async t => {
   const f = fixture(t), d = f.dispatch(); d.accept(); const runtime = d.runtime(), input = { path: "unknown.txt", content: "accepted" };
   await assert.rejects(executeWorkspaceTool(runtime.permit, "workspace_write", async frozen => {
@@ -304,10 +371,13 @@ test("C3 capacity refuses new work before effects and retains reserved slots for
   fs.writeFileSync(f.file, JSON.stringify(state)+"\n", { mode: 0o600 });
   const before = fs.readFileSync(f.file, "utf8"), blocked = f.dispatch("must not start a new model or effect");
   assert.throws(() => blocked.accept(), code("AUTHORITY_UNVERIFIED")); assert.equal(fs.readFileSync(f.file, "utf8"), before);
-  await assert.rejects(runtime.call("workspace_write", { path: "capacity-no.txt", content: "no" }), code("AUTHORITY_UNVERIFIED"));
-  assert.equal(fs.existsSync(join(f.project, "capacity-no.txt")), false);
+  assert.equal(f.authority.commandControlSourceHealthy(), true);
+  assert.equal(f.control.inspect(f.transport, f.agent.agentId).sourceAvailableHere, true);
+  await runtime.call("workspace_write", { path: "capacity-healthy.txt", content: "already admitted" });
+  assert.equal(fs.readFileSync(join(f.project, "capacity-healthy.txt"), "utf8"), "already admitted");
   const stop = f.draft({ action: "task.stop", taskId: d.task.id, runId: d.binding.runId, claimRevision: 1 });
   const stopped = f.apply(stop); assert.notEqual(stopped.status, "rejected"); assert.ok(stopped.control.holdId);
+  assert.ok(f.apply(f.draft({ action: "agent.pause", reason: "human_request" })).control.holdId);
   await closeWorkspaceRunPermit(runtime.permit); f.control.observeDrained(workspaceRunDrainProof(runtime.permit));
   assert.equal(f.control.readReceipt(f.transport, f.agent.agentId, stop.commandId).execution.drain, "observed");
 });
@@ -379,6 +449,33 @@ for (const altered of ["claimRevision", "requestId", "originalIntent"]) test(`C3
   fs.writeFileSync(f.file, JSON.stringify(state)+"\n", { mode: 0o600 });
   await assert.rejects(runtime.call("workspace_write", { path: "altered-no.txt", content: "no" }), code("AUTHORITY_UNVERIFIED"));
   assert.equal(fs.existsSync(join(f.project, "altered-no.txt")), false);
+});
+
+test("C3 downgrade observed only inside CAS stays fenced after the original file is restored", async t => {
+  const f = fixture(t), healthy = f.dispatch(); healthy.accept(); const runtime = healthy.runtime(), next = f.dispatch("after cut");
+  const before = fs.readFileSync(f.file, "utf8"), update = f.authority.state.update.bind(f.authority.state);
+  // Inject the cross-file cut after preflight reads and restore before the caller catches it.
+  f.authority.state.update = (revision, change) => {
+    fs.writeFileSync(f.file, JSON.stringify({ ...JSON.parse(f.beforeMigration), revision })+"\n", { mode: 0o600 });
+    try { return update(revision, change); }
+    finally { fs.writeFileSync(f.file, before, { mode: 0o600 }); f.authority.state.update = update; }
+  };
+  assert.throws(() => next.accept(), code("AUTHORITY_UNVERIFIED"));
+  assert.equal(fs.readFileSync(f.file, "utf8"), before); assert.equal(f.authority.commandControlSourceHealthy(), false);
+  await assert.rejects(runtime.call("workspace_write", { path: "restored-cut-no.txt", content: "no" }), code("AUTHORITY_UNVERIFIED"));
+  assert.equal(fs.existsSync(join(f.project, "restored-cut-no.txt")), false);
+  assert.ok(f.apply(f.draft({ action: "task.stop", taskId: healthy.task.id, runId: healthy.binding.runId, claimRevision: 1 })).control.holdId);
+});
+
+test("C3 an invalid trusted transition still permanently fences the source and healthy effects", async t => {
+  const f = fixture(t), d = f.dispatch(); d.accept(); const runtime = d.runtime();
+  const before = fs.readFileSync(f.file, "utf8"), snapshot = f.authority.commandControlState();
+  assert.throws(() => f.authority.observeCommandControl(snapshot.revision, state => {
+    state.runs[0].requestId = randomUUID(); return state;
+  }), code("AUTHORITY_UNVERIFIED"));
+  assert.equal(fs.readFileSync(f.file, "utf8"), before); assert.equal(f.authority.commandControlSourceHealthy(), false);
+  await assert.rejects(runtime.call("workspace_write", { path: "invalid-transition-no.txt", content: "no" }), code("AUTHORITY_UNVERIFIED"));
+  assert.equal(fs.existsSync(join(f.project, "invalid-transition-no.txt")), false);
 });
 
 test("C3 a real private-lock publication failure preserves the ledger and permanently fences old effects", async t => {

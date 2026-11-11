@@ -187,16 +187,29 @@ export class WorkspaceAgentBoundaryAuthority {
   }
   private update(expectedRevision: unknown, change: (state: State) => State, action?: AgentBoundaryAction): State {
     if (!Number.isSafeInteger(expectedRevision) || Number(expectedRevision) < 0) return fail("INVALID_DOCUMENT", "authority.revision");
+    let rejectedChange: { error: unknown } | undefined;
     try { return this.state.update(expectedRevision as number, state => {
-      const next = change(state);
+      if (state.schemaVersion === 2) this.controlledStateSeen = true;
+      else if (this.controlledStateSeen) { this.controlStorageFailed = true; return fail("AUTHORITY_UNVERIFIED", "control.migrationRecovery"); }
+      let next: State;
+      try { next = change(state); }
+      catch (error) { rejectedChange = { error }; throw error; }
       if (state.control) { if (!next.control) return fail("AUTHORITY_UNVERIFIED", "control.transition"); assertAgentCommandTransition(state.control, next.control, action); }
       return next;
     }); }
     catch (error) {
-      if (error instanceof AgentBoundaryContractError) throw error;
+      // A rejected command callback never reached validation/publication. Its own lease or
+      // deadline must not poison unrelated runs. Compare identity: lock-release IO can replace
+      // the callback error and still must take the shared storage-failure path below.
+      if (rejectedChange && Object.is(error, rejectedChange.error)) {
+        if (error instanceof AgentBoundaryContractError) throw error;
+        return fail("AUTHORITY_UNVERIFIED", "authority.command");
+      }
       if (error instanceof Error && error.message === "Workspace state changed; refresh before writing") return fail("STALE_REVISION");
       if (error instanceof Error && error.message === "Workspace revision exhausted") return fail("COUNTER_EXHAUSTED");
+      // Read/parse, transition, validation and actual publication failures remain permanently fenced.
       if (this.options.commandControl || this.controlledStateSeen) this.controlStorageFailed = true;
+      if (error instanceof AgentBoundaryContractError) throw error;
       return fail("AUTHORITY_UNVERIFIED", "authority.policy");
     }
   }
