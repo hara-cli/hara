@@ -9,7 +9,7 @@ import { createWorkspaceCompletionEvidence } from "./completion-evidence-store.j
 import type { RuntimeExecutionPolicy, NativeWorkspaceEvidence, RuntimeRiskEvent } from "../agent-runtime/execution-policy.js";
 // A serialized RunBinding is provenance, never an execution capability. Only trusted Host composition
 // calls this factory; renderer/Agent arguments cannot populate the private WeakMap below.
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { NeutralMsg, Provider, ProviderRetryEvent, TurnResult, TurnArgs } from "../providers/types.js";
@@ -20,7 +20,8 @@ import type { LocalWorkspaceCatalog } from "./local-catalog.js";
 import type { WorkspaceResources } from "./resources.js";
 import type { WorkspaceConnectionStoreV2 } from "./scoped-connections.js";
 import type { WorkspaceSessionLease } from "./session-lease.js";
-import { canonical } from "./local-state.js";
+import { canonical, deepFreeze } from "./local-state.js";
+import { AgentBoundaryContractError } from "./agent-boundaries-contract.js";
 import { workspaceStateHome, type WorkspaceResourceStorage } from "./resource-context.js";
 import { freezeWorkspaceRunBinding, workspaceFileIdMatches, workspaceRunBindingsEqual, workspaceRunMatchesTask, type WorkspaceRunBinding } from "./run-binding.js";
 import type { WorkspaceUsage, WorkspaceConversation } from "./conversations.js";
@@ -33,6 +34,8 @@ import type { RuntimeStageRecorder } from "./runtime-stage-events.js";
 import type { WorkspaceUserInteraction, WorkspaceUserQuestion } from "./user-interaction.js";
 
 export interface WorkspaceRunPermit { readonly binding: Readonly<WorkspaceRunBinding> }
+declare const drainBrand: unique symbol;
+export interface WorkspaceRunDrainProof { readonly [drainBrand]: true }
 interface PermitState {
   boundaryExecution?: ReturnType<typeof bindAgentBoundaryExecution>;
   resetRoundClock?: () => void;
@@ -54,6 +57,7 @@ interface PermitState {
   pending: Set<Promise<unknown>>;
   lease: WorkspaceSessionLease;
   retired: boolean;
+  drainProof?: WorkspaceRunDrainProof;
   started: boolean;
   nativePolicy?: RuntimeExecutionPolicy;
   nativeEvidence?: NativeWorkspaceEvidence;
@@ -514,8 +518,26 @@ export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string
   state.toolTail = operation.then(() => undefined, () => undefined);
   return track(state, operation);
 }
+/** Observation only, from the real private runtime state. Not accepted from task/RPC JSON. */
+export function workspaceRunEffectFacts(permit: WorkspaceRunPermit) {
+  const state = stateOf(permit);
+  let operations: ReturnType<WorkspaceExecutionAudit["read"]>["operations"] | null;
+  try { operations = state.audit.read().operations; } catch { operations = null; }
+  return deepFreeze({ binding: permit.binding, attemptId: state.lease.attemptId, started: state.started,
+    modelCalls: state.usage.modelCalls, toolCalls: state.usage.toolCalls,
+    effects: state.completionEvidence.effectReceipts(), operations });
+}
+const drainProofs = new WeakMap<object, Readonly<ReturnType<typeof workspaceRunEffectFacts> & { proofRef: string }>>();
+export function workspaceRunDrainProof(permit: WorkspaceRunPermit): WorkspaceRunDrainProof {
+  const proof = stateOf(permit).drainProof;
+  if (!proof) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "control.drainProof"); return proof;
+}
+export function workspaceRunDrainFacts(proof: unknown) {
+  const facts = proof && typeof proof === "object" ? drainProofs.get(proof) : undefined;
+  if (!facts) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "control.drainProof"); return facts;
+}
 export async function closeWorkspaceRunPermit(permit: WorkspaceRunPermit): Promise<void> {
-  const state = stateOf(permit); state.retired = true;
+  const state = stateOf(permit); if (state.drainProof) return; state.retired = true;
   while (state.pending.size) await Promise.allSettled([...state.pending]);
   if (state.nativePolicy) {
     state.lease.setDraining(true);
@@ -527,6 +549,9 @@ export async function closeWorkspaceRunPermit(permit: WorkspaceRunPermit): Promi
   }
   state.boundaryExecution?.close();
   state.lease.release();
+  const proof = Object.freeze({}) as WorkspaceRunDrainProof;
+  drainProofs.set(proof, deepFreeze({ ...workspaceRunEffectFacts(permit), proofRef: `drain_${randomUUID()}` }));
+  state.drainProof = proof;
 }
 
 /** Observation only. Callers retain the original live checks at protected boundaries. */

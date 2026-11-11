@@ -18,7 +18,7 @@ import { captureWorkspaceProjectIdentity, freezeWorkspaceRunBinding, workspaceAg
 import { createTaskExecution } from "../dist/session/task.js";
 import { localWorkspaceFileTools } from "../dist/workspace/local-tools.js";
 import { createAgentBoundaryExecutionGate } from "../dist/workspace/agent-boundary-execution.js";
-import { createWorkspaceRunPermit, bindWorkspaceRunOptions, beginWorkspaceGovernedRun, closeWorkspaceRunPermit, executeWorkspaceTool, assertWorkspaceRunContextCurrent } from "../dist/workspace/execution.js";
+import { createWorkspaceRunPermit, bindWorkspaceRunOptions, beginWorkspaceGovernedRun, closeWorkspaceRunPermit, workspaceRunDrainProof, executeWorkspaceTool, assertWorkspaceRunContextCurrent } from "../dist/workspace/execution.js";
 
 const fixtureDocs = JSON.parse(fs.readFileSync(new URL("./fixtures/agent-boundaries-v1.json", import.meta.url), "utf8"));
 const code = expected => error => error instanceof AgentBoundaryContractError && error.code === expected;
@@ -70,9 +70,10 @@ function fixture(t, input = {}) {
       permit = createWorkspaceRunPermit({ binding, agentBoundary: gate, catalog, resources, storage, connections, lease, cwd: project, signal: abort.signal,
         provider: { id: "openai", model: binding.connection.model, async turn() { throw new Error("No model expected"); } }, toolNames: names,
         usage: { modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 }, updateUsage() {} }); permits.push(permit);
+      control.attachRuntime(binding.runId, permit);
       const options = bindWorkspaceRunOptions(permit, { ctx: { cwd: project, sessionId }, signal: abort.signal, hooks: false, approval: "auto-edit", extraTools: files,
         taskIntake: { task, current: () => task } }); beginWorkspaceGovernedRun(permit, options, "pi");
-      return { permit, call: async (name, data, id = randomUUID()) => executeWorkspaceTool(permit, name,
+      return { permit, files, call: async (name, data, id = randomUUID()) => executeWorkspaceTool(permit, name,
         frozen => files.find(tool => tool.name === name).run(frozen, { cwd: project }), undefined, data, id) };
     }
     return { task, command, binding, lease, intake: begun.intake, prepared, accept, runtime, message };
@@ -80,7 +81,7 @@ function fixture(t, input = {}) {
   function apply(command, proposal) { const begun = control.begin(transport, command, { ...(proposal ? { proposal } : {}) }); return begun.receipt ?? control.accept(begun.intake); }
   t.after(async () => { try { for (const permit of permits) await closeWorkspaceRunPermit(permit); for (const lease of leases) lease.release(); authority.close(); transports.close(); } finally { fs.rmSync(base, { recursive: true, force: true }); } });
   return { home, project, catalog, resources, storage, agent, row, connections, credential, transports, transport, authority, authorityOptions, control, draft, dispatch, apply,
-    file, beforeMigration, advance(ms) { clock += ms; }, snapshot: () => JSON.parse(fs.readFileSync(file, "utf8")) };
+    file, beforeMigration, trackLease(lease) { leases.push(lease); return lease; }, advance(ms) { clock += ms; }, snapshot: () => JSON.parse(fs.readFileSync(file, "utf8")) };
 }
 
 test("C3 explicit private migration preserves policies and fences legacy writers without changing portable C0", t => {
@@ -212,4 +213,39 @@ test("C3 counter exhaustion never resets the epoch or writes a false successful 
   fs.writeFileSync(f.file, JSON.stringify(state)+"\n", { mode: 0o600 }); const before = fs.readFileSync(f.file, "utf8");
   const command = f.draft({ action: "agent.pause", reason: "human_request" });
   assert.throws(() => f.apply(command), code("COUNTER_EXHAUSTED")); assert.equal(fs.readFileSync(f.file, "utf8"), before);
+});
+
+
+test("C3 drained requires a genuine post-drain runtime proof; JSON and abort are not observation", async t => {
+  const f = fixture(t), d = f.dispatch(); d.accept(); const runtime = d.runtime();
+  assert.throws(() => f.control.observeDrained({ approved: true }), code("AUTHORITY_UNVERIFIED"));
+  assert.throws(() => workspaceRunDrainProof(runtime.permit), code("AUTHORITY_UNVERIFIED"));
+  await runtime.call("workspace_write", { path: "observed.txt", content: "yes" });
+  await closeWorkspaceRunPermit(runtime.permit);
+  const proof = workspaceRunDrainProof(runtime.permit); f.control.observeDrained(proof); f.control.observeDrained(proof);
+  const receipt = f.control.readReceipt(f.transport, f.agent.agentId, d.command.commandId);
+  assert.equal(receipt.status, "drained"); assert.equal(receipt.execution.drain, "observed"); assert.ok(receipt.execution.drainProofRef);
+  assert.equal(receipt.execution.effect, "completed");
+  assert.equal(f.snapshot().control.audit.filter(row => row.action === "runtime.drained").length, 1);
+});
+
+test("C3 UNKNOWN can be queried and manually stopped; drain/ack cannot erase or replay it", async t => {
+  const f = fixture(t), d = f.dispatch(); d.accept(); const runtime = d.runtime(), input = { path: "unknown.txt", content: "accepted" };
+  await assert.rejects(executeWorkspaceTool(runtime.permit, "workspace_write", async frozen => {
+    await runtime.files.find(tool => tool.name === "workspace_write").run(frozen, { cwd: f.project }); throw new Error("synthetic response lost");
+  }, undefined, input, "unknown-effect"), /response lost/);
+  assert.equal(f.control.readReceipt(f.transport, f.agent.agentId, d.command.commandId).execution.effect, "unknown");
+  await closeWorkspaceRunPermit(runtime.permit); f.control.observeDrained(workspaceRunDrainProof(runtime.permit));
+  const stop = f.draft({ action: "task.stop", taskId: d.task.id, runId: d.binding.runId, claimRevision: 1 }), stopped = f.apply(stop);
+  assert.equal(stopped.status, "unknown"); assert.equal(stopped.execution.drain, "observed"); assert.equal(stopped.execution.effect, "unknown");
+  assert.ok(stopped.control.holdId); assert.equal(f.snapshot().control.runs[0].effect, "unknown");
+  assert.ok(f.control.inspect(f.transport, f.agent.agentId).runs[0].recovery.includes("query_original"));
+  assert.equal(fs.readFileSync(join(f.project, "unknown.txt"), "utf8"), "accepted");
+  const retry = { ...structuredClone(d.command), commandId: randomUUID() };
+  retry.intentDigest = createHash("sha256").update(agentBoundaryCommandSigningText(retry)).digest("hex");
+  const begun = f.control.begin(f.transport, retry, { message: d.message });
+  const retryLease = f.trackLease(WorkspaceSessionLease.acquire(f.storage, d.binding.sessionId));
+  const prepared = f.control.prepareRun(begun.intake, { ...d.binding, runId: randomUUID() }, retryLease, randomUUID());
+  // Original accepted root/task remain non-replayable even with a new command/run ID.
+  const result = f.control.accept(begun.intake, prepared); assert.equal(result.status, "rejected"); assert.equal(result.error.code, "COMMAND_ID_CONFLICT");
 });

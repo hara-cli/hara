@@ -13,7 +13,7 @@ export type AgentCommandHoldReason = "task_stop" | "agent_pause" | "dismissed" |
 export interface AgentCommandHold { holdId: string; reason: AgentCommandHoldReason; sequence: number }
 export interface AgentCommandControl { agentId: string; epoch: number; hold: AgentCommandHold | null; dismissed: boolean }
 export interface AgentCommandRun {
-  commandId: string; rootRequestId: string; agentId: string; taskId: string; runId: string; claimRevision: number;
+  commandId: string; rootRequestId: string; agentId: string; taskId: string; runId: string; claimRevision: number; policyRevision: number;
   requestId: string; leaseAttemptId: string; issuerId: string; binding: Readonly<WorkspaceRunBinding>; bindingDigest: string;
   agentControlEpoch: number; epoch: number; hold: AgentCommandHold | null;
   state: "accepted" | "bound" | "running" | "draining" | "drained" | "unknown";
@@ -69,8 +69,9 @@ export function parseAgentCommandState(raw: unknown, context: AgentBoundaryConte
     assertAgentBoundaryContext(command, context); assertAgentBoundaryContext(receipt, context); commands.set(command.commandId, command);
   }
   for (const item of raw.runs) {
-    if (!plain(item) || !exact(item, ["commandId", "rootRequestId", "agentId", "taskId", "runId", "claimRevision", "requestId", "leaseAttemptId", "issuerId", "binding", "bindingDigest", "agentControlEpoch", "epoch", "hold", "state", "effect", "effectId", "drainProofRef"])
+    if (!plain(item) || !exact(item, ["commandId", "rootRequestId", "agentId", "taskId", "runId", "claimRevision", "policyRevision", "requestId", "leaseAttemptId", "issuerId", "binding", "bindingDigest", "agentControlEpoch", "epoch", "hold", "state", "effect", "effectId", "drainProofRef"])
       || !commandId(item.commandId) || !commandId(item.rootRequestId) || !commandId(item.agentId) || !commandId(item.taskId) || !commandId(item.runId)
+      || !commandEpoch(item.policyRevision) || Number(item.policyRevision) < 1
       || runs.has(item.runId) || !commandEpoch(item.claimRevision) || Number(item.claimRevision) < 1 || !uuid(item.requestId) || !uuid(item.leaseAttemptId) || !uuid(item.issuerId)
       || !hash(item.bindingDigest) || !commandEpoch(item.agentControlEpoch) || !commandEpoch(item.epoch) || !hold(item.hold, sequence)
       || !["accepted", "bound", "running", "draining", "drained", "unknown"].includes(String(item.state))

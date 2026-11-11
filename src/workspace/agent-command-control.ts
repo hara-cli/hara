@@ -1,3 +1,4 @@
+import { workspaceRunEffectFacts, workspaceRunDrainFacts, type WorkspaceRunPermit } from "./execution.js";
 // C3 trusted Host composition. There is no default issuer and no renderer callback/approved boolean.
 import { createHash, randomUUID } from "node:crypto";
 import { AGENT_BOUNDARY_ERRORS, AgentBoundaryContractError, assertAgentBoundaryContext, parseAgentBoundaryDocument,
@@ -19,7 +20,7 @@ declare const preparationBrand: unique symbol;
 export interface AgentCommandRunPreparation { readonly [preparationBrand]: true }
 interface Intake { owner: WorkspaceAgentCommandControl; transport: Parameters<WorkspaceAgentBoundaryAuthority["admit"]>[0]; command: AgentBoundaryCommand; proposal?: unknown; consumed: boolean }
 interface Preparation { intake: AgentCommandIntake; binding: Readonly<WorkspaceRunBinding>; lease: WorkspaceSessionLease; requestId: string }
-interface LiveRun extends Preparation { command: AgentBoundaryCommand; grant: AgentCommandGrant; bound: boolean }
+interface LiveRun extends Preparation { command: AgentBoundaryCommand; grant: AgentCommandGrant; bound: boolean; permit?: WorkspaceRunPermit }
 const intakes = new WeakMap<object, Intake>(), preparations = new WeakMap<object, Preparation>();
 export function agentCommandIntakeFacts(handle: unknown) {
   const state = handle && typeof handle === "object" ? intakes.get(handle) : undefined;
@@ -73,7 +74,7 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
     const existing = snapshot.control.commands.find(row => row.command.commandId === parsed.commandId);
     if (existing) {
       if (canonical(parsed) !== canonical(existing.command)) return fail("COMMAND_ID_CONFLICT", "control.command");
-      return { receipt: existing.receipt }; // Fresh reader authentication; never re-admit an expired intent.
+      return { receipt: this.currentReceipt(existing.command, existing.receipt, snapshot.control) }; // Fresh reader authentication; never re-admit an expired intent.
     }
     if (!this.available) return fail("AUTHORITY_UNVERIFIED", "control.source");
     const command = this.authority.authenticateCommandIntent(transport, parsed);
@@ -121,7 +122,7 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
           else {
             this.authority.assertCommandRunBinding(preparation.binding); preparation.lease.assertCurrent();
             const run: AgentCommandRun = { commandId: command.commandId, rootRequestId: command.rootRequestId, agentId: command.agentId, taskId: op.taskId,
-              runId: preparation.binding.runId, claimRevision: 1, requestId: preparation.requestId, leaseAttemptId: preparation.lease.attemptId, issuerId: this.issuerId,
+              runId: preparation.binding.runId, claimRevision: 1, policyRevision: facts.policyRevision, requestId: preparation.requestId, leaseAttemptId: preparation.lease.attemptId, issuerId: this.issuerId,
               binding: preparation.binding, bindingDigest: commandDigest(preparation.binding), agentControlEpoch: agent.epoch, epoch: agent.epoch,
               hold: null, state: "accepted", effect: "none", effectId: null, drainProofRef: null };
             state.runs.push(run); targetRun = run; acceptedNew = true;
@@ -140,7 +141,7 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
         const newEpoch = op.action === "task.stop" ? targetRun?.epoch ?? oldEpoch : agent.epoch;
         const holdId = op.action === "task.stop" ? targetRun?.hold?.holdId ?? null : agent.hold?.holdId ?? null;
         const drain = ["task.stop", "agent.pause", "agent.dismiss"].includes(op.action);
-        const result = receipt(command, newEpoch, holdId, code ? "rejected" : drain || op.action === "task.dispatch" ? "accepted" : "applied", code, undefined, !code && drain);
+        const result = receipt(command, newEpoch, holdId, code ? "rejected" : drain || op.action === "task.dispatch" ? "accepted" : "applied", code, !code && op.action === "task.stop" ? targetRun : undefined, !code && drain);
         addAudit(state, command, { decision: code ? "rejected" : "allowed", code, oldEpoch, newEpoch,
           policyRevision: applyPolicy ? facts.proposedPolicyRevision! : facts.policyRevision, now: this.now() });
         state.commands.push({ command, receipt: result, sequence: state.sequence });
@@ -184,17 +185,78 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
     return Object.freeze({ commandId: command.commandId, runId: binding.runId, controlEpoch: command.expected.controlEpoch,
       assertCurrent: () => { this.assertRunCurrent(live); } });
   }
+  private currentReceipt(command: AgentBoundaryCommand, original: AgentBoundaryReceipt, state: AgentCommandState): AgentBoundaryReceipt {
+    const operation = command.operation;
+    const found = operation.action === "task.dispatch" ? state.runs.find(run => run.commandId === command.commandId)
+      : operation.action === "task.stop" ? state.runs.find(run => run.runId === operation.runId && run.agentId === command.agentId) : undefined;
+    if (!found || original.status === "rejected") return original;
+    const run = { ...found }, agent = state.agents.find(row => row.agentId === command.agentId), live = this.live.get(run.runId);
+    if (live?.permit && !run.drainProofRef && run.effect !== "unknown") {
+      try {
+        const facts = workspaceRunEffectFacts(live.permit);
+        if (facts.effects.some(effect => effect.state === "unknown") || facts.operations?.some(row => row.outcome === "error" || row.outcome === "cancelled")) run.effect = "unknown";
+      } catch { if (run.effect !== "none") run.effect = "unknown"; }
+    }
+    const blocked = Boolean(run.hold || agent?.hold || agent?.dismissed || agent?.epoch !== run.agentControlEpoch);
+    const phase = run.drainProofRef ? "drained" : run.state === "unknown" ? "unknown" : blocked ? "draining" : run.state === "running" ? "applying" : "accepted";
+    return receipt(command, run.hold ? run.epoch : agent?.epoch ?? run.epoch, run.hold?.holdId ?? agent?.hold?.holdId ?? null, phase,
+      phase === "unknown" && run.effect !== "unknown" ? "AUTHORITY_UNVERIFIED" : null, run, blocked);
+  }
+  /** Called only after the real opaque permit exists, before any model/tool call. */
+  attachRuntime(runId: string, permit: WorkspaceRunPermit): void {
+    const live = this.live.get(runId); if (!live || !live.bound || live.permit) return fail("AUTHORITY_UNVERIFIED", "control.runtime");
+    const facts = workspaceRunEffectFacts(permit);
+    if (!workspaceRunBindingsEqual(facts.binding, live.binding) || facts.attemptId !== live.lease.attemptId || facts.started || facts.modelCalls || facts.toolCalls) return fail("CONTEXT_MISMATCH", "control.runtime");
+    this.assertRunCurrent(live);
+    const snapshot = this.authority.commandControlState();
+    live.permit = permit;
+    this.authority.observeCommandControl(snapshot.revision, state => {
+      const run = state.runs.find(run => run.runId === runId)!;
+      run.state = "bound"; run.effect = "accepted"; run.effectId = `work_${runId}`;
+      addAudit(state, live.command, { action: "runtime.bound", decision: "observed", oldEpoch: run.epoch, newEpoch: run.epoch, policyRevision: run.policyRevision, now: this.now() });
+      const record = state.commands.find(record => record.command.commandId === live.command.commandId)!;
+      record.receipt = this.currentReceipt(record.command, record.receipt, state);
+      assertAgentCommandCapacity(state); return state;
+    });
+  }
+  /** The proof is minted only after all actual Promises/native teardown and the physical lease drain. */
+  observeDrained(proof: unknown): void {
+    const facts = workspaceRunDrainFacts(proof), live = this.live.get(facts.binding.runId), before = this.authority.commandControlState();
+    const prior = before.control.runs.find(run => run.runId === facts.binding.runId);
+    if (prior?.drainProofRef === facts.proofRef) return;
+    if (!live || !live.permit || !prior || prior.issuerId !== this.issuerId || facts.attemptId !== prior.leaseAttemptId
+      || !workspaceRunBindingsEqual(facts.binding, prior.binding)) return fail("AUTHORITY_UNVERIFIED", "control.drainProof");
+    this.authority.observeCommandControl(before.revision, state => {
+      const run = state.runs.find(run => run.runId === facts.binding.runId)!;
+      run.state = "drained"; run.drainProofRef = facts.proofRef;
+      const unknown = run.effect === "unknown" || facts.effects.some(effect => effect.state !== "completed") || facts.operations === null
+        || facts.operations.some(row => row.outcome !== "completed");
+      if (run.effect !== "none") run.effect = unknown ? "unknown" : "completed";
+      addAudit(state, live.command, { action: "runtime.drained", decision: "observed", code: unknown ? "EFFECT_OUTCOME_UNKNOWN" : null,
+        oldEpoch: run.epoch, newEpoch: run.epoch, policyRevision: run.policyRevision, now: this.now() });
+      for (const record of state.commands) if (record.command.commandId === live.command.commandId
+        || record.command.operation.action === "task.stop" && record.command.operation.runId === run.runId) {
+        record.receipt = this.currentReceipt(record.command, record.receipt, state);
+      }
+      assertAgentCommandCapacity(state, true); return state;
+    });
+    this.live.delete(facts.binding.runId);
+  }
+  runForIntake(handle: AgentCommandIntake) {
+    const intake = intakes.get(handle); if (!intake || intake.owner !== this) return fail("AUTHORITY_UNVERIFIED", "control.intake");
+    return this.authority.commandControlState().control.runs.find(run => run.commandId === intake.command.commandId);
+  }
   readReceipt(transport: Intake["transport"], agentId: string, id: string): AgentBoundaryReceipt {
     if (!commandId(id)) return fail("INVALID_DOCUMENT");
     const snapshot = this.authority.commandControlForReader(transport, agentId), row = snapshot.control.commands.find(row => row.command.commandId === id && row.command.agentId === agentId);
-    if (!row) return fail("AUTHORIZATION_DENIED", "control.receipt"); return row.receipt;
+    if (!row) return fail("AUTHORIZATION_DENIED", "control.receipt"); return this.currentReceipt(row.command, row.receipt, snapshot.control);
   }
   inspect(transport: Intake["transport"], agentId: string) {
     const { control } = this.authority.commandControlForReader(transport, agentId), agent = control.agents.find(row => row.agentId === agentId);
-    return deepFreeze({ agent: agent ?? { agentId, epoch: 0, hold: null, dismissed: false },
+    return deepFreeze({ sourceAvailableHere: this.available, agent: agent ?? { agentId, epoch: 0, hold: null, dismissed: false },
       runs: control.runs.filter(run => run.agentId === agentId).map(run => ({ runId: run.runId, taskId: run.taskId, commandId: run.commandId,
         claimRevision: run.claimRevision, epoch: run.epoch, state: run.state, effect: run.effect, hold: run.hold, drainProofRef: run.drainProofRef,
-        recovery: ["unknown", "draining"].includes(run.state) ? ["query_original", "request_stop", "await_physical_drain"] : [] })) });
+        recovery: run.effect === "unknown" || ["unknown", "draining"].includes(run.state) ? ["query_original", "request_stop", "await_physical_drain"] : [] })) });
   }
   audit(transport: Intake["transport"], agentId: string) {
     return this.authority.commandControlForReader(transport, agentId).control.audit.filter(row => row.agentId === agentId);
