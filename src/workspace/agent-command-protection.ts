@@ -10,7 +10,7 @@ export function workspaceAgentCommandProtected(storage: WorkspaceResourceStorage
     try { raw = JSON.parse(snapshot.text); } catch { throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "control.protection"); }
     if (!plain(raw) || raw.schemaVersion !== 1 && raw.schemaVersion !== 2 && raw.schemaVersion !== 3 || !isWorkspaceResourceBinding(raw.resourceBinding)
       || !sameWorkspaceResourceBinding(raw.resourceBinding, currentWorkspaceResourceBinding()!)) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "control.protection");
-    if (raw.schemaVersion === 1 && Object.hasOwn(raw, "control") || raw.schemaVersion !== 1 && (!plain(raw.control) || raw.schemaVersion === 3 && !plain(raw.lifecycle))) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "control.protection");
+    if (raw.schemaVersion === 1 && (Object.hasOwn(raw, "control") || Object.hasOwn(raw, "lifecycle")) || raw.schemaVersion !== 1 && (!plain(raw.control) || raw.schemaVersion === 3 && !plain(raw.lifecycle))) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "control.protection");
     return raw.schemaVersion !== 1;
   });
 }

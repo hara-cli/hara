@@ -33,3 +33,11 @@ The genuine C4 control source supplies the C2 gate's synchronous `prepareQuiesce
 `reconcileQuiescentRelease` requires a genuine C1 authority and current authenticated management rights; it re-reads the positive persisted closure inside physical admission/lease locks, checks the complete owner digest/inode/times/scope and proves the old owner dead (or the exact current process instance). It never acquires an execution. Missing ownership alone proves nothing. Its in-process WeakRef table only marks an original receipt released after those checks; it supplies no permission or epoch. Recovered business outcomes become UNKNOWN conservatively.
 
 The actual owning Host observes persisted exact target IDs every250ms while it has owned work. Explicit reconciliation gets a bounded30s observer window; the timer is unref'ed and closes with that Host. A second Host with an empty jobs map cannot report notification or drain. Notifications may only abort an already-owned matching job, and never start/rebind business. Independent synchronous C2 gates reject effects immediately without waiting for this notification interval.
+
+## Explicit N5 recovery and conversation projection
+
+Only the original opaque preparation plus its current captured lease may prove a never-issued acceptance. The terminal proof and recovery hold publish before original lease release. Post-issuance failure retains UNKNOWN, the accepted request journal and original owner; a missing permit or zero usage cannot retire it. Failed proof publication never frees the owner.
+
+An explicit private recovery request binds the previous positive terminal digest and latest claim revision to a new C0 dispatch. Current manage, invoke and nodeUse are re-read in the same CAS. Duplicate operation is read-only; another operation cannot share the next claim. Original taskId/root/run/receipt remain retained. The conversation store accepts a same-task old-run to new-run projection only through a genuine opaque handle minted for that exact accepted claim. JSON, ordinary save and zero counters cannot reset its budget or erase prior requests/tasks.
+
+The C implementation checkpoint is saved before its joint validation because the workstation load gate refused the test start. This is a local implementation commit, not acceptance: the final draft requires a rebuilt exact final SHA and full guard receipt.

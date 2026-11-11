@@ -76,3 +76,12 @@ test("C4 pure migration cannot turn historical acceptance into a never-issued pr
   const oversized = { ...fixture.empty, segments: Array.from({ length: 65 }, () => ({})) };
   assert.throws(() => parseAgentLifecycleState(oversized, control), error => error.field === "lifecycle.capacity");
 });
+
+
+test("C4 a partial downgrade retaining lifecycle can never fall through the legacy protection probe", t => {
+  const f = lifecycleFixture(t), original = fs.readFileSync(f.file, "utf8"), partial = JSON.parse(original);
+  partial.schemaVersion = 1; delete partial.control;
+  fs.writeFileSync(f.file, JSON.stringify(partial) + "\n");
+  assert.throws(() => f.storage.run(() => workspaceAgentCommandProtected(f.storage)), code("AUTHORITY_UNVERIFIED"));
+  fs.writeFileSync(f.file, original);
+});

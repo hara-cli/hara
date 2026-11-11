@@ -40,7 +40,7 @@ import { WorkspaceAgentBoundaryAuthority, type AgentBoundaryResource } from "./a
 import { AgentBoundaryTransports, type AgentBoundaryTransport } from "./agent-boundary-transport.js";
 import { createAgentBoundaryExecutionGate, assertAgentBoundaryRuntimeSupported, AGENT_BOUNDARY_BOOKKEEPING_TOOLS } from "./agent-boundary-execution.js";
 import { isWorkspaceScopedFileTool, WORKSPACE_SCOPED_FILE_TOOLS } from "./scoped-tool-binding.js";
-import { WorkspaceAgentCommandControl, agentCommandIntakeFacts, type AgentCommandIntake } from "./agent-command-control.js";
+import { WorkspaceAgentCommandControl, agentCommandIntakeFacts, type AgentCommandIntake, type AgentCommandRunPreparation } from "./agent-command-control.js";
 import type { AgentHubDirectory } from "../agent-hub/contracts.js";
 import { WorkspaceResources } from "./resources.js";
 import { currentWorkspaceResourceBinding, workspaceStateHome, WorkspaceResourceStorage } from "./resource-context.js";
@@ -368,7 +368,24 @@ export class LocalWorkspaceHost {
   }
   submitAgentBoundaryCommand(clientId: string, transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string,
     command: unknown, input: { message?: string; proposal?: unknown }) {
-    const control = this.commandAuthority(transport, workspaceId), begun = control.begin(transport!, command, input);
+    const control = this.commandAuthority(transport, workspaceId);
+    return this.submitAgentCommandIntake(clientId, transport!, workspaceId, agentId, control, control.begin(transport!, command, input), input);
+  }
+  draftAgentLifecycleRecovery(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string,
+    input: Parameters<WorkspaceAgentCommandControl["draftRecovery"]>[2]) {
+    return this.commandAuthority(transport, workspaceId).draftRecovery(transport!, agentId, input);
+  }
+  submitAgentLifecycleRecovery(clientId: string, transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string,
+    recovery: unknown, command: unknown, input: { message: string }) {
+    const control = this.commandAuthority(transport, workspaceId);
+    if (!this.options.boundaryLifecycleControl) throw new AgentBoundaryContractError("RUNTIME_UNSUPPORTED", "lifecycle.bootstrap");
+    return this.submitAgentCommandIntake(clientId, transport!, workspaceId, agentId, control, control.beginRecovery(transport!, recovery, command, input), input);
+  }
+  reconcileAgentLifecycle(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string) {
+    const result = this.commandAuthority(transport, workspaceId).reconcileLifecycleObservations(transport!, agentId); this.kickLifecycleObserver(); return result;
+  }
+  private submitAgentCommandIntake(clientId: string, transport: AgentBoundaryTransport, workspaceId: string, agentId: string,
+    control: WorkspaceAgentCommandControl, begun: ReturnType<WorkspaceAgentCommandControl["begin"]>, input: { message?: string; proposal?: unknown }) {
     if ("receipt" in begun) return begun.receipt;
     const intake = begun.intake, facts = agentCommandIntakeFacts(intake, control);
     if (facts.workspaceId !== workspaceId || facts.command.agentId !== agentId) throw new AgentBoundaryContractError("CONTEXT_MISMATCH", "control.target");
@@ -1716,7 +1733,10 @@ export class LocalWorkspaceHost {
     journal.receive({ requestId, digest, operation: isContinue ? "continue" : resume ? "resume" : "send" }, origin);
     let lease: WorkspaceSessionLease | undefined;
     let job: LocalJob | undefined;
+    let commandPreparation: AgentCommandRunPreparation | undefined;
+    let commandAccepted: ReturnType<WorkspaceAgentCommandControl["runForIntake"]> = undefined;
     try {
+      if (commandExecution && this.options.boundaryLifecycleControl) commandExecution.control.assertConversationStart(commandExecution.intake);
       if ([...this.jobs.values()].some(job => !job.closed && job.workspaceId === workspaceId && job.store.sessionId === store.sessionId)) throw new Error("Agent is still running or draining");
       lease = WorkspaceSessionLease.acquire(context.storage, store.sessionId);
       let value = store.read(); // lock BEFORE loading the resumable state
@@ -1777,7 +1797,7 @@ export class LocalWorkspaceHost {
         const createdTask = createTaskExecution(message, randomUUID());
         if (commandFacts?.command.operation.action === "task.dispatch") {
           const taskId = commandFacts.command.operation.taskId;
-          if (value.task?.id === taskId || value.pastTasks.some(row => row.task.id === taskId)) throw new AgentBoundaryContractError("COMMAND_ID_CONFLICT", "control.task");
+          if (!commandFacts.recovery && (value.task?.id === taskId || value.pastTasks.some(row => row.task.id === taskId))) throw new AgentBoundaryContractError("COMMAND_ID_CONFLICT", "control.task");
           createdTask.id = taskId;
         }
         task = context.resources.agents.bindTask(createdTask, agentId, agent.configRevision, agent.agentEpoch);
@@ -1832,16 +1852,22 @@ export class LocalWorkspaceHost {
         const q = startContext.initialQuestion; interaction.request(q.reason, q.question, q.options, q.intent ? { intent: q.intent } : {});
       }
       if (commandExecution) {
-        const prepared = commandExecution.control.prepareRun(commandExecution.intake, binding, lease, requestId);
-        const result = commandExecution.control.accept(commandExecution.intake, prepared);
+        commandPreparation = commandExecution.control.prepareRun(commandExecution.intake, binding, lease, requestId);
+        const result = commandExecution.control.accept(commandExecution.intake, commandPreparation);
         if (result.status === "rejected") throw new AgentBoundaryContractError(result.error!.code, "control.admission");
         const accepted = commandExecution.control.runForIntake(commandExecution.intake);
         if (!accepted || accepted.runId !== binding.runId) throw new AgentBoundaryContractError("COMMAND_ID_CONFLICT", "control.claim");
+        commandAccepted = accepted;
+        if (this.options.boundaryLifecycleControl) {
+          journal.settle(requestId, "accepted", { taskId: accepted.taskId, runId: accepted.runId });
+          commandExecution.control.assertPreparedStart(commandExecution.intake);
+        }
       }
       const modelHistoryStart = value.history.length;
       value.history.push({ role: "user", content: message }); value.task = task;
       value.attempt = { attemptId: lease.attemptId, fence: (value.attempt?.fence ?? 0) + 1, runId: binding.runId, state: "running", startedAt: new Date().toISOString(), endedAt: null };
-      value.requests.push({ requestId, digest, taskId: task.id, runId: binding.runId }); value = store.save(value.revision, value);
+      value.requests.push({ requestId, digest, taskId: task.id, runId: binding.runId }); value = store.save(value.revision, value,
+        commandFacts?.recovery ? commandExecution!.control.claimProjection(commandExecution!.intake) : undefined);
       journal.settle(requestId, "accepted", { taskId: task.id, runId: binding.runId });
       messageTiming.mark("T2");
       if (questionId) this.interactionFor(context, value)!.answer(questionId, new WorkspaceTreeBudget(context.storage, binding.lineage.rootRunId ?? binding.runId, binding.budget, binding.lineage.depth === 1).read().usage.modelCalls);
@@ -1973,6 +1999,30 @@ export class LocalWorkspaceHost {
       owned.promise = new Promise<void>(resolve => setImmediate(resolve)).then(() => this.run(owned)); this.changed(workspaceId, agentId);
       return { runId: owned.id, duplicate: false };
     } catch (error) {
+      if (commandExecution && this.options.boundaryLifecycleControl) {
+        const result = commandPreparation ? commandExecution.control.settlePreparationFailure(commandPreparation,
+          error instanceof AgentBoundaryContractError ? error.code : "AUTHORITY_UNVERIFIED") : { acceptance: "not_accepted" as const };
+        const accepted = "run" in result ? result.run : commandAccepted;
+        try {
+          if (accepted) journal.settle(requestId, "accepted", { taskId: accepted.taskId, runId: accepted.runId });
+          else if (result.acceptance === "not_accepted") journal.settle(requestId, "rejected", { reason: "admission_rejected" });
+          if (accepted && "execution" in result && result.execution && ["aborted_before_execution", "issued"].includes(result.execution.phase)) {
+            const retained = store.read(), neverIssued = result.execution.phase === "aborted_before_execution";
+            if (retained.task?.workspaceRunBinding?.runId === accepted.runId && retained.attempt && lease && retained.attempt.attemptId === lease.attemptId) {
+              retained.task = finishTaskExecution(retained.task, { status: "error", error: neverIssued
+                ? "未能开始执行；原记录已保留。" : "原操作结果尚未确认；请查看原记录，不要重复执行。" })!;
+              retained.attempt = { ...retained.attempt, state: neverIssued ? "blocked" : "draining", endedAt: neverIssued ? new Date().toISOString() : null }; store.save(retained.revision, retained);
+            }
+          }
+        } catch { /* C3 accepted/UNKNOWN remains authoritative; an incomplete projection never enables replay. */ }
+        if (job?.permit) {
+          job.controller.abort();
+          if (this.jobs.get(job.id) !== job) void (async () => { await job!.extensionAttempt?.close(); await closeWorkspaceRunPermit(job!.permit!); job!.commandControl?.observeDrained(workspaceRunDrainProof(job!.permit!)); })().catch(() => {});
+          // An already-registered job's own Promise/finally still owns its real drain.
+        } else if (result.acceptance === "not_accepted") { try { lease?.release(); } catch { /* Unknown owner is retained. */ } }
+        // Prepared terminal proof already closed its own lease; issued/unknown without a genuine closer stays held.
+        throw error;
+      }
       try { journal.settle(requestId, "rejected", { reason: error instanceof WorkspaceBudgetAdmissionError || error instanceof WorkspaceProviderAdmissionError ? error.reason : "admission_rejected" }); }
       finally { if (job?.permit) void (async () => { await job.extensionAttempt?.close(); await closeWorkspaceRunPermit(job.permit!); job.commandControl?.observeDrained(workspaceRunDrainProof(job.permit!)); })().catch(() => {}); else lease?.release(); }
       throw error;

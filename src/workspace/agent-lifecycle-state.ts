@@ -150,9 +150,11 @@ export function parseAgentLifecycleState(raw: unknown, control: AgentCommandStat
       if (owner.sessionId !== run.binding.sessionId || owner.attemptId !== run.leaseAttemptId) return fail();
     }
     if (row.acceptedReceipt !== null) {
-      const receipt = parseAgentBoundaryDocument(row.acceptedReceipt);
+      const receipt = parseAgentBoundaryDocument(row.acceptedReceipt), original = control.commands.find(row => row.command.commandId === run.commandId)!;
       if (receipt.kind !== "command-receipt" || receipt.status !== "accepted" || receipt.commandId !== run.commandId || receipt.agentId !== run.agentId
-        || receipt.rootRequestId !== run.rootRequestId || receipt.execution.effect !== "none") return fail();
+        || receipt.rootRequestId !== run.rootRequestId || receipt.execution.effect !== "none" || receipt.execution.drain !== "not_requested" || receipt.error !== null
+        || receipt.intentDigest !== original.command.intentDigest || canonical(receipt.context) !== canonical(original.command.context)
+        || receipt.control.epoch !== original.command.expected.controlEpoch || receipt.control.holdId !== null) return fail();
     }
     if (row.terminal !== null) {
       fields(row.terminal, ["proofRef", "issuerId", "reason", "lease"]);
@@ -165,6 +167,7 @@ export function parseAgentLifecycleState(raw: unknown, control: AgentCommandStat
         || canonical(lease(row.quiescence.lease)) !== canonical(row.lease) || row.phase !== "issued") return fail();
     }
     if (row.leaseReleased && !row.terminal && !row.quiescence && !(row.phase === "legacy_unknown" && run.state === "drained" && run.drainProofRef)) return fail();
+    if (row.phase !== "legacy_unknown" && row.claimRevision > 1 && row.recovery === null) return fail();
     if (row.recovery !== null) {
       fields(row.recovery, ["operationId", "requestDigest", "previousRunId", "proofDigest"]);
       if (!commandId(row.recovery.operationId) || !commandId(row.recovery.previousRunId) || !hash(row.recovery.requestDigest) || !hash(row.recovery.proofDigest)

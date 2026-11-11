@@ -1,3 +1,4 @@
+import { agentLifecycleClaimProjectionFacts, type AgentLifecycleClaimProjection } from "./agent-command-control.js";
 import type { NeutralMsg } from "../providers/types.js";
 import { isTaskExecution, type TaskExecution } from "../session/task.js";
 import { redactSensitiveValue } from "../security/secrets.js";
@@ -68,7 +69,7 @@ export function closedWorkspaceHistory(history: NeutralMsg[]): NeutralMsg[] {
 export class WorkspaceConversationStore {
   private readonly state: WorkspaceJsonState<WorkspaceConversation>;
   readonly sessionId: string;
-  constructor(storage: WorkspaceResourceStorage, readonly agentId: string, channelId?: string) {
+  constructor(private readonly storage: WorkspaceResourceStorage, readonly agentId: string, channelId?: string) {
     if (!isWorkspaceAgentId(agentId)) throw new Error("invalid scoped conversation Agent");
     this.sessionId = channelId ? channelSessionId(channelId, agentId) : agentId.slice(3);
     const binding = () => this.state.binding();
@@ -133,9 +134,17 @@ export class WorkspaceConversationStore {
     if (current.revision > 0 && canonical({ ...safe, revision: current.revision }) === canonical(current)) return current;
     return this.save(expectedRevision, value);
   }
-  save(expectedRevision: number, value: WorkspaceConversation): WorkspaceConversation {
+  save(expectedRevision: number, value: WorkspaceConversation, claimProjection?: AgentLifecycleClaimProjection): WorkspaceConversation {
     const safe = this.prepare(value);
     return this.state.update(expectedRevision, previous => {
+      const claim = claimProjection === undefined ? undefined : agentLifecycleClaimProjectionFacts(claimProjection);
+      if (claim && (claim.agentId !== value.agentId || claim.sessionId !== value.sessionId || claim.taskId !== value.task?.id
+        || claim.runId !== value.task?.workspaceRunBinding?.runId || claim.requestId !== value.requests.at(-1)?.requestId
+        || canonical(claim.scope) !== canonical(this.storage.scope) || !sameWorkspaceResourceBinding(claim.resourceBinding, this.state.binding())))
+        throw new Error("Lifecycle claim projection scope changed");
+      const newClaim = Boolean(claim && previous.task?.id === claim.taskId && previous.task.workspaceRunBinding?.runId === claim.previousRunId
+        && claim.runId !== claim.previousRunId && claim.claimRevision > 1);
+      if (newClaim && Object.values(previous.runUsage).some(value => value !== 0)) throw new Error("Never-issued claim contradicts recorded usage; retained");
       if (canonical(value.requests.slice(0, previous.requests.length)) !== canonical(previous.requests)
         || value.requests.length < previous.requests.length || value.requests.length > previous.requests.length + 1) throw new Error("Workspace request receipts cannot be rewritten");
       if (previous.attempt && value.attempt && value.attempt.fence < previous.attempt.fence) throw new Error("stale Workspace attempt fence");
@@ -144,9 +153,9 @@ export class WorkspaceConversationStore {
         && (!value.attempt || value.attempt.fence <= previous.attempt.fence)) throw new Error("new Workspace attempt requires a higher fence");
       for (const key of Object.keys(previous.usage) as (keyof WorkspaceUsage)[]) {
         if (value.usage[key] < previous.usage[key]) throw new Error("Workspace cumulative usage cannot decrease");
-        if (previous.task?.id === value.task?.id && value.runUsage[key] < previous.runUsage[key]) throw new Error("Workspace run budget cannot reset on resume");
+        if (!newClaim && previous.task?.id === value.task?.id && value.runUsage[key] < previous.runUsage[key]) throw new Error("Workspace run budget cannot reset on resume");
       }
-      if (previous.task && previous.task.id !== value.task?.id) {
+      if (previous.task && (previous.task.id !== value.task?.id || newClaim)) {
         if (value.pastTasks.length !== previous.pastTasks.length + 1
           || canonical(value.pastTasks.slice(0, -1)) !== canonical(previous.pastTasks)
           || canonical(value.pastTasks.at(-1)?.task) !== canonical(previous.task)

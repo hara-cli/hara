@@ -53,18 +53,21 @@ export function lifecycleFixture(t, input = {}) {
   const beforeLifecycleMigration = fs.readFileSync(file, "utf8");
   if (!input.noInitialize && !input.noLifecycleInitialize && input.lifecycleControl !== false) authority.initializeAgentLifecycle(transport);
   const draft = (operation, extras = {}) => authority.draft(transport, agent.agentId, { commandId: randomUUID(), rootRequestId: randomUUID(), lifetimeMs: 30000, operation, ...extras });
-  function dispatch(message = "write a private fixture", extras = {}) {
-    let task = resources.agents.bindTask(createTaskExecution(message, randomUUID()), agent.agentId, agent.configRevision, agent.agentEpoch);
-    const sessionId = randomUUID();
-    const command = draft({ action: "task.dispatch", taskId: task.id, conversationId: sessionId, messageDigest: agentCommandMessageDigest(sessionId, message) }, extras);
+  function dispatch(message = "write a private fixture", extras = {}, recoveryFrom) {
+    let task = resources.agents.bindTask(createTaskExecution(message, recoveryFrom?.task.id ?? randomUUID()), agent.agentId, agent.configRevision, agent.agentEpoch);
+    const sessionId = recoveryFrom?.binding.sessionId ?? (input.fixedSession ? agent.agentId.slice(3) : randomUUID());
+    const expectedClaimRevision = recoveryFrom ? control.inspect(transport, agent.agentId).runs.find(row => row.runId === recoveryFrom.binding.runId).claimRevision : 0;
+    const recoveryIntent = recoveryFrom ? control.draftRecovery(transport, agent.agentId, { operationId: extras.operationId ?? randomUUID(), previousRunId: recoveryFrom.binding.runId,
+      expectedClaimRevision: extras.expectedClaimRevision ?? expectedClaimRevision, commandId: extras.commandId ?? randomUUID(), rootRequestId: extras.rootRequestId ?? randomUUID(), message, lifetimeMs: extras.lifetimeMs ?? 30000 }) : null;
+    const command = recoveryIntent?.command ?? draft({ action: "task.dispatch", taskId: task.id, conversationId: sessionId, messageDigest: agentCommandMessageDigest(sessionId, message) }, extras);
     const binding = freezeWorkspaceRunBinding({ schemaVersion: 1, scope: row.scope, agent: task.workspaceAgentBinding, agentBindingHash: workspaceAgentBindingHash(task.workspaceAgentBinding),
       connection: connections.capture(), runtimeContract: "hara-governed-runtime-v1", project: root, sessionId, runId: randomUUID(), lineage: { rootRunId: null, parentRunId: null, depth: 0 },
       createdAt: new Date().toISOString(), host: { hostId: catalog.read().hostId, hostEpoch: 1, actorId: row.actorId, grantId: row.grantId, grantRevision: row.grantRevision, policyRevision: row.policyRevision },
       budget: { maxRounds: 12, maxToolCalls: 32, maxTokens: 32000, timeoutMs: 60000 } });
     task.workspaceRunBinding = binding;
     const lease = WorkspaceSessionLease.acquire(storage, sessionId); leases.push(lease);
-    const begun = control.begin(transport, command, { message }); assert.ok(begun.intake);
-    const prepared = control.prepareRun(begun.intake, binding, lease, randomUUID());
+    const begun = recoveryIntent ? control.beginRecovery(transport, recoveryIntent.recovery, command, { message }) : control.begin(transport, command, { message }); assert.ok(begun.intake);
+    const requestId = randomUUID(), prepared = control.prepareRun(begun.intake, binding, lease, requestId);
     const accept = () => control.accept(begun.intake, prepared);
     function runtime() {
       const abort = new AbortController(); let permit;
@@ -80,10 +83,10 @@ export function lifecycleFixture(t, input = {}) {
       return { permit, files, call: async (name, data, id = randomUUID()) => executeWorkspaceTool(permit, name,
         frozen => files.find(tool => tool.name === name).run(frozen, { cwd: project }), undefined, data, id) };
     }
-    return { task, command, binding, lease, intake: begun.intake, prepared, accept, runtime, message };
+    return { task, command, binding, lease, intake: begun.intake, prepared, accept, runtime, message, requestId, recovery: recoveryIntent?.recovery };
   }
   function apply(command, proposal) { const begun = control.begin(transport, command, { ...(proposal ? { proposal } : {}) }); return begun.receipt ?? control.accept(begun.intake); }
   t.after(async () => { try { for (const permit of permits) await closeWorkspaceRunPermit(permit); for (const lease of leases) lease.release(); authority.close(); transports.close(); } finally { fs.rmSync(base, { recursive: true, force: true }); } });
-  return { home, project, catalog, resources, storage, agent, row, connections, credential, transports, transport, authority, authorityOptions, control, draft, dispatch, apply,
+  return { home, project, catalog, resources, storage, agent, row, connections, credential, transports, transport, authority, authorityOptions, control, draft, dispatch, recover: (previous, message = "new explicit intent", options = {}) => dispatch(message, options, previous), apply,
     file, beforeMigration, beforeLifecycleMigration, duty, boundary, rights, trackLease(lease) { leases.push(lease); return lease; }, advance(ms) { clock += ms; }, snapshot: () => JSON.parse(fs.readFileSync(file, "utf8")) };
 }

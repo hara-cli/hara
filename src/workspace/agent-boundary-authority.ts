@@ -1,8 +1,8 @@
-import { assertAgentLifecycleCapacity, assertAgentLifecycleTransition, migrateAgentLifecycleState, parseAgentLifecycleState, type AgentLifecycleState } from "./agent-lifecycle-state.js";
+import { assertAgentLifecycleCapacity, assertAgentLifecycleTransition, migrateAgentLifecycleState, parseAgentLifecycleState, type AgentLifecycleState, type AgentLifecycleRun, type AgentLifecycleRecoveryV1 } from "./agent-lifecycle-state.js";
 import { assertNoWorkspaceLegacyEffects } from "./agent-command-protection.js";
 import { assertNoWorkspaceSessionLeases, withWorkspaceSessionAdmission } from "./session-lease.js";
 import type { WorkspaceRunBinding } from "./run-binding.js";
-import { assertAgentCommandTransition, agentCommandTargetEpoch, agentPolicyProposalDigest, commandDigest, emptyAgentCommandState, parseAgentCommandState, type AgentCommandState } from "./agent-command-state.js";
+import { assertAgentCommandTransition, agentCommandTargetEpoch, agentPolicyProposalDigest, commandDigest, emptyAgentCommandState, parseAgentCommandState, type AgentCommandState, type AgentCommandRun } from "./agent-command-state.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   AgentBoundaryContractError, agentBoundaryCommandSigningText, assertAgentBoundaryContext, parseAgentBoundaryDocument,
@@ -205,6 +205,7 @@ export class WorkspaceAgentBoundaryAuthority {
       else if (this.lifecycleStateSeen) { this.controlStorageFailed = true; return fail("AUTHORITY_UNVERIFIED", "lifecycle.migrationRecovery"); }
       let next: State;
       try {
+        if (state.schemaVersion === 3 && !this.options.lifecycleControl) return fail("AUTHORITY_UNVERIFIED", "lifecycle.bootstrap");
         next = change(state);
         if (next.lifecycle) {
           assertAgentLifecycleCapacity(next.lifecycle);
@@ -420,6 +421,17 @@ export class WorkspaceAgentBoundaryAuthority {
   }
   /** Trusted Host composition only, never an RPC-returned object. */
   lifecycleStorage(): WorkspaceResourceStorage { this.assertHostCurrent(); return this.options.storage; }
+  /** Narrow history ports remain closed until immutable segment verification is installed. */
+  lifecycleHistoricalRun(_lifecycle: AgentLifecycleState, _runId: string): { run: AgentCommandRun; execution: AgentLifecycleRun } {
+    return fail("AUTHORITY_UNVERIFIED", "lifecycle.historyUnavailable");
+  }
+  lifecycleHistoricalRecovery(_transport: AgentBoundaryTransport, _recovery: AgentLifecycleRecoveryV1, _command: AgentBoundaryCommand, _input: { message: string }): { receipt: import("./agent-boundaries-contract.js").AgentBoundaryReceipt } {
+    return fail("AUTHORITY_UNVERIFIED", "lifecycle.historyUnavailable");
+  }
+  lifecycleRights(transport: AgentBoundaryTransport, agentId: string): Readonly<AgentBoundaryRights> {
+    this.source(transport); const state = this.read(), policy = this.currentPolicy(agentId, state.policies.find(row => row.agentId === agentId));
+    return deepFreeze({ ...policy.rights });
+  }
   /** Current human management rights; independent of invoke/privateRead/nodeUse. */
   assertLifecycleManager(transport: AgentBoundaryTransport, agentId: string): void {
     this.source(transport); const state = this.read(), policy = this.currentPolicy(agentId, state.policies.find(row => row.agentId === agentId));
