@@ -2908,7 +2908,7 @@ async function runAgentInner(
         return { status: "completed" };
       };
       return opts.workspaceRun
-        ? executeWorkspaceTool(opts.workspaceRun, "ask_user", retainQuestion, result => result.status === "error")
+        ? executeWorkspaceTool(opts.workspaceRun, "ask_user", retainQuestion, result => result.status === "error", pendingAsk.input, pendingAsk.id)
         : retainQuestion();
     }
     const finalizeStoppedToolRound = (): RunOutcome => {
@@ -3686,8 +3686,8 @@ async function runAgentInner(
         if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return;
         const asyncAsk = opts.workspaceRun && p.tool === askUserTool && isAsyncWorkspaceAsk(p.tu.input) && !askUserRequestsCredential(p.tu.input);
         const physicalTool = opts.workspaceRun
-          ? executeWorkspaceTool(opts.workspaceRun, p.tool!.name, asyncAsk ? async () => postAsyncWorkspaceAsk(opts.workspaceRun!, p.tu.input)
-            : () => p.tool!.run(p.tu.input, executionToolCtx), () => structuredToolError, p.tu.input)
+          ? executeWorkspaceTool(opts.workspaceRun, p.tool!.name, asyncAsk ? async input => postAsyncWorkspaceAsk(opts.workspaceRun!, input)
+            : input => p.tool!.run(input, executionToolCtx), () => structuredToolError, p.tu.input, p.tu.id)
           : p.tool!.run(p.tu.input, executionToolCtx);
         const observedTool = physicalTool.then(
           (value) => { settled = { ok: true, value }; return value; },

@@ -287,7 +287,7 @@ export class LocalWorkspaceHost {
     const agent = context.resources.agents.get(agentId), home = context.homes.view(agentId);
     if (!agent || agent.state !== "active" || !home.created || !home.available) return [];
     const identity = captureWorkspaceProjectIdentity(home.path), binding = context.storage.run(() => currentWorkspaceResourceBinding()!);
-    return [{ resourceId: `project_${agentId}`, agentId, revision: agent.agentEpoch, binding,
+    return [{ resourceId: `project_${agentId}`, agentId, revision: agent.agentEpoch, binding, project: identity,
       access: ["read", "write", "execute"], assertCurrent: () => {
         context.storage.run(() => {
           const current = context.resources.agents.get(agentId), currentHome = context.homes.view(agentId);

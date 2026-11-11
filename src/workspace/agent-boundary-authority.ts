@@ -18,6 +18,8 @@ export interface AgentBoundaryRights { manage: boolean; invoke: boolean; private
 export interface AgentBoundaryResource {
   resourceId: string; agentId: string; revision: number; binding: WorkspaceResourceBinding;
   access: readonly ("read" | "write" | "execute")[]; assertCurrent(): void;
+  /** Optional physical root from the SAME trusted registry entry; absence cannot grant file IO. */
+  project?: Readonly<{ root: string; dev: string | number; ino: string | number }>;
 }
 export interface AgentBoundaryTool {
   toolId: string; connectorId: string | null; catalogRevision: number; assertCurrent(): void;
@@ -35,6 +37,10 @@ interface State { schemaVersion: 1; revision: number; resourceBinding: Workspace
 declare const grantBrand: unique symbol;
 /** C1 intent authority only. It is neither a runtime ExecutionPermit nor a C3 receipt. */
 export interface AgentCommandGrant { readonly [grantBrand]: true }
+declare const executionPolicyBrand: unique symbol;
+/** Current C1 policy only, after authenticated command admission. Still NOT a C2/C3 execution permit. */
+export interface AgentExecutionPolicy { readonly [executionPolicyBrand]: true }
+interface ExecutionPolicyState { command: AgentBoundaryCommand; policyRevision: number; live: boolean }
 interface GrantState { transport: AgentBoundaryTransport; command: AgentBoundaryCommand; policyRevision: number; live: boolean }
 const fail = (code: AgentBoundaryErrorCode, field = "authority"): never => { throw new AgentBoundaryContractError(code, field); };
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/;
@@ -67,6 +73,7 @@ function nextRevision(previous: AgentDutyProfile | AgentExecutionBoundary | unde
 export class WorkspaceAgentBoundaryAuthority {
   private readonly state: WorkspaceJsonState<State>;
   private readonly grants = new WeakMap<object, GrantState>();
+  private readonly executionPolicies = new WeakMap<object, ExecutionPolicyState>();
   private readonly parent: { hostId: string; hostEpoch: number; row: string; context: AgentBoundaryContext };
   private closed = false;
   private readonly now: () => number;
@@ -295,6 +302,43 @@ export class WorkspaceAgentBoundaryAuthority {
     if (policy.revision !== grant.policyRevision) return fail("STALE_REVISION", "authority.commandGrant");
     return deepFreeze({ command, duty: policy.duty, boundary: policy.boundary, rights: policy.rights,
       policyRevision: policy.revision, executionPermit: false, controlVerified: false });
+  }
+  /** Command expiry/connection liveness governs admission, not the lifetime of accepted work.
+   * C2 must ALSO hold the existing RunPermit and a live C3 accepted-command/control lease. This
+   * policy handle merely pins current C1 authority; it cannot dispatch or release any effect. */
+  captureExecutionPolicy(handle: AgentCommandGrant): AgentExecutionPolicy {
+    const facts = this.grantFacts(handle);
+    if (facts.command.operation.action !== "task.dispatch") return fail("AUTHORIZATION_DENIED");
+    const policy = Object.freeze({}) as AgentExecutionPolicy;
+    this.executionPolicies.set(policy, { command: facts.command, policyRevision: facts.policyRevision, live: true });
+    return policy;
+  }
+  executionPolicyFacts(handle: unknown) {
+    const captured = handle && typeof handle === "object" ? this.executionPolicies.get(handle) : undefined;
+    if (!captured?.live) return fail("AUTHORITY_UNVERIFIED", "authority.executionPolicy");
+    this.assertHostCurrent(); assertAgentBoundaryContext(captured.command, this.parent.context);
+    const state = this.read(), policy = this.currentPolicy(captured.command.agentId, state.policies.find(row => row.agentId === captured.command.agentId));
+    if (captured.policyRevision !== policy.revision) return fail("STALE_REVISION", "authority.executionPolicy");
+    this.permission(policy, "task.dispatch");
+    return deepFreeze({ command: captured.command, duty: policy.duty, boundary: policy.boundary, rights: policy.rights,
+      policyRevision: policy.revision, executionPermit: false, controlVerified: false });
+  }
+  retireExecutionPolicy(handle: unknown): void {
+    const policy = handle && typeof handle === "object" ? this.executionPolicies.get(handle) : undefined;
+    if (policy) policy.live = false;
+  }
+  /** C2 consumes the original registry attestations, never a second caller-provided path map. */
+  executionResources(handle: unknown): readonly AgentBoundaryResource[] {
+    const facts = handle && typeof handle === "object" && this.executionPolicies.has(handle)
+      ? this.executionPolicyFacts(handle) : this.grantFacts(handle);
+    if (facts.command.operation.action !== "task.dispatch") return fail("AUTHORIZATION_DENIED");
+    const available = this.options.resourcesForAgent?.(facts.command.agentId) ?? [];
+    return Object.freeze(facts.boundary.resources.map(ref => {
+      const resource = available.find(item => item.resourceId === ref.resourceId);
+      if (!resource || resource.assertCurrent() !== undefined) return fail("AUTHORITY_UNVERIFIED", "authority.resource");
+      return Object.freeze({ ...resource, access: Object.freeze([...resource.access]),
+        ...(resource.project ? { project: Object.freeze({ ...resource.project }) } : {}) });
+    }));
   }
   retire(handle: unknown): void { const grant = handle && typeof handle === "object" ? this.grants.get(handle) : undefined; if (grant) grant.live = false; }
   check(transport: AgentBoundaryTransport, raw: unknown) {

@@ -1,3 +1,4 @@
+import { AgentBoundaryContractError } from "../workspace/agent-boundaries-contract.js";
 import type { NativeWorkspaceEvidence } from "../agent-runtime/execution-policy.js";
 import { createHash } from "node:crypto";
 import type { TaskExecution } from "../session/task.js";
@@ -28,7 +29,11 @@ export interface CompletionObservation {
   receipt?: string;
 }
 
-export interface CompletionEvidenceSnapshot { schemaVersion: 1; observations: CompletionObservation[] }
+/** Protected dispatch facts share the existing run-bound journal. No arguments or raw results. */
+export interface CompletionEffectReceipt {
+  key: string; operationDigest: string; state: "accepted" | "completed" | "unknown";
+}
+export interface CompletionEvidenceSnapshot { schemaVersion: 1; observations: CompletionObservation[]; effects?: CompletionEffectReceipt[]; agentBoundaryAuthority?: string }
 /** Host-private storage only; never accept this snapshot from model history, RPC or a runtime. */
 export function parseCompletionEvidenceSnapshot(value: unknown): CompletionEvidenceSnapshot {
   const plain = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v)
@@ -36,7 +41,7 @@ export function parseCompletionEvidenceSnapshot(value: unknown): CompletionEvide
   const exact = (v: Record<string, unknown>, keys: string[]) => Object.keys(v).length === keys.length && keys.every(k => Object.hasOwn(v, k));
   const hash = (v: unknown) => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
   const invalid = (): never => { throw new Error("Invalid private completion provenance; state was preserved"); };
-  if (!plain(value) || !exact(value, ["schemaVersion", "observations"]) || value.schemaVersion !== 1
+  if (!plain(value) || !exact(value, ["schemaVersion", "observations", ...(Object.hasOwn(value, "effects") ? ["effects"] : []), ...(Object.hasOwn(value, "agentBoundaryAuthority") ? ["agentBoundaryAuthority"] : [])]) || value.schemaVersion !== 1
     || !Array.isArray(value.observations) || value.observations.length > MAX_OBSERVATIONS) return invalid();
   const observations = value.observations.map((row): CompletionObservation => {
     if (!plain(row) || !exact(row, ["key", "scope", "eligible", "ambiguous", "mutating", ...(Object.hasOwn(row, "receipt") ? ["receipt"] : [])])
@@ -45,7 +50,19 @@ export function parseCompletionEvidenceSnapshot(value: unknown): CompletionEvide
     return structuredClone(row) as unknown as CompletionObservation;
   });
   if (new Set(observations.map(row => row.key)).size !== observations.length) return invalid();
-  return { schemaVersion: 1, observations };
+  let effects: CompletionEffectReceipt[] | undefined;
+  if (Object.hasOwn(value, "effects")) {
+    if (!Array.isArray(value.effects) || value.effects.length > MAX_OBSERVATIONS) return invalid();
+    effects = value.effects.map(row => {
+      if (!plain(row) || !exact(row, ["key", "operationDigest", "state"]) || !hash(row.key) || !hash(row.operationDigest)
+        || !["accepted", "completed", "unknown"].includes(String(row.state))) return invalid();
+      return structuredClone(row) as unknown as CompletionEffectReceipt;
+    });
+    if (new Set(effects.map(row => row.key)).size !== effects.length) return invalid();
+  }
+  if (Object.hasOwn(value, "agentBoundaryAuthority") && !hash(value.agentBoundaryAuthority)) return invalid();
+  return { schemaVersion: 1, observations, ...(effects ? { effects } : {}),
+    ...(typeof value.agentBoundaryAuthority === "string" ? { agentBoundaryAuthority: value.agentBoundaryAuthority } : {}) };
 }
 
 /** Bounded dispatch provenance, not a semantic/business-success oracle. No arguments, raw results or
@@ -58,12 +75,59 @@ export class CompletionEvidenceLedger {
   }
   private readonly observations = new Map<string, CompletionObservation>();
   private readonly fresh = new Set<string>();
+  private readonly effects = new Map<string, CompletionEffectReceipt>();
+  private readonly effectClaims = new WeakMap<object, string>();
+  private agentBoundaryAuthority?: string;
   constructor(private readonly journal?: { restored: unknown; persist(value: CompletionEvidenceSnapshot): void;
     recovery?: { previousScope: string; currentScope: string } }) {
-    if (journal) for (const row of parseCompletionEvidenceSnapshot(journal.restored).observations) this.observations.set(row.key, row);
+    if (journal) {
+      const restored = parseCompletionEvidenceSnapshot(journal.restored);
+      for (const row of restored.observations) this.observations.set(row.key, row);
+      for (const row of restored.effects ?? []) this.effects.set(row.key, row);
+      this.agentBoundaryAuthority = restored.agentBoundaryAuthority;
+    }
   }
   private persist(): void {
-    this.journal?.persist({ schemaVersion: 1, observations: [...this.observations.values()].map(row => structuredClone(row)) });
+    this.journal?.persist({ schemaVersion: 1, observations: [...this.observations.values()].map(row => structuredClone(row)),
+      ...(this.effects.size ? { effects: [...this.effects.values()].map(row => structuredClone(row)) } : {}),
+      ...(this.agentBoundaryAuthority ? { agentBoundaryAuthority: this.agentBoundaryAuthority } : {}) });
+  }
+
+  get requiresAgentBoundary(): boolean { return this.agentBoundaryAuthority !== undefined; }
+  /** One-way private admission pin. Removing a runtime option cannot resume this run as legacy. */
+  bindAgentBoundary(authorityDigest: string): void {
+    if (!this.journal || !/^[a-f0-9]{64}$/.test(authorityDigest)) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "execution.authority");
+    if (this.agentBoundaryAuthority && this.agentBoundaryAuthority !== authorityDigest) throw new AgentBoundaryContractError("CONTEXT_MISMATCH", "execution.authority");
+    this.agentBoundaryAuthority = authorityDigest; this.persist();
+  }
+
+  /** C2 only: durable acceptance precedes physical dispatch. IDs are unique for the WHOLE run,
+   * independent of a mutable intake/turn scope. A crash, thrown call or lost settlement is not replayable.
+   * The same unknown operation under a new ID is refused too; changing an ID is not recovery. */
+  claimEffect(id: string, operationDigest: string, maxEffects: number): object {
+    const fail = (code: "INVALID_DOCUMENT" | "COMMAND_ID_CONFLICT" | "EFFECT_OUTCOME_UNKNOWN" | "AUTHORIZATION_DENIED"): never => {
+      throw new AgentBoundaryContractError(code, "execution.effect");
+    };
+    if (typeof id !== "string" || !id || id.length > 240 || /[\u0000-\u001f\u007f]/u.test(id) || typeof operationDigest !== "string" || !/^[a-f0-9]{64}$/.test(operationDigest)
+      || !Number.isSafeInteger(maxEffects) || maxEffects < 0 || !this.journal) return fail("INVALID_DOCUMENT");
+    const key = digest(JSON.stringify(["c2-effect-v1", id])), previous = this.effects.get(key);
+    if (previous) return fail(previous.operationDigest !== operationDigest || previous.state === "completed"
+      ? "COMMAND_ID_CONFLICT" : "EFFECT_OUTCOME_UNKNOWN");
+    if ([...this.effects.values()].some(row => row.operationDigest === operationDigest && row.state !== "completed")) return fail("EFFECT_OUTCOME_UNKNOWN");
+    if (this.effects.size >= Math.min(MAX_OBSERVATIONS, maxEffects)) return fail("AUTHORIZATION_DENIED");
+    const row: CompletionEffectReceipt = { key, operationDigest, state: "accepted" };
+    this.effects.set(key, row);
+    try { this.persist(); } catch (error) { row.state = "unknown"; throw error; }
+    const claim = Object.freeze({}); this.effectClaims.set(claim, key); return claim;
+  }
+  settleEffect(claim: object, completed: boolean): void {
+    const key = this.effectClaims.get(claim), row = key ? this.effects.get(key) : undefined;
+    if (!row || row.state !== "accepted") throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "execution.effect");
+    this.effectClaims.delete(claim); row.state = completed ? "completed" : "unknown";
+    try { this.persist(); } catch (error) { row.state = "unknown"; throw error; }
+  }
+  effectReceipts(): readonly Readonly<CompletionEffectReceipt>[] {
+    return Object.freeze([...this.effects.values()].map(row => Object.freeze({ ...row })));
   }
 
   begin(scope: string | undefined, id: string, name: string, effect: ToolEffect | undefined): CompletionObservation | undefined {

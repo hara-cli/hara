@@ -1,3 +1,4 @@
+import { bindAgentBoundaryExecution, type AgentBoundaryExecutionGate } from "./agent-boundary-execution.js";
 import { WorkspaceNativeSessions, resettableNativeRuntime } from "./native-session-boundary.js";
 import { runtimeToolTargetLabel } from "./runtime-tool-label.js";
 import type { MessageTimingPoint, MessageTimingRecorder } from "./message-timing.js";
@@ -33,6 +34,7 @@ import type { WorkspaceUserInteraction, WorkspaceUserQuestion } from "./user-int
 
 export interface WorkspaceRunPermit { readonly binding: Readonly<WorkspaceRunBinding> }
 interface PermitState {
+  boundaryExecution?: ReturnType<typeof bindAgentBoundaryExecution>;
   resetRoundClock?: () => void;
   completionEvidence: CompletionEvidenceLedger;
   storage: WorkspaceResourceStorage;
@@ -119,6 +121,8 @@ export function workspaceRunManagedProjectRoots(permit: WorkspaceRunPermit): Rea
 
 export function createWorkspaceRunPermit(input: {
   binding: WorkspaceRunBinding;
+  /** C2 trusted Host composition only. Missing retains the released legacy lane; null/JSON denies. */
+  agentBoundary?: AgentBoundaryExecutionGate;
   catalog: LocalWorkspaceCatalog;
   resources: WorkspaceResources;
   storage: WorkspaceResourceStorage;
@@ -171,6 +175,7 @@ export function createWorkspaceRunPermit(input: {
   const assertLive = (): void => {
     if (state?.retired || input.signal.aborted || (binding.budget.mode !== "interactive" && Date.now() - started >= binding.budget.timeoutMs)) throw new Error("Workspace attempt cancelled or expired");
     input.lease.assertCurrent();
+    state?.boundaryExecution?.assertCurrent();
     if (legacyIdentity) {
       const currentLegacy = lstatSync(legacyRoot, { bigint: true });
       if (!currentLegacy.isDirectory() || currentLegacy.isSymbolicLink() || realpathSync.native(legacyRoot) !== legacyRoot
@@ -205,6 +210,7 @@ export function createWorkspaceRunPermit(input: {
       assertLive();
       if (!state.started) throw new Error("Workspace model requires the governed entry");
       if (signal?.aborted) throw new Error("Workspace model preparation cancelled");
+      state.boundaryExecution?.beforeModel(state.usage.modelCalls);
       if (state.runtimeModel) return undefined; // Native CLI owns its model transport; never prepare another provider route.
       const result = await track(state, Promise.resolve().then(() => { assertLive(); return input.provider.prepareTurn?.(history, signal); }));
       assertLive(); return result;
@@ -216,6 +222,7 @@ export function createWorkspaceRunPermit(input: {
         || state.usage.inputTokens + state.usage.outputTokens >= binding.budget.maxTokens))) throw new Error("Workspace model budget exhausted or cancelled");
       if (state.interaction?.check(state.interactionUsage?.() ?? state.usage, Date.now() - started)) throw new Error("Workspace is waiting for user input; model not dispatched");
       state.resetRoundClock?.();
+      state.boundaryExecution?.beforeModel(state.usage.modelCalls);
       publishUsage(state, { modelCalls: 1 });
       const auditIndex = state.audit.start("model", state.usage.modelCalls, "provider"), callStarted = performance.now();
       const endStage = runtimeStageObserve(state, () => state.runtimeStages?.beginEvent("model_roundtrip", { call: state.usage.modelCalls }));
@@ -283,6 +290,8 @@ export function createWorkspaceRunPermit(input: {
     ...(input.modelHistory ? { modelHistory: { ...input.modelHistory,
       prefixDigest: createHash("sha256").update(canonical(input.modelHistory.history.slice(0, input.modelHistory.start))).digest("hex") } } : {}) };
   for (const value of Object.values(state.usage)) if (!Number.isSafeInteger(value) || value < 0) throw new Error("invalid Workspace persisted usage");
+  if (Object.hasOwn(input, "agentBoundary")) state.boundaryExecution = bindAgentBoundaryExecution(input.agentBoundary, binding, state.completionEvidence);
+  else if (state.completionEvidence.requiresAgentBoundary) throw new Error("Workspace run requires its original C2 authority; no legacy fallback was started");
   permits.set(permit, state);
   assertLive();
   return permit;
@@ -297,6 +306,7 @@ export function bindWorkspaceRunOptions(permit: WorkspaceRunPermit, input: Omit<
     || input.guardian || input.fallback || input.hooks !== false || input.pendingInput || input.skillPolicies?.length
     || input.autoApprove || input.projectApprovals || input.taskApprovals || input.organizationPolicyVersion !== undefined
     || input.signal !== state.signal || !input.taskIntake) throw new Error("Workspace run contains unscoped dependencies");
+  state.boundaryExecution?.assertTools(input.extraTools ?? []);
   const extraTools = input.extraTools?.map(tool => {
     if (!state.tools.has(tool.name) || ["task_intake", "task_checkpoint", "todo_write"].includes(tool.name)
       || (tool.kind === "exec" || tool.kind === "computer") && !isWorkspaceExtensionTool(tool)) throw new Error("unscoped Workspace extra tool");
@@ -340,6 +350,7 @@ export function attachWorkspaceRuntimeModel(permit: WorkspaceRunPermit, options:
   if ((!["codex", "claude", "gemini", "kimi"].includes(runtimeId)) || state.started || state.runtimeModel || typeof execute !== "function") {
     throw new Error("Workspace Runtime model transport is unavailable or already attached");
   }
+  state.boundaryExecution?.assertNativeUnavailable();
   state.runtimeModel = execute;
 }
 export function beginWorkspaceGovernedRun(permit: WorkspaceRunPermit, options: RunOpts, runtimeId: string): void {
@@ -470,7 +481,7 @@ export function workspaceRunAsyncAnswers(permit: WorkspaceRunPermit): NeutralMsg
 export function workspaceRunBeginToolBatch(permit: WorkspaceRunPermit, names: readonly string[]): void {
   stateOf(permit).interaction?.beginBatch(names);
 }
-export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string, execute: () => Promise<T>, toolFailed?: (result: T) => boolean, toolInput?: unknown): Promise<T> {
+export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string, execute: (input?: unknown) => Promise<T>, toolFailed?: (result: T) => boolean, toolInput?: unknown, toolCallId?: string): Promise<T> {
   const state = stateOf(permit); state.assertLive();
   // Serialize the governed dispatch boundary, including read lookups. A third queued search or a
   // sibling write cannot run past the second result that required a real user's answer.
@@ -485,7 +496,10 @@ export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string
     const endStage = runtimeStageObserve(state, () => state.runtimeStages?.beginEvent("tool_call", { call: state.usage.toolCalls, toolName: name, ...(targetLabel ? { targetLabel } : {}) }));
     let outcome: "completed" | "error" | "cancelled" = "error", errorKind: WorkspaceExecutionError = "thrown";
     try {
-      state.assertLive(); const result = await execute();
+      state.assertLive();
+      const result = state.boundaryExecution
+        ? await state.boundaryExecution.runTool(name, toolInput, toolCallId, input => execute(input), toolFailed)
+        : await execute(toolInput);
       const failed = Boolean(toolFailed?.(result) || (typeof result === "string" && /^Error:/i.test(result)));
       state.interaction?.observe(name, result, failed);
       outcome = failed ? "error" : "completed"; errorKind = failed ? "tool_error" : null; return result;
@@ -511,6 +525,7 @@ export async function closeWorkspaceRunPermit(permit: WorkspaceRunPermit): Promi
     await endWorkspaceNativePolicy(permit, policy, { keepResidentRoot: false }); await policy.close();
     state.lease.setDraining(false);
   }
+  state.boundaryExecution?.close();
   state.lease.release();
 }
 
