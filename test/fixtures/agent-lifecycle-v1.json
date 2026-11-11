@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "scope": "Host-private C4; C0 canonical fixture unchanged",
+  "empty": {
+    "schemaVersion": 1,
+    "migration": {
+      "fromSchema": 2,
+      "sourceDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "at": "2026-11-12T00:00:00.000Z"
+    },
+    "executions": [],
+    "operations": [],
+    "segments": [],
+    "retiredCommands": [],
+    "retiredRuns": []
+  },
+  "recovery": {
+    "schemaVersion": 1,
+    "kind": "agent-lifecycle-recovery",
+    "operationId": "recovery_1",
+    "agentId": "agent_1",
+    "taskId": "task_1",
+    "previousRunId": "run_1",
+    "expectedClaimRevision": 1,
+    "proofDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "commandId": "command_2",
+    "rootRequestId": "root_2"
+  },
+  "invalidRecoveryPatches": [
+    {
+      "schemaVersion": 2
+    },
+    {
+      "expectedClaimRevision": 0
+    },
+    {
+      "expectedClaimRevision": 9007199254740992
+    },
+    {
+      "proofDigest": "approved"
+    },
+    {
+      "kind": "command"
+    },
+    {
+      "operationId": ""
+    }
+  ]
+}
