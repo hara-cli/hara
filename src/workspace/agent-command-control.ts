@@ -287,7 +287,8 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
           const targetRunIds = op.action === "task.stop" ? targetRun ? [targetRun.runId] : [] : state.runs.filter(run => run.agentId === command.agentId).map(run => run.runId);
           lifecycle.operations.push({ commandId: command.commandId, agentId: command.agentId, action: op.action as AgentLifecycleOperation["action"],
             epoch: newEpoch, holdId: holdId!, targetRunIds, notifiedRunIds: [], revokedRunIds: [],
-            schedules: op.action === "task.stop" ? "none" : "pending", archive: op.action === "agent.dismiss" ? "pending" : "not_requested", archivedResource: null });
+            schedules: op.action === "task.stop" ? "none" : "pending", archive: op.action === "agent.dismiss" ? "pending" : "not_requested",
+            archiveExpected: op.action === "agent.dismiss" ? facts.agentResource : null, archivedResource: null });
         }
         assertAgentCommandCapacity(state, !code && drain);
         return { control: state, applyPolicy, ...(lifecycle ? { lifecycle } : {}) };
@@ -550,6 +551,11 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
   }
   /** Trusted local owner observer. It reads persisted targets; no caller supplies an allow decision. */
   lifecycleOperations() { return this.authority.commandControlState().lifecycle?.operations ?? []; }
+  reconcileLifecycleOperation(commandId: string) {
+    const operation = this.authority.reconcileLifecycleOperation(commandId);
+    for (const id of operation.revokedRunIds) { const run = this.live.get(id); if (run) this.authority.retire(run.grant); }
+    return operation;
+  }
   /** Explicit publication/physical closure of positive persisted evidence; never creates work. */
   reconcileLifecycleLease(transport: Intake["transport"], runId: string) {
     const retained = this.pendingQuiescenceProofs.get(runId); if (retained) this.observeQuiescence(retained);
@@ -562,6 +568,7 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
       if (row.quiescence) { run.state = "drained"; run.drainProofRef = row.quiescence.drainProofRef; if (run.effect !== "none") run.effect = "unknown"; }
       return state;
     });
+    const live = this.live.get(runId); if (live) this.authority.retire(live.grant);
     this.live.delete(runId); return this.authority.commandControlState();
   }
   private authorityStorage() { return this.authority.lifecycleStorage(); }
@@ -599,6 +606,7 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
       assertAgentCommandCapacity(state, true); return state;
     });
     } catch (error) { this.available = false; throw error; }
+    this.authority.retire(live.grant);
     this.pendingDrainProofs.delete(facts.binding.runId);
     this.live.delete(facts.binding.runId);
   }

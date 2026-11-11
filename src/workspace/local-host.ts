@@ -415,11 +415,14 @@ export class LocalWorkspaceHost {
     for (const [workspaceId, context] of this.contexts) {
       const control = context.commandControl; if (!control) continue;
       try {
-        for (const operation of control.lifecycleOperations()) for (const runId of operation.targetRunIds) {
-          const job = this.jobs.get(runId);
-          if (!job || job.closed || job.workspaceId !== workspaceId || job.agentId !== operation.agentId || !job.permit || job.commandControl !== control) continue;
-          this.cancelOwnedJob(job);
-          if (!operation.notifiedRunIds.includes(runId)) control.observeLifecycleNotification(operation.commandId, runId, job.permit);
+        for (const operation of control.lifecycleOperations()) {
+          for (const runId of operation.targetRunIds) {
+            const job = this.jobs.get(runId);
+            if (!job || job.closed || job.workspaceId !== workspaceId || job.agentId !== operation.agentId || !job.permit || job.commandControl !== control) continue;
+            this.cancelOwnedJob(job);
+            if (!operation.notifiedRunIds.includes(runId)) control.observeLifecycleNotification(operation.commandId, runId, job.permit);
+          }
+          try { control.reconcileLifecycleOperation(operation.commandId); } catch { /* Keep the exact pending phase; no rollback or business restart. */ }
         }
       } catch { /* Unconfirmed state remains held. C2 independently re-reads its synchronous gate. */ }
     }
@@ -995,7 +998,7 @@ export class LocalWorkspaceHost {
   }
   saveSchedule(workspaceId: string, input: unknown, expected: number, approved: boolean) {
     if (!approved || !plain(input) || typeof input.agentId !== "string" || this.context(workspaceId).resources.agents.get(input.agentId)?.state !== "active") throw new Error("Scheduled task requires a confirmed active same-Workspace colleague");
-    if (this.lifecycleChanges.has(JSON.stringify([workspaceId, input.agentId]))) throw new Error("Colleague lifecycle is changing; scheduled tasks stay paused");
+    this.assertAgentLifecycleWritable(workspaceId, input.agentId);
     this.context(workspaceId).features.saveSchedule(input, expected); this.changed(workspaceId); return this.workspaceFeatures(workspaceId);
   }
   deleteSchedule(workspaceId: string, id: string, expected: number, approved: boolean) {
@@ -1085,6 +1088,7 @@ export class LocalWorkspaceHost {
     this.changed(workspaceId, agentId); return agent;
   }
   private assertAgentLifecycleWritable(workspaceId: string, agentId: string) {
+    if (this.agentCommandProtectionActive(workspaceId)) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "control.commandRequired");
     if (this.lifecycleChanges.has(JSON.stringify([workspaceId, agentId]))) throw new Error("Colleague lifecycle is changing; wait for task cleanup before editing");
   }
   private assertAgentConfigurationWritable(workspaceId: string, agentId: string) {
@@ -2140,7 +2144,10 @@ export class LocalWorkspaceHost {
     } finally { lease.release(); }
   }
   private cancelOwnedJob(job: LocalJob): void {
-    job.controller.abort(); job.value.attempt = { ...job.value.attempt!, state: "draining" }; this.commit(job);
+    job.controller.abort();
+    for (const pending of [...this.pending.values()]) if (pending.job === job) pending.finish({ approved: false, state: "aborted" });
+    this.closeRunInteractions(job);
+    if (job.value.attempt?.state !== "draining") { job.value.attempt = { ...job.value.attempt!, state: "draining" }; this.commit(job); }
   }
   cancel(workspaceId: string, agentId: string, runId: string): void {
     if (this.options.boundaryCommandControl || this.agentCommandProtectionActive(workspaceId)) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "control.commandRequired");

@@ -28,7 +28,9 @@ export function lifecycleFixture(t, input = {}) {
   const base = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-c3-control-"))), home = join(base, "home"), project = join(base, "project");
   fs.mkdirSync(home, { mode: 0o700 }); fs.mkdirSync(project, { mode: 0o700 });
   const catalog = new LocalWorkspaceCatalog(home), row = catalog.create("Personal", catalog.read().revision), resources = new WorkspaceResources(home, row.scope);
-  resources.initialize(); let agent = resources.agents.initializeMain(); agent = resources.agents.setPermissionTier(agent.agentId, "controlled", agent.configRevision, agent.agentEpoch);
+  resources.initialize(); let agent = resources.agents.initializeMain();
+  if (input.colleague) agent = resources.agents.create({ username: "lifecycle_fixture", profile: { displayName: "Lifecycle Fixture" }, runtimeId: "pi", permissionTier: "controlled" }, resources.agents.list().revision);
+  else agent = resources.agents.setPermissionTier(agent.agentId, "controlled", agent.configRevision, agent.agentEpoch);
   const storage = new WorkspaceResourceStorage(home, row.scope); storage.initialize(); const connections = new WorkspaceConnectionStoreV2(storage);
   connections.add({ label: "fixture", provider: "openai", baseURL: "http://127.0.0.1:1/v1", apiKey: "synthetic-not-real", defaultModel: "synthetic" }, 0);
   const credential = randomBytes(32).toString("hex"), transports = new AgentBoundaryTransports(credential), transport = transports.connect("owner", credential);
@@ -54,7 +56,8 @@ export function lifecycleFixture(t, input = {}) {
   if (!input.noInitialize && !input.noLifecycleInitialize && input.lifecycleControl !== false) authority.initializeAgentLifecycle(transport);
   const draft = (operation, extras = {}) => authority.draft(transport, agent.agentId, { commandId: randomUUID(), rootRequestId: randomUUID(), lifetimeMs: 30000, operation, ...extras });
   function dispatch(message = "write a private fixture", extras = {}, recoveryFrom) {
-    let task = resources.agents.bindTask(createTaskExecution(message, recoveryFrom?.task.id ?? randomUUID()), agent.agentId, agent.configRevision, agent.agentEpoch);
+    const unbound = createTaskExecution(message, randomUUID()); if (recoveryFrom) unbound.id = recoveryFrom.task.id;
+    let task = resources.agents.bindTask(unbound, agent.agentId, agent.configRevision, agent.agentEpoch);
     const sessionId = recoveryFrom?.binding.sessionId ?? (input.fixedSession ? agent.agentId.slice(3) : randomUUID());
     const expectedClaimRevision = recoveryFrom ? control.inspect(transport, agent.agentId).runs.find(row => row.runId === recoveryFrom.binding.runId).claimRevision : 0;
     const recoveryIntent = recoveryFrom ? control.draftRecovery(transport, agent.agentId, { operationId: extras.operationId ?? randomUUID(), previousRunId: recoveryFrom.binding.runId,

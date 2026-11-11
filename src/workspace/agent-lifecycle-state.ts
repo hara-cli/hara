@@ -36,6 +36,7 @@ export interface AgentLifecycleOperation {
   commandId: string; agentId: string; action: "task.stop" | "agent.pause" | "agent.dismiss";
   epoch: number; holdId: string; targetRunIds: string[]; notifiedRunIds: string[]; revokedRunIds: string[];
   schedules: "pending" | "paused" | "none"; archive: "not_requested" | "pending" | "archived";
+  archiveExpected: { agentEpoch: number; configRevision: number } | null;
   archivedResource: { agentEpoch: number; configRevision: number } | null;
 }
 export interface AgentLifecycleSegment {
@@ -179,16 +180,21 @@ export function parseAgentLifecycleState(raw: unknown, control: AgentCommandStat
   if (executions.size !== control.runs.length) return fail();
   const operations = new Set<string>();
   for (const row of value.operations) {
-    fields(row, ["commandId", "agentId", "action", "epoch", "holdId", "targetRunIds", "notifiedRunIds", "revokedRunIds", "schedules", "archive", "archivedResource"]);
+    fields(row, ["commandId", "agentId", "action", "epoch", "holdId", "targetRunIds", "notifiedRunIds", "revokedRunIds", "schedules", "archive", "archiveExpected", "archivedResource"]);
     if (!commandId(row.commandId) || !commands.has(row.commandId) || operations.has(row.commandId) || !commandId(row.agentId) || !commandId(row.holdId)
       || !commandEpoch(row.epoch) || !["task.stop", "agent.pause", "agent.dismiss"].includes(row.action) || !ids(row.targetRunIds, 128)
       || row.targetRunIds.some(id => !runIds.has(id)) || !ids(row.notifiedRunIds, 128) || !ids(row.revokedRunIds, 128)
       || [...row.notifiedRunIds, ...row.revokedRunIds].some(id => !row.targetRunIds.includes(id))
       || !["pending", "paused", "none"].includes(row.schedules) || !["not_requested", "pending", "archived"].includes(row.archive)
       || (row.action === "agent.dismiss") !== (row.archive !== "not_requested")) return fail();
+    if (row.archiveExpected !== null) {
+      fields(row.archiveExpected, ["agentEpoch", "configRevision"]);
+      if (row.action !== "agent.dismiss" || !positive(row.archiveExpected.agentEpoch) || !positive(row.archiveExpected.configRevision)) return fail();
+    } else if (row.action === "agent.dismiss") return fail();
     if (row.archivedResource !== null) {
       fields(row.archivedResource, ["agentEpoch", "configRevision"]);
-      if (row.action !== "agent.dismiss" || row.archive !== "archived" || !positive(row.archivedResource.agentEpoch) || !positive(row.archivedResource.configRevision)) return fail();
+      if (row.action !== "agent.dismiss" || row.archive !== "archived" || !positive(row.archivedResource.agentEpoch) || !positive(row.archivedResource.configRevision)
+        || row.archivedResource.agentEpoch !== row.archiveExpected!.agentEpoch + 1 || row.archivedResource.configRevision !== row.archiveExpected!.configRevision) return fail();
     } else if (row.archive === "archived") return fail();
     operations.add(row.commandId);
   }
@@ -214,7 +220,7 @@ export function assertAgentLifecycleTransition(before: AgentLifecycleState, next
   for (const old of before.operations) {
     const row = next.operations.find(row => row.commandId === old.commandId);
     if (!row) { if (!next.retiredCommands.some(row => row.commandId === old.commandId)) return deny(); continue; }
-    for (const key of ["commandId", "agentId", "action", "epoch", "holdId", "targetRunIds"] as const) if (canonical(old[key]) !== canonical(row[key])) return deny();
+    for (const key of ["commandId", "agentId", "action", "epoch", "holdId", "targetRunIds", "archiveExpected"] as const) if (canonical(old[key]) !== canonical(row[key])) return deny();
     if (old.notifiedRunIds.some(id => !row.notifiedRunIds.includes(id)) || old.revokedRunIds.some(id => !row.revokedRunIds.includes(id))
       || old.schedules !== "pending" && old.schedules !== row.schedules || old.archive !== "pending" && old.archive !== row.archive
       || old.archivedResource !== null && canonical(old.archivedResource) !== canonical(row.archivedResource)) return deny();

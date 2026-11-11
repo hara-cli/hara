@@ -24,12 +24,12 @@ async function peerFixture(t) {
 }
 
 test("C4 actual Host repairs a post-projection N5, keeps accepted journal and only explicit new claim can execute", async t => {
-  const h = await peerFixture(t), { f, peer, context, transport } = h, resolve = context.resources.agents.resolveTask.bind(context.resources.agents);
+  const h = await peerFixture(t), { f, peer, context, transport } = h, save = WorkspaceConversationStore.prototype.save;
   const store = new WorkspaceConversationStore(context.storage, f.params.agentId); let interrupted = false;
-  context.resources.agents.resolveTask = binding => {
-    const actual = resolve(binding), snapshot = context.boundaryAuthority.commandControlState(), current = store.read();
-    if (!interrupted && snapshot.lifecycle.executions.some(row => row.phase === "prepared" && row.runId === current.task?.workspaceRunBinding?.runId)) {
-      interrupted = true; throw new Error("synthetic startup failure after conversation projection");
+  WorkspaceConversationStore.prototype.save = function (...args) {
+    const actual = save.apply(this, args), snapshot = context.boundaryAuthority.commandControlState();
+    if (!interrupted && snapshot.lifecycle.executions.some(row => row.phase === "prepared" && row.runId === actual.task?.workspaceRunBinding?.runId)) {
+      interrupted = true; throw new Error("synthetic startup failure after durable conversation projection");
     }
     return actual;
   };
@@ -42,7 +42,7 @@ test("C4 actual Host repairs a post-projection N5, keeps accepted journal and on
     const ordinary = peer.draftAgentBoundaryCommand(transport, f.params.workspaceId, f.params.agentId,
       { commandId: randomUUID(), rootRequestId: randomUUID(), lifetimeMs: 30000, operation: command.operation });
     assert.equal(h.submit(ordinary).status, "rejected"); assert.equal(h.calls(), 0);
-    context.resources.agents.resolveTask = resolve;
+    WorkspaceConversationStore.prototype.save = save;
     const recovery = peer.draftAgentLifecycleRecovery(transport, f.params.workspaceId, f.params.agentId,
       { operationId: randomUUID(), previousRunId: run.runId, expectedClaimRevision: 1, commandId: randomUUID(), rootRequestId: randomUUID(), message: "hello", lifetimeMs: 30000 });
     const next = peer.submitAgentLifecycleRecovery("recovery_owner", transport, f.params.workspaceId, f.params.agentId, recovery.recovery, recovery.command, { message: "hello" });
@@ -53,7 +53,7 @@ test("C4 actual Host repairs a post-projection N5, keeps accepted journal and on
     assert.deepEqual(after.pastTasks[0].task, original.task); assert.deepEqual(after.requests.slice(0, 1), original.requests);
     assert.equal(journal.find(run.requestId).state, "accepted");
     peer.submitAgentLifecycleRecovery("recovery_owner", transport, f.params.workspaceId, f.params.agentId, recovery.recovery, recovery.command, { message: "hello" }); assert.equal(h.calls(), 1);
-  } finally { context.resources.agents.resolveTask = resolve; await peer.close(); h.transports.close(); }
+  } finally { WorkspaceConversationStore.prototype.save = save; await peer.close(); h.transports.close(); }
 });
 
 test("C4 actual Host preserves post-issuance UNKNOWN and does not acquire another lease for a new message", async t => {

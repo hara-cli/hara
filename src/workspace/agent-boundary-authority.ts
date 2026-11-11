@@ -1,4 +1,5 @@
 import { assertAgentLifecycleCapacity, assertAgentLifecycleTransition, migrateAgentLifecycleState, parseAgentLifecycleState, type AgentLifecycleState, type AgentLifecycleRun, type AgentLifecycleRecoveryV1 } from "./agent-lifecycle-state.js";
+import { WorkspaceFeatures } from "./features.js";
 import { assertNoWorkspaceLegacyEffects } from "./agent-command-protection.js";
 import { assertNoWorkspaceSessionLeases, withWorkspaceSessionAdmission } from "./session-lease.js";
 import type { WorkspaceRunBinding } from "./run-binding.js";
@@ -42,7 +43,7 @@ interface State { schemaVersion: 1 | 2 | 3; revision: number; resourceBinding: W
 export interface AgentCommandMutation {
   command: AgentBoundaryCommand; control: AgentCommandState; authorizationError: AgentBoundaryErrorCode | null;
   policyRevision: number; proposedPolicyRevision: number | null;
-  agentKind: WorkspaceAgentView["kind"] | null; rights: AgentBoundaryRights | null; lifecycle?: AgentLifecycleState;
+  agentKind: WorkspaceAgentView["kind"] | null; agentResource: { agentEpoch: number; configRevision: number } | null; rights: AgentBoundaryRights | null; lifecycle?: AgentLifecycleState;
 }
 export interface AgentCommandMutationResult { control: AgentCommandState; applyPolicy?: boolean; lifecycle?: AgentLifecycleState }
 declare const grantBrand: unique symbol;
@@ -364,7 +365,8 @@ export class WorkspaceAgentBoundaryAuthority {
       || state.schemaVersion === 3 && !this.options.lifecycleControl) return fail("AUTHORITY_UNVERIFIED", "control.source");
     const policy = this.currentPolicy(command.agentId, state.policies.find(row => row.agentId === command.agentId));
     if (command.expected.dutyRevision !== policy.duty.dutyRevision || command.expected.boundaryRevision !== policy.boundary.boundaryRevision) fail("STALE_REVISION");
-    this.permission(policy, command.operation.action); this.source(transport); return { command, policy };
+    this.permission(policy, command.operation.action); this.assertLifecycleCapabilityCurrent(state, command);
+    this.source(transport); return { command, policy };
   }
   /** Explicit owner setup; no absent/corrupt store is adopted as an execution history. */
   initializeCommandControl(transport: AgentBoundaryTransport) {
@@ -481,7 +483,9 @@ export class WorkspaceAgentBoundaryAuthority {
       } catch (error) { authorizationError = error instanceof AgentBoundaryContractError ? error.code : "AUTHORITY_UNVERIFIED"; }
       const result = change({ command, control: structuredClone(state.control), authorizationError,
         policyRevision: policy?.revision ?? 0, proposedPolicyRevision: proposed?.revision ?? null,
-        agentKind: this.options.resources.agents.get(command.agentId)?.kind ?? null, rights: policy ? { ...policy.rights } : null,
+        agentKind: this.options.resources.agents.get(command.agentId)?.kind ?? null,
+        agentResource: (() => { const agent = this.options.resources.agents.get(command.agentId);
+          return agent ? { agentEpoch: agent.agentEpoch, configRevision: agent.configRevision } : null; })(), rights: policy ? { ...policy.rights } : null,
         ...(state.lifecycle ? { lifecycle: structuredClone(state.lifecycle) } : {}) });
       if (result.applyPolicy && (authorizationError || !proposed)) return fail("AUTHORITY_UNVERIFIED", "control.proposal");
       this.source(transport);
@@ -505,6 +509,79 @@ export class WorkspaceAgentBoundaryAuthority {
       return { ...state, control: next, ...(lifecycle ? { lifecycle } : {}) };
     });
     return this.commandControlState();
+  }
+  /** Durable C4 revocation applies to every Host, including old handles after resume. The
+   * local WeakMaps are capabilities, not an inventory whose absence could prove revocation. */
+  private assertLifecycleCapabilityCurrent(state: State, command: AgentBoundaryCommand): void {
+    if (!state.lifecycle || command.operation.action !== "task.dispatch") return;
+    if (state.lifecycle.retiredCommands.some(row => row.commandId === command.commandId)) return fail("GRANT_REVOKED", "lifecycle.retired");
+    const run = state.control!.runs.find(row => row.commandId === command.commandId);
+    if (!run) return; // C1 intent only; no accepted run or execution permission is produced here.
+    const agent = state.control!.agents.find(row => row.agentId === run.agentId), execution = state.lifecycle.executions.find(row => row.runId === run.runId);
+    if (!agent || !execution || agent.hold || agent.dismissed || agent.epoch !== run.agentControlEpoch || run.hold
+      || ["draining", "drained", "unknown"].includes(run.state) || execution.terminal || execution.quiescence || execution.leaseReleased
+      || execution.phase === "legacy_unknown") return fail("GRANT_REVOKED", "lifecycle.control");
+  }
+  /** Continue only a persisted authenticated restrictive operation. This maintenance port
+   * cannot issue work, approve tools, alter a target or restore an Agent. */
+  reconcileLifecycleOperation(commandId: string) {
+    if (!this.commandControlSourceHealthy()) return fail("AUTHORITY_UNVERIFIED", "lifecycle.source");
+    const first = this.commandControlState(), original = first.lifecycle?.operations.find(row => row.commandId === commandId);
+    if (!original) return fail("AUTHORIZATION_DENIED", "lifecycle.operation");
+    const record = first.control.commands.find(row => row.command.commandId === commandId);
+    if (!record || record.receipt.status === "rejected" || record.command.operation.action !== original.action
+      || record.command.agentId !== original.agentId) return fail("AUTHORITY_UNVERIFIED", "lifecycle.operation");
+    if (original.targetRunIds.some(id => !original.revokedRunIds.includes(id))) {
+      this.observeCommandControl(first.revision, (control, lifecycle) => {
+        const operation = lifecycle!.operations.find(row => row.commandId === commandId)!;
+        for (const id of operation.targetRunIds) {
+          const run = control.runs.find(row => row.runId === id), agent = control.agents.find(row => row.agentId === operation.agentId), execution = lifecycle!.executions.find(row => row.runId === id);
+          if (!run || run.agentId !== operation.agentId || !agent || !execution
+            || !(run.hold || agent.hold || agent.dismissed || agent.epoch !== run.agentControlEpoch || execution.terminal || execution.quiescence || execution.leaseReleased))
+            return fail("AUTHORITY_UNVERIFIED", "lifecycle.revocation");
+          if (!operation.revokedRunIds.includes(id)) operation.revokedRunIds.push(id);
+        }
+        return control;
+      });
+    }
+    let snapshot = this.commandControlState(), operation = snapshot.lifecycle!.operations.find(row => row.commandId === commandId)!;
+    const features = new WorkspaceFeatures(this.options.storage, "", this.options.storage.scope.workspaceId);
+    if (operation.schedules === "pending") {
+      const paused = features.pauseAgentSchedulesForLifecycle(operation.agentId);
+      this.observeCommandControl(snapshot.revision, (control, lifecycle) => {
+        if (features.schedules().some(row => row.enabled && row.definition.agentId === operation.agentId)) return fail("CONTROL_HELD", "lifecycle.schedules");
+        lifecycle!.operations.find(row => row.commandId === commandId)!.schedules = paused.length ? "paused" : "none"; return control;
+      });
+      // Publication is already durable. Failure retains the original recovery receipt; never re-enable.
+      features.finishArchivePause(operation.agentId, paused);
+    }
+    snapshot = this.commandControlState(); operation = snapshot.lifecycle!.operations.find(row => row.commandId === commandId)!;
+    const retained = features.archivePauseReceipts().find(row => row.agentId === operation.agentId);
+    if (operation.schedules !== "pending" && retained) {
+      features.assertLifecycleSchedulesPaused(operation.agentId, retained.schedules);
+      features.finishArchivePause(operation.agentId, retained.schedules);
+    }
+    if (operation.archive === "pending") {
+      if (operation.schedules === "pending" || operation.targetRunIds.some(id => !operation.revokedRunIds.includes(id)
+        || !snapshot.lifecycle!.executions.find(row => row.runId === id)?.leaseReleased)) return operation;
+      const held = snapshot.control.agents.find(row => row.agentId === operation.agentId), expected = operation.archiveExpected!, agent = this.options.resources.agents.get(operation.agentId);
+      if (!held?.dismissed || held.hold?.holdId !== operation.holdId || !agent || agent.kind === "main") return fail("AUTHORITY_UNVERIFIED", "lifecycle.archive");
+      if (agent.state === "active") {
+        this.options.resources.agents.setArchived(operation.agentId, true, expected.configRevision, expected.agentEpoch, 0);
+      }
+      const archived = this.options.resources.agents.get(operation.agentId);
+      if (!archived || archived.state !== "archived" || archived.agentEpoch !== expected.agentEpoch + 1 || archived.configRevision !== expected.configRevision)
+        return fail("CONTROL_HELD", "lifecycle.archiveIdentity");
+      // Re-read after the cross-file step. A crash here can publish this exact receipt later.
+      snapshot = this.commandControlState();
+      this.observeCommandControl(snapshot.revision, (control, lifecycle) => {
+        const current = this.options.resources.agents.get(operation.agentId);
+        if (canonical(current) !== canonical(archived)) return fail("STALE_REVISION", "lifecycle.archiveIdentity");
+        const row = lifecycle!.operations.find(row => row.commandId === commandId)!; row.archive = "archived";
+        row.archivedResource = { agentEpoch: archived.agentEpoch, configRevision: archived.configRevision }; return control;
+      });
+    }
+    return this.commandControlState().lifecycle!.operations.find(row => row.commandId === commandId)!;
   }
   admit(transport: AgentBoundaryTransport, raw: unknown): AgentCommandGrant {
     const { command, policy } = this.verify(transport, raw), handle = Object.freeze({}) as AgentCommandGrant;
@@ -535,7 +612,7 @@ export class WorkspaceAgentBoundaryAuthority {
     this.assertHostCurrent(); assertAgentBoundaryContext(captured.command, this.parent.context);
     const state = this.read(), policy = this.currentPolicy(captured.command.agentId, state.policies.find(row => row.agentId === captured.command.agentId));
     if (captured.policyRevision !== policy.revision) return fail("STALE_REVISION", "authority.executionPolicy");
-    this.permission(policy, "task.dispatch");
+    this.permission(policy, "task.dispatch"); this.assertLifecycleCapabilityCurrent(state, captured.command);
     return deepFreeze({ command: captured.command, duty: policy.duty, boundary: policy.boundary, rights: policy.rights,
       policyRevision: policy.revision, executionPermit: false, controlVerified: false });
   }
