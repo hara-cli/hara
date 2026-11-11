@@ -37,7 +37,8 @@ interface GateState {
 }
 const gates = new WeakMap<object, GateState>();
 const effects = new AsyncLocalStorage<{ assertCurrent(): void; assertFile(path: string, access: "read" | "write"): void }>();
-const bookkeeping = new Set(["task_intake", "task_checkpoint", "todo_write", "ask_user"]);
+export const AGENT_BOUNDARY_BOOKKEEPING_TOOLS = Object.freeze(["task_intake", "task_checkpoint", "todo_write", "ask_user"]);
+const bookkeeping = new Set(AGENT_BOUNDARY_BOOKKEEPING_TOOLS);
 const fail = (code: AgentBoundaryErrorCode, field = "execution.authority"): never => { throw new AgentBoundaryContractError(code, field); };
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const sync = (check: () => void) => {

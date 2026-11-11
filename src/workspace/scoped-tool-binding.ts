@@ -2,6 +2,7 @@
 import type { Tool } from "../tools/registry.js";
 import { AgentBoundaryContractError } from "./agent-boundaries-contract.js";
 const fileTools = Object.freeze({ workspace_read: "read", workspace_write: "edit", workspace_verify: "read" } as const);
+export const WORKSPACE_SCOPED_FILE_TOOLS = Object.freeze(Object.keys(fileTools));
 const scoped = new WeakSet<object>();
 /** Called only by the reviewed Host-scoped file factory, never by a transport or model. */
 export function bindWorkspaceScopedFileTool(tool: Tool): Tool {

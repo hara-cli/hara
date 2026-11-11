@@ -27,7 +27,7 @@ function tokenMatches(actual: unknown, expected: string): boolean {
   if (typeof actual !== "string" || !/^[a-f0-9]{64}$/.test(actual) || actual.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
 }
-export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; hostHome?: string; discoveryHome?: string; legacySourceHome?: string; credentialVault?: CredentialVault; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; extensionCatalog?: ExtensionCatalogProvider; reviewedMcpSources?: () => readonly ReviewedMcpSource[]; mcpReviewHome?: string; mcpLaunchCandidate?: WorkspaceMcpLaunchProvider; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1]; backgroundRuntimeDetectionMs?: number; agentBoundaries?: { ownerCredential: string; maxCommandLifetimeMs?: number; externalDirectory?: AgentHubDirectory } }): Promise<ServeHandle> {
+export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; hostHome?: string; discoveryHome?: string; legacySourceHome?: string; credentialVault?: CredentialVault; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; extensionCatalog?: ExtensionCatalogProvider; reviewedMcpSources?: () => readonly ReviewedMcpSource[]; mcpReviewHome?: string; mcpLaunchCandidate?: WorkspaceMcpLaunchProvider; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1]; backgroundRuntimeDetectionMs?: number; agentBoundaries?: { commandControl?: boolean; ownerCredential: string; maxCommandLifetimeMs?: number; externalDirectory?: AgentHubDirectory } }): Promise<ServeHandle> {
   if (opts.host !== "127.0.0.1" || !Number.isSafeInteger(opts.port) || opts.port < 0 || opts.port > 65535) throw new Error("Workspace Dev listens only on explicit IPv4 loopback");
   const token = opts.token ?? randomBytes(32).toString("hex");
   if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("invalid Workspace Dev transport token");
@@ -45,7 +45,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
   const clients = new Map<WebSocket, Client>();
   let closing = false;
   const capability = input.mode === "workspace" ? "workspace.v1" : CAPABILITY;
-  const host = new LocalWorkspaceHost(input.root, { boundaryTransports, boundaryMaxCommandLifetimeMs: input.agentBoundaries?.maxCommandLifetimeMs, boundaryExternalDirectory: input.agentBoundaries?.externalDirectory, mode: input.mode, hostHome: input.hostHome, discoveryHome: input.discoveryHome, legacySourceHome: input.legacySourceHome, credentialVault: input.credentialVault, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, extensionCatalog: input.extensionCatalog, reviewedMcpSources: input.reviewedMcpSources, mcpReviewHome: input.mcpReviewHome, mcpLaunchCandidate: input.mcpLaunchCandidate, runtimeInstallerOptions: input.runtimeInstallerOptions, backgroundRuntimeDetectionMs: input.backgroundRuntimeDetectionMs, onChange(event) {
+  const host = new LocalWorkspaceHost(input.root, { boundaryCommandControl: input.agentBoundaries?.commandControl, boundaryTransports, boundaryMaxCommandLifetimeMs: input.agentBoundaries?.maxCommandLifetimeMs, boundaryExternalDirectory: input.agentBoundaries?.externalDirectory, mode: input.mode, hostHome: input.hostHome, discoveryHome: input.discoveryHome, legacySourceHome: input.legacySourceHome, credentialVault: input.credentialVault, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, extensionCatalog: input.extensionCatalog, reviewedMcpSources: input.reviewedMcpSources, mcpReviewHome: input.mcpReviewHome, mcpLaunchCandidate: input.mcpLaunchCandidate, runtimeInstallerOptions: input.runtimeInstallerOptions, backgroundRuntimeDetectionMs: input.backgroundRuntimeDetectionMs, onChange(event) {
     for (const [client, state] of clients) if (state.initialized && client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ jsonrpc: "2.0", method: "workspace.changed", params: event }));
   }, onAssistantPreview(clientId, frame) {
     for (const [client, state] of clients) if (state.id === clientId && state.initialized && client.readyState === WebSocket.OPEN) {
@@ -65,6 +65,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       response.writeHead(404); response.end(); return;
     }
     try {
+      if (input.agentBoundaries?.commandControl || host.hasProtectedAgentCommands()) throw new Error("Protected media adapter unavailable");
       const media = host.readMedia(match[1]!, request.headers.range, request.method === "HEAD", !!match[2]);
       if (match[2]) { response.writeHead(200, { "Content-Type": "application/json" }); response.end(JSON.stringify({ path: media.path })); }
       else { response.writeHead(media.status, media.headers); response.end(media.bytes); }
@@ -101,6 +102,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       if (params.clientCapabilities !== undefined && (!Array.isArray(params.clientCapabilities) || params.clientCapabilities.length > 32
         || !params.clientCapabilities.every(value => typeof value === "string" && value.length <= 100))) throw new Error("invalid client capabilities");
       client.boundaryTransport = boundaryTransports?.connect(client.id, params.boundaryCredential);
+      if (input.agentBoundaries?.commandControl || host.hasProtectedAgentCommands()) host.assertBoundaryTransport(client.boundaryTransport);
       host.setAssistantPreviewCapability(client.id, Array.isArray(params.clientCapabilities) && params.clientCapabilities.includes("workspace.assistant-preview.v1"));
       host.setExtensionClientCapability(client.id, Array.isArray(params.clientCapabilities) && params.clientCapabilities.includes("workspace.extensions.manager.v1"));
       host.setExtensionOwnerReviewCapability(client.id, Array.isArray(params.clientCapabilities) && params.clientCapabilities.includes("workspace.extensions.owner-review.v1"));
@@ -108,9 +110,13 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, runtimePlatform: { writeProtection: runtimeWriteProtection(), permissionTiers: availableRuntimePermissionTiers() }, capabilities: [capability, ...(boundaryTransports ? ["workspace.agent-boundaries.authority.v1"] : []), "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.media.v1", "workspace.media.states.v1", "workspace.i18n.v1", "workspace.agents.archive.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, runtimePlatform: { writeProtection: runtimeWriteProtection(), permissionTiers: availableRuntimePermissionTiers() }, capabilities: [capability, ...(boundaryTransports ? ["workspace.agent-boundaries.authority.v1"] : []), ...(input.agentBoundaries?.commandControl ? ["workspace.agent-command-control.v1"] : []), "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.media.v1", "workspace.media.states.v1", "workspace.i18n.v1", "workspace.agents.archive.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
+    if (input.agentBoundaries?.commandControl || host.hasProtectedAgentCommands()) {
+      host.assertBoundaryTransport(client.boundaryTransport);
+      if (method.startsWith("workspace.update.")) throw new AgentBoundaryContractError("RUNTIME_UNSUPPORTED", "control.maintenance");
+    }
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
     if (method === "workspace.message-timing.clock") { fields([]); return { hostAtMs: performance.now() }; }
     if (method === "workspace.list") { fields([]); return host.list(); }
@@ -129,6 +135,33 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
         fields(["workspaceId", "agentId"]); return host.agentBoundaryView(client.boundaryTransport, workspaceId, params.agentId as string);
       }
       host.assertGeneration(workspaceId, params.expectedGeneration);
+      if (method === "workspace.boundaries.control.initialize") {
+        fields(["workspaceId", "expectedGeneration", "agentId"]); return host.initializeAgentCommandControl(client.boundaryTransport, workspaceId, params.agentId as string);
+      }
+      if (method === "workspace.boundaries.control.submit") {
+        fields(["workspaceId", "expectedGeneration", "agentId", "command", ...["message", "proposal"].filter(key => Object.hasOwn(params, key))]);
+        if (!plain(params.command) || params.command.agentId !== params.agentId || params.message !== undefined && !messageBody(params.message)) throw new AgentBoundaryContractError("INVALID_DOCUMENT", "control.request");
+        return host.submitAgentBoundaryCommand(client.id, client.boundaryTransport, workspaceId, params.agentId as string, params.command,
+          { ...(Object.hasOwn(params, "message") ? { message: params.message as string } : {}), ...(Object.hasOwn(params, "proposal") ? { proposal: params.proposal } : {}) });
+      }
+      if (method === "workspace.boundaries.control.receipt") {
+        fields(["workspaceId", "expectedGeneration", "agentId", "commandId"]);
+        if (!text(params.commandId)) throw new AgentBoundaryContractError("INVALID_DOCUMENT", "control.request");
+        return host.agentCommandReceipt(client.boundaryTransport, workspaceId, params.agentId as string, params.commandId);
+      }
+      if (method === "workspace.boundaries.control.audit.ack") {
+        fields(["workspaceId", "expectedGeneration", "agentId", "eventIds"]);
+        return host.acknowledgeAgentCommandAudit(client.boundaryTransport, workspaceId, params.agentId as string, params.eventIds);
+      }
+      if (method === "workspace.boundaries.control.reconcile") {
+        fields(["workspaceId", "expectedGeneration", "agentId"]);
+        return host.reconcileAgentCommandObservations(client.boundaryTransport, workspaceId, params.agentId as string);
+      }
+      if (method === "workspace.boundaries.control.inspect" || method === "workspace.boundaries.control.audit") {
+        fields(["workspaceId", "expectedGeneration", "agentId"]);
+        return method.endsWith(".audit") ? host.agentCommandAudit(client.boundaryTransport, workspaceId, params.agentId as string)
+          : host.agentCommandStatus(client.boundaryTransport, workspaceId, params.agentId as string);
+      }
       if (method === "workspace.boundaries.prepareProject") {
         fields(["workspaceId", "expectedGeneration", "agentId"]); return host.prepareAgentBoundaryProject(client.boundaryTransport, workspaceId, params.agentId as string);
       }
@@ -156,6 +189,13 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     }
     const workspaceId = params.workspaceId;
     if (!text(workspaceId)) throw new Error("Workspace must be explicit");
+    if (host.agentCommandProtectionActive(workspaceId)) {
+      // Legacy mutations and private projections need reviewed C4/C10/C12 adapters. Default deny.
+      if (!["workspace.snapshot", "workspace.session.receipt"].includes(method)) throw new AgentBoundaryContractError("RUNTIME_UNSUPPORTED", "control.legacyEntry");
+      if (!text(params.agentId)) throw new AgentBoundaryContractError("AUTHORIZATION_DENIED", "control.privateRead");
+      const view = host.agentBoundaryView(client.boundaryTransport, workspaceId, params.agentId);
+      if (!view.current || !view.policy?.rights.privateRead) throw new AgentBoundaryContractError("AUTHORIZATION_DENIED", "control.privateRead");
+    }
     if (method === "workspace.select" || method === "workspace.settings.select") { fields(["workspaceId", "expectedRevision"]); if (!positive(params.expectedRevision)) throw new Error("invalid Workspace selection"); host.select(client.id, workspaceId, params.expectedRevision, method === "workspace.settings.select"); return host.snapshot(workspaceId, undefined, client.id); }
     if (method === "workspace.snapshot") { fields(["workspaceId", "agentId"]); if (params.agentId !== null && !text(params.agentId)) throw new Error("invalid Agent selection"); return host.snapshot(workspaceId, typeof params.agentId === "string" ? params.agentId : undefined, client.id); }
     host.assertGeneration(workspaceId, params.expectedGeneration);
