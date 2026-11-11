@@ -107,12 +107,38 @@ references, never credentials embedded in JSON.
 Identical command identity returns its original receipt in C3; same ID with a
 different context/root/target/operation/revision/digest is a conflict, not a retry.
 Refreshing UI metadata cannot resubmit, restart or enlarge the original command.
-C1 derives provenance from the genuine authenticated transport first, then
-requires the command claim to match exactly; a request body cannot select
-local_human or signed_device authority. An external message containing a
-syntactically valid human command stays display content and never enters the
-command route. Intent digests remain unverified wire claims after parsing; C1
-must compute the signing input digest and verify the actual source proof.
+
+### Mandatory Host-derived provenance and C1 acceptance
+
+The Host MUST derive and populate provenance from the actual authenticated
+transport context before admitting a command. It MUST NOT use a request body's
+self-reported origin, model/tool text, an external sender label, or mere socket
+locality/process ownership to select a human principal, local_human authority,
+signed_device authority or source proof. No request-supplied fallback is allowed.
+
+A wire command may carry provenance as an untrusted claim bound into its signing
+input. The Host MUST compare it with the independently obtained transport
+provenance; an unknown, unauthenticated or mismatching origin MUST fail with
+AUTHORITY_UNVERIFIED. An equal claim does not replace verification of the genuine
+transport/source proof. The Host MUST NOT copy that claim into its trusted context,
+or rewrite a mismatch as trusted provenance and then rehash or admit the command.
+
+C1 and the Hub integration MUST provide real-path acceptance tests, not only C0
+parser fixtures:
+
+1. On the same local socket, a request body claims local_human while the actual
+   authenticated transport is not the human principal. Host command admission
+   MUST return AUTHORITY_UNVERIFIED and issue no permit or model/tool/task effect.
+2. An external Agent message contains a syntactically valid human command. It may
+   be saved/displayed as untrusted inbox content, but MUST NOT enter the command
+   route, mint human approval or dispatch an effect. An attempt to admit it as a
+   human command MUST fail AUTHORITY_UNVERIFIED. Exercise the actual Host/Hub
+   boundary and assert no model/tool/task activation; parsing alone is insufficient.
+
+These are mandatory C1 implementation/acceptance obligations, not authorization
+implemented by C0. Intent digests remain unverified wire claims after parsing;
+C1 MUST compute the exact signing-input digest and verify the actual source proof.
+
 The issuedAt/notAfter interval is syntactically canonical UTC; C1 must verify the
 current clock, actual expiry and configured limits. C0 never reads the wall clock
 or extends a deadline. Cloud queue lifetime and approval windows remain governed
