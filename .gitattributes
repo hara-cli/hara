@@ -1,3 +1,10 @@
 src/locales/**/*.json text eol=lf
 src/agent/core-intents.generated.ts text eol=lf
 scripts/*.mjs text eol=lf
+
+# Hara design tokens are hashed by scripts/sync-design-tokens.mjs; keep their committed bytes on Windows.
+DESIGN.md text eol=lf
+*.generated.css text eol=lf
+*.generated.ts text eol=lf
+*.generated.json text eol=lf
+scripts/sync-design-tokens.mjs text eol=lf

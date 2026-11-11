@@ -1,5 +1,7 @@
 # Repository Guidelines
 
+> **Design:** read `DESIGN.md` before writing any UI. Design tokens come from the shared Hara design source (`uiux/design-language/hara/DESIGN.md`) and change only through `node scripts/sync-design-tokens.mjs`; never edit the generated token files by hand.
+
 ## Project Structure & Module Organization
 
 Core TypeScript lives in `src/`, organized by domain: orchestration in `src/agent/`, gateways in `src/gateway/`, providers in `src/providers/`, security in `src/security/`, and Ink components in `src/tui/`. Tests live in `test/` and import compiled modules from `dist/`. Documentation and assets are in `docs/`, bundled skills in `plugins/`, and build helpers in `scripts/`. Treat `dist/` as generated output—change `src/`, then rebuild.
