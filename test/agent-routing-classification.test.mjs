@@ -1,3 +1,4 @@
+import { agentPolicyProposalDigest } from "../dist/workspace/agent-command-state.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -81,4 +82,31 @@ test("C6 exhausted routing counters refuse new classification without corrupting
   const fs = await import("node:fs"); fs.writeFileSync(f.file, JSON.stringify(state) + "\n");
   await assert.rejects(() => r.classify(f.transport, data), error => error.code === "COUNTER_EXHAUSTED");
   assert.equal(calls, 0); assert.equal(f.authority.commandControlSourceHealthy(), true); assert.equal(f.snapshot().routing.records[0].classification, null);
+});
+
+test("C6 classifier cancellation preserves UNKNOWN while the physical adapter is still pending", async t => {
+  const f = routingFixture(t); let calls = 0, finish;
+  const cfg = config(async () => { calls++; return new Promise(resolve => { finish = resolve; }); }), r = router(t, f, cfg), data = f.input("unmatched authorized request");
+  const pending = r.classify(f.transport, data); await new Promise(resolve => setImmediate(resolve)); assert.equal(calls, 1); assert.equal(r.pendingClassificationTurns(), 1);
+  r.close(); const result = await pending; assert.equal(result.classification.phase, "unknown"); assert.equal(result.code, "NEEDS_OWNER"); assert.equal(r.pendingClassificationTurns(), 1);
+  const next = router(t, f, cfg); await next.classify(f.transport, data); assert.equal(calls, 1);
+  finish(reply(f.agent.agentId)); await new Promise(resolve => setImmediate(resolve)); assert.equal(r.pendingClassificationTurns(), 0);
+  assert.equal(next.get(f.transport, data.channelId, data.workItemId).classification.phase, "unknown"); assert.equal(f.snapshot().control.runs.length, 0);
+});
+
+
+test("C6 classification redacts every public duty field and message without changing confirmed C0 duties", async t => {
+  const f = routingFixture(t), view = f.authority.view(f.transport, f.agent.agentId), secret = label => `sk-${label}-${"x".repeat(32)}`;
+  const profile = { title: "Finance " + secret("title"), description: "Public responsibility " + secret("description"), owns: ["invoice", secret("owns")], rejects: ["publish", secret("rejects")] };
+  const duty = structuredClone(view.policy.duty); duty.dutyRevision++; duty.publicProfile = profile;
+  const proposal = { duty, boundary: view.policy.boundary, rights: view.policy.rights };
+  const command = f.authority.draft(f.transport, f.agent.agentId, { commandId: randomUUID(), rootRequestId: randomUUID(), lifetimeMs: 30000,
+    operation: { action: "duty.update", proposedDutyDigest: agentPolicyProposalDigest(proposal) } });
+  const begun = f.control.begin(f.transport, command, { proposal }); assert.equal(f.control.accept(begun.intake).status, "applied");
+  let payload, calls = 0;
+  const r = router(t, f, config(async request => { calls++; payload = request.payload; return reply(f.agent.agentId); }));
+  const result = await r.classify(f.transport, f.input("new authorized request " + secret("message"))); assert.equal(result.state, "selected"); assert.equal(calls, 1);
+  const serialized = JSON.stringify(payload);
+  for (const field of ["title", "description", "owns", "rejects", "message"]) assert.equal(serialized.includes(secret(field)), false, `raw ${field} credential must not leave for classification`);
+  assert.ok(serialized.includes("sk-***")); assert.deepEqual(f.authority.view(f.transport, f.agent.agentId).policy.duty.publicProfile, profile);
 });

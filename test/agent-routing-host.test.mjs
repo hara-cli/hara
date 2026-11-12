@@ -6,6 +6,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { routingHostFixture, routingUntil, boundary } from "./helpers/agent-routing-host-fixture.mjs";
 import { channelSessionId } from "../dist/workspace/channel-session.js";
 import { WorkspaceConversationStore } from "../dist/workspace/conversations.js";
+import { WorkspaceAgentStore } from "../dist/workspace/agents.js";
 import { WorkspaceColleagueHomes } from "../dist/workspace/colleague-homes.js";
 import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { startLocalWorkspaceServe } from "../dist/serve/local-workspace.js";
@@ -78,8 +79,11 @@ test("C6 persisted audience epoch isolates unrelated channels and never revives 
 });
 
 test("C6 public directory never consults execution resources or private persona as a fallback", t => {
-  const f = routingFixture(t); f.authorityOptions.resourcesForAgent = () => { throw new Error("Private resource reader must not be used for public nomination"); };
-  const directory = f.router.directory(f.transport, f.input().channelId); assert.equal(directory.length, 3);
+  let personaReads = 0; const original = WorkspaceAgentStore.prototype.channelPrefilterProfiles;
+  WorkspaceAgentStore.prototype.channelPrefilterProfiles = function () { personaReads++; return original.call(this); };
+  t.after(() => { WorkspaceAgentStore.prototype.channelPrefilterProfiles = original; });
+  const f = routingFixture(t); personaReads = 0; f.authorityOptions.resourcesForAgent = () => { throw new Error("Private resource reader must not be used for public nomination"); };
+  let directory; assert.doesNotThrow(() => { directory = f.router.directory(f.transport, f.input().channelId); }); assert.equal(directory.length, 3); assert.equal(personaReads, 0);
   assert.ok(directory.every(row => Object.keys(row.publicProfile).sort().join(",") === "description,owns,rejects,title"));
   assert.ok(!JSON.stringify(directory).includes("instructions"));
 });

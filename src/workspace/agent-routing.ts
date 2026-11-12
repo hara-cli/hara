@@ -1,5 +1,6 @@
+import { readWorkspaceCompletionEffects } from "./completion-evidence-store.js";
 import { AgentRoutingClassifier, type AgentRoutingClassifierConfig } from "./agent-routing-classification.js";
-import { redactSensitiveText } from "../security/secrets.js";
+import { redactSensitiveText, redactSensitiveValue } from "../security/secrets.js";
 // C6 Host-only routing over the ORIGINAL C1/C3/C4 aggregate. No business provider is called here.
 import { randomUUID } from "node:crypto";
 import { AgentBoundaryContractError, parseAgentBoundaryDocument, type AgentBoundaryCommand, type AgentBoundaryOwnerDecision, type AgentBoundaryWorkClaim, type AgentBoundaryReceipt } from "./agent-boundaries-contract.js";
@@ -18,7 +19,7 @@ export interface AgentRoutingProjection {
   schemaVersion: 1; kind: "agent-routing-projection"; channelId: string; workItemId: string; workKey: string; rootRequestId: string;
   revision: number; code: "NEEDS_OWNER" | null; state: "needs_owner" | "selected" | "claimed" | "blocked"; reason: string; ownerAgentId: string | null;
   method: AgentRoutingRecord["method"]; decision: AgentBoundaryOwnerDecision | null; claim: AgentBoundaryWorkClaim | null;
-  receipt: AgentBoundaryReceipt | null; classification: { requestId: string; phase: string } | null; executionPermit: false;
+  receipt: AgentBoundaryReceipt | null; effectObservation: AgentBoundaryWorkClaim["effect"] | null; classification: { requestId: string; phase: string } | null; executionPermit: false;
 }
 const fail = (code: "AUTHORITY_UNVERIFIED" | "AUTHORIZATION_DENIED" | "STALE_REVISION" | "COMMAND_ID_CONFLICT" | "CONTROL_HELD", field: string): never => { throw new AgentBoundaryContractError(code, field); };
 export class WorkspaceAgentRouting {
@@ -118,7 +119,7 @@ export class WorkspaceAgentRouting {
     if (f.catalogDigest !== row.catalogDigest || f.audienceDigest !== row.audienceDigest) return deepFreeze({ ...observe(), reason: "stale" });
     const ids = new Set(f.nomination.classificationCandidateIds), payload: AgentRoutingClassificationPayload = {
       schemaVersion: 1, message: redactSensitiveText(input.message).text,
-      candidates: f.directory.filter(candidate => ids.has(candidate.agentId)).map(candidate => ({ agentId: candidate.agentId, publicProfile: candidate.publicProfile })),
+      candidates: f.directory.filter(candidate => ids.has(candidate.agentId)).map(candidate => ({ agentId: candidate.agentId, publicProfile: redactSensitiveValue(candidate.publicProfile).value })),
     };
     const policy = this.classifier.policy;
     if (this.classifier.inputBytes(payload) > policy.maxInputBytes) return deepFreeze({ ...observe(), reason: "classification_unavailable" });
@@ -174,12 +175,19 @@ export class WorkspaceAgentRouting {
     if (!commandId(workItemId)) return fail("AUTHORIZATION_DENIED", "routing.workItem");
     const snapshot = this.options.authority.routingSnapshot(transport), key = agentRoutingWorkKey(snapshot.context.resourceBinding.scopeKey, snapshot.context.resourceBinding.generation, channelId, workItemId);
     const row = snapshot.routing.records.find(row => row.workKey === key); if (!row) return null;
+    let effectObservation: AgentBoundaryWorkClaim["effect"] | null = null;
     let receipt: AgentBoundaryReceipt | null = null, claim: AgentBoundaryWorkClaim | null = null, decision: AgentBoundaryOwnerDecision | null = null;
     if (row.ownerAgentId !== null && (row.claim || snapshot.control.commands.some(record => record.command.commandId === row.commandId))) receipt = this.options.control.readReceipt(transport, row.ownerAgentId, row.commandId);
     if (row.claim) {
       const run = snapshot.control.runs.find(run => run.runId === row.claim!.runId)
         ?? (snapshot.lifecycle ? this.options.authority.lifecycleHistoricalRun(snapshot.lifecycle, row.claim.runId).run : undefined);
       if (!run || run.commandId !== row.commandId || run.agentId !== row.ownerAgentId) return fail("AUTHORITY_UNVERIFIED", "routing.claim");
+      effectObservation = run.effect;
+      if (!run.drainProofRef) {
+        const effects = readWorkspaceCompletionEffects(this.options.authority.lifecycleStorage(), run.binding);
+        const execution = snapshot.lifecycle?.executions.find(entry => entry.runId === run.runId);
+        if (effects?.some(effect => effect.state === "unknown") || effects === null && execution?.phase === "issued") effectObservation = "unknown";
+      }
       const c = parseAgentBoundaryDocument({ schemaVersion: 1, mode: "personal", context: snapshot.context, kind: "work-claim",
         rootRequestId: run.rootRequestId, taskId: run.taskId, agentId: run.agentId, claimRevision: run.claimRevision,
         attemptId: run.leaseAttemptId, effect: run.effect, effectId: run.effectId });
@@ -189,10 +197,10 @@ export class WorkspaceAgentRouting {
       if (c.kind !== "work-claim" || d.kind !== "owner-decision") return fail("AUTHORITY_UNVERIFIED", "routing.projection"); claim = c; decision = d;
     }
     const audienceChanged = commandDigest([snapshot.context.resourceBinding, audience]) !== row.audienceDigest;
-    const blocked = audienceChanged && row.ownerAgentId !== null || receipt?.status === "unknown" || receipt?.status === "rejected" || receipt?.control.holdId !== null && receipt !== null;
+    const blocked = effectObservation === "unknown" || audienceChanged && row.ownerAgentId !== null || receipt?.status === "unknown" || receipt?.status === "rejected" || receipt?.control.holdId !== null && receipt !== null;
     return deepFreeze({ schemaVersion: 1, kind: "agent-routing-projection", channelId, workItemId, workKey: key, rootRequestId: row.rootRequestId,
-      revision: row.revision, code: row.state === "needs_owner" ? "NEEDS_OWNER" : null, state: blocked ? "blocked" : row.state, reason: receipt?.status === "unknown" ? "unknown_effect" : audienceChanged && row.ownerAgentId !== null ? "audience_changed" : blocked ? "control_held" : row.reason,
-      ownerAgentId: row.ownerAgentId, method: row.method, decision, claim, receipt,
+      revision: row.revision, code: row.state === "needs_owner" ? "NEEDS_OWNER" : null, state: blocked ? "blocked" : row.state, reason: effectObservation === "unknown" || receipt?.status === "unknown" ? "unknown_effect" : audienceChanged && row.ownerAgentId !== null ? "audience_changed" : blocked ? "control_held" : row.reason,
+      ownerAgentId: row.ownerAgentId, method: row.method, decision, claim, receipt, effectObservation,
       classification: row.classification ? { requestId: row.classification.requestId, phase: row.classification.phase === "submission_started" ? "unknown" : row.classification.phase } : null,
       executionPermit: false });
   }
