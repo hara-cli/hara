@@ -18,6 +18,8 @@ export interface AgentBoundaryControlSource {
   bind(command: AgentBoundaryCommand, binding: Readonly<WorkspaceRunBinding>): {
     readonly commandId: string; readonly runId: string; readonly controlEpoch: number;
     assertCurrent(): void;
+    /** Optional C4 Host-owned sink; proof comes only from the real private runtime close. */
+    prepareQuiescence?(proof: unknown): void;
   };
 }
 export interface AgentBoundaryEffectResource { resourceId: string; access: "read" | "write" | "execute" }
@@ -96,6 +98,8 @@ export function createAgentBoundaryExecutionGate(input: {
     if (control && typeof (control as unknown as { then?: unknown }).then === "function") void Promise.resolve(control).catch(() => {});
     return fail("AUTHORITY_UNVERIFIED", "execution.control");
   }
+  const lifecycle = input.authority.commandLifecycleInitialized();
+  if (lifecycle && typeof control.prepareQuiescence !== "function") return fail("AUTHORITY_UNVERIFIED", "lifecycle.quiescenceSink");
   const roots = new Map<string, Readonly<NonNullable<AgentBoundaryResource["project"]>>>();
   for (const item of input.authority.executionResources(input.grant)) if (item.project) {
     const root = captureWorkspaceProjectIdentity(item.project.root);
@@ -110,7 +114,7 @@ export function createAgentBoundaryExecutionGate(input: {
   });
   const state: GateState = { binding, authority: input.authority, policy: input.authority.captureExecutionPolicy(input.grant),
     control: Object.freeze({ commandId: control.commandId, runId: control.runId, controlEpoch: control.controlEpoch,
-      assertCurrent: control.assertCurrent.bind(control) }), tools: Object.freeze(tools), roots, attached: false };
+      assertCurrent: control.assertCurrent.bind(control), ...(lifecycle ? { prepareQuiescence: control.prepareQuiescence!.bind(control) } : {}) }), tools: Object.freeze(tools), roots, attached: false };
   current(state);
   const gate = Object.freeze({}) as AgentBoundaryExecutionGate; gates.set(gate, state); return gate;
 }
@@ -146,6 +150,11 @@ export function bindAgentBoundaryExecution(gate: unknown, binding: WorkspaceRunB
   return Object.freeze({
     assertCurrent: check,
     close() { state.authority.retireExecutionPolicy(state.policy); },
+    requiresQuiescence: Boolean(state.control.prepareQuiescence),
+    prepareQuiescence(proof: unknown) {
+      if (!state.control.prepareQuiescence) return fail("AUTHORITY_UNVERIFIED", "lifecycle.quiescenceSink");
+      sync(() => state.control.prepareQuiescence!(proof));
+    },
     beforeModel(calls: number) { const facts = current(state); if (facts.boundary.approvalRequired.includes("paid") || calls >= facts.boundary.budget.maxModelCalls) fail("AUTHORIZATION_DENIED", "execution.budget"); },
     assertNativeUnavailable(): never { return fail("RUNTIME_UNSUPPORTED", "execution.runtime"); },
     assertTools(tools: readonly Tool[]) {

@@ -96,6 +96,21 @@ export class WorkspaceFeatures {
       schedules: current.schedules.map(row => ids.has(row.id) ? { ...row, enabled: false } : row) }));
     return matches;
   }
+  /** C4 maintenance retries the exact durable pause; it never rolls back or enables work. */
+  assertLifecycleSchedulesPaused(agentId: string, receipt: readonly WorkspaceSchedule[]) {
+    const schedules = this.schedules();
+    if (schedules.some(row => row.enabled && row.definition.agentId === agentId)) throw new Error("Agent schedules remain enabled");
+    for (const original of receipt) {
+      const current = schedules.find(row => row.id === original.id);
+      if (!current || original.definition.agentId !== agentId || canonical(current) !== canonical({ ...original, enabled: false }))
+        throw new Error("Lifecycle schedule receipt changed; preserved for review");
+    }
+  }
+  pauseAgentSchedulesForLifecycle(agentId: string): WorkspaceSchedule[] {
+    const retained = this.archivePauseReceipts().find(row => row.agentId === agentId);
+    if (retained) { this.assertLifecycleSchedulesPaused(agentId, retained.schedules); return retained.schedules; }
+    const paused = this.pauseAgentSchedulesWithReceipt(agentId); this.assertLifecycleSchedulesPaused(agentId, paused); return paused;
+  }
   /** Only rollback a failed archive's exact pause receipt; preserve unrelated schedule changes. */
   restorePausedAgentSchedules(agentId: string, receipt: readonly WorkspaceSchedule[]): void {
     if (!receipt.length) return;

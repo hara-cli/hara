@@ -27,8 +27,9 @@ function tokenMatches(actual: unknown, expected: string): boolean {
   if (typeof actual !== "string" || !/^[a-f0-9]{64}$/.test(actual) || actual.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
 }
-export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; hostHome?: string; discoveryHome?: string; legacySourceHome?: string; credentialVault?: CredentialVault; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; extensionCatalog?: ExtensionCatalogProvider; reviewedMcpSources?: () => readonly ReviewedMcpSource[]; mcpReviewHome?: string; mcpLaunchCandidate?: WorkspaceMcpLaunchProvider; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1]; backgroundRuntimeDetectionMs?: number; agentBoundaries?: { commandControl?: boolean; ownerCredential: string; maxCommandLifetimeMs?: number; externalDirectory?: AgentHubDirectory } }): Promise<ServeHandle> {
+export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; hostHome?: string; discoveryHome?: string; legacySourceHome?: string; credentialVault?: CredentialVault; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; extensionCatalog?: ExtensionCatalogProvider; reviewedMcpSources?: () => readonly ReviewedMcpSource[]; mcpReviewHome?: string; mcpLaunchCandidate?: WorkspaceMcpLaunchProvider; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1]; backgroundRuntimeDetectionMs?: number; agentBoundaries?: { commandControl?: boolean; lifecycleControl?: boolean; ownerCredential: string; maxCommandLifetimeMs?: number; externalDirectory?: AgentHubDirectory } }): Promise<ServeHandle> {
   if (opts.host !== "127.0.0.1" || !Number.isSafeInteger(opts.port) || opts.port < 0 || opts.port > 65535) throw new Error("Workspace Dev listens only on explicit IPv4 loopback");
+  if (input.agentBoundaries?.lifecycleControl && !input.agentBoundaries.commandControl) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "lifecycle.bootstrap");
   const token = opts.token ?? randomBytes(32).toString("hex");
   if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("invalid Workspace Dev transport token");
   // Separate owner capability supplied only by a trusted native bootstrap. It is never included
@@ -45,7 +46,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
   const clients = new Map<WebSocket, Client>();
   let closing = false;
   const capability = input.mode === "workspace" ? "workspace.v1" : CAPABILITY;
-  const host = new LocalWorkspaceHost(input.root, { boundaryCommandControl: input.agentBoundaries?.commandControl, boundaryTransports, boundaryMaxCommandLifetimeMs: input.agentBoundaries?.maxCommandLifetimeMs, boundaryExternalDirectory: input.agentBoundaries?.externalDirectory, mode: input.mode, hostHome: input.hostHome, discoveryHome: input.discoveryHome, legacySourceHome: input.legacySourceHome, credentialVault: input.credentialVault, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, extensionCatalog: input.extensionCatalog, reviewedMcpSources: input.reviewedMcpSources, mcpReviewHome: input.mcpReviewHome, mcpLaunchCandidate: input.mcpLaunchCandidate, runtimeInstallerOptions: input.runtimeInstallerOptions, backgroundRuntimeDetectionMs: input.backgroundRuntimeDetectionMs, onChange(event) {
+  const host = new LocalWorkspaceHost(input.root, { boundaryCommandControl: input.agentBoundaries?.commandControl, boundaryLifecycleControl: input.agentBoundaries?.lifecycleControl, boundaryTransports, boundaryMaxCommandLifetimeMs: input.agentBoundaries?.maxCommandLifetimeMs, boundaryExternalDirectory: input.agentBoundaries?.externalDirectory, mode: input.mode, hostHome: input.hostHome, discoveryHome: input.discoveryHome, legacySourceHome: input.legacySourceHome, credentialVault: input.credentialVault, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, extensionCatalog: input.extensionCatalog, reviewedMcpSources: input.reviewedMcpSources, mcpReviewHome: input.mcpReviewHome, mcpLaunchCandidate: input.mcpLaunchCandidate, runtimeInstallerOptions: input.runtimeInstallerOptions, backgroundRuntimeDetectionMs: input.backgroundRuntimeDetectionMs, onChange(event) {
     for (const [client, state] of clients) if (state.initialized && client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ jsonrpc: "2.0", method: "workspace.changed", params: event }));
   }, onAssistantPreview(clientId, frame) {
     for (const [client, state] of clients) if (state.id === clientId && state.initialized && client.readyState === WebSocket.OPEN) {
@@ -110,7 +111,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, runtimePlatform: { writeProtection: runtimeWriteProtection(), permissionTiers: availableRuntimePermissionTiers() }, capabilities: [capability, ...(boundaryTransports ? ["workspace.agent-boundaries.authority.v1"] : []), ...(input.agentBoundaries?.commandControl ? ["workspace.agent-command-control.v1"] : []), "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.preferences.default-runtime.v1", "workspace.onboarding.v1", "workspace.agents.create-batch.v1", "workspace.media.v1", "workspace.media.states.v1", "workspace.i18n.v1", "workspace.agents.archive.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, runtimePlatform: { writeProtection: runtimeWriteProtection(), permissionTiers: availableRuntimePermissionTiers() }, capabilities: [capability, ...(boundaryTransports ? ["workspace.agent-boundaries.authority.v1"] : []), ...(input.agentBoundaries?.commandControl ? ["workspace.agent-command-control.v1"] : []), ...(input.agentBoundaries?.lifecycleControl ? ["workspace.agent-lifecycle.v1"] : []), "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.preferences.default-runtime.v1", "workspace.onboarding.v1", "workspace.agents.create-batch.v1", "workspace.media.v1", "workspace.media.states.v1", "workspace.i18n.v1", "workspace.agents.archive.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     if (input.agentBoundaries?.commandControl || host.hasProtectedAgentCommands()) {
@@ -135,6 +136,31 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
         fields(["workspaceId", "agentId"]); return host.agentBoundaryView(client.boundaryTransport, workspaceId, params.agentId as string);
       }
       host.assertGeneration(workspaceId, params.expectedGeneration);
+      if (method.startsWith("workspace.boundaries.lifecycle.")) {
+        if (!input.agentBoundaries?.lifecycleControl) throw new AgentBoundaryContractError("RUNTIME_UNSUPPORTED", "lifecycle.bootstrap");
+        const common = ["workspaceId", "expectedGeneration", "agentId"];
+        if (method === "workspace.boundaries.lifecycle.get") {
+          fields(common); return host.agentLifecycleStatus(client.boundaryTransport, workspaceId, params.agentId as string);
+        }
+        if (method === "workspace.boundaries.lifecycle.reconcile") {
+          fields(common); return host.reconcileAgentLifecycle(client.boundaryTransport, workspaceId, params.agentId as string);
+        }
+        if (method === "workspace.boundaries.lifecycle.history.archive") {
+          fields([...common, "maximum"]); if (!Number.isSafeInteger(params.maximum) || Number(params.maximum) < 1 || Number(params.maximum) > 8) throw new AgentBoundaryContractError("INVALID_DOCUMENT", "lifecycle.archiveLimit");
+          return host.archiveAgentLifecycleHistory(client.boundaryTransport, workspaceId, params.agentId as string, params.maximum as number);
+        }
+        if (method === "workspace.boundaries.lifecycle.recovery.draft") {
+          fields([...common, "input"]); return host.draftAgentLifecycleRecovery(client.boundaryTransport, workspaceId, params.agentId as string,
+            params.input as Parameters<LocalWorkspaceHost["draftAgentLifecycleRecovery"]>[3]);
+        }
+        if (method === "workspace.boundaries.lifecycle.recovery.submit") {
+          fields([...common, "recovery", "command", "message"]);
+          if (!plain(params.recovery) || params.recovery.agentId !== params.agentId || !plain(params.command) || params.command.agentId !== params.agentId || !messageBody(params.message))
+            throw new AgentBoundaryContractError("INVALID_DOCUMENT", "lifecycle.recovery");
+          return host.submitAgentLifecycleRecovery(client.id, client.boundaryTransport, workspaceId, params.agentId as string, params.recovery, params.command, { message: params.message });
+        }
+        throw new AgentBoundaryContractError("INVALID_DOCUMENT", "lifecycle.method");
+      }
       if (method === "workspace.boundaries.control.initialize") {
         fields(["workspaceId", "expectedGeneration", "agentId"]); return host.initializeAgentCommandControl(client.boundaryTransport, workspaceId, params.agentId as string);
       }

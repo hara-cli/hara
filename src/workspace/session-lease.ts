@@ -1,5 +1,8 @@
 import { readdirSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import type { AgentLifecycleLease } from "./agent-lifecycle-state.js";
+import { WorkspaceAgentBoundaryAuthority } from "./agent-boundary-authority.js";
+import type { AgentBoundaryTransport } from "./agent-boundary-transport.js";
 import {
   assertPrivateStateDirectory, ensurePrivateStateSubdirectory, bindPrivateHaraStateFile, readPrivateStateFileSnapshotSync, removePrivateStateFile,
   withPrivateStateLockSync, writePrivateStateFileSync, type PrivateStateFileBinding, type PrivateStateFileSnapshot,
@@ -9,6 +12,9 @@ import { currentWorkspaceResourceBinding, isWorkspaceResourceBinding, sameWorksp
 import { exact, plain, positive, UUID } from "./local-state.js";
 
 const PROCESS_INSTANCE = randomUUID();
+// Only marks a genuine in-process receipt AFTER positive persisted closure and actual release.
+// It never supplies authority, replaces durable epochs or proves quiescence.
+const leaseReceipts = new Map<string, WeakRef<WorkspaceSessionLease>>();
 interface Owner { schemaVersion: 1; resourceBinding: WorkspaceResourceBinding; sessionId: string; attemptId: string; token: string; pid: number; processInstance: string }
 function owner(value: unknown): value is Owner {
   return plain(value) && exact(value, ["schemaVersion", "resourceBinding", "sessionId", "attemptId", "token", "pid", "processInstance"])
@@ -65,6 +71,7 @@ export class WorkspaceSessionLease {
         const published = readPrivateStateFileSnapshotSync(file.path, 4096);
         if (!published || published.text !== JSON.stringify(claim) + "\n") throw new Error("Workspace session lease publication changed");
         acquired = new WorkspaceSessionLease(file, published, sessionId, attemptId);
+        leaseReceipts.set(createHash("sha256").update(published.text).digest("hex"), new WeakRef(acquired));
         return acquired;
       }));
     } catch (error) {
@@ -80,6 +87,49 @@ export class WorkspaceSessionLease {
     if (!current || current.text !== this.snapshot.text || current.dev !== this.snapshot.dev || current.ino !== this.snapshot.ino
       || current.ctimeMs !== this.snapshot.ctimeMs || current.mtimeMs !== this.snapshot.mtimeMs) throw new Error("Workspace attempt lease owner changed");
   }
+  private static observeReleasedReceipt(ownerDigest: string): void {
+    const receipt = leaseReceipts.get(ownerDigest)?.deref();
+    if (receipt && createHash("sha256").update(receipt.snapshot.text).digest("hex") === ownerDigest) {
+      receipt.released = true; receipt.draining = false;
+    }
+    leaseReceipts.delete(ownerDigest);
+  }
+  /** Observation of this genuine captured owner; never an execution/release capability. */
+  captureOwner(): Readonly<AgentLifecycleLease> {
+    this.assertCurrent(); const held = decode(this.snapshot);
+    if (held.pid !== process.pid || held.processInstance !== PROCESS_INSTANCE || held.sessionId !== this.sessionId || held.attemptId !== this.attemptId)
+      throw new Error("Workspace lease does not belong to this process instance");
+    return Object.freeze({ sessionId: held.sessionId, attemptId: held.attemptId, ownerPid: held.pid, processInstance: held.processInstance,
+      ownerDigest: createHash("sha256").update(this.snapshot.text).digest("hex"), dev: this.snapshot.dev, ino: this.snapshot.ino,
+      ctimeMs: this.snapshot.ctimeMs, mtimeMs: this.snapshot.mtimeMs });
+  }
+  /** Explicit safe closure only. The real authority re-reads its published positive quiescence;
+   * caller JSON, a missing file or a dead PID cannot manufacture that evidence. Never acquires. */
+  static reconcileQuiescentRelease(storage: WorkspaceResourceStorage, authority: WorkspaceAgentBoundaryAuthority,
+    transport: AgentBoundaryTransport, runId: string): { released: true; alreadyMissing: boolean } {
+    if (!(authority instanceof WorkspaceAgentBoundaryAuthority)) throw new Error("Genuine lifecycle authority required");
+    return withWorkspaceSessionAdmission(storage, () => {
+      const facts = authority.lifecycleLeaseReleaseFacts(transport, runId), owner = facts.lease;
+      if (!sameWorkspaceResourceBinding(facts.context.resourceBinding, currentWorkspaceResourceBinding()!)) throw new Error("Lifecycle lease scope changed");
+      return withPrivateStateLockSync(workspaceStateHome(), ["workspace-run-locks"], `lease-${owner.sessionId}`, () => {
+        const currentFacts = authority.lifecycleLeaseReleaseFacts(transport, runId);
+        if (JSON.stringify(currentFacts) !== JSON.stringify(facts)) throw new Error("Lifecycle closure evidence changed");
+        const file = bindPrivateHaraStateFile(workspaceStateHome(), ["workspace-run-locks"], `${owner.sessionId}.json`);
+        const current = readPrivateStateFileSnapshotSync(file.path, 4096);
+        if (!current) { WorkspaceSessionLease.observeReleasedReceipt(owner.ownerDigest); return { released: true as const, alreadyMissing: true }; } // Positive evidence was verified FIRST.
+        const held = decode(current);
+        if (held.sessionId !== owner.sessionId || held.attemptId !== owner.attemptId || held.pid !== owner.ownerPid
+          || held.processInstance !== owner.processInstance || !sameWorkspaceResourceBinding(held.resourceBinding, currentWorkspaceResourceBinding()!)
+          || createHash("sha256").update(current.text).digest("hex") !== owner.ownerDigest || current.dev !== owner.dev || current.ino !== owner.ino
+          || current.ctimeMs !== owner.ctimeMs || current.mtimeMs !== owner.mtimeMs) throw new Error("Original lifecycle lease identity changed; retained");
+        if (!(held.pid === process.pid && held.processInstance === PROCESS_INSTANCE) && !knownDead(held.pid))
+          throw new Error("Original lifecycle owner death is unproven; lease retained");
+        removePrivateStateFile(file.path, current, file.directory);
+        WorkspaceSessionLease.observeReleasedReceipt(owner.ownerDigest);
+        return { released: true as const, alreadyMissing: false };
+      });
+    });
+  }
   /** A non-cooperative physical operation keeps its lease even when the UI has stopped awaiting it. */
   setDraining(value: boolean): void { this.assertCurrent(); this.draining = value; }
   release(): void {
@@ -88,5 +138,6 @@ export class WorkspaceSessionLease {
     this.assertCurrent();
     removePrivateStateFile(this.file.path, this.snapshot, this.file.directory);
     this.released = true;
+    leaseReceipts.delete(createHash("sha256").update(this.snapshot.text).digest("hex"));
   }
 }

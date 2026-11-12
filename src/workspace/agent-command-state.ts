@@ -21,7 +21,7 @@ export interface AgentCommandRun {
 }
 export interface AgentCommandRecord { command: AgentBoundaryCommand; receipt: AgentBoundaryReceipt; sequence: number }
 export interface AgentCommandAudit {
-  eventId: string; sequence: number; commandId: string; agentId: string; action: AgentBoundaryAction | "runtime.bound" | "runtime.started" | "runtime.drained" | "runtime.unknown" | "recovery.ack";
+  eventId: string; sequence: number; commandId: string; agentId: string; action: AgentBoundaryAction | "runtime.bound" | "runtime.started" | "runtime.issued" | "runtime.quiescent" | "runtime.aborted" | "runtime.drained" | "runtime.unknown" | "recovery.ack";
   decision: "allowed" | "rejected" | "observed"; code: AgentBoundaryErrorCode | null;
   actorId: string; nodeId: string; at: string; oldEpoch: number; newEpoch: number; policyRevision: number; acknowledged: boolean;
 }
@@ -98,7 +98,7 @@ export function parseAgentCommandState(raw: unknown, context: AgentBoundaryConte
       || item.actorId !== context.humanSubjectId || item.nodeId !== context.nodeId || typeof item.at !== "string" || !Number.isFinite(Date.parse(item.at))
       || !commandEpoch(item.oldEpoch) || !commandEpoch(item.newEpoch) || !commandEpoch(item.policyRevision) || typeof item.acknowledged !== "boolean") return invalid();
     const command = commands.get(item.commandId)!;
-    if (item.action !== command.operation.action && !["runtime.bound", "runtime.started", "runtime.drained", "runtime.unknown", "recovery.ack"].includes(String(item.action))) return invalid();
+    if (item.action !== command.operation.action && !["runtime.bound", "runtime.started", "runtime.issued", "runtime.quiescent", "runtime.aborted", "runtime.drained", "runtime.unknown", "recovery.ack"].includes(String(item.action))) return invalid();
     previousSequence = Number(item.sequence); eventIds.add(item.eventId);
   }
   if (Buffer.byteLength(canonical(raw)) > CONTROL_BYTES) return invalid();
@@ -127,18 +127,21 @@ export function agentCommandRunIdentity(run: AgentCommandRun) {
 }
 /** Append-only identity/recovery facts. A trusted observation may advance an outcome, never erase
  * the original acceptance, clear UNKNOWN or resume a held Agent behind the human command path. */
-export function assertAgentCommandTransition(before: AgentCommandState, next: AgentCommandState, action?: AgentBoundaryAction): void {
+/** Host creates this only after immutable-file verification against the exact old aggregate. */
+export interface AgentCommandRetirement { commands: ReadonlyMap<string, string>; runs: ReadonlyMap<string, string>; audit: ReadonlyMap<string, string> }
+export function assertAgentCommandTransition(before: AgentCommandState, next: AgentCommandState, action?: AgentBoundaryAction, retirement?: AgentCommandRetirement): void {
   const deny = (): never => { throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "control.transition"); };
-  if (canonical(before.origin) !== canonical(next.origin) || next.sequence < before.sequence || next.commands.length < before.commands.length
-    || next.runs.length < before.runs.length || next.audit.length < before.audit.length) return deny();
-  for (let i = 0; i < before.commands.length; i++) {
-    const old = before.commands[i]!, row = next.commands[i];
-    if (!row || canonical(old.command) !== canonical(row.command) || old.sequence !== row.sequence
+  if (canonical(before.origin) !== canonical(next.origin) || next.sequence < before.sequence) return deny();
+  for (const old of before.commands) {
+    const row = next.commands.find(row => row.command.commandId === old.command.commandId);
+    if (!row) { if (retirement?.commands.get(old.command.commandId) !== commandDigest(old)) return deny(); continue; }
+    if (canonical(old.command) !== canonical(row.command) || old.sequence !== row.sequence
       || old.receipt.status === "rejected" && canonical(old.receipt) !== canonical(row.receipt)) return deny();
   }
-  for (let i = 0; i < before.runs.length; i++) {
-    const old = before.runs[i]!, row = next.runs[i];
-    if (!row || canonical(agentCommandRunIdentity(old)) !== canonical(agentCommandRunIdentity(row)) || row.epoch < old.epoch
+  for (const old of before.runs) {
+    const row = next.runs.find(row => row.runId === old.runId);
+    if (!row) { if (retirement?.runs.get(old.runId) !== commandDigest(old)) return deny(); continue; }
+    if (canonical(agentCommandRunIdentity(old)) !== canonical(agentCommandRunIdentity(row)) || row.epoch < old.epoch
       || old.hold !== null && canonical(row.hold) !== canonical(old.hold)
       || old.state === "drained" && row.state !== "drained"
       || ["unknown", "draining", "drained"].includes(old.state) && ["accepted", "bound", "running"].includes(row.state)
@@ -150,8 +153,9 @@ export function assertAgentCommandTransition(before: AgentCommandState, next: Ag
     if (!row || row.epoch < old.epoch || old.dismissed && !row.dismissed
       || old.hold !== null && row.hold === null && (action !== "agent.resume" || row.epoch <= old.epoch)) return deny();
   }
-  for (let i = 0; i < before.audit.length; i++) {
-    const old = before.audit[i]!, row = next.audit[i]; if (!row) return deny();
+  for (const old of before.audit) {
+    const row = next.audit.find(row => row.eventId === old.eventId);
+    if (!row) { if (retirement?.audit.get(old.eventId) !== commandDigest(old)) return deny(); continue; }
     const { acknowledged: oldAck, ...a } = old, { acknowledged: nextAck, ...b } = row;
     if (canonical(a) !== canonical(b) || oldAck && !nextAck) return deny();
   }
