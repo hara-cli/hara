@@ -3,13 +3,21 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { fork } from "node:child_process";
+import { once } from "node:events";
 import { lifecycleFixture } from "./helpers/agent-lifecycle-fixture.mjs";
 import { routingConnect } from "./helpers/agent-routing-host-fixture.mjs";
 import { AgentBoundaryContractError } from "../dist/workspace/agent-boundaries-contract.js";
-import { agentCommandMessageDigest } from "../dist/workspace/agent-command-control.js";
+import { WorkspaceAgentCommandControl, agentCommandMessageDigest } from "../dist/workspace/agent-command-control.js";
 import { commandDigest } from "../dist/workspace/agent-command-state.js";
 import { closeWorkspaceRunPermit, workspaceRunDrainProof } from "../dist/workspace/execution.js";
-import { currentWorkspaceResourceBinding } from "../dist/workspace/resource-context.js";
+import { WorkspaceResourceStorage, currentWorkspaceResourceBinding, workspaceStateHome } from "../dist/workspace/resource-context.js";
+import { LocalWorkspaceCatalog } from "../dist/workspace/local-catalog.js";
+import { WorkspaceResources } from "../dist/workspace/resources.js";
+import { WorkspaceAgentBoundaryAuthority } from "../dist/workspace/agent-boundary-authority.js";
+import { AgentBoundaryTransports } from "../dist/workspace/agent-boundary-transport.js";
+import { captureWorkspaceProjectIdentity } from "../dist/workspace/run-binding.js";
+import { bindPrivateHaraStateFile } from "../dist/security/private-state.js";
 import { startLocalWorkspaceServe } from "../dist/serve/local-workspace.js";
 const code = expected => error => error instanceof AgentBoundaryContractError && error.code === expected;
 
@@ -71,3 +79,36 @@ test("C13 F3 real WS recovery.submit refuses the same manual issued/null-termina
     assert.equal(f.snapshot().control.runs.length, 1); assertIssuedWithoutTerminal(f.snapshot().control.runs[0], f.snapshot().lifecycle.executions[0]);
   } finally { await owner.close(); await handle.close(); }
 });
+
+for (const mode of ["terminal", "quiescence"]) {
+  test(`C13 F4 a live foreign ${mode} owner retains its real lease despite a genuine positive closure fact`, { timeout: 45000 }, async t => {
+    const child = fork(new URL("./helpers/agent-boundaries-c13-live-owner.mjs", import.meta.url), [mode], { execArgv: [], silent: true });
+    const exit = once(child, "exit"); let errors = ""; child.stderr.on("data", chunk => { errors += chunk; });
+    t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM"); await exit; });
+    const [input] = await once(child, "message"); assert.equal(input.ready, true, input.error ?? errors);
+    const catalog = new LocalWorkspaceCatalog(input.home), row = catalog.resolve(input.workspaceId), resources = new WorkspaceResources(input.home, row.scope);
+    resources.initialize(); const storage = new WorkspaceResourceStorage(input.home, row.scope); storage.initialize();
+    const transports = new AgentBoundaryTransports(input.credential), transport = transports.connect("independent_closure_reader", input.credential);
+    const binding = storage.run(() => currentWorkspaceResourceBinding()), root = captureWorkspaceProjectIdentity(input.project);
+    const names = ["workspace_read", "workspace_write", "workspace_verify", "task_intake", "task_checkpoint", "todo_write", "ask_user"];
+    const authority = new WorkspaceAgentBoundaryAuthority({ catalog, resources, storage, transports, commandControl: true, lifecycleControl: true,
+      toolsForAgent: () => names.map(toolId => ({ toolId, connectorId: null, catalogRevision: 1, assertCurrent() {} })),
+      resourcesForAgent: () => [{ resourceId: "files", agentId: input.agentId, revision: 1, binding, project: root, access: ["read", "write"], assertCurrent() {} }] });
+    t.after(() => { authority.close(); transports.close(); }); const control = new WorkspaceAgentCommandControl(authority);
+    const before = authority.commandControlState(), execution = before.lifecycle.executions.find(row => row.runId === input.runId);
+    assert.ok(mode === "terminal" ? execution.terminal : execution.quiescence); assert.equal(execution.leaseReleased, false);
+    assert.equal(execution.lease.ownerPid, child.pid); assert.doesNotThrow(() => process.kill(child.pid, 0));
+    const leasePath = storage.run(() => bindPrivateHaraStateFile(workspaceStateHome(), ["workspace-run-locks"], `${execution.lease.sessionId}.json`).path);
+    const lease = fs.readFileSync(leasePath);
+    assert.throws(() => control.reconcileLifecycleLease(transport, input.runId), /owner death is unproven/);
+    assert.deepEqual(fs.readFileSync(leasePath), lease); assert.deepEqual(authority.commandControlState(), before);
+    assert.equal(authority.commandControlSourceHealthy(), true); assert.throws(() => control.executionGrant(input.runId));
+    child.send("exit"); const [result, signal] = await exit; assert.equal(result, 0, errors); assert.equal(signal, null);
+    control.reconcileLifecycleLease(transport, input.runId);
+    const after = authority.commandControlState(), actual = after.lifecycle.executions.find(row => row.runId === input.runId);
+    assert.equal(actual.leaseReleased, true); assert.equal(fs.existsSync(leasePath), false);
+    assert.deepEqual(actual.terminal, execution.terminal); assert.deepEqual(actual.quiescence, execution.quiescence);
+    assert.equal(after.control.runs.length, before.control.runs.length); assert.equal(after.control.commands.length, before.control.commands.length);
+    assert.throws(() => control.executionGrant(input.runId)); // Physical closure is not a fresh execution capability.
+  });
+}
