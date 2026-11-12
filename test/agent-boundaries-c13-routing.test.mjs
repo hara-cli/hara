@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { WorkspaceConnectionStoreV2 } from "../dist/workspace/connections.js";
+import { WorkspaceAgentCommandControl } from "../dist/workspace/agent-command-control.js";
+import { agentPolicyProposalDigest } from "../dist/workspace/agent-command-state.js";
 import { routingHostFixture, routingUntil, boundary } from "./helpers/agent-routing-host-fixture.mjs";
 
 for (const state of ["needs_owner", "selected", "claimed"]) {
@@ -39,5 +41,54 @@ for (const state of ["needs_owner", "selected", "claimed"]) {
       release();
       if (state === "claimed") await routingUntil(async () => (await f.read(data)).receipt.execution.drain === "observed");
     } finally { release(); }
+  });
+}
+
+for (const race of ["policy", "audience"]) {
+  test(`C13 F2 real WS preserves the original C3 rejection code after a genuine ${race} race`, async t => {
+    const f = await routingHostFixture(t), data = f.data();
+    const originalBegin = WorkspaceAgentCommandControl.prototype.begin, originalPrepare = WorkspaceAgentCommandControl.prototype.prepareRun;
+    const admitted = new WeakMap(); let injected = 0;
+    WorkspaceAgentCommandControl.prototype.begin = function (transport, command, input) {
+      const value = originalBegin.call(this, transport, command, input);
+      if (command.operation.action === "task.dispatch" && value.intake) admitted.set(this, { transport, command });
+      return value;
+    };
+    WorkspaceAgentCommandControl.prototype.prepareRun = function (...args) {
+      const prepared = originalPrepare.apply(this, args), intent = admitted.get(this);
+      if (!intent || injected) return prepared;
+      injected++;
+      if (race === "policy") {
+        // A genuine, authenticated C3 policy command wins after task preparation, before task acceptance.
+        const authority = this.authority, current = authority.view(intent.transport, intent.command.agentId);
+        const proposal = { duty: current.policy.duty, boundary: current.policy.boundary, rights: { ...current.policy.rights, invoke: false } };
+        const update = authority.draft(intent.transport, intent.command.agentId, { commandId: randomUUID(), rootRequestId: randomUUID(), lifetimeMs: 30000,
+          operation: { action: "boundary.update", proposedBoundaryDigest: agentPolicyProposalDigest(proposal) } });
+        const begun = originalBegin.call(this, intent.transport, update, { proposal }); assert.ok(begun.intake);
+        assert.equal(this.accept(begun.intake).status, "applied", "the competing policy command must genuinely apply");
+      } else {
+        // Real channel CAS removes the selected owner; no injected error substitutes for audience revalidation.
+        f.rooms.update(f.channelId, "Owner removed during admission", f.members.slice(1), f.rooms.list().revision);
+      }
+      return prepared;
+    };
+    try {
+      let failure;
+      try { await f.submit(data); } catch (error) { failure = error; }
+      assert.equal(injected, 1, "the race must cross the real Host preparation");
+      const state = f.state(), original = state.routing.records[0];
+      const rejection = state.control.commands.find(row => row.command.commandId === original.commandId)?.receipt;
+      assert.equal(rejection?.status, "rejected", "the actual C3 rejection must be persisted");
+      assert.ok(rejection.error?.code); assert.equal(state.control.runs.length, 0); assert.equal(state.lifecycle.executions.length, 0);
+      assert.equal(f.providers.length, 0); assert.equal(f.calls.length, 0);
+      assert.ok(failure, "a rejected original command must not be reported as successful routing submission");
+      assert.equal(failure.data?.boundary?.code, rejection.error.code, "the RPC must retain the original canonical C3 error code");
+      const retry = await f.submit({ ...data, requestId: randomUUID(), explicitAgentIds: [f.members[1]] });
+      assert.equal(retry.state, "blocked"); assert.deepEqual(retry.receipt, rejection);
+      assert.equal(f.state().routing.records[0].commandId, original.commandId); assert.equal(f.state().routing.records[0].taskId, original.taskId);
+      assert.equal(f.providers.length, 0); assert.equal(f.calls.length, 0); assert.equal(f.state().control.runs.length, 0);
+    } finally {
+      WorkspaceAgentCommandControl.prototype.begin = originalBegin; WorkspaceAgentCommandControl.prototype.prepareRun = originalPrepare;
+    }
   });
 }
