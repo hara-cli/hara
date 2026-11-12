@@ -130,3 +130,22 @@ test("C13 F5 refused abort of an issued run preserves its own and sibling real f
   assert.equal(after.lifecycle.executions.find(row => row.runId === d.binding.runId).phase, "issued");
   assert.equal(after.lifecycle.executions.find(row => row.runId === d.binding.runId).terminal, null);
 });
+
+test("C13 F3 unresolved original lease refuses manual recovery even with a genuine never-issued terminal", t => {
+  const f = lifecycleFixture(t), d = f.dispatch("original terminal publication"); d.accept();
+  const release = d.lease.release.bind(d.lease), interrupted = new Error("C13 original release interruption");
+  d.lease.release = () => { throw interrupted; };
+  try {
+    assert.throws(() => f.control.abortBeforeExecution(d.prepared), error => error === interrupted);
+    const state = f.snapshot(), run = state.control.runs.find(row => row.runId === d.binding.runId), execution = state.lifecycle.executions.find(row => row.runId === run.runId);
+    assert.equal(execution.phase, "aborted_before_execution"); assert.ok(execution.terminal); assert.equal(execution.leaseReleased, false); assert.equal(run.effect, "none");
+    d.lease.assertCurrent();
+    const message = "new explicit recovery cannot bypass original closure", command = f.draft({ action: "task.dispatch", taskId: run.taskId,
+      conversationId: run.binding.sessionId, messageDigest: agentCommandMessageDigest(run.binding.sessionId, message) });
+    const recovery = { ...manualRecovery(f.agent.agentId, run, command), proofDigest: commandDigest(execution.terminal) }, before = fs.readFileSync(f.file, "utf8");
+    assert.throws(() => f.control.beginRecovery(f.transport, recovery, command, { message }), code("CONTROL_HELD"));
+    assert.equal(fs.readFileSync(f.file, "utf8"), before); d.lease.assertCurrent();
+  } finally { d.lease.release = release; }
+  f.control.reconcileLifecycleObservations(f.transport, f.agent.agentId);
+  assert.equal(f.snapshot().lifecycle.executions.find(row => row.runId === d.binding.runId).leaseReleased, true);
+});

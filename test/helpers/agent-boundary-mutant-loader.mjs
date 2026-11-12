@@ -17,6 +17,7 @@ export async function load(url, context, nextLoad) {
   if (!url.endsWith("/dist/workspace/" + ${JSON.stringify(target)})) return result;
   const source = Buffer.from(result.source).toString("utf8");
   const before = ${JSON.stringify(before)}, after = ${JSON.stringify(after)};
-  if (!source.includes(before)) throw new Error("Boundary mutation target missing");
+  if (source.split(before).length !== 2) throw new Error("Boundary mutation target missing or ambiguous");
+  process.stderr.write("[BOUNDARY_MUTATION_APPLIED:${mutation}]\\n");
   return { ...result, source: source.replace(before, after) };
 }`), import.meta.url);
