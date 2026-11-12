@@ -47,7 +47,7 @@ export class VersionedSettings<T extends State> {
       throw new Error("Settings are damaged; original and backup preserved; no empty overwrite");
     }
   }
-  private load() {
+  private load(assertCurrent = workspaceResourceCommitGuard()) {
     const file = this.file();
     if (!file.snapshot) {
       const backup = this.file(this.backupName());
@@ -70,15 +70,15 @@ export class VersionedSettings<T extends State> {
     // unavailable setting; do not reclassify it or manufacture an empty writable state.
     this.blockedSource = undefined;
     if (raw.schemaVersion !== this.version) {
-      this.backup(this.safeBackup(raw, value));
-      writePrivateStateFileSync(file, JSON.stringify(value) + "\n", { expectedText: file.snapshot.text, assertCurrent: workspaceResourceCommitGuard() });
+      this.backup(this.safeBackup(raw, value), assertCurrent);
+      writePrivateStateFileSync(file, JSON.stringify(value) + "\n", { expectedText: file.snapshot.text, assertCurrent });
     }
     return { file: this.file(), value, readOnly: false, recovered: false, migrationPending: false };
   }
-  private backup(value: unknown) {
+  private backup(value: unknown, assertCurrent = workspaceResourceCommitGuard()) {
     const target = this.file(this.backupName());
     writePrivateStateFileSync(target, JSON.stringify(value) + "\n", {
-      ...(target.snapshot ? { expectedText: target.snapshot.text } : { expectedMissing: true }), assertCurrent: workspaceResourceCommitGuard() });
+      ...(target.snapshot ? { expectedText: target.snapshot.text } : { expectedMissing: true }), assertCurrent });
   }
   read() { return this.run(() => {
     // A verified current-schema snapshot is complete. Publication may briefly claim the pathname;
@@ -102,17 +102,20 @@ export class VersionedSettings<T extends State> {
     });
   }); }
   retryMigration() { this.blockedSource = undefined; }
-  update(expected: number, change: (value: T) => T): T {
+  update(expected: number, change: (value: T) => T, assertWriteCurrent?: () => void): T {
     return this.run(() => withPrivateStateLockSync(this.home(), [], this.filename.slice(0, -5), () => {
-      const loaded = this.load();
+      const assertResource = workspaceResourceCommitGuard();
+      const assertCurrent = () => { assertResource?.(); assertWriteCurrent?.(); };
+      assertCurrent();
+      const loaded = this.load(assertCurrent);
       if (loaded.readOnly) throw new Error("Settings are read-only: pending migration, newer schema or backup recovery; original preserved");
       if (loaded.value.revision !== expected) throw new Error("Settings changed; refresh before writing");
       const value = this.parse({ ...change(structuredClone(loaded.value)), revision: expected + 1, schemaVersion: this.version });
-      this.backup(loaded.value);
+      this.backup(loaded.value, assertCurrent);
       writePrivateStateFileSync(loaded.file, JSON.stringify(value) + "\n", {
-        ...(loaded.file.snapshot ? { expectedText: loaded.file.snapshot.text } : { expectedMissing: true }), assertCurrent: workspaceResourceCommitGuard() });
+        ...(loaded.file.snapshot ? { expectedText: loaded.file.snapshot.text } : { expectedMissing: true }), assertCurrent });
       // The recovery copy must not resurrect a removed connection or point at a deleted Keychain ref.
-      this.backup(value);
+      this.backup(value, assertCurrent);
       return structuredClone(value);
     }));
   }

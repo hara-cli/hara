@@ -79,6 +79,9 @@ import { LegacyConnectionCatalog } from "./legacy-connections.js";
 import { WorkspacePreferences } from "./preferences.js";
 import { WorkspaceOnboarding } from "./onboarding.js";
 import { WorkspaceDefaultRuntime } from "./default-runtime-preferences.js";
+import type { WorkspaceResourcePrincipal } from "./account-resources.js";
+/** Restricts G1 metadata on an already admitted local Workspace; never admits Account scopes. */
+export type WorkspaceDefaultRuntimeRole = (workspaceId: string) => WorkspaceResourcePrincipal["role"] | null;
 import type { WorkspaceAgentBatchInput } from "./agents.js";
 import { WorkspaceFeatures } from "./features.js";
 import type { JsonCliPolicyFactory } from "../agent-runtime/json-cli-policy.js";
@@ -201,6 +204,8 @@ export class LocalWorkspaceHost {
     discoveryHome?: string;
     legacySourceHome?: string;
     credentialVault?: CredentialVault;
+    /** Trusted Host restriction only. No renderer/config role, human identity or execution grant. */
+    defaultRuntimeRole?: WorkspaceDefaultRuntimeRole;
     runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1];
     /** Operator entry only: detect installed engines in the background this long after a Workspace opens. */
     backgroundRuntimeDetectionMs?: number;
@@ -235,6 +240,7 @@ export class LocalWorkspaceHost {
     legacyBusinessFactory?: (input: { storage: WorkspaceResourceStorage; features: WorkspaceFeatures; resources: WorkspaceLegacyResources }) => WorkspaceLegacyBusiness;
   } = {}) {
     if (options.boundaryLifecycleControl && !options.boundaryCommandControl) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "lifecycle.bootstrap");
+    if (options.defaultRuntimeRole !== undefined && typeof options.defaultRuntimeRole !== "function") throw new Error("Invalid Workspace default runtime policy");
     this.usageCache = new WorkspaceRuntimeUsageCache(options.usageCollector);
     if (options.usageCollector) {
       this.usageTimer = setInterval(() => {
@@ -938,16 +944,33 @@ export class LocalWorkspaceHost {
   private newColleagueRuntime(workspaceId: string, options: ReturnType<WorkspaceHostContext["resources"]["agents"]["runtimeOptions"]>) {
     const available = options.filter(option => option.available && option.id !== "hara");
     let preferred: AgentRuntimeId | null = null;
-    try { preferred = this.context(workspaceId).defaultRuntime.get().defaultRuntimeId; } catch { /* A missing/unreadable preference cannot retarget existing Agents. */ }
+    try { preferred = this.getDefaultRuntime(workspaceId).defaultRuntimeId; } catch { /* A missing/unreadable preference cannot retarget existing Agents. */ }
     return available.find(option => option.id === preferred)?.id ?? available.find(option => option.id === "pi")?.id ?? available[0]?.id;
+  }
+  private defaultRuntimeWritable(workspaceId: string): boolean {
+    // The Local catalog admits only its registered local owner. This optional policy can
+    // narrow that existing metadata right; it does not connect Account membership or C1/C3.
+    this.catalog.resolve(workspaceId);
+    if (!this.options.defaultRuntimeRole) return true;
+    try { const role = this.options.defaultRuntimeRole(workspaceId); return role === "OWNER" || role === "ADMIN"; }
+    catch { return false; }
+  }
+  private assertDefaultRuntimeWritable(workspaceId: string) {
+    if (this.closing || this.updateLease) throw new Error("Workspace is preparing to restart");
+    if (!this.defaultRuntimeWritable(workspaceId)) throw new Error("Workspace default runtime is read-only");
   }
   getDefaultRuntime(workspaceId: string) {
     if (this.closing || this.updateLease) throw new Error("Workspace is preparing to restart");
-    return this.context(workspaceId).defaultRuntime.get();
+    const context = this.context(workspaceId), readOnly = !this.defaultRuntimeWritable(workspaceId);
+    const result = context.defaultRuntime.get({ readOnly, assertWriteCurrent: () => this.assertDefaultRuntimeWritable(workspaceId) });
+    return { ...result, readOnly: result.readOnly || !this.defaultRuntimeWritable(workspaceId) };
   }
   setDefaultRuntime(clientId: string, workspaceId: string, defaultRuntimeId: unknown, expectedRevision: number) {
-    const context = this.assertOnboardingView(clientId, workspaceId), result = context.defaultRuntime.set(defaultRuntimeId, expectedRevision);
-    this.changed(workspaceId); return result;
+    const context = this.assertOnboardingView(clientId, workspaceId);
+    const assertWriteCurrent = () => { this.assertOnboardingView(clientId, workspaceId); this.assertDefaultRuntimeWritable(workspaceId); };
+    assertWriteCurrent();
+    const result = context.defaultRuntime.set(defaultRuntimeId, expectedRevision, assertWriteCurrent);
+    this.changed(workspaceId); return { ...result, readOnly: result.readOnly || !this.defaultRuntimeWritable(workspaceId) };
   }
   getOnboarding(workspaceId: string) {
     if (this.closing || this.updateLease) throw new Error("Workspace is preparing to restart");

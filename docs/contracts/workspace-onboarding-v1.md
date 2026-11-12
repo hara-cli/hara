@@ -4,11 +4,15 @@ This is a Core interface slice. Desktop owns the guide and HireAgentDialog. This
 
 ## G1: new-colleague default
 
-Initialization advertises `workspace.preferences.default-runtime.v1` (unreleased draft contract, amended by Jeff on 2026-11-12). The default is **per Workspace**, separate from Host appearance and onboarding progress:
+Initialization advertises the new `workspace.default-runtime.v1` capability; the old `workspace.preferences.default-runtime.v1` draft capability is not advertised. This lets Desktop hide this setting on old Host-global draft producers. The default is **per Workspace**, separate from Host appearance and onboarding progress:
 
-- `workspace.preferences.defaultRuntime.get {workspaceId, expectedGeneration}`.
-- `workspace.preferences.defaultRuntime.set {workspaceId, expectedGeneration, expectedRevision, defaultRuntimeId: AgentRuntimeId|null}`.
+- `workspace.defaultRuntime.get {workspaceId, expectedGeneration}`.
+- `workspace.defaultRuntime.set {workspaceId, expectedGeneration, expectedRevision, defaultRuntimeId: AgentRuntimeId|null}`.
 - Reply: `{schemaVersion:1, workspaceId, revision, defaultRuntimeId, readOnly, recovered}`. `expectedRevision` uses this Workspace's G1 revision, never the appearance, onboarding or Agent-catalog revision. Read before writing. Reject stale revisions, stale generations, extra fields and writes outside the selected main-Hara/settings view. C3-protected legacy entries remain denied.
+
+OWNER/ADMIN may write; MEMBER is read-only. The role comes only from trusted Host composition, never request fields, discovery or renderer state. Missing/unknown/failed role policy results fail closed. A read-only missing record returns null/revision 0 without reading legacy migration input or creating the G1 document; callers must not initialize it by writing. Owner/admin initialization produces revision 1. Writes recheck the current view and role at each backup/primary publication. Stale revisions use the existing Settings changed RPC error; reread and prompt rather than automatically overwriting.
+
+The existing Local catalog admits only registered local owners. Its default is therefore writable; the optional Host-only `defaultRuntimeRole(workspaceId)` restriction uses the canonical Account role type and can only narrow that existing local metadata right. It does not admit an Account scope, authenticate a human, grant execution, or wire real Account members into this local transport. A future Account adapter must supply its own verified authority and freshness. Synthetic member-policy WS tests are not real Account-member production acceptance.
 
 The bound Workspace resource storage owns `workspace-default-runtime-v1.json`. A missing record is initialized once by CAS from the explicit old Host `ui-preferences-v1.json` default, if safely readable in a known schema. Missing/invalid old values seed null (Pi first); the legacy source is preserved byte-for-byte. A missing primary first arbitrates with the existing Host writer lock and may use its retained backup. A busy publication or unverified IO leaves migration pending without writing a scoped empty value. The migration reads only these bounded preference files, does not restore/migrate appearance, enumerate history or read another Agent's session. Existing scoped records, including an explicit null, never reread or follow the Host default. Workspace choices and revisions survive restart independently. Newer/corrupt scoped state follows the standard read-only recovery rules; links cannot redirect reads/writes.
 

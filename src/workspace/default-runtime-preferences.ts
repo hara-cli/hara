@@ -16,9 +16,9 @@ export class WorkspaceDefaultRuntime {
         return { schemaVersion: 1, revision: Number(raw.revision), defaultRuntimeId: raw.defaultRuntimeId as AgentRuntimeId | null };
       }, {}, storage);
   }
-  get() {
+  get(options: { readOnly?: boolean; assertWriteCurrent?: () => void } = {}) {
     const current = this.state.read();
-    if (!current.readOnly && current.value.revision === 0) {
+    if (!options.readOnly && !current.readOnly && current.value.revision === 0) {
       try {
         this.state.update(0, old => {
           // The scoped CAS winner reads only the explicit old Host preference. Once this
@@ -30,18 +30,18 @@ export class WorkspaceDefaultRuntime {
             // A safely read but invalid legacy value cannot become a valid engine choice.
           }
           return { ...old, defaultRuntimeId: initial };
-        });
+        }, options.assertWriteCurrent);
       } catch (error) {
         const latest = this.state.read(); if (latest.readOnly || latest.value.revision === 0) throw error;
       }
     }
     const { value, readOnly, recovered } = this.state.read();
-    return { ...value, workspaceId: this.storage.scope.workspaceId, readOnly, recovered };
+    return { ...value, workspaceId: this.storage.scope.workspaceId, readOnly: readOnly || !!options.readOnly, recovered };
   }
-  set(defaultRuntimeId: unknown, expectedRevision: number) {
+  set(defaultRuntimeId: unknown, expectedRevision: number, assertWriteCurrent?: () => void) {
     if (defaultRuntimeId !== null && !isAgentRuntimeId(defaultRuntimeId)) throw new Error("Invalid default Runtime preference");
     if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) throw new Error("Invalid default Runtime revision");
-    this.state.update(expectedRevision, old => ({ ...old, defaultRuntimeId: defaultRuntimeId as AgentRuntimeId | null }));
+    this.state.update(expectedRevision, old => ({ ...old, defaultRuntimeId: defaultRuntimeId as AgentRuntimeId | null }), assertWriteCurrent);
     return this.get();
   }
 }

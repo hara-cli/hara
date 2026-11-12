@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -20,8 +21,8 @@ function directory(t) {
   const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-onboarding-")));
   t.after(() => fs.promises.rm(root, { recursive: true, force: true, maxRetries: 3 })); return root;
 }
-function fixture(t) {
-  const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-onboarding-host-"))), host = new LocalWorkspaceHost(root, { credentialVault: new MemoryCredentialVault() });
+function fixture(t, options = {}) {
+  const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-onboarding-host-"))), host = new LocalWorkspaceHost(root, { credentialVault: new MemoryCredentialVault(), ...options });
   const snapshot = host.createWorkspace("New", host.list().revision), id = snapshot.workspaceId;
   host.select("client", id, host.list().revision); t.after(async () => { await host.close(); await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 3 }); });
   return { root, host, id, snapshot, agents: host.context(id).resources.agents,
@@ -223,7 +224,8 @@ test("G4: explicit rerun has a new ID and CAS; unknown fields, invalid completio
 });
 
 test("RPC: authenticated capability-gated preferences, progress and batch keep generation, fields and selection fences", async t => {
-  const root = directory(t), handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port: 0, cwd: root }, { root, version: "fixture", credentialVault: new MemoryCredentialVault(),
+  let role = "OWNER";
+  const root = directory(t), handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port: 0, cwd: root }, { root, version: "fixture", credentialVault: new MemoryCredentialVault(), defaultRuntimeRole: () => role,
     providerFactory() { throw new Error("onboarding RPC must not dispatch a model"); } });
   const socket = new WebSocket("ws://127.0.0.1:" + handle.port), pending = new Map(); let serial = 0;
   socket.on("message", raw => { const value = JSON.parse(raw), waiter = pending.get(value.id); if (waiter) { pending.delete(value.id); clearTimeout(waiter.timer); value.error ? waiter.reject(new Error(value.error.message)) : waiter.resolve(value.result); } });
@@ -231,22 +233,34 @@ test("RPC: authenticated capability-gated preferences, progress and batch keep g
   try {
     await once(socket, "open"); await assert.rejects(rpc("workspace.preferences.get", {}), /unauthorized/);
     const init = await rpc("initialize", { token: handle.token }); assert.ok(init.capabilities.includes("workspace.onboarding.v1")); assert.ok(init.capabilities.includes("workspace.agents.create-batch.v1"));
+    assert.ok(init.capabilities.includes("workspace.default-runtime.v1"));
+    assert.equal(init.capabilities.includes("workspace.preferences.default-runtime.v1"), false);
     const workspace = await rpc("workspace.create", { label: "RPC", expectedRevision: init.workspace.revision });
     await rpc("workspace.select", { workspaceId: workspace.workspaceId, expectedRevision: (await rpc("workspace.list", {})).revision });
     const binding = { workspaceId: workspace.workspaceId, expectedGeneration: workspace.resourceGeneration };
     assert.equal(Object.hasOwn(await rpc("workspace.preferences.get", {}), "defaultRuntimeId"), false);
-    let pref = await rpc("workspace.preferences.defaultRuntime.get", binding);
-    pref = await rpc("workspace.preferences.defaultRuntime.set", { ...binding, defaultRuntimeId: "pi", expectedRevision: pref.revision }); assert.equal(pref.defaultRuntimeId, "pi");
+    let pref = await rpc("workspace.defaultRuntime.get", binding);
+    pref = await rpc("workspace.defaultRuntime.set", { ...binding, defaultRuntimeId: "pi", expectedRevision: pref.revision }); assert.equal(pref.defaultRuntimeId, "pi");
     assert.equal(pref.workspaceId, binding.workspaceId);
+    await assert.rejects(rpc("workspace.preferences.defaultRuntime.get", binding), /unsupported|unknown/i);
+    await assert.rejects(rpc("workspace.preferences.defaultRuntime.set", { ...binding, defaultRuntimeId: "codex", expectedRevision: pref.revision }), /unsupported|unknown/i);
+    role = "MEMBER";
+    assert.equal((await rpc("workspace.defaultRuntime.get", binding)).readOnly, true);
+    await assert.rejects(rpc("workspace.defaultRuntime.set", { ...binding, defaultRuntimeId: "claude", expectedRevision: pref.revision }), /read-only/);
+    await assert.rejects(rpc("workspace.defaultRuntime.set", { ...binding, defaultRuntimeId: "claude", expectedRevision: pref.revision, role: "OWNER" }), /unsupported/);
+    role = "ADMIN";
+    pref = await rpc("workspace.defaultRuntime.set", { ...binding, defaultRuntimeId: "pi", expectedRevision: pref.revision });
+    assert.equal(pref.readOnly, false);
+    role = "OWNER";
     await assert.rejects(rpc("workspace.preferences.set", { defaultRuntimeId: "codex", expectedRevision: 1 }), /unsupported/);
-    await assert.rejects(rpc("workspace.preferences.defaultRuntime.get", {}), /explicit/);
-    await assert.rejects(rpc("workspace.preferences.defaultRuntime.set", { ...binding, expectedGeneration: randomUUID(), defaultRuntimeId: "codex", expectedRevision: pref.revision }), /generation|changed/i);
-    await assert.rejects(rpc("workspace.preferences.defaultRuntime.set", { ...binding, defaultRuntimeId: "codex", expectedRevision: pref.revision, actor: "human" }), /unsupported/);
+    await assert.rejects(rpc("workspace.defaultRuntime.get", {}), /explicit/);
+    await assert.rejects(rpc("workspace.defaultRuntime.set", { ...binding, expectedGeneration: randomUUID(), defaultRuntimeId: "codex", expectedRevision: pref.revision }), /generation|changed/i);
+    await assert.rejects(rpc("workspace.defaultRuntime.set", { ...binding, defaultRuntimeId: "codex", expectedRevision: pref.revision, actor: "human" }), /unsupported/);
     const second = await rpc("workspace.create", { label: "RPC other", expectedRevision: (await rpc("workspace.list", {})).revision });
     const secondBinding = { workspaceId: second.workspaceId, expectedGeneration: second.resourceGeneration };
-    const otherPref = await rpc("workspace.preferences.defaultRuntime.get", secondBinding); assert.equal(otherPref.defaultRuntimeId, null);
-    await assert.rejects(rpc("workspace.preferences.defaultRuntime.set", { ...secondBinding, defaultRuntimeId: "claude", expectedRevision: otherPref.revision }), /view changed/);
-    assert.equal((await rpc("workspace.preferences.defaultRuntime.get", binding)).defaultRuntimeId, "pi");
+    const otherPref = await rpc("workspace.defaultRuntime.get", secondBinding); assert.equal(otherPref.defaultRuntimeId, null);
+    await assert.rejects(rpc("workspace.defaultRuntime.set", { ...secondBinding, defaultRuntimeId: "claude", expectedRevision: otherPref.revision }), /view changed/);
+    assert.equal((await rpc("workspace.defaultRuntime.get", binding)).defaultRuntimeId, "pi");
     const current = await rpc("workspace.onboarding.get", binding);
     const updated = await rpc("workspace.onboarding.set", { ...binding, ...progress(current), step: 2, expectedRevision: current.revision }); assert.equal(updated.step, 2);
     await assert.rejects(rpc("workspace.onboarding.get", { ...binding, expectedGeneration: randomUUID() }), /generation|changed/i);
@@ -275,4 +289,69 @@ test("G4: newer/corrupt progress is read-only and a symlink cannot redirect its 
   assert.throws(() => f.host.setOnboarding("client", f.id, progress(initial), initial.revision), /read-only/); assert.deepEqual(fs.readFileSync(file), before);
   const outside = join(f.root, "retained-private.txt"); fs.writeFileSync(outside, "preserved"); fs.unlinkSync(file); fs.symlinkSync(outside, file);
   assert.throws(() => f.host.setOnboarding("client", f.id, progress(initial), initial.revision)); assert.equal(fs.readFileSync(outside, "utf8"), "preserved");
+});
+
+
+test("G1: trusted member policy cannot initialize a missing preference or read its legacy seed", t => {
+  let role = "MEMBER";
+  const seen = [], f = fixture(t, { defaultRuntimeRole: workspaceId => { seen.push(workspaceId); return role; } });
+  const file = f.path("workspace-default-runtime-v1.json"), backup = f.path("workspace-default-runtime-v1-backup.json");
+  const legacy = t.mock.method(f.host.preferences, "legacyDefaultRuntimeId", () => "claude");
+  const first = f.host.getDefaultRuntime(f.id);
+  assert.equal(first.readOnly, true); assert.equal(first.revision, 0); assert.equal(first.defaultRuntimeId, null);
+  assert.equal(legacy.mock.callCount(), 0); assert.equal(fs.existsSync(file), false); assert.equal(fs.existsSync(backup), false);
+  assert.throws(() => f.host.setDefaultRuntime("client", f.id, "pi", first.revision), /read-only/);
+  assert.equal(fs.existsSync(file), false);
+  role = "OWNER";
+  const seeded = f.host.getDefaultRuntime(f.id); assert.equal(seeded.defaultRuntimeId, "claude"); assert.equal(seeded.revision, 1); assert.equal(seeded.readOnly, false);
+  assert.equal(legacy.mock.callCount(), 1);
+  role = "ADMIN";
+  const saved = f.host.setDefaultRuntime("client", f.id, "codex", seeded.revision); assert.equal(saved.defaultRuntimeId, "codex");
+  const before = fs.readFileSync(file);
+  role = "MEMBER";
+  assert.equal(f.host.getDefaultRuntime(f.id).defaultRuntimeId, "codex"); assert.equal(f.host.getDefaultRuntime(f.id).readOnly, true);
+  assert.throws(() => f.host.setDefaultRuntime("client", f.id, null, saved.revision), /read-only/);
+  assert.deepEqual(fs.readFileSync(file), before); assert.equal(legacy.mock.callCount(), 1); assert.ok(seen.length > 0 && seen.every(id => id === f.id));
+});
+
+test("G1: absent, unknown and failed trusted role results fail closed without a scoped document", t => {
+  let current = null;
+  const f = fixture(t, { defaultRuntimeRole: () => { if (current instanceof Error) throw current; return current; } });
+  for (const role of [null, undefined, "owner", "UNKNOWN", new Error("private policy failure")]) {
+    current = role;
+    const result = f.host.getDefaultRuntime(f.id); assert.equal(result.readOnly, true); assert.equal(result.revision, 0);
+    assert.throws(() => f.host.setDefaultRuntime("client", f.id, "pi", 1), /read-only/);
+    assert.equal(fs.existsSync(f.path("workspace-default-runtime-v1.json")), false);
+  }
+});
+
+test("G1: role revocation during backup publication cannot publish a new primary", t => {
+  let role = "OWNER";
+  const f = fixture(t, { defaultRuntimeRole: () => role });
+  const initial = f.host.getDefaultRuntime(f.id), file = f.path("workspace-default-runtime-v1.json"), backup = f.path("workspace-default-runtime-v1-backup.json");
+  const before = fs.readFileSync(file), original = fs.linkSync; let revoked = false;
+  fs.linkSync = function(from, to) { const result = original.apply(this, arguments); if (to === backup) { role = "MEMBER"; revoked = true; } return result; };
+  syncBuiltinESMExports();
+  try { assert.throws(() => f.host.setDefaultRuntime("client", f.id, "codex", initial.revision), /read-only/); }
+  finally { fs.linkSync = original; syncBuiltinESMExports(); }
+  assert.equal(revoked, true); assert.deepEqual(fs.readFileSync(file), before);
+  const read = f.host.getDefaultRuntime(f.id); assert.equal(read.readOnly, true); assert.equal(read.defaultRuntimeId, initial.defaultRuntimeId);
+});
+
+test("G1: trusted metadata policy is evaluated for the exact Workspace, not the last selected one", t => {
+  const roles = new Map(), f = fixture(t, { defaultRuntimeRole: id => roles.get(id) ?? null });
+  roles.set(f.id, "OWNER");
+  const first = f.host.getDefaultRuntime(f.id);
+  f.host.setDefaultRuntime("client", f.id, "codex", first.revision);
+  const other = f.host.createWorkspace("Read only", f.host.list().revision);
+  const member = f.host.getDefaultRuntime(other.workspaceId);
+  assert.equal(member.readOnly, true); assert.equal(member.revision, 0);
+  f.host.select("client", other.workspaceId, f.host.list().revision);
+  assert.throws(() => f.host.setDefaultRuntime("client", other.workspaceId, "pi", 1), /read-only/);
+  assert.equal(f.host.getDefaultRuntime(f.id).defaultRuntimeId, "codex");
+  roles.set(other.workspaceId, "ADMIN");
+  const admin = f.host.getDefaultRuntime(other.workspaceId);
+  const saved = f.host.setDefaultRuntime("client", other.workspaceId, "claude", admin.revision);
+  assert.equal(saved.readOnly, false); assert.equal(saved.defaultRuntimeId, "claude");
+  assert.equal(f.host.getDefaultRuntime(f.id).defaultRuntimeId, "codex");
 });
