@@ -1,3 +1,4 @@
+import type { AgentRoutingClaim } from "./agent-boundary-authority.js";
 import { workspaceRunDrainProof, assertWorkspaceRunDrainOwner, workspaceRunEffectFacts, workspaceRunDrainFacts, workspaceRunQuiescenceFacts, assertWorkspaceRunQuiescenceOwner, type WorkspaceRunPermit } from "./execution.js";
 // C3 trusted Host composition. There is no default issuer and no renderer callback/approved boolean.
 import { createHash, randomUUID } from "node:crypto";
@@ -20,7 +21,7 @@ declare const intakeBrand: unique symbol;
 export interface AgentCommandIntake { readonly [intakeBrand]: true }
 declare const preparationBrand: unique symbol;
 export interface AgentCommandRunPreparation { readonly [preparationBrand]: true }
-interface Intake { owner: WorkspaceAgentCommandControl; transport: Parameters<WorkspaceAgentBoundaryAuthority["admit"]>[0]; command: AgentBoundaryCommand; proposal?: unknown; recovery?: AgentLifecycleRecoveryV1; consumed: boolean }
+interface Intake { owner: WorkspaceAgentCommandControl; transport: Parameters<WorkspaceAgentBoundaryAuthority["admit"]>[0]; command: AgentBoundaryCommand; proposal?: unknown; recovery?: AgentLifecycleRecoveryV1; routing?: AgentRoutingClaim; consumed: boolean }
 interface Preparation { intake: AgentCommandIntake; binding: Readonly<WorkspaceRunBinding>; lease: WorkspaceSessionLease; requestId: string }
 interface LiveRun extends Preparation { accepted: Readonly<AgentCommandRun>; command: AgentBoundaryCommand; grant: AgentCommandGrant; bound: boolean; permit?: WorkspaceRunPermit }
 const intakes = new WeakMap<object, Intake>(), preparations = new WeakMap<object, Preparation>();
@@ -85,7 +86,7 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
     const state = handle && typeof handle === "object" ? intakes.get(handle) : undefined;
     if (!state || state.owner !== this || state.consumed || !this.available && !restrictive(state.command.operation.action)) return fail("AUTHORITY_UNVERIFIED", "control.intake"); return state;
   }
-  begin(transport: Intake["transport"], raw: unknown, input: { message?: string; proposal?: unknown } = {}): { receipt: AgentBoundaryReceipt } | { intake: AgentCommandIntake } {
+  begin(transport: Intake["transport"], raw: unknown, input: { message?: string; proposal?: unknown; routing?: AgentRoutingClaim } = {}): { receipt: AgentBoundaryReceipt } | { intake: AgentCommandIntake } {
     const parsed = parseAgentBoundaryDocument(raw);
     if (parsed.kind !== "command") return fail("INVALID_DOCUMENT");
     const snapshot = this.authority.commandControlForReader(transport, parsed.agentId);
@@ -118,8 +119,9 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
     if (command.operation.action === "task.dispatch") {
       if (!messageBody(input.message) || agentCommandMessageDigest(command.operation.conversationId, input.message) !== command.operation.messageDigest) return fail("AUTHORITY_UNVERIFIED", "control.message");
     } else if (input.message !== undefined) return fail("INVALID_DOCUMENT", "control.message");
+    this.authority.assertRoutingClaim(transport, input.routing, command);
     const handle = Object.freeze({}) as AgentCommandIntake;
-    intakes.set(handle, { owner: this, transport, command, ...(input.proposal !== undefined ? { proposal: structuredClone(input.proposal) } : {}), consumed: false });
+    intakes.set(handle, { owner: this, transport, command, ...(input.proposal !== undefined ? { proposal: structuredClone(input.proposal) } : {}), ...(input.routing ? { routing: input.routing } : {}), consumed: false });
     return { intake: handle };
   }
   private previousLifecycleRun(control: AgentCommandState, lifecycle: AgentLifecycleState, runId: string): { run: AgentCommandRun; execution: AgentLifecycleRun } {
@@ -202,6 +204,7 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
     const intake = this.intake(handle), { command, transport } = intake, operation = command.operation;
     let grant: AgentCommandGrant | undefined;
     try {
+      this.authority.assertRoutingClaim(transport, intake.routing, command);
       grant = this.authority.admit(transport, command);
       const snapshot = this.authority.commandControlState(), { control, lifecycle } = snapshot;
       if (intake.recovery) this.recoveryAnchor(control, lifecycle, intake.recovery, this.authority.lifecycleRights(transport, command.agentId));
@@ -308,7 +311,7 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
         }
         assertAgentCommandCapacity(state, !code && drain);
         return { control: state, applyPolicy, ...(lifecycle ? { lifecycle } : {}) };
-      }, intake.proposal);
+      }, intake.proposal, intake.routing);
       for (let attempt = 0; ; attempt++) {
         acceptedNew = false;
         try { transact(); break; }

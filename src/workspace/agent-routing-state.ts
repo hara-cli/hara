@@ -15,7 +15,7 @@ export interface AgentRoutingClassification {
   phase: "submission_started" | "completed" | "unknown" | "failed"; candidateId: string | null; responseDigest: string | null;
 }
 export interface AgentRoutingRecord {
-  workKey: string; channelId: string; workItemId: string; rootRequestId: string; requestId: string; inputDigest: string;
+  workKey: string; channelId: string; workItemId: string; rootRequestId: string; requestId: string; requestDigest: string; selectionRequestId: string; selectionRequestDigest: string; sourceRef: string; inputDigest: string;
   commandId: string; taskId: string; audienceDigest: string; catalogDigest: string; candidates: AgentRoutingCandidateVersion[];
   revision: number; state: "needs_owner" | "selected" | "claimed"; ownerAgentId: string | null; method: AgentRoutingMethod | null; reason: AgentRoutingReason;
   claim: { commandId: string; taskId: string; runId: string; claimRevision: number } | null;
@@ -68,9 +68,9 @@ export function parseAgentRoutingState(raw: unknown, control: AgentCommandState,
   const value = raw as unknown as AgentRoutingState; assertAgentRoutingCapacity(value);
   const keys = new Set<string>(), roots = new Set<string>(), commands = new Set<string>(), tasks = new Set<string>();
   for (const r of value.records) {
-    routingFields(r, ["workKey", "channelId", "workItemId", "rootRequestId", "requestId", "inputDigest", "commandId", "taskId", "audienceDigest", "catalogDigest", "candidates", "revision", "state", "ownerAgentId", "method", "reason", "claim", "classification"]);
-    if (![r.workKey, r.inputDigest, r.audienceDigest, r.catalogDigest].every(hash) || !UUID.test(r.channelId)
-      || ![r.workItemId, r.rootRequestId, r.requestId, r.commandId, r.taskId].every(commandId) || !positive(r.revision)
+    routingFields(r, ["workKey", "channelId", "workItemId", "rootRequestId", "requestId", "requestDigest", "selectionRequestId", "selectionRequestDigest", "sourceRef", "inputDigest", "commandId", "taskId", "audienceDigest", "catalogDigest", "candidates", "revision", "state", "ownerAgentId", "method", "reason", "claim", "classification"]);
+    if (![r.workKey, r.inputDigest, r.requestDigest, r.selectionRequestDigest, r.sourceRef, r.audienceDigest, r.catalogDigest].every(hash) || !UUID.test(r.channelId)
+      || ![r.workItemId, r.rootRequestId, r.requestId, r.selectionRequestId, r.commandId, r.taskId].every(commandId) || !positive(r.revision)
       || keys.has(r.workKey) || roots.has(r.rootRequestId) || commands.has(r.commandId) || tasks.has(r.taskId)
       || !["needs_owner", "selected", "claimed"].includes(r.state) || !["no_match", "ambiguous", "scope_denied", "classification_unavailable", "responsibility_rejected", "stale", "selected", "current_owner"].includes(r.reason)
       || !(r.method === null || ["explicit_human", "business_mapping", "duty_match", "classification"].includes(r.method))
@@ -96,7 +96,7 @@ export function parseAgentRoutingState(raw: unknown, control: AgentCommandState,
     if (r.classification) {
       const c = r.classification; routingFields(c, ["requestId", "providerRef", "inputDigest", "catalogDigest", "startedAt", "phase", "candidateId", "responseDigest"]);
       if (!commandId(c.requestId) || !commandId(c.providerRef) || !hash(c.inputDigest) || !hash(c.catalogDigest) || !timestamp(c.startedAt)
-        || !["submission_started", "completed", "unknown", "failed"].includes(c.phase) || !(c.candidateId === null || agents.has(c.candidateId))
+        || !["submission_started", "completed", "unknown", "failed"].includes(c.phase) || !(c.candidateId === null || commandId(c.candidateId))
         || !(c.responseDigest === null || hash(c.responseDigest)) || c.phase !== "completed" && c.candidateId !== null
         || r.method === "classification" && (c.phase !== "completed" || c.candidateId !== r.ownerAgentId)) return routingFail();
     } else if (r.method === "classification") return routingFail();
@@ -111,8 +111,9 @@ export function assertAgentRoutingTransition(before: AgentRoutingState, after: A
   for (const old of before.records) {
     const next = after.records.find(row => row.workKey === old.workKey); if (!next) return routingFail("routing.transition");
     if (canonical(old) === canonical(next) ? next.revision !== old.revision : next.revision !== old.revision + 1) return routingFail("routing.revision");
-    for (const key of ["channelId", "workItemId", "rootRequestId", "requestId", "inputDigest", "commandId", "taskId"] as const)
+    for (const key of ["channelId", "workItemId", "rootRequestId", "requestId", "requestDigest", "sourceRef", "inputDigest", "commandId", "taskId"] as const)
       if (old[key] !== next[key]) return routingFail("routing.transition");
+    if (old.state === "selected" && next.state !== "claimed" && canonical(old) !== canonical(next)) return routingFail("routing.owner");
     if (old.state === "claimed" && canonical(old) !== canonical(next) || old.state !== "claimed" && next.state === "claimed" && !next.claim) return routingFail("routing.claim");
     if (old.classification) {
       if (!next.classification) return routingFail("routing.classification");
