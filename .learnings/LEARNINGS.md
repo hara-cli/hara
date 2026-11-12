@@ -1502,3 +1502,6 @@ Historical shape validation must not be the admission predicate for resuming an 
 
 ## LRN-20261112-ONBOARDING-ATOMIC-BATCH (best_practice)
 For retryable configuration creation, persist the successful draft key on the retained Agent in the same catalog CAS. Return existing records before checking the caller's stale revision, but block all new slots on a stale catalog. Failed rows have stable actionable codes and no durable success marker. Progress, chosen defaults and row keys are UX metadata, never human provenance or execution authority. Existing C3 legacy-entry denial still applies.
+
+## 2026-11-12 Workspace default-runtime scope
+A new-colleague default is Workspace metadata, with its own resource binding and CAS revision. Use a Host-global value only as a one-time migration seed; persisted null also ends that migration. Keep appearance revisions independent, fence scoped RPC by generation and view, and test two spaces plus restart and the actual proposal card. Saving a choice is not an engine readiness probe or execution authorization.

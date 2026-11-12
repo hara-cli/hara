@@ -78,6 +78,7 @@ import { MacKeychainCredentialVault, type CredentialVault } from "./credential-v
 import { LegacyConnectionCatalog } from "./legacy-connections.js";
 import { WorkspacePreferences } from "./preferences.js";
 import { WorkspaceOnboarding } from "./onboarding.js";
+import { WorkspaceDefaultRuntime } from "./default-runtime-preferences.js";
 import type { WorkspaceAgentBatchInput } from "./agents.js";
 import { WorkspaceFeatures } from "./features.js";
 import type { JsonCliPolicyFactory } from "../agent-runtime/json-cli-policy.js";
@@ -109,7 +110,7 @@ const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTo
 export const colleagueCreateIntent = (message: string): boolean =>
   !/(?:不要|别|別|不必|无需|無需|do not|don't|never|without)\s*.{0,12}?(?:建立|建一?[个個位]?|创建|創建|新增|create|add)/iu.test(message)
   && /(?:建立|建一?[个個位]?|创建|創建|新增|create|add)\s*.{0,30}?(?:同事|bot|agent|colleague)/iu.test(message);
-interface WorkspaceHostContext { onboarding: WorkspaceOnboarding; commandControl?: WorkspaceAgentCommandControl; boundaryAuthority?: WorkspaceAgentBoundaryAuthority; media?: WorkspaceMediaRegistry; resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; homes: WorkspaceColleagueHomes; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; extensions: WorkspaceExtensions; mcp: WorkspaceMcpManager; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
+interface WorkspaceHostContext { defaultRuntime: WorkspaceDefaultRuntime; onboarding: WorkspaceOnboarding; commandControl?: WorkspaceAgentCommandControl; boundaryAuthority?: WorkspaceAgentBoundaryAuthority; media?: WorkspaceMediaRegistry; resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; homes: WorkspaceColleagueHomes; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; extensions: WorkspaceExtensions; mcp: WorkspaceMcpManager; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
 type WorkspaceConnectionSnapshot = ReturnType<WorkspaceConnectionStoreV2["list"]> & {
   readOnly?: boolean; recovered?: boolean; migrationPending?: boolean; unavailable?: boolean; activeConnectionId?: string | null;
 };
@@ -497,7 +498,7 @@ export class LocalWorkspaceHost {
     const runtimes = new WorkspaceRuntimeInstaller(storage, { ...((this.options.discoveryHome ?? this.options.hostHome) ? { discovery: { home: (this.options.discoveryHome ?? this.options.hostHome)!, probeHome: this.options.hostHome, shell: process.env.HARA_WORKSPACE_HOST_SHELL } } : {}),
       ...this.options.runtimeInstallerOptions, onChange: () => this.changed(workspaceId) });
     const resources = new WorkspaceResources(this.home, row.scope, { assertCurrent: assertAuthority, runtimeInstaller: runtimes }); resources.initialize(); resources.agents.migrateDefaultLabels();
-    const context: WorkspaceHostContext = { onboarding: new WorkspaceOnboarding(storage), storage, resources, connections, project, homes: new WorkspaceColleagueHomes(storage, project), extensions: new WorkspaceExtensions(storage),
+    const context: WorkspaceHostContext = { defaultRuntime: new WorkspaceDefaultRuntime(storage, () => this.preferences.legacyDefaultRuntimeId()), onboarding: new WorkspaceOnboarding(storage), storage, resources, connections, project, homes: new WorkspaceColleagueHomes(storage, project), extensions: new WorkspaceExtensions(storage),
       mcp: new WorkspaceMcpManager(storage, { accountHome: this.options.hostHome ?? this.home, invalidateReview: (sourceId, revision) => this.mcpOwnerReview.invalidate(sourceId, revision), proxy: () => runtimes.proxy.read(), onChange: () => this.changed(workspaceId) }),
       features: new WorkspaceFeatures(storage, project, workspaceId, this.options.mode === "workspace" ? this.options.hostHome : undefined),
       runtimes, runtimeModels: new WorkspaceRuntimeModels(storage, runtimes) };
@@ -934,11 +935,19 @@ export class LocalWorkspaceHost {
     }
     return { applied, agent: agents.list().agents.find(row => row.agentId === input.agentId) ?? null };
   }
-  private newColleagueRuntime(options: ReturnType<WorkspaceHostContext["resources"]["agents"]["runtimeOptions"]>) {
+  private newColleagueRuntime(workspaceId: string, options: ReturnType<WorkspaceHostContext["resources"]["agents"]["runtimeOptions"]>) {
     const available = options.filter(option => option.available && option.id !== "hara");
     let preferred: AgentRuntimeId | null = null;
-    try { preferred = this.preferences.read().defaultRuntimeId; } catch { /* A missing/unreadable preference cannot retarget existing Agents. */ }
+    try { preferred = this.context(workspaceId).defaultRuntime.get().defaultRuntimeId; } catch { /* A missing/unreadable preference cannot retarget existing Agents. */ }
     return available.find(option => option.id === preferred)?.id ?? available.find(option => option.id === "pi")?.id ?? available[0]?.id;
+  }
+  getDefaultRuntime(workspaceId: string) {
+    if (this.closing || this.updateLease) throw new Error("Workspace is preparing to restart");
+    return this.context(workspaceId).defaultRuntime.get();
+  }
+  setDefaultRuntime(clientId: string, workspaceId: string, defaultRuntimeId: unknown, expectedRevision: number) {
+    const context = this.assertOnboardingView(clientId, workspaceId), result = context.defaultRuntime.set(defaultRuntimeId, expectedRevision);
+    this.changed(workspaceId); return result;
   }
   getOnboarding(workspaceId: string) {
     if (this.closing || this.updateLease) throw new Error("Workspace is preparing to restart");
@@ -960,14 +969,17 @@ export class LocalWorkspaceHost {
     if (!plain(input) || !exact(input, ["runId", "rows"]) || typeof input.runId !== "string" || !UUID.test(input.runId)
       || !Array.isArray(input.rows) || input.rows.length < 1 || input.rows.length > 8) throw new Error("Invalid colleague batch");
     // Resolve only an omitted choice. An explicit unavailable runtime is a row failure, never a fallback.
-    const fallback = this.newColleagueRuntime(context.resources.agents.runtimeOptions());
+    const fallback = this.newColleagueRuntime(workspaceId, context.resources.agents.runtimeOptions());
     const rows = input.rows.map(row => plain(row) && !Object.hasOwn(row, "runtimeId") ? { ...row, runtimeId: fallback } : row);
     const result = context.resources.agents.createBatch({ runId: input.runId, rows } as WorkspaceAgentBatchInput, expectedCatalogRevision);
     if (result.results.some(row => row.status === "created")) this.changed(workspaceId);
     return result;
   }
-  getPreferences() { const current = this.preferences.read(); if (!current.readOnly && current.revision === 0) this.preferences.save(current.theme, 0); return this.preferences.read(); }
-  setPreferences(theme: unknown, expected: number, extra = {}) { this.preferences.save(theme, expected, extra); return this.preferences.read(); }
+  getPreferences() {
+    const current = this.preferences.read(); if (!current.readOnly && current.revision === 0) this.preferences.save(current.theme, 0);
+    const { defaultRuntimeId: _legacyDefaultRuntimeId, ...appearance } = this.preferences.read(); return appearance;
+  }
+  setPreferences(theme: unknown, expected: number, extra = {}) { this.preferences.save(theme, expected, extra); return this.getPreferences(); }
   private connectionSource(workspaceId: string) { return this.context(workspaceId).storage.run(() => join(workspaceStateHome(), ".hara/workspace-connections-v2.json")); }
   legacyConnections(workspaceId: string) { return this.legacy?.list(this.connectionSource(workspaceId)) ?? []; }
   importConnection(workspaceId: string, id: string, expected: number, approved: boolean): void {
@@ -1665,7 +1677,7 @@ export class LocalWorkspaceHost {
         agentCreateAttempts += 1; // Reserve before approval yields so parallel tool uses cannot show two cards.
         const options = job.context.resources.agents.runtimeOptions().filter(row => row.available && row.id !== "hara");
         // The saved preference affects only a new draft; the person still chooses on the card.
-        const defaultRuntime = host.newColleagueRuntime(options);
+        const defaultRuntime = host.newColleagueRuntime(job.workspaceId, options);
         if (!defaultRuntime) return JSON.stringify({ created: false, refused: "runtime_unavailable", humanConfirmed: false });
         const decision = await host.approval(job, { username: proposed.username as string, displayName: proposed.displayName as string, title: proposed.title as string, instructions: proposed.instructions as string,
           project: typeof proposed.project === "string" ? proposed.project : "", runtimeId: defaultRuntime, permissionTier: defaultRuntimePermissionTier() });

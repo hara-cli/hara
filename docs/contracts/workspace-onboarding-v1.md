@@ -4,9 +4,19 @@ This is a Core interface slice. Desktop owns the guide and HireAgentDialog. This
 
 ## G1: new-colleague default
 
-Initialization advertises `workspace.preferences.default-runtime.v1`. `workspace.preferences.get` adds `defaultRuntimeId: AgentRuntimeId | null` to the existing Host UI preferences. Old v2 documents project a missing value as null without rewriting on read. `workspace.preferences.set` accepts `{defaultRuntimeId, expectedRevision}` or the existing theme/display/update fields; its shared revision is required. Null restores the previous Pi-first behavior. Default-only changes preserve appearance and unrelated preferences.
+Initialization advertises `workspace.preferences.default-runtime.v1` (unreleased draft contract, amended by Jeff on 2026-11-12). The default is **per Workspace**, separate from Host appearance and onboarding progress:
 
-The proposal tool and omitted batch runtime choices use the saved engine only if currently available for new colleagues, otherwise available Pi, otherwise the first available colleague engine. The model cannot select this value through `agent_create` arguments, and the existing human confirmation card remains required. An explicit batch runtime is honored exactly or fails; it never silently falls back. Existing Agent bindings/configurations and in-flight tasks are unchanged. Desktop must consume the preference in its own hire dialog.
+- `workspace.preferences.defaultRuntime.get {workspaceId, expectedGeneration}`.
+- `workspace.preferences.defaultRuntime.set {workspaceId, expectedGeneration, expectedRevision, defaultRuntimeId: AgentRuntimeId|null}`.
+- Reply: `{schemaVersion:1, workspaceId, revision, defaultRuntimeId, readOnly, recovered}`. `expectedRevision` uses this Workspace's G1 revision, never the appearance, onboarding or Agent-catalog revision. Read before writing. Reject stale revisions, stale generations, extra fields and writes outside the selected main-Hara/settings view. C3-protected legacy entries remain denied.
+
+The bound Workspace resource storage owns `workspace-default-runtime-v1.json`. A missing record is initialized once by CAS from the explicit old Host `ui-preferences-v1.json` default, if safely readable in a known schema. Missing/invalid/unreadable old values seed null (Pi first); the legacy source is preserved byte-for-byte. The migration reads only that bounded file, does not run an appearance migration, enumerate history or read another Agent's session. Existing scoped records, including an explicit null, never reread or follow the Host default. Workspace choices and revisions survive restart independently. Newer/corrupt scoped state follows the standard read-only recovery rules; links cannot redirect reads/writes.
+
+`workspace.preferences.get/set` continue to manage Host appearance/update settings. Their public DTO no longer exposes the legacy default; global default writes are rejected. Appearance saves preserve any old migration input. This replaces the original Host-global G1 draft before merge; Desktop #78 must use the scoped calls and drop stale replies after switching Workspaces. The setting belongs inside the Workspace's read-only boundary. Onboarding step one uses the same G1 calls; saving onboarding progress alone never changes G1.
+
+The proposal tool and omitted batch runtime choices read **their bound Workspace's** saved engine, use it only if currently available for new colleagues, otherwise available Pi, otherwise the first available colleague engine. Null restores Pi first. The model cannot select this value through `agent_create` arguments, and the existing human confirmation card remains required. An explicit batch runtime is honored exactly or fails, with no silent fallback. Existing Agent bindings/configurations and in-flight tasks are unchanged.
+
+In 1.3.0 Desktop, hiring consumes this preference indirectly through Core's `agent_create` confirmation card. The legacy-only `HireAgentDialog` is not used by that entry and is outside this slice. Settings and onboarding consume the scoped G1 API; a saved choice never probes/starts a runtime or proves it works.
 
 ## G2: `workspace.agents.createBatch`
 

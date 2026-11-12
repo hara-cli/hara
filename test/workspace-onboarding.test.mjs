@@ -28,31 +28,80 @@ function fixture(t) {
 const row = (key, username = key, extra = {}) => ({ draftKey: key, username, profile: { displayName: username }, instructions: "Scoped helper", runtimeId: "pi", permissionTier: "controlled", ...extra });
 const progress = value => Object.fromEntries(["runId", "step", "engineChoice", "thirdPartySkipped", "dismissed", "completedAt"].map(key => [key, value[key]]));
 
-test("G1: old preferences default to null without rewriting; default-only CAS saves preserve appearance", t => {
+test("G1: pure legacy migration input preserves appearance bytes and global writes are refused", t => {
   const home = directory(t), prefs = new WorkspacePreferences(home);
-  prefs.save("dark", 0); const path = join(home, ".hara", "ui-preferences-v1.json");
-  const old = JSON.parse(fs.readFileSync(path)); delete old.defaultRuntimeId; fs.writeFileSync(path, JSON.stringify(old));
-  const before = fs.readFileSync(path); assert.equal(prefs.read().defaultRuntimeId, null); assert.deepEqual(fs.readFileSync(path), before);
-  prefs.save(undefined, 1, { defaultRuntimeId: "claude" }); assert.equal(prefs.read().theme, "dark"); assert.equal(prefs.read().defaultRuntimeId, "claude");
-  assert.throws(() => prefs.save(undefined, 1, { defaultRuntimeId: "pi" }), /changed/);
-  assert.throws(() => prefs.save(undefined, 2, { defaultRuntimeId: "invented" }), /Runtime/);
-  prefs.save("light", 2); assert.equal(new WorkspacePreferences(home).read().defaultRuntimeId, "claude");
-  prefs.save(undefined, 3, { defaultRuntimeId: null }); assert.equal(prefs.read().defaultRuntimeId, null);
+  prefs.save("dark", 0); const file = join(home, ".hara", "ui-preferences-v1.json");
+  const old = JSON.parse(fs.readFileSync(file)); old.defaultRuntimeId = "claude"; fs.writeFileSync(file, JSON.stringify(old));
+  const before = fs.readFileSync(file); assert.equal(prefs.legacyDefaultRuntimeId(), "claude"); assert.deepEqual(fs.readFileSync(file), before);
+  assert.throws(() => prefs.save(undefined, 1, { defaultRuntimeId: "pi" }), /explicit Workspace/);
+  assert.deepEqual(fs.readFileSync(file), before);
+  prefs.save("light", 1); assert.equal(prefs.read().defaultRuntimeId, "claude");
+  const future = { ...JSON.parse(fs.readFileSync(file)), schemaVersion: 99 }; fs.writeFileSync(file, JSON.stringify(future));
+  const retained = fs.readFileSync(file); assert.throws(() => prefs.legacyDefaultRuntimeId(), /legacy/); assert.deepEqual(fs.readFileSync(file), retained);
+});
+
+test("G1: two Workspaces independently migrate the old Host value once, retain null and survive restart", async t => {
+  const f = fixture(t); f.host.getPreferences();
+  const legacy = join(f.host.home, ".hara", "ui-preferences-v1.json");
+  const old = JSON.parse(fs.readFileSync(legacy)); old.defaultRuntimeId = "codex"; fs.writeFileSync(legacy, JSON.stringify(old));
+  const before = fs.readFileSync(legacy), a = f.host.getDefaultRuntime(f.id);
+  const second = f.host.createWorkspace("Other", f.host.list().revision), b = f.host.getDefaultRuntime(second.workspaceId);
+  assert.equal(a.workspaceId, f.id); assert.equal(b.workspaceId, second.workspaceId); assert.equal(a.defaultRuntimeId, "codex"); assert.equal(b.defaultRuntimeId, "codex");
+  assert.deepEqual(fs.readFileSync(legacy), before); assert.equal(Object.hasOwn(f.host.getPreferences(), "defaultRuntimeId"), false);
+  f.host.select("client", f.id, f.host.list().revision);
+  const aNext = f.host.setDefaultRuntime("client", f.id, null, a.revision);
+  assert.equal(aNext.defaultRuntimeId, null); assert.equal(f.host.getDefaultRuntime(second.workspaceId).defaultRuntimeId, "codex");
+  assert.throws(() => f.host.setDefaultRuntime("client", f.id, "pi", a.revision), /changed/);
+  assert.throws(() => f.host.setDefaultRuntime("client", second.workspaceId, "pi", b.revision), /view changed/);
+  const appearance = f.host.getPreferences(); f.host.setPreferences("dark", appearance.revision);
+  assert.equal(f.host.getDefaultRuntime(f.id).revision, aNext.revision); assert.equal(f.host.getDefaultRuntime(second.workspaceId).revision, b.revision);
+  const changedLegacy = JSON.parse(fs.readFileSync(legacy)); changedLegacy.defaultRuntimeId = "agy"; fs.writeFileSync(legacy, JSON.stringify(changedLegacy));
+  const noLegacyRead = t.mock.method(WorkspacePreferences.prototype, "legacyDefaultRuntimeId", () => assert.fail("a migrated Workspace must not reread the Host default"));
+  const reopened = new LocalWorkspaceHost(f.root); t.after(() => reopened.close());
+  assert.equal(reopened.getDefaultRuntime(f.id).defaultRuntimeId, null); assert.equal(reopened.getDefaultRuntime(second.workspaceId).defaultRuntimeId, "codex");
+  noLegacyRead.mock.restore();
+  f.host.select("client", second.workspaceId, f.host.list().revision);
+  const bNext = f.host.setDefaultRuntime("client", second.workspaceId, "claude", b.revision);
+  assert.equal(f.host.getDefaultRuntime(f.id).defaultRuntimeId, null); assert.equal(bNext.defaultRuntimeId, "claude");
+  assert.throws(() => f.host.setDefaultRuntime("client", second.workspaceId, "unknown", bNext.revision), /Runtime/);
+});
+
+test("G1: an unreadable old value stays preserved and Workspace writes remain independent", t => {
+  const f = fixture(t); f.host.getPreferences(); const legacy = join(f.host.home, ".hara", "ui-preferences-v1.json");
+  fs.writeFileSync(legacy, "{"); const initial = f.host.getDefaultRuntime(f.id);
+  assert.equal(initial.defaultRuntimeId, null); assert.equal(fs.readFileSync(legacy, "utf8"), "{");
+  assert.equal(f.host.setDefaultRuntime("client", f.id, "claude", initial.revision).defaultRuntimeId, "claude");
+  assert.equal(fs.readFileSync(legacy, "utf8"), "{");
+});
+
+test("G1: unknown/corrupt scoped settings and links cannot overwrite retained Workspace state", t => {
+  const f = fixture(t), initial = f.host.getDefaultRuntime(f.id), file = f.path("workspace-default-runtime-v1.json");
+  const saved = f.host.setDefaultRuntime("client", f.id, "codex", initial.revision);
+  const future = { ...JSON.parse(fs.readFileSync(file)), schemaVersion: 99, futureField: true }; fs.writeFileSync(file, JSON.stringify(future));
+  const before = fs.readFileSync(file), read = f.host.getDefaultRuntime(f.id); assert.equal(read.readOnly, true);
+  assert.throws(() => f.host.setDefaultRuntime("client", f.id, "pi", saved.revision), /read-only/); assert.deepEqual(fs.readFileSync(file), before);
+  fs.writeFileSync(file, "{"); assert.equal(f.host.getDefaultRuntime(f.id).recovered, true);
+  assert.throws(() => f.host.setDefaultRuntime("client", f.id, "pi", saved.revision), /read-only/); assert.equal(fs.readFileSync(file, "utf8"), "{");
+  const outside = join(f.root, "retained-default-runtime.json"); fs.writeFileSync(outside, "retained"); fs.unlinkSync(file); fs.symlinkSync(outside, file);
+  assert.throws(() => f.host.getDefaultRuntime(f.id)); assert.throws(() => f.host.setDefaultRuntime("client", f.id, "pi", saved.revision));
+  assert.equal(fs.readFileSync(outside, "utf8"), "retained");
 });
 
 test("G1: the actual proposal card honors an available preference, falls back from unavailable and keeps existing Agents", async t => {
   const f = fixture(t); f.host.configureSynthetic(f.id, 0);
   const options = AgentRuntimeRegistry.prototype.options;
   t.mock.method(AgentRuntimeRegistry.prototype, "options", function() { return options.call(this).map(option => option.id === "codex" ? { ...option, available: true, selectable: true } : option); });
-  let pref = f.host.getPreferences(); f.host.setPreferences(undefined, pref.revision, { defaultRuntimeId: "codex" });
-  for (const [preferred, expected] of [["codex", "codex"], ["agy", "pi"]]) {
-    pref = f.host.getPreferences(); f.host.setPreferences(undefined, pref.revision, { defaultRuntimeId: preferred });
-    const run = f.host.start("client", f.id, f.snapshot.selectedAgentId, "建立一位测试同事", randomUUID());
+  const second = f.host.createWorkspace("Other proposal", f.host.list().revision); f.host.configureSynthetic(second.workspaceId, 0);
+  for (const [workspaceId, agentId, preferred, expected] of [[f.id, f.snapshot.selectedAgentId, "codex", "codex"], [second.workspaceId, second.selectedAgentId, "agy", "pi"]]) {
+    f.host.select("client", workspaceId, f.host.list().revision);
+    const pref = f.host.getDefaultRuntime(workspaceId); f.host.setDefaultRuntime("client", workspaceId, preferred, pref.revision);
+    const run = f.host.start("client", workspaceId, agentId, "建立一位测试同事", randomUUID());
     const deadline = Date.now() + 10000; let card;
-    while (!(card = f.host.snapshot(f.id, f.snapshot.selectedAgentId, "client").approvals[0]) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    while (!(card = f.host.snapshot(workspaceId, agentId, "client").approvals[0]) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
     assert.ok(card); assert.equal(card.draft.runtimeId, expected);
-    f.host.answerApproval("client", f.id, card.id, false); await f.host.wait(run.runId);
+    f.host.answerApproval("client", workspaceId, card.id, false); await f.host.wait(run.runId);
   }
+  assert.equal(f.host.getDefaultRuntime(f.id).defaultRuntimeId, "codex");
   assert.equal(f.agents.list().agents.length, 1); assert.equal(f.agents.list().agents[0].runtime.id, "pi");
 });
 
@@ -114,10 +163,10 @@ test("G2: archived success remains exists; separate Workspaces do not share succ
 });
 
 test("G2: an omitted runtime uses the new preference fallback, while explicit unavailable runtime never falls back", t => {
-  const f = fixture(t), pref = f.host.getPreferences();
+  const f = fixture(t), pref = f.host.getDefaultRuntime(f.id);
   const { draftKey: _key, ...retainedInput } = row("retained");
   const retained = f.agents.create(retainedInput, f.agents.list().revision);
-  f.host.setPreferences(undefined, pref.revision, { defaultRuntimeId: "agy" });
+  f.host.setDefaultRuntime("client", f.id, "agy", pref.revision);
   assert.equal(f.agents.get(retained.agentId).runtime.id, retained.runtime.id);
   assert.equal(f.agents.get(retained.agentId).configRevision, retained.configRevision);
   const omitted = row("fallback"); delete omitted.runtimeId;
@@ -163,8 +212,19 @@ test("RPC: authenticated capability-gated preferences, progress and batch keep g
     const workspace = await rpc("workspace.create", { label: "RPC", expectedRevision: init.workspace.revision });
     await rpc("workspace.select", { workspaceId: workspace.workspaceId, expectedRevision: (await rpc("workspace.list", {})).revision });
     const binding = { workspaceId: workspace.workspaceId, expectedGeneration: workspace.resourceGeneration };
-    let pref = await rpc("workspace.preferences.get", {});
-    pref = await rpc("workspace.preferences.set", { defaultRuntimeId: "pi", expectedRevision: pref.revision }); assert.equal(pref.defaultRuntimeId, "pi");
+    assert.equal(Object.hasOwn(await rpc("workspace.preferences.get", {}), "defaultRuntimeId"), false);
+    let pref = await rpc("workspace.preferences.defaultRuntime.get", binding);
+    pref = await rpc("workspace.preferences.defaultRuntime.set", { ...binding, defaultRuntimeId: "pi", expectedRevision: pref.revision }); assert.equal(pref.defaultRuntimeId, "pi");
+    assert.equal(pref.workspaceId, binding.workspaceId);
+    await assert.rejects(rpc("workspace.preferences.set", { defaultRuntimeId: "codex", expectedRevision: 1 }), /unsupported/);
+    await assert.rejects(rpc("workspace.preferences.defaultRuntime.get", {}), /explicit/);
+    await assert.rejects(rpc("workspace.preferences.defaultRuntime.set", { ...binding, expectedGeneration: randomUUID(), defaultRuntimeId: "codex", expectedRevision: pref.revision }), /generation|changed/i);
+    await assert.rejects(rpc("workspace.preferences.defaultRuntime.set", { ...binding, defaultRuntimeId: "codex", expectedRevision: pref.revision, actor: "human" }), /unsupported/);
+    const second = await rpc("workspace.create", { label: "RPC other", expectedRevision: (await rpc("workspace.list", {})).revision });
+    const secondBinding = { workspaceId: second.workspaceId, expectedGeneration: second.resourceGeneration };
+    const otherPref = await rpc("workspace.preferences.defaultRuntime.get", secondBinding); assert.equal(otherPref.defaultRuntimeId, null);
+    await assert.rejects(rpc("workspace.preferences.defaultRuntime.set", { ...secondBinding, defaultRuntimeId: "claude", expectedRevision: otherPref.revision }), /view changed/);
+    assert.equal((await rpc("workspace.preferences.defaultRuntime.get", binding)).defaultRuntimeId, "pi");
     const current = await rpc("workspace.onboarding.get", binding);
     const updated = await rpc("workspace.onboarding.set", { ...binding, ...progress(current), step: 2, expectedRevision: current.revision }); assert.equal(updated.step, 2);
     await assert.rejects(rpc("workspace.onboarding.get", { ...binding, expectedGeneration: randomUUID() }), /generation|changed/i);

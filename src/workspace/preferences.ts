@@ -1,6 +1,7 @@
 import { lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { bindPrivateHaraStateFile, readPrivateStateFileSnapshotSync } from "../security/private-state.js";
 import { VersionedSettings } from "./versioned-settings.js";
 import { plain } from "./local-state.js";
 import { isAgentRuntimeId, type AgentRuntimeId } from "../agent-runtime/bindings.js";
@@ -43,7 +44,7 @@ function updates(raw: unknown): UpdatePreferences {
 interface Preferences { defaultRuntimeId: AgentRuntimeId | null; schemaVersion: 2; revision: number; theme: ThemePreference; migratedFrom: string; executionDetails: "brief" | "detailed"; collapseDetails: boolean; alwaysShowTimingDiagnostics: boolean; updates: UpdatePreferences }
 export class WorkspacePreferences {
   private readonly state: VersionedSettings<Preferences>;
-  constructor(home: string, legacyHome?: string, legacyTheme: () => ThemePreference = () => legacyHome ? readLegacyTheme(legacyHome) : "system") {
+  constructor(private readonly home: string, legacyHome?: string, legacyTheme: () => ThemePreference = () => legacyHome ? readLegacyTheme(legacyHome) : "system") {
     let cachedTheme: ThemePreference | undefined;
     this.state = new VersionedSettings<Preferences>(() => home, "ui-preferences-v1.json", 2,
       () => ({ schemaVersion: 2, revision: 0, defaultRuntimeId: null, theme: cachedTheme ??= legacyTheme(), migratedFrom: legacyHome ? "legacy-preference-or-system" : "system", executionDetails: "brief", collapseDetails: true, alwaysShowTimingDiagnostics: false, updates: updateDefaults() }),
@@ -57,12 +58,21 @@ export class WorkspacePreferences {
           executionDetails: raw.executionDetails === "detailed" ? "detailed" : "brief", collapseDetails: raw.collapseDetails !== false, alwaysShowTimingDiagnostics: raw.alwaysShowTimingDiagnostics === true, updates: updates(raw.updates) };
       }, { 1: raw => ({ ...raw, schemaVersion: 2, migratedFrom: "v1" }) });
   }
+  /** Pure, bounded migration input; never runs appearance migration or overwrites the source. */
+  legacyDefaultRuntimeId(): AgentRuntimeId | null {
+    const file = bindPrivateHaraStateFile(this.home, [], "ui-preferences-v1.json");
+    const snapshot = readPrivateStateFileSnapshotSync(file.path, 4 * 1024 * 1024);
+    if (!snapshot) return null;
+    const raw: unknown = JSON.parse(snapshot.text);
+    if (!plain(raw) || raw.schemaVersion !== 1 && raw.schemaVersion !== 2 || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 0
+      || raw.defaultRuntimeId !== undefined && raw.defaultRuntimeId !== null && !isAgentRuntimeId(raw.defaultRuntimeId)) throw new Error("Invalid legacy Runtime preference");
+    return isAgentRuntimeId(raw.defaultRuntimeId) ? raw.defaultRuntimeId : null;
+  }
   read() { const { value, readOnly, recovered } = this.state.read(); return { ...value, readOnly, recovered }; }
   save(value: unknown, expected: number, extra: { defaultRuntimeId?: unknown; executionDetails?: unknown; collapseDetails?: unknown; alwaysShowTimingDiagnostics?: unknown; updates?: unknown } = {}) {
-    if (!theme(value) && !(value === undefined && Object.hasOwn(extra, "defaultRuntimeId"))) throw new Error("Invalid appearance choice");
-    if (Object.hasOwn(extra, "defaultRuntimeId") && extra.defaultRuntimeId !== null && !isAgentRuntimeId(extra.defaultRuntimeId)) throw new Error("Invalid default Runtime preference");
+    if (Object.hasOwn(extra, "defaultRuntimeId")) throw new Error("Default runtime requires an explicit Workspace preference");
+    if (!theme(value)) throw new Error("Invalid appearance choice");
     return this.state.update(expected, old => ({ ...old, theme: value === undefined ? old.theme : value as ThemePreference,
-      ...(Object.hasOwn(extra, "defaultRuntimeId") ? { defaultRuntimeId: extra.defaultRuntimeId as AgentRuntimeId | null } : {}),
       ...(extra.executionDetails !== undefined ? { executionDetails: extra.executionDetails as Preferences["executionDetails"] } : {}),
       ...(extra.alwaysShowTimingDiagnostics !== undefined ? { alwaysShowTimingDiagnostics: extra.alwaysShowTimingDiagnostics as boolean } : {}),
       ...(extra.collapseDetails !== undefined ? { collapseDetails: extra.collapseDetails as boolean } : {}), ...(extra.updates !== undefined ? { updates: updates(extra.updates) } : {}) }));

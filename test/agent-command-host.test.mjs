@@ -175,7 +175,7 @@ test("C3 reopening a protected scope with bootstrap disabled cannot revive the g
 
 test("C3 onboarding metadata and batch creation keep the legacy-entry default deny", async t => {
   const f = await fixture(t), before = await f.snapshot();
-  for (const method of ["workspace.onboarding.get", "workspace.onboarding.set", "workspace.agents.createBatch"]) {
+  for (const method of ["workspace.preferences.defaultRuntime.get", "workspace.preferences.defaultRuntime.set", "workspace.onboarding.get", "workspace.onboarding.set", "workspace.agents.createBatch"]) {
     await assert.rejects(f.owner.request(method, { ...f.params, runId: randomUUID(), rows: [], approved: true, source: "local_human" }), boundaryCode("RUNTIME_UNSUPPORTED"));
   }
   const peer = new LocalWorkspaceHost(f.root); t.after(() => peer.close());

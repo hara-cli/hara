@@ -123,7 +123,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (method === "workspace.list") { fields([]); return host.list(); }
     if (method === "workspace.create") { fields(["label", "expectedRevision"]); if (!text(params.label, 80) || !positive(params.expectedRevision)) throw new Error("invalid Workspace creation"); return host.createWorkspace(params.label, params.expectedRevision); }
     if (method === "workspace.preferences.get") { fields([]); return host.getPreferences(); }
-    if (method === "workspace.preferences.set") { fields(["expectedRevision", ...["theme", "defaultRuntimeId", "executionDetails", "collapseDetails", "alwaysShowTimingDiagnostics", "updates"].filter(key => Object.hasOwn(params, key))]); return host.setPreferences(params.theme, params.expectedRevision as number, params); }
+    if (method === "workspace.preferences.set") { fields(["expectedRevision", ...["theme", "executionDetails", "collapseDetails", "alwaysShowTimingDiagnostics", "updates"].filter(key => Object.hasOwn(params, key))]); return host.setPreferences(params.theme, params.expectedRevision as number, params); }
     if (method === "workspace.activity") { fields([]); return host.activity(); }
     if (method === "workspace.update.prepare") { fields(["approved"]); if (params.approved !== true) throw new Error("Explicit restart approval required"); return host.prepareUpdate(client.id); }
     if (method === "workspace.update.release") { fields(["id"]); if (!text(params.id)) throw new Error("Invalid update lease"); host.releaseUpdate(client.id, params.id); return { released: true }; }
@@ -369,6 +369,11 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       if (typeof params.operationId !== "string" || !UUID.test(params.operationId)) throw new Error("invalid runtime operation");
       host.cancelRuntime(workspaceId, params.operationId); return { state: "cancelling" }; }
     if (method === "workspace.agent.select") { fields(["workspaceId", "expectedGeneration", "agentId"]); if (!text(params.agentId)) throw new Error("invalid Agent selection"); host.selectAgent(client.id, workspaceId, params.agentId); return host.snapshot(workspaceId, params.agentId, client.id); }
+    if (method === "workspace.preferences.defaultRuntime.get") { fields(["workspaceId", "expectedGeneration"]); return host.getDefaultRuntime(workspaceId); }
+    if (method === "workspace.preferences.defaultRuntime.set") {
+      fields(["workspaceId", "expectedGeneration", "expectedRevision", "defaultRuntimeId"]);
+      return host.setDefaultRuntime(client.id, workspaceId, params.defaultRuntimeId, params.expectedRevision as number);
+    }
     if (method === "workspace.onboarding.get") { fields(["workspaceId", "expectedGeneration"]); return host.getOnboarding(workspaceId); }
     if (method === "workspace.onboarding.set") {
       fields(["workspaceId", "expectedGeneration", "expectedRevision", "runId", "step", "engineChoice", "thirdPartySkipped", "dismissed", "completedAt"]);
