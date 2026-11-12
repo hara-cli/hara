@@ -23,7 +23,8 @@ test("C6 C3 accepts exactly one owner/claim in the same aggregate and projects g
   const state = f.snapshot(), record = state.routing.records[0]; assert.equal(record.state, "claimed"); assert.equal(state.control.runs.length, 1);
   assert.equal(record.claim.runId, state.control.runs[0].runId); assert.equal(record.claim.taskId, state.control.runs[0].taskId);
   const view = f.router.get(f.transport, data.channelId, data.workItemId); assert.equal(view.decision.reason, "current_owner"); assert.equal(view.claim.claimRevision, 1); assert.equal(view.method, "duty_match"); assert.equal(view.executionPermit, false);
-  assert.equal(f.router.select(f.transport, { ...data, requestId: randomUUID(), explicitAgentIds: [f.members[1].agentId], message: "compile instead" }).ownerAgentId, f.agent.agentId);
+  assert.throws(() => f.router.select(f.transport, { ...data, requestId: randomUUID(), explicitAgentIds: [f.members[1].agentId], message: "compile instead" }), code("COMMAND_ID_CONFLICT"));
+  assert.equal(f.router.get(f.transport, data.channelId, data.workItemId).ownerAgentId, f.agent.agentId);
   assert.throws(() => f.router.prepareDispatch(f.transport, data), code("CONTROL_HELD")); assert.equal(f.snapshot().control.runs.length, 1);
 });
 

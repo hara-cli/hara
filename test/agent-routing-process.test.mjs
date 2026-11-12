@@ -44,7 +44,8 @@ for (const mode of ["classificationJournal", "classificationSubmitted", "classif
       const file = join(input.project, "classification-submissions.txt"); assert.equal(fs.existsSync(file), mode !== "classificationJournal");
       if (fs.existsSync(file)) assert.equal(fs.readFileSync(file, "utf8"), "one\n");
     } else {
-      const later = router.select(transport, { ...input.data, requestId: randomUUID(), message: "compile instead", explicitAgentIds: [input.members[1]] });
+      assert.throws(() => router.select(transport, { ...input.data, requestId: randomUUID(), message: "compile instead", explicitAgentIds: [input.members[1]] }), error => error.code === "COMMAND_ID_CONFLICT");
+      const later = authority.routingSnapshot(transport).routing.records[0];
       assert.equal(later.ownerAgentId, original.ownerAgentId); assert.equal(later.taskId, original.taskId); assert.equal(later.commandId, original.commandId);
       if (mode !== "selected") {
         assert.equal(observed.claim.taskId, original.claim.taskId); assert.equal(authority.commandControlState().control.runs.length, 1);
