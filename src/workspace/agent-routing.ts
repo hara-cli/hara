@@ -7,14 +7,16 @@ import { WorkspaceAgentBoundaryAuthority, type AgentRoutingClaim, type RoutingPe
 import { WorkspaceAgentCommandControl, agentCommandMessageDigest } from "./agent-command-control.js";
 import type { AgentBoundaryTransport } from "./agent-boundary-transport.js";
 import { commandDigest, commandEpoch, commandId, nextCommandEpoch } from "./agent-command-state.js";
+import { channelSessionId } from "./channel-session.js";
 import { canonical, deepFreeze, UUID } from "./local-state.js";
 import { nominateAgentOwner, parseAgentRoutingInput, agentDutyRejects, type AgentRoutingInput, type AgentRoutingDirectoryEntry } from "./agent-routing-owner.js";
 import { AGENT_ROUTING_ALGORITHM, agentRoutingWorkKey, routingFields, type AgentRoutingRecord, type AgentRoutingCandidateVersion, type AgentRoutingClassificationPayload, type AgentRoutingClassificationOutcome } from "./agent-routing-state.js";
 
+export interface AgentRoutingBusinessBinding { revision: number; ownerAgentIds: readonly string[] }
 export interface AgentRoutingAudience { channelId: string; revision: number; memberIds: readonly string[] }
 export interface AgentRoutingProjection {
   schemaVersion: 1; kind: "agent-routing-projection"; channelId: string; workItemId: string; workKey: string; rootRequestId: string;
-  revision: number; state: "needs_owner" | "selected" | "claimed" | "blocked"; reason: string; ownerAgentId: string | null;
+  revision: number; code: "NEEDS_OWNER" | null; state: "needs_owner" | "selected" | "claimed" | "blocked"; reason: string; ownerAgentId: string | null;
   method: AgentRoutingRecord["method"]; decision: AgentBoundaryOwnerDecision | null; claim: AgentBoundaryWorkClaim | null;
   receipt: AgentBoundaryReceipt | null; classification: { requestId: string; phase: string } | null; executionPermit: false;
 }
@@ -27,7 +29,7 @@ export class WorkspaceAgentRouting {
     audience(channelId: string): AgentRoutingAudience;
     automaticAgentIds(): readonly string[];
     /** Host/operator-confirmed mapping only. Not a request-supplied list. */
-    businessOwners?(reference: string): readonly string[];
+    businessOwners?(reference: string): AgentRoutingBusinessBinding | null;
     commandLifetimeMs?: number; classifier?: AgentRoutingClassifierConfig;
   }) { this.classifier = options.classifier ? new AgentRoutingClassifier(options.authority, options.classifier) : undefined; }
   private audience(channelId: string) {
@@ -43,12 +45,18 @@ export class WorkspaceAgentRouting {
     // No directory/persona/context lookup precedes the actual audience check above.
     const snapshot = this.options.authority.routingSnapshot(transport), automatic = this.options.automaticAgentIds();
     const directory = this.options.authority.routingDirectory(transport, audience.memberIds, automatic);
-    const businessOwners = input.businessBindingRef === null || input.explicitAgentIds.length ? [] : [...(this.options.businessOwners?.(input.businessBindingRef) ?? [])];
+    const businessBinding = input.businessBindingRef === null || input.explicitAgentIds.length ? null : this.options.businessOwners?.(input.businessBindingRef) ?? null;
+    if (businessBinding !== null) {
+      routingFields(businessBinding, ["revision", "ownerAgentIds"]);
+      if (!commandEpoch(businessBinding.revision) || !Array.isArray(businessBinding.ownerAgentIds) || businessBinding.ownerAgentIds.length > 128
+        || !businessBinding.ownerAgentIds.every(commandId) || new Set(businessBinding.ownerAgentIds).size !== businessBinding.ownerAgentIds.length) return fail("AUTHORITY_UNVERIFIED", "routing.businessBinding");
+    }
+    const businessOwners = [...(businessBinding?.ownerAgentIds ?? [])];
     const nomination = input.businessBindingRef !== null && !input.explicitAgentIds.length && !businessOwners.length
       ? { ownerAgentId: null, method: null, reason: "scope_denied" as const, classificationCandidateIds: [] }
       : nominateAgentOwner(input, directory, businessOwners);
     const audienceDigest = commandDigest([snapshot.context.resourceBinding, audience]);
-    const catalogDigest = commandDigest([AGENT_ROUTING_ALGORITHM, [...directory].sort((a, b) => a.agentId.localeCompare(b.agentId)), [...businessOwners].sort()]);
+    const catalogDigest = commandDigest([AGENT_ROUTING_ALGORITHM, [...directory].sort((a, b) => a.agentId.localeCompare(b.agentId)), businessBinding === null ? null : { revision: businessBinding.revision, ownerAgentIds: [...businessOwners].sort() }]);
     return { provenance, audience, snapshot, directory, nomination, audienceDigest, catalogDigest,
       key: agentRoutingWorkKey(snapshot.context.resourceBinding.scopeKey, snapshot.context.resourceBinding.generation, input.channelId, input.workItemId) };
   }
@@ -58,6 +66,12 @@ export class WorkspaceAgentRouting {
   }
   private versions(directory: readonly AgentRoutingDirectoryEntry[]): AgentRoutingCandidateVersion[] {
     return directory.map(({ agentId, dutyRevision, policyRevision, agentEpoch, configRevision }) => ({ agentId, dutyRevision, policyRevision, agentEpoch, configRevision }));
+  }
+  /** Current personal audience, confirmed public duties only. Not an execution or private-read grant. */
+  directory(transport: AgentBoundaryTransport, channelId: string) {
+    this.options.authority.assertRoutingTransport(transport);
+    const audience = this.audience(channelId);
+    return this.options.authority.routingDirectory(transport, audience.memberIds, this.options.automaticAgentIds());
   }
   /** Syntactic nomination and durable ownership reservation only; no execution is started. */
   select(transport: AgentBoundaryTransport, raw: unknown): Readonly<AgentRoutingRecord> {
@@ -149,14 +163,14 @@ export class WorkspaceAgentRouting {
       if (!owner?.available || agentDutyRejects(input.message, owner.publicProfile)
         || row.method !== "classification" && (current.nomination.ownerAgentId !== row.ownerAgentId || current.nomination.method !== row.method)) return fail("STALE_REVISION", "routing.selection");
     };
-    const routing = this.options.authority.prepareRoutingClaim(transport, row.workKey, row.revision, { assertSelection, assertAudience });
+    const routing = this.options.authority.prepareRoutingClaim(transport, row.workKey, row.revision, input.message, { assertSelection, assertAudience });
     const command = this.options.authority.draft(transport, row.ownerAgentId, { commandId: row.commandId, rootRequestId: row.rootRequestId,
       lifetimeMs: this.options.commandLifetimeMs ?? 30000,
-      operation: { action: "task.dispatch", taskId: row.taskId, conversationId: row.channelId, messageDigest: row.inputDigest } });
+      operation: { action: "task.dispatch", taskId: row.taskId, conversationId: channelSessionId(row.channelId, row.ownerAgentId), messageDigest: agentCommandMessageDigest(channelSessionId(row.channelId, row.ownerAgentId), input.message) } });
     return { command, routing };
   }
   get(transport: AgentBoundaryTransport, channelId: string, workItemId: string): AgentRoutingProjection | null {
-    this.options.authority.assertRoutingTransport(transport); this.audience(channelId);
+    this.options.authority.assertRoutingTransport(transport); const audience = this.audience(channelId);
     if (!commandId(workItemId)) return fail("AUTHORIZATION_DENIED", "routing.workItem");
     const snapshot = this.options.authority.routingSnapshot(transport), key = agentRoutingWorkKey(snapshot.context.resourceBinding.scopeKey, snapshot.context.resourceBinding.generation, channelId, workItemId);
     const row = snapshot.routing.records.find(row => row.workKey === key); if (!row) return null;
@@ -174,9 +188,10 @@ export class WorkspaceAgentRouting {
         state: "owned", ownerAgentId: run.agentId, reason: "current_owner" });
       if (c.kind !== "work-claim" || d.kind !== "owner-decision") return fail("AUTHORITY_UNVERIFIED", "routing.projection"); claim = c; decision = d;
     }
-    const blocked = receipt?.status === "unknown" || receipt?.status === "rejected" || receipt?.control.holdId !== null && receipt !== null;
+    const audienceChanged = commandDigest([snapshot.context.resourceBinding, audience]) !== row.audienceDigest;
+    const blocked = audienceChanged && row.ownerAgentId !== null || receipt?.status === "unknown" || receipt?.status === "rejected" || receipt?.control.holdId !== null && receipt !== null;
     return deepFreeze({ schemaVersion: 1, kind: "agent-routing-projection", channelId, workItemId, workKey: key, rootRequestId: row.rootRequestId,
-      revision: row.revision, state: blocked ? "blocked" : row.state, reason: receipt?.status === "unknown" ? "unknown_effect" : blocked ? "control_held" : row.reason,
+      revision: row.revision, code: row.state === "needs_owner" ? "NEEDS_OWNER" : null, state: blocked ? "blocked" : row.state, reason: receipt?.status === "unknown" ? "unknown_effect" : audienceChanged && row.ownerAgentId !== null ? "audience_changed" : blocked ? "control_held" : row.reason,
       ownerAgentId: row.ownerAgentId, method: row.method, decision, claim, receipt,
       classification: row.classification ? { requestId: row.classification.requestId, phase: row.classification.phase === "submission_started" ? "unknown" : row.classification.phase } : null,
       executionPermit: false });

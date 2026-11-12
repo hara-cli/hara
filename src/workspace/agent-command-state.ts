@@ -35,6 +35,8 @@ export const commandEpoch = (value: unknown): value is number => Number.isSafeIn
 const hash = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const uuid = (value: unknown): value is string => typeof value === "string" && UUID.test(value);
 export const commandDigest = (value: unknown): string => createHash("sha256").update(canonical(value)).digest("hex");
+export const agentCommandMessageDigest = (conversationId: string, message: string): string => createHash("sha256")
+  .update("hara-agent-command-message-v1\0").update(canonical({ conversationId, message })).digest("hex");
 export const agentPolicyProposalDigest = (value: unknown): string => createHash("sha256").update("hara-agent-policy-proposal-v1\0").update(canonical(value)).digest("hex");
 export function nextCommandEpoch(epoch: number): number {
   if (!commandEpoch(epoch) || epoch >= Number.MAX_SAFE_INTEGER) throw new AgentBoundaryContractError("COUNTER_EXHAUSTED", "control.epoch"); return epoch + 1;

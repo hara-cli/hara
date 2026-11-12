@@ -1,4 +1,5 @@
 // Deterministic nomination only. Audience, source, authoritative claim and execution are separate gates.
+import { AgentBoundaryContractError } from "./agent-boundaries-contract.js";
 import type { AgentDutyPublicProfile } from "./agent-duty-draft.js";
 import { commandEpoch, commandId } from "./agent-command-state.js";
 import { deepFreeze, messageBody, UUID } from "./local-state.js";
@@ -12,11 +13,13 @@ export interface AgentRoutingDirectoryEntry extends AgentRoutingCandidateVersion
 }
 export interface AgentOwnerNomination { ownerAgentId: string | null; method: AgentRoutingMethod | null; reason: AgentRoutingReason; classificationCandidateIds: string[] }
 export function parseAgentRoutingInput(raw: unknown): Readonly<AgentRoutingInput> {
-  assertAgentRoutingJson(raw); routingFields(raw, ["channelId", "workItemId", "requestId", "message", "explicitAgentIds", "leadAgentId", "businessBindingRef", "expectedWorkRevision"]);
-  if (typeof raw.channelId !== "string" || !UUID.test(raw.channelId) || !commandId(raw.workItemId) || !commandId(raw.requestId) || !messageBody(raw.message)
-    || !Array.isArray(raw.explicitAgentIds) || raw.explicitAgentIds.length > AGENT_ROUTING_CANDIDATE_LIMIT || !raw.explicitAgentIds.every(commandId)
-    || new Set(raw.explicitAgentIds).size !== raw.explicitAgentIds.length || !(raw.leadAgentId === null || commandId(raw.leadAgentId))
-    || !(raw.businessBindingRef === null || commandId(raw.businessBindingRef)) || !commandEpoch(raw.expectedWorkRevision)) return routingFail("routing.input");
+  try { assertAgentRoutingJson(raw); routingFields(raw, ["channelId", "workItemId", "requestId", "message", "explicitAgentIds", "leadAgentId", "businessBindingRef", "expectedWorkRevision"]); }
+  catch { throw new AgentBoundaryContractError("INVALID_DOCUMENT", "routing.input"); }
+  const input = raw as Record<string, unknown>;
+  if (typeof input.channelId !== "string" || !UUID.test(input.channelId) || !commandId(input.workItemId) || !commandId(input.requestId) || !messageBody(input.message)
+    || !Array.isArray(input.explicitAgentIds) || input.explicitAgentIds.length > AGENT_ROUTING_CANDIDATE_LIMIT || !input.explicitAgentIds.every(commandId)
+    || new Set(input.explicitAgentIds).size !== input.explicitAgentIds.length || !(input.leadAgentId === null || commandId(input.leadAgentId))
+    || !(input.businessBindingRef === null || commandId(input.businessBindingRef)) || !commandEpoch(input.expectedWorkRevision)) throw new AgentBoundaryContractError("INVALID_DOCUMENT", "routing.input");
   return deepFreeze(structuredClone(raw)) as unknown as Readonly<AgentRoutingInput>;
 }
 const fold = (s: string): string => s.normalize("NFKC").trim().toLowerCase();

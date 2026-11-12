@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { routingFixture } from "./helpers/agent-routing-fixture.mjs";
 import { commandDigest } from "../dist/workspace/agent-command-state.js";
 import { agentRoutingWorkKey } from "../dist/workspace/agent-routing-state.js";
+import { WorkspaceAgentRouting } from "../dist/workspace/agent-routing.js";
 import { closeWorkspaceRunPermit } from "../dist/workspace/execution.js";
 const code = c => error => error.code === c;
 
@@ -101,4 +102,14 @@ test("C6 full routing reservation capacity rejects only the new work item, leavi
   assert.equal(f.authority.commandControlSourceHealthy(), true); assert.equal(f.snapshot().routing.records.length, 128);
   await runtime.call("workspace_write", { path: "after-routing-full.txt", content: "still alive" });
   assert.equal(fs.readFileSync(join(f.project, "after-routing-full.txt"), "utf8"), "still alive");
+});
+
+
+test("C6 human-confirmed business mapping revisions are rechecked even when the owner list returns to its old value", t => {
+  const f = routingFixture(t); let revision = 1;
+  const router = new WorkspaceAgentRouting({ ...f.options, businessOwners: () => ({ revision, ownerAgentIds: [f.agent.agentId] }) });
+  const data = f.input("invoice", { businessBindingRef: "approved-binding" });
+  assert.equal(router.select(f.transport, data).method, "business_mapping"); const d = f.prepare(data, router);
+  revision = 3; assert.equal(d.accept().status, "rejected"); assert.equal(f.snapshot().control.runs.length, 0);
+  assert.equal(f.authority.commandControlSourceHealthy(), true);
 });

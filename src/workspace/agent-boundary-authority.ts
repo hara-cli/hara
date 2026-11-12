@@ -1,3 +1,4 @@
+import { channelSessionId } from "./channel-session.js";
 import type { AgentRoutingDirectoryEntry } from "./agent-routing-owner.js";
 import { emptyAgentRoutingState, parseAgentRoutingState, assertAgentRoutingJson, assertAgentRoutingCapacity, assertAgentRoutingTransition, type AgentRoutingState, type AgentRoutingRecord, type AgentRoutingClassification, type AgentRoutingClassificationPayload, type AgentRoutingClassificationOutcome } from "./agent-routing-state.js";
 import { WorkspaceAgentLifecycleHistory } from "./agent-lifecycle-history.js";
@@ -6,7 +7,7 @@ import { WorkspaceFeatures } from "./features.js";
 import { assertNoWorkspaceLegacyEffects } from "./agent-command-protection.js";
 import { assertNoWorkspaceSessionLeases, withWorkspaceSessionAdmission } from "./session-lease.js";
 import type { WorkspaceRunBinding } from "./run-binding.js";
-import { assertAgentCommandTransition, agentCommandTargetEpoch, agentPolicyProposalDigest, commandDigest, nextCommandEpoch, emptyAgentCommandState, parseAgentCommandState, type AgentCommandState, type AgentCommandRun, type AgentCommandRetirement } from "./agent-command-state.js";
+import { agentCommandMessageDigest, assertAgentCommandTransition, agentCommandTargetEpoch, agentPolicyProposalDigest, commandDigest, nextCommandEpoch, emptyAgentCommandState, parseAgentCommandState, type AgentCommandState, type AgentCommandRun, type AgentCommandRetirement } from "./agent-command-state.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   AgentBoundaryContractError, agentBoundaryCommandSigningText, assertAgentBoundaryContext, parseAgentBoundaryDocument,
@@ -59,7 +60,7 @@ interface ExecutionPolicyState { command: AgentBoundaryCommand; policyRevision: 
 interface GrantState { transport: AgentBoundaryTransport; command: AgentBoundaryCommand; policyRevision: number; live: boolean }
 declare const routingClaimBrand: unique symbol;
 export interface AgentRoutingClaim { readonly [routingClaimBrand]: true }
-interface RoutingClaimState { workKey: string; revision: number; assertSelection(): void; assertAudience(): void }
+interface RoutingClaimState { workKey: string; revision: number; channelId: string; conversationId: string; messageDigest: string; assertSelection(): void; assertAudience(): void }
 declare const routingPermitBrand: unique symbol;
 export interface RoutingPermit { readonly [routingPermitBrand]: true }
 interface RoutingPermitState { transport: AgentBoundaryTransport; workKey: string; entry: AgentRoutingClassification; payload: AgentRoutingClassificationPayload; assertCurrent(): void; used: boolean; submitted: boolean }
@@ -533,12 +534,16 @@ export class WorkspaceAgentBoundaryAuthority {
     }, undefined, true);
   }
   /** An unclaimed nomination is NOT this opaque bridge into the original C3 admission. */
-  prepareRoutingClaim(transport: AgentBoundaryTransport, workKey: string, revision: number, checks: { assertSelection(): void; assertAudience(): void }): AgentRoutingClaim {
+  prepareRoutingClaim(transport: AgentBoundaryTransport, workKey: string, revision: number, message: string, checks: { assertSelection(): void; assertAudience(): void }): AgentRoutingClaim {
     const snapshot = this.routingSnapshot(transport), row = snapshot.routing.records.find(row => row.workKey === workKey);
-    if (!row || row.state !== "selected" || row.claim || row.revision !== revision) return fail("CONTROL_HELD", "routing.owner");
+    if (!row || row.state !== "selected" || row.claim || row.revision !== revision || row.ownerAgentId === null || row.inputDigest !== agentCommandMessageDigest(row.channelId, message)) return fail("CONTROL_HELD", "routing.owner");
     if (checks.assertSelection() !== undefined || checks.assertAudience() !== undefined) return fail("AUTHORITY_UNVERIFIED", "routing.checks");
     const handle = Object.freeze({}) as AgentRoutingClaim;
-    this.routingClaims.set(handle, { workKey, revision, assertSelection: checks.assertSelection, assertAudience: checks.assertAudience }); return handle;
+    const conversationId = channelSessionId(row.channelId, row.ownerAgentId);
+    this.routingClaims.set(handle, { workKey, revision, channelId: row.channelId, conversationId, messageDigest: agentCommandMessageDigest(conversationId, message), assertSelection: checks.assertSelection, assertAudience: checks.assertAudience }); return handle;
+  }
+  routingClaimChannel(handle: AgentRoutingClaim): string {
+    const captured = this.routingClaims.get(handle); if (!captured) return fail("AUTHORITY_UNVERIFIED", "routing.claim"); return captured.channelId;
   }
   private routingClaimRecord(handle: unknown, state: State, command: AgentBoundaryCommand): AgentRoutingRecord {
     const captured = handle && typeof handle === "object" ? this.routingClaims.get(handle) : undefined;
@@ -546,7 +551,7 @@ export class WorkspaceAgentBoundaryAuthority {
     const row = state.routing.records.find(row => row.workKey === captured.workKey), op = command.operation;
     if (!row || row.state !== "selected" || row.claim || row.revision !== captured.revision || row.ownerAgentId !== command.agentId
       || row.commandId !== command.commandId || row.taskId !== op.taskId || row.rootRequestId !== command.rootRequestId
-      || row.channelId !== op.conversationId || row.inputDigest !== op.messageDigest) return fail("CONTROL_HELD", "routing.claim");
+      || row.channelId !== captured.channelId || captured.conversationId !== op.conversationId || captured.messageDigest !== op.messageDigest) return fail("CONTROL_HELD", "routing.claim");
     if (captured.assertSelection() !== undefined || captured.assertAudience() !== undefined) return fail("AUTHORITY_UNVERIFIED", "routing.checks"); return row;
   }
   assertRoutingClaim(transport: AgentBoundaryTransport, handle: unknown, command: AgentBoundaryCommand): void {
@@ -570,7 +575,10 @@ export class WorkspaceAgentBoundaryAuthority {
     for (const agentId of memberIds) {
       const policy = state.policies.find(row => row.agentId === agentId);
       if (!policy || !policy.rights.manage && !policy.rights.invoke) continue;
-      try { this.currentPolicy(agentId, policy); } catch (error) { if (error instanceof AgentBoundaryContractError) continue; throw error; }
+      // Public nomination reads metadata and confirmed duties only, never resource roots, homes or private context.
+      const agent = this.options.resources.agents.get(agentId);
+      if (!agent || agent.state !== "active" || agent.agentEpoch !== policy.agentEpoch || agent.configRevision !== policy.configRevision) continue;
+      try { assertAgentBoundaryContext(policy.duty, this.parent.context); } catch (error) { if (error instanceof AgentBoundaryContractError) continue; throw error; }
       const control = state.control.agents.find(row => row.agentId === agentId), available = policy.rights.invoke && policy.rights.nodeUse && !control?.hold && !control?.dismissed;
       result.push({ agentId, dutyRevision: policy.duty.dutyRevision, policyRevision: policy.revision,
         agentEpoch: policy.agentEpoch, configRevision: policy.configRevision, publicProfile: policy.duty.publicProfile,

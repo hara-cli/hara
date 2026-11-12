@@ -12,7 +12,7 @@ import { channelRoleUnrelated, type ChannelPrefilterProfile } from "./channel-pr
 import { readChannelAutonomy, parseChannelAutonomyUpdate, assertChannelAutonomyProductionDispatch, type ChannelAutonomyPolicy } from "./channel-autonomy.js";
 
 export interface LocalChannel { id: string; name: string; memberIds: string[]; createdAt: string; autonomy?: ChannelAutonomyPolicy; lastMessageAt?: string; preview?: string; messageCount?: number; activityAvailable?: boolean }
-interface Catalog { schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; channels: LocalChannel[] }
+interface Catalog { schemaVersion: 1; revision: number; resourceBinding: WorkspaceResourceBinding; channels: (LocalChannel & { audienceRevision?: number })[] }
 type ReplyState = "queued" | "running" | "completed" | "cancelled" | "failed" | "interrupted" | "passed";
 interface Reply {
   agentId: string; displayName: string; requestId: string; runId: string | null; startIndex: number; endIndex: number | null;
@@ -81,8 +81,8 @@ export class WorkspaceLocalChannels {
         || !sameWorkspaceResourceBinding(value.resourceBinding as WorkspaceResourceBinding, this.catalog.binding()) || !Array.isArray(value.channels)) throw new Error("invalid local channel catalog; retained");
       const seen = new Set<string>();
       for (const row of value.channels) {
-        if (!plain(row) || !exact(row, ["id", "name", "memberIds", "createdAt", ...(Object.hasOwn(row, "autonomy") ? ["autonomy"] : [])]) || typeof row.id !== "string" || !UUID.test(row.id) || seen.has(row.id)
-          || !text(row.name, 80) || !ids(row.memberIds) || !time(row.createdAt)) throw new Error("invalid local channel metadata; retained");
+        if (!plain(row) || !exact(row, ["id", "name", "memberIds", "createdAt", ...(Object.hasOwn(row, "autonomy") ? ["autonomy"] : []), ...(Object.hasOwn(row, "audienceRevision") ? ["audienceRevision"] : [])]) || typeof row.id !== "string" || !UUID.test(row.id) || seen.has(row.id)
+          || !text(row.name, 80) || !ids(row.memberIds) || !time(row.createdAt) || row.audienceRevision !== undefined && !nonnegative(row.audienceRevision)) throw new Error("invalid local channel metadata; retained");
         readChannelAutonomy(row.autonomy, row.memberIds);
         seen.add(row.id);
       }
@@ -91,7 +91,7 @@ export class WorkspaceLocalChannels {
   }
   private accepting() { return !this.closed && this.host.accepting(); }
   private clientKey(channelId: string, turnId: string) { return channelId + ":" + turnId; }
-  private view(channel: LocalChannel): LocalChannel { return { ...channel, autonomy: readChannelAutonomy(channel.autonomy, channel.memberIds) }; }
+  private view(channel: LocalChannel & { audienceRevision?: number }): LocalChannel { const { audienceRevision: _privateRevision, ...visible } = channel; return { ...visible, autonomy: readChannelAutonomy(channel.autonomy, channel.memberIds) }; }
   list() {
     const value = this.catalog.read();
     return { revision: value.revision, channels: value.channels.map(channel => {
@@ -109,6 +109,13 @@ export class WorkspaceLocalChannels {
     if (!row) throw new Error("local channel is not in this Workspace");
     return this.view(row);
   }
+  /** Metadata only: no history, persona or activity preview reads. Legacy metadata starts at epoch zero. */
+  routingAudience(channelId: string) {
+    if (!UUID.test(channelId)) throw new Error("invalid local channel identity");
+    const row = this.catalog.read().channels.find(row => row.id === channelId);
+    if (!row) throw new Error("local channel is not in this Workspace");
+    return { channelId, revision: row.audienceRevision ?? 0, memberIds: [...row.memberIds] };
+  }
   private members(memberIds: unknown, roster = this.host.agents(), retained: readonly string[] = []): asserts memberIds is string[] {
     if (!ids(memberIds) || memberIds.some(id => !roster.some(agent => agent.agentId === id && agent.kind === "colleague" && (agent.state === "active" || agent.state === "archived" && retained.includes(id)))))
       throw new Error("channel members must be active colleagues in this Workspace");
@@ -121,7 +128,7 @@ export class WorkspaceLocalChannels {
       if (prior.name !== name || canonical(prior.memberIds) !== canonical(memberIds)) throw new Error("channel request identity already used");
       return this.list();
     }
-    this.catalog.update(expectedRevision, value => { value.channels.push({ id, name, memberIds, createdAt: new Date().toISOString(), autonomy: readChannelAutonomy(undefined, memberIds) }); return value; });
+    this.catalog.update(expectedRevision, value => { value.channels.push({ id, name, memberIds, audienceRevision: 0, createdAt: new Date().toISOString(), autonomy: readChannelAutonomy(undefined, memberIds) }); return value; });
     this.host.changed(); return this.list();
   }
   update(channelId: string, name: string, memberIds: unknown, expectedRevision: number, autonomy?: unknown) {
@@ -136,6 +143,10 @@ export class WorkspaceLocalChannels {
     try {
       this.catalog.update(expectedRevision, value => {
         lease.assertCurrent(); const row = value.channels.find(row => row.id === channelId)!;
+        if (canonical([...row.memberIds].sort()) !== canonical([...memberIds].sort())) {
+          if ((row.audienceRevision ?? 0) >= Number.MAX_SAFE_INTEGER) throw new Error("channel audience revision exhausted");
+          row.audienceRevision = (row.audienceRevision ?? 0) + 1;
+        }
         row.name = name; row.memberIds = memberIds; row.autonomy = policy; return value;
       });
     } finally { if (!active) lease.release(); }
