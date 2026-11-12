@@ -112,3 +112,21 @@ for (const mode of ["terminal", "quiescence"]) {
     assert.throws(() => control.executionGrant(input.runId)); // Physical closure is not a fresh execution capability.
   });
 }
+
+test("C13 F5 refused abort of an issued run preserves its own and sibling real file effects", async t => {
+  const f = lifecycleFixture(t), d = f.dispatch("original healthy issued run"); d.accept(); const runtime = d.runtime();
+  const sibling = f.dispatch("healthy sibling"); sibling.accept(); const other = sibling.runtime();
+  await runtime.call("workspace_write", { path: "original-before.txt", content: "original was healthy" });
+  assert.equal(fs.readFileSync(join(f.project, "original-before.txt"), "utf8"), "original was healthy");
+  const before = fs.readFileSync(f.file, "utf8");
+  assert.throws(() => f.control.abortBeforeExecution(d.prepared), code("CONTROL_HELD"));
+  assert.equal(fs.readFileSync(f.file, "utf8"), before, "invalid abort must not write a terminal fact, hold or epoch");
+  await other.call("workspace_write", { path: "sibling-after.txt", content: "sibling remains healthy" });
+  await assert.doesNotReject(runtime.call("workspace_write", { path: "original-after.txt", content: "original remains healthy" }),
+    "refusing an invalid lifecycle call must not poison the genuine issued run");
+  assert.equal(fs.readFileSync(join(f.project, "sibling-after.txt"), "utf8"), "sibling remains healthy");
+  assert.equal(fs.readFileSync(join(f.project, "original-after.txt"), "utf8"), "original remains healthy");
+  const after = f.snapshot(); assert.equal(after.control.runs.length, 2); assert.equal(f.authority.commandControlSourceHealthy(), true);
+  assert.equal(after.lifecycle.executions.find(row => row.runId === d.binding.runId).phase, "issued");
+  assert.equal(after.lifecycle.executions.find(row => row.runId === d.binding.runId).terminal, null);
+});
