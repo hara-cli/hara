@@ -7,6 +7,8 @@ import { fork } from "node:child_process";
 import { once } from "node:events";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { LocalWorkspaceCatalog } from "../../dist/workspace/local-catalog.js";
+import { openLocalWorkspaceDevRoot } from "../../dist/workspace/local-dev-root.js";
+import { ensurePrivateStateSubdirectory } from "../../dist/security/private-state.js";
 import { WorkspaceResources } from "../../dist/workspace/resources.js";
 import { WorkspaceResourceStorage, workspaceStateHome } from "../../dist/workspace/resource-context.js";
 import { WorkspaceConnectionStoreV2 } from "../../dist/workspace/connections.js";
@@ -25,27 +27,33 @@ import { createWorkspaceRunPermit, bindWorkspaceRunOptions, beginWorkspaceGovern
 const fixtureDocs = JSON.parse(fs.readFileSync(new URL("../fixtures/agent-boundaries-v1.json", import.meta.url), "utf8"));
 const code = expected => error => error instanceof AgentBoundaryContractError && error.code === expected;
 export function lifecycleFixture(t, input = {}) {
-  const base = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-c3-control-"))), home = join(base, "home"), project = join(base, "project");
-  fs.mkdirSync(home, { mode: 0o700 }); fs.mkdirSync(project, { mode: 0o700 });
+  const base = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-c3-control-"))), home = join(base, "home");
+  let project = join(base, "project");
+  if (input.devRoot) openLocalWorkspaceDevRoot(base); // Prepare the official empty private Dev root BEFORE creating any state.
+  else { fs.mkdirSync(home, { mode: 0o700 }); fs.mkdirSync(project, { mode: 0o700 }); }
   const catalog = new LocalWorkspaceCatalog(home), row = catalog.create("Personal", catalog.read().revision), resources = new WorkspaceResources(home, row.scope);
   resources.initialize(); let agent = resources.agents.initializeMain();
   if (input.colleague) agent = resources.agents.create({ username: "lifecycle_fixture", profile: { displayName: "Lifecycle Fixture" }, runtimeId: "pi", permissionTier: "controlled" }, resources.agents.list().revision);
   else agent = resources.agents.setPermissionTier(agent.agentId, "controlled", agent.configRevision, agent.agentEpoch);
-  const storage = new WorkspaceResourceStorage(home, row.scope); storage.initialize(); const connections = new WorkspaceConnectionStoreV2(storage);
+  const storage = new WorkspaceResourceStorage(home, row.scope); storage.initialize();
+  if (input.devRoot) project = storage.run(() => ensurePrivateStateSubdirectory(base, ["project", row.scope.workspaceId]).path);
+  const connections = new WorkspaceConnectionStoreV2(storage);
   connections.add({ label: "fixture", provider: "openai", baseURL: "http://127.0.0.1:1/v1", apiKey: "synthetic-not-real", defaultModel: "synthetic" }, 0);
   const credential = randomBytes(32).toString("hex"), transports = new AgentBoundaryTransports(credential), transport = transports.connect("owner", credential);
   const now = () => clock; let clock = Date.now(); const root = captureWorkspaceProjectIdentity(project), permits = [], leases = [];
   const names = ["workspace_read", "workspace_write", "workspace_verify", "task_intake", "task_checkpoint", "todo_write", "ask_user"], ref = name => ({ toolId: name, connectorId: null, catalogRevision: 1 });
+  // A Dev consumer uses the actual Host project namespace/revision; ordinary unit fixtures retain "files".
+  const resourceId = input.devRoot ? `project_${agent.agentId}` : "files", resourceRevision = input.devRoot ? agent.agentEpoch : 1;
   const authorityOptions = { catalog, resources, storage, transports, commandControl: true, lifecycleControl: input.lifecycleControl !== false, now,
     toolsForAgent: () => names.map(name => ({ ...ref(name), assertCurrent() {} })) };
   // Use the actual resource binding captured by the Agent's task registry.
   const seed = resources.agents.bindTask(createTaskExecution("seed", randomUUID()), agent.agentId, agent.configRevision, agent.agentEpoch);
-  authorityOptions.resourcesForAgent = () => [{ resourceId: "files", agentId: agent.agentId, revision: 1, binding: seed.workspaceAgentBinding.resourceBinding,
+  authorityOptions.resourcesForAgent = () => [{ resourceId, agentId: agent.agentId, revision: resourceRevision, binding: seed.workspaceAgentBinding.resourceBinding,
     project: root, access: ["read", "write"], assertCurrent() { assert.deepEqual(captureWorkspaceProjectIdentity(project), root); } }];
   const authority = new WorkspaceAgentBoundaryAuthority(authorityOptions), view = authority.view(transport, agent.agentId);
   const document = name => structuredClone(fixtureDocs.valid.find(item => item.name === name).document), duty = document("duty"), boundary = document("boundary");
   for (const doc of [duty, boundary]) { doc.agentId = agent.agentId; doc.context = structuredClone(view.context); }
-  boundary.resources = [{ resourceId: "files", access: ["read", "write"] }]; boundary.tools = { allow: names.map(ref), deny: [], readOnly: false };
+  boundary.resources = [{ resourceId, access: ["read", "write"] }]; boundary.tools = { allow: names.map(ref), deny: [], readOnly: false };
   boundary.approvalRequired = []; boundary.budget = { budgetRef: "fixture", maxModelCalls: 12, maxToolEffects: 32 };
   const rights = { manage: true, invoke: true, privateRead: false, nodeUse: true, ...input.rights };
   authority.configure(transport, agent.agentId, { expectedRevision: view.revision, duty, boundary, rights });
@@ -77,7 +85,7 @@ export function lifecycleFixture(t, input = {}) {
       const abort = new AbortController(); let permit;
       const files = localWorkspaceFileTools(project, () => { assertWorkspaceRunContextCurrent(permit); });
       const grant = control.executionGrant(binding.runId), gate = createAgentBoundaryExecutionGate({ binding, authority, grant, control,
-        tools: files.map(tool => ({ tool, reference: ref(tool.name), resources: () => (tool.kind === "edit" ? ["read", "write"] : ["read"]).map(access => ({ resourceId: "files", access })) })) });
+        tools: files.map(tool => ({ tool, reference: ref(tool.name), resources: () => (tool.kind === "edit" ? ["read", "write"] : ["read"]).map(access => ({ resourceId, access })) })) });
       permit = createWorkspaceRunPermit({ binding, agentBoundary: gate, catalog, resources, storage, connections, lease, cwd: project, signal: abort.signal,
         provider: { id: "openai", model: binding.connection.model, async turn() { throw new Error("No model expected"); } }, toolNames: names,
         usage: { modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 }, updateUsage() {} }); permits.push(permit);
