@@ -1498,3 +1498,7 @@ Review N1/N2 found 15 normal links and 20,848 real-scale entries made the origin
 **Area**: backend
 
 Historical shape validation must not be the admission predicate for resuming an unpublished record. Compare its full canonical provenance to the current factory result for the authenticated frozen pair/binding before any repair publication, while retaining independent Host/grant fences. Reject-and-preserve mismatches; JSON key reordering alone is harmless. Source: C0 joint review J-HIST-ORPHAN; related: src/agent-hub/store.ts, c0-adapter.ts.
+
+
+## LRN-20261112-ONBOARDING-ATOMIC-BATCH (best_practice)
+For retryable configuration creation, persist the successful draft key on the retained Agent in the same catalog CAS. Return existing records before checking the caller's stale revision, but block all new slots on a stale catalog. Failed rows have stable actionable codes and no durable success marker. Progress, chosen defaults and row keys are UX metadata, never human provenance or execution authority. Existing C3 legacy-entry denial still applies.

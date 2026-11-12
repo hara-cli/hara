@@ -110,7 +110,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, runtimePlatform: { writeProtection: runtimeWriteProtection(), permissionTiers: availableRuntimePermissionTiers() }, capabilities: [capability, ...(boundaryTransports ? ["workspace.agent-boundaries.authority.v1"] : []), ...(input.agentBoundaries?.commandControl ? ["workspace.agent-command-control.v1"] : []), "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.media.v1", "workspace.media.states.v1", "workspace.i18n.v1", "workspace.agents.archive.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, runtimePlatform: { writeProtection: runtimeWriteProtection(), permissionTiers: availableRuntimePermissionTiers() }, capabilities: [capability, ...(boundaryTransports ? ["workspace.agent-boundaries.authority.v1"] : []), ...(input.agentBoundaries?.commandControl ? ["workspace.agent-command-control.v1"] : []), "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.preferences.default-runtime.v1", "workspace.onboarding.v1", "workspace.agents.create-batch.v1", "workspace.media.v1", "workspace.media.states.v1", "workspace.i18n.v1", "workspace.agents.archive.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     if (input.agentBoundaries?.commandControl || host.hasProtectedAgentCommands()) {
@@ -122,7 +122,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (method === "workspace.list") { fields([]); return host.list(); }
     if (method === "workspace.create") { fields(["label", "expectedRevision"]); if (!text(params.label, 80) || !positive(params.expectedRevision)) throw new Error("invalid Workspace creation"); return host.createWorkspace(params.label, params.expectedRevision); }
     if (method === "workspace.preferences.get") { fields([]); return host.getPreferences(); }
-    if (method === "workspace.preferences.set") { fields(["theme", "expectedRevision", ...["executionDetails", "collapseDetails", "alwaysShowTimingDiagnostics", "updates"].filter(key => Object.hasOwn(params, key))]); return host.setPreferences(params.theme, params.expectedRevision as number, params); }
+    if (method === "workspace.preferences.set") { fields(["expectedRevision", ...["theme", "defaultRuntimeId", "executionDetails", "collapseDetails", "alwaysShowTimingDiagnostics", "updates"].filter(key => Object.hasOwn(params, key))]); return host.setPreferences(params.theme, params.expectedRevision as number, params); }
     if (method === "workspace.activity") { fields([]); return host.activity(); }
     if (method === "workspace.update.prepare") { fields(["approved"]); if (params.approved !== true) throw new Error("Explicit restart approval required"); return host.prepareUpdate(client.id); }
     if (method === "workspace.update.release") { fields(["id"]); if (!text(params.id)) throw new Error("Invalid update lease"); host.releaseUpdate(client.id, params.id); return { released: true }; }
@@ -343,6 +343,16 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       if (typeof params.operationId !== "string" || !UUID.test(params.operationId)) throw new Error("invalid runtime operation");
       host.cancelRuntime(workspaceId, params.operationId); return { state: "cancelling" }; }
     if (method === "workspace.agent.select") { fields(["workspaceId", "expectedGeneration", "agentId"]); if (!text(params.agentId)) throw new Error("invalid Agent selection"); host.selectAgent(client.id, workspaceId, params.agentId); return host.snapshot(workspaceId, params.agentId, client.id); }
+    if (method === "workspace.onboarding.get") { fields(["workspaceId", "expectedGeneration"]); return host.getOnboarding(workspaceId); }
+    if (method === "workspace.onboarding.set") {
+      fields(["workspaceId", "expectedGeneration", "expectedRevision", "runId", "step", "engineChoice", "thirdPartySkipped", "dismissed", "completedAt"]);
+      const { workspaceId: _workspace, expectedGeneration: _generation, expectedRevision, ...progress } = params;
+      return host.setOnboarding(client.id, workspaceId, progress, expectedRevision as number);
+    }
+    if (method === "workspace.agents.createBatch") {
+      fields(["workspaceId", "expectedGeneration", "runId", "rows", "expectedCatalogRevision"]);
+      return host.createAgentBatch(client.id, workspaceId, { runId: params.runId, rows: params.rows }, params.expectedCatalogRevision as number);
+    }
     if (method === "workspace.agents.setPermissionTier") {
       fields(["workspaceId", "expectedGeneration", "agentId", "permissionTier", "configRevision", "agentEpoch"]);
       if (!text(params.agentId) || !isRuntimePermissionTier(params.permissionTier) || !positive(params.configRevision) || !positive(params.agentEpoch)) throw new Error("Invalid colleague permission update");

@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { VersionedSettings } from "./versioned-settings.js";
 import { plain } from "./local-state.js";
+import { isAgentRuntimeId, type AgentRuntimeId } from "../agent-runtime/bindings.js";
 
 export type ThemePreference = "system" | "light" | "dark";
 const theme = (value: unknown): value is ThemePreference => value === "system" || value === "light" || value === "dark";
@@ -39,26 +40,29 @@ function updates(raw: unknown): UpdatePreferences {
     || !(raw.snooze === null || plain(raw.snooze) && typeof raw.snooze.version === "string" && /^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/.test(raw.snooze.version) && typeof raw.snooze.until === "number" && Number.isFinite(raw.snooze.until))) throw new Error("Invalid update preferences");
   return structuredClone(raw) as unknown as UpdatePreferences;
 }
-interface Preferences { schemaVersion: 2; revision: number; theme: ThemePreference; migratedFrom: string; executionDetails: "brief" | "detailed"; collapseDetails: boolean; alwaysShowTimingDiagnostics: boolean; updates: UpdatePreferences }
+interface Preferences { defaultRuntimeId: AgentRuntimeId | null; schemaVersion: 2; revision: number; theme: ThemePreference; migratedFrom: string; executionDetails: "brief" | "detailed"; collapseDetails: boolean; alwaysShowTimingDiagnostics: boolean; updates: UpdatePreferences }
 export class WorkspacePreferences {
   private readonly state: VersionedSettings<Preferences>;
   constructor(home: string, legacyHome?: string, legacyTheme: () => ThemePreference = () => legacyHome ? readLegacyTheme(legacyHome) : "system") {
     let cachedTheme: ThemePreference | undefined;
     this.state = new VersionedSettings<Preferences>(() => home, "ui-preferences-v1.json", 2,
-      () => ({ schemaVersion: 2, revision: 0, theme: cachedTheme ??= legacyTheme(), migratedFrom: legacyHome ? "legacy-preference-or-system" : "system", executionDetails: "brief", collapseDetails: true, alwaysShowTimingDiagnostics: false, updates: updateDefaults() }),
+      () => ({ schemaVersion: 2, revision: 0, defaultRuntimeId: null, theme: cachedTheme ??= legacyTheme(), migratedFrom: legacyHome ? "legacy-preference-or-system" : "system", executionDetails: "brief", collapseDetails: true, alwaysShowTimingDiagnostics: false, updates: updateDefaults() }),
       raw => {
         if (!plain(raw) || raw.schemaVersion !== 2 || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 0 || !theme(raw.theme)) throw new Error("Invalid appearance settings");
         if (raw.executionDetails !== undefined && !["brief", "detailed"].includes(String(raw.executionDetails)) || raw.collapseDetails !== undefined && typeof raw.collapseDetails !== "boolean"
           || raw.alwaysShowTimingDiagnostics !== undefined && typeof raw.alwaysShowTimingDiagnostics !== "boolean") throw new Error("Invalid execution display preference");
+        if (raw.defaultRuntimeId !== undefined && raw.defaultRuntimeId !== null && !isAgentRuntimeId(raw.defaultRuntimeId)) throw new Error("Invalid default Runtime preference");
         // Optional additions to v2 are backwards compatible; no side-effecting schema migration.
-        return { schemaVersion: 2, revision: Number(raw.revision), theme: raw.theme, migratedFrom: typeof raw.migratedFrom === "string" ? raw.migratedFrom : "v1",
+        return { schemaVersion: 2, revision: Number(raw.revision), defaultRuntimeId: raw.defaultRuntimeId as AgentRuntimeId | null ?? null, theme: raw.theme, migratedFrom: typeof raw.migratedFrom === "string" ? raw.migratedFrom : "v1",
           executionDetails: raw.executionDetails === "detailed" ? "detailed" : "brief", collapseDetails: raw.collapseDetails !== false, alwaysShowTimingDiagnostics: raw.alwaysShowTimingDiagnostics === true, updates: updates(raw.updates) };
       }, { 1: raw => ({ ...raw, schemaVersion: 2, migratedFrom: "v1" }) });
   }
   read() { const { value, readOnly, recovered } = this.state.read(); return { ...value, readOnly, recovered }; }
-  save(value: unknown, expected: number, extra: { executionDetails?: unknown; collapseDetails?: unknown; alwaysShowTimingDiagnostics?: unknown; updates?: unknown } = {}) {
-    if (!theme(value)) throw new Error("Invalid appearance choice");
-    return this.state.update(expected, old => ({ ...old, theme: value,
+  save(value: unknown, expected: number, extra: { defaultRuntimeId?: unknown; executionDetails?: unknown; collapseDetails?: unknown; alwaysShowTimingDiagnostics?: unknown; updates?: unknown } = {}) {
+    if (!theme(value) && !(value === undefined && Object.hasOwn(extra, "defaultRuntimeId"))) throw new Error("Invalid appearance choice");
+    if (Object.hasOwn(extra, "defaultRuntimeId") && extra.defaultRuntimeId !== null && !isAgentRuntimeId(extra.defaultRuntimeId)) throw new Error("Invalid default Runtime preference");
+    return this.state.update(expected, old => ({ ...old, theme: value === undefined ? old.theme : value as ThemePreference,
+      ...(Object.hasOwn(extra, "defaultRuntimeId") ? { defaultRuntimeId: extra.defaultRuntimeId as AgentRuntimeId | null } : {}),
       ...(extra.executionDetails !== undefined ? { executionDetails: extra.executionDetails as Preferences["executionDetails"] } : {}),
       ...(extra.alwaysShowTimingDiagnostics !== undefined ? { alwaysShowTimingDiagnostics: extra.alwaysShowTimingDiagnostics as boolean } : {}),
       ...(extra.collapseDetails !== undefined ? { collapseDetails: extra.collapseDetails as boolean } : {}), ...(extra.updates !== undefined ? { updates: updates(extra.updates) } : {}) }));
