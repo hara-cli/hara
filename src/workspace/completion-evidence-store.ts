@@ -16,7 +16,7 @@ interface Document {
 /** The whole frozen run binding, including task/Agent/connection/project/authority/budget, must match.
  * Per-operation updates are synchronous and atomic: persist pending before dispatch, success after
  * observation. A crash in between leaves an unusable receipt; it never authorizes automatic replay. */
-export function createWorkspaceCompletionEvidence(storage: WorkspaceResourceStorage, input: WorkspaceRunBinding, resume?: { previousTask: TaskExecution; currentTask: TaskExecution; answeredQuestionId?: string }): CompletionEvidenceLedger {
+function completionEvidenceState(storage: WorkspaceResourceStorage, input: WorkspaceRunBinding) {
   const binding = freezeWorkspaceRunBinding(input);
   const hash = (text: string) => createHash("sha256").update(text).digest("hex");
   const runBindingHash = hash(canonical(binding));
@@ -30,6 +30,18 @@ export function createWorkspaceCompletionEvidence(storage: WorkspaceResourceStor
       snapshot: parseCompletionEvidenceSnapshot(value.snapshot) };
   }, () => ({ schemaVersion: 1, revision: 0, resourceBinding: state.binding(), runBindingHash,
     snapshot: { schemaVersion: 1, observations: [] } }));
+  return state;
+}
+
+/** Read-only same-run C2 facts. Missing is unknown to the reader, never proof of no dispatch. */
+export function readWorkspaceCompletionEffects(storage: WorkspaceResourceStorage, input: WorkspaceRunBinding): readonly Readonly<NonNullable<CompletionEvidenceSnapshot["effects"]>[number]>[] | null {
+  const current = completionEvidenceState(storage, input).read();
+  return current.revision === 0 ? null : Object.freeze((current.snapshot.effects ?? []).map(row => Object.freeze({ ...row })));
+}
+
+export function createWorkspaceCompletionEvidence(storage: WorkspaceResourceStorage, input: WorkspaceRunBinding, resume?: { previousTask: TaskExecution; currentTask: TaskExecution; answeredQuestionId?: string }): CompletionEvidenceLedger {
+  const binding = freezeWorkspaceRunBinding(input), state = completionEvidenceState(storage, binding);
+  const invalid = (): never => { throw new Error("Invalid private completion run binding; state was preserved"); };
   let current = state.read();
   let recovery: { previousScope: string; currentScope: string } | undefined;
   if (resume) {
