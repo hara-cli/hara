@@ -1,3 +1,4 @@
+import type { AgentRoutingDirectoryEntry } from "./agent-routing-owner.js";
 import { emptyAgentRoutingState, parseAgentRoutingState, assertAgentRoutingCapacity, assertAgentRoutingTransition, type AgentRoutingState } from "./agent-routing-state.js";
 import { WorkspaceAgentLifecycleHistory } from "./agent-lifecycle-history.js";
 import { assertAgentLifecycleCapacity, assertAgentLifecycleTransition, migrateAgentLifecycleState, parseAgentLifecycleState, type AgentLifecycleState, type AgentLifecycleRun, type AgentLifecycleRecoveryV1 } from "./agent-lifecycle-state.js";
@@ -443,6 +444,24 @@ export class WorkspaceAgentBoundaryAuthority {
     });
   }
   commandRoutingInitialized(): boolean { return this.read().schemaVersion === 4; }
+  /** Public C0 duties only. The trusted caller must validate the audience BEFORE invoking this. */
+  routingDirectory(transport: AgentBoundaryTransport, memberIds: readonly string[], automaticAgentIds: readonly string[]): readonly AgentRoutingDirectoryEntry[] {
+    this.source(transport); const state = this.read();
+    if (!this.options.routingControl || state.schemaVersion !== 4 || !state.control) return fail("AUTHORITY_UNVERIFIED", "routing.bootstrap");
+    if (memberIds.length > 128 || new Set(memberIds).size !== memberIds.length || !memberIds.every(id)) return fail("INVALID_DOCUMENT", "routing.audience");
+    const result: AgentRoutingDirectoryEntry[] = [];
+    for (const agentId of memberIds) {
+      const policy = state.policies.find(row => row.agentId === agentId);
+      if (!policy || !policy.rights.manage && !policy.rights.invoke) continue;
+      try { this.currentPolicy(agentId, policy); } catch (error) { if (error instanceof AgentBoundaryContractError) continue; throw error; }
+      const control = state.control.agents.find(row => row.agentId === agentId), available = policy.rights.invoke && policy.rights.nodeUse && !control?.hold && !control?.dismissed;
+      result.push({ agentId, dutyRevision: policy.duty.dutyRevision, policyRevision: policy.revision,
+        agentEpoch: policy.agentEpoch, configRevision: policy.configRevision, publicProfile: policy.duty.publicProfile,
+        available: Boolean(available), automatic: Boolean(available && automaticAgentIds.includes(agentId)) });
+    }
+    this.source(transport); return deepFreeze(result);
+  }
+
   /** Trusted library read used by the C3 source after the original UI disconnects. */
   commandControlState() {
     const state = this.read();

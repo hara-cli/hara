@@ -31,17 +31,18 @@ export function routingFields(value: unknown, keys: readonly string[]): asserts 
   if (own.length !== keys.length || own.some(key => typeof key !== "string" || !keys.includes(key) || !descriptors[key]!.enumerable || !Object.hasOwn(descriptors[key]!, "value"))) return routingFail();
 }
 /** Validate descriptors before canonicalizing even direct library inputs. */
-function jsonOnly(value: unknown, depth = 0, budget = { nodes: 100000 }): void {
+export function assertAgentRoutingJson(value: unknown, depth = 0, budget = { nodes: 100000 }): void {
   if (--budget.nodes < 0 || depth > 24) return routingFail();
   if (value === null || typeof value === "string" || typeof value === "boolean" || typeof value === "number" && Number.isFinite(value)) return;
   if (!value || typeof value !== "object") return routingFail();
   const array = Array.isArray(value);
+  if (array && Object.getPrototypeOf(value) !== Array.prototype) return routingFail();
   if (!array && ![Object.prototype, null].includes(Object.getPrototypeOf(value))) return routingFail();
   const descriptors = Object.getOwnPropertyDescriptors(value);
   for (const key of Reflect.ownKeys(descriptors)) {
     if (array && key === "length") continue;
-    if (typeof key !== "string" || array && !/^(0|[1-9][0-9]*)$/.test(key) || !descriptors[key]!.enumerable || !Object.hasOwn(descriptors[key]!, "value")) return routingFail();
-    jsonOnly(descriptors[key]!.value, depth + 1, budget);
+    if (typeof key !== "string" || ["__proto__", "constructor", "prototype"].includes(key) || array && !/^(0|[1-9][0-9]*)$/.test(key) || !descriptors[key]!.enumerable || !Object.hasOwn(descriptors[key]!, "value")) return routingFail();
+    assertAgentRoutingJson(descriptors[key]!.value, depth + 1, budget);
   }
   if (array && Object.keys(descriptors).length !== (value as unknown[]).length + 1) return routingFail();
 }
@@ -60,7 +61,7 @@ export function assertAgentRoutingCapacity(state: AgentRoutingState): void {
 }
 export function parseAgentRoutingState(raw: unknown, control: AgentCommandState, binding: AgentBoundaryContext["resourceBinding"],
   retired: readonly { runId: string; commandId: string; taskId: string; rootRequestId: string; agentId: string; claimRevision: number }[] = []): AgentRoutingState {
-  jsonOnly(raw);
+  assertAgentRoutingJson(raw);
   routingFields(raw, ["schemaVersion", "migration", "sequence", "records"]); routingFields(raw.migration, ["fromSchema", "sourceDigest", "at"]);
   if (raw.schemaVersion !== 1 || raw.migration.fromSchema !== 3 || !hash(raw.migration.sourceDigest) || !timestamp(raw.migration.at)
     || !commandEpoch(raw.sequence) || !Array.isArray(raw.records)) return routingFail();
