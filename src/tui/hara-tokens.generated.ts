@@ -1,11 +1,11 @@
-// Hara design tokens · version 2.1.1 · sourceSha 1a02f9eb24575e6d50d3de9e1a6c33091d477600386c71e731717a91fb977f89
+// Hara design tokens · version 2.1.2 · sourceSha 363e99542888d219a9e9d351738595904da766264ea46d677bfdec70ccafe03f
 // GENERATED from uiux/design-language/hara/DESIGN.md by build_tokens.mjs — do not edit by hand.
 // Terminal palette. Use the truecolor value when supported, else the 256 index, else the 16-colour name.
 // Respect NO_COLOR and non-TTY output: emit no colour at all.
 
 export const haraTerminal = {
-  "version": "2.1.1",
-  "sourceSha": "1a02f9eb24575e6d50d3de9e1a6c33091d477600386c71e731717a91fb977f89",
+  "version": "2.1.2",
+  "sourceSha": "363e99542888d219a9e9d351738595904da766264ea46d677bfdec70ccafe03f",
   "accent": {
     "dark": "#A78BFA",
     "light": "#6D28D9",
