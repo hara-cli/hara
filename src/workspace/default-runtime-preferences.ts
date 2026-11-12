@@ -1,6 +1,6 @@
 import { isAgentRuntimeId, type AgentRuntimeId } from "../agent-runtime/bindings.js";
 import { exact, plain } from "./local-state.js";
-import { VersionedSettings } from "./versioned-settings.js";
+import { SettingsMigrationPendingError, VersionedSettings } from "./versioned-settings.js";
 import { workspaceStateHome, type WorkspaceResourceStorage } from "./resource-context.js";
 
 interface State { schemaVersion: 1; revision: number; defaultRuntimeId: AgentRuntimeId | null }
@@ -24,7 +24,11 @@ export class WorkspaceDefaultRuntime {
           // The scoped CAS winner reads only the explicit old Host preference. Once this
           // record exists, even a saved null never reads or follows that legacy value again.
           let initial: AgentRuntimeId | null = null;
-          try { initial = this.legacyInitial(); } catch { /* Preserve an unreadable legacy source; retain Pi-first. */ }
+          try { initial = this.legacyInitial(); }
+          catch (error) {
+            if (error instanceof SettingsMigrationPendingError) throw error;
+            // A safely read but invalid legacy value cannot become a valid engine choice.
+          }
           return { ...old, defaultRuntimeId: initial };
         });
       } catch (error) {

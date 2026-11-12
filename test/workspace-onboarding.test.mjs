@@ -8,6 +8,8 @@ import { once } from "node:events";
 import { WebSocket } from "ws";
 import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { WorkspacePreferences } from "../dist/workspace/preferences.js";
+import { SettingsMigrationPendingError } from "../dist/workspace/versioned-settings.js";
+import { withPrivateStateLockSync } from "../dist/security/private-state.js";
 import { WorkspaceAgentStore } from "../dist/workspace/agents.js";
 import { AgentRuntimeRegistry } from "../dist/agent-runtime/registry.js";
 import { workspaceStateHome } from "../dist/workspace/resource-context.js";
@@ -66,7 +68,27 @@ test("G1: two Workspaces independently migrate the old Host value once, retain n
   assert.throws(() => f.host.setDefaultRuntime("client", second.workspaceId, "unknown", bNext.revision), /Runtime/);
 });
 
-test("G1: an unreadable old value stays preserved and Workspace writes remain independent", t => {
+test("G1: a Host publication claim cannot permanently migrate an empty default", t => {
+  const f = fixture(t); f.host.getPreferences();
+  const primary = join(f.host.home, ".hara", "ui-preferences-v1.json"), backup = primary.replace(".json", "-backup.json");
+  const raw = JSON.parse(fs.readFileSync(primary)); raw.defaultRuntimeId = "codex"; fs.writeFileSync(primary, JSON.stringify(raw)); fs.writeFileSync(backup, JSON.stringify(raw));
+  const before = fs.readFileSync(primary), claimed = primary + ".claimed-fixture", claimedBackup = backup + ".claimed-fixture";
+  const scoped = f.path("workspace-default-runtime-v1.json");
+  withPrivateStateLockSync(f.host.home, [], "ui-preferences-v1", () => {
+    fs.renameSync(primary, claimed); fs.renameSync(backup, claimedBackup);
+    try {
+      assert.throws(() => f.host.getDefaultRuntime(f.id), error => error instanceof SettingsMigrationPendingError);
+      assert.equal(fs.existsSync(scoped), false); assert.equal(fs.existsSync(scoped.replace(".json", "-backup.json")), false);
+    } finally { fs.renameSync(claimed, primary); fs.renameSync(claimedBackup, backup); }
+  });
+  assert.equal(f.host.getDefaultRuntime(f.id).defaultRuntimeId, "codex"); assert.deepEqual(fs.readFileSync(primary), before);
+  const retainedBackup = fs.readFileSync(backup); fs.unlinkSync(primary);
+  const second = f.host.createWorkspace("Backup migration", f.host.list().revision);
+  assert.equal(f.host.getDefaultRuntime(second.workspaceId).defaultRuntimeId, "codex");
+  assert.equal(fs.existsSync(primary), false); assert.deepEqual(fs.readFileSync(backup), retainedBackup);
+});
+
+test("G1: an invalid old document stays preserved and Workspace writes remain independent", t => {
   const f = fixture(t); f.host.getPreferences(); const legacy = join(f.host.home, ".hara", "ui-preferences-v1.json");
   fs.writeFileSync(legacy, "{"); const initial = f.host.getDefaultRuntime(f.id);
   assert.equal(initial.defaultRuntimeId, null); assert.equal(fs.readFileSync(legacy, "utf8"), "{");

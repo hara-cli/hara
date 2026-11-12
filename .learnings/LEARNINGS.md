@@ -1505,3 +1505,5 @@ For retryable configuration creation, persist the successful draft key on the re
 
 ## 2026-11-12 Workspace default-runtime scope
 A new-colleague default is Workspace metadata, with its own resource binding and CAS revision. Use a Host-global value only as a one-time migration seed; persisted null also ends that migration. Keep appearance revisions independent, fence scoped RPC by generation and view, and test two spaces plus restart and the actual proposal card. Saving a choice is not an engine readiness probe or execution authorization.
+
+G1 migration follow-up: a pathname may be absent while a versioned-settings writer owns its publication claim. Arbitrate missing primary/backup with that writer lock and preserve migration-pending errors; never persist a null seed merely because another writer temporarily owns the name. A retained backup can seed a genuinely missing primary without restoring or rewriting the Host source.

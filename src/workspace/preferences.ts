@@ -1,8 +1,8 @@
 import { lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { bindPrivateHaraStateFile, readPrivateStateFileSnapshotSync } from "../security/private-state.js";
-import { VersionedSettings } from "./versioned-settings.js";
+import { bindPrivateHaraStateFile, readPrivateStateFileSnapshotSync, withPrivateStateLockSync } from "../security/private-state.js";
+import { SettingsMigrationPendingError, VersionedSettings } from "./versioned-settings.js";
 import { plain } from "./local-state.js";
 import { isAgentRuntimeId, type AgentRuntimeId } from "../agent-runtime/bindings.js";
 
@@ -60,8 +60,23 @@ export class WorkspacePreferences {
   }
   /** Pure, bounded migration input; never runs appearance migration or overwrites the source. */
   legacyDefaultRuntimeId(): AgentRuntimeId | null {
-    const file = bindPrivateHaraStateFile(this.home, [], "ui-preferences-v1.json");
-    const snapshot = readPrivateStateFileSnapshotSync(file.path, 4 * 1024 * 1024);
+    const read = (name = "ui-preferences-v1.json") => {
+      try {
+        const file = bindPrivateHaraStateFile(this.home, [], name);
+        return readPrivateStateFileSnapshotSync(file.path, 4 * 1024 * 1024);
+      } catch (error: any) {
+        if (error?.code === "ENOENT") return null;
+        throw new SettingsMigrationPendingError();
+      }
+    };
+    let snapshot = read();
+    if (!snapshot) {
+      // Publication can briefly claim both names. A missing snapshot is not an empty
+      // preference until the existing Host writer has released its lock.
+      try {
+        snapshot = withPrivateStateLockSync(this.home, [], "ui-preferences-v1", () => read() ?? read("ui-preferences-v1-backup.json"));
+      } catch { throw new SettingsMigrationPendingError(); }
+    }
     if (!snapshot) return null;
     const raw: unknown = JSON.parse(snapshot.text);
     if (!plain(raw) || raw.schemaVersion !== 1 && raw.schemaVersion !== 2 || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 0
