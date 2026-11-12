@@ -45,6 +45,9 @@ export interface WorkspaceAgentCreateInput extends WorkspaceAgentPersonaInput {
 }
 export interface WorkspaceAgentBatchRow extends WorkspaceAgentCreateInput { draftKey: string }
 export interface WorkspaceAgentBatchInput { runId: string; rows: WorkspaceAgentBatchRow[] }
+/** Trusted Host preflight only, never part of the RPC envelope. Null means no available engine. */
+export type WorkspaceAgentBatchDefault = Readonly<{ kind: "resolved"; runtimeId: AgentRuntimeId | null }
+  | { kind: "preference_unavailable" }>;
 export type WorkspaceAgentBatchFailure = "invalid_request" | "runtime_unconfirmed" | "runtime_unavailable"
   | "permission_tier_unavailable" | "username_taken" | "catalog_changed" | "batch_limit";
 export type WorkspaceAgentBatchResult = { index: number; draftKey: string; status: "created" | "exists"; agent: WorkspaceAgentView }
@@ -364,7 +367,7 @@ export class WorkspaceAgentStore {
   /** Explicit human UI admission only. Success markers and Agents share one CAS publication, so
    * ACK loss/restart/archive cannot create a second colleague for the same runId + draftKey.
    * Successful keys always return their original Agent; changed retry text never edits it. */
-  createBatch(input: WorkspaceAgentBatchInput, expectedCatalogRevision: number) {
+  createBatch(input: WorkspaceAgentBatchInput, expectedCatalogRevision: number, defaultRuntime?: WorkspaceAgentBatchDefault) {
     this.binding();
     if (!object(input) || !keys(input, ["runId", "rows"]) || typeof input.runId !== "string" || !BATCH_RUN.test(input.runId)
       || !Array.isArray(input.rows) || input.rows.length < 1 || input.rows.length > 8 || !positive(expectedCatalogRevision)) throw new Error("Invalid Workspace Agent batch");
@@ -373,6 +376,9 @@ export class WorkspaceAgentStore {
       if (!object(row) || typeof row.draftKey !== "string" || !DRAFT_KEY.test(row.draftKey) || seen.has(row.draftKey)) throw new Error("Invalid or repeated batch draft key");
       seen.add(row.draftKey);
     }
+    if (defaultRuntime !== undefined && (!object(defaultRuntime) || (defaultRuntime.kind === "resolved"
+      ? !keys(defaultRuntime, ["kind", "runtimeId"]) || defaultRuntime.runtimeId !== null && (!isAgentRuntimeId(defaultRuntime.runtimeId) || defaultRuntime.runtimeId === "hara")
+      : defaultRuntime.kind !== "preference_unavailable" || !keys(defaultRuntime, ["kind"])))) throw new Error("Invalid Workspace Agent batch default");
     const request = structuredClone(input);
     return withPrivateStateLockSync(workspaceStateHome(), [], "workspace-agents", () => {
       const loaded = this.load(), value = loaded.value; if (!value) throw new Error("Workspace Agent catalog unavailable");
@@ -386,12 +392,19 @@ export class WorkspaceAgentStore {
         if (value.agents.filter(agent => agent.creation?.runId === request.runId).length >= 8) { failed("batch_limit"); continue; }
         if (!keys(row as unknown as Record<string, unknown>, ["draftKey", "username", "profile"], ["description", "instructions", "runtimeId", "permissionTier"])
           || typeof row.username !== "string" || !USERNAME.test(row.username) || ["main", "hara"].includes(row.username)
-          || !isAgentRuntimeId(row.runtimeId) || row.runtimeId === "hara" || row.permissionTier !== undefined && !isRuntimePermissionTier(row.permissionTier)) { failed("invalid_request"); continue; }
+          || Object.hasOwn(row, "runtimeId") && (!isAgentRuntimeId(row.runtimeId) || row.runtimeId === "hara")
+          || row.permissionTier !== undefined && !isRuntimePermissionTier(row.permissionTier)) { failed("invalid_request"); continue; }
         if (row.permissionTier !== undefined && !availableRuntimePermissionTiers().includes(row.permissionTier)) { failed("permission_tier_unavailable"); continue; }
-        const runtime = options.find(option => option.id === row.runtimeId);
+        // Existing/stale/overflow slots were settled above. A pending implicit slot cannot
+        // silently choose Pi when its Workspace preference could not be read. Nothing in
+        // this in-memory batch has been published yet, including earlier explicit rows.
+        if (!Object.hasOwn(row, "runtimeId") && defaultRuntime?.kind === "preference_unavailable") throw new Error("Workspace default engine settings unavailable; refresh before creating colleagues");
+        const runtimeId = Object.hasOwn(row, "runtimeId") ? row.runtimeId : defaultRuntime?.kind === "resolved" ? defaultRuntime.runtimeId : undefined;
+        if (!isAgentRuntimeId(runtimeId) || runtimeId === "hara") { failed("runtime_unavailable"); continue; }
+        const runtime = options.find(option => option.id === runtimeId);
         if (!runtime?.available) { failed(runtime?.confirmation !== undefined && runtime.confirmation !== "none" ? "runtime_unconfirmed" : "runtime_unavailable"); continue; }
         if (value.agents.some(agent => agent.username === row.username)) { failed("username_taken"); continue; }
-        const { draftKey, username, runtimeId, permissionTier = defaultRuntimePermissionTier(), ...fields } = row;
+        const { draftKey, username, runtimeId: _requestedRuntime, permissionTier = defaultRuntimePermissionTier(), ...fields } = row;
         let normalized: ReturnType<typeof persona>;
         try { normalized = persona(fields, username); } catch { failed("invalid_request"); continue; }
         // Recheck live runtime registration before admission, without launching or probing models.

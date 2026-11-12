@@ -355,3 +355,80 @@ test("G1: trusted metadata policy is evaluated for the exact Workspace, not the 
   assert.equal(saved.readOnly, false); assert.equal(saved.defaultRuntimeId, "claude");
   assert.equal(f.host.getDefaultRuntime(f.id).defaultRuntimeId, "codex");
 });
+
+
+test("G4 review N1: a different run must start at step one without a skipped third party", t => {
+  const f = fixture(t), first = f.host.getOnboarding(f.id), file = f.path("workspace-onboarding-v1.json"), before = fs.readFileSync(file);
+  for (const change of [{ step: 2 }, { thirdPartySkipped: true }]) {
+    assert.throws(() => f.host.setOnboarding("client", f.id, { ...progress(first), runId: randomUUID(), ...change }, first.revision), /step one/);
+    assert.deepEqual(fs.readFileSync(file), before); assert.equal(f.host.getOnboarding(f.id).revision, first.revision);
+  }
+});
+
+test("G4 review N1: completion cannot be cleared within the same run", t => {
+  const f = fixture(t), first = f.host.getOnboarding(f.id);
+  const complete = f.host.setOnboarding("client", f.id, { ...progress(first), step: 3, completedAt: new Date().toISOString() }, first.revision);
+  const file = f.path("workspace-onboarding-v1.json"), before = fs.readFileSync(file);
+  assert.throws(() => f.host.setOnboarding("client", f.id, { ...progress(complete), completedAt: null }, complete.revision), /explicit new run/);
+  assert.deepEqual(fs.readFileSync(file), before); assert.deepEqual(f.host.getOnboarding(f.id), complete);
+});
+
+test("G4 review N1: a selected colleague cannot write onboarding/defaults or create a batch", t => {
+  const f = fixture(t), first = f.host.getOnboarding(f.id), pref = f.host.getDefaultRuntime(f.id);
+  const { draftKey, ...input } = row("selected");
+  const colleague = f.agents.create(input, f.agents.list().revision);
+  const files = [f.path("workspace-onboarding-v1.json"), f.path("workspace-default-runtime-v1.json"), f.path("workspace-agents.json")];
+  const retained = files.map(file => fs.readFileSync(file));
+  f.host.selectAgent("client", f.id, colleague.agentId);
+  assert.throws(() => f.host.setOnboarding("client", f.id, { ...progress(first), step: 2 }, first.revision), /view changed/);
+  assert.throws(() => f.host.setDefaultRuntime("client", f.id, "codex", pref.revision), /view changed/);
+  assert.throws(() => f.host.createAgentBatch("client", f.id, { runId: randomUUID(), rows: [row("refused")] }, f.agents.list().revision), /view changed/);
+  files.forEach((file,index) => assert.deepEqual(fs.readFileSync(file), retained[index]));
+});
+
+test("G2 review N2: actual pending G1 migration cannot silently publish any row of a mixed batch", t => {
+  const f = fixture(t); f.host.getPreferences();
+  const primary = join(f.host.home, ".hara", "ui-preferences-v1.json"), backup = join(f.host.home, ".hara", "ui-preferences-v1-backup.json");
+  const catalog = f.path("workspace-agents.json"), before = fs.readFileSync(catalog), revision = f.agents.list().revision;
+  const implicit = row("implicit"); delete implicit.runtimeId;
+  const input = { runId: randomUUID(), rows: [row("explicit"), implicit] };
+  withPrivateStateLockSync(f.host.home, [], "ui-preferences-v1", () => {
+    const held = [primary,backup].filter(file => fs.existsSync(file)).map(file => [file,file+".review-held"]);
+    for (const [file,hold] of held) fs.renameSync(file,hold);
+    try {
+      assert.throws(() => f.host.createAgentBatch("client", f.id, input, revision), /default.*unavailable/i);
+      assert.deepEqual(fs.readFileSync(catalog), before);
+      assert.equal(fs.existsSync(f.path("workspace-default-runtime-v1.json")), false);
+      assert.equal(fs.existsSync(f.path("workspace-default-runtime-v1-backup.json")), false);
+    } finally { for (const [file,hold] of held) fs.renameSync(hold,file); }
+  });
+  const retried = f.host.createAgentBatch("client", f.id, input, revision);
+  assert.deepEqual(retried.results.map(result => result.status), ["created","created"]);
+  assert.equal(retried.revision, revision+1); assert.equal(f.agents.list().agents.length, 3);
+});
+
+test("G2 review N2: committed implicit keys survive unreadable G1 and explicit rows never consult it", t => {
+  const f = fixture(t), implicit = row("original"); delete implicit.runtimeId;
+  const input = { runId: randomUUID(), rows: [implicit] };
+  const saved = f.host.createAgentBatch("client", f.id, input, f.agents.list().revision);
+  for (const name of ["workspace-default-runtime-v1.json","workspace-default-runtime-v1-backup.json"]) fs.writeFileSync(f.path(name), "{damaged");
+  const original = f.host.getDefaultRuntime.bind(f.host), read = t.mock.method(f.host, "getDefaultRuntime", original);
+  assert.throws(() => original(f.id));
+  const retried = f.host.createAgentBatch("client", f.id, input, saved.revision-1);
+  assert.equal(retried.results[0].status, "exists"); assert.equal(retried.results[0].agent.agentId, saved.results[0].agent.agentId);
+  assert.equal(retried.revision, saved.revision);
+  const reads = read.mock.callCount();
+  const explicit = f.host.createAgentBatch("client", f.id, { runId: randomUUID(), rows: [row("explicit-ok")] }, saved.revision);
+  assert.equal(explicit.results[0].status, "created"); assert.equal(read.mock.callCount(), reads);
+});
+
+test("G2 review N3: no available colleague engine returns runtime_unavailable without publication", t => {
+  const f = fixture(t); f.host.getDefaultRuntime(f.id);
+  const options = AgentRuntimeRegistry.prototype.options;
+  t.mock.method(AgentRuntimeRegistry.prototype, "options", function() { return options.call(this).map(option => ({ ...option, available: false })); });
+  const implicit = row("missing"); delete implicit.runtimeId;
+  const file = f.path("workspace-agents.json"), before = fs.readFileSync(file), revision = f.agents.list().revision;
+  const result = f.host.createAgentBatch("client", f.id, { runId: randomUUID(), rows: [implicit] }, revision);
+  assert.equal(result.results[0].status, "failed"); assert.equal(result.results[0].reason, "runtime_unavailable");
+  assert.equal(result.revision, revision); assert.deepEqual(fs.readFileSync(file), before);
+});

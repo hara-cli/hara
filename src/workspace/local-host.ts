@@ -85,7 +85,7 @@ import { WorkspaceDefaultRuntime } from "./default-runtime-preferences.js";
 import type { WorkspaceResourcePrincipal } from "./account-resources.js";
 /** Restricts G1 metadata on an already admitted local Workspace; never admits Account scopes. */
 export type WorkspaceDefaultRuntimeRole = (workspaceId: string) => WorkspaceResourcePrincipal["role"] | null;
-import type { WorkspaceAgentBatchInput } from "./agents.js";
+import type { WorkspaceAgentBatchDefault, WorkspaceAgentBatchInput } from "./agents.js";
 import { WorkspaceFeatures } from "./features.js";
 import type { JsonCliPolicyFactory } from "../agent-runtime/json-cli-policy.js";
 import { WorkspaceExtensions, type ExtensionChange, type ExtensionToolSnapshot } from "./extensions.js";
@@ -992,11 +992,15 @@ export class LocalWorkspaceHost {
     }
     return { applied, agent: agents.list().agents.find(row => row.agentId === input.agentId) ?? null };
   }
-  private newColleagueRuntime(workspaceId: string, options: ReturnType<WorkspaceHostContext["resources"]["agents"]["runtimeOptions"]>) {
+  private selectColleagueRuntime(preferred: AgentRuntimeId | null, options: ReturnType<WorkspaceHostContext["resources"]["agents"]["runtimeOptions"]>) {
     const available = options.filter(option => option.available && option.id !== "hara");
-    let preferred: AgentRuntimeId | null = null;
-    try { preferred = this.getDefaultRuntime(workspaceId).defaultRuntimeId; } catch { /* A missing/unreadable preference cannot retarget existing Agents. */ }
     return available.find(option => option.id === preferred)?.id ?? available.find(option => option.id === "pi")?.id ?? available[0]?.id;
+  }
+  private newColleagueRuntime(workspaceId: string, options: ReturnType<WorkspaceHostContext["resources"]["agents"]["runtimeOptions"]>) {
+    let preferred: AgentRuntimeId | null = null;
+    // Proposal cards still expose the fallback engine for explicit human correction/confirmation.
+    try { preferred = this.getDefaultRuntime(workspaceId).defaultRuntimeId; } catch { /* Existing Agents are never retargeted. */ }
+    return this.selectColleagueRuntime(preferred, options);
   }
   private defaultRuntimeWritable(workspaceId: string): boolean {
     // The Local catalog admits only its registered local owner. This optional policy can
@@ -1042,10 +1046,17 @@ export class LocalWorkspaceHost {
     const context = this.assertOnboardingView(clientId, workspaceId);
     if (!plain(input) || !exact(input, ["runId", "rows"]) || typeof input.runId !== "string" || !UUID.test(input.runId)
       || !Array.isArray(input.rows) || input.rows.length < 1 || input.rows.length > 8) throw new Error("Invalid colleague batch");
-    // Resolve only an omitted choice. An explicit unavailable runtime is a row failure, never a fallback.
-    const fallback = this.newColleagueRuntime(workspaceId, context.resources.agents.runtimeOptions());
-    const rows = input.rows.map(row => plain(row) && !Object.hasOwn(row, "runtimeId") ? { ...row, runtimeId: fallback } : row);
-    const result = context.resources.agents.createBatch({ runId: input.runId, rows } as WorkspaceAgentBatchInput, expectedCatalogRevision);
+    // Resolve only omitted choices, outside the Agent catalog lock. Explicit-only batches
+    // and committed slot retries do not need a readable G1 record to retain their semantics.
+    let defaultRuntime: WorkspaceAgentBatchDefault | undefined;
+    if (input.rows.some(row => plain(row) && !Object.hasOwn(row, "runtimeId"))) {
+      try {
+        const preferred = this.getDefaultRuntime(workspaceId).defaultRuntimeId;
+        defaultRuntime = { kind: "resolved", runtimeId: this.selectColleagueRuntime(preferred, context.resources.agents.runtimeOptions()) ?? null };
+      } catch { defaultRuntime = { kind: "preference_unavailable" }; }
+    }
+    this.assertOnboardingView(clientId, workspaceId);
+    const result = context.resources.agents.createBatch(input as unknown as WorkspaceAgentBatchInput, expectedCatalogRevision, defaultRuntime);
     if (result.results.some(row => row.status === "created")) this.changed(workspaceId);
     return result;
   }
