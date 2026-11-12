@@ -41,9 +41,10 @@ export async function routingHostFixture(t, input = {}) {
     assert.equal(state.routing.records.filter(row => row.ownerAgentId === context.agent.agentId && row.state === "claimed").length > 0, true, "claim must precede business provider construction");
     providers.push(context.agent.agentId);
     input.providerCreated?.(context);
-    return { id: "openai", model: binding.model, async turn(args) {
+    const provider = input.provider?.(connection, binding, context);
+    return { ...provider, id: "openai", model: binding.model, async turn(args) {
       calls.push({ agentId: context.agent.agentId, system: args.system, history: structuredClone(args.history) });
-      return input.turn ? input.turn(args, context) : { text: "Confirmed single owner response", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+      return provider ? provider.turn(args) : input.turn ? input.turn(args, context) : { text: "Confirmed single owner response", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
     } };
   }, agentBoundaries: { commandControl: true, lifecycleControl: true, ownerCredential,
     ...(input.disabled ? {} : { routing: { automaticAgentIds: () => members, ...(input.classifier ? { classifier: () => input.classifier } : {}) } }) } };
