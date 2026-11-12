@@ -92,5 +92,5 @@ export function lifecycleFixture(t, input = {}) {
   function apply(command, proposal) { const begun = control.begin(transport, command, { ...(proposal ? { proposal } : {}) }); return begun.receipt ?? control.accept(begun.intake); }
   t.after(async () => { try { for (const permit of permits) await closeWorkspaceRunPermit(permit); for (const lease of leases) lease.release(); authority.close(); transports.close(); } finally { fs.rmSync(base, { recursive: true, force: true }); } });
   return { home, project, catalog, resources, storage, agent, row, connections, credential, transports, transport, authority, authorityOptions, control, draft, dispatch, recover: (previous, message = "new explicit intent", options = {}) => dispatch(message, options, previous), apply,
-    file, beforeMigration, beforeLifecycleMigration, duty, boundary, rights, trackLease(lease) { leases.push(lease); return lease; }, advance(ms) { clock += ms; }, snapshot: () => JSON.parse(fs.readFileSync(file, "utf8")) };
+    file, beforeMigration, beforeLifecycleMigration, duty, boundary, rights, trackLease(lease) { leases.push(lease); return lease; }, trackPermit(permit) { permits.push(permit); return permit; }, advance(ms) { clock += ms; }, snapshot: () => JSON.parse(fs.readFileSync(file, "utf8")) };
 }
