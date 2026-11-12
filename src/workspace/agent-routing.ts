@@ -1,13 +1,15 @@
+import { AgentRoutingClassifier, type AgentRoutingClassifierConfig } from "./agent-routing-classification.js";
+import { redactSensitiveText } from "../security/secrets.js";
 // C6 Host-only routing over the ORIGINAL C1/C3/C4 aggregate. No business provider is called here.
 import { randomUUID } from "node:crypto";
 import { AgentBoundaryContractError, parseAgentBoundaryDocument, type AgentBoundaryCommand, type AgentBoundaryOwnerDecision, type AgentBoundaryWorkClaim, type AgentBoundaryReceipt } from "./agent-boundaries-contract.js";
-import { WorkspaceAgentBoundaryAuthority, type AgentRoutingClaim } from "./agent-boundary-authority.js";
+import { WorkspaceAgentBoundaryAuthority, type AgentRoutingClaim, type RoutingPermit } from "./agent-boundary-authority.js";
 import { WorkspaceAgentCommandControl, agentCommandMessageDigest } from "./agent-command-control.js";
 import type { AgentBoundaryTransport } from "./agent-boundary-transport.js";
-import { commandDigest, commandEpoch, commandId } from "./agent-command-state.js";
+import { commandDigest, commandEpoch, commandId, nextCommandEpoch } from "./agent-command-state.js";
 import { canonical, deepFreeze, UUID } from "./local-state.js";
 import { nominateAgentOwner, parseAgentRoutingInput, agentDutyRejects, type AgentRoutingInput, type AgentRoutingDirectoryEntry } from "./agent-routing-owner.js";
-import { AGENT_ROUTING_ALGORITHM, agentRoutingWorkKey, routingFields, type AgentRoutingRecord, type AgentRoutingCandidateVersion } from "./agent-routing-state.js";
+import { AGENT_ROUTING_ALGORITHM, agentRoutingWorkKey, routingFields, type AgentRoutingRecord, type AgentRoutingCandidateVersion, type AgentRoutingClassificationPayload, type AgentRoutingClassificationOutcome } from "./agent-routing-state.js";
 
 export interface AgentRoutingAudience { channelId: string; revision: number; memberIds: readonly string[] }
 export interface AgentRoutingProjection {
@@ -18,6 +20,7 @@ export interface AgentRoutingProjection {
 }
 const fail = (code: "AUTHORITY_UNVERIFIED" | "AUTHORIZATION_DENIED" | "STALE_REVISION" | "COMMAND_ID_CONFLICT" | "CONTROL_HELD", field: string): never => { throw new AgentBoundaryContractError(code, field); };
 export class WorkspaceAgentRouting {
+  private readonly classifier?: AgentRoutingClassifier;
   constructor(private readonly options: {
     authority: WorkspaceAgentBoundaryAuthority; control: WorkspaceAgentCommandControl;
     /** Current Host-owned channel metadata only, synchronous and independent of a UI socket. */
@@ -25,8 +28,8 @@ export class WorkspaceAgentRouting {
     automaticAgentIds(): readonly string[];
     /** Host/operator-confirmed mapping only. Not a request-supplied list. */
     businessOwners?(reference: string): readonly string[];
-    commandLifetimeMs?: number;
-  }) {}
+    commandLifetimeMs?: number; classifier?: AgentRoutingClassifierConfig;
+  }) { this.classifier = options.classifier ? new AgentRoutingClassifier(options.authority, options.classifier) : undefined; }
   private audience(channelId: string) {
     const row = this.options.audience(channelId);
     routingFields(row, ["channelId", "revision", "memberIds"]);
@@ -76,7 +79,7 @@ export class WorkspaceAgentRouting {
       base.audienceDigest = f.audienceDigest; base.catalogDigest = f.catalogDigest; base.candidates = this.versions(f.directory);
       base.ownerAgentId = f.nomination.ownerAgentId; base.method = f.nomination.method; base.reason = f.nomination.reason;
       base.state = base.ownerAgentId === null ? "needs_owner" : "selected"; base.selectionRequestId = input.requestId; base.selectionRequestDigest = digest;
-      if (old) base.revision++;
+      if (old) base.revision = nextCommandEpoch(base.revision);
       try {
         const next = this.options.authority.mutateRouting(transport, f.snapshot.revision, state => {
           // Repeat the live audience/catalog check inside the ORIGINAL authority CAS.
@@ -85,7 +88,7 @@ export class WorkspaceAgentRouting {
           const current = state.records.find(row => row.workKey === f.key);
           if (old ? !current || canonical(current) !== canonical(old) : current !== undefined) return fail("STALE_REVISION", "routing.workItem");
           if (current) state.records[state.records.indexOf(current)] = base; else state.records.push(base);
-          state.sequence++; return state;
+          state.sequence = nextCommandEpoch(state.sequence); return state;
         });
         return next.routing.records.find(row => row.workKey === f.key)!;
       } catch (error) {
@@ -93,6 +96,44 @@ export class WorkspaceAgentRouting {
       }
     }
   }
+  /** Optional preclaim classification. The one submitted request is durable before the adapter boundary. */
+  async classify(transport: AgentBoundaryTransport, raw: unknown): Promise<AgentRoutingProjection> {
+    const input = parseAgentRoutingInput(raw), row = this.select(transport, input), f = this.facts(transport, input);
+    const observe = () => this.get(transport, input.channelId, input.workItemId)!;
+    if (!this.classifier || row.state !== "needs_owner" || row.classification || !f.nomination.classificationCandidateIds.length) return observe();
+    if (f.catalogDigest !== row.catalogDigest || f.audienceDigest !== row.audienceDigest) return deepFreeze({ ...observe(), reason: "stale" });
+    const ids = new Set(f.nomination.classificationCandidateIds), payload: AgentRoutingClassificationPayload = {
+      schemaVersion: 1, message: redactSensitiveText(input.message).text,
+      candidates: f.directory.filter(candidate => ids.has(candidate.agentId)).map(candidate => ({ agentId: candidate.agentId, publicProfile: candidate.publicProfile })),
+    };
+    const policy = this.classifier.policy;
+    if (this.classifier.inputBytes(payload) > policy.maxInputBytes) return deepFreeze({ ...observe(), reason: "classification_unavailable" });
+    const entry = { ...policy, requestId: randomUUID(), maxCalls: 1 as const, inputDigest: commandDigest(payload), catalogDigest: row.catalogDigest,
+      startedAt: new Date().toISOString(), phase: "submission_started" as const, candidateId: null, responseDigest: null, providerRequestRef: null };
+    let permit: RoutingPermit;
+    try {
+      permit = this.options.authority.beginRoutingClassification(transport, f.snapshot.revision, row.workKey, row.revision, entry, payload, () => {
+        const current = this.facts(transport, input);
+        if (current.audienceDigest !== row.audienceDigest || current.catalogDigest !== row.catalogDigest || !current.nomination.classificationCandidateIds.length) return fail("STALE_REVISION", "routing.classification");
+      });
+    } catch (error) {
+      if (error instanceof AgentBoundaryContractError && ["STALE_REVISION", "CONTROL_HELD", "AUTHORITY_UNVERIFIED"].includes(error.code)) return deepFreeze({ ...observe(), reason: "classification_unavailable" });
+      throw error;
+    }
+    let outcome: AgentRoutingClassificationOutcome;
+    try { outcome = await this.classifier.run(permit); }
+    catch { outcome = { phase: "unknown", candidateId: null, responseDigest: null, providerRequestRef: null }; }
+    for (let attempt = 0; ; attempt++) {
+      try { this.options.authority.observeRoutingClassification(permit, outcome); break; }
+      catch (error) {
+        if (error instanceof AgentBoundaryContractError && error.code === "STALE_REVISION" && attempt < 2) continue; // Original observation only, never resubmit the provider.
+        if (!this.options.authority.commandControlSourceHealthy()) throw error; break; // Original submitted identity stays UNKNOWN/read-only.
+      }
+    }
+    return observe();
+  }
+  pendingClassificationTurns(): number { return this.classifier?.pendingTurns() ?? 0; }
+  close(): void { this.classifier?.close(); }
   /** Only the trusted Host receives this opaque bridge. It is never a wire return value. */
   prepareDispatch(transport: AgentBoundaryTransport, raw: unknown): { command: AgentBoundaryCommand; routing: AgentRoutingClaim } {
     const input = parseAgentRoutingInput(raw), f = this.facts(transport, input), row = f.snapshot.routing.records.find(row => row.workKey === f.key);

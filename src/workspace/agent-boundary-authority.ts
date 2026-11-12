@@ -1,12 +1,12 @@
 import type { AgentRoutingDirectoryEntry } from "./agent-routing-owner.js";
-import { emptyAgentRoutingState, parseAgentRoutingState, assertAgentRoutingCapacity, assertAgentRoutingTransition, type AgentRoutingState, type AgentRoutingRecord } from "./agent-routing-state.js";
+import { emptyAgentRoutingState, parseAgentRoutingState, assertAgentRoutingJson, assertAgentRoutingCapacity, assertAgentRoutingTransition, type AgentRoutingState, type AgentRoutingRecord, type AgentRoutingClassification, type AgentRoutingClassificationPayload, type AgentRoutingClassificationOutcome } from "./agent-routing-state.js";
 import { WorkspaceAgentLifecycleHistory } from "./agent-lifecycle-history.js";
 import { assertAgentLifecycleCapacity, assertAgentLifecycleTransition, migrateAgentLifecycleState, parseAgentLifecycleState, type AgentLifecycleState, type AgentLifecycleRun, type AgentLifecycleRecoveryV1 } from "./agent-lifecycle-state.js";
 import { WorkspaceFeatures } from "./features.js";
 import { assertNoWorkspaceLegacyEffects } from "./agent-command-protection.js";
 import { assertNoWorkspaceSessionLeases, withWorkspaceSessionAdmission } from "./session-lease.js";
 import type { WorkspaceRunBinding } from "./run-binding.js";
-import { assertAgentCommandTransition, agentCommandTargetEpoch, agentPolicyProposalDigest, commandDigest, emptyAgentCommandState, parseAgentCommandState, type AgentCommandState, type AgentCommandRun, type AgentCommandRetirement } from "./agent-command-state.js";
+import { assertAgentCommandTransition, agentCommandTargetEpoch, agentPolicyProposalDigest, commandDigest, nextCommandEpoch, emptyAgentCommandState, parseAgentCommandState, type AgentCommandState, type AgentCommandRun, type AgentCommandRetirement } from "./agent-command-state.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   AgentBoundaryContractError, agentBoundaryCommandSigningText, assertAgentBoundaryContext, parseAgentBoundaryDocument,
@@ -60,6 +60,10 @@ interface GrantState { transport: AgentBoundaryTransport; command: AgentBoundary
 declare const routingClaimBrand: unique symbol;
 export interface AgentRoutingClaim { readonly [routingClaimBrand]: true }
 interface RoutingClaimState { workKey: string; revision: number; assertSelection(): void; assertAudience(): void }
+declare const routingPermitBrand: unique symbol;
+export interface RoutingPermit { readonly [routingPermitBrand]: true }
+interface RoutingPermitState { transport: AgentBoundaryTransport; workKey: string; entry: AgentRoutingClassification; payload: AgentRoutingClassificationPayload; assertCurrent(): void; used: boolean; submitted: boolean }
+
 
 const fail = (code: AgentBoundaryErrorCode, field = "authority"): never => { throw new AgentBoundaryContractError(code, field); };
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/;
@@ -94,6 +98,7 @@ export class WorkspaceAgentBoundaryAuthority {
   private readonly grants = new WeakMap<object, GrantState>();
   private readonly executionPolicies = new WeakMap<object, ExecutionPolicyState>();
   private readonly routingClaims = new WeakMap<object, RoutingClaimState>();
+  private readonly routingPermits = new WeakMap<object, RoutingPermitState>();
   private readonly routingRuns = new Map<string, { workKey: string; assertAudience(): void }>();
   private readonly parent: { hostId: string; hostEpoch: number; row: string; context: AgentBoundaryContext };
   private closed = false;
@@ -213,7 +218,7 @@ export class WorkspaceAgentBoundaryAuthority {
       if (error instanceof AgentBoundaryContractError) throw error; return fail("AUTHORITY_UNVERIFIED", "authority.policy");
     }
   }
-  private update(expectedRevision: unknown, change: (state: State) => State, action?: AgentBoundaryAction): State {
+  private update(expectedRevision: unknown, change: (state: State) => State, action?: AgentBoundaryAction, reserveLifecycle = false): State {
     if (!Number.isSafeInteger(expectedRevision) || Number(expectedRevision) < 0) return fail("INVALID_DOCUMENT", "authority.revision");
     let rejectedChange: { error: unknown } | undefined;
     try { return this.state.update(expectedRevision as number, state => {
@@ -230,7 +235,7 @@ export class WorkspaceAgentBoundaryAuthority {
         next = change(state);
         if (next.routing) assertAgentRoutingCapacity(next.routing);
         if (next.lifecycle) {
-          assertAgentLifecycleCapacity(next.lifecycle, next.control, action !== undefined && !["task.stop", "agent.pause", "agent.dismiss"].includes(action));
+          assertAgentLifecycleCapacity(next.lifecycle, next.control, reserveLifecycle || action !== undefined && !["task.stop", "agent.pause", "agent.dismiss"].includes(action));
           if (state.lifecycle && state.control && next.control) retirement = this.history().retirement(state.control, state.lifecycle, next.control, next.lifecycle);
           if (Buffer.byteLength(canonical(next)) > 3.75 * 1024 * 1024) fail("AUTHORITY_UNVERIFIED", "lifecycle.capacity");
         }
@@ -467,14 +472,71 @@ export class WorkspaceAgentBoundaryAuthority {
       this.assertRoutingTransport(transport); if (!state.routing || state.schemaVersion !== 4) return fail("AUTHORITY_UNVERIFIED", "routing.bootstrap");
       const routing = change(structuredClone(state.routing)); assertAgentRoutingCapacity(routing);
       return { ...state, routing };
-    });
+    }, undefined, true);
     return this.routingSnapshot(transport);
+  }
+  /** Only the successful null->submission_started CAS mints a RoutingPermit. Cold JSON cannot. */
+  beginRoutingClassification(transport: AgentBoundaryTransport, expectedRevision: number, workKey: string, expectedWorkRevision: number,
+    entry: AgentRoutingClassification, payload: AgentRoutingClassificationPayload, assertCurrent: () => void): RoutingPermit {
+    this.assertRoutingTransport(transport); assertAgentRoutingJson(entry); assertAgentRoutingJson(payload);
+    this.mutateRouting(transport, expectedRevision, routing => {
+      const row = routing.records.find(row => row.workKey === workKey);
+      if (!row || row.revision !== expectedWorkRevision || row.state !== "needs_owner" || row.classification || row.reason !== "no_match") return fail("CONTROL_HELD", "routing.classification");
+      if (entry.phase !== "submission_started" || entry.candidateId !== null || entry.responseDigest !== null || entry.providerRequestRef !== null
+        || entry.inputDigest !== commandDigest(payload) || entry.catalogDigest !== row.catalogDigest || !payload.candidates.length
+        || payload.candidates.some(candidate => !row.candidates.some(row => row.agentId === candidate.agentId))) return fail("AUTHORITY_UNVERIFIED", "routing.classification");
+      if (assertCurrent() !== undefined) return fail("AUTHORITY_UNVERIFIED", "routing.checks"); row.classification = structuredClone(entry); row.revision = nextCommandEpoch(row.revision); routing.sequence = nextCommandEpoch(routing.sequence); return routing;
+    });
+    const permit = Object.freeze({}) as RoutingPermit;
+    this.routingPermits.set(permit, { transport, workKey, entry: structuredClone(entry), payload: structuredClone(payload), assertCurrent, used: false, submitted: false }); return permit;
+  }
+  private routingPermitState(handle: unknown): RoutingPermitState {
+    const captured = handle && typeof handle === "object" ? this.routingPermits.get(handle) : undefined;
+    if (!captured) return fail("AUTHORITY_UNVERIFIED", "routing.permit"); return captured;
+  }
+  consumeRoutingPermit(handle: unknown) {
+    const captured = this.routingPermitState(handle); if (captured.used) return fail("AUTHORITY_UNVERIFIED", "routing.permit"); captured.used = true;
+    return deepFreeze({ entry: structuredClone(captured.entry), payload: structuredClone(captured.payload) });
+  }
+  /** Called immediately at the ONE provider boundary, after cancellation checks. */
+  submitRoutingPermit(handle: unknown): void {
+    const captured = this.routingPermitState(handle); if (!captured.used || captured.submitted) return fail("AUTHORITY_UNVERIFIED", "routing.permit"); captured.submitted = true;
+    this.assertRoutingTransport(captured.transport); if (captured.assertCurrent() !== undefined) return fail("AUTHORITY_UNVERIFIED", "routing.checks");
+    const row = this.routingSnapshot(captured.transport).routing.records.find(row => row.workKey === captured.workKey);
+    if (!row || row.state !== "needs_owner" || row.classification?.requestId !== captured.entry.requestId || row.classification.phase !== "submission_started") return fail("CONTROL_HELD", "routing.classification");
+  }
+  /** An original one-shot observation may be retained after a UI disconnect. It never changes an existing owner. */
+  observeRoutingClassification(handle: unknown, outcome: AgentRoutingClassificationOutcome): void {
+    const captured = this.routingPermitState(handle); if (!captured.used) return fail("AUTHORITY_UNVERIFIED", "routing.permit");
+    this.assertHostCurrent(); assertAgentRoutingJson(outcome); const before = this.commandControlState();
+    const original = before.routing?.records.find(row => row.workKey === captured.workKey);
+    if (original?.classification?.requestId === captured.entry.requestId && original.classification.phase !== "submission_started") return;
+    this.update(before.revision, state => {
+      this.assertHostCurrent(); if (!state.routing) return fail("AUTHORITY_UNVERIFIED", "routing.bootstrap");
+      const routing = structuredClone(state.routing), row = routing.records.find(row => row.workKey === captured.workKey);
+      if (!row || row.classification?.requestId !== captured.entry.requestId) return fail("AUTHORITY_UNVERIFIED", "routing.classification");
+      if (row.classification.phase !== "submission_started") return state; // UNKNOWN/final original observations are immutable.
+      fields(outcome, ["phase", "candidateId", "responseDigest", "providerRequestRef"]);
+      if (!["completed", "unknown", "failed"].includes(outcome.phase) || !(outcome.candidateId === null || captured.payload.candidates.some(c => c.agentId === outcome.candidateId))
+        || outcome.phase !== "completed" && outcome.candidateId !== null || !(outcome.responseDigest === null || typeof outcome.responseDigest === "string" && /^[a-f0-9]{64}$/.test(outcome.responseDigest))
+        || !(outcome.providerRequestRef === null || id(outcome.providerRequestRef))) return fail("AUTHORITY_UNVERIFIED", "routing.classification");
+      let current = false;
+      try { this.assertRoutingTransport(captured.transport); current = captured.assertCurrent() === undefined; } catch { /* Retain observation; do not claim stale context. */ }
+      row.classification = { ...row.classification, ...outcome };
+      if (row.state === "needs_owner") {
+        row.reason = !current ? "stale" : outcome.phase === "completed" ? "no_match" : "classification_unavailable";
+        if (current && outcome.phase === "completed" && outcome.candidateId !== null) {
+          row.ownerAgentId = outcome.candidateId; row.state = "selected"; row.method = "classification"; row.reason = "selected";
+        }
+      }
+      row.revision = nextCommandEpoch(row.revision); routing.sequence = nextCommandEpoch(routing.sequence); assertAgentRoutingCapacity(routing); return { ...state, routing };
+    }, undefined, true);
   }
   /** An unclaimed nomination is NOT this opaque bridge into the original C3 admission. */
   prepareRoutingClaim(transport: AgentBoundaryTransport, workKey: string, revision: number, checks: { assertSelection(): void; assertAudience(): void }): AgentRoutingClaim {
     const snapshot = this.routingSnapshot(transport), row = snapshot.routing.records.find(row => row.workKey === workKey);
     if (!row || row.state !== "selected" || row.claim || row.revision !== revision) return fail("CONTROL_HELD", "routing.owner");
-    checks.assertSelection(); checks.assertAudience();
+    if (checks.assertSelection() !== undefined || checks.assertAudience() !== undefined) return fail("AUTHORITY_UNVERIFIED", "routing.checks");
     const handle = Object.freeze({}) as AgentRoutingClaim;
     this.routingClaims.set(handle, { workKey, revision, assertSelection: checks.assertSelection, assertAudience: checks.assertAudience }); return handle;
   }
@@ -485,7 +547,7 @@ export class WorkspaceAgentBoundaryAuthority {
     if (!row || row.state !== "selected" || row.claim || row.revision !== captured.revision || row.ownerAgentId !== command.agentId
       || row.commandId !== command.commandId || row.taskId !== op.taskId || row.rootRequestId !== command.rootRequestId
       || row.channelId !== op.conversationId || row.inputDigest !== op.messageDigest) return fail("CONTROL_HELD", "routing.claim");
-    captured.assertSelection(); captured.assertAudience(); return row;
+    if (captured.assertSelection() !== undefined || captured.assertAudience() !== undefined) return fail("AUTHORITY_UNVERIFIED", "routing.checks"); return row;
   }
   assertRoutingClaim(transport: AgentBoundaryTransport, handle: unknown, command: AgentBoundaryCommand): void {
     this.source(transport); const state = this.read();
@@ -496,7 +558,7 @@ export class WorkspaceAgentBoundaryAuthority {
     if (!state.routing || command.operation.action !== "task.dispatch") return;
     const captured = this.routingRuns.get(command.commandId), row = captured && state.routing.records.find(row => row.workKey === captured.workKey);
     if (!captured || !row || row.state !== "claimed" || row.ownerAgentId !== command.agentId || row.claim?.commandId !== command.commandId) return fail("AUTHORITY_UNVERIFIED", "routing.execution");
-    captured.assertAudience(); // Uses current Host scope/membership, not the UI connection's lifetime.
+    if (captured.assertAudience() !== undefined) return fail("AUTHORITY_UNVERIFIED", "routing.checks"); // Current scope, independent of UI lifetime.
   }
 
   /** Public C0 duties only. The trusted caller must validate the audience BEFORE invoking this. */
@@ -638,7 +700,7 @@ export class WorkspaceAgentBoundaryAuthority {
       if (newRun && routing) {
         if (authorizationError) return fail("AUTHORITY_UNVERIFIED", "routing.claim");
         const row = this.routingClaimRecord(routingClaim, state, command), next = routing.records.find(record => record.workKey === row.workKey)!;
-        next.state = "claimed"; next.reason = "current_owner"; next.revision++; routing.sequence++;
+        next.state = "claimed"; next.reason = "current_owner"; next.revision = nextCommandEpoch(next.revision); routing.sequence = nextCommandEpoch(routing.sequence);
         next.claim = { commandId: newRun.commandId, taskId: newRun.taskId, runId: newRun.runId, claimRevision: newRun.claimRevision };
         assertAgentRoutingCapacity(routing);
       }

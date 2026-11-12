@@ -11,8 +11,14 @@ export interface AgentRoutingCandidateVersion { agentId: string; dutyRevision: n
 export type AgentRoutingMethod = "explicit_human" | "business_mapping" | "duty_match" | "classification";
 export type AgentRoutingReason = "no_match" | "ambiguous" | "scope_denied" | "classification_unavailable" | "responsibility_rejected" | "stale" | "selected" | "current_owner";
 export interface AgentRoutingClassification {
-  requestId: string; providerRef: string; inputDigest: string; catalogDigest: string; startedAt: string;
-  phase: "submission_started" | "completed" | "unknown" | "failed"; candidateId: string | null; responseDigest: string | null;
+  requestId: string; providerRef: string; budgetRef: string; maxCalls: 1; maxInputBytes: number; maxOutputTokens: number; timeoutMs: number; inputDigest: string; catalogDigest: string; startedAt: string;
+  phase: "submission_started" | "completed" | "unknown" | "failed"; candidateId: string | null; responseDigest: string | null; providerRequestRef: string | null;
+}
+export interface AgentRoutingClassificationPayload {
+  schemaVersion: 1; message: string; candidates: { agentId: string; publicProfile: import("./agent-duty-draft.js").AgentDutyPublicProfile }[];
+}
+export interface AgentRoutingClassificationOutcome {
+  phase: "completed" | "unknown" | "failed"; candidateId: string | null; responseDigest: string | null; providerRequestRef: string | null;
 }
 export interface AgentRoutingRecord {
   workKey: string; channelId: string; workItemId: string; rootRequestId: string; requestId: string; requestDigest: string; selectionRequestId: string; selectionRequestDigest: string; sourceRef: string; inputDigest: string;
@@ -57,7 +63,7 @@ export function emptyAgentRoutingState(sourceDigest: string, at: string): AgentR
   return { schemaVersion: 1, migration: { fromSchema: 3, sourceDigest, at }, sequence: 0, records: [] };
 }
 export function assertAgentRoutingCapacity(state: AgentRoutingState): void {
-  if (state.records.length > AGENT_ROUTING_RECORD_LIMIT || Buffer.byteLength(canonical(state)) > AGENT_ROUTING_STATE_BYTES) return routingFail("routing.capacity");
+  if (state.records.length > AGENT_ROUTING_RECORD_LIMIT || Buffer.byteLength(canonical(state)) + state.records.filter(row => row.classification?.phase === "submission_started").length * 1024 > AGENT_ROUTING_STATE_BYTES) return routingFail("routing.capacity");
 }
 export function parseAgentRoutingState(raw: unknown, control: AgentCommandState, binding: AgentBoundaryContext["resourceBinding"],
   retired: readonly { runId: string; commandId: string; taskId: string; rootRequestId: string; agentId: string; claimRevision: number }[] = []): AgentRoutingState {
@@ -94,8 +100,9 @@ export function parseAgentRoutingState(raw: unknown, control: AgentCommandState,
       if (!run || (run.commandId !== r.commandId || run.taskId !== r.taskId || run.rootRequestId !== r.rootRequestId || run.agentId !== r.ownerAgentId || run.claimRevision !== r.claim.claimRevision)) return routingFail();
     }
     if (r.classification) {
-      const c = r.classification; routingFields(c, ["requestId", "providerRef", "inputDigest", "catalogDigest", "startedAt", "phase", "candidateId", "responseDigest"]);
-      if (!commandId(c.requestId) || !commandId(c.providerRef) || !hash(c.inputDigest) || !hash(c.catalogDigest) || !timestamp(c.startedAt)
+      const c = r.classification; routingFields(c, ["requestId", "providerRef", "budgetRef", "maxCalls", "maxInputBytes", "maxOutputTokens", "timeoutMs", "inputDigest", "catalogDigest", "startedAt", "phase", "candidateId", "responseDigest", "providerRequestRef"]);
+      if (!commandId(c.requestId) || !commandId(c.providerRef) || !commandId(c.budgetRef) || c.maxCalls !== 1 || !positive(c.maxInputBytes) || c.maxInputBytes > 32768 || !positive(c.maxOutputTokens) || c.maxOutputTokens > 256 || !positive(c.timeoutMs) || c.timeoutMs > 30000
+        || !(c.providerRequestRef === null || commandId(c.providerRequestRef)) || !hash(c.inputDigest) || !hash(c.catalogDigest) || !timestamp(c.startedAt)
         || !["submission_started", "completed", "unknown", "failed"].includes(c.phase) || !(c.candidateId === null || commandId(c.candidateId))
         || !(c.responseDigest === null || hash(c.responseDigest)) || c.phase !== "completed" && c.candidateId !== null
         || r.method === "classification" && (c.phase !== "completed" || c.candidateId !== r.ownerAgentId)) return routingFail();
@@ -113,11 +120,12 @@ export function assertAgentRoutingTransition(before: AgentRoutingState, after: A
     if (canonical(old) === canonical(next) ? next.revision !== old.revision : next.revision !== old.revision + 1) return routingFail("routing.revision");
     for (const key of ["channelId", "workItemId", "rootRequestId", "requestId", "requestDigest", "sourceRef", "inputDigest", "commandId", "taskId"] as const)
       if (old[key] !== next[key]) return routingFail("routing.transition");
-    if (old.state === "selected" && next.state !== "claimed" && canonical(old) !== canonical(next)) return routingFail("routing.owner");
-    if (old.state === "claimed" && canonical(old) !== canonical(next) || old.state !== "claimed" && next.state === "claimed" && !next.claim) return routingFail("routing.claim");
+    const ownership = (row: AgentRoutingRecord) => ({ ...row, revision: 0, classification: null });
+    if (old.state === "selected" && next.state !== "claimed" && canonical(ownership(old)) !== canonical(ownership(next))) return routingFail("routing.owner");
+    if (old.state === "claimed" && canonical(ownership(old)) !== canonical(ownership(next)) || old.state !== "claimed" && next.state === "claimed" && !next.claim) return routingFail("routing.claim");
     if (old.classification) {
       if (!next.classification) return routingFail("routing.classification");
-      for (const key of ["requestId", "providerRef", "inputDigest", "catalogDigest", "startedAt"] as const)
+      for (const key of ["requestId", "providerRef", "budgetRef", "maxCalls", "maxInputBytes", "maxOutputTokens", "timeoutMs", "inputDigest", "catalogDigest", "startedAt"] as const)
         if (old.classification[key] !== next.classification[key]) return routingFail("routing.classification");
       if (old.classification.phase !== "submission_started" && canonical(old.classification) !== canonical(next.classification)) return routingFail("routing.classification");
     }

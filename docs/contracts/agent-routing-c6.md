@@ -27,3 +27,10 @@ A separately minted opaque RoutingPermit authorizes at most one no-tool provider
 ## C12 prerequisites retained
 
 Before opening production entries, separately review and implement C4 history capacity extension/compaction (64segments,512KiB each and4096commands/2048runs exact indexes) and manual recovery for issued crashes without positive quiescence. Do not erase taskId, release an unproven lease, evict UNKNOWN by age or replay business as a workaround.
+
+
+### Narrow classifier adapter and its observation lifetime
+
+C6 optionally accepts an explicit Host-only single-origin `AgentRoutingClassifierConfig`; the CLI/production bootstrap supplies none. It passes only a frozen public payload, stable original request/provider/budget refs, `tools=[]`, bounded input bytes/output tokens and an AbortSignal. The adapter must honor those limits and never replay accepted/unknown submissions; a real transport requires C12 review. No general provider/fallback factory is selected by the core. Current verification uses synthetic callbacks, not a paid provider claim.
+
+Only the null-to-submission_started authority CAS mints the opaque RoutingPermit. Consumption and actual submission are separately one-shot; JSON, cold stored records, another authority or C1 grants cannot replace it. Physical adapter Promises remain observable after logical timeout. An original observed result can be stored after UI disconnection, but it cannot change an existing human-selected/claimed owner or promote a stale audience/catalog. UNKNOWN/final classification metadata is immutable. Routing state reserves1024bytes per submitted classification for bounded result publication, while preserving C4 active-run closure reserve. Counter exhaustion refuses the current request before invalid bytes can be written.
