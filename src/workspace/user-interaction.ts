@@ -7,6 +7,7 @@ import { exact, plain, text, UUID, WorkspaceJsonState } from "./local-state.js";
 import { sameWorkspaceResourceBinding, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import type { WorkspaceRunBinding } from "./run-binding.js";
 import type { WorkspaceUsage } from "./conversations.js";
+import { distinctiveConversationTerm } from "./context-compaction.js";
 
 export type WorkspaceQuestionReason = "lookup_missing" | "lookup_ambiguous" | "tool_problem" | "budget_warning" | "runaway_guard" | "explicit";
 /** Optional purpose of a question. rename_target: choose which existing colleague receives a requested new name. */
@@ -265,7 +266,7 @@ export class WorkspaceUserInteraction {
       // private conversation this run already sees (workspace_context_lookup reports those hits itself).
       const query = name === "workspace_memory_search" && plain(input) && typeof input.query === "string"
         ? input.query.normalize("NFKC").toLocaleLowerCase().trim() : "";
-      if (lookupMissing && !failed && query.length >= 2 && this.recentConversation.some(text => text.includes(query))) lookupMissing = false;
+      if (lookupMissing && !failed && distinctiveConversationTerm(query) && this.recentConversation.some(text => text.includes(query))) lookupMissing = false;
     }
     if (!failed && !lookupMissing) {
       const s = this.state.read();

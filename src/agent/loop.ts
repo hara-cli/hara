@@ -1204,8 +1204,14 @@ export function discussionHandback(runMessages: readonly NeutralMsg[], outcome: 
   if (runMessages.some(message => message.role === "tool" ? message.results.some(result => !DISCUSSION_LOOKUPS.has(result.name))
     : message.role === "assistant" && message.toolUses.some(use => !DISCUSSION_LOOKUPS.has(use.name)))) return false;
   const reply = [...runMessages].reverse().find(message => message.role === "assistant");
-  const text = reply?.role === "assistant" ? reply.text.trim() : "";
-  return Boolean(text) && /[?？]/u.test(text.slice(-600));
+  return reply?.role === "assistant" && asksHumanQuestion(reply.text);
+}
+/** A question handed back to the human: a ?/？ in the reply's last paragraph, ignoring code blocks and
+ * inline code (so `a?.b` or a ternary in a snippet is not a question). */
+export function asksHumanQuestion(text: string): boolean {
+  const prose = text.replace(/```[\s\S]*?(?:```|$)/gu, " ").replace(/`[^`\n]*`/gu, " ");
+  const paragraphs = prose.split(/\n\s*\n/u).map(part => part.trim()).filter(Boolean);
+  return /[?？]/u.test((paragraphs.at(-1) ?? "").slice(-600));
 }
 export async function runGovernedAgent(
   history: NeutralMsg[], opts: RunOpts, runtimeId: "hara" | "pi" | "codex" | "claude" | "opencode" | "gemini" | "kimi" | "copilot" | "cursor" | "grok", executeTurn?: AgentRuntimeTurn,

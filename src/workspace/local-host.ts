@@ -112,6 +112,20 @@ import { codexSessionPool } from "../agent-runtime/codex-session.js";
 import { codexThreadState, codexThreadView } from "./codex-thread.js";
 
 const ZERO_USAGE = (): WorkspaceUsage => ({ modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 });
+/** Which runs may see the bounded recent view of their private conversation. Only a human's (ui/cli)
+ * new task in a private conversation. Excluded, each for a stated reason:
+ * - channel: a group run's audience is the channel, which carries its own transcript;
+ * - routed: a C6 work item routed from a channel answers that channel's audience;
+ * - delegated (parent): the child answers another Agent, not this conversation's human;
+ * - scheduled: unattended, not a follow-up the human just typed;
+ * - resume / question answer: the same run already carries its own transcript;
+ * - codex: its native thread already holds the conversation (no duplicate injection).
+ * A personal-mode C3 dispatch is human-bound to this same conversation, so it stays eligible. */
+export function recentConversationEligible(run: { resume: boolean; questionAnswer: boolean; channel: boolean; routed: boolean;
+  delegated: boolean; scheduled: boolean; origin: string; runtimeId: string }): boolean {
+  return !run.resume && !run.questionAnswer && !run.channel && !run.routed && !run.delegated && !run.scheduled
+    && (run.origin === "ui" || run.origin === "cli") && run.runtimeId !== "codex";
+}
 /** Only an explicit new-colleague request gets a Host-understood change brief; the card still needs one human confirmation. */
 export const colleagueCreateIntent = (message: string): boolean =>
   !/(?:不要|别|別|不必|无需|無需|do not|don't|never|without)\s*.{0,12}?(?:建立|建一?[个個位]?|创建|創建|新增|create|add)/iu.test(message)
@@ -2012,12 +2026,11 @@ export class LocalWorkspaceHost {
       // Ordinary C3 prepares dependencies before acceptance. C6 first binds the exclusive claim;
       // any later dependency failure uses the original C4 pre-issuance settlement, never another owner.
       const interaction = new WorkspaceUserInteraction(context.storage, binding, task.id, replyCopyLanguage(task.objective));
-      // A new task in a human's private conversation sees a bounded view of the same conversation.
-      // Channels, C6 routing, delegation, schedules, resumes and question answers keep their own
-      // audiences/contexts. A personal-mode C3 dispatch is human-bound to this same conversation
-      // (operation.conversationId === sessionId above). Codex keeps its own native thread.
-      const recentEligible = !resume && !questionId && !channel && !parent && !parentSignal && !scheduledConnection
-        && (origin.source === "ui" || origin.source === "cli") && !commandFacts?.routingChannelId && binding.agent.runtimeId !== "codex";
+      // A new task in a human's private conversation sees a bounded view of the same conversation
+      // (see recentConversationEligible for each exclusion and its reason).
+      const recentEligible = recentConversationEligible({ resume, questionAnswer: Boolean(questionId), channel: Boolean(channel),
+        routed: Boolean(commandFacts?.routingChannelId), delegated: Boolean(parent || parentSignal), scheduled: Boolean(scheduledConnection),
+        origin: origin.source, runtimeId: binding.agent.runtimeId });
       // An explicit Pi/Claude native-session reset is a hard boundary for this view, as for the engine.
       const resetStart = recentEligible && resettableNativeRuntime(binding.agent.runtimeId)
         ? new WorkspaceNativeSessions(context.storage, agentId, store.sessionId).latest(binding.agent.runtimeId, value.history.length)?.historyStart ?? 0 : 0;
