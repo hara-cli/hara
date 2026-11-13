@@ -2,6 +2,7 @@ import { WorkspaceNativeSessions } from "../dist/workspace/native-session-bounda
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,41 @@ import { WorkspaceResourceStorage } from "../dist/workspace/resource-context.js"
 import { readPiNativeChildConfig } from "../dist/agent-runtime/pi-rpc-entry.js";
 import { PiRpcProcess } from "../dist/agent-runtime/pi-rpc-process.js";
 import { runtimeFailureMessage } from "../dist/agent-runtime/failure-diagnostics.js";
+
+// Only the synthetic grandchild is eligible for teardown: a PID alone is not ownership.
+function fixtureProcessStamp(pid) {
+  let output;
+  try { output = execFileSync("/bin/ps", ["-ww", "-p", String(pid), "-o", "pid=,ppid=,pgid=,stat=,lstart=,args="],
+    { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"], env: { PATH: "/usr/bin:/bin", LC_ALL: "C" } }); }
+  catch (error) { if (error.status === 1 && !String(error.stdout ?? "").trim()) return null; throw error; }
+  const fields = output.trim().split(/\s+/);
+  if (fields.length < 10 || Number(fields[0]) !== pid) throw new Error("Fixture process identity is unverified");
+  return { pid, ppid: Number(fields[1]), pgid: Number(fields[2]), state: fields[3], born: fields.slice(4, 9).join(" "), argv: fields.slice(9) };
+}
+function cleanupFixtureGrandchild(record, ownerTag, { inspect = fixtureProcessStamp, signal = (pid, name) => process.kill(pid, name) } = {}) {
+  if (!record || !Number.isSafeInteger(record.pid) || record.pid <= 1 || record.ownerTag !== ownerTag
+    || typeof record.born !== "string" || !record.born) return "unverified";
+  const row = inspect(record.pid);
+  if (!row || row.state.startsWith("Z")) return "already-gone";
+  if (row.pid !== record.pid || row.born !== record.born || !row.argv.includes(ownerTag)) return "unverified";
+  signal(record.pid, "SIGKILL"); // One verified fixture PID, never a process group or a name match.
+  return "signalled";
+}
+test("Pi native fixture teardown never signals a reused or foreign process", () => {
+  const record = { pid: 9001, born: "fixture-birth", ownerTag: "fixture-owner" };
+  const row = { pid: 9001, ppid: 8001, pgid: 9001, state: "S", born: record.born, argv: ["node", record.ownerTag] };
+  const sent = [], attempt = (value, observed) => cleanupFixtureGrandchild(value, record.ownerTag,
+    { inspect: () => observed, signal: (...args) => sent.push(args) });
+  assert.equal(attempt(record, { ...row, born: "reused-pid-birth" }), "unverified");
+  assert.equal(attempt(record, { ...row, argv: ["node", "foreign-owner"] }), "unverified");
+  assert.equal(attempt(record, { ...row, argv: ["node", record.ownerTag + "-suffix"] }), "unverified");
+  assert.equal(attempt(record, { ...row, pid: record.pid + 1 }), "unverified");
+  assert.equal(attempt({ ...record, ownerTag: "foreign-owner" }, row), "unverified");
+  assert.equal(attempt({ ...record, pid: 1 }, row), "unverified");
+  assert.equal(attempt(record, { ...row, state: "Z" }), "already-gone");
+  assert.equal(attempt(record, null), "already-gone"); assert.deepEqual(sent, []);
+  assert.equal(attempt(record, row), "signalled"); assert.deepEqual(sent, [[record.pid, "SIGKILL"]]);
+});
 
 const reply = text => ({ text, toolUses: [], stop: "end", usage: { input: 10, output: 2 } });
 const budget = { maxProviderRounds: 4, maxToolCalls: 4, maxTokens: 100000, timeoutMs: 10000 };
@@ -210,7 +246,24 @@ test("the production bundled Pi RPC entry executes native tools and Hara MCP usi
     writeFileSync(trap, 'import {writeFileSync} from "node:fs"; writeFileSync(' + JSON.stringify(join(work,"unexpected-global-resource")) + ',"loaded"); export default function () {}');
     writeFileSync(join(base, "settings.json"), JSON.stringify({ extensions: [trap], packages: [], hooks: { session_start: "touch unexpected-global-resource" }, mcpServers: { foreign: { command: "touch", args: ["unexpected-global-resource"] } } }));
   }
-  const backgroundScript = 'const {spawn}=require("node:child_process"),fs=require("node:fs");const child=spawn(process.execPath,["-e","setTimeout(()=>{},5000)"],{detached:true,stdio:"ignore"});child.unref();fs.writeFileSync("background.json",JSON.stringify({pid:child.pid}));fs.writeFileSync("env.json",JSON.stringify({env:process.env,argv:process.argv}));setTimeout(()=>{},350);';
+  // The common sampler must first observe the ancestry; mirror the A-tier 1500ms fixture window.
+  // Keep the grandchild alive well beyond that window/drain so natural expiry cannot fake success.
+  const grandchildTag = "hara-pi-native-grandchild-" + randomUUID();
+  const backgroundScript = 'const {spawn}=require("node:child_process"),fs=require("node:fs");const ownerTag=' + JSON.stringify(grandchildTag)
+    + ';const child=spawn(process.execPath,["-e","setTimeout(()=>{},15000)",ownerTag],{detached:true,stdio:"ignore"});child.unref();fs.writeFileSync("background.json",JSON.stringify({pid:child.pid,ownerTag}));fs.writeFileSync("env.json",JSON.stringify({env:process.env,argv:process.argv}));setTimeout(()=>{},1500);';
+  // The sandboxed fixture reports identity immediately. Host reads ps metadata outside Seatbelt,
+  // then teardown obtains a fresh stamp and compares both birth and the unique argv marker.
+  const backgroundRecord = () => {
+    const record = JSON.parse(readFileSync(join(work,"background.json"),"utf8"));
+    assert.equal(record.ownerTag, grandchildTag); assert.ok(Number.isSafeInteger(record.pid) && record.pid > 1);
+    if (!record.born) {
+      const row = fixtureProcessStamp(record.pid);
+      if (row && row.argv.includes(grandchildTag)) {
+        record.born = row.born; writeFileSync(join(work,"background.json"),JSON.stringify(record));
+      }
+    }
+    return record;
+  };
   let confirmations = 0, calls = 0;
   const endpoint = await createWorkspaceMcpEndpoint({ signal: new AbortController().signal, assertCurrent() {}, tools: () => [tool], async call() {
     confirmations++; return { id: "fixture", name: tool.name, content: "Host declined the synthetic mutation", isError: true };
@@ -260,28 +313,47 @@ test("the production bundled Pi RPC entry executes native tools and Hara MCP usi
         : /connect|fetch|socket|ECONN/i.test(message) ? "connection" : /\b[45]\d\d\b/.test(message) ? "http-status" : "other" }));
     throw error;
   });
-  const result = await diagnosed("first", rpc, rpc.prompt("Run the fixed synthetic native steps and respect the Host denial."));
-  assert.equal(result.text, "native production entry verified"); assert.equal(confirmations, 1); assert.equal(calls, 4);
-  assert.equal(readFileSync(join(work,"proof.txt"),"utf8"),"native effect");
-  assert.equal(existsSync(join(work,"unexpected-global-resource")),false);
-  const {execFileSync} = await import("node:child_process");
-  const pid = JSON.parse(readFileSync(join(work,"background.json"),"utf8")).pid;
-  const live = () => { try { return !execFileSync("/bin/ps",["-p",String(pid),"-o","stat="],{encoding:"utf8",stdio:["ignore","pipe","ignore"]}).trim().startsWith("Z"); } catch { return false; } };
-  assert.equal(live(),true); await rpc.close(); assert.equal(live(),false);
-  await endpoint.close();
-  const resumedEndpoint = await createWorkspaceMcpEndpoint({ signal: new AbortController().signal, assertCurrent() {}, tools: () => [tool],
-    async call() { throw new Error("A resumed idle session must not repeat the previous Hara mutation"); } }); t.after(() => resumedEndpoint.close());
-  const resumedBridge = await openBridge();
-  const resumed = startRpc({...config,model:{baseURL:resumedBridge.baseURL,token:resumedBridge.token},sessionFile:result.state.sessionFile,mcp:{...config.mcp,url:resumedEndpoint.url,token:resumedEndpoint.env.HARA_WORKSPACE_MCP_TOKEN}});
-  const state = await resumed.state(); assert.equal(state.sessionId,result.state.sessionId);
-  const again = await diagnosed("resumed", resumed, resumed.prompt("A new human continuation: do not repeat previous tools."));
-  assert.equal(again.state.sessionId,result.state.sessionId); assert.equal(calls,5); assert.equal(confirmations,1);
-  await resumed.close();
-  assert.equal(readFileSync(join(work,"env.json"),"utf8").includes(sentinel),false);
-  for (const name of ["auth.json", "models.json", "models-store.json"]) {
-    const text = readFileSync(join(root,"agent",name),"utf8");
-    assert.equal(text.includes(sentinel),false); assert.equal(text.includes(b.token),false);
-    assert.equal(text.includes(config.mcp.token),false);
+  try {
+    const result = await diagnosed("first", rpc, rpc.prompt("Run the fixed synthetic native steps and respect the Host denial."));
+    assert.equal(result.text, "native production entry verified"); assert.equal(confirmations, 1); assert.equal(calls, 4);
+    assert.equal(readFileSync(join(work,"proof.txt"),"utf8"),"native effect");
+    assert.equal(existsSync(join(work,"unexpected-global-resource")),false);
+    const background = backgroundRecord(), pid = background.pid;
+    assert.equal(background.ownerTag, grandchildTag); assert.ok(Number.isSafeInteger(pid) && pid > 1);
+    assert.ok(typeof background.born === "string" && background.born.length > 0);
+    const live = () => { try { return !execFileSync("/bin/ps",["-p",String(pid),"-o","stat="],{encoding:"utf8",stdio:["ignore","pipe","ignore"]}).trim().startsWith("Z"); } catch { return false; } };
+    assert.equal(live(),true); await rpc.close();
+    const remainsLive = live(); // Capture immediately: a later diagnostic must not turn expiry into success.
+    if (remainsLive) {
+      const row = fixtureProcessStamp(pid);
+      t.diagnostic("pi-native-background-after-close " + JSON.stringify(row && { pid: row.pid, ppid: row.ppid, pgid: row.pgid, state: row.state, born: row.born }));
+    }
+    assert.equal(remainsLive,false);
+    await endpoint.close();
+    const resumedEndpoint = await createWorkspaceMcpEndpoint({ signal: new AbortController().signal, assertCurrent() {}, tools: () => [tool],
+      async call() { throw new Error("A resumed idle session must not repeat the previous Hara mutation"); } }); t.after(() => resumedEndpoint.close());
+    const resumedBridge = await openBridge();
+    const resumed = startRpc({...config,model:{baseURL:resumedBridge.baseURL,token:resumedBridge.token},sessionFile:result.state.sessionFile,mcp:{...config.mcp,url:resumedEndpoint.url,token:resumedEndpoint.env.HARA_WORKSPACE_MCP_TOKEN}});
+    const state = await resumed.state(); assert.equal(state.sessionId,result.state.sessionId);
+    const again = await diagnosed("resumed", resumed, resumed.prompt("A new human continuation: do not repeat previous tools."));
+    assert.equal(again.state.sessionId,result.state.sessionId); assert.equal(calls,5); assert.equal(confirmations,1);
+    await resumed.close();
+    assert.equal(readFileSync(join(work,"env.json"),"utf8").includes(sentinel),false);
+    for (const name of ["auth.json", "models.json", "models-store.json"]) {
+      const text = readFileSync(join(root,"agent",name),"utf8");
+      assert.equal(text.includes(sentinel),false); assert.equal(text.includes(b.token),false);
+      assert.equal(text.includes(config.mcp.token),false);
+    }
+  } finally {
+    // Runs before fixture(t)'s removal hook, including prompt/close/assertion failures.
+    try {
+      const record = backgroundRecord(); let observed;
+      const result = cleanupFixtureGrandchild(record, grandchildTag, { inspect: pid => (observed = fixtureProcessStamp(pid)) });
+      if (result !== "already-gone") t.diagnostic("pi-native-fixture-teardown " + JSON.stringify({ result, pid: record.pid,
+        ppid: observed?.ppid ?? null, pgid: observed?.pgid ?? null, born: observed?.born ?? null }));
+    } catch (error) {
+      if (error.code !== "ENOENT") t.diagnostic("pi-native-fixture-teardown-refused " + JSON.stringify({ code: error.code ?? "identity-unverified" }));
+    }
   }
 });
 
