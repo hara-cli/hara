@@ -2,6 +2,7 @@ import type { NeutralMsg, ToolResult } from "../providers/types.js";
 import type { TaskExecution } from "../session/task.js";
 import { closedWorkspaceHistory } from "./conversations.js";
 import { historyChars } from "../agent/context-budget.js";
+import { RECENT_CONVERSATION, recentConversation, recentConversationPrompt } from "./context-compaction.js";
 
 export const WORKSPACE_CONTEXT_LIMITS = Object.freeze({ toolChars: 8000, agedToolChars: 2000, briefChars: 2000,
   wakeChars: 8000, wakeItemChars: 1600, summaryChars: 2000, compactAt: 0.72, recentShare: 0.18 });
@@ -45,11 +46,15 @@ function resultPreview(result: ToolResult, cap: number, retain?: Retain): string
 
 /** A request view, NOT another transcript or a completion-evidence source. The Host pins an
  * attempt boundary before appending its user message. Identity/roster remain in the stable system
- * tier, the current task/checkpoint in the engine turn tier, and only this attempt's working
- * messages travel here. On recovery the checkpoint is a hint: state must be observed again.
+ * tier, the current task/checkpoint in the engine turn tier, and this attempt's working messages
+ * travel here. A Host-approved private conversation may prefix one bounded, redacted prose view of
+ * its earlier turns (never tool bodies). On recovery the checkpoint is a hint: state must be observed again.
  * Never strip provider-owned reasoning from a retained tool chain or split use/result pairs. */
 export function workspaceTaskProjection(history: NeutralMsg[], start: number, options: {
   usedTokens?: number; maxTokens?: number; task?: TaskExecution; retain?: Retain;
+  /** Host-approved private conversation only: the digest-validated durable messages before this
+   * attempt. A bounded prose view of them is prefixed to the request. */
+  earlierConversation?: readonly NeutralMsg[];
 } = {}): { history: NeutralMsg[]; stats: WorkspaceContextStats } {
   if (!Number.isSafeInteger(start) || start < 0 || start >= history.length || history[start]?.role !== "user") {
     throw new Error("Workspace model context boundary changed; full history retained");
@@ -83,6 +88,10 @@ export function workspaceTaskProjection(history: NeutralMsg[], start: number, op
       view = [{ role: "user", content: summary }, ...recent.flat()]; summaryChars = summary.length; recentChars = chars;
     }
   }
+  // Added after compaction so it is never summarized away or duplicated. Tool calls/results,
+  // reasoning and reminders are excluded by recentConversation; text is redacted and bounded.
+  const earlier = options.earlierConversation ? recentConversation(options.earlierConversation, RECENT_CONVERSATION) : [];
+  if (earlier.length) view = [{ role: "user", content: recentConversationPrompt(earlier) }, ...view];
   const projectedTools = view.flatMap(message => message.role === "tool" ? [message] : []);
   return { history: view, stats: { compacted: summaryChars > 0, originalChars, recentChars, summaryChars,
     toolMaxChars: Math.max(0, ...projectedTools.flatMap(message => message.results.map(result => result.content.length))),

@@ -45,7 +45,12 @@ test("new send after long legacy history archives old checkpoint and failure cou
   assert.deepEqual(value.history.slice(0, f.before.history.length), f.before.history);
   assert.deepEqual(new WorkspaceTreeBudget(f.storage, f.run.runId, f.before.task.workspaceRunBinding.budget).read(), tree);
   assert.equal(value.runUsage.modelCalls, 1); assert.equal(value.usage.modelCalls, f.before.usage.modelCalls + 1);
-  assert.doesNotMatch(JSON.stringify(args.history), /HISTORICAL-ONLY|OLD-OBJECTIVE/);
+  // The new task sees only the bounded recent view of this private conversation (newest turns),
+  // never the long legacy history, the old objective or its failure counts.
+  const requested = JSON.stringify(args.history);
+  assert.match(requested, /hara-recent-conversation/); assert.match(requested, /HISTORICAL-ONLY-119 /);
+  assert.ok((requested.match(/HISTORICAL-ONLY-\d+ /g) ?? []).length <= 6, "at most the newest six historical user turns");
+  assert.doesNotMatch(requested, /HISTORICAL-ONLY-(?:0|1|100) |OLD-OBJECTIVE|consecutiveFailures/);
   assert.doesNotMatch(args.system, /consecutiveFailures|OLD-OBJECTIVE|via workspace_skill before using|load every page of instructions via workspace_skill before acting/);
   assert.equal(args.system.split(skill.files["cards/create-colleague.md"]).length - 1, 1);
   assert.equal(args.system.includes(skill.version), true);

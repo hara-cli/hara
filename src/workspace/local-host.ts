@@ -101,7 +101,7 @@ import { executeLegacyPrint } from "./legacy-print.js";
 import { RuntimeStageRecorder, WorkspaceRuntimeStageStore, projectRuntimeStageReports,
   MAX_RUNTIME_STAGE_REPORTS, type RuntimeStageReport } from "./runtime-stage-events.js";
 import { runtimeStageErrorKind } from "../agent-runtime/stage-observer.js";
-import { WorkspaceContextCompactions } from "./context-compaction.js";
+import { RECENT_CONVERSATION, recentConversation, WorkspaceContextCompactions } from "./context-compaction.js";
 import { codexSessionPool } from "../agent-runtime/codex-session.js";
 import { codexThreadState, codexThreadView } from "./codex-thread.js";
 
@@ -1925,7 +1925,15 @@ export class LocalWorkspaceHost {
       // Ordinary C3 prepares dependencies before acceptance. C6 first binds the exclusive claim;
       // any later dependency failure uses the original C4 pre-issuance settlement, never another owner.
       const interaction = new WorkspaceUserInteraction(context.storage, binding, task.id, replyCopyLanguage(task.objective));
-      const startContext = prepareWorkspaceStartContext({ storage: context.storage,
+      // A new task in a human's private conversation sees a bounded view of the same conversation.
+      // Channels, C6 routing, delegation, schedules, resumes and question answers keep their own
+      // audiences/contexts. A personal-mode C3 dispatch is human-bound to this same conversation
+      // (operation.conversationId === sessionId above). Codex keeps its own native thread.
+      const recentEligible = !resume && !questionId && !channel && !parent && !parentSignal && !scheduledConnection
+        && (origin.source === "ui" || origin.source === "cli") && !commandFacts?.routingChannelId && binding.agent.runtimeId !== "codex";
+      const recent = recentEligible ? recentConversation(value.history, RECENT_CONVERSATION) : [];
+      interaction.useRecentConversation(recent.map(row => row.text));
+      const startContext = prepareWorkspaceStartContext({ storage: context.storage, conversation: recent,
         personalHome: this.options.mode === "workspace" ? this.options.hostHome : undefined,
         workspaceRoots: withWorkspaceAgentMemory(context.storage, agentId, context.project, () => context.resources.memory.roots(context.project)),
         projectLocations: prepareWorkspaceProjectLocations({ storage: context.storage, project: context.project, history: value.history, objective: task.objective }),
@@ -1982,7 +1990,7 @@ export class LocalWorkspaceHost {
       owned.commandControl = commandExecution?.control;
       owned.permit = createWorkspaceRunPermit({ binding, ...(agentBoundary ? { agentBoundary } : {}), catalog: this.catalog, resources: context.resources, storage: context.storage, connections: context.connections,
         completionRecovery, lease, provider, cwd: binding.project.root, managedProjectRoot: context.project, signal: owned.signal, toolNames: ["task_intake", "task_checkpoint", "todo_write", "ask_user", ...tools.map(tool => tool.name)], usage: value.runUsage,
-        modelHistory: { history: value.history, start: modelHistoryStart, retain: result => owned.receipts!.retain(result),
+        modelHistory: { history: value.history, start: modelHistoryStart, retain: result => owned.receipts!.retain(result), recentConversation: recent.length > 0,
           usedTokens: () => { const usage = tree.read().usage; return usage.inputTokens + usage.outputTokens; } },
         observeContext: observation => { owned.lease.assertCurrent(); audit.append(observation); },
         runtimeStages: owned.runtimeStages, messageTiming: owned.messageTiming,
@@ -2046,7 +2054,7 @@ export class LocalWorkspaceHost {
           content: `You are ${configuration.identity.displayName}, a clearly identified Hara AI colleague. ${instructions}${instructionsPolicy}\nUse only this Workspace's supplied tools. Never claim completion without observed evidence.\n` + sharedPolicy
           + `Reply naturally in the user's language. Call AI coworkers 同事, not Pi 同事; pi is only an internal runtime. A greeting needs no tools.\n`
           + `${WORKSPACE_START_CONTEXT_GOVERNANCE}\n${management.policyPrompt}\n`
-          + `Use workspace_context_lookup to resolve missing names and aliases. Core pauses after two unresolved lookups or a recoverable safety checkpoint. Use ask_user for a real problem or material ambiguity; never guess a user answer.\n`
+          + `When <hara-recent-conversation> is present, read it first: a short follow-up usually continues that same conversation and needs no lookup. Use workspace_context_lookup to resolve names and aliases it does not settle. Core pauses after two unresolved lookups or a recoverable safety checkpoint. Use ask_user for a real problem or material ambiguity; never guess a user answer.\n`
           + "For a genuinely ambiguous project/folder, reuse the evidenced projectLocations.options with its otherOption in ask_user. These catalog-only hints do not grant file access; never invent a path or ask for one already identified.\n"
           + `For an explicit new-colleague request, use the bounded startup roster and projectLocations candidates to call agent_create in your FIRST model response. Do not call workspace_skill, agent_list, workspace_receipt_read or ask_user first merely to fill name, role, project or runtime; the human edits missing fields on the card. A project candidate is only a label and does not grant file access. If an existing active colleague clearly matches, suggest reusing that colleague instead. For delegation use agent_contact with an existing exact agentId.\n`
           + `每轮最多建立一位同事。\n`

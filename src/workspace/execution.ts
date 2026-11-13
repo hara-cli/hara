@@ -75,7 +75,7 @@ interface PermitState {
   onNativeRisks?(risks: readonly RuntimeRiskEvent[]): void;
   compactionSource?(): WorkspaceConversation;
   runtimeModel?: (args: TurnArgs) => Promise<TurnResult>;
-  modelHistory?: { history: NeutralMsg[]; start: number; prefixDigest: string; retain?: (result: ToolResult) => string; usedTokens?: () => number };
+  modelHistory?: { history: NeutralMsg[]; start: number; prefixDigest: string; retain?: (result: ToolResult) => string; usedTokens?: () => number; recentConversation?: boolean };
   contextStats?: WorkspaceContextStats;
   wakeChars: number;
   audit: WorkspaceExecutionAudit;
@@ -151,8 +151,10 @@ export function createWorkspaceRunPermit(input: {
   usage: WorkspaceUsage;
   /** Same-task continuation predecessor and actual question answer from protected Host state; never renderer task data. */
   completionRecovery?: { previousTask: TaskExecution; currentTask: TaskExecution; answeredQuestionId?: string };
-  /** Trusted Host-only attempt boundary. Persisted history stays complete and append-only. */
-  modelHistory?: { history: NeutralMsg[]; start: number; retain?: (result: ToolResult) => string; usedTokens?: () => number };
+  /** Trusted Host-only attempt boundary. Persisted history stays complete and append-only.
+   * recentConversation: the Host established a private, human-originated conversation whose earlier
+   * durable messages share this run's audience; the bounded view is derived here, never supplied. */
+  modelHistory?: { history: NeutralMsg[]; start: number; retain?: (result: ToolResult) => string; usedTokens?: () => number; recentConversation?: boolean };
   observeContext?(value: WorkspaceContextObservation): void;
   /** Host-created diagnostic recorder, never accepted from model/RPC data. */
   runtimeStages?: RuntimeStageRecorder;
@@ -452,7 +454,8 @@ export function prepareWorkspaceRunHistory(permit: WorkspaceRunPermit, history: 
   const source = modelTranscript ?? history;
   const start = modelTranscript ? source.indexOf(history[pinned.start]!) : pinned.start;
   const projected = workspaceTaskProjection(source, start, { usedTokens: pinned.usedTokens?.() ?? state.usage.inputTokens + state.usage.outputTokens,
-    maxTokens: permit.binding.budget.maxTokens, task: state.options?.taskIntake?.current?.(), retain: pinned.retain });
+    maxTokens: permit.binding.budget.maxTokens, task: state.options?.taskIntake?.current?.(), retain: pinned.retain,
+    ...(pinned.recentConversation === true ? { earlierConversation: history.slice(0, pinned.start) } : {}) });
   state.contextStats = projected.stats; return projected.history;
 }
 export function prepareWorkspaceRunWakeBrief(permit: WorkspaceRunPermit): string {
@@ -516,7 +519,7 @@ export function executeWorkspaceTool<T>(permit: WorkspaceRunPermit, name: string
         ? await state.boundaryExecution.runTool(name, toolInput, toolCallId, input => execute(input), toolFailed)
         : await execute(toolInput);
       const failed = Boolean(toolFailed?.(result) || (typeof result === "string" && /^Error:/i.test(result)));
-      state.interaction?.observe(name, result, failed);
+      state.interaction?.observe(name, result, failed, toolInput);
       outcome = failed ? "error" : "completed"; errorKind = failed ? "tool_error" : null; return result;
     } catch (error) {
       state.interaction?.observe(name, undefined, true); throw error;
