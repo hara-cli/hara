@@ -157,3 +157,22 @@ test("the recent view is bounded, redacted and excludes tool rounds and reminder
   const projected = workspaceTaskProjection(current, current.length - 1, { earlierConversation: current.slice(0, -1) }).history;
   assert.equal(projected.length, 2); assert.match(projected[0].content, /^<hara-recent-conversation>/); assert.equal(projected[1].content, "now");
 });
+
+test("an explicit native-session reset is a hard boundary for the recent view", async () => {
+  const { calls, factory } = scripted({});
+  const f = await setup(1, factory), agent = f.members[0];
+  try {
+    await send(f, agent, "BEFORE-RESET-MARKER 旧话题");
+    f.host.selectAgent("client", f.id, agent);
+    const view = f.host.snapshot(f.id, agent, "client").conversation;
+    assert.equal(view.nativeSession.runtimeId, "pi");
+    await f.host.newNativeSession("client", f.id, agent, view.revision, view.nativeSession.revision, randomUUID());
+    await send(f, agent, "AFTER-RESET-ONE 新话题");
+    await send(f, agent, "那新话题还有什么");
+    const last = calls.filter(row => row.objective === "那新话题还有什么")[0] ?? calls.at(-1);
+    const block = recentBlock(last.history);
+    assert.ok(block, "post-reset turns still form a recent view");
+    assert.match(String(block.content), /AFTER-RESET-ONE/);
+    for (const row of calls.filter(row => !row.objective.startsWith("BEFORE-RESET"))) assert.doesNotMatch(JSON.stringify(row.history), /BEFORE-RESET-MARKER/);
+  } finally { await f.host.close(); }
+});

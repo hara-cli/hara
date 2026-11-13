@@ -1931,7 +1931,10 @@ export class LocalWorkspaceHost {
       // (operation.conversationId === sessionId above). Codex keeps its own native thread.
       const recentEligible = !resume && !questionId && !channel && !parent && !parentSignal && !scheduledConnection
         && (origin.source === "ui" || origin.source === "cli") && !commandFacts?.routingChannelId && binding.agent.runtimeId !== "codex";
-      const recent = recentEligible ? recentConversation(value.history, RECENT_CONVERSATION) : [];
+      // An explicit Pi/Claude native-session reset is a hard boundary for this view, as for the engine.
+      const resetStart = recentEligible && resettableNativeRuntime(binding.agent.runtimeId)
+        ? new WorkspaceNativeSessions(context.storage, agentId, store.sessionId).latest(binding.agent.runtimeId, value.history.length)?.historyStart ?? 0 : 0;
+      const recent = recentEligible ? recentConversation(value.history.slice(resetStart), RECENT_CONVERSATION) : [];
       interaction.useRecentConversation(recent.map(row => row.text));
       const startContext = prepareWorkspaceStartContext({ storage: context.storage, conversation: recent,
         personalHome: this.options.mode === "workspace" ? this.options.hostHome : undefined,

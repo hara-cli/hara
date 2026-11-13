@@ -455,7 +455,8 @@ export function prepareWorkspaceRunHistory(permit: WorkspaceRunPermit, history: 
   const start = modelTranscript ? source.indexOf(history[pinned.start]!) : pinned.start;
   const projected = workspaceTaskProjection(source, start, { usedTokens: pinned.usedTokens?.() ?? state.usage.inputTokens + state.usage.outputTokens,
     maxTokens: permit.binding.budget.maxTokens, task: state.options?.taskIntake?.current?.(), retain: pinned.retain,
-    ...(pinned.recentConversation === true ? { earlierConversation: history.slice(0, pinned.start) } : {}) });
+    // An explicit native-session reset is a hard boundary: earlier turns never return as context.
+    ...(pinned.recentConversation === true ? { earlierConversation: history.slice(workspaceNativeSessionBoundary(permit, pinned.start)?.historyStart ?? 0, pinned.start) } : {}) });
   state.contextStats = projected.stats; return projected.history;
 }
 export function prepareWorkspaceRunWakeBrief(permit: WorkspaceRunPermit): string {
