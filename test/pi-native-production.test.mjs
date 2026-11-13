@@ -265,6 +265,7 @@ test("the production bundled Pi RPC entry executes native tools and Hara MCP usi
     return record;
   };
   let confirmations = 0, calls = 0;
+  let bashStartedAt = 0, bashElapsedMs = null;
   const endpoint = await createWorkspaceMcpEndpoint({ signal: new AbortController().signal, assertCurrent() {}, tools: () => [tool], async call() {
     confirmations++; return { id: "fixture", name: tool.name, content: "Host declined the synthetic mutation", isError: true };
   } }); t.after(() => endpoint.close());
@@ -277,8 +278,8 @@ test("the production bundled Pi RPC entry executes native tools and Hara MCP usi
       calls++;
       assert.equal(args.tools.some(tool => /cron|schedulewakeup|foreign/i.test(tool.name)), false);
       if (calls === 1) return { text: "", toolUses: [{ id: "native-write", name: "write", input: { path: "proof.txt", content: "native effect" } }], stop: "tool_use" };
-      if (calls === 2) return { text: "", toolUses: [{ id: "native-bash", name: "bash", input: { command: 'if cat "$HOME/.hara/connection.json" >/dev/null 2>&1; then exit 9; fi; node -e \'' + backgroundScript + '\'; printf fixture-ok', timeout: 5 } }], stop: "tool_use" };
-      if (calls === 3) return { text: "", toolUses: [{ id: "hara-choice", name: piWorkspaceToolName(tool.name), input: { question: "approve?" } }], stop: "tool_use" };
+      if (calls === 2) { bashStartedAt = performance.now(); return { text: "", toolUses: [{ id: "native-bash", name: "bash", input: { command: 'if cat "$HOME/.hara/connection.json" >/dev/null 2>&1; then exit 9; fi; node -e \'' + backgroundScript + '\'; printf fixture-ok', timeout: 5 } }], stop: "tool_use" }; }
+      if (calls === 3) { bashElapsedMs = Math.round(performance.now() - bashStartedAt); return { text: "", toolUses: [{ id: "hara-choice", name: piWorkspaceToolName(tool.name), input: { question: "approve?" } }], stop: "tool_use" }; }
       assert.ok(args.history.some(message => message.role === "tool" && message.results.some(result => result.content.includes("Host declined"))));
       return reply("native production entry verified");
     } };
@@ -291,23 +292,29 @@ test("the production bundled Pi RPC entry executes native tools and Hara MCP usi
   const q = JSON.stringify;
   const profile = `(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* (subpath ${q(work)}) (subpath ${q(join(root,"agent/sessions"))}) (subpath ${q(join(root,"agent/tmp"))}) (subpath ${q(join(root,"agent/auth.json.lock"))}) (literal "/dev/null") (literal "/dev/stdout") (literal "/dev/stderr"))\n(deny file-read-data (subpath ${q(join(root,"home/.hara"))}))\n(deny file-write* (subpath ${q(join(root,"home/.hara"))}))\n(deny file-link)\n`;
   const launch = piNativeLauncher(), env = { HOME: join(root, "home"), USERPROFILE: join(root, "home"), PI_CODING_AGENT_DIR: join(root, "agent"), PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", NODE_DISABLE_COMPILE_CACHE: "1", PATH: process.execPath.slice(0,process.execPath.lastIndexOf("/")) + ":/usr/bin:/bin", TMPDIR: join(root,"agent/tmp") };
+  let nativeLaunches = 0;
   const startRpc = configuration => {
+    const launchNumber = ++nativeLaunches, nativeStartedAt = performance.now();
     const lifecycle = new RuntimeProcessBoundary(); lifecycle.markWrapped();
     const rpc = new PiRpcProcess({ ...launch, env, configuration, cwd: work, timeoutMs: 15000, signal: new AbortController().signal, onFrame() {}, onAccepted() {},
     boundary: { spawn() {
       const child = spawn("/bin/sh", ["-c", RUNTIME_GUARD_SCRIPT, "hara-native-guard", "/usr/bin/sandbox-exec", "-p", profile, launch.command, ...launch.args], { cwd: work, env, detached: true, stdio: ["pipe","pipe","pipe","pipe"] });
-      return { child, ready: lifecycle.own(child, true) };
+      return { child, ready: lifecycle.own(child, true).then(() => {
+        t.diagnostic("pi-native-boundary-ready " + JSON.stringify({ launchNumber, elapsedMs: Math.round(performance.now() - nativeStartedAt) }));
+      }) };
     }, async drain() { await lifecycle.drain(false); } } });
     t.after(async () => { await rpc.close(); await lifecycle.close(); }); return rpc;
   };
   const rpc = startRpc(config);
   await rpc.state();
+  const nativeStartupMs = Math.round(performance.now() - bridgeStartedAt);
+  t.diagnostic("pi-native-entry-startup " + JSON.stringify({ nativeStartupMs, bridgeBudgetMs: entryBudget.timeoutMs }));
   // Failure diagnostics only (no prompt, tool or model text): which turn and fixture step was reached, how
   // the last assistant frame stopped, elapsed time against the bridge's run-wide and Pi's per-turn limits.
   const diagnosed = (turn, process, run) => run.catch(error => {
     const last = process.lastAssistant, message = typeof last?.errorMessage === "string" ? last.errorMessage : undefined;
     t.diagnostic("pi-native-entry " + JSON.stringify({ turn, error: String(error?.message).slice(0, 80), stopReason: last?.stopReason ?? null,
-      providerCalls: calls, hostConfirmations: confirmations, elapsedMs: Math.round(performance.now() - bridgeStartedAt),
+      providerCalls: calls, hostConfirmations: confirmations, elapsedMs: Math.round(performance.now() - bridgeStartedAt), nativeStartupMs: turn === "first" ? nativeStartupMs : null,
       bridgeRunTimeoutMs: entryBudget.timeoutMs, piTurnTimeoutMs: 15000, errorMessageLength: message?.length ?? null,
       errorKind: message === undefined ? null : /abort/i.test(message) ? "aborted" : /timeout/i.test(message) ? "timeout"
         : /connect|fetch|socket|ECONN/i.test(message) ? "connection" : /\b[45]\d\d\b/.test(message) ? "http-status" : "other" }));
@@ -315,13 +322,15 @@ test("the production bundled Pi RPC entry executes native tools and Hara MCP usi
   });
   try {
     const result = await diagnosed("first", rpc, rpc.prompt("Run the fixed synthetic native steps and respect the Host denial."));
+    t.diagnostic("pi-native-entry-timing " + JSON.stringify({ firstElapsedMs: Math.round(performance.now() - bridgeStartedAt),
+      bashDispatchToNextProviderMs: bashElapsedMs, bridgeBudgetMs: entryBudget.timeoutMs, bashBudgetMs: 5000, piTurnBudgetMs: 15000 }));
     assert.equal(result.text, "native production entry verified"); assert.equal(confirmations, 1); assert.equal(calls, 4);
     assert.equal(readFileSync(join(work,"proof.txt"),"utf8"),"native effect");
     assert.equal(existsSync(join(work,"unexpected-global-resource")),false);
     const background = backgroundRecord(), pid = background.pid;
     assert.equal(background.ownerTag, grandchildTag); assert.ok(Number.isSafeInteger(pid) && pid > 1);
     assert.ok(typeof background.born === "string" && background.born.length > 0);
-    const live = () => { try { return !execFileSync("/bin/ps",["-p",String(pid),"-o","stat="],{encoding:"utf8",stdio:["ignore","pipe","ignore"]}).trim().startsWith("Z"); } catch { return false; } };
+    const live = () => { const row = fixtureProcessStamp(pid); return !!row && !row.state.startsWith("Z"); };
     assert.equal(live(),true); await rpc.close();
     const remainsLive = live(); // Capture immediately: a later diagnostic must not turn expiry into success.
     if (remainsLive) {
