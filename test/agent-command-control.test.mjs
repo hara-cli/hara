@@ -546,3 +546,42 @@ test("C3 a real private-lock publication failure preserves the ledger and perman
   const stop = f.draft({ action: "task.stop", taskId: d.task.id, runId: d.binding.runId, claimRevision: 1 });
   assert.ok(f.apply(stop).control.holdId); assert.equal(f.control.inspect(f.transport, f.agent.agentId).sourceAvailableHere, false);
 });
+
+
+test("C5 M1 authenticated missing-receipt observation uses authority time and an expired intake cannot later commit", t => {
+  const f = fixture(t), command = f.draft({ action: "agent.pause", reason: "human_request" });
+  const intake = f.control.begin(f.transport, command).intake;
+  const before = f.control.lookupReceipt(f.transport, f.agent.agentId, command.commandId);
+  assert.equal(before.state, "not_seen"); assert.equal(before.receipt, null);
+  assert.equal(before.kind, "command-receipt-lookup"); assert.deepEqual(before.context, command.context);
+  assert.equal(before.agentId, command.agentId); assert.equal(before.commandId, command.commandId);
+  assert.ok(Date.parse(before.observedAt) < Date.parse(command.notAfter));
+  f.advance(31001);
+  const expired = f.control.lookupReceipt(f.transport, f.agent.agentId, command.commandId);
+  assert.ok(Date.parse(expired.observedAt) > Date.parse(command.notAfter) + 1000);
+  assert.throws(() => f.control.accept(intake), code("AUTHORITY_UNVERIFIED"));
+  assert.equal(f.snapshot().control.commands.length, 0); assert.equal(f.snapshot().control.runs.length, 0);
+});
+
+test("C5 M1 observed time is sampled before reading the ledger, never after an acceptance window", t => {
+  const f = fixture(t), command = f.draft({ action: "agent.pause", reason: "human_request" });
+  const read = f.authority.commandControlForReader.bind(f.authority);
+  let once = false;
+  f.authority.commandControlForReader = (...args) => { if (!once) { once = true; f.advance(31001); } return read(...args); };
+  const observed = f.control.lookupReceipt(f.transport, f.agent.agentId, command.commandId);
+  assert.equal(observed.state, "not_seen");
+  assert.ok(Date.parse(observed.observedAt) < Date.parse(command.notAfter), "A late snapshot cannot turn an earlier observation into an expired proof");
+});
+
+test("C5 M1 seen accepted commands survive expiry and absence is never substituted for failed authority", t => {
+  const f = fixture(t), run = f.dispatch(); run.accept(); f.advance(60000);
+  const seen = f.control.lookupReceipt(f.transport, f.agent.agentId, run.command.commandId);
+  assert.equal(seen.state, "seen"); assert.equal(seen.receipt.status, "accepted");
+  assert.deepEqual(seen.receipt, f.control.readReceipt(f.transport, f.agent.agentId, run.command.commandId));
+  assert.throws(() => f.control.lookupReceipt({}, f.agent.agentId, randomUUID()), code("AUTHORITY_UNVERIFIED"));
+  assert.throws(() => f.control.lookupReceipt(f.transport, "other-agent", randomUUID()), code("AUTHORIZATION_DENIED"));
+  assert.throws(() => f.control.lookupReceipt(f.transport, f.agent.agentId, "bad id"), code("INVALID_DOCUMENT"));
+  const healthy = f.authority.commandControlSourceHealthy; f.authority.commandControlSourceHealthy = () => false;
+  try { assert.throws(() => f.control.lookupReceipt(f.transport, f.agent.agentId, randomUUID()), code("AUTHORITY_UNVERIFIED")); }
+  finally { f.authority.commandControlSourceHealthy = healthy; }
+});

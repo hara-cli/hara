@@ -99,3 +99,16 @@ test("C4 logical dismissal and subsequent history retirement retain management p
   assert.equal(f.control.archiveLifecycleHistory(f.transport, f.agent.agentId).published, 0);
   assert.ok(f.control.readReceipt(f.transport, f.agent.agentId, dismiss.commandId)); assert.equal(f.snapshot().control.agents.find(row => row.agentId === f.agent.agentId).dismissed, true);
 });
+
+
+test("C5 M1 receipt lookup includes retired commands and corrupt history cannot prove an ID unseen", t => {
+  const f = lifecycleFixture(t), run = abort(f), id = run.command.commandId;
+  f.control.acknowledgeAudit(f.transport, f.agent.agentId, f.control.audit(f.transport, f.agent.agentId).map(row => row.eventId));
+  f.control.archiveLifecycleHistory(f.transport, f.agent.agentId);
+  assert.ok(f.snapshot().lifecycle.retiredCommands.some(row => row.commandId === id));
+  const seen = f.control.lookupReceipt(f.transport, f.agent.agentId, id);
+  assert.equal(seen.state, "seen"); assert.deepEqual(seen.receipt, f.control.readReceipt(f.transport, f.agent.agentId, id));
+  const file = historyFile(f), saved = fs.readFileSync(file); fs.writeFileSync(file, "corrupt synthetic history");
+  try { assert.throws(() => f.control.lookupReceipt(f.transport, f.agent.agentId, randomUUID()), code("AUTHORITY_UNVERIFIED")); }
+  finally { fs.writeFileSync(file, saved); }
+});
