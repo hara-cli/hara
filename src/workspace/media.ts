@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { closeSync, constants, fstatSync, fsyncSync, lstatSync, openSync, readSync, realpathSync, renameSync, unlinkSync, writeSync, type Stats } from "node:fs";
+import { closeSync, constants, fstatSync, fsyncSync, lstatSync, openSync, readdirSync, readSync, realpathSync, renameSync, unlinkSync, writeSync, type Stats } from "node:fs";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { verifyOpenedRegularFileSync } from "../fs-read.js";
@@ -37,6 +37,20 @@ function matchesMime(bytes: Buffer, mime: string): boolean {
   const box = bytes.subarray(4, 8).toString("ascii");
   if (box === "ftyp" && ["heic", "heix", "hevc", "hevx", "mif1", "msf1", "avif", "avis"].includes(bytes.subarray(8, 12).toString("ascii"))) return false;
   return mime === "video/quicktime" ? ["ftyp", "moov", "mdat", "wide"].includes(box) : mime === "video/mp4" && box === "ftyp";
+}
+const IMPORT_TEMP = /^\.import-[a-f0-9]{32}$/u;
+/** Removes temp files an import interrupted by a crash left in `directory` (the attachments folder).
+ * Only exact temp names; regular files or links (the link itself, never its target); never directories. */
+export function sweepImportLeftovers(directory: string): number {
+  let names: string[];
+  try { const info = lstatSync(directory); if (!info.isDirectory() || info.isSymbolicLink()) return 0; names = readdirSync(directory); } catch { return 0; }
+  let removed = 0;
+  for (const name of names) {
+    if (!IMPORT_TEMP.test(name)) continue;
+    const path = join(directory, name);
+    try { const info = lstatSync(path); if (!info.isFile() && !info.isSymbolicLink()) continue; unlinkSync(path); removed++; } catch { /* already gone */ }
+  }
+  return removed;
 }
 /** Ephemeral artifact registrations. Roots come only from the Host's current Workspace/project catalog,
  * never from renderer input. Every read repeats the current grant, directory, inode and MIME checks. */

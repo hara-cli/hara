@@ -44,6 +44,7 @@ All errors are thrown as RPC errors.
   - Discarded bytes are zeroed.
 - **File name:** the content hash. Callers cannot name or place the file, and the same image twice reuses one file.
 - **Write:** the bytes go to a private temp file (`O_EXCL|O_NOFOLLOW`, mode 0600) in `attachments/` (0700), are fsynced, then renamed into place.
-  - A link or hard link at the destination is refused, never replaced or followed.
+  - Links are never followed or written through: a link or hard link at the destination makes the import fail and is left as it is.
+  - A temp file left by an import interrupted by a crash (`.import-<32 hex>`) is removed when the workspace is next opened.
   - `attachments/` itself must be a real directory owned by the user.
 - **Retention:** no automatic cleanup. Conversation history keeps referring to these files, so pasted images accumulate in `attachments/`. A future attachment-cleanup feature (1.3.x backlog) will handle them.

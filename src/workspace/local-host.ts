@@ -10,7 +10,7 @@ import { WorkspaceNativeSessions, resettableNativeRuntime } from "./native-sessi
 import { withWorkspaceAgentMemory, withWorkspaceSharedMemory } from "../memory/agent-scope.js";
 import { invalidateWorkspaceNativeEvidenceForHostWrite, beginWorkspaceHostWrite } from "../agent-runtime/workspace-native-policy.js";
 import { groupCreationAuthorized, singleGroupCreationRequest, type GroupCreateDraft } from "./group-create.js";
-import { WorkspaceMediaRegistry } from "./media.js";
+import { WorkspaceMediaRegistry, sweepImportLeftovers } from "./media.js";
 import { colleagueProposal } from "./colleague-proposal.js";
 import { CodexHistoryBoundaries } from "./codex-history-boundary.js";
 import { parseWorkspaceAssistantPreview, type WorkspaceAssistantPreview } from "./assistant-preview.js";
@@ -545,6 +545,8 @@ export class LocalWorkspaceHost {
     // The fixture project is workspace data too. Sharing the container root would let B observe
     // or reuse A's same-relative-path artifacts despite isolated chat/config/budget state.
     const project = storage.run(() => ensurePrivateStateSubdirectory(this.root, ["project", row.scope.workspaceId]).path);
+    // Opening a workspace is the start of its imports here: no import can be in flight, so leftovers are crash debris.
+    storage.run(() => sweepImportLeftovers(join(project, "attachments")));
     const source = storage.run(() => join(workspaceStateHome(), ".hara/workspace-connections-v2.json"));
     const connections = this.options.mode === "workspace" ? new WorkspaceSecureConnections(storage, this.vault, id => {
       if (!this.legacy) throw new Error("Legacy source unavailable"); return this.legacy.resolve(id, source, true);
