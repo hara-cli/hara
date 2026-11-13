@@ -39,16 +39,23 @@ function matchesMime(bytes: Buffer, mime: string): boolean {
   return mime === "video/quicktime" ? ["ftyp", "moov", "mdat", "wide"].includes(box) : mime === "video/mp4" && box === "ftyp";
 }
 const IMPORT_TEMP = /^\.import-[a-f0-9]{32}$/u;
+/** A live import writes, fsyncs and renames its temp file inside one synchronous call (milliseconds). */
+export const IMPORT_LEFTOVER_AGE_MS = 10 * 60_000;
 /** Removes temp files an import interrupted by a crash left in `directory` (the attachments folder).
- * Only exact temp names; regular files or links (the link itself, never its target); never directories. */
-export function sweepImportLeftovers(directory: string): number {
+ * Only exact temp names; regular files or links (the link itself, never its target); never directories;
+ * `directory` itself must be a real directory, not a link.
+ *
+ * Two Hosts on one root: the serve discovery receipt (`serve-v2.json`) refuses a second live Host, but that
+ * check runs after initialization and is not an atomic lock. So only temp files older than
+ * IMPORT_LEFTOVER_AGE_MS go: another Host's in-flight temp file is never that old. */
+export function sweepImportLeftovers(directory: string, now = Date.now()): number {
   let names: string[];
   try { const info = lstatSync(directory); if (!info.isDirectory() || info.isSymbolicLink()) return 0; names = readdirSync(directory); } catch { return 0; }
   let removed = 0;
   for (const name of names) {
     if (!IMPORT_TEMP.test(name)) continue;
     const path = join(directory, name);
-    try { const info = lstatSync(path); if (!info.isFile() && !info.isSymbolicLink()) continue; unlinkSync(path); removed++; } catch { /* already gone */ }
+    try { const info = lstatSync(path); if ((!info.isFile() && !info.isSymbolicLink()) || now - info.mtimeMs < IMPORT_LEFTOVER_AGE_MS) continue; unlinkSync(path); removed++; } catch { /* already gone */ }
   }
   return removed;
 }

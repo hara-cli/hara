@@ -8,7 +8,7 @@ import { once } from "node:events";
 import { WebSocket } from "ws";
 import { startLocalWorkspaceServe } from "../dist/serve/local-workspace.js";
 import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
-import { IMPORT_IMAGE_TOO_LARGE, MAX_IMPORT_IMAGE_BYTES } from "../dist/workspace/media.js";
+import { IMPORT_IMAGE_TOO_LARGE, IMPORT_LEFTOVER_AGE_MS, MAX_IMPORT_IMAGE_BYTES, sweepImportLeftovers } from "../dist/workspace/media.js";
 import { MAX_IMPORT_CHUNK_BYTES, MediaImportSessions, parseMediaImportChunk } from "../dist/workspace/media-import.js";
 
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
@@ -217,15 +217,37 @@ test("temp files left by a crashed import are removed when the workspace is open
     const kept = await (async () => { const id = randomUUID(); return first.rpc("workspace.media.import", { workspaceId: ws.workspaceId, expectedGeneration: ws.resourceGeneration, importId: id, mime: "image/png", index: 0, total: 1, bytes: PNG.length, chunkBase64: PNG.toString("base64") }); })();
     await first.close();
     const outside = join(root, "outside.txt"); fs.writeFileSync(outside, "keep");
-    const debris = `.import-${"a".repeat(32)}`, linked = `.import-${"b".repeat(32)}`, folder = `.import-${"c".repeat(32)}`;
+    const debris = `.import-${"a".repeat(32)}`, linked = `.import-${"b".repeat(32)}`, folder = `.import-${"c".repeat(32)}`, fresh = `.import-${"d".repeat(32)}`, suffixed = `.import-${"e".repeat(32)}.png`;
     fs.writeFileSync(join(attachments, debris), "partial"); fs.symlinkSync(outside, join(attachments, linked)); fs.mkdirSync(join(attachments, folder));
     fs.writeFileSync(join(attachments, ".import-short"), "not ours"); fs.writeFileSync(join(attachments, "notes.txt"), "user file");
+    fs.writeFileSync(join(attachments, suffixed), "same prefix, longer name"); fs.writeFileSync(join(attachments, fresh), "another Host is writing this");
+    const old = new Date(Date.now() - 60 * 60_000);
+    for (const name of [debris, folder, suffixed, ".import-short"]) fs.utimesSync(join(attachments, name), old, old);
+    fs.lutimesSync(join(attachments, linked), old, old);
     const second = await open();
     await second.rpc("workspace.snapshot", { workspaceId: ws.workspaceId, agentId: null });
-    assert.deepEqual(fs.readdirSync(attachments).sort(), [folder, ".import-short", `${hash(PNG)}.png`, "notes.txt"].sort(), "only exact temp names that are files or links go");
+    assert.deepEqual(fs.readdirSync(attachments).sort(), [folder, ".import-short", suffixed, fresh, `${hash(PNG)}.png`, "notes.txt"].sort(),
+      "only old, exact temp names that are files or links go; a prefix-alike name (review of #72, ②) and a fresh temp file another Host may be writing stay");
     assert.equal(fs.readFileSync(outside, "utf8"), "keep", "a link is removed, never followed");
     assert.deepEqual(fs.readFileSync(kept.path), PNG);
     await second.close();
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the sweep never reaches through attachments/ when it is itself a link (review of #72, ①)", { skip: process.platform === "win32" }, () => {
+  const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "hara-media-sweep-link-")));
+  try {
+    const target = join(root, "elsewhere"), attachments = join(root, "attachments"); fs.mkdirSync(target);
+    const name = `.import-${"f".repeat(32)}`, old = new Date(Date.now() - 60 * 60_000);
+    fs.writeFileSync(join(target, name), "not ours"); fs.utimesSync(join(target, name), old, old);
+    fs.symlinkSync(target, attachments);
+    assert.equal(sweepImportLeftovers(attachments), 0);
+    assert.deepEqual(fs.readdirSync(target), [name], "the linked directory's contents are untouched");
+    fs.rmSync(attachments); fs.renameSync(target, attachments);
+    assert.equal(sweepImportLeftovers(attachments), 1, "the same file in a real attachments/ is swept");
+    fs.writeFileSync(join(attachments, name), "fresh");
+    assert.equal(sweepImportLeftovers(attachments), 0, "a temp file younger than 10 minutes is kept");
+    assert.equal(sweepImportLeftovers(attachments, Date.now() + IMPORT_LEFTOVER_AGE_MS + 1000), 1);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
