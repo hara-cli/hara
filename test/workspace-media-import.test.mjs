@@ -8,7 +8,7 @@ import { once } from "node:events";
 import { WebSocket } from "ws";
 import { startLocalWorkspaceServe } from "../dist/serve/local-workspace.js";
 import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
-import { IMPORT_IMAGE_TOO_LARGE, MAX_IMPORT_IMAGE_BYTES } from "../dist/workspace/media.js";
+import { IMPORT_IMAGE_TOO_LARGE, IMPORT_LEFTOVER_AGE_MS, MAX_IMPORT_IMAGE_BYTES, sweepImportLeftovers } from "../dist/workspace/media.js";
 import { MAX_IMPORT_CHUNK_BYTES, MediaImportSessions, parseMediaImportChunk } from "../dist/workspace/media-import.js";
 
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
@@ -187,4 +187,71 @@ test("a torn earlier file under the hash name is atomically replaced; a hard-lin
   fs.rmSync(target); const other = join(root, "other.png"); fs.writeFileSync(other, PNG); fs.linkSync(other, target);
   await assert.rejects(importAll(rpc, PNG, "image/png"), /media unavailable/);
   assert.deepEqual(fs.readFileSync(other), PNG); assert.deepEqual(leftovers(), []);
+});
+
+test("a non-canonical padding character and a last chunk short of the declared size are refused (review of #70, N1)", async t => {
+  const { rpc, chunk, attachments } = await serve(t);
+  const canonical = PNG.toString("base64"); assert.match(canonical, /[A-Za-z0-9+/]==$/);
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", at = canonical.length - 3;
+  const forged = canonical.slice(0, at) + alphabet[alphabet.indexOf(canonical[at]) + 1] + "==";
+  assert.deepEqual(Buffer.from(forged, "base64"), PNG, "Node decodes it to the same bytes");
+  await assert.rejects(rpc("workspace.media.import", chunk(PNG, "image/png", randomUUID(), 0, { chunkBase64: forged })), /Invalid Workspace media import/);
+  await assert.rejects(rpc("workspace.media.import", chunk(PNG, "image/png", randomUUID(), 0, { bytes: PNG.length + 5 })), /import_aborted: final size does not match/);
+  assert.equal(fs.existsSync(attachments) ? fs.readdirSync(attachments).length : 0, 0);
+});
+
+test("temp files left by a crashed import are removed when the workspace is opened again, and nothing else (review of #70, N3)", { skip: process.platform === "win32" }, async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "hara-media-sweep-")));
+  const open = async () => {
+    const handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port: 0, cwd: root }, { root, version: "fixture", credentialVault: new MemoryCredentialVault() });
+    const socket = new WebSocket(`ws://127.0.0.1:${handle.port}`), pending = new Map(); let serial = 0;
+    socket.on("message", raw => { const value = JSON.parse(raw), wait = pending.get(value.id); if (wait) { pending.delete(value.id); value.error ? wait.reject(Error(value.error.message)) : wait.resolve(value.result); } });
+    await once(socket, "open");
+    const rpc = (method, params = {}) => new Promise((resolve, reject) => { const id = ++serial; pending.set(id, { resolve, reject }); socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params })); });
+    const init = await rpc("initialize", { token: handle.token });
+    return { rpc, init, close: async () => { socket.terminate(); await handle.close(); } };
+  };
+  try {
+    const first = await open(), ws = await first.rpc("workspace.create", { label: "Sweep", expectedRevision: first.init.workspace.revision });
+    const attachments = join(root, "project", ws.workspaceId, "attachments");
+    const kept = await (async () => { const id = randomUUID(); return first.rpc("workspace.media.import", { workspaceId: ws.workspaceId, expectedGeneration: ws.resourceGeneration, importId: id, mime: "image/png", index: 0, total: 1, bytes: PNG.length, chunkBase64: PNG.toString("base64") }); })();
+    await first.close();
+    const outside = join(root, "outside.txt"); fs.writeFileSync(outside, "keep");
+    const debris = `.import-${"a".repeat(32)}`, linked = `.import-${"b".repeat(32)}`, folder = `.import-${"c".repeat(32)}`, fresh = `.import-${"d".repeat(32)}`, suffixed = `.import-${"e".repeat(32)}.png`;
+    fs.writeFileSync(join(attachments, debris), "partial"); fs.symlinkSync(outside, join(attachments, linked)); fs.mkdirSync(join(attachments, folder));
+    fs.writeFileSync(join(attachments, ".import-short"), "not ours"); fs.writeFileSync(join(attachments, "notes.txt"), "user file");
+    fs.writeFileSync(join(attachments, suffixed), "same prefix, longer name"); fs.writeFileSync(join(attachments, fresh), "another Host is writing this");
+    const old = new Date(Date.now() - 60 * 60_000);
+    for (const name of [debris, folder, suffixed, ".import-short"]) fs.utimesSync(join(attachments, name), old, old);
+    fs.lutimesSync(join(attachments, linked), old, old);
+    const second = await open();
+    await second.rpc("workspace.snapshot", { workspaceId: ws.workspaceId, agentId: null });
+    assert.deepEqual(fs.readdirSync(attachments).sort(), [folder, ".import-short", suffixed, fresh, `${hash(PNG)}.png`, "notes.txt"].sort(),
+      "only old, exact temp names that are files or links go; a prefix-alike name (review of #72, ②) and a fresh temp file another Host may be writing stay");
+    assert.equal(fs.readFileSync(outside, "utf8"), "keep", "a link is removed, never followed");
+    assert.deepEqual(fs.readFileSync(kept.path), PNG);
+    await second.close();
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the sweep never reaches through attachments/ when it is itself a link (review of #72, ①)", { skip: process.platform === "win32" }, () => {
+  const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "hara-media-sweep-link-")));
+  try {
+    const target = join(root, "elsewhere"), attachments = join(root, "attachments"); fs.mkdirSync(target);
+    const name = `.import-${"f".repeat(32)}`, old = new Date(Date.now() - 60 * 60_000);
+    fs.writeFileSync(join(target, name), "not ours"); fs.utimesSync(join(target, name), old, old);
+    fs.symlinkSync(target, attachments);
+    assert.equal(sweepImportLeftovers(attachments), 0);
+    assert.deepEqual(fs.readdirSync(target), [name], "the linked directory's contents are untouched");
+    fs.rmSync(attachments); fs.renameSync(target, attachments);
+    assert.equal(sweepImportLeftovers(attachments), 1, "the same file in a real attachments/ is swept");
+    fs.writeFileSync(join(attachments, name), "fresh");
+    assert.equal(sweepImportLeftovers(attachments), 0, "a temp file younger than 10 minutes is kept");
+    assert.equal(sweepImportLeftovers(attachments, Date.now() + IMPORT_LEFTOVER_AGE_MS + 1000), 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the sweep runs when a workspace context is opened (source)", () => {
+  const host = fs.readFileSync(new URL("../src/workspace/local-host.ts", import.meta.url), "utf8");
+  assert.match(host, /const project = storage\.run\(\(\) => ensurePrivateStateSubdirectory\(this\.root, \["project", row\.scope\.workspaceId\]\)\.path\);\n.*\n\s+storage\.run\(\(\) => sweepImportLeftovers\(join\(project, "attachments"\)\)\);/);
 });
