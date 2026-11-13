@@ -1,16 +1,22 @@
-import { randomBytes } from "node:crypto";
-import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync, type Stats } from "node:fs";
-import { extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { createHash, randomBytes } from "node:crypto";
+import { closeSync, constants, fstatSync, fsyncSync, lstatSync, openSync, readSync, realpathSync, renameSync, unlinkSync, writeSync, type Stats } from "node:fs";
+import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { verifyOpenedRegularFileSync } from "../fs-read.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
 import { sensitiveFileError, lexicalSensitiveFileReason } from "../security/sensitive-files.js";
+import { MAX_NATIVE_IMAGE_BYTES } from "../vision.js";
 
 export const MAX_MEDIA_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_VIDEO_BYTES = 256 * 1024 * 1024, MAX_REGISTRATIONS = 512;
 const MIME: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
   ".pdf": "application/pdf", ".zip": "application/zip", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".md": "text/markdown", ".txt": "text/plain",
   ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm" };
+/** Pasted images follow the existing image attachment rules: these four types, at most the native image limit. */
+export const IMPORT_IMAGE_TYPES: Readonly<Record<string, string>> = { "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp" };
+export const MAX_IMPORT_IMAGE_BYTES = MAX_NATIVE_IMAGE_BYTES;
+/** Stable message clients match on (`image_too_large`) to say «the image is over 3.6 MB». */
+export const IMPORT_IMAGE_TOO_LARGE = `image_too_large: images are limited to ${(MAX_IMPORT_IMAGE_BYTES / 1_000_000).toFixed(1)} MB (${MAX_IMPORT_IMAGE_BYTES} bytes)`;
 interface Entry { id: string; path: string; root: string; rootInfo: Stats; info: Stats; mime: string }
 export interface WorkspaceMediaRegistration { id: string; mime: string; bytes: number }
 const inside = (root: string, path: string) => { const rel = relative(root, path); return !!rel && !isAbsolute(rel) && rel.split(sep).every(part => part !== ".." && part !== ""); };
@@ -115,6 +121,47 @@ export class WorkspaceMediaRegistry {
     this.assertCurrent();
     try { return { state: "ready", media: this.register(input) }; }
     catch (error) { this.assertCurrent(); return { state: error instanceof WorkspaceMediaError ? error.kind : "failed", ...(error instanceof WorkspaceMediaError && error.reason ? { reason: error.reason } : {}) }; }
+  }
+  /** Writes a complete pasted image into `directory` (the Host's private attachments folder) and registers it.
+   * The name is the content hash, never caller text. Bytes go to a private temp file (O_EXCL, no link following)
+   * and are renamed into place, so a reader never sees a partial image; the same image twice reuses one file. */
+  importImage(directory: string, bytes: Buffer, mime: string): { path: string; media: WorkspaceMediaRegistration } {
+    this.assertCurrent();
+    if (bytes.length > MAX_IMPORT_IMAGE_BYTES) throw new Error(IMPORT_IMAGE_TOO_LARGE);
+    const extension = Object.hasOwn(IMPORT_IMAGE_TYPES, mime) ? IMPORT_IMAGE_TYPES[mime] : undefined;
+    if (!extension || !bytes.length || !matchesMime(bytes.subarray(0, 32), mime)) throw denied("failed");
+    const path = join(directory, `${createHash("sha256").update(bytes).digest("hex")}${extension}`);
+    const existing = this.existing(path, bytes);
+    if (existing === "same") return { path, media: this.register(path) };
+    const temp = join(directory, `.import-${randomBytes(16).toString("hex")}`);
+    let fd: number, open = true;
+    try { fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600); } catch { throw denied("failed"); }
+    try {
+      for (let offset = 0; offset < bytes.length;) offset += writeSync(fd, bytes, offset, bytes.length - offset);
+      fsyncSync(fd); closeSync(fd); open = false;
+      this.assertCurrent();
+      // rename never follows a link at the destination; re-check right before it so a planted link is refused, not replaced.
+      if (this.existing(path, bytes) === "same") { unlinkSync(temp); return { path, media: this.register(path) }; }
+      renameSync(temp, path);
+    } catch (error) {
+      if (open) try { closeSync(fd); } catch { /* best effort */ }
+      try { unlinkSync(temp); } catch { /* already gone */ }
+      throw error instanceof WorkspaceMediaError ? error : error instanceof Error && error.message.startsWith("Workspace") ? error : denied("failed");
+    }
+    return { path, media: this.register(path) };
+  }
+  /** "same" when an identical regular file is already there; "none"/"replaceable" otherwise. Links and hard links are refused. */
+  private existing(path: string, bytes: Buffer): "same" | "none" | "replaceable" {
+    let info: Stats; try { info = lstatSync(path); } catch { return "none"; }
+    if (info.isSymbolicLink()) throw denied("failed", "symlink");
+    if (!info.isFile() || info.nlink !== 1) throw denied("failed");
+    if (info.size !== bytes.length) return "replaceable";
+    let fd: number; try { fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)); } catch { throw denied("failed"); }
+    try {
+      const current = Buffer.alloc(bytes.length);
+      for (let offset = 0; offset < current.length;) { const count = readSync(fd, current, offset, current.length - offset, offset); if (!count) return "replaceable"; offset += count; }
+      return current.equals(bytes) ? "same" : "replaceable";
+    } finally { closeSync(fd); }
   }
   has(id: string) { return /^[a-f0-9]{64}$/u.test(id) && this.entries.has(id); }
   read(id: string, range?: string, head = false, pathOnly = false) {

@@ -649,18 +649,26 @@ export class LocalWorkspaceHost {
     const current = this.context(workspaceId).storage.run(() => currentWorkspaceResourceBinding()!.generation);
     if (typeof generation !== "string" || generation !== current) throw new Error("Workspace resource generation changed; refresh before acting");
   }
-  registerMedia(workspaceId: string, path: string, describe = false, clientId?: string) {
-    const context = this.context(workspaceId);
+  private mediaRegistry(workspaceId: string, context: WorkspaceHostContext): WorkspaceMediaRegistry {
     const generation = context.storage.run(() => currentWorkspaceResourceBinding()!.generation);
-    context.media ??= new WorkspaceMediaRegistry(context.project, () => [context.project,
+    return context.media ??= new WorkspaceMediaRegistry(context.project, () => [context.project,
       ...new WorkspaceLegacyResources(context.storage).directoryReferencesForHost().filter(row => row.purposes.some(kind => kind === "project" || kind === "workspace-files")).map(row => row.path)],
     () => { if (this.closing || this.context(workspaceId) !== context) throw new Error("Workspace media unavailable"); this.assertGeneration(workspaceId, generation); }, true);
+  }
+  /** Pasted image bytes land in the managed project's `attachments/` folder (never a renderer-chosen path). */
+  importMedia(workspaceId: string, mime: string, bytes: Buffer) {
+    const context = this.context(workspaceId), media = this.mediaRegistry(workspaceId, context);
+    const directory = context.storage.run(() => ensurePrivateStateSubdirectory(context.project, ["attachments"]).path);
+    return media.importImage(directory, bytes, mime);
+  }
+  registerMedia(workspaceId: string, path: string, describe = false, clientId?: string) {
+    const context = this.context(workspaceId), media = this.mediaRegistry(workspaceId, context);
     const selection = clientId ? this.clients.get(clientId) : undefined;
     const agent = selection?.workspaceId === workspaceId && !selection.channelId && selection.agentId ? context.resources.agents.get(selection.agentId) : undefined;
     const project = agent ? this.runProject(context, agent, new WorkspaceConversationStore(context.storage, agent.agentId).read(), false) : context.project;
     // Preserve traversal/URI validation in the registry, while rebasing relative paths to the selected colleague.
     const resolved = path.startsWith("file:") || path.split(/[\\/]/u).includes("..") ? path : resolve(project, path);
-    return describe ? context.media.describe(resolved) : context.media.register(resolved);
+    return describe ? media.describe(resolved) : media.register(resolved);
   }
   readMedia(id: string, range?: string, head = false, pathOnly = false) {
     for (const context of this.contexts.values()) if (context.media?.has(id)) return context.media.read(id, range, head, pathOnly);
