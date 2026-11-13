@@ -11469,6 +11469,12 @@ C0 author J-HIST-ORPHAN identified that ordinary orphan repair reused a same-sco
 J-HIST-ORPHAN verification: three negative/current-source positive cases and the existing historical-read/old-token checks pass in the 61/61 focused group. Build and canonical C0 lock pass; final hot max93.86ms text /122.91ms four64KiB attachments, initial calibration325.23ms. Production remains disabled.
 
 
+## ERR-20261112-ONBOARDING-PRIVATE-CARD (test fixture)
+Guard focus-v1 built correctly and passed51/52; the new G1 fixture queried snapshot without its owning clientId, so the intentionally private approval projection was empty. Use the actual client/Agent view instead of weakening privacy or increasing the deadline. Corrected focus-v2 plus real C3 rejection tests passed107/107 under the standard private environment/command guard.
+
+Known Hub fixture teardown also received the reviewed async fs.promises.rm + bounded retries: Node's synchronous rimraf retry does not rescan a Finder-created .DS_Store. Wait for that fixture's accounting census before retiring its synthetic HOME. Product logic/thresholds unchanged. Source: local ERROR-LOG C4 full-v2; related test/agent-hub.test.mjs.
+
+Full-v1 on9c187c8 completed4531 total:4524pass/2fail/5conditional skip, guard and clean-source checks passed. Both failures were exact capability-list fixtures not yet updated for the three new advertised APIs. Preserve exact equality and add only the new capabilities. Before final verification, merge the already-approved C4 integrated head274f45a into the task branch (normal forward merge, no history rewrite); retain both lifecycle and onboarding capabilities and combine both bounded fixture-teardown safeguards.
 ## [ERR-20261113-PRIVATE-CHAT-NO-RECENT-CONTEXT] private follow-ups lost the earlier conversation
 
 **Status**: resolved (1.3.0)

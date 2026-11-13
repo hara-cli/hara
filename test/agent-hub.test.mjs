@@ -35,7 +35,7 @@ function fixture(t, extra = {}) {
   const home = realpathSync.native(mkdtempSync(join(tmpdir(), "agent-hub-")));
   // macOS may recreate .DS_Store during removal of the large synthetic home. Async
   // ENOTEMPTY retries rescan new entries; sync rmdir retries alone do not. Errors still fail.
-  t.after(() => fs.promises.rm(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }));
+  t.after(async () => { await globalQuota.refreshUsage().catch(() => {}); await fs.promises.rm(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); });
   const agents = new Map([[agentA.agentId, { ...agentA }], [agentB.agentId, { ...agentB }]]);
   const directory = { registeredAgent: id => agents.get(id) ?? null };
   const globalQuota = new HaraStorageQuota({ home, limitBytes: extra.globalQuotaBytes ?? 64 * 1024 * 1024 });

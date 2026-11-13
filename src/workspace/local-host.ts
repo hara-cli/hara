@@ -80,6 +80,12 @@ import { resolveWorkspaceFileCredential } from "./file-credential.js";
 import { MacKeychainCredentialVault, type CredentialVault } from "./credential-vault.js";
 import { LegacyConnectionCatalog } from "./legacy-connections.js";
 import { WorkspacePreferences } from "./preferences.js";
+import { WorkspaceOnboarding } from "./onboarding.js";
+import { WorkspaceDefaultRuntime } from "./default-runtime-preferences.js";
+import type { WorkspaceResourcePrincipal } from "./account-resources.js";
+/** Restricts G1 metadata on an already admitted local Workspace; never admits Account scopes. */
+export type WorkspaceDefaultRuntimeRole = (workspaceId: string) => WorkspaceResourcePrincipal["role"] | null;
+import type { WorkspaceAgentBatchDefault, WorkspaceAgentBatchInput } from "./agents.js";
 import { WorkspaceFeatures } from "./features.js";
 import type { JsonCliPolicyFactory } from "../agent-runtime/json-cli-policy.js";
 import { WorkspaceExtensions, type ExtensionChange, type ExtensionToolSnapshot } from "./extensions.js";
@@ -116,7 +122,7 @@ export interface AgentRoutingHostOptions {
   businessOwners?(workspaceId: string, reference: string): AgentRoutingBusinessBinding | null;
   classifier?(workspaceId: string): AgentRoutingClassifierConfig | undefined;
 }
-interface WorkspaceHostContext { routing?: WorkspaceAgentRouting; commandControl?: WorkspaceAgentCommandControl; boundaryAuthority?: WorkspaceAgentBoundaryAuthority; media?: WorkspaceMediaRegistry; resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; homes: WorkspaceColleagueHomes; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; extensions: WorkspaceExtensions; mcp: WorkspaceMcpManager; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
+interface WorkspaceHostContext { routing?: WorkspaceAgentRouting; defaultRuntime: WorkspaceDefaultRuntime; onboarding: WorkspaceOnboarding; commandControl?: WorkspaceAgentCommandControl; boundaryAuthority?: WorkspaceAgentBoundaryAuthority; media?: WorkspaceMediaRegistry; resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; homes: WorkspaceColleagueHomes; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; extensions: WorkspaceExtensions; mcp: WorkspaceMcpManager; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
 type WorkspaceConnectionSnapshot = ReturnType<WorkspaceConnectionStoreV2["list"]> & {
   readOnly?: boolean; recovered?: boolean; migrationPending?: boolean; unavailable?: boolean; activeConnectionId?: string | null;
 };
@@ -207,6 +213,8 @@ export class LocalWorkspaceHost {
     discoveryHome?: string;
     legacySourceHome?: string;
     credentialVault?: CredentialVault;
+    /** Trusted Host restriction only. No renderer/config role, human identity or execution grant. */
+    defaultRuntimeRole?: WorkspaceDefaultRuntimeRole;
     runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1];
     /** Operator entry only: detect installed engines in the background this long after a Workspace opens. */
     backgroundRuntimeDetectionMs?: number;
@@ -243,6 +251,7 @@ export class LocalWorkspaceHost {
   } = {}) {
     if (options.boundaryLifecycleControl && !options.boundaryCommandControl) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "lifecycle.bootstrap");
     if (options.boundaryRouting && !options.boundaryLifecycleControl) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "routing.bootstrap");
+    if (options.defaultRuntimeRole !== undefined && typeof options.defaultRuntimeRole !== "function") throw new Error("Invalid Workspace default runtime policy");
     this.usageCache = new WorkspaceRuntimeUsageCache(options.usageCollector);
     if (options.usageCollector) {
       this.usageTimer = setInterval(() => {
@@ -281,7 +290,7 @@ export class LocalWorkspaceHost {
     try {
       if (!hasLegacyStartupSource(sourceHome)) { this.inheritanceState = noLegacyStartup(); return this.inheritanceState; }
       if (this.closing) throw new Error();
-      if (!this.catalog.read().workspaces.length) this.createWorkspace("个人空间", this.catalog.read().revision);
+      if (!this.catalog.read().workspaces.length) this.createWorkspace("个人空间", this.catalog.read().revision, true);
       const record = this.catalog.resolvePersonalWorkspace(); this.inheritanceWorkspaceId = record.scope.workspaceId;
       const context = this.context(record.scope.workspaceId);
       this.inheritance = new WorkspaceLegacyStartup({ sourceHome, storage: context.storage, catalog: this.catalog,
@@ -547,7 +556,7 @@ export class LocalWorkspaceHost {
     const runtimes = new WorkspaceRuntimeInstaller(storage, { ...((this.options.discoveryHome ?? this.options.hostHome) ? { discovery: { home: (this.options.discoveryHome ?? this.options.hostHome)!, probeHome: this.options.hostHome, shell: process.env.HARA_WORKSPACE_HOST_SHELL } } : {}),
       ...this.options.runtimeInstallerOptions, onChange: () => this.changed(workspaceId) });
     const resources = new WorkspaceResources(this.home, row.scope, { assertCurrent: assertAuthority, runtimeInstaller: runtimes }); resources.initialize(); resources.agents.migrateDefaultLabels();
-    const context: WorkspaceHostContext = { storage, resources, connections, project, homes: new WorkspaceColleagueHomes(storage, project), extensions: new WorkspaceExtensions(storage),
+    const context: WorkspaceHostContext = { defaultRuntime: new WorkspaceDefaultRuntime(storage, () => this.preferences.legacyDefaultRuntimeId()), onboarding: new WorkspaceOnboarding(storage), storage, resources, connections, project, homes: new WorkspaceColleagueHomes(storage, project), extensions: new WorkspaceExtensions(storage),
       mcp: new WorkspaceMcpManager(storage, { accountHome: this.options.hostHome ?? this.home, invalidateReview: (sourceId, revision) => this.mcpOwnerReview.invalidate(sourceId, revision), proxy: () => runtimes.proxy.read(), onChange: () => this.changed(workspaceId) }),
       features: new WorkspaceFeatures(storage, project, workspaceId, this.options.mode === "workspace" ? this.options.hostHome : undefined),
       runtimes, runtimeModels: new WorkspaceRuntimeModels(storage, runtimes) };
@@ -663,10 +672,10 @@ export class LocalWorkspaceHost {
       workspaces: value.workspaces.map(row => ({ workspaceId: row.scope.workspaceId, label: row.label, ...(row.labelSource ? { labelSource: row.labelSource, labelKey: row.labelKey } : {}), role: "owner", active: row.active })),
       inheritance: this.inheritanceState ?? noLegacyStartup(), ...this.modelMode() };
   }
-  createWorkspace(label: string, expectedRevision: number) {
+  createWorkspace(label: string, expectedRevision: number, legacyOnboardingDismissed = false) {
     if (this.closing) throw new Error("Workspace Host is closing");
     const row = this.catalog.create(label, expectedRevision), context = this.context(row.scope.workspaceId);
-    context.resources.agents.initializeMain(); this.changed(row.scope.workspaceId);
+    context.resources.agents.initializeMain(); context.onboarding.initializeNew(legacyOnboardingDismissed); this.changed(row.scope.workspaceId);
     return this.snapshot(row.scope.workspaceId);
   }
   renameWorkspace(workspaceId: string, label: string, expectedRevision: number) {
@@ -984,8 +993,79 @@ export class LocalWorkspaceHost {
     }
     return { applied, agent: agents.list().agents.find(row => row.agentId === input.agentId) ?? null };
   }
-  getPreferences() { const current = this.preferences.read(); if (!current.readOnly && current.revision === 0) this.preferences.save(current.theme, 0); return this.preferences.read(); }
-  setPreferences(theme: unknown, expected: number, extra = {}) { this.preferences.save(theme, expected, extra); return this.preferences.read(); }
+  private selectColleagueRuntime(preferred: AgentRuntimeId | null, options: ReturnType<WorkspaceHostContext["resources"]["agents"]["runtimeOptions"]>) {
+    const available = options.filter(option => option.available && option.id !== "hara");
+    return available.find(option => option.id === preferred)?.id ?? available.find(option => option.id === "pi")?.id ?? available[0]?.id;
+  }
+  private newColleagueRuntime(workspaceId: string, options: ReturnType<WorkspaceHostContext["resources"]["agents"]["runtimeOptions"]>) {
+    let preferred: AgentRuntimeId | null = null;
+    // Proposal cards still expose the fallback engine for explicit human correction/confirmation.
+    try { preferred = this.getDefaultRuntime(workspaceId).defaultRuntimeId; } catch { /* Existing Agents are never retargeted. */ }
+    return this.selectColleagueRuntime(preferred, options);
+  }
+  private defaultRuntimeWritable(workspaceId: string): boolean {
+    // The Local catalog admits only its registered local owner. This optional policy can
+    // narrow that existing metadata right; it does not connect Account membership or C1/C3.
+    this.catalog.resolve(workspaceId);
+    if (!this.options.defaultRuntimeRole) return true;
+    try { const role = this.options.defaultRuntimeRole(workspaceId); return role === "OWNER" || role === "ADMIN"; }
+    catch { return false; }
+  }
+  private assertDefaultRuntimeWritable(workspaceId: string) {
+    if (this.closing || this.updateLease) throw new Error("Workspace is preparing to restart");
+    if (!this.defaultRuntimeWritable(workspaceId)) throw new Error("Workspace default runtime is read-only");
+  }
+  getDefaultRuntime(workspaceId: string) {
+    if (this.closing || this.updateLease) throw new Error("Workspace is preparing to restart");
+    const context = this.context(workspaceId), readOnly = !this.defaultRuntimeWritable(workspaceId);
+    const result = context.defaultRuntime.get({ readOnly, assertWriteCurrent: () => this.assertDefaultRuntimeWritable(workspaceId) });
+    return { ...result, readOnly: result.readOnly || !this.defaultRuntimeWritable(workspaceId) };
+  }
+  setDefaultRuntime(clientId: string, workspaceId: string, defaultRuntimeId: unknown, expectedRevision: number) {
+    const context = this.assertOnboardingView(clientId, workspaceId);
+    const assertWriteCurrent = () => { this.assertOnboardingView(clientId, workspaceId); this.assertDefaultRuntimeWritable(workspaceId); };
+    assertWriteCurrent();
+    const result = context.defaultRuntime.set(defaultRuntimeId, expectedRevision, assertWriteCurrent);
+    this.changed(workspaceId); return { ...result, readOnly: result.readOnly || !this.defaultRuntimeWritable(workspaceId) };
+  }
+  getOnboarding(workspaceId: string) {
+    if (this.closing || this.updateLease) throw new Error("Workspace is preparing to restart");
+    return this.context(workspaceId).onboarding.get();
+  }
+  private assertOnboardingView(clientId: string, workspaceId: string) {
+    if (this.agentCommandProtectionActive(workspaceId)) throw new AgentBoundaryContractError("RUNTIME_UNSUPPORTED", "control.legacyEntry");
+    const selected = this.clients.get(clientId), context = this.context(workspaceId);
+    if (this.closing || this.updateLease || !selected || selected.workspaceId !== workspaceId || selected.channelId
+      || selected.agentId !== context.resources.agents.list().mainAgentId) throw new Error("Onboarding view changed; select this Workspace first");
+    return context;
+  }
+  setOnboarding(clientId: string, workspaceId: string, input: unknown, expectedRevision: number) {
+    const context = this.assertOnboardingView(clientId, workspaceId), result = context.onboarding.set(input, expectedRevision);
+    this.changed(workspaceId); return result;
+  }
+  createAgentBatch(clientId: string, workspaceId: string, input: unknown, expectedCatalogRevision: number) {
+    const context = this.assertOnboardingView(clientId, workspaceId);
+    if (!plain(input) || !exact(input, ["runId", "rows"]) || typeof input.runId !== "string" || !UUID.test(input.runId)
+      || !Array.isArray(input.rows) || input.rows.length < 1 || input.rows.length > 8) throw new Error("Invalid colleague batch");
+    // Resolve only omitted choices, outside the Agent catalog lock. Explicit-only batches
+    // and committed slot retries do not need a readable G1 record to retain their semantics.
+    let defaultRuntime: WorkspaceAgentBatchDefault | undefined;
+    if (input.rows.some(row => plain(row) && !Object.hasOwn(row, "runtimeId"))) {
+      try {
+        const preferred = this.getDefaultRuntime(workspaceId).defaultRuntimeId;
+        defaultRuntime = { kind: "resolved", runtimeId: this.selectColleagueRuntime(preferred, context.resources.agents.runtimeOptions()) ?? null };
+      } catch { defaultRuntime = { kind: "preference_unavailable" }; }
+    }
+    this.assertOnboardingView(clientId, workspaceId);
+    const result = context.resources.agents.createBatch(input as unknown as WorkspaceAgentBatchInput, expectedCatalogRevision, defaultRuntime);
+    if (result.results.some(row => row.status === "created")) this.changed(workspaceId);
+    return result;
+  }
+  getPreferences() {
+    const current = this.preferences.read(); if (!current.readOnly && current.revision === 0) this.preferences.save(current.theme, 0);
+    const { defaultRuntimeId: _legacyDefaultRuntimeId, ...appearance } = this.preferences.read(); return appearance;
+  }
+  setPreferences(theme: unknown, expected: number, extra = {}) { this.preferences.save(theme, expected, extra); return this.getPreferences(); }
   private connectionSource(workspaceId: string) { return this.context(workspaceId).storage.run(() => join(workspaceStateHome(), ".hara/workspace-connections-v2.json")); }
   legacyConnections(workspaceId: string) { return this.legacy?.list(this.connectionSource(workspaceId)) ?? []; }
   importConnection(workspaceId: string, id: string, expected: number, approved: boolean): void {
@@ -1682,9 +1762,8 @@ export class LocalWorkspaceHost {
         if (agentCreateAttempts >= 1) return JSON.stringify({ created: false, refused: "turn_limit", humanConfirmed: false, limit: 1 });
         agentCreateAttempts += 1; // Reserve before approval yields so parallel tool uses cannot show two cards.
         const options = job.context.resources.agents.runtimeOptions().filter(row => row.available && row.id !== "hara");
-        // The built-in engine is the starting point; the person picks another on the card. The proposing
-        // colleague's own engine is not a recommendation for the new colleague.
-        const defaultRuntime = options.some(row => row.id === "pi") ? "pi" : options[0]?.id;
+        // The saved preference affects only a new draft; the person still chooses on the card.
+        const defaultRuntime = host.newColleagueRuntime(job.workspaceId, options);
         if (!defaultRuntime) return JSON.stringify({ created: false, refused: "runtime_unavailable", humanConfirmed: false });
         const decision = await host.approval(job, { username: proposed.username as string, displayName: proposed.displayName as string, title: proposed.title as string, instructions: proposed.instructions as string,
           project: typeof proposed.project === "string" ? proposed.project : "", runtimeId: defaultRuntime, permissionTier: defaultRuntimePermissionTier() });

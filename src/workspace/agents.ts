@@ -43,6 +43,17 @@ export interface WorkspaceAgentCreateInput extends WorkspaceAgentPersonaInput {
   runtimeId?: AgentRuntimeId;
   permissionTier?: RuntimePermissionTier;
 }
+export interface WorkspaceAgentBatchRow extends WorkspaceAgentCreateInput { draftKey: string }
+export interface WorkspaceAgentBatchInput { runId: string; rows: WorkspaceAgentBatchRow[] }
+/** Trusted Host preflight only, never part of the RPC envelope. Null means no available engine. */
+export type WorkspaceAgentBatchDefault = Readonly<{ kind: "resolved"; runtimeId: AgentRuntimeId | null }
+  | { kind: "preference_unavailable" }>;
+export type WorkspaceAgentBatchFailure = "invalid_request" | "runtime_unconfirmed" | "runtime_unavailable"
+  | "permission_tier_unavailable" | "username_taken" | "catalog_changed" | "batch_limit";
+export type WorkspaceAgentBatchResult = { index: number; draftKey: string; status: "created" | "exists"; agent: WorkspaceAgentView }
+  | { index: number; draftKey: string; status: "failed"; reason: WorkspaceAgentBatchFailure };
+const BATCH_RUN = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+const DRAFT_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 /** Private immutable configuration, never a renderer/catalog DTO. */
 export interface WorkspaceAgentConfiguration {
   revision: number;
@@ -58,6 +69,8 @@ export interface WorkspaceLegacyAgentInput extends WorkspaceAgentPersonaInput {
   username: string; state: "active" | "archived"; importId: string; sourceHash: string; toolPolicy: WorkspaceLegacyToolPolicy;
 }
 interface AgentRecord {
+  /** Successful onboarding admission, committed atomically with this retained Agent. Never an execution grant. */
+  creation?: { runId: string; draftKey: string };
   titleSource?: "default";
   titleKey?: "core.name.orchestrator";
   agentId: string;
@@ -194,9 +207,9 @@ export class WorkspaceAgentStore {
       || !positive(raw.revision) || !Array.isArray(raw.agents) || raw.agents.length < 1) return invalid();
     const { revision, agents, ...rawManifestOwner } = raw;
     if (canonical(this.parseOwner(rawManifestOwner)) !== canonical(owner)) return invalid();
-    const ids = new Set<string>(), usernames = new Set<string>();
+    const ids = new Set<string>(), usernames = new Set<string>(), creations = new Set<string>(), creationCounts = new Map<string, number>();
     const rows: AgentRecord[] = agents.map(value => {
-      if (!object(value) || !keys(value, ["agentId", "username", "kind", "state", "epoch", "currentConfigRevision", "configurations"], ["legacy", "archivedAt", "pausedScheduleCount", "titleSource", "titleKey"])
+      if (!object(value) || !keys(value, ["agentId", "username", "kind", "state", "epoch", "currentConfigRevision", "configurations"], ["legacy", "archivedAt", "pausedScheduleCount", "titleSource", "titleKey", "creation"])
         || !isWorkspaceAgentId(value.agentId) || ids.has(value.agentId)
         || typeof value.username !== "string" || !USERNAME.test(value.username) || usernames.has(value.username)
         || (value.kind !== "main" && value.kind !== "colleague") || (value.state !== "active" && value.state !== "archived")
@@ -204,6 +217,13 @@ export class WorkspaceAgentStore {
         || value.configurations.length < 1 || value.configurations.length > MAX_CONFIGS) return invalid();
       if (value.kind === "main" ? (value.agentId !== owner.mainAgentId || value.username !== "hara" || value.state !== "active")
         : (value.agentId === owner.mainAgentId || value.username === "hara" || value.username === "main")) return invalid();
+      if (value.creation !== undefined) {
+        const mark = value.creation;
+        if (value.kind !== "colleague" || !object(mark) || !keys(mark, ["runId", "draftKey"])
+          || typeof mark.runId !== "string" || !BATCH_RUN.test(mark.runId) || typeof mark.draftKey !== "string" || !DRAFT_KEY.test(mark.draftKey)) return invalid();
+        const key = canonical([mark.runId, mark.draftKey]), count = (creationCounts.get(mark.runId) ?? 0) + 1;
+        if (creations.has(key) || count > 8) return invalid(); creations.add(key); creationCounts.set(mark.runId, count);
+      }
       if (value.legacy !== undefined && (!object(value.legacy) || !keys(value.legacy, ["importId", "sourceHash"])
         || !/^[a-f0-9]{64}$/.test(String(value.legacy.importId)) || !/^[a-f0-9]{64}$/.test(String(value.legacy.sourceHash)) || value.kind !== "colleague")) return invalid();
       if ((value.archivedAt !== undefined || value.pausedScheduleCount !== undefined) && (value.state !== "archived"
@@ -342,6 +362,60 @@ export class WorkspaceAgentStore {
         currentConfigRevision: 1, configurations: [configuration(normalized, 1, runtimeId, undefined, permissionTier)] };
       value.agents.push(row); this.advance(value); this.persist(loaded, value);
       return this.view(row);
+    });
+  }
+  /** Explicit human UI admission only. Success markers and Agents share one CAS publication, so
+   * ACK loss/restart/archive cannot create a second colleague for the same runId + draftKey.
+   * Successful keys always return their original Agent; changed retry text never edits it. */
+  createBatch(input: WorkspaceAgentBatchInput, expectedCatalogRevision: number, defaultRuntime?: WorkspaceAgentBatchDefault) {
+    this.binding();
+    if (!object(input) || !keys(input, ["runId", "rows"]) || typeof input.runId !== "string" || !BATCH_RUN.test(input.runId)
+      || !Array.isArray(input.rows) || input.rows.length < 1 || input.rows.length > 8 || !positive(expectedCatalogRevision)) throw new Error("Invalid Workspace Agent batch");
+    const seen = new Set<string>();
+    for (const row of input.rows) {
+      if (!object(row) || typeof row.draftKey !== "string" || !DRAFT_KEY.test(row.draftKey) || seen.has(row.draftKey)) throw new Error("Invalid or repeated batch draft key");
+      seen.add(row.draftKey);
+    }
+    if (defaultRuntime !== undefined && (!object(defaultRuntime) || (defaultRuntime.kind === "resolved"
+      ? !keys(defaultRuntime, ["kind", "runtimeId"]) || defaultRuntime.runtimeId !== null && (!isAgentRuntimeId(defaultRuntime.runtimeId) || defaultRuntime.runtimeId === "hara")
+      : defaultRuntime.kind !== "preference_unavailable" || !keys(defaultRuntime, ["kind"])))) throw new Error("Invalid Workspace Agent batch default");
+    const request = structuredClone(input);
+    return withPrivateStateLockSync(workspaceStateHome(), [], "workspace-agents", () => {
+      const loaded = this.load(), value = loaded.value; if (!value) throw new Error("Workspace Agent catalog unavailable");
+      const stale = value.revision !== expectedCatalogRevision, options = this.runtimes.options();
+      const results: WorkspaceAgentBatchResult[] = []; let created = 0;
+      for (const [index, row] of request.rows.entries()) {
+        const failed = (reason: WorkspaceAgentBatchFailure) => results.push({ index, draftKey: row.draftKey, status: "failed", reason });
+        const existing = value.agents.find(agent => agent.creation?.runId === request.runId && agent.creation.draftKey === row.draftKey);
+        if (existing) { results.push({ index, draftKey: row.draftKey, status: "exists", agent: this.view(existing, options) }); continue; }
+        if (stale) { failed("catalog_changed"); continue; }
+        if (value.agents.filter(agent => agent.creation?.runId === request.runId).length >= 8) { failed("batch_limit"); continue; }
+        if (!keys(row as unknown as Record<string, unknown>, ["draftKey", "username", "profile"], ["description", "instructions", "runtimeId", "permissionTier"])
+          || typeof row.username !== "string" || !USERNAME.test(row.username) || ["main", "hara"].includes(row.username)
+          || Object.hasOwn(row, "runtimeId") && (!isAgentRuntimeId(row.runtimeId) || row.runtimeId === "hara")
+          || row.permissionTier !== undefined && !isRuntimePermissionTier(row.permissionTier)) { failed("invalid_request"); continue; }
+        if (row.permissionTier !== undefined && !availableRuntimePermissionTiers().includes(row.permissionTier)) { failed("permission_tier_unavailable"); continue; }
+        // Existing/stale/overflow slots were settled above. A pending implicit slot cannot
+        // silently choose Pi when its Workspace preference could not be read. Nothing in
+        // this in-memory batch has been published yet, including earlier explicit rows.
+        if (!Object.hasOwn(row, "runtimeId") && defaultRuntime?.kind === "preference_unavailable") throw new Error("Workspace default engine settings unavailable; refresh before creating colleagues");
+        const runtimeId = Object.hasOwn(row, "runtimeId") ? row.runtimeId : defaultRuntime?.kind === "resolved" ? defaultRuntime.runtimeId : undefined;
+        if (!isAgentRuntimeId(runtimeId) || runtimeId === "hara") { failed("runtime_unavailable"); continue; }
+        const runtime = options.find(option => option.id === runtimeId);
+        if (!runtime?.available) { failed(runtime?.confirmation !== undefined && runtime.confirmation !== "none" ? "runtime_unconfirmed" : "runtime_unavailable"); continue; }
+        if (value.agents.some(agent => agent.username === row.username)) { failed("username_taken"); continue; }
+        const { draftKey, username, runtimeId: _requestedRuntime, permissionTier = defaultRuntimePermissionTier(), ...fields } = row;
+        let normalized: ReturnType<typeof persona>;
+        try { normalized = persona(fields, username); } catch { failed("invalid_request"); continue; }
+        // Recheck live runtime registration before admission, without launching or probing models.
+        try { this.runtimes.assertAvailable(runtimeId); } catch { failed("runtime_unavailable"); continue; }
+        const agent: AgentRecord = { agentId: `ag_${randomUUID()}`, username, kind: "colleague", state: "active", epoch: 1,
+          currentConfigRevision: 1, configurations: [configuration(normalized, 1, runtimeId, undefined, permissionTier)], creation: { runId: request.runId, draftKey } };
+        value.agents.push(agent); created++;
+        results.push({ index, draftKey, status: "created", agent: this.view(agent, options) });
+      }
+      if (created) { this.advance(value); this.persist(loaded, value); }
+      return { runId: request.runId, revision: value.revision, results };
     });
   }
   private advance(value: Manifest): void {
