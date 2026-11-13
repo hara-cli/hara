@@ -187,9 +187,10 @@ test("C3 onboarding metadata and batch creation keep the legacy-entry default de
 test("C5 M1 real WS lookup authenticates despite advertised capability and observes an unseen ID without submitting", async t => {
   const f = await fixture(t), id = randomUUID();
   assert.ok(f.init.capabilities.includes("workspace.agent-command-receipt-lookup.v1"));
-  const guest = await f.open(), init = await guest.request("initialize", { token: f.handle.token, source: "local_human" });
-  assert.ok(init.capabilities.includes("workspace.agent-command-receipt-lookup.v1"));
-  await assert.rejects(guest.request("workspace.boundaries.control.lookup", { ...f.params, commandId: id }), boundaryCode("AUTHORITY_UNVERIFIED"));
+  const guest = await f.open();
+  // C3 protects initialization itself, stronger than the earlier C1-only capability advertisement.
+  await assert.rejects(guest.request("initialize", { token: f.handle.token, source: "local_human",
+    clientCapabilities: ["workspace.agent-command-receipt-lookup.v1"] }), boundaryCode("AUTHORITY_UNVERIFIED"));
   const before = await f.inspect(), value = await f.owner.request("workspace.boundaries.control.lookup", { ...f.params, commandId: id });
   assert.equal(value.state, "not_seen"); assert.equal(value.receipt, null); assert.equal(value.commandId, id);
   assert.equal(value.agentId, f.params.agentId); assert.ok(Number.isSafeInteger(Date.parse(value.observedAt)));

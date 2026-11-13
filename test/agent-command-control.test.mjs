@@ -585,3 +585,13 @@ test("C5 M1 seen accepted commands survive expiry and absence is never substitut
   try { assert.throws(() => f.control.lookupReceipt(f.transport, f.agent.agentId, randomUUID()), code("AUTHORITY_UNVERIFIED")); }
   finally { f.authority.commandControlSourceHealthy = healthy; }
 });
+
+
+test("C5 M1 lookup requires current manage or invoke and cannot return absence for another agent's ID", t => {
+  const denied = fixture(t, { rights: { manage: false, invoke: false } });
+  assert.throws(() => denied.control.lookupReceipt(denied.transport, denied.agent.agentId, randomUUID()), code("AUTHORIZATION_DENIED"));
+  const f = fixture(t), run = f.dispatch(); run.accept();
+  const reader = f.authority.commandControlForReader.bind(f.authority);
+  f.authority.commandControlForReader = (transport, _target) => reader(transport, f.agent.agentId);
+  assert.throws(() => f.control.lookupReceipt(f.transport, "other-authorized-agent", run.command.commandId), code("AUTHORIZATION_DENIED"));
+});
