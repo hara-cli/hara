@@ -30,7 +30,8 @@ export function parseMediaImportChunk(params: Record<string, unknown>): MediaImp
 
 /**
  * Per-connection staging for chunked pasted-image imports. Memory only, never on disk; one import per
- * connection; chunks must arrive in order exactly once. Anything unexpected discards the whole import.
+ * connection (a new import's first chunk replaces an abandoned one); chunks must arrive in order exactly
+ * once. Anything unexpected discards the whole import.
  */
 export class MediaImportSessions {
   private readonly pending = new Map<string, Pending>();
@@ -40,8 +41,10 @@ export class MediaImportSessions {
   accept(clientId: string, chunk: MediaImportChunk): { mime: string; bytes: Buffer } | null {
     let row = this.pending.get(clientId);
     if (row && row.importId !== chunk.importId) {
-      if (chunk.index === 0) throw new MediaImportError("import_busy: another image is still importing on this connection");
-      this.discard(clientId); throw aborted("unknown import");
+      // One connection is one client that imports one image at a time, so a new import's first chunk
+      // means the staged one was abandoned (the user switched workspace, say): it replaces it.
+      this.discard(clientId); row = undefined;
+      if (chunk.index !== 0) throw aborted("unknown import");
     }
     if (!row) {
       if (chunk.index !== 0) throw aborted("chunk out of order");

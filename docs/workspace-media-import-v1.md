@@ -33,14 +33,13 @@ All errors are thrown as RPC errors.
 |---|---|
 | `image_too_large` | The declared `bytes` is over 3.6 MB (`MAX_NATIVE_IMAGE_BYTES`, the existing image attachment limit). Sent on the first chunk; nothing is staged. |
 | `import_aborted` | A chunk was out of order or duplicated, didn't match the import, or had the wrong size; or the staged import is gone (timed out, disconnected or generation changed). The whole import is discarded; start again with a new `importId`. |
-| `import_busy` | This connection already has an import in progress. That import is not affected. |
 | `Workspace resource generation changed` | The workspace generation is stale. Anything staged on this connection is discarded. |
 | `Workspace media unavailable` | The final bytes don't match `mime` (checked by magic bytes), or a link or hard link sits at the destination. |
 | `Invalid Workspace media import` / `unsupported Workspace RPC fields` | The request is malformed. |
 
 ## Guarantees
 
-- **Staging:** only in memory, one import per connection.
+- **Staging:** only in memory, one import per connection. Chunk 0 of a new `importId` replaces a staged import, which the client has abandoned (for example after switching workspace).
   - It is discarded after 60 s without a chunk, on disconnect, on a generation change, or on any refusal.
   - Discarded bytes are zeroed.
 - **File name:** the content hash. Callers cannot name or place the file, and the same image twice reuses one file.

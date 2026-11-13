@@ -21,7 +21,7 @@ import type { CredentialVault } from "../workspace/credential-vault.js";
 import { isAgentRuntimeId } from "../agent-runtime/bindings.js";
 import type { ExtensionCatalogProvider } from "../workspace/extension-catalog.js";
 import type { WorkspaceAgentPersonaInput } from "../workspace/agents.js";
-import { MediaImportError, MediaImportSessions, parseMediaImportChunk } from "../workspace/media-import.js";
+import { MediaImportSessions, parseMediaImportChunk } from "../workspace/media-import.js";
 
 const CAPABILITY = "workspace.local-dev.v2";
 function tokenMatches(actual: unknown, expected: string): boolean {
@@ -256,7 +256,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
         if (!image) return { received: (params.index as number) + 1 };
         return host.importMedia(workspaceId, image.mime, image.bytes);
       } catch (error) {
-        if (!(error instanceof MediaImportError && error.message.startsWith("import_busy"))) mediaImports.discard(client.id);
+        mediaImports.discard(client.id);
         throw error;
       }
     }

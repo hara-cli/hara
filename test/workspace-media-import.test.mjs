@@ -80,7 +80,7 @@ test("over 3.6 MB is refused on the first chunk with image_too_large, and no fur
   assert.equal(fs.existsSync(attachments) ? fs.readdirSync(attachments).length : 0, 0);
 });
 
-test("chunks out of order, duplicated, or not matching the import discard the whole import", async t => {
+test("chunks out of order, duplicated, or not matching the import discard the whole import; a new import replaces an abandoned one", async t => {
   const { rpc, chunk, attachments, leftovers } = await serve(t);
   const big = padded(PNG, MAX_IMPORT_CHUNK_BYTES * 3), id = randomUUID();
   await rpc("workspace.media.import", chunk(big, "image/png", id, 0));
@@ -96,12 +96,16 @@ test("chunks out of order, duplicated, or not matching the import discard the wh
   const short = randomUUID();
   await rpc("workspace.media.import", chunk(big, "image/png", short, 0));
   await assert.rejects(rpc("workspace.media.import", chunk(big, "image/png", short, 1, { chunkBase64: PNG.toString("base64") })), /import_aborted: chunk size/);
-  // One import per connection: a second one is refused while the first keeps going.
+  // One import per connection: a new import's first chunk replaces an abandoned one (review of Desk #103, M1),
+  // so a user who switched workspace mid-paste can paste again at once.
   const a = randomUUID(), b = randomUUID();
   await rpc("workspace.media.import", chunk(big, "image/png", a, 0));
-  await assert.rejects(rpc("workspace.media.import", chunk(PNG, "image/png", b, 0)), /import_busy/);
-  await rpc("workspace.media.import", chunk(big, "image/png", a, 1));
-  assert.equal((await rpc("workspace.media.import", chunk(big, "image/png", a, 2))).media.bytes, big.length);
+  assert.equal((await rpc("workspace.media.import", chunk(PNG, "image/png", b, 0))).media.bytes, PNG.length, "the new image imports at once");
+  await assert.rejects(rpc("workspace.media.import", chunk(big, "image/png", a, 1)), /import_aborted: chunk out of order/, "the abandoned import is gone");
+  const c = randomUUID(), d = randomUUID();
+  await rpc("workspace.media.import", chunk(big, "image/png", c, 0));
+  await assert.rejects(rpc("workspace.media.import", chunk(big, "image/png", d, 1)), /import_aborted: unknown import/, "a new import must start at chunk 0");
+  await assert.rejects(rpc("workspace.media.import", chunk(big, "image/png", c, 1)), /import_aborted: chunk out of order/, "and the staged one is dropped");
   assert.equal(fs.readdirSync(attachments).length, 1); assert.deepEqual(leftovers(), []);
 });
 
