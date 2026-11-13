@@ -21,13 +21,14 @@ import type { CredentialVault } from "../workspace/credential-vault.js";
 import { isAgentRuntimeId } from "../agent-runtime/bindings.js";
 import type { ExtensionCatalogProvider } from "../workspace/extension-catalog.js";
 import type { WorkspaceAgentPersonaInput } from "../workspace/agents.js";
+import { MediaImportSessions, parseMediaImportChunk } from "../workspace/media-import.js";
 
 const CAPABILITY = "workspace.local-dev.v2";
 function tokenMatches(actual: unknown, expected: string): boolean {
   if (typeof actual !== "string" || !/^[a-f0-9]{64}$/.test(actual) || actual.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
 }
-export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; hostHome?: string; discoveryHome?: string; legacySourceHome?: string; credentialVault?: CredentialVault; defaultRuntimeRole?: WorkspaceDefaultRuntimeRole; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; extensionCatalog?: ExtensionCatalogProvider; reviewedMcpSources?: () => readonly ReviewedMcpSource[]; mcpReviewHome?: string; mcpLaunchCandidate?: WorkspaceMcpLaunchProvider; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1]; backgroundRuntimeDetectionMs?: number; agentBoundaries?: { commandControl?: boolean; lifecycleControl?: boolean; routing?: AgentRoutingHostOptions; ownerCredential: string; maxCommandLifetimeMs?: number; externalDirectory?: AgentHubDirectory } }): Promise<ServeHandle> {
+export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; hostHome?: string; discoveryHome?: string; legacySourceHome?: string; credentialVault?: CredentialVault; defaultRuntimeRole?: WorkspaceDefaultRuntimeRole; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; extensionCatalog?: ExtensionCatalogProvider; reviewedMcpSources?: () => readonly ReviewedMcpSource[]; mcpReviewHome?: string; mcpLaunchCandidate?: WorkspaceMcpLaunchProvider; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1]; backgroundRuntimeDetectionMs?: number; mediaImportIdleMs?: number; agentBoundaries?: { commandControl?: boolean; lifecycleControl?: boolean; routing?: AgentRoutingHostOptions; ownerCredential: string; maxCommandLifetimeMs?: number; externalDirectory?: AgentHubDirectory } }): Promise<ServeHandle> {
   if (opts.host !== "127.0.0.1" || !Number.isSafeInteger(opts.port) || opts.port < 0 || opts.port > 65535) throw new Error("Workspace Dev listens only on explicit IPv4 loopback");
   if (input.agentBoundaries?.lifecycleControl && !input.agentBoundaries.commandControl) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "lifecycle.bootstrap");
   if (input.agentBoundaries?.routing && !input.agentBoundaries.lifecycleControl) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "routing.bootstrap");
@@ -58,6 +59,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     return false;
   } });
   await host.initialize();
+  const mediaImports = new MediaImportSessions(input.mediaImportIdleMs);
   const server = createServer((request, response) => {
     response.setHeader("Cache-Control", "no-store"); response.setHeader("X-Content-Type-Options", "nosniff");
     response.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
@@ -112,7 +114,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, runtimePlatform: { writeProtection: runtimeWriteProtection(), permissionTiers: availableRuntimePermissionTiers() }, capabilities: [capability, ...(boundaryTransports ? ["workspace.agent-boundaries.authority.v1"] : []), ...(input.agentBoundaries?.commandControl ? ["workspace.agent-command-control.v1"] : []), ...(input.agentBoundaries?.lifecycleControl ? ["workspace.agent-lifecycle.v1"] : []), ...(input.agentBoundaries?.routing ? ["workspace.agent-routing.v1"] : []), "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.default-runtime.v1", "workspace.onboarding.v1", "workspace.agents.create-batch.v1", "workspace.media.v1", "workspace.media.states.v1", "workspace.i18n.v1", "workspace.agents.archive.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, runtimePlatform: { writeProtection: runtimeWriteProtection(), permissionTiers: availableRuntimePermissionTiers() }, capabilities: [capability, ...(boundaryTransports ? ["workspace.agent-boundaries.authority.v1"] : []), ...(input.agentBoundaries?.commandControl ? ["workspace.agent-command-control.v1"] : []), ...(input.agentBoundaries?.lifecycleControl ? ["workspace.agent-lifecycle.v1"] : []), ...(input.agentBoundaries?.routing ? ["workspace.agent-routing.v1"] : []), "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.default-runtime.v1", "workspace.onboarding.v1", "workspace.agents.create-batch.v1", "workspace.media.v1", "workspace.media.states.v1", "workspace.media.import.v1", "workspace.i18n.v1", "workspace.agents.archive.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     if (input.agentBoundaries?.commandControl || host.hasProtectedAgentCommands()) {
@@ -245,6 +247,19 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     }
     if (method === "workspace.select" || method === "workspace.settings.select") { fields(["workspaceId", "expectedRevision"]); if (!positive(params.expectedRevision)) throw new Error("invalid Workspace selection"); host.select(client.id, workspaceId, params.expectedRevision, method === "workspace.settings.select"); return host.snapshot(workspaceId, undefined, client.id); }
     if (method === "workspace.snapshot") { fields(["workspaceId", "agentId"]); if (params.agentId !== null && !text(params.agentId)) throw new Error("invalid Agent selection"); return host.snapshot(workspaceId, typeof params.agentId === "string" ? params.agentId : undefined, client.id); }
+    if (method === "workspace.media.import") {
+      // Chunked so each frame stays under maxPayload. Any refusal, including a stale generation, drops what was staged.
+      fields(["workspaceId", "expectedGeneration", "importId", "mime", "index", "total", "bytes", "chunkBase64"]);
+      try {
+        host.assertGeneration(workspaceId, params.expectedGeneration);
+        const image = mediaImports.accept(client.id, parseMediaImportChunk(params));
+        if (!image) return { received: (params.index as number) + 1 };
+        return host.importMedia(workspaceId, image.mime, image.bytes);
+      } catch (error) {
+        mediaImports.discard(client.id);
+        throw error;
+      }
+    }
     host.assertGeneration(workspaceId, params.expectedGeneration);
     if (method === "workspace.rename") { fields(["workspaceId", "expectedGeneration", "label", "expectedRevision"]);
       if (!text(params.label, 80) || !positive(params.expectedRevision)) throw new Error("Invalid Workspace rename");
@@ -497,7 +512,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
   wss.on("connection", ws => {
     const client: Client = { id: randomUUID(), initialized: false }; clients.set(ws, client);
     ws.on("error", () => {});
-    ws.on("close", () => { boundaryTransports?.disconnect(client.boundaryTransport); host.disconnect(client.id); clients.delete(ws); });
+    ws.on("close", () => { mediaImports.discard(client.id); boundaryTransports?.disconnect(client.boundaryTransport); host.disconnect(client.id); clients.delete(ws); });
     ws.on("message", raw => {
       const receivedAt = performance.now();
       void (async () => {
@@ -520,7 +535,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
   });
   host.startScheduler();
   return { port, token, async close() {
-    if (closing) return; closing = true; boundaryTransports?.close();
+    if (closing) return; closing = true; mediaImports.close(); boundaryTransports?.close();
     await host.close();
     for (const client of clients.keys()) client.terminate();
     await new Promise<void>(resolve => wss.close(() => resolve()));
