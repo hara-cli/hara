@@ -1,4 +1,5 @@
 import test from "node:test";
+import { untilObserved } from "./helpers/observable-wait.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { tmpdir } from "node:os";
@@ -27,13 +28,9 @@ async function connect(handle) {
     pending.set(id, { resolve, reject, timer }); socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
   }); }, async close() { if (socket.readyState === WebSocket.CLOSED) return; const closed = once(socket, "close"); socket.close(); await closed; } };
 }
-async function until(read) {
-  // Actual governed IO completes around 20s with four concurrent security suites on this host.
-  // This observation window does not change command/runtime budgets or any safety assertion.
-  const end = Date.now() + 30000;
-  while (Date.now() < end) { const value = await read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 100)); }
-  throw new Error("C3 observable state deadline");
-}
+// Actual governed IO completes around 20s with four concurrent security suites on this host. The
+// observation window (see helpers/observable-wait.mjs) never changes command/runtime budgets or assertions.
+const until = (read, progress) => untilObserved(read, { label: "C3", progress });
 async function fixture(t, input = {}) {
   const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-c3-host-"))), ownerCredential = randomBytes(32).toString("hex");
   let calls = 0, providers = 0;
@@ -77,7 +74,11 @@ test("C3 actual WS Host combines C1, persisted C3, C2 and RunPermit for a scoped
   const d = await f.dispatch(), accepted = await f.submit(d.command, d.message);
   assert.equal(accepted.commandId, d.command.commandId); assert.equal(accepted.status, "accepted");
   let lastReceipt, drained;
-  try { drained = await until(async () => { lastReceipt = await f.receipt(d.command); return lastReceipt.execution.drain === "observed" && lastReceipt; }); }
+  // Progress: the receipt plus the conversation's revision, state and runtime stages change several times
+  // during the real native run; a run that stops changing still fails after the idle window.
+  const progress = async () => { const c = (await f.snapshot()).conversation;
+    return JSON.stringify([lastReceipt, c.revision, c.state, c.runtimeStages, c.history.length]); };
+  try { drained = await until(async () => { lastReceipt = await f.receipt(d.command); return lastReceipt.execution.drain === "observed" && lastReceipt; }, progress); }
   catch (error) { throw new Error(`${error.message}; last receipt ${JSON.stringify(lastReceipt)}; control ${JSON.stringify(await f.inspect())}`); }
   assert.equal(drained.execution.effect, "completed"); assert.equal(drained.status, "drained");
   const snapshot = await f.snapshot(); assert.equal(snapshot.conversation.taskState, "completed");

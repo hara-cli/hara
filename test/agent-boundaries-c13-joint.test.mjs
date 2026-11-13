@@ -59,7 +59,10 @@ test("C13 joint two real Hosts cross the selected barrier and read one genuine c
   }
 });
 
-test("C13 joint real WS routing and C2 IO retain the original owner while audience revocation refuses the next real file effect", { timeout: 45000 }, async t => {
+// Outer bound only: both waits inside are progress-aware (a stalled run fails after 30 s without an
+// observable change). Measured 2026-11-13: ~10 s at low load, 49.6 s while still progressing at load1 ~30
+// with four files in parallel, which the former 45 s bound cut off. 110 s stays under the 120 s file limit.
+test("C13 joint real WS routing and C2 IO retain the original owner while audience revocation refuses the next real file effect", { timeout: 110000 }, async t => {
   let resume; const continueResponse = new Promise(resolve => { resume = resolve; }); let paused = false, f;
   f = await routingHostFixture(t, { provider(connection, binding, context) {
     const synthetic = createWorkspaceSyntheticProvider(connection, binding, context);
@@ -77,12 +80,15 @@ test("C13 joint real WS routing and C2 IO retain the original owner while audien
   const data = f.data("Write hello.md and verify the file", { explicitAgentIds: [f.members[0]] });
   try {
     const accepted = await f.submit(data); assert.equal(accepted.state, "claimed");
-    await routingUntil(() => paused);
+    // Progress: the authority state (routing/control/lifecycle) and the owner's channel conversation change
+    // as the real routed run starts, writes and calls the model; a stalled run still fails after the idle window.
+    const progress = () => JSON.stringify([f.state(), f.conversation(f.members[0]).revision, f.providers.length]);
+    await routingUntil(() => paused, progress);
     const before = f.state(), route = before.routing.records[0], run = before.control.runs[0];
     const file = join(run.binding.project.root, "hello.md"), forbidden = join(run.binding.project.root, "after-removal.txt");
     assert.equal(fs.readFileSync(file, "utf8"), "hello workspace\n"); const firstDigest = hash(fs.readFileSync(file));
     f.rooms.update(f.channelId, "Original owner removed after first actual IO", f.members.slice(1), f.rooms.list().revision);
-    resume(); await routingUntil(async () => (await f.read(data)).receipt.execution.drain === "observed");
+    resume(); await routingUntil(async () => (await f.read(data)).receipt.execution.drain === "observed", progress);
     assert.equal(fs.existsSync(forbidden), false); assert.equal(hash(fs.readFileSync(file)), firstDigest);
     const observed = await f.read(data); assert.equal(observed.state, "blocked"); assert.equal(observed.reason, "unknown_effect");
     assert.equal(observed.effectObservation, "unknown"); assert.equal(observed.receipt.status, "unknown");

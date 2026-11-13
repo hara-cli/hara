@@ -9,7 +9,7 @@ const cases = [
   ["capabilityScope", "agent-lifecycle-maintenance", "C4 persistent task revocation rejects copied C1 grants"],
   ["coldRead", "agent-lifecycle-history", "C4 missing history refuses dependent reads/admission"],
   ["closedProof", "agent-lifecycle-history", "C4 unconfirmed issued ownership cannot be archived"],
-  ["unknown", "agent-command-control", "C3 transition independently refuses erasing UNKNOWN effect"],
+  ["unknown", "agent-command-control-c", "C3 transition independently refuses erasing UNKNOWN effect"],
   ["drainCasIsolation", "agent-lifecycle-drain", "C4 stale final-drain publication keeps sibling effects"],
   ["partialDowngrade", "agent-lifecycle-contract", "C4 a partial downgrade retaining lifecycle"],
 ];

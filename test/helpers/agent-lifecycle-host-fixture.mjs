@@ -1,4 +1,5 @@
 import test from "node:test";
+import { untilObserved } from "./observable-wait.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { tmpdir } from "node:os";
@@ -27,13 +28,9 @@ async function connect(handle) {
     pending.set(id, { resolve, reject, timer }); socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
   }); }, async close() { if (socket.readyState === WebSocket.CLOSED) return; const closed = once(socket, "close"); socket.close(); await closed; } };
 }
-export async function until(read) {
-  // Actual governed IO completes around 20s with four concurrent security suites on this host.
-  // This observation window does not change command/runtime budgets or any safety assertion.
-  const end = Date.now() + 30000;
-  while (Date.now() < end) { const value = await read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 100)); }
-  throw new Error("C3 observable state deadline");
-}
+// Actual governed IO completes around 20s with four concurrent security suites on this host. The
+// observation window (see observable-wait.mjs) never changes command/runtime budgets or assertions.
+export const until = (read, progress) => untilObserved(read, { label: "C3", progress });
 export async function lifecycleHostFixture(t, input = {}) {
   const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-c3-host-"))), ownerCredential = randomBytes(32).toString("hex");
   let calls = 0, providers = 0;

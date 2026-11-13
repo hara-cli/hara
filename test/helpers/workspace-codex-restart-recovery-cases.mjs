@@ -8,7 +8,11 @@ import { cliMcpFixture, until } from "./workspace-cli-mcp.mjs";
 
 const done = view => ["completed", "blocked", "paused", "cancelled"].includes(view.conversation.state);
 const starts = f => f.native().filter(row => ["thread/start", "thread/resume"].includes(row.method));
-async function exchange(f, text) { await f.send(text); return until(f.read, done); }
+// Progress: the conversation's state, revision and runtime stages. The silent resume case waits out the
+// product's own 10 s thread/resume deadline (codex-session JsonlRpcClient timeoutMs) plus process exit and
+// publication; the longest quiet stretch is that 10 s, inside the 20 s idle window.
+const progressOf = view => JSON.stringify([view.conversation.state, view.conversation.revision, view.conversation.runtimeStages]);
+async function exchange(f, text) { await f.send(text); return until(f.read, done, 20000, progressOf); }
 
 const threadState = f => {
   const name = fs.readdirSync(f.root, { recursive: true }).find(name => /(?:^|\/)codex-thread-[a-f0-9]+\.json$/.test(name));
