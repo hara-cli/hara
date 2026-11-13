@@ -81,8 +81,8 @@ export class WorkspaceAgentRouting {
       const f = this.facts(transport, input), old = f.snapshot.routing.records.find(row => row.workKey === f.key);
       if (old) {
         if (old.requestId === input.requestId && old.requestDigest !== digest || old.selectionRequestId === input.requestId && old.selectionRequestDigest !== digest) return fail("COMMAND_ID_CONFLICT", "routing.request");
-        if (old.state !== "needs_owner" || old.requestId === input.requestId || old.selectionRequestId === input.requestId) return old;
         if (old.inputDigest !== inputDigest) return fail("COMMAND_ID_CONFLICT", "routing.workItem");
+        if (old.state !== "needs_owner" || old.requestId === input.requestId || old.selectionRequestId === input.requestId) return old;
         if (old.revision !== input.expectedWorkRevision) return fail("STALE_REVISION", "routing.workItem");
       } else if (input.expectedWorkRevision !== 0) return fail("STALE_REVISION", "routing.workItem");
       const base: AgentRoutingRecord = old ? structuredClone(old) : {

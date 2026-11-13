@@ -346,7 +346,7 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
   abortBeforeExecution(handle: AgentCommandRunPreparation, reason: AgentBoundaryErrorCode = "AUTHORITY_UNVERIFIED") {
     const preparation = preparations.get(handle), intake = preparation && intakes.get(preparation.intake);
     if (!preparation || !intake || intake.owner !== this || !Object.hasOwn(AGENT_BOUNDARY_ERRORS, reason)) return fail("AUTHORITY_UNVERIFIED", "lifecycle.preparation");
-    const runId = preparation.binding.runId; this.abandoning.add(runId);
+    const runId = preparation.binding.runId;
     for (let attempt = 0; ; attempt++) {
       if (!this.authority.commandControlSourceHealthy()) return fail("AUTHORITY_UNVERIFIED", "lifecycle.source");
       const before = this.authority.commandControlState(), run = before.control.runs.find(row => row.runId === runId), row = before.lifecycle?.executions.find(row => row.runId === runId), live = this.live.get(runId);
@@ -357,6 +357,7 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
         || live?.bound || live?.permit) return fail("CONTROL_HELD", "lifecycle.alreadyIssued");
       const owner = preparation.lease.captureOwner();
       if (canonical(owner) !== canonical(row.lease)) return fail("AUTHORITY_UNVERIFIED", "lifecycle.preparation");
+      this.abandoning.add(runId);
       const terminal = { proofRef: `never_${randomUUID()}`, issuerId: this.issuerId, reason, lease: { ...owner } };
       try {
         this.authority.observeCommandControl(before.revision, (state, lifecycle) => {

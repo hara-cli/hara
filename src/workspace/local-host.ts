@@ -420,9 +420,10 @@ export class LocalWorkspaceHost {
       this.submitAgentCommandIntake(clientId, transport!, workspaceId, dispatch.command.agentId, control,
         control.begin(transport!, dispatch.command, { message: input.message, routing: dispatch.routing }), { message: input.message });
     } catch (error) {
-      // A competing genuine claim is observed; it is never replaced or sent through legacy fanout.
+      // Only an original genuine claim permits readback after a competing admission.
+      // A persisted rejection receipt does not mean this work was accepted.
       const current = router.get(transport!, input.channelId, input.workItemId);
-      if (!current?.claim && !current?.receipt) throw error;
+      if (!current?.claim) throw error;
     }
     this.changed(workspaceId);
     return router.get(transport!, input.channelId, input.workItemId);

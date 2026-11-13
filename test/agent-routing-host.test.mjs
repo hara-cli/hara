@@ -27,7 +27,8 @@ test("C6 real WS starts one original C3 owner before any business provider and u
   assert.ok(f.calls[0].system.includes("single claimed owner")); assert.ok(!f.calls[0].system.includes("use channel_peer_wake"));
   const original = await f.read(data), duplicate = await f.submit(data);
   assert.deepEqual(duplicate.claim, original.claim);
-  const later = await f.submit({ ...data, requestId: randomUUID(), explicitAgentIds: [f.members[1]], message: "compile this instead" });
+  await assert.rejects(f.submit({ ...data, requestId: randomUUID(), explicitAgentIds: [f.members[1]], message: "compile this instead" }), boundary("COMMAND_ID_CONFLICT"));
+  const later = await f.read(data);
   assert.deepEqual(later.claim, original.claim); assert.equal(later.ownerAgentId, f.members[0]); assert.equal(f.calls.length, 1); assert.equal(f.providers.length, 1);
 });
 
