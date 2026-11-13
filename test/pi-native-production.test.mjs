@@ -63,6 +63,25 @@ async function bridge(t, extra = {}) {
   const config = host.provider.hara.options;
   return { host, token: config.apiKey, baseURL: config.baseURL, mcpURL: host.mcp.url };
 }
+// Test-owned phases: runtime initialization has its existing RPC watchdog; only a started
+// human dispatch consumes this 10s total clock. Keep the same Host counters in interactive mode.
+async function phaseBoundBridge(t, extra = {}) {
+  const limits = { ...budget, ...extra.budget }, controller = new AbortController();
+  let armed = false, timer, closing;
+  const b = await bridge(t, { ...extra, budget: { ...limits, mode: "interactive" }, signal: controller.signal,
+    onProgress(metrics) {
+      return armed && metrics.providerRounds <= limits.maxProviderRounds && metrics.toolCalls <= limits.maxToolCalls
+        && metrics.totalTokens <= limits.maxTokens;
+    } });
+  const close = () => closing ??= (async () => { clearTimeout(timer); controller.abort(); await b.host.close(); })();
+  t.after(close);
+  return { ...b, close, startDispatch() {
+    assert.equal(armed || controller.signal.aborted, false, "one live dispatch per fixture bridge");
+    armed = true;
+    timer = setTimeout(() => controller.abort(), limits.timeoutMs);
+    timer.unref();
+  } };
+}
 function body(tools = []) { return { model: "coding", messages: [{ role: "user", content: "synthetic frozen request" }], tools: tools.map(tool => ({ type: "function", function: { name: tool.name, description: "untrusted child text", parameters: { type: "object" } } })), stream: false }; }
 const call = (b, overrides = {}) => fetch(overrides.url ?? b.baseURL + "/chat/completions", { method: overrides.method ?? "POST", headers: { Authorization: "Bearer " + (overrides.token ?? b.token), "Content-Type": "application/json" }, body: overrides.method === "GET" ? undefined : JSON.stringify(overrides.body ?? body()) });
 
@@ -77,6 +96,22 @@ test("production Pi model gateway binds its audience, rejects model-token MCP an
   assert.equal(calls, 0);
   assert.equal((await call(b)).status, 200); assert.equal(calls, 1);
   await b.host.close(); await assert.rejects(call(b));
+});
+
+test("Pi fixture separates startup authority from dispatch while preserving its Host budget caps", async t => {
+  let requests = 0;
+  const provider = { id: "phase-fixture", model: "synthetic-only", async turn() { requests++; return reply("fixture reply"); } };
+  const beforeDispatch = await phaseBoundBridge(t, { provider });
+  const early = await call(beforeDispatch).catch(() => null);
+  assert.ok(early === null || early.status === 429); assert.equal(requests, 0);
+  await beforeDispatch.close();
+  const active = await phaseBoundBridge(t, { provider, budget: { ...budget, maxProviderRounds: 1 } });
+  assert.equal(active.host.budget.timeoutMs, 10000); assert.equal(active.host.budget.maxProviderRounds, 1);
+  active.startDispatch();
+  assert.equal((await call(active)).status, 200); assert.equal(requests, 1);
+  const overBudget = await call(active).catch(() => null);
+  assert.ok(overBudget === null || overBudget.status === 429); assert.equal(requests, 1);
+  await active.close(); await assert.rejects(call(active));
 });
 
 test("production Pi tools come from the pinned SDK and Host schemas; native batches consume budget before dispatch", async t => {
@@ -270,12 +305,17 @@ test("the production bundled Pi RPC entry executes native tools and Hara MCP usi
     confirmations++; return { id: "fixture", name: tool.name, content: "Host declined the synthetic mutation", isError: true };
   } }); t.after(() => endpoint.close());
   const specs = piNativeModelTools(work, [tool]);
-  // A non-interactive bridge's timeoutMs is one dispatch's run-wide budget, so each human turn below
-  // opens its own bridge (as the product does per dispatch) instead of sharing one budget across turns.
+  // Isolate the test's 10s dispatch budget from cold startup without changing any timeout.
+  // Production native Pi also creates its gateway before startup; this is a fixture phase split,
+  // not a claim that the product is prewarmed or that noninteractive production timers changed.
   const entryBudget = { ...budget, maxProviderRounds: 8, maxToolCalls: 8 };
-  let bridgeStartedAt = 0;
+  const fixtureStartedAt = performance.now();
+  let dispatchStartedAt = 0, phase = "first", nativeStartedAt = 0;
+  const stage = (name, turn = phase) => t.diagnostic("pi-native-stage " + JSON.stringify({ turn, stage: name,
+    elapsedMs: Math.round(performance.now() - fixtureStartedAt) }));
   const entryProvider = { id: "actual-hara-connection", model: "frozen-fixture-model", async turn(args) {
       calls++;
+      if (calls === 1 || calls === 5) stage("first-provider");
       assert.equal(args.tools.some(tool => /cron|schedulewakeup|foreign/i.test(tool.name)), false);
       if (calls === 1) return { text: "", toolUses: [{ id: "native-write", name: "write", input: { path: "proof.txt", content: "native effect" } }], stop: "tool_use" };
       if (calls === 2) { bashStartedAt = performance.now(); return { text: "", toolUses: [{ id: "native-bash", name: "bash", input: { command: 'if cat "$HOME/.hara/connection.json" >/dev/null 2>&1; then exit 9; fi; node -e \'' + backgroundScript + '\'; printf fixture-ok', timeout: 5 } }], stop: "tool_use" }; }
@@ -283,7 +323,7 @@ test("the production bundled Pi RPC entry executes native tools and Hara MCP usi
       assert.ok(args.history.some(message => message.role === "tool" && message.results.some(result => result.content.includes("Host declined"))));
       return reply("native production entry verified");
     } };
-  const openBridge = () => { bridgeStartedAt = performance.now(); return bridge(t, { tools: specs, budget: entryBudget, provider: entryProvider }); };
+  const openBridge = async () => { const value = await phaseBoundBridge(t, { tools: specs, budget: entryBudget, provider: entryProvider }); stage("bridge-created"); return value; };
   const b = await openBridge();
   for (const name of ["auth.json", "models.json", "models-store.json"]) writeFileSync(join(root, "agent", name), "{}\n", { mode: 0o600 });
   const config = { schemaVersion: 1, sdkVersion: "1.5.0", root, cwd: work, system: "Synthetic Hara native entry test", model: { baseURL: b.baseURL, token: b.token },
@@ -293,37 +333,44 @@ test("the production bundled Pi RPC entry executes native tools and Hara MCP usi
   const profile = `(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* (subpath ${q(work)}) (subpath ${q(join(root,"agent/sessions"))}) (subpath ${q(join(root,"agent/tmp"))}) (subpath ${q(join(root,"agent/auth.json.lock"))}) (literal "/dev/null") (literal "/dev/stdout") (literal "/dev/stderr"))\n(deny file-read-data (subpath ${q(join(root,"home/.hara"))}))\n(deny file-write* (subpath ${q(join(root,"home/.hara"))}))\n(deny file-link)\n`;
   const launch = piNativeLauncher(), env = { HOME: join(root, "home"), USERPROFILE: join(root, "home"), PI_CODING_AGENT_DIR: join(root, "agent"), PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", NODE_DISABLE_COMPILE_CACHE: "1", PATH: process.execPath.slice(0,process.execPath.lastIndexOf("/")) + ":/usr/bin:/bin", TMPDIR: join(root,"agent/tmp") };
   let nativeLaunches = 0;
-  const startRpc = configuration => {
-    const launchNumber = ++nativeLaunches, nativeStartedAt = performance.now();
+  const startRpc = (configuration, turn) => {
+    const launchNumber = ++nativeLaunches; nativeStartedAt = performance.now();
     const lifecycle = new RuntimeProcessBoundary(); lifecycle.markWrapped();
-    const rpc = new PiRpcProcess({ ...launch, env, configuration, cwd: work, timeoutMs: 15000, signal: new AbortController().signal, onFrame() {}, onAccepted() {},
+    const rpc = new PiRpcProcess({ ...launch, env, configuration, cwd: work, timeoutMs: 15000, signal: new AbortController().signal, onFrame() {}, onAccepted() { stage("prompt-accepted", turn); },
     boundary: { spawn() {
+      stage("spawn", turn);
       const child = spawn("/bin/sh", ["-c", RUNTIME_GUARD_SCRIPT, "hara-native-guard", "/usr/bin/sandbox-exec", "-p", profile, launch.command, ...launch.args], { cwd: work, env, detached: true, stdio: ["pipe","pipe","pipe","pipe"] });
       return { child, ready: lifecycle.own(child, true).then(() => {
+        // own() resolved after the real common guard observed T and sent CONT.
+        stage("guard-owned-and-CONT-returned", turn);
         t.diagnostic("pi-native-boundary-ready " + JSON.stringify({ launchNumber, elapsedMs: Math.round(performance.now() - nativeStartedAt) }));
       }) };
     }, async drain() { await lifecycle.drain(false); } } });
     t.after(async () => { await rpc.close(); await lifecycle.close(); }); return rpc;
   };
-  const rpc = startRpc(config);
-  await rpc.state();
-  const nativeStartupMs = Math.round(performance.now() - bridgeStartedAt);
+  const rpc = startRpc(config, phase);
+  await rpc.state(); stage("state-returned");
+  const nativeStartupMs = Math.round(performance.now() - nativeStartedAt);
+  assert.equal(calls, 0); assert.equal(b.host.metrics.providerRounds, 0);
   t.diagnostic("pi-native-entry-startup " + JSON.stringify({ nativeStartupMs, bridgeBudgetMs: entryBudget.timeoutMs }));
   // Failure diagnostics only (no prompt, tool or model text): which turn and fixture step was reached, how
   // the last assistant frame stopped, elapsed time against the bridge's run-wide and Pi's per-turn limits.
   const diagnosed = (turn, process, run) => run.catch(error => {
     const last = process.lastAssistant, message = typeof last?.errorMessage === "string" ? last.errorMessage : undefined;
     t.diagnostic("pi-native-entry " + JSON.stringify({ turn, error: String(error?.message).slice(0, 80), stopReason: last?.stopReason ?? null,
-      providerCalls: calls, hostConfirmations: confirmations, elapsedMs: Math.round(performance.now() - bridgeStartedAt), nativeStartupMs: turn === "first" ? nativeStartupMs : null,
-      bridgeRunTimeoutMs: entryBudget.timeoutMs, piTurnTimeoutMs: 15000, errorMessageLength: message?.length ?? null,
+      providerCalls: calls, hostConfirmations: confirmations, elapsedMs: Math.round(performance.now() - dispatchStartedAt), nativeStartupMs: turn === "first" ? nativeStartupMs : null,
+      dispatchTimeoutMs: entryBudget.timeoutMs, bridgeRequestTimeoutMs: entryBudget.timeoutMs, piTurnTimeoutMs: 15000, errorMessageLength: message?.length ?? null,
       errorKind: message === undefined ? null : /abort/i.test(message) ? "aborted" : /timeout/i.test(message) ? "timeout"
         : /connect|fetch|socket|ECONN/i.test(message) ? "connection" : /\b[45]\d\d\b/.test(message) ? "http-status" : "other" }));
     throw error;
   });
   try {
+    dispatchStartedAt = performance.now(); b.startDispatch(); stage("dispatch-armed"); stage("prompt-invoked");
     const result = await diagnosed("first", rpc, rpc.prompt("Run the fixed synthetic native steps and respect the Host denial."));
-    t.diagnostic("pi-native-entry-timing " + JSON.stringify({ firstElapsedMs: Math.round(performance.now() - bridgeStartedAt),
-      bashDispatchToNextProviderMs: bashElapsedMs, bridgeBudgetMs: entryBudget.timeoutMs, bashBudgetMs: 5000, piTurnBudgetMs: 15000 }));
+    t.diagnostic("pi-native-entry-timing " + JSON.stringify({ firstElapsedMs: Math.round(performance.now() - dispatchStartedAt),
+      startupMs: nativeStartupMs, firstWallElapsedMs: Math.round(performance.now() - fixtureStartedAt), clockScope: "dispatch-after-state",
+      bashDispatchToNextProviderMs: bashElapsedMs, bridgeBudgetMs: entryBudget.timeoutMs, dispatchBudgetMs: entryBudget.timeoutMs,
+      bashBudgetMs: 5000, piTurnBudgetMs: 15000 }));
     assert.equal(result.text, "native production entry verified"); assert.equal(confirmations, 1); assert.equal(calls, 4);
     assert.equal(readFileSync(join(work,"proof.txt"),"utf8"),"native effect");
     assert.equal(existsSync(join(work,"unexpected-global-resource")),false);
@@ -338,20 +385,23 @@ test("the production bundled Pi RPC entry executes native tools and Hara MCP usi
       t.diagnostic("pi-native-background-after-close " + JSON.stringify(row && { pid: row.pid, ppid: row.ppid, pgid: row.pgid, state: row.state, born: row.born }));
     }
     assert.equal(remainsLive,false);
-    await endpoint.close();
+    await b.close(); await endpoint.close();
     const resumedEndpoint = await createWorkspaceMcpEndpoint({ signal: new AbortController().signal, assertCurrent() {}, tools: () => [tool],
       async call() { throw new Error("A resumed idle session must not repeat the previous Hara mutation"); } }); t.after(() => resumedEndpoint.close());
+    phase = "resumed";
     const resumedBridge = await openBridge();
-    const resumed = startRpc({...config,model:{baseURL:resumedBridge.baseURL,token:resumedBridge.token},sessionFile:result.state.sessionFile,mcp:{...config.mcp,url:resumedEndpoint.url,token:resumedEndpoint.env.HARA_WORKSPACE_MCP_TOKEN}});
-    const state = await resumed.state(); assert.equal(state.sessionId,result.state.sessionId);
+    const resumed = startRpc({...config,model:{baseURL:resumedBridge.baseURL,token:resumedBridge.token},sessionFile:result.state.sessionFile,mcp:{...config.mcp,url:resumedEndpoint.url,token:resumedEndpoint.env.HARA_WORKSPACE_MCP_TOKEN}}, phase);
+    const state = await resumed.state(); stage("state-returned"); assert.equal(state.sessionId,result.state.sessionId);
+    assert.equal(resumedBridge.host.metrics.providerRounds, 0);
+    dispatchStartedAt = performance.now(); resumedBridge.startDispatch(); stage("dispatch-armed"); stage("prompt-invoked");
     const again = await diagnosed("resumed", resumed, resumed.prompt("A new human continuation: do not repeat previous tools."));
     assert.equal(again.state.sessionId,result.state.sessionId); assert.equal(calls,5); assert.equal(confirmations,1);
-    await resumed.close();
+    await resumed.close(); await resumedBridge.close();
     assert.equal(readFileSync(join(work,"env.json"),"utf8").includes(sentinel),false);
     for (const name of ["auth.json", "models.json", "models-store.json"]) {
       const text = readFileSync(join(root,"agent",name),"utf8");
       assert.equal(text.includes(sentinel),false); assert.equal(text.includes(b.token),false);
-      assert.equal(text.includes(config.mcp.token),false);
+      assert.equal(text.includes(resumedBridge.token),false); assert.equal(text.includes(config.mcp.token),false);
     }
   } finally {
     // Runs before fixture(t)'s removal hook, including prompt/close/assertion failures.
