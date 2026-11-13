@@ -195,5 +195,6 @@ test("C5 M1 real WS lookup authenticates despite advertised capability and obser
   assert.equal(value.state, "not_seen"); assert.equal(value.receipt, null); assert.equal(value.commandId, id);
   assert.equal(value.agentId, f.params.agentId); assert.ok(Number.isSafeInteger(Date.parse(value.observedAt)));
   assert.deepEqual(await f.inspect(), before); assert.equal(f.providers(), 0); assert.equal(f.calls(), 0);
-  await assert.rejects(f.owner.request("workspace.boundaries.control.lookup", { ...f.params, commandId: id, approved: true }), boundaryCode("INVALID_DOCUMENT"));
+  await assert.rejects(f.owner.request("workspace.boundaries.control.lookup", { ...f.params, commandId: id, approved: true }), error => error.message === "unsupported Workspace RPC fields");
+  assert.deepEqual(await f.inspect(), before); assert.equal(f.providers(), 0); assert.equal(f.calls(), 0);
 });
