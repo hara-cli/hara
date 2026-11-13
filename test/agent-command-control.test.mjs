@@ -4,7 +4,6 @@ import fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fork } from "node:child_process";
-import { once } from "node:events";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { LocalWorkspaceCatalog } from "../dist/workspace/local-catalog.js";
 import { WorkspaceResources } from "../dist/workspace/resources.js";
@@ -382,33 +381,89 @@ test("C3 capacity refuses new work before effects and retains reserved slots for
   assert.equal(f.control.readReceipt(f.transport, f.agent.agentId, stop.commandId).execution.drain, "observed");
 });
 
-test("C3 independent processes compete through real private CAS; only one old-epoch pause wins", async t => {
-  const f = fixture(t), children = [];
-  const launch = () => {
-    const child = fork(new URL("./helpers/agent-command-competitor.mjs", import.meta.url), [], { execArgv: [], silent: true }); children.push(child);
-    let stderr = ""; child.stderr.on("data", data => { stderr += data; });
-    const messages = [], waiters = [];
-    child.on("message", value => { const waiter = waiters.shift(); if (waiter) waiter(value); else messages.push(value); });
-    const next = () => messages.length ? Promise.resolve(messages.shift()) : new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`CAS competitor deadline: ${stderr}`)), 10000);
-      waiters.push(value => { clearTimeout(timer); resolve(value); });
-    });
-    const exited = once(child, "exit");
-    child.stdin.end(JSON.stringify({ home: f.home, project: f.project, workspaceId: f.row.scope.workspaceId, credential: f.credential,
-      agentId: f.agent.agentId, names: ["workspace_read", "workspace_write", "workspace_verify", "task_intake", "task_checkpoint", "todo_write", "ask_user"] }));
-    return { child, next, exited };
+// Phase-aware private child channel. Early exit/error is a phase failure, not a later generic IPC timeout.
+function commandCompetitor(t, f, label, { controlled = false, fault } = {}) {
+  const release = controlled ? join(f.home, `cas-${label}-release`) : undefined;
+  const child = fork(new URL("./helpers/agent-command-competitor.mjs", import.meta.url), [], { execArgv: [], silent: true });
+  const messages = [], waiters = new Set(), trace = [];
+  let terminal, failure, stderr = "";
+  const redact = text => String(text).split(f.credential).join("[redacted]");
+  const diagnostic = (phase, reason) => new Error(`CAS competitor ${label} pid=${child.pid} phase=${phase}: ${reason}; trace=${trace.join(",")}; stderr=${redact(stderr)}`);
+  const flush = () => {
+    for (const waiter of [...waiters]) {
+      const i = messages.findIndex(value => waiter.phase === "ready" ? value.ready === true : waiter.phase === "before-commit" ? value.phase === waiter.phase : Boolean(value.receipt));
+      if (waiter.phase === "exit") { if (terminal) waiter.finish(null, terminal); continue; }
+      if (i >= 0) waiter.finish(null, messages.splice(i, 1)[0]);
+      else if (failure || terminal) waiter.finish(diagnostic(waiter.phase, failure ?? `exit code=${terminal.code} signal=${terminal.signal}`));
+    }
   };
-  const a = launch(), b = launch();
-  t.after(() => { for (const child of children) if (child.exitCode === null && !child.killed) child.kill(); });
-  assert.deepEqual(await a.next(), { ready: true }); assert.deepEqual(await b.next(), { ready: true });
-  a.child.send("go"); b.child.send("go");
-  const results = await Promise.all([a.next(), b.next()]); await Promise.all([a.exited, b.exited]);
+  child.stderr.on("data", data => { stderr = (stderr + redact(data)).slice(-2048); });
+  child.on("message", value => {
+    if (value?.error) { failure = `helper ${value.error.phase}/${value.error.code}`; trace.push("helper-error"); }
+    else { messages.push(value); trace.push(value?.phase ?? (value?.ready ? "ready" : "receipt")); }
+    flush();
+  });
+  child.on("error", error => { failure = `process error ${error.code ?? "unknown"}`; trace.push("process-error"); flush(); });
+  child.once("close", (code, signal) => { terminal = { code, signal }; trace.push("closed"); flush(); });
+  const next = phase => new Promise((resolve, reject) => {
+    const waiter = { phase, finish(error, value) { clearTimeout(timer); waiters.delete(waiter); if (error) reject(error); else resolve(value); } };
+    const timer = setTimeout(() => waiter.finish(diagnostic(phase, "10000ms IPC deadline")), 10000);
+    waiters.add(waiter); flush();
+  });
+  child.stdin.on("error", error => { failure = `input error ${error.code ?? "unknown"}`; flush(); });
+  child.stdin.end(JSON.stringify({ home: f.home, project: f.project, workspaceId: f.row.scope.workspaceId, credential: f.credential,
+    agentId: f.agent.agentId, names: ["workspace_read", "workspace_write", "workspace_verify", "task_intake", "task_checkpoint", "todo_write", "ask_user"], release, fault }));
+  const stop = async () => {
+    if (!terminal) {
+      child.kill();
+      try { await next("exit"); }
+      catch (error) { if (!terminal) { child.kill("SIGKILL"); await next("exit"); } else throw error; }
+    }
+    assert.ok(terminal, "private child must actually close before fixture cleanup");
+    return terminal;
+  };
+  t.after(stop);
+  return { child, next, stop, release() { assert.ok(release); fs.writeFileSync(release, "release", { flag: "wx", mode: 0o600 }); },
+    go() { return new Promise((resolve, reject) => child.send("go", error => error ? reject(diagnostic("go", error.code ?? "IPC closed")) : resolve())); } };
+}
+for (const first of ["a", "b"]) test(`C3 independent processes compete through real private CAS; only one old-epoch pause wins (${first} commits first)`, async t => {
+  const f = fixture(t), revision = f.snapshot().revision;
+  const children = { a: commandCompetitor(t, f, "a", { controlled: true }), b: commandCompetitor(t, f, "b", { controlled: true }) };
+  const { a, b } = children;
+  assert.deepEqual(await a.next("ready"), { ready: true }); assert.deepEqual(await b.next("ready"), { ready: true });
+  await Promise.all([a.go(), b.go()]);
+  const snapshots = await Promise.all([a.next("before-commit"), b.next("before-commit")]);
+  assert.deepEqual(snapshots.map(row => row.expectedRevision), [revision, revision]);
+  const winner = children[first], loser = children[first === "a" ? "b" : "a"];
+  winner.release(); const won = await winner.next("receipt");
+  assert.equal(won.receipt.status, "accepted"); loser.release(); const lost = await loser.next("receipt");
+  assert.deepEqual(won.attempts, [{ revision, outcome: "committed" }]);
+  assert.deepEqual(lost.attempts, [{ revision, outcome: "STALE_REVISION" }, { revision: revision + 1, outcome: "committed" }]);
+  const results = [won, lost];
+  assert.deepEqual(await Promise.all([a.next("exit"), b.next("exit")]), [{ code: 0, signal: null }, { code: 0, signal: null }]);
   assert.equal(results.filter(row => row.receipt?.status === "accepted").length, 1);
   assert.equal(results.filter(row => row.receipt?.error?.code === "STALE_REVISION").length, 1);
   const state = f.snapshot(); assert.equal(state.control.agents[0].epoch, 1); assert.equal(state.control.commands.length, 2);
   assert.equal(state.control.audit.filter(row => row.decision === "allowed").length, 1);
   assert.equal(state.control.audit.filter(row => row.decision === "rejected").length, 1);
   assert.equal(new Set(state.control.audit.map(row => row.sequence)).size, 2);
+});
+for (const [fault, exitCode, phase] of [["before-ready", 42, "ready"], ["after-ready", 43, "receipt"]]) test(`C3 competitor early ${fault} exit retains the failing phase and leaves no command`, async t => {
+  const f = fixture(t), child = commandCompetitor(t, f, "fault", { fault });
+  if (phase === "receipt") await child.next("ready");
+  await assert.rejects(child.next(phase), error => error.message.includes(`phase=${phase}`) && error.message.includes(`exit code=${exitCode}`) && !error.message.includes("IPC deadline") && !error.message.includes(f.credential));
+  assert.deepEqual(await child.next("exit"), { code: exitCode, signal: null });
+  assert.equal(f.snapshot().control.commands.length, 0); assert.equal(f.snapshot().control.agents[0].epoch, 0);
+});
+
+test("C3 competitor cleanup waits for its exact live child after a reported failure", async t => {
+  const f = fixture(t), child = commandCompetitor(t, f, "cleanup", { fault: "reported-failure" });
+  await child.next("ready");
+  await assert.rejects(child.next("receipt"), /helper accept\/SYNTHETIC_FAILURE/);
+  assert.equal(child.child.exitCode, null); assert.equal(child.child.signalCode, null);
+  const terminal = await child.stop(); assert.ok(terminal.signal);
+  assert.equal(child.child.signalCode, terminal.signal); assert.equal(child.child.exitCode, terminal.code);
+  assert.equal(f.snapshot().control.commands.length, 0);
 });
 
 test("C3 first migration refuses any physical lease and preserves the v1 policy until actual release", t => {
