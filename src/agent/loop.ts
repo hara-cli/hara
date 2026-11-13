@@ -1193,6 +1193,26 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
  * approval, continuation, budget and physical-drain rules; the kernel owns the actual model step.
  * There is one physical model request, not a Hara planner delegating its full task to a second planner. */
 export type AgentRuntimeTurn = (provider: Provider, args: TurnArgs) => Promise<TurnResult>;
+/** Read-only context lookups: consulting them is not an attempted action. */
+const DISCUSSION_LOOKUPS = new Set(["workspace_context_lookup", "workspace_memory_search", "agent_list", "agent_get"]);
+/** A prose-only native turn that attempted no action (at most read-only context lookups) and handed a
+ * question back to the human is a discussion awaiting their reply, not a paused action without a
+ * receipt. The task stays unfinished (nothing is marked complete; /continue still applies); only the
+ * "paused / no receipt" closeout is not appended. Any other tool, or prose without a question, keeps it. */
+export function discussionHandback(runMessages: readonly NeutralMsg[], outcome: RunOutcome): boolean {
+  if (outcome.status !== "halted" || outcome.stopReason !== "native_prose_only") return false;
+  if (runMessages.some(message => message.role === "tool" ? message.results.some(result => !DISCUSSION_LOOKUPS.has(result.name))
+    : message.role === "assistant" && message.toolUses.some(use => !DISCUSSION_LOOKUPS.has(use.name)))) return false;
+  const reply = [...runMessages].reverse().find(message => message.role === "assistant");
+  return reply?.role === "assistant" && asksHumanQuestion(reply.text);
+}
+/** A question handed back to the human: a ?/？ in the reply's last paragraph, ignoring code blocks and
+ * inline code (so `a?.b` or a ternary in a snippet is not a question). */
+export function asksHumanQuestion(text: string): boolean {
+  const prose = text.replace(/```[\s\S]*?(?:```|$)/gu, " ").replace(/`[^`\n]*`/gu, " ");
+  const paragraphs = prose.split(/\n\s*\n/u).map(part => part.trim()).filter(Boolean);
+  return /[?？]/u.test((paragraphs.at(-1) ?? "").slice(-600));
+}
 export async function runGovernedAgent(
   history: NeutralMsg[], opts: RunOpts, runtimeId: "hara" | "pi" | "codex" | "claude" | "opencode" | "gemini" | "kimi" | "copilot" | "cursor" | "grok", executeTurn?: AgentRuntimeTurn,
 ): Promise<RunOutcome> {
@@ -1230,11 +1250,12 @@ export async function runGovernedAgent(
   const computerScope = createComputerRunScope();
   const media = new Map<string, { images: ImageAttachment[]; store: ReturnType<typeof createToolImageStore> }>();
   try {
+    const runStart = history.length;
     const outcome = await runAgentInner(history, { ...opts, ctx: { ...opts.ctx, computerScope } }, life, media, taskAuthority, executeTurn);
     const task = opts.taskIntake?.current ? opts.taskIntake.current() : opts.taskIntake?.task;
     const sameTaskTurn = task && task.id === runTaskBinding?.id && task.turnId === runTaskBinding?.turnId;
     if (sameTaskTurn && (task.brief?.intent === "change" || outcome.stopReason === "native_resume_timeout" || outcome.stopReason === "native_prose_only")
-      && outcome.status !== "completed" && !opts.signal?.aborted) {
+      && outcome.status !== "completed" && !opts.signal?.aborted && !discussionHandback(history.slice(runStart), outcome)) {
       // Notices carry diagnostics; an ordinary persisted assistant reply carries the human handoff.
       // Do not ask the provider to summarize a stopped run, or re-run its external side effects.
       const text = pausedCloseoutText(task, currentTodos(opts.ctx.todoScope), life.language, outcome);

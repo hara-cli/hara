@@ -62,14 +62,28 @@ test("actual Pi execution reaches the frozen scoped provider once, without legac
 });
 test("attempt context is pinned to the actual durable transcript and refuses a replaced or rewritten prefix",async()=>{
  const history=[{role:"user",content:"retained older task"},{role:"assistant",text:"old result",toolUses:[]},{role:"user",content:"current task"}];
- const a=fixture(async()=>reply("must not run"),[],{history,start:2});
+ const a=fixture(async()=>reply("must not run"),[],{history,start:2,recentConversation:true});
  try{
   assert.throws(()=>prepareWorkspaceRunHistory(a.permit,history),/governed entry/);
   beginWorkspaceGovernedRun(a.permit,a.options,"pi");
-  assert.deepEqual(prepareWorkspaceRunHistory(a.permit,history),history.slice(2));
+  // A private conversation's new task sees a bounded prose view of the validated earlier turns,
+  // followed by its own attempt. The durable transcript itself is unchanged.
+  const view=prepareWorkspaceRunHistory(a.permit,history);
+  assert.equal(view.length,2);assert.deepEqual(view[1],history[2]);
+  assert.match(view[0].content,/^<hara-recent-conversation>/);
+  assert.deepEqual(JSON.parse(view[0].content.split("\n").at(-2)),[{role:"user",text:"retained older task"},{role:"assistant",text:"old result"}]);
+  assert.equal(history.length,3);
   assert.throws(()=>prepareWorkspaceRunHistory(a.permit,structuredClone(history)),/prefix changed/);
   history[0].content="rewritten old task";
   assert.throws(()=>prepareWorkspaceRunHistory(a.permit,history),/prefix changed/);assert.equal(a.requests,0);
+ }finally{await a.close();}
+});
+test("without the Host's private-conversation flag an attempt still sees only its own messages",async()=>{
+ const history=[{role:"user",content:"retained older task"},{role:"assistant",text:"old result",toolUses:[]},{role:"user",content:"current task"}];
+ const a=fixture(async()=>reply("must not run"),[],{history,start:2});
+ try{
+  beginWorkspaceGovernedRun(a.permit,a.options,"pi");
+  assert.deepEqual(prepareWorkspaceRunHistory(a.permit,history),history.slice(2));assert.equal(a.requests,0);
  }finally{await a.close();}
 });
 test("forged JSON handles, direct legacy kernel, changed provider and stripped provenance start zero models",async()=>{

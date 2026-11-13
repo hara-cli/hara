@@ -7,6 +7,7 @@ import { exact, plain, text, UUID, WorkspaceJsonState } from "./local-state.js";
 import { sameWorkspaceResourceBinding, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
 import type { WorkspaceRunBinding } from "./run-binding.js";
 import type { WorkspaceUsage } from "./conversations.js";
+import { distinctiveConversationTerm } from "./context-compaction.js";
 
 export type WorkspaceQuestionReason = "lookup_missing" | "lookup_ambiguous" | "tool_problem" | "budget_warning" | "runaway_guard" | "explicit";
 /** Optional purpose of a question. rename_target: choose which existing colleague receives a requested new name. */
@@ -91,6 +92,7 @@ export function workspaceRenameTargetQuestion(newName: string, language: boolean
 export class WorkspaceUserInteraction {
   private readonly state: WorkspaceJsonState<State>;
   private lookupBatch = false;
+  private recentConversation: readonly string[] = [];
   private readonly locale: Locale;
   constructor(storage: WorkspaceResourceStorage, private readonly binding: Readonly<WorkspaceRunBinding>,
     private readonly taskId: string, language: boolean | Locale) {
@@ -234,12 +236,16 @@ export class WorkspaceUserInteraction {
       || elapsedMs >= b.timeoutMs * 0.8)) return this.request("budget_warning");
     return null;
   }
+  /** Host-approved, redacted recent private conversation the model already sees for this run. */
+  useRecentConversation(texts: readonly string[]): void {
+    this.recentConversation = texts.slice(-12).map(text => text.normalize("NFKC").toLocaleLowerCase());
+  }
   beginBatch(names: readonly string[]): void { this.lookupBatch = names.some(name => LOOKUPS.has(name)); }
   admit(name: string): void {
     if (this.retainedQuestion()) throw new Error("Workspace is waiting for the user's answer; no action was dispatched");
     if (this.lookupBatch && !LOOKUPS.has(name) && name !== "ask_user") throw new Error("Resolve context in a separate lookup batch before executing other tools");
   }
-  observe(name: string, result: unknown, failed: boolean): void {
+  observe(name: string, result: unknown, failed: boolean, input?: unknown): void {
     let lookupMissing = false;
     if (name === "workspace_context_lookup" || name === "workspace_memory_search" || name === "workspace_read") {
       let parsed: Record<string, unknown> = {};
@@ -256,6 +262,11 @@ export class WorkspaceUserInteraction {
         // rename_new_name: the user-supplied new display name is not an unresolved reference.
         : failed || (name === "workspace_context_lookup" ? parsed.status !== "resolved" && parsed.status !== "rename_new_name"
           : !Array.isArray(parsed.hits) || parsed.hits.length === 0);
+      // No remembered note is not an unresolved target when the exact query is part of the recent
+      // private conversation this run already sees (workspace_context_lookup reports those hits itself).
+      const query = name === "workspace_memory_search" && plain(input) && typeof input.query === "string"
+        ? input.query.normalize("NFKC").toLocaleLowerCase().trim() : "";
+      if (lookupMissing && !failed && distinctiveConversationTerm(query) && this.recentConversation.some(text => text.includes(query))) lookupMissing = false;
     }
     if (!failed && !lookupMissing) {
       const s = this.state.read();
