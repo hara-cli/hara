@@ -14,7 +14,7 @@ const META = /^message-[a-f0-9]{64}\.json$/;
 const BLOB = /^(?:body-[a-f0-9]{64}|attachment-[a-f0-9]{64}-[0-3])\.bin$/;
 const CONTROL = /^(?:cleanup|reader)-[a-f0-9-]{36}\.json$/;
 export interface HubFileSnapshot { dev: number; ino: number; mode: number; nlink: number; size: number; mtimeMs: number; ctimeMs: number }
-/** All mutations share the home-wide quota lock before the per-scope state lock. */
+/** Mutations use shared home-wide accounting and the per-scope state lock. */
 export class AgentHubPrivateStore {
   private readonly namespace: readonly string[];
   private directory?: PrivateStateDirectoryIdentity;
@@ -29,8 +29,14 @@ export class AgentHubPrivateStore {
     // canonical path/dev/ino/mode at every IO/publication fence and reject replacement directories.
     return { directory: this.directory, path: join(this.directory.path, filename) };
   }
-  transaction<T>(fn: () => T): T {
-    try { return this.globalQuota.run(() => withPrivateStateLockSync(this.home, this.namespace, "hub", fn, { attempts: 10, waitMs: 5 })); }
+  transaction<T>(fn: () => T, readOnly = false): T {
+    // Credential preflight reads an atomic, verified catalog snapshot. No lock-file/directory
+    // mutation or census scheduling: concurrent preflights must not invalidate a shared scan.
+    // This grants no publication authority; receive() authenticates again under its write lock.
+    try {
+      if (readOnly) { this.globalQuota.assertPrepared(); return fn(); }
+      return this.globalQuota.run(() => withPrivateStateLockSync(this.home, this.namespace, "hub", fn, { attempts: 10, waitMs: 5 }));
+    }
     catch (error) {
       if (error instanceof AgentHubError) throw error;
       throw new AgentHubError(error instanceof StorageQuotaError && error.code === "quota_exceeded" ? "quota_exceeded" : "store_unavailable");

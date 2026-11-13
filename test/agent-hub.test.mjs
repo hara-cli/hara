@@ -33,12 +33,12 @@ const agentA = { agentId: "registered-a", instanceId: "boot-a", alias: "agent-a"
 const agentB = { agentId: "registered-b", instanceId: "boot-b", alias: "agent-b", displayName: "Agent B", engine: "claude" };
 function fixture(t, extra = {}) {
   const home = realpathSync.native(mkdtempSync(join(tmpdir(), "agent-hub-")));
+  const agents = new Map([[agentA.agentId, { ...agentA }], [agentB.agentId, { ...agentB }]]);
+  const directory = { registeredAgent: id => agents.get(id) ?? null };
+  const globalQuota = new HaraStorageQuota({ home, limitBytes: extra.globalQuotaBytes ?? 64 * 1024 * 1024, now: extra.quotaNow });
   // macOS may recreate .DS_Store during removal of the large synthetic home. Async
   // ENOTEMPTY retries rescan new entries; sync rmdir retries alone do not. Errors still fail.
   t.after(async () => { await globalQuota.refreshUsage().catch(() => {}); await fs.promises.rm(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); });
-  const agents = new Map([[agentA.agentId, { ...agentA }], [agentB.agentId, { ...agentB }]]);
-  const directory = { registeredAgent: id => agents.get(id) ?? null };
-  const globalQuota = new HaraStorageQuota({ home, limitBytes: extra.globalQuotaBytes ?? 64 * 1024 * 1024 });
   const options = { home, directory, boundary, globalQuota, assertCurrent() {}, scopeKey: "a".repeat(64), generation: "b4c24374-7200-4e28-9373-1df781c606e8", ...extra }, hub = new AgentHubStore(options);
   return { home, hub, agents, options, state: join(home, ".hara", "agent-hub", options.scopeKey) };
 }
@@ -570,8 +570,9 @@ test("real C0 ingress uses the canonical fixed error/retry pair and saved respon
 });
 
 
-test("N2: 20,848-entry Hara home uses incremental message accounting outside the global lock", async t => {
-  const f = fixture(t, { globalQuotaBytes: 4 * 1024 ** 3 });
+test("N2/N3: 20,848-entry Hara home keeps hot admission fast and saves the first idle HTTP message", async t => {
+  let quotaNow = Date.now();
+  const f = fixture(t, { globalQuotaBytes: 4 * 1024 ** 3, quotaNow: () => quotaNow });
   const root = join(f.home, ".hara"); mkdirSync(root, { mode: 0o700 });
   // 20,633 sparse files + 200 directories + 15 links = the reviewed real-home scale.
   // Logical payload is >1 GiB, physical scratch stays bounded; no real user data is copied/read.
@@ -598,11 +599,26 @@ test("N2: 20,848-entry Hara home uses incremental message accounting outside the
     }
   } finally { fs.readdirSync = readdir; syncBuiltinESMExports(); }
   const stats = values => { const sorted = [...values].sort((a, b) => a - b); return { samples: values.length, p50Ms: sorted[4], p95Ms: sorted[9], maxMs: Math.max(...values) }; };
-  const result = { entries: 20848, symlinks: 15, coldMs, text: stats(text), four64KiBAttachments: stats(attachments) };
+  const ingress = await startAgentHubIngress({ store: hub, errorBody: code => ({ testTransportError: code }) });
+  const realpath = fs.promises.realpath; let idleCensuses = 0;
+  fs.promises.realpath = async (path, ...args) => {
+    if (String(path) === root) { idleCensuses++; assert.equal(fs.existsSync(lock), false); }
+    return realpath(path, ...args);
+  };
+  quotaNow += 6 * 60_000; const idleAt = performance.now(); let idleFirstHTTPMs;
+  try {
+    const input = post("agent-a", "first after six idle minutes");
+    const reply = await fetch(ingress.endpoint + "/v1/agent-hub/messages", { method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${grant.token}` }, body: JSON.stringify(input) });
+    assert.equal(reply.status, 200); const receipt = await reply.json(); idleFirstHTTPMs = performance.now() - idleAt;
+    assert.equal(receipt.seq, 21); assert.deepEqual(hub.receipt(grant.token, input.requestId), receipt);
+    assert.equal(idleCensuses, 1);
+  } finally { fs.promises.realpath = realpath; await ingress.close(); }
+  const result = { entries: 20848, symlinks: 15, coldMs, text: stats(text), four64KiBAttachments: stats(attachments), idleFirstHTTPMs, idleCensuses };
   console.log("HUB_SCALE_PERF " + JSON.stringify(result));
   const maximum = Number(process.env.HARA_HUB_PERF_MAX_MS);
   if (Number.isFinite(maximum) && maximum > 0) for (const elapsed of [...text, ...attachments]) assert.ok(elapsed < maximum, `hot message ${elapsed.toFixed(2)}ms exceeds ${maximum}ms`);
-  assert.equal(hub.messages(grant.connectionId).length, 20);
+  assert.equal(hub.messages(grant.connectionId).length, 21);
   assert.ok(f.options.globalQuota.usageBytes() >= 20633 * 64 * 1024);
 });
 
