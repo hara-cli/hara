@@ -16,6 +16,11 @@ import { newAgentLifecycleRun, parseAgentLifecycleRecovery, type AgentLifecycleO
 const restrictive = (action: string) => ["task.stop", "agent.pause", "agent.dismiss"].includes(action);
 const fail = (code: AgentBoundaryErrorCode, field = "control.authority"): never => { throw new AgentBoundaryContractError(code, field); };
 export { agentCommandMessageDigest } from "./agent-command-state.js";
+/** Private authenticated read projection, NOT a portable C0 receipt or an execution permission. */
+export type AgentCommandReceiptLookup = Readonly<{
+  schemaVersion: 1; kind: "command-receipt-lookup"; context: AgentBoundaryCommand["context"];
+  agentId: string; commandId: string; observedAt: string;
+} & ({ state: "seen"; receipt: AgentBoundaryReceipt } | { state: "not_seen"; receipt: null })>;
 declare const intakeBrand: unique symbol;
 export interface AgentCommandIntake { readonly [intakeBrand]: true }
 declare const preparationBrand: unique symbol;
@@ -676,6 +681,22 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
   runForIntake(handle: AgentCommandIntake) {
     const intake = intakes.get(handle); if (!intake || intake.owner !== this) return fail("AUTHORITY_UNVERIFIED", "control.intake");
     return this.authority.commandControlState().control.runs.find(run => run.commandId === intake.command.commandId);
+  }
+  /** Absence is explicit only for a healthy, complete ledger and an authenticated reader.
+   * The early timestamp cannot turn a pre-expiry snapshot into a post-expiry proof.
+   * Admission revalidates notAfter inside CAS, including an intake begun before this read. */
+  lookupReceipt(transport: Intake["transport"], agentId: string, id: string): AgentCommandReceiptLookup {
+    if (!commandId(id)) return fail("INVALID_DOCUMENT");
+    const observedAt = new Date(this.authority.commandObservationTime(transport)).toISOString();
+    const snapshot = this.authority.commandControlForReader(transport, agentId);
+    if (!this.available || !this.authority.commandControlSourceHealthy()) return fail("AUTHORITY_UNVERIFIED", "control.receiptSource");
+    this.authority.assertLifecycleHistory();
+    const live = snapshot.control.commands.find(row => row.command.commandId === id);
+    const retired = snapshot.lifecycle?.retiredCommands.find(row => row.commandId === id);
+    if (live && live.command.agentId !== agentId || retired && retired.agentId !== agentId) return fail("AUTHORIZATION_DENIED", "control.receipt");
+    const base = { schemaVersion: 1 as const, kind: "command-receipt-lookup" as const, context: snapshot.context, agentId, commandId: id, observedAt };
+    return live || retired ? deepFreeze({ ...base, state: "seen" as const, receipt: this.readReceipt(transport, agentId, id) })
+      : deepFreeze({ ...base, state: "not_seen" as const, receipt: null });
   }
   readReceipt(transport: Intake["transport"], agentId: string, id: string): AgentBoundaryReceipt {
     if (!commandId(id)) return fail("INVALID_DOCUMENT");

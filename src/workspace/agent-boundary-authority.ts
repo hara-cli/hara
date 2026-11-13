@@ -378,6 +378,12 @@ export class WorkspaceAgentBoundaryAuthority {
     if (command.kind !== "command") return fail("INVALID_DOCUMENT"); this.source(transport); return command;
   }
   /** Authenticated original intent only. Returning a parsed document does not issue permission. */
+  /** Same authority clock used for admission deadlines. Sample BEFORE observing the ledger. */
+  commandObservationTime(transport: AgentBoundaryTransport): number {
+    this.source(transport); const now = this.now();
+    if (!Number.isSafeInteger(now) || !Number.isFinite(new Date(now).getTime())) return fail("AUTHORITY_UNVERIFIED", "control.receiptClock");
+    return now;
+  }
   authenticateCommandIntent(transport: AgentBoundaryTransport, raw: unknown): AgentBoundaryCommand {
     const provenance = this.source(transport), command = parseAgentBoundaryDocument(raw);
     if (command.kind !== "command") return fail("INVALID_DOCUMENT");

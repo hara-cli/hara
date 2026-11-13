@@ -372,6 +372,9 @@ export class LocalWorkspaceHost {
     if (this.options.boundaryLifecycleControl) control.initializeLifecycle(transport!);
     this.kickLifecycleObserver(); return control.inspect(transport!, agentId);
   }
+  agentCommandReceiptLookup(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string, commandId: string) {
+    return this.commandAuthority(transport, workspaceId).lookupReceipt(transport!, agentId, commandId);
+  }
   agentCommandReceipt(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string, commandId: string) {
     return this.commandAuthority(transport, workspaceId).readReceipt(transport!, agentId, commandId);
   }
