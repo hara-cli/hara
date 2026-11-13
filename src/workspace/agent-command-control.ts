@@ -687,10 +687,8 @@ export class WorkspaceAgentCommandControl implements AgentBoundaryControlSource 
    * Admission revalidates notAfter inside CAS, including an intake begun before this read. */
   lookupReceipt(transport: Intake["transport"], agentId: string, id: string): AgentCommandReceiptLookup {
     if (!commandId(id)) return fail("INVALID_DOCUMENT");
-    const observedAt = new Date(this.authority.commandObservationTime(transport)).toISOString();
-    const snapshot = this.authority.commandControlForReader(transport, agentId);
+    const { observedAt, snapshot } = this.authority.commandReceiptObservation(transport, agentId);
     if (!this.available || !this.authority.commandControlSourceHealthy()) return fail("AUTHORITY_UNVERIFIED", "control.receiptSource");
-    this.authority.assertLifecycleHistory();
     const live = snapshot.control.commands.find(row => row.command.commandId === id);
     const retired = snapshot.lifecycle?.retiredCommands.find(row => row.commandId === id);
     if (live && live.command.agentId !== agentId || retired && retired.agentId !== agentId) return fail("AUTHORIZATION_DENIED", "control.receipt");

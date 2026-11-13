@@ -67,6 +67,15 @@ export class WorkspaceJsonState<T> {
     return { file, value: this.decode(file.snapshot) };
   }
   read(): T { return this.storage.readJson(this.filename, snapshot => structuredClone(this.decode(snapshot))); }
+  /** Read-only absence observations serialize with the SAME CAS lock; no revision/file write. */
+  withReadLock<R>(read: () => R): R {
+    return this.storage.run(() => withPrivateStateLockSync(workspaceStateHome(), [], this.filename.slice(0, -5), () => {
+      const file = this.file(), assertResource = workspaceResourceCommitGuard();
+      assertResource?.(); file.assertCurrent(); const result = read();
+      if (result && (typeof result === "object" || typeof result === "function") && "then" in result) throw new Error("Workspace read observation must be synchronous");
+      assertResource?.(); file.assertCurrent(); return result;
+    }));
+  }
   update(expectedRevision: number, change: (value: T) => T): T {
     if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new Error("invalid expected Workspace revision");
     return this.storage.run(() => withPrivateStateLockSync(workspaceStateHome(), [], this.filename.slice(0, -5), () => {

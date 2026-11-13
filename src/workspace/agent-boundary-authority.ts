@@ -378,6 +378,19 @@ export class WorkspaceAgentBoundaryAuthority {
     if (command.kind !== "command") return fail("INVALID_DOCUMENT"); this.source(transport); return command;
   }
   /** Authenticated original intent only. Returning a parsed document does not issue permission. */
+  /** A definitive missing-ID observation cannot race an in-flight publication already holding CAS. */
+  commandReceiptObservation(transport: AgentBoundaryTransport, agentId: string) {
+    this.source(transport);
+    try { return this.state.withReadLock(() => {
+      const observedAt = new Date(this.commandObservationTime(transport)).toISOString();
+      const snapshot = this.commandControlForReader(transport, agentId);
+      if (snapshot.lifecycle) this.history().verify(snapshot.lifecycle);
+      return deepFreeze({ observedAt, snapshot });
+    }); } catch (error) {
+      if (error instanceof AgentBoundaryContractError) throw error;
+      return fail("AUTHORITY_UNVERIFIED", "control.receiptObservation"); // Contention/IO is UNKNOWN, never absence or global corruption.
+    }
+  }
   /** Same authority clock used for admission deadlines. Sample BEFORE observing the ledger. */
   commandObservationTime(transport: AgentBoundaryTransport): number {
     this.source(transport); const now = this.now();

@@ -595,3 +595,17 @@ test("C5 M1 lookup requires current manage or invoke and cannot return absence f
   f.authority.commandControlForReader = (transport, _target) => reader(transport, f.agent.agentId);
   assert.throws(() => f.control.lookupReceipt(f.transport, "other-authorized-agent", run.command.commandId), code("AUTHORIZATION_DENIED"));
 });
+
+
+test("C5 M1 an in-flight real CAS cannot be observed absent and lock contention leaves authority usable", t => {
+  const f = fixture(t), id = randomUUID(), revision = f.snapshot().revision;
+  f.authority.state.update(revision, state => {
+    assert.throws(() => f.control.lookupReceipt(f.transport, f.agent.agentId, id), code("AUTHORITY_UNVERIFIED"));
+    return state;
+  });
+  assert.equal(f.authority.commandControlSourceHealthy(), true);
+  const before = fs.readFileSync(f.file, "utf8"), observed = f.control.lookupReceipt(f.transport, f.agent.agentId, id);
+  assert.equal(observed.state, "not_seen"); assert.equal(fs.readFileSync(f.file, "utf8"), before, "A lookup cannot change state/revision");
+  assert.throws(() => f.authority.state.withReadLock(() => Promise.resolve("not an observation")), /synchronous/);
+  assert.equal(f.authority.commandControlSourceHealthy(), true);
+});
