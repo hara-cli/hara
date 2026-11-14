@@ -8,6 +8,7 @@ import { classifyError, errorHint, failoverAction } from "../dist/agent/failover
 import { runAgent } from "../dist/agent/loop.js";
 import { RUNTIME_FAILURE_KINDS, runtimeFailureMessage, classifyRuntimeFailure } from "../dist/agent-runtime/failure-diagnostics.js";
 import { withProviderRetry } from "../dist/providers/retry.js";
+import { ProviderConnectionCircuitRegistry } from "../dist/providers/connection-health.js";
 import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
 import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
 import { workspaceProviderFailure, legacyWorkspaceProviderFailure } from "../dist/workspace/provider-recovery.js";
@@ -76,6 +77,21 @@ test("Runtime failures never buy a transport retry, including native timeout and
     assert.equal(result.errorMsg, message);
     assert.equal(calls, 1, kind); assert.equal(sleeps, 0, kind);
   }
+});
+
+test("connection health keeps the legacy observation vocabulary without treating local Runtime failures as provider overload", () => {
+  for (const kind of RUNTIME_FAILURE_KINDS) {
+    const registry = new ProviderConnectionCircuitRegistry({ now: () => 1000 });
+    for (const elapsed of [429, 503, 529]) {
+      const snapshot = registry.failure("fixture", classifyError(diagnostic(kind, elapsed)));
+      assert.equal(snapshot.lastFailureKind, kind === "runtime_proxy" ? "runtime_proxy" : "unknown");
+      assert.equal(snapshot.circuit, "closed", "local failure cannot open a provider HTTP overload circuit");
+    }
+  }
+  const registry = new ProviderConnectionCircuitRegistry({ now: () => 1000 });
+  for (let n = 0; n < 3; n++) registry.failure("http-control", classifyError("503", 503));
+  assert.equal(registry.snapshot("http-control").lastFailureKind, "overloaded");
+  assert.equal(registry.snapshot("http-control").circuit, "open", "real provider overload isolation is preserved");
 });
 
 test("real agent recovery does not mistake Runtime prose for context/tool recovery or call an authorized backup", async t => {
