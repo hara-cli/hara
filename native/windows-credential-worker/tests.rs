@@ -31,7 +31,7 @@ struct Account { name:Vec<u16>,token:Option<Owned>,profile:Handle,impersonating:
 impl Drop for Account { fn drop(&mut self) { unsafe {
     if self.impersonating {RevertToSelf();}
     if let Some(token)=&self.token {if !self.profile.is_null() {UnloadUserProfile(token.0,self.profile);}}
-    self.token.take(); NetUserDel(null(),self.name.as_ptr());
+    self.token.take(); if !self.name.is_empty() {NetUserDel(null(),self.name.as_ptr());}
 } } }
 fn namespace() -> [u8;32] { let mut n=[0;32]; assert!(unsafe{BCryptGenRandom(null_mut(),n.as_mut_ptr(),32,2)}>=0,"test RNG"); n }
 #[test] fn current_user_dpapi_and_real_second_user_rejection() { unsafe {
@@ -63,6 +63,8 @@ fn namespace() -> [u8;32] { let mut n=[0;32]; assert!(unsafe{BCryptGenRandom(nul
     assert!(dpapi(&foreign.0,entropy,false).is_err(),"original user cannot decrypt second-user blob");
     assert!(store.remove(b"test:cross-user").is_ok(),"own cleanup");
     let private=store.path.clone();drop(store);assert!(std::fs::remove_dir_all(private).is_ok(),"remove exact native fixture namespace");
+    assert!(UnloadUserProfile(token,account.profile)!=0,"unload test user profile"); account.profile=null_mut();
+    account.token.take(); assert!(NetUserDel(null(),account.name.as_ptr())==0,"delete test OS user");account.name.clear();
 } }
 #[test] fn ancestor_handles_block_directory_replacement_during_actual_io() {
     assert!(std::env::var("GITHUB_ACTIONS").ok().as_deref()==Some("true"),"ephemeral Windows CI only");

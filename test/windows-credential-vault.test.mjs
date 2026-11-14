@@ -40,7 +40,7 @@ test("real Windows DPAPI worker and Node adapter boundary", { skip: !native, tim
     assert.ok(vault.get(old) === secret, "old ref preserved"); vault.set(next, secret + "3"); assert.ok(vault.get(next) === secret + "3", "same-ref replacement confirmed");
   });
   await t.test("one bounded frame accepts 256 maximum UTF16 keys; invalid batches do not mutate", () => {
-    const entries = Array.from({ length: 256 }, (_, i) => ({ ref: remember(`batch:max.${i}`), key: "🐧".repeat(8192) }));
+    const entries = Array.from({ length: 256 }, (_, i) => ({ ref: remember(`batch:max.${i}`.padEnd(240, "r")), key: "🐧".repeat(8192) }));
     vault.setMany(entries); for (const entry of entries) assert.ok(vault.get(entry.ref) === entry.key, "batch exact readback");
     assert.throws(() => vault.setMany([...entries, { ref: "batch:extra", key: secret }]), code("invalid_request"));
     assert.throws(() => vault.setMany([{ ref: "a:x", key: secret }, { ref: "b:x", key: secret }]), code("invalid_request"));
@@ -96,6 +96,26 @@ test("real Windows DPAPI worker and Node adapter boundary", { skip: !native, tim
   await t.test("helper tamper or missing bundle never falls back or executes", () => {
     const invalid = new WindowsDpapiCredentialVault(home, { ...bundle, sha256: "0".repeat(64) });
     assert.throws(() => invalid.set("invalid:helper", secret), code("unavailable")); assert.equal(vault.get("invalid:helper"), undefined);
+  });
+  await t.test("timeouts, truncated replies, output overflow and exits retain unknown state without retry", () => {
+    const fixtureSource = process.env.HARA_VAULT_FAILURE_FIXTURE;
+    assert.ok(fixtureSource && path.isAbsolute(fixtureSource), "compiled fixture supplied by CI");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hara-vault-failure-"));
+    const helper = path.join(dir, "hara-credential-worker.exe"); fs.copyFileSync(fixtureSource, helper);
+    const failing = new WindowsDpapiCredentialVault(home, { path: helper, sha256: createHash("sha256").update(fs.readFileSync(helper)).digest("hex") });
+    const attempt = (mode, op, expected) => {
+      fs.writeFileSync(path.join(dir, "mode"), mode); fs.writeFileSync(path.join(dir, "counter"), Buffer.alloc(4));
+      assert.throws(op, code(expected));
+      assert.equal(fs.readFileSync(path.join(dir, "counter")).readUInt32LE(), 1, "one dispatch, no automatic retry");
+    };
+    try {
+      attempt("timeout", () => failing.set("unknown:timeout", secret), "write_unconfirmed");
+      attempt("exit", () => failing.setMany([{ ref: "unknown:a", key: secret }, { ref: "unknown:b", key: secret }]), "write_unconfirmed");
+      attempt("exit", () => failing.remove("unknown:remove"), "cleanup_unconfirmed");
+      attempt("invalid", () => failing.get("unknown:get"), "unavailable");
+      attempt("oversize", () => failing.set("unknown:overflow", secret), "write_unconfirmed");
+      assert.equal(vault.get("unknown:timeout"), undefined, "failure fixture did not touch the real vault");
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
   await t.test("remove is confirmed and missing removal is idempotent", () => {
     const ref = remember("canary:remove"); vault.set(ref, secret); vault.remove(ref); vault.remove(ref); assert.equal(vault.get(ref), undefined);

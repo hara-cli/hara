@@ -22,6 +22,19 @@ export class CredentialVaultError extends Error {
 }
 interface Entry { ref: string; key: string }
 export interface WindowsCredentialWorkerBundle { readonly path: string; readonly sha256: string }
+function readBoundedFile(file: string, limit: number): Buffer {
+  const fd = fs.openSync(file, "r");
+  try {
+    const info = fs.fstatSync(fd);
+    if (!info.isFile() || info.nlink !== 1 || info.size > limit) throw new Error();
+    // One extra byte detects growth without ever allocating an unbounded readFile buffer.
+    const result = Buffer.alloc(info.size + 1);
+    let count = 0;
+    while (count < result.length) { const n = fs.readSync(fd, result, count, result.length - count, null); if (!n) break; count += n; }
+    if (count !== info.size) throw new Error();
+    return result.subarray(0, count);
+  } finally { fs.closeSync(fd); }
+}
 /** Trusted packaging boundary. Never call with a renderer, discovery or user-configured path. */
 export function bundledWindowsCredentialWorker(): WindowsCredentialWorkerBundle {
   if (typeof __HARA_WINDOWS_VAULT_SHA256__ !== "undefined") {
@@ -29,7 +42,7 @@ export function bundledWindowsCredentialWorker(): WindowsCredentialWorkerBundle 
   }
   const root = fileURLToPath(new URL("../native/win32-x64/", import.meta.url));
   try {
-    const raw = fs.readFileSync(path.join(root, "manifest.json"));
+    const raw = readBoundedFile(path.join(root, "manifest.json"), 4096);
     if (raw.length > 4096) throw new Error();
     const data: unknown = JSON.parse(raw.toString("utf8"));
     if (!data || typeof data !== "object" || !("protocolVersion" in data) || data.protocolVersion !== 1
@@ -50,10 +63,15 @@ export class WindowsDpapiCredentialVault implements CredentialVault {
       if (!path.isAbsolute(home)) throw new Error();
       // Bind the existing canonical Host home; path aliases must not create new vault namespaces.
       const canonical = fs.realpathSync.native(home).replaceAll("/", "\\");
+      if (!fs.statSync(canonical).isDirectory()) throw new Error();
       this.namespace = createHash("sha256").update("hara-host-home-v1\0").update(canonical, "utf8").digest();
       bundle ??= bundledWindowsCredentialWorker();
       if (!path.isAbsolute(bundle.path) || path.basename(bundle.path) !== HELPER || !/^[a-f0-9]{64}$/.test(bundle.sha256)) throw new Error();
-      this.bundle = Object.freeze({ ...bundle });
+      // Resolve a trusted package path once: Windows TEMP/npm paths can legitimately use 8.3 aliases.
+      // The executable itself must still be a regular non-link file, and every dispatch verifies it.
+      const supplied = fs.lstatSync(bundle.path);
+      if (!supplied.isFile() || supplied.isSymbolicLink() || supplied.nlink !== 1) throw new Error();
+      this.bundle = Object.freeze({ path: fs.realpathSync.native(bundle.path), sha256: bundle.sha256 });
     } catch (error) { if (error instanceof CredentialVaultError) throw error; throw new CredentialVaultError("unavailable"); }
   }
   private call(op: number, entries: readonly Entry[]): string | undefined {
@@ -71,7 +89,7 @@ export class WindowsDpapiCredentialVault implements CredentialVault {
       const info = fs.lstatSync(this.bundle.path);
       if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size < 1024 || info.size > 16 * 1024 * 1024
         || fs.realpathSync.native(this.bundle.path) !== path.resolve(this.bundle.path)
-        || createHash("sha256").update(fs.readFileSync(this.bundle.path)).digest("hex") !== this.bundle.sha256) throw new CredentialVaultError("unavailable");
+        || createHash("sha256").update(readBoundedFile(this.bundle.path, 16 * 1024 * 1024)).digest("hex") !== this.bundle.sha256) throw new CredentialVaultError("unavailable");
       request.writeUInt32LE(size, 0); request.write("HVQ1", 4, "ascii"); request[8] = op;
       nonce.copy(request, 9); this.namespace.copy(request, 25); request.writeUInt16LE(entries.length, 57);
       let offset = 59;

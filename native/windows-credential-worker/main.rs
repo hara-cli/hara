@@ -215,7 +215,7 @@ mod windows {
             if raw as isize == -1 { return if unsafe{GetLastError()}==2 {Ok(())}else{Err(CLEANUP_UNKNOWN)}; }
             let h=Owned(raw); info(h.0,false)?; self.sec.check(h.0)?; let deletion=1i32;
             if unsafe{SetFileInformationByHandle(h.0,4,(&deletion as *const i32).cast(),4)}==0 { return Err(CLEANUP_UNKNOWN); }
-            drop(h); if self.read(reference)?.is_some() { return Err(CLEANUP_UNKNOWN); } Ok(())
+            drop(h); if self.read(reference).map_err(|_|CLEANUP_UNKNOWN)?.is_some() { return Err(CLEANUP_UNKNOWN); } Ok(())
         }
     }
     fn dpapi(input:&[u8], entropy:&[u8], protect:bool) -> Result<Secret> { unsafe {
@@ -258,7 +258,7 @@ mod windows {
         match op {
             0=>{let cipher=dpapi(nonce,&store.entropy(b"probe"),true)?; let clear=dpapi(&cipher.0,&store.entropy(b"probe"),false)?; if clear.0.as_slice()!=nonce.as_slice() {return Err(UNAVAILABLE);} Ok(vec![])},
             1=>Ok(vec![store.read(entries[0].0)?]),
-            2|3=>{for (r,k) in entries {store.write(r,k)?;} Ok(vec![])},
+            2|3=>{for (i,(r,k)) in entries.into_iter().enumerate() {if let Err(code)=store.write(r,k) {return Err(if i>0{WRITE_UNKNOWN}else{code});}} Ok(vec![])},
             4=>{store.remove(entries[0].0)?; Ok(vec![])},
             _=>Err(INVALID)
         }
