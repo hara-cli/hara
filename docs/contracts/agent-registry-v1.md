@@ -46,7 +46,10 @@ refusal, not permission to fall back to an unversioned ag file.
 
 Agent records carry only agentId, instanceId, alias, displayName, engine,
 sessionSource, createdAt, registeredAt, lifecycle and state. Extra fields,
-accessors, nonplain objects and duplicate identities are rejected. No PID, cwd,
+accessors, nonplain objects and duplicate identities are rejected. In-process
+agent arrays must be dense ordinary arrays with enumerable data elements and no
+extra own fields; index getters and replacement collection methods are never
+invoked. No PID, cwd,
 argv, native thread ID, credentials, private controller ID or message preview
 cross this boundary.
 

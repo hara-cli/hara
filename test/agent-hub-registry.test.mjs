@@ -349,6 +349,25 @@ test("wire parser rejects extra fields, unsupported sources/statuses, accessors 
   assert.equal(parseManagedAgentRegistrySnapshot(emoji).agents[0].displayName, emoji.agents[0].displayName);
 });
 
+test("wire agent arrays reject accessors, sparse indices and collection overrides without invoking them", t => {
+  const { directory } = fixture(t); created(directory);
+  const good = directory.snapshot(); let effects = 0;
+  const accessor = structuredClone(good), entry = accessor.agents[0];
+  Object.defineProperty(accessor.agents, "0", { enumerable: true, get() { effects++; return entry; } });
+  const method = structuredClone(good);
+  method.agents.map = () => { effects++; return []; };
+  const sparse = structuredClone(good); delete sparse.agents[0];
+  const hidden = structuredClone(good);
+  Object.defineProperty(hidden.agents, "0", { enumerable: false, value: hidden.agents[0] });
+  const inherited = structuredClone(good); Object.setPrototypeOf(inherited.agents, Object.create(Array.prototype));
+  const symbol = structuredClone(good); symbol.agents[Symbol("extra")] = "not wire metadata";
+  for (const invalid of [accessor, method, sparse, hidden, inherited, symbol]) {
+    assert.throws(() => parseManagedAgentRegistrySnapshot(invalid), AgentHubError);
+    assert.equal(effects, 0);
+  }
+  assert.deepEqual(parseManagedAgentRegistrySnapshot(good), good);
+});
+
 test("docs/contracts lock and shared golden corpus match the actual exported parser", () => {
   const root = fileURLToPath(new URL("../", import.meta.url));
   const prefix = join(root, "docs/contracts/agent-registry-v1");

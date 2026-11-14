@@ -85,7 +85,16 @@ export function parseManagedAgentRegistrySnapshot(value: unknown): ManagedAgentR
   if (row.availability === "available") {
     if (!Number.isSafeInteger(row.revision) || Number(row.revision) < 0 || row.error !== null) return reject();
   } else if (row.availability !== "unavailable" || row.revision !== null || row.error !== "registry_unavailable" || row.agents.length) return reject();
-  const agents = row.agents.map(parseManagedAgentMetadata), ids = new Set(agents.map(agent => agent.agentId));
+  // Reflect on data slots before reading elements or invoking any caller-owned array method.
+  if (Object.getPrototypeOf(row.agents) !== Array.prototype
+    || Reflect.ownKeys(row.agents).length !== row.agents.length + 1) return reject();
+  const agents: ManagedAgentMetadataV1[] = [];
+  for (let index = 0; index < row.agents.length; index++) {
+    const field = Object.getOwnPropertyDescriptor(row.agents, String(index));
+    if (!field?.enumerable || !("value" in field)) return reject();
+    agents.push(parseManagedAgentMetadata(field.value));
+  }
+  const ids = new Set(agents.map(agent => agent.agentId));
   if (ids.size !== agents.length) return reject();
   const result = { contract: AGENT_REGISTRY_CONTRACT, schemaVersion: 1 as const, binding, source: "core-managed" as const,
     availability: row.availability as ManagedAgentRegistrySnapshotV1["availability"], revision: row.revision as number | null,
