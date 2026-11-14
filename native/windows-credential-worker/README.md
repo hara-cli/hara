@@ -27,3 +27,18 @@ References: [DPAPI](https://learn.microsoft.com/windows/win32/api/dpapi/nf-dpapi
 [handle rename](https://learn.microsoft.com/windows/win32/api/winbase/ns-winbase-file_rename_info),
 [reparse points](https://learn.microsoft.com/windows/win32/fileio/reparse-point-operations).
 No production Host switch is part of S1. Real Windows evidence + review precede S2 activation.
+
+
+## Activation handoff
+
+S1 canaries build the actual npm package and Core standalone, then call this adapter in a compiled
+Bun executable with a sibling worker. They do not claim a released Desktop installer or a production
+Host vault operation. S2 must make missing Windows worker artifacts a packaging error, feed the
+same source-bound Windows artifact into npm's Linux publication job, and include the worker beside
+the Desktop sidecar. The worker digest is baked into Bun at compile time; npm carries its generated
+protocol/target/digest manifest alongside the fixed binary. No PATH/config/discovery resolution.
+
+The Host factory, permission/generation fences, migration failure preservation, stable RPC errors,
+Linux explicit unsupported, descriptor and renderer separation are S2 gates. S1 does not modify the
+macOS vault or allow a renderer to pass a helper path. Installed-code integrity is the package/signing
+boundary; this does not claim to defend against an attacker who can replace the trusted Host code.

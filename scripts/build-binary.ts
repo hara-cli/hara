@@ -18,6 +18,7 @@ let windowsVaultSha: string | undefined;
 const windowsTarget = target?.startsWith("bun-windows-") || (!target && process.platform === "win32");
 const vaultRoot = "dist/native/win32-x64";
 if (windowsTarget && fs.existsSync(`${vaultRoot}/manifest.json`)) {
+  if (target && !/^bun-windows-x64(?:-baseline)?$/.test(target) || !target && process.arch !== "x64") throw new Error("Windows credential worker requires an x64 target");
   const manifest = JSON.parse(fs.readFileSync(`${vaultRoot}/manifest.json`, "utf8"));
   const binary = fs.readFileSync(`${vaultRoot}/hara-credential-worker.exe`);
   const digest = createHash("sha256").update(binary).digest("hex");
