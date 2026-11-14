@@ -58,7 +58,10 @@ Normative constraints beyond generic JSON Schema:
   prefix matches sessionSource. Non-runtime source equals engine; runtime
   supports codex or claude only. Unsupported future sources need review.
 - displayName is 1..160 UTF-16 code units, matching W0, with no C0/DEL or bidi
-  override/isolate controls. JSON Schema maxLength counts code points, so the
+  override/isolate controls. Unicode must be well formed: isolated UTF-16 high
+  or low surrogates are rejected, matching C0; valid astral pairs remain allowed.
+  The x-unicodeScalarValues annotation and golden cases also apply.
+  JSON Schema maxLength counts code points, so the
   x-maxUtf16CodeUnits annotation and golden boundary cases MUST also be enforced
   by a Python consumer (UTF-16-LE encoded byte length divided by two).
 - timestamps are canonical UTC ISO strings with three fractional digits and

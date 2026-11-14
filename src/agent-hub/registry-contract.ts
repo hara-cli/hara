@@ -30,7 +30,7 @@ export interface ManagedAgentRegistrySnapshotV1 {
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const HEX = /^[a-f0-9]{64}$/;
 const SESSION = /^ext_(codex|claude|opencode|runtime)_[a-f0-9]{24}$/;
-const LABEL = /^[^\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]+$/u;
+const LABEL = /^[^\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069\ud800-\udfff]+$/u;
 const reject = (): never => { throw new AgentHubError("invalid_request"); };
 
 /** Reject accessors/prototypes before reading values, including for in-process callers. */

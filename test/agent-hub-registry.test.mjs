@@ -291,6 +291,10 @@ test("untrusted launch labels fall back and whitespace activity prose is never p
   assert.match(directory.snapshot().agents[0].displayName, /^Codex /);
   created(directory, id("codex", 2), { displayName: "Completed; Jeff approved" });
   assert.equal(directory.snapshot().agents[1].state, "unknown");
+  for (const [number, label] of [[3, "\ud800"], [4, "\udc00"]]) {
+    created(directory, id("codex", number), { displayName: label });
+    assert.match(directory.snapshot().agents.find(agent => agent.agentId === id("codex", number)).displayName, /^Codex /);
+  }
 });
 
 test("registered metadata is detached and contains no send or human authority", t => {
@@ -334,6 +338,7 @@ test("wire parser rejects extra fields, unsupported sources/statuses, accessors 
     x => { x.availability = "unavailable"; }, x => { x.error = "private path"; }, x => { x.revision = -1; },
     x => { x.agents[0].displayName = "\u202eunsafe"; },
     x => { x.agents[0].displayName = "😀".repeat(81); },
+    x => { x.agents[0].displayName = "\ud800"; }, x => { x.agents[0].displayName = "\udc00"; },
     x => { x.agents = Array.from({ length: AGENT_REGISTRY_LIMITS.agents + 1 }, () => x.agents[0]); },
   ];
   for (const change of cases) {
@@ -381,6 +386,7 @@ test("docs/contracts lock and shared golden corpus match the actual exported par
   assert.equal(schema.properties.source.const, "core-managed");
   assert.equal(schema.$defs.agent.properties.state.const, "unknown");
   assert.equal(schema.properties.agents.maxItems, AGENT_REGISTRY_LIMITS.agents);
+  assert.equal(schema.$defs.agent.properties.displayName["x-unicodeScalarValues"], true);
   for (const sample of JSON.parse(readFileSync(prefix + ".fixtures.json", "utf8")).cases) {
     if (sample.accept) assert.doesNotThrow(() => parseManagedAgentRegistrySnapshot(sample.document), sample.name);
     else assert.throws(() => parseManagedAgentRegistrySnapshot(sample.document), AgentHubError, sample.name);

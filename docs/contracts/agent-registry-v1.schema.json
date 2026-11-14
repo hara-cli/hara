@@ -116,7 +116,8 @@
           "minLength": 1,
           "maxLength": 160,
           "x-maxUtf16CodeUnits": 160,
-          "pattern": "^[^\\u0000-\\u001f\\u007f\\u202a-\\u202e\\u2066-\\u2069]+$"
+          "pattern": "^[^\\u0000-\\u001f\\u007f\\u202a-\\u202e\\u2066-\\u2069]+$",
+          "x-unicodeScalarValues": true
         },
         "engine": {
           "enum": [

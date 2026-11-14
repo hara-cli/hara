@@ -664,6 +664,70 @@
         ],
         "error": null
       }
+    },
+    {
+      "name": "reject-display-name-unpaired-high-surrogate",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "\ud800",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "reject-display-name-unpaired-low-surrogate",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "\udc00",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": null
+      }
     }
   ]
 }
