@@ -63,7 +63,9 @@ test("malformed, ambiguous or oversized Runtime envelopes fail closed instead of
 test("ordinary provider HTTP errors keep their existing retry/failover and hint policy", () => {
   for (const [message, status, expected] of [["429", 429, "rate_limit"], ["503", 503, "overloaded"], ["529", 529, "overloaded"], ["network timeout", undefined, "timeout"], ["unrecognized provider failure", undefined, "unknown"]]) {
     assert.equal(classifyError(message, status), expected);
+    assert.equal(classifyError(message), expected, "plain provider text without HTTP metadata keeps its classification");
     assert.equal(failoverAction(expected, ready), "fallback");
+    if (["rate_limit", "overloaded"].includes(expected)) assert.match(errorHint(expected), expected === "rate_limit" ? /rate-limited/ : /provider overloaded/);
   }
   assert.match(errorHint("runtime_proxy"), /Workspace runtime proxy/);
 });
@@ -120,14 +122,17 @@ test("real agent recovery does not mistake Runtime prose for context/tool recove
 test("real agent still uses the configured compatible backup for an ordinary provider error", async t => {
   const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-provider-fallback-control-")));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  let fallbackCalls = 0;
-  const outcome = await runAgent([{ role: "user", content: "hello" }], {
-    provider: { id: "openai", model: "primary-fixture", async turn() { return { text: "", toolUses: [], stop: "error", errorMsg: "503" }; } },
-    fallback: { provider: { id: "backup", model: "backup-fixture", async turn() { fallbackCalls++; return { text: "hello", toolUses: [], stop: "end" }; } } },
-    approval: "full-auto", confirm: async () => true, quiet: true,
-    ctx: { cwd: root, ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice() {} } },
-  });
-  assert.equal(outcome.status, "completed"); assert.equal(fallbackCalls, 1);
+  for (const message of ["429", "503", "529"]) {
+    let primaryCalls = 0, fallbackCalls = 0;
+    const outcome = await runAgent([{ role: "user", content: "hello" }], {
+      provider: { id: "openai", model: "primary-fixture", async turn() { primaryCalls++; return { text: "", toolUses: [], stop: "error", errorMsg: message }; } },
+      fallback: { provider: { id: "backup", model: "backup-fixture", async turn() { fallbackCalls++; return { text: "hello", toolUses: [], stop: "end" }; } } },
+      approval: "full-auto", confirm: async () => true, quiet: true,
+      ctx: { cwd: root, ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice() {} } },
+    });
+    assert.equal(outcome.status, "completed", message);
+    assert.equal(primaryCalls, 1, message); assert.equal(fallbackCalls, 1, message);
+  }
 });
 
 for (const elapsed of [429, 503, 529]) test(`Host persists an intact blockReason without provider recovery for elapsedMs=${elapsed}`, async t => {
