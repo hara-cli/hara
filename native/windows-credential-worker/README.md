@@ -1,7 +1,8 @@
 # Hara Windows credential worker (S1; Host activation gated)
 
 Rust standard library + Windows system libraries only. Compile for x86_64-pc-windows-msvc;
-never build a worker on demand on a user's computer. No general encrypt/decrypt/file-path API.
+never build a worker on demand on a user's computer. The MSVC CRT is linked statically;
+the build records PE imports and rejects an external Visual C++ Redistributable dependency. No general encrypt/decrypt/file-path API.
 
 One length-prefixed binary request per process, bounded before allocation (8,500,000 bytes).
 `HVQ1`, operation byte (probe=0/get=1/set=2/setMany=3/remove=4), 16-byte nonce,

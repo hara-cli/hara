@@ -1,5 +1,5 @@
 //! Hara-only, one-request CurrentUser DPAPI worker. No CLI/path/env supplied storage roots.
-//! Build: rustc --edition=2021 -C opt-level=2 -C panic=abort -C strip=symbols main.rs
+//! Build: rustc --edition=2021 -C opt-level=2 -C target-feature=+crt-static -C panic=abort -C strip=symbols main.rs
 #![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 #[cfg(not(windows))]
 fn main() { std::process::exit(70); }
