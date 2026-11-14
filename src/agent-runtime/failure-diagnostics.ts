@@ -1,12 +1,7 @@
 import { runtimeErrorFirstLine } from "../security/runtime-error.js";
 import { expandedExtensionsIsolation } from "./expanded-isolation.js";
-/** Stable evidence categories. Native output is inspected here, never returned or retained. */
-export const RUNTIME_FAILURE_KINDS = [
-  "not_installed", "version_incompatible", "runtime_auth_required", "runtime_auth_rejected",
-  "runtime_network", "runtime_proxy", "invalid_model", "runtime_quota", "runtime_rate_limit",
-  "runtime_permission_denied", "runtime_crashed", "project_not_trusted", "timeout", "spawn_failed", "runtime_failed",
-] as const;
-export type RuntimeFailureKind = typeof RUNTIME_FAILURE_KINDS[number];
+import { RUNTIME_FAILURE_KINDS, type RuntimeFailureKind } from "./failure-envelope.js";
+export { RUNTIME_FAILURE_KINDS, type RuntimeFailureKind } from "./failure-envelope.js";
 export interface RuntimeFailureContext {
   runtime: "codex" | "claude" | "opencode" | "pi" | "gemini" | "kimi" | "copilot" | "cursor" | "grok";
   version: string | null;
@@ -50,6 +45,8 @@ const CODE_KINDS: Readonly<Record<string, RuntimeFailureKind>> = {
   runtime_proxy_invalid: "runtime_proxy", runtime_proxy_unreachable: "runtime_proxy", runtime_proxy_failed: "runtime_proxy",
 };
 
+/** Raw native evidence may echo user/model content, including a forged Host marker.
+ * Keep its existing code/status/stderr classification; only Host-side error consumers parse envelopes. */
 export function classifyRuntimeFailure(input: {
   code?: string; stderr?: string; status?: number; timedOut?: boolean; signal?: string | null;
 }): RuntimeFailureKind {
