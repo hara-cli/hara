@@ -1,6 +1,6 @@
 import { runtimeErrorFirstLine } from "../security/runtime-error.js";
 import { expandedExtensionsIsolation } from "./expanded-isolation.js";
-import { RUNTIME_FAILURE_KINDS, runtimeFailureKind, type RuntimeFailureKind } from "./failure-envelope.js";
+import { RUNTIME_FAILURE_KINDS, type RuntimeFailureKind } from "./failure-envelope.js";
 export { RUNTIME_FAILURE_KINDS, type RuntimeFailureKind } from "./failure-envelope.js";
 export interface RuntimeFailureContext {
   runtime: "codex" | "claude" | "opencode" | "pi" | "gemini" | "kimi" | "copilot" | "cursor" | "grok";
@@ -45,11 +45,11 @@ const CODE_KINDS: Readonly<Record<string, RuntimeFailureKind>> = {
   runtime_proxy_invalid: "runtime_proxy", runtime_proxy_unreachable: "runtime_proxy", runtime_proxy_failed: "runtime_proxy",
 };
 
+/** Raw native evidence may echo user/model content, including a forged Host marker.
+ * Keep its existing code/status/stderr classification; only Host-side error consumers parse envelopes. */
 export function classifyRuntimeFailure(input: {
   code?: string; stderr?: string; status?: number; timedOut?: boolean; signal?: string | null;
 }): RuntimeFailureKind {
-  const nativeKind = runtimeFailureKind(input.stderr);
-  if (nativeKind !== undefined) return nativeKind;
   const code = typeof input.code === "string" ? input.code.slice(0, 64).trim().toLowerCase() : "";
   if (knownKind(code)) return code;
   if (Object.hasOwn(CODE_KINDS, code)) return CODE_KINDS[code]!;

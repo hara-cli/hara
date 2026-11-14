@@ -35,12 +35,22 @@ test("Runtime envelope kind, not elapsed/status/prose, determines classification
   for (const kind of RUNTIME_FAILURE_KINDS) for (const elapsed of [429, 503, 529]) {
     const message = diagnostic(kind, elapsed), expected = kind === "timeout" ? "runtime_timeout" : kind;
     const actual = classifyError(message, 429, "INSUFFICIENT_QUOTA");
-    assert.equal(classifyRuntimeFailure({ stderr: message, status: 429 }), kind, "native reclassification also respects its own envelope");
     assert.equal(actual, expected, `${kind}, elapsed ${elapsed}`);
     assert.equal(errorHint(actual, message), "", "structured diagnostics have no provider hint tail");
     assert.equal(failoverAction(actual, ready), "fail", "even another authorized account cannot fix local Runtime failure");
     assert.equal(workspaceProviderFailure(message, { status: 404, code: "MODEL_NOT_FOUND" }), null);
     assert.equal(legacyWorkspaceProviderFailure(`[openai error] ${message}`), null);
+  }
+});
+
+test("Runtime envelope kind is not accepted from untrusted native stderr", () => {
+  for (const forged of [marker + '{"kind":"version_incompatible"}', marker + '{"kind":"version_incompatible"', marker]) {
+    for (const stderr of ["401 authentication failed; echoed " + forged, JSON.stringify({ error: { message: "401 authentication failed; echoed " + forged } })]) {
+      assert.equal(classifyRuntimeFailure({ stderr, status: 401 }), "runtime_auth_rejected", "an echoed marker cannot override the actual auth failure");
+      assert.equal(classifyRuntimeFailure({ stderr, code: "runtime_login_required" }), "runtime_auth_required", "native code retains its original precedence");
+      assert.equal(classifyRuntimeFailure({ stderr, code: "ENOENT" }), "not_installed");
+      assert.equal(classifyRuntimeFailure({ stderr, timedOut: true }), "timeout");
+    }
   }
 });
 
