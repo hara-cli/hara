@@ -48,6 +48,9 @@ jobs:
         run: |
           node scripts/build-windows-vault-worker.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc +1.92.0 --edition=2021 --target=x86_64-pc-windows-msvc native/windows-credential-worker/failure-fixture.rs -o "$env:RUNNER_TEMP/vault-failure-fixture.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "HARA_VAULT_FAILURE_FIXTURE=$env:RUNNER_TEMP/vault-failure-fixture.exe" >> $env:GITHUB_ENV
           rustc +1.92.0 --edition=2021 --target=x86_64-pc-windows-msvc --test native/windows-credential-worker/main.rs -o "$env:RUNNER_TEMP/vault-native-tests.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "$env:RUNNER_TEMP/vault-native-tests.exe" --test-threads=1 2>&1 | Tee-Object "$env:RUNNER_TEMP/vault-native-tests.log"
