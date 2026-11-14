@@ -1,4 +1,5 @@
 import { classifyError } from "../agent/failover.js";
+import { runtimeFailureKind } from "../agent-runtime/failure-envelope.js";
 import { providerErrorMetadata } from "../providers/retry.js";
 import type { Provider, ProviderErrorMetadata } from "../providers/types.js";
 import { isWorkspaceAgentId } from "./agent-binding.js";
@@ -9,6 +10,9 @@ import { exact, plain, positive, UUID, WorkspaceJsonState } from "./local-state.
 export const WORKSPACE_PROVIDER_FAILURES = ["connection_model_unavailable", "connection_auth_required", "connection_quota_exhausted", "connection_region_unavailable"] as const;
 export type WorkspaceProviderFailure = typeof WORKSPACE_PROVIDER_FAILURES[number];
 export function workspaceProviderFailure(message: string, metadata?: ProviderErrorMetadata): WorkspaceProviderFailure | null {
+  // Native diagnostics have their own recovery UX. Never infer connection/model/account
+  // failures from their JSON fields (or from a historical hint appended to that JSON).
+  if (runtimeFailureKind(message) !== undefined) return null;
   if (metadata?.status === 404) return "connection_model_unavailable";
   const kind = classifyError(message, metadata?.status, metadata?.code);
   if (kind === "quota_exhausted") return "connection_quota_exhausted";
