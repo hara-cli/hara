@@ -112,6 +112,7 @@ export class ManagedAgentRegistry implements AgentHubDirectory {
     }
   }
   private transaction(action: () => void): void {
+    this.current();
     this.options.globalQuota.run(() => withPrivateStateLockSync(this.options.home, this.namespace, "registry",
       () => { this.current(); action(); }, { attempts: 10, waitMs: 5 }));
   }

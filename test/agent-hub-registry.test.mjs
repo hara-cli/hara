@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID, createHash } from "node:crypto";
-import { mkdtempSync, realpathSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync, statSync } from "node:fs";
+import { mkdtempSync, realpathSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync, statSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -180,6 +180,15 @@ test("close immediately retires this controller even if adapter shutdown fails",
   assert.equal(directory.snapshot().availability, "unavailable");
   assert.throws(() => directory.registeredAgent(id()), AgentHubError);
   assert.equal(new ManagedAgentRegistry(options).snapshot().agents[0].lifecycle, "unknown");
+});
+
+test("revoked observation is refused before quota preparation or private storage IO", t => {
+  const { directory, home, revoke } = fixture(t);
+  assert.equal(existsSync(join(home, ".hara")), false);
+  revoke();
+  directory.recordCreated({ sessionId: id(), sessionSource: "codex", engine: "codex" });
+  assert.equal(directory.snapshot().availability, "unavailable");
+  assert.equal(existsSync(join(home, ".hara")), false);
 });
 
 test("scope/generation are isolated and revocation does not silently recover", t => {
