@@ -82,7 +82,8 @@ import {
 } from "./progress-watchdog.js";
 import { agentMaxRounds, agentRunTimeoutMs, formatAgentDuration, MAX_AGENT_MAX_ROUNDS } from "./limits.js";
 import { subdirHint } from "../context/subdir-hints.js";
-import { classifyError, failoverAction, errorHint, type ErrKind } from "./failover.js";
+import { classifyError, failoverAction, errorHint, providerObservationErrorKind, type ErrKind, type ProviderErrorKind } from "./failover.js";
+import { runtimeFailureKind } from "../agent-runtime/failure-envelope.js";
 import { currentTodos, type Todo } from "../tools/todo.js";
 import { drainReminders, wrapReminders, wrapTurnContext, isSystemReminderContent, pushReminder, synthesisReminder, SYNTHESIS_MIN_AGENTS } from "./reminders.js";
 import { coreDeferredToolsForHistory } from "./core-capabilities.js";
@@ -776,7 +777,7 @@ export interface RunRuntimeItemEvent {
   effect?: ToolOperationTraits["effect"];
   provider?: string;
   model?: string;
-  errorKind?: ErrKind;
+  errorKind?: ProviderErrorKind;
   generation?: number;
   inputTokens?: number;
   /** Cache-read share of `inputTokens`, when the provider reports it. */
@@ -784,9 +785,11 @@ export interface RunRuntimeItemEvent {
   outputTokens?: number;
 }
 
-function emitRuntimeItem(opts: RunOpts, event: Omit<RunRuntimeItemEvent, "at"> & { at?: string }): void {
+function emitRuntimeItem(opts: RunOpts, event: Omit<RunRuntimeItemEvent, "at" | "errorKind"> & { at?: string; errorKind?: ErrKind }): void {
   try {
-    opts.onRuntimeItem?.({ ...event, at: event.at ?? new Date().toISOString() });
+    const { errorKind, ...fields } = event;
+    opts.onRuntimeItem?.({ ...fields, at: event.at ?? new Date().toISOString(),
+      ...(errorKind ? { errorKind: providerObservationErrorKind(errorKind) } : {}) });
   } catch {
     // Item journaling is observability only and can never change provider or tool execution.
   }
@@ -825,7 +828,8 @@ const RUN_STOPPED = Symbol("agent-run-stopped");
 const REPEATED_FAILURE_LIMIT = 3;
 
 function recoverableMalformedToolCall(error: string | undefined): boolean {
-  return /(?:Tool call dropped — .*arguments were incomplete|Responses generation was incomplete)/iu.test(error ?? "");
+  return runtimeFailureKind(error) === undefined
+    && /(?:Tool call dropped — .*arguments were incomplete|Responses generation was incomplete)/iu.test(error ?? "");
 }
 
 interface RunLifecycle {
@@ -2571,7 +2575,7 @@ async function runAgentInner(
         }
         continue;
       }
-      const msg = kind === "interrupted" ? "(interrupted)" : `[${activeProvider.id} error] ${r.errorMsg ?? "unknown"}${errorHint(kind)}`;
+      const msg = kind === "interrupted" ? "(interrupted)" : `[${activeProvider.id} error] ${r.errorMsg ?? "unknown"}${errorHint(kind, r.errorMsg)}`;
       if (r.toolUses.length) {
         // A provider can fail after partially assembling tool calls. The assistant turn is already persisted;
         // close every call explicitly so the next request is valid, while never executing partial work.

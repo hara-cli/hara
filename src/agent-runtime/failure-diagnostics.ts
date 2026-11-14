@@ -1,12 +1,7 @@
 import { runtimeErrorFirstLine } from "../security/runtime-error.js";
 import { expandedExtensionsIsolation } from "./expanded-isolation.js";
-/** Stable evidence categories. Native output is inspected here, never returned or retained. */
-export const RUNTIME_FAILURE_KINDS = [
-  "not_installed", "version_incompatible", "runtime_auth_required", "runtime_auth_rejected",
-  "runtime_network", "runtime_proxy", "invalid_model", "runtime_quota", "runtime_rate_limit",
-  "runtime_permission_denied", "runtime_crashed", "project_not_trusted", "timeout", "spawn_failed", "runtime_failed",
-] as const;
-export type RuntimeFailureKind = typeof RUNTIME_FAILURE_KINDS[number];
+import { RUNTIME_FAILURE_KINDS, runtimeFailureKind, type RuntimeFailureKind } from "./failure-envelope.js";
+export { RUNTIME_FAILURE_KINDS, type RuntimeFailureKind } from "./failure-envelope.js";
 export interface RuntimeFailureContext {
   runtime: "codex" | "claude" | "opencode" | "pi" | "gemini" | "kimi" | "copilot" | "cursor" | "grok";
   version: string | null;
@@ -53,6 +48,8 @@ const CODE_KINDS: Readonly<Record<string, RuntimeFailureKind>> = {
 export function classifyRuntimeFailure(input: {
   code?: string; stderr?: string; status?: number; timedOut?: boolean; signal?: string | null;
 }): RuntimeFailureKind {
+  const nativeKind = runtimeFailureKind(input.stderr);
+  if (nativeKind !== undefined) return nativeKind;
   const code = typeof input.code === "string" ? input.code.slice(0, 64).trim().toLowerCase() : "";
   if (knownKind(code)) return code;
   if (Object.hasOwn(CODE_KINDS, code)) return CODE_KINDS[code]!;
