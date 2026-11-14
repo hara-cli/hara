@@ -1,0 +1,7 @@
+{
+  "contract": "hara.agent-registry.v1",
+  "schemaVersion": 1,
+  "sourceSha256": "1287f770dca2138731a24d013061cb70b8b1ce7b20fb551e3036049a77aa5d28",
+  "schemaSha256": "c0438ff5bbc6b4969992bc087e6535fb2d1c52e9cd495f98cda1e09f62899fe8",
+  "fixturesSha256": "ce9e98290593cbd2d2ec623caf6aedd5625fb61db8c079663983dc70099c6e96"
+}
