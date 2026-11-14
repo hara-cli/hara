@@ -66,9 +66,19 @@ async function bridge(t, extra = {}) {
 // Test-owned phases: runtime initialization has its existing RPC watchdog; only a started
 // human dispatch consumes this 10s total clock. Keep the same Host counters in interactive mode.
 async function phaseBoundBridge(t, extra = {}) {
-  const limits = { ...budget, ...extra.budget }, controller = new AbortController();
-  let armed = false, timer, closing;
-  const b = await bridge(t, { ...extra, budget: { ...limits, mode: "interactive" }, signal: controller.signal,
+  const limits = { ...budget, ...extra.budget }, controller = new AbortController(), provider = extra.provider;
+  assert.equal(typeof provider?.turn, "function");
+  assert.equal(provider.prepareTurn, undefined, "this frozen fixture has no preparation side effects");
+  let armed = false, timer, closing, b;
+  b = await bridge(t, { ...extra, budget: { ...limits, mode: "interactive" }, signal: controller.signal,
+    provider: { ...provider, async turn(args) {
+      // Match the bounded Host's pre-provider estimate, also bypassed by interactive mode.
+      const inputEstimate = Buffer.byteLength(JSON.stringify({ system: args.system, history: args.history, tools: args.tools }));
+      if (b.host.metrics.totalTokens + inputEstimate > limits.maxTokens) {
+        controller.abort(); throw new Error("Synthetic fixture input budget exhausted");
+      }
+      return provider.turn(args);
+    } },
     onProgress(metrics) {
       return armed && metrics.providerRounds <= limits.maxProviderRounds && metrics.toolCalls <= limits.maxToolCalls
         && metrics.totalTokens <= limits.maxTokens;
@@ -112,6 +122,10 @@ test("Pi fixture separates startup authority from dispatch while preserving its 
   const overBudget = await call(active).catch(() => null);
   assert.ok(overBudget === null || overBudget.status === 429); assert.equal(requests, 1);
   await active.close(); await assert.rejects(call(active));
+  const inputLimited = await phaseBoundBridge(t, { provider }); inputLimited.startDispatch();
+  const oversized = await call(inputLimited, { body: { ...body(), messages: [{ role: "user", content: "x".repeat(budget.maxTokens + 1) }] } }).catch(() => null);
+  assert.ok(oversized === null || oversized.status === 429); assert.equal(requests, 1, "oversized input never reaches the provider");
+  await inputLimited.close();
 });
 
 test("production Pi tools come from the pinned SDK and Host schemas; native batches consume budget before dispatch", async t => {
