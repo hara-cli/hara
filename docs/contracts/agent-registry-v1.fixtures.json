@@ -1,0 +1,733 @@
+{
+  "contract": "hara.agent-registry.v1",
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "name": "healthy-empty-is-not-unavailable",
+      "accept": true,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 0,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [],
+        "error": null
+      }
+    },
+    {
+      "name": "explicit-managed-codex",
+      "accept": true,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "lifecycle-unknown",
+      "accept": true,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "unknown",
+            "state": "unknown"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "lifecycle-ended",
+      "accept": true,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "ended",
+            "state": "unknown"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "source-unavailable-is-explicit",
+      "accept": true,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "unavailable",
+        "revision": null,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [],
+        "error": "registry_unavailable"
+      }
+    },
+    {
+      "name": "utf16-boundary-160",
+      "accept": true,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "no-tmux-source",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "tmux",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "no-source-b-field",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": null,
+        "tmux": true
+      }
+    },
+    {
+      "name": "no-inferred-busy",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "busy"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "no-input-state",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown",
+            "draft": "clear"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "no-raw-provider-id",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "native-session-secret",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "alias-must-match-id",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_222222222222222222222222",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "no-cross-engine-binding",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "claude",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "no-caller-authority",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": null,
+        "approved": true
+      }
+    },
+    {
+      "name": "no-native-pid-field",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown",
+            "pid": 123
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "no-private-controller-field",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown",
+            "controllerId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "canonical-calendar-required",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-02-31T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "duplicate-id-refused",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          },
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "unavailable-cannot-carry-agents",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "unavailable",
+        "revision": null,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": "registry_unavailable"
+      }
+    },
+    {
+      "name": "utf16-over-boundary",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "unsupported-version",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 2,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "Explicit builder",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "reject-display-name-unpaired-high-surrogate",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "\ud800",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "name": "reject-display-name-unpaired-low-surrogate",
+      "accept": false,
+      "document": {
+        "contract": "hara.agent-registry.v1",
+        "schemaVersion": 1,
+        "binding": {
+          "schemaVersion": 1,
+          "scopeKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": "bf343cb3-3dbb-4d1b-bb4c-e541341e7589"
+        },
+        "source": "core-managed",
+        "availability": "available",
+        "revision": 1,
+        "capturedAt": "2026-11-14T00:00:00.000Z",
+        "agents": [
+          {
+            "agentId": "ext_codex_111111111111111111111111",
+            "instanceId": "f118bcdb-d5ee-4ff8-bbed-43b381b20cbd",
+            "alias": "agent-ext_codex_111111111111111111111111",
+            "displayName": "\udc00",
+            "engine": "codex",
+            "sessionSource": "codex",
+            "createdAt": "2026-11-14T00:00:00.000Z",
+            "registeredAt": "2026-11-14T00:00:00.000Z",
+            "lifecycle": "registered",
+            "state": "unknown"
+          }
+        ],
+        "error": null
+      }
+    }
+  ]
+}
