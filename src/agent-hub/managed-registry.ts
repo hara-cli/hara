@@ -111,10 +111,10 @@ export class ManagedAgentRegistry implements AgentHubDirectory {
       catch (error) { this.options.globalQuota.uncertainMutation(); throw error; }
     }
   }
-  private transaction(action: () => void): void {
+  private transaction<T>(action: () => T): T {
     this.current();
-    this.options.globalQuota.run(() => withPrivateStateLockSync(this.options.home, this.namespace, "registry",
-      () => { this.current(); action(); }, { attempts: 10, waitMs: 5 }));
+    return this.options.globalQuota.run(() => withPrivateStateLockSync(this.options.home, this.namespace, "registry",
+      () => { this.current(); return action(); }, { attempts: 10, waitMs: 5 }));
   }
   private fence(): void { this.unavailable = true; this.active.clear(); }
   /** An observation failure is visible as unavailable; never retry native creation. */
@@ -128,7 +128,7 @@ export class ManagedAgentRegistry implements AgentHubDirectory {
     if (this.closed || this.unavailable) return;
     try {
       const instanceId = randomUUID();
-      this.transaction(() => {
+      const published = this.transaction(() => {
         const { value, text } = this.read(), previous = value.entries.find(entry => entry.agentId === input.sessionId);
         const now = this.timestamp();
         const metadata = parseManagedAgentMetadata({
@@ -137,15 +137,17 @@ export class ManagedAgentRegistry implements AgentHubDirectory {
           engine: input.engine, sessionSource: input.sessionSource,
           createdAt: previous?.createdAt ?? now, registeredAt: now, lifecycle: "registered", state: "unknown",
         });
-        if (!previous && value.entries.length >= AGENT_REGISTRY_LIMITS.agents) return fail();
+        // A full, healthy directory refuses this new identity, not existing sender grants.
+        if (!previous && value.entries.length >= AGENT_REGISTRY_LIMITS.agents) return false;
         const { lifecycle: _lifecycle, state: _state, ...stored } = metadata;
         value.entries = value.entries.filter(entry => entry.agentId !== stored.agentId);
         value.entries.push({ ...stored, controllerId: this.controllerId, ended: false });
         if (!Number.isSafeInteger(value.revision + 1)) return fail();
         value.revision++;
         this.write(value, text);
+        return true;
       });
-      this.active.set(input.sessionId, instanceId);
+      if (published) this.active.set(input.sessionId, instanceId);
     } catch { this.fence(); }
   }
   /** Capture before awaiting an explicit removal; a late result cannot retire a newer instance. */

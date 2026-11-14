@@ -191,6 +191,64 @@ test("revoked observation is refused before quota preparation or private storage
   assert.equal(existsSync(join(home, ".hara")), false);
 });
 
+test("registry capacity at 127/128/129 preserves existing registrations and W0 sender grants", async t => {
+  const { directory, home, file, quota, options } = fixture(t);
+  for (let n = 1; n <= 127; n++) directory.recordCreated({ sessionId: id("codex", n), sessionSource: "codex", engine: "codex" });
+  assert.equal(directory.snapshot().agents.length, 127);
+  const last = created(directory, id("codex", 128));
+  const full = directory.snapshot();
+  assert.equal(full.agents.length, 128);
+  assert.equal(full.availability, "available");
+  const hub = createC0AgentHubStore({ home, scopeKey, generation, directory, globalQuota: quota,
+    assertCurrent: options.assertCurrent });
+  const firstGrant = hub.issueGrant(id("codex", 1)), lastGrant = hub.issueGrant(last.agentId);
+  const before = sha(readFileSync(file));
+  const fake = adapters(); fake.result.session.id = id("codex", 129);
+  const registry = new ExternalSessionRegistry({ haraVersion: "test", adapters: [fake.adapter], managedAgents: directory });
+  assert.equal(await registry.createCodingSession({ agentKind: "codex", cwd: home }), fake.result);
+  assert.equal(fake.calls.length, 1);
+  const after = directory.snapshot();
+  assert.equal(after.availability, "available");
+  assert.equal(after.revision, full.revision);
+  assert.deepEqual(after.agents, full.agents);
+  assert.equal(sha(readFileSync(file)), before);
+  assert.equal(directory.registeredAgent(id("codex", 129)), null);
+  assert.throws(() => hub.issueGrant(id("codex", 129)), error => error.code === "registry_unavailable");
+  for (const grant of [firstGrant, lastGrant]) {
+    const receipt = hub.receive(grant.token, { requestId: randomUUID(), from: grant.from, text: "capacity does not revoke this sender", attachments: [] });
+    assert.equal(receipt.status, "saved");
+    assert.equal(hub.unread(grant.connectionId), 1);
+  }
+  assert.deepEqual(fake.forbidden, []);
+});
+
+test("registry capacity retains ended and previous-controller entries without disabling reads or replacements", t => {
+  const { directory, options, file } = fixture(t);
+  for (let n = 1; n <= 128; n++) directory.recordCreated({ sessionId: id("codex", n), sessionSource: "codex", engine: "codex" });
+  const first = directory.registeredAgent(id());
+  directory.recordRemoved(id(), directory.captureInstance(id()));
+  const ended = directory.snapshot();
+  assert.equal(ended.agents[0].lifecycle, "ended");
+  const before = sha(readFileSync(file));
+  directory.recordCreated({ sessionId: id("codex", 129), sessionSource: "codex", engine: "codex" });
+  assert.equal(directory.snapshot().availability, "available");
+  assert.deepEqual(directory.snapshot().agents, ended.agents);
+  assert.equal(sha(readFileSync(file)), before);
+  const restarted = new ManagedAgentRegistry(options);
+  restarted.recordCreated({ sessionId: id("codex", 129), sessionSource: "codex", engine: "codex" });
+  const retained = restarted.snapshot();
+  assert.equal(retained.availability, "available");
+  assert.equal(retained.agents.length, 128);
+  assert.equal(retained.agents.filter(agent => agent.lifecycle === "unknown").length, 127);
+  assert.equal(retained.agents.filter(agent => agent.lifecycle === "ended").length, 1);
+  assert.equal(sha(readFileSync(file)), before);
+  const replacement = created(restarted);
+  assert.notEqual(replacement.instanceId, first.instanceId);
+  assert.equal(restarted.snapshot().agents.length, 128);
+  assert.equal(restarted.snapshot().agents.find(agent => agent.agentId === id()).lifecycle, "registered");
+  assert.equal(directory.registeredAgent(id()), null);
+});
+
 test("scope/generation are isolated and revocation does not silently recover", t => {
   const { directory, options, revoke } = fixture(t); created(directory);
   const other = new ManagedAgentRegistry({ ...options, scopeKey: "b".repeat(64) });

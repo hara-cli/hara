@@ -18,6 +18,9 @@ can register a session by supplying this JSON.
 Only successful explicit createCodingSession/createSession and explicit Hara
 Live recovery creation publish launch metadata. The observer reads the opaque
 returned ID and explicit launch label, never provider title or messages. The
+label is the title argument supplied to that explicit creation API, not a title
+read from the provider result or history. It remains untrusted display metadata;
+its text does not prove that a human authored or approved the launch. The
 existing native operation is not retried if metadata publication fails: creation
 still returns its original result, while the directory becomes unavailable and
 refuses W0 sender grants. This avoids duplicating an already-created Agent.
@@ -81,6 +84,23 @@ turn. lifecycle=registered/ended/unknown is registration metadata, not idle,
 busy, waiting, draft, human approval or task completion. Proactive reporting
 belongs to the reviewed 1.3.x mailbox contract.
 
+## Capacity admission
+
+The 128-entry limit counts registered, ended and historical unknown records.
+At capacity, observing a new agentId refuses only that registration: the native
+creation still returns its original success once, the catalog/revision remain
+unchanged, and existing registrations and sender grants remain usable. The new
+identity is absent from registeredAgent and cannot receive a W0 sender grant.
+Callers must distinguish native creation success from registry admission and
+must not retry the creation to repair missing metadata.
+
+Explicit creation of an already-recorded agentId can still rotate its instance
+at capacity. Ended or previous-controller records are not silently evicted or
+pruned by age. Space for new identities requires a separately authorized bounded
+cleanup or a genuine new resource generation; no fake generation is created to
+escape this limit. Capacity refusal is not a storage/authority failure. Corrupt
+state, quota denial and uncertain publication still fence the entire directory.
+
 ## Storage and failure
 
 The small private catalog lives in the existing private Hara namespace under
@@ -93,7 +113,10 @@ Corrupt/missing/replaced state, authority failure, quota failure or publication
 uncertainty fences this object. It neither repairs from native history nor
 silently recovers when a missing file reappears. Host lifecycle may explicitly
 construct a new controller under current authority; that is not an ingress
-retry grant. All callbacks here are trusted Host ports, not request fields.
+retry grant. R1 cannot distinguish a file deleted between controllers from a
+never-created catalog: a fresh controller initially treats absence as empty. It
+does not claim cross-controller deletion detection or restore old sender grants.
+All callbacks here are trusted Host ports, not request fields.
 
 The schema parser proves syntax only. Neither a saved file, parsed JSON,
 lifecycle=registered, a Hub saved receipt nor an ag operations message proves
