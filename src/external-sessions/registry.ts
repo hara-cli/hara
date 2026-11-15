@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import type { ManagedAgentRegistry } from "../agent-hub/managed-registry.js";
 import { realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { AgyExternalSessionAdapter } from "./agy.js";
@@ -54,6 +55,8 @@ export interface ExternalSessionRegistryOptions {
   adapters?: ExternalSessionAdapter[];
   identityKey?: Buffer;
   identityHome?: string;
+  /** Host-owned source-A sink, never a renderer callback or a discovery adapter. */
+  managedAgents?: ManagedAgentRegistry;
   codex?: Partial<ExternalCommandOptions> & { managedDaemon?: boolean };
   claude?: Partial<ExternalCommandOptions>;
   opencode?: Partial<ExternalCommandOptions>;
@@ -84,8 +87,10 @@ export class ExternalSessionRegistry implements ExternalSessionService {
   private readonly adapters: Map<ExternalSessionSourceId, ExternalSessionAdapter>;
   private readonly cursors = new Map<string, CursorRecord>();
   private readonly writers = new Set<string>();
+  private readonly managedAgents?: ManagedAgentRegistry;
 
   constructor(options: ExternalSessionRegistryOptions) {
+    this.managedAgents = options.managedAgents;
     const adapters = options.adapters ?? (() => {
       const identityKey = options.identityKey ?? externalSessionIdentityKey(options.identityHome);
       const ownership = new ExternalSessionOwnershipStore(options.identityHome);
@@ -265,7 +270,7 @@ export class ExternalSessionRegistry implements ExternalSessionService {
     const adapter = this.adapters.get(input.sourceId);
     if (!adapter?.create) throw new ExternalSessionInputError("Hara Live runtime is unavailable");
     const providerAdapter = this.adapters.get(input.agentKind);
-    return await adapter.create({
+    const created = await adapter.create({
       cwd: input.cwd,
       agentKind: input.agentKind,
       ...(input.title !== undefined ? { title: input.title } : {}),
@@ -279,6 +284,8 @@ export class ExternalSessionRegistry implements ExternalSessionService {
         }),
       } : {}),
     });
+    this.observeManagedCreation(created, "runtime", input.agentKind, input.title);
+    return created;
   }
 
   async recoverRuntimeSession(input: ExternalRuntimeRecoverInput): Promise<ExternalSessionReadResult> {
@@ -294,7 +301,7 @@ export class ExternalSessionRegistry implements ExternalSessionService {
     if (!providerAdapter.prepareRuntimeContinuation) {
       throw new ExternalSessionInputError("this provider cannot restore a Hara Live terminal");
     }
-    return await runtimeAdapter.create({
+    const created = await runtimeAdapter.create({
       cwd: input.cwd,
       agentKind: input.agentKind,
       ...(input.title !== undefined ? { title: input.title } : {}),
@@ -309,6 +316,17 @@ export class ExternalSessionRegistry implements ExternalSessionService {
         });
       },
     });
+    this.observeManagedCreation(created, "runtime", input.agentKind, input.title);
+    return created;
+  }
+
+  private observeManagedCreation(
+    created: ExternalSessionReadResult, source: "runtime" | "codex" | "claude" | "opencode",
+    engine: "codex" | "claude" | "opencode", displayName?: string,
+  ): void {
+    if (!this.managedAgents) return;
+    try { this.managedAgents.recordCreated({ sessionId: created.session.id, sessionSource: source, engine, displayName }); }
+    catch { this.managedAgents.invalidate(); }
   }
 
   private codingInput(input: ExternalCodingSessionInput): ExternalCodingSessionInput {
@@ -330,7 +348,9 @@ export class ExternalSessionRegistry implements ExternalSessionService {
     const bounded = this.codingInput(input);
     const adapter = this.adapters.get(bounded.agentKind);
     if (!adapter?.createCodingSession) throw new ExternalSessionInputError("this provider cannot create a structured coding worker");
-    return await adapter.createCodingSession(bounded);
+    const created = await adapter.createCodingSession(bounded);
+    this.observeManagedCreation(created, bounded.agentKind, bounded.agentKind, bounded.title);
+    return created;
   }
 
   async resumeCodingSession(input: ExternalCodingSessionResumeInput): Promise<ExternalSessionReadResult> {
@@ -416,7 +436,9 @@ export class ExternalSessionRegistry implements ExternalSessionService {
     if (!adapter.remove) {
       throw new ExternalSessionInputError("this external session cannot be removed by Hara");
     }
+    const instance = this.managedAgents?.captureInstance(sessionId) ?? null;
     await adapter.remove(sessionId);
+    this.managedAgents?.recordRemoved(sessionId, instance);
   }
 
   async terminalSnapshot(sessionId: string): Promise<ExternalTerminalSnapshot> {
@@ -511,6 +533,7 @@ export class ExternalSessionRegistry implements ExternalSessionService {
   }
 
   async close(): Promise<void> {
+    this.managedAgents?.close();
     await Promise.all([...this.adapters.values()].map((adapter) => adapter.close?.() ?? Promise.resolve()));
   }
 }
