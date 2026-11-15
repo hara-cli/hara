@@ -114,7 +114,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, runtimePlatform: { writeProtection: runtimeWriteProtection(), permissionTiers: availableRuntimePermissionTiers() }, capabilities: [capability, ...(boundaryTransports ? ["workspace.agent-boundaries.authority.v1"] : []), ...(input.agentBoundaries?.commandControl ? ["workspace.agent-command-control.v1", "workspace.agent-command-receipt-lookup.v1"] : []), ...(input.agentBoundaries?.lifecycleControl ? ["workspace.agent-lifecycle.v1"] : []), ...(input.agentBoundaries?.routing ? ["workspace.agent-routing.v1"] : []), "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.default-runtime.v1", "workspace.onboarding.v1", "workspace.agents.create-batch.v1", "workspace.media.v1", "workspace.media.states.v1", "workspace.media.import.v1", "workspace.i18n.v1", "workspace.agents.archive.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId, runtimePlatform: { writeProtection: runtimeWriteProtection(), permissionTiers: availableRuntimePermissionTiers() }, capabilities: [capability, ...(boundaryTransports ? ["workspace.agent-boundaries.authority.v1"] : []), ...(input.agentBoundaries?.commandControl ? ["workspace.agent-command-control.v1", "workspace.agent-command-receipt-lookup.v1"] : []), ...(input.agentBoundaries?.lifecycleControl ? ["workspace.agent-lifecycle.v1"] : []), ...(input.agentBoundaries?.routing ? ["workspace.agent-routing.v1"] : []), "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.default-runtime.v1", "workspace.onboarding.v1", "workspace.agents.create-batch.v1", "workspace.media.v1", "workspace.media.states.v1", "workspace.media.import.v1", "workspace.i18n.v1", "workspace.agents.archive.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1", "workspace.connection-catalog.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     if (input.agentBoundaries?.commandControl || host.hasProtectedAgentCommands()) {
@@ -264,6 +264,18 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
         mediaImports.discard(client.id);
         throw error;
       }
+    }
+    if (method === "workspace.connection.catalog") {
+      if (input.mode !== "workspace") throw new Error("Connection catalog requires Workspace mode");
+      const optional = ["providerId", "documentedRef", "query", "cursor", "limit"].filter(key => Object.hasOwn(params, key));
+      fields(["workspaceId", "expectedGeneration", ...optional]);
+      return host.connectionCatalog(workspaceId, params.expectedGeneration, {
+        ...(Object.hasOwn(params, "providerId") ? { providerId: params.providerId } : {}),
+        ...(Object.hasOwn(params, "documentedRef") ? { documentedRef: params.documentedRef } : {}),
+        ...(Object.hasOwn(params, "query") ? { query: params.query } : {}),
+        ...(Object.hasOwn(params, "cursor") ? { cursor: params.cursor } : {}),
+        ...(Object.hasOwn(params, "limit") ? { limit: params.limit } : {}),
+      });
     }
     host.assertGeneration(workspaceId, params.expectedGeneration);
     if (method === "workspace.rename") { fields(["workspaceId", "expectedGeneration", "label", "expectedRevision"]);
