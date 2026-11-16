@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
+import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -54,8 +56,8 @@ function fixture(t) {
     const state = new WorkspaceResourceStorage(target, { schemaVersion: 1, workspaceId: `ws_${randomUUID()}`,
       authority: { kind: "local", localAuthorityId: randomUUID() } }); state.initialize(); return state;
   };
-  const host = legacy => new LocalWorkspaceHost(target, { mode: "workspace", hostHome: source,
-    ...(legacy ? { legacySourceHome: source } : {}), credentialVault: vault,
+  const host = (legacy, credentialVault = vault) => new LocalWorkspaceHost(target, { mode: "workspace", hostHome: source,
+    ...(legacy ? { legacySourceHome: source } : {}), credentialVault,
     providerFactory() { assert.fail("This regression must not invoke a model"); } });
   return { base, home, source, target, items, calls, vault, write, storage, host, victim };
 }
@@ -111,7 +113,7 @@ for (const [name, createSource] of Object.entries(legacySources)) {
     const f = fixture(t), file = createSource(f), bytes = fs.readFileSync(file), before = snapshot(f.items);
     const catalog = new LegacyConnectionCatalog(f.source, f.vault), candidates = catalog.list().filter(row => row.keySaved);
     assert.equal(candidates.length, 1); assert.equal(f.calls.length, 0);
-    assert.throws(() => catalog.resolve(candidates[0].id), { message: "Invalid credential reference" });
+    assert.throws(() => catalog.resolve(candidates[0].id), { message: "Old credential unavailable; original preserved" });
     assert.equal(f.calls.length, 0); unchanged(f, before); assert.deepEqual(fs.readFileSync(file), bytes);
   });
 }
@@ -121,7 +123,7 @@ test("Host confirmed old-connection import refuses the ambiguous credential with
     const created = host.createWorkspace("Fixture", host.list().revision);
     const file = legacySources.personal(f), bytes = fs.readFileSync(file), before = snapshot(f.items), state = host.snapshot(created.workspaceId).connections;
     const [source] = host.legacyConnections(created.workspaceId); assert.ok(source?.keySaved);
-    assert.throws(() => host.importConnection(created.workspaceId, source.id, state.revision, true), { message: "Invalid credential reference" });
+    assert.throws(() => host.importConnection(created.workspaceId, source.id, state.revision, true), { message: "Old credential unavailable; original preserved" });
     assert.deepEqual(host.snapshot(created.workspaceId).connections, state); assert.equal(f.calls.length, 0);
     unchanged(f, before); assert.deepEqual(fs.readFileSync(file), bytes);
   } finally { await host.close(); }
@@ -131,7 +133,7 @@ test("Host old-connection migration retry stays pending without reading or copyi
   try {
     const created = host.createWorkspace("Fixture", host.list().revision), state = created.connections;
     assert.equal(state.migrationPending, true); assert.equal(f.calls.length, 0);
-    assert.throws(() => host.retryConnectionMigration(created.workspaceId, state.revision, true), { message: "Invalid credential reference" });
+    assert.throws(() => host.retryConnectionMigration(created.workspaceId, state.revision, true), { message: "Old credential unavailable; original preserved" });
     assert.deepEqual(host.snapshot(created.workspaceId).connections, state); assert.equal(f.calls.length, 0);
     unchanged(f, before); assert.deepEqual(fs.readFileSync(file), bytes);
   } finally { await host.close(); }
@@ -181,4 +183,106 @@ test("inheritance rollback removes only generated refs and preserves original so
   assert.equal(f.vault.get(originalRef), fakeKey); assert.equal(f.items.get(ambiguous), f.victim);
   for (const [account, value] of original.items) assert.equal(f.items.get(account), value);
   assert.deepEqual(fs.readFileSync(original.file), original.bytes); assert.equal(domain.connections.list().connections.length, 0);
+});
+
+// This backend deliberately has no Mac ref validation. Removing the legacy guard must fail these
+// tests even while the real Mac vault boundary remains protected by the direct-entry tests above.
+function unguardedVault(f) {
+  const values = new Map([[ambiguous, f.victim]]), gets = [], writes = [], removes = [];
+  const vault = {
+    get(ref) { gets.push(ref); return values.get(ref); },
+    set(ref, key) { writes.push(ref); values.set(ref, key); },
+    setMany(entries) { for (const { ref, key } of entries) { writes.push(ref); values.set(ref, key); } },
+    remove(ref) { removes.push(ref); values.delete(ref); },
+  };
+  return { vault, values, gets, writes, removes };
+}
+const unavailableLegacy = { message: "Old credential unavailable; original preserved" };
+for (const [name, createSource] of Object.entries(legacySources)) {
+  test(`legacy reader independent of Mac guard rejects the ${name} source before calling its vault`, t => {
+    const f = fixture(t), backend = unguardedVault(f), file = createSource(f), bytes = fs.readFileSync(file);
+    const before = snapshot(backend.values), catalog = new LegacyConnectionCatalog(f.source, backend.vault);
+    const [row] = catalog.list().filter(item => item.keySaved); assert.ok(row);
+    assert.throws(() => catalog.resolve(row.id), unavailableLegacy);
+    assert.deepEqual(backend.gets, []); assert.deepEqual(backend.writes, []); assert.deepEqual(backend.removes, []);
+    assert.deepEqual(snapshot(backend.values), before); assert.deepEqual(fs.readFileSync(file), bytes);
+  });
+}
+test("legacy reader validates every declared keyRef before plaintext precedence or any vault call", t => {
+  const f = fixture(t), backend = unguardedVault(f), catalog = new LegacyConnectionCatalog(f.source, backend.vault);
+  for (const keyRef of [ambiguous, "", "bad/ref", "bad\nref", "x".repeat(241), null, 1, {}, []]) {
+    const file = f.write(".hara/config.json", { ...connection, keyRef, apiKey: fakeKey }), bytes = fs.readFileSync(file);
+    const [row] = catalog.list(); assert.ok(row?.keySaved);
+    assert.throws(() => catalog.resolve(row.id), unavailableLegacy);
+    assert.deepEqual(backend.gets, []); assert.deepEqual(backend.writes, []); assert.deepEqual(fs.readFileSync(file), bytes);
+  }
+});
+test("legacy reader retains qualified refs, ordinary legacy refs, inline keys and keyless-source behavior", t => {
+  const f = fixture(t), backend = unguardedVault(f), catalog = new LegacyConnectionCatalog(f.source, backend.vault);
+  for (const keyRef of [originalRef, "ordinary-legacy", "x".repeat(240)]) {
+    backend.values.set(keyRef, fakeKey); f.write(".hara/config.json", { ...connection, keyRef });
+    const [row] = catalog.list(); assert.equal(catalog.resolve(row.id).input.apiKey, fakeKey); assert.equal(backend.gets.at(-1), keyRef);
+  }
+  const before = backend.gets.length;
+  f.write(".hara/config.json", { ...connection, apiKey: fakeKey });
+  assert.equal(catalog.resolve(catalog.list()[0].id).input.apiKey, fakeKey); assert.equal(backend.gets.length, before);
+  f.write(".hara/config.json", connection);
+  assert.throws(() => catalog.resolve(catalog.list()[0].id), unavailableLegacy); assert.equal(backend.gets.length, before);
+});
+async function oldEndpoint(t) {
+  let requests = 0;
+  const server = http.createServer((_request, response) => {
+    requests++; response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ data: [{ id: "gpt-5.6-sol" }] }));
+  });
+  server.listen(0, "127.0.0.1"); await once(server, "listening");
+  t.after(async () => { const closed = once(server, "close"); server.close(); server.closeAllConnections(); await closed; });
+  return { baseURL: `http://127.0.0.1:${server.address().port}/v1`, requests: () => requests };
+}
+async function probeOldConnection(host, workspaceId) {
+  const view = host.snapshot(workspaceId); assert.ok(view.selectedAgentId);
+  const id = view.connections.connections.find(row => row.status === "active")?.id ?? "mc_00000000-0000-4000-8000-000000000000";
+  try { return await host.listConnectionModels(workspaceId, view.selectedAgentId, id); } catch { return null; }
+}
+for (const entry of ["import", "migration", "inheritance"]) for (const inline of [false, true]) {
+  test(`old-endpoint ${entry} sends nothing for a bare ref with an unguarded vault${inline ? " even beside an inline key" : ""}`, async t => {
+    const f = fixture(t), backend = unguardedVault(f), endpoint = await oldEndpoint(t);
+    const row = { ...connection, baseURL: endpoint.baseURL, keyRef: ambiguous, ...(inline ? { apiKey: fakeKey } : {}) };
+    if (entry !== "import") f.write(".hara/config.json", row);
+    const host = f.host(entry === "inheritance", backend.vault), before = snapshot(backend.values);
+    let workspaceId, failure, result, file;
+    try {
+      if (entry === "inheritance") {
+        file = join(f.source, ".hara/config.json"); result = await host.initialize(); workspaceId = host.list().workspaces[0].workspaceId;
+      } else {
+        const created = host.createWorkspace("Fixture", host.list().revision); workspaceId = created.workspaceId;
+        if (entry === "import") {
+          file = f.write(".hara/config.json", row); const [source] = host.legacyConnections(workspaceId);
+          try { host.importConnection(workspaceId, source.id, created.connections.revision, true); } catch (error) { failure = error; }
+        } else {
+          file = join(f.source, ".hara/config.json"); assert.equal(created.connections.migrationPending, true);
+          try { host.retryConnectionMigration(workspaceId, created.connections.revision, true); } catch (error) { failure = error; }
+        }
+      }
+      // Exercise the real model-list sink after the attempted operation. Without the reader guard,
+      // the permissive backend enables a saved connection and this loopback endpoint sees its key.
+      const probe = await probeOldConnection(host, workspaceId); assert.equal(endpoint.requests(), 0); assert.equal(probe, null);
+      if (entry === "inheritance") { assert.equal(result.state, "pending"); assert.equal(result.reason, "legacy_inheritance_requires_review"); }
+      else assert.equal(failure?.message, unavailableLegacy.message);
+      assert.deepEqual(backend.gets, []); assert.deepEqual(backend.writes, []); assert.deepEqual(backend.removes, []);
+      assert.deepEqual(snapshot(backend.values), before); assert.deepEqual(JSON.parse(fs.readFileSync(file)), row);
+      assert.equal(host.snapshot(workspaceId).connections.connections.some(row => row.keySaved), false);
+    } finally { await host.close(); }
+  });
+}
+test("old-endpoint positive control accepts a qualified legacy ref and reaches only the fixture endpoint", async t => {
+  const f = fixture(t), backend = unguardedVault(f), endpoint = await oldEndpoint(t), host = f.host(false, backend.vault);
+  backend.values.set(originalRef, fakeKey);
+  try {
+    const created = host.createWorkspace("Fixture", host.list().revision);
+    f.write(".hara/config.json", { ...connection, baseURL: endpoint.baseURL, keyRef: originalRef });
+    const [source] = host.legacyConnections(created.workspaceId);
+    host.importConnection(created.workspaceId, source.id, created.connections.revision, true);
+    assert.equal((await probeOldConnection(host, created.workspaceId))?.source, "live"); assert.equal(endpoint.requests(), 1);
+  } finally { await host.close(); }
 });
