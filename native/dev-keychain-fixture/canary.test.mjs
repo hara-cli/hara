@@ -6,8 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { inspectFormalSidecar } from "../native/dev-keychain-fixture/guards.mjs";
-import { FixtureError } from "../native/dev-keychain-fixture/protocol.mjs";
+import { inspectFormalSidecar } from "./guards.mjs";
+import { FixtureError } from "./protocol.mjs";
 const sha = bytes => createHash("sha256").update(bytes).digest("hex");
 test("selected Bun's actual clean/Dev canaries qualify the artifact scanner", t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "hara-k1-canary-"));

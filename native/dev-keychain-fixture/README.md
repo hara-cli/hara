@@ -23,10 +23,12 @@ The formal vault/default Host expressions and installed Dev entry are unchanged.
   Format recognition is only a prerequisite for this namespace scan; existing
   architecture, provenance and signing checks remain separate requirements.
 
-Run the five `test/dev-keychain-k1-*.test.mjs` files using the repository's
+Run the four `test/dev-keychain-k1-*.test.mjs` files using the repository's
 isolated-home setup. Native codec tests need macOS/Xcode Command Line Tools;
-canary tests use the selected Bun to compile tiny synthetic binaries, never run
-or sign them. On macOS the native tests also check that the probe has no Security
+run `native/dev-keychain-fixture/canary.test.mjs` explicitly with Node and the
+approved Bun on PATH. The canary is outside the normal npm test glob so Node-only
+CI does not acquire a new Bun dependency. It compiles tiny synthetic binaries, never runs
+or signs them. On macOS the native tests also check that the probe has no Security
 imports/dependency, and that compilation without `K1_FAKE_ONLY` fails. No npm
 packages or external frameworks are added.
 
