@@ -22,7 +22,12 @@ export class MacKeychainCredentialVault implements CredentialVault {
       stdio: ["pipe", "pipe", "pipe"], env: { HOME: this.home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" } }); }
     catch { throw new Error("OS credential operation could not start; original settings preserved"); }
   }
-  private ref(ref: string) { if (!/^[a-zA-Z0-9_.:-]{1,240}$/.test(ref)) throw new Error("Invalid credential reference"); return ref; }
+  private ref(ref: string) {
+    // A bare vault.* legacy account aliases another scope's grouped item. Never touch either
+    // namespace (including its lock) when the item type cannot be distinguished safely.
+    if (!/^[a-zA-Z0-9_.:-]{1,240}$/.test(ref) || ref.startsWith("vault.") && !ref.includes(":")) throw new Error("Invalid credential reference");
+    return ref;
+  }
   private account(ref: string) { return `vault.${this.ref(ref).split(":")[0]}`; }
   private group(ref: string): Record<string, string> {
     const result = this.run(["find-generic-password", "-s", WORKSPACE_CREDENTIAL_SERVICE, "-a", this.account(ref), "-w"]);
