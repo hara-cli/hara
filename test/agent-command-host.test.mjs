@@ -1,4 +1,5 @@
 import test from "node:test";
+import { untilObserved } from "./helpers/observable-wait.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { tmpdir } from "node:os";
@@ -27,13 +28,9 @@ async function connect(handle) {
     pending.set(id, { resolve, reject, timer }); socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
   }); }, async close() { if (socket.readyState === WebSocket.CLOSED) return; const closed = once(socket, "close"); socket.close(); await closed; } };
 }
-async function until(read) {
-  // Actual governed IO completes around 20s with four concurrent security suites on this host.
-  // This observation window does not change command/runtime budgets or any safety assertion.
-  const end = Date.now() + 30000;
-  while (Date.now() < end) { const value = await read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 100)); }
-  throw new Error("C3 observable state deadline");
-}
+// Actual governed IO completes around 20s with four concurrent security suites on this host. The
+// observation window (see helpers/observable-wait.mjs) never changes command/runtime budgets or assertions.
+const until = (read, progress) => untilObserved(read, { label: "C3", progress });
 async function fixture(t, input = {}) {
   const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-c3-host-"))), ownerCredential = randomBytes(32).toString("hex");
   let calls = 0, providers = 0;
@@ -77,7 +74,11 @@ test("C3 actual WS Host combines C1, persisted C3, C2 and RunPermit for a scoped
   const d = await f.dispatch(), accepted = await f.submit(d.command, d.message);
   assert.equal(accepted.commandId, d.command.commandId); assert.equal(accepted.status, "accepted");
   let lastReceipt, drained;
-  try { drained = await until(async () => { lastReceipt = await f.receipt(d.command); return lastReceipt.execution.drain === "observed" && lastReceipt; }); }
+  // Progress: the receipt plus the conversation's revision, state and runtime stages change several times
+  // during the real native run; a run that stops changing still fails after the idle window.
+  const progress = async () => { const c = (await f.snapshot()).conversation;
+    return JSON.stringify([lastReceipt, c.revision, c.state, c.runtimeStages, c.history.length]); };
+  try { drained = await until(async () => { lastReceipt = await f.receipt(d.command); return lastReceipt.execution.drain === "observed" && lastReceipt; }, progress); }
   catch (error) { throw new Error(`${error.message}; last receipt ${JSON.stringify(lastReceipt)}; control ${JSON.stringify(await f.inspect())}`); }
   assert.equal(drained.execution.effect, "completed"); assert.equal(drained.status, "drained");
   const snapshot = await f.snapshot(); assert.equal(snapshot.conversation.taskState, "completed");
@@ -181,4 +182,20 @@ test("C3 onboarding metadata and batch creation keep the legacy-entry default de
   const peer = new LocalWorkspaceHost(f.root); t.after(() => peer.close());
   assert.throws(() => peer.createAgentBatch("untrusted-view", f.params.workspaceId, { runId: randomUUID(), rows: [] }, before.agentRevision), error => error.code === "RUNTIME_UNSUPPORTED");
   assert.equal((await f.snapshot()).agentRevision, before.agentRevision); assert.equal(f.providers(), 0);
+});
+
+
+test("C5 M1 real WS lookup authenticates despite advertised capability and observes an unseen ID without submitting", async t => {
+  const f = await fixture(t), id = randomUUID();
+  assert.ok(f.init.capabilities.includes("workspace.agent-command-receipt-lookup.v1"));
+  const guest = await f.open();
+  // C3 protects initialization itself, stronger than the earlier C1-only capability advertisement.
+  await assert.rejects(guest.request("initialize", { token: f.handle.token, source: "local_human",
+    clientCapabilities: ["workspace.agent-command-receipt-lookup.v1"] }), boundaryCode("AUTHORITY_UNVERIFIED"));
+  const before = await f.inspect(), value = await f.owner.request("workspace.boundaries.control.lookup", { ...f.params, commandId: id });
+  assert.equal(value.state, "not_seen"); assert.equal(value.receipt, null); assert.equal(value.commandId, id);
+  assert.equal(value.agentId, f.params.agentId); assert.ok(Number.isSafeInteger(Date.parse(value.observedAt)));
+  assert.deepEqual(await f.inspect(), before); assert.equal(f.providers(), 0); assert.equal(f.calls(), 0);
+  await assert.rejects(f.owner.request("workspace.boundaries.control.lookup", { ...f.params, commandId: id, approved: true }), error => error.message === "unsupported Workspace RPC fields");
+  assert.deepEqual(await f.inspect(), before); assert.equal(f.providers(), 0); assert.equal(f.calls(), 0);
 });

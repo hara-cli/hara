@@ -17,6 +17,7 @@ import { parseWorkspaceAssistantPreview, type WorkspaceAssistantPreview } from "
 import { MessageTimingRecorder, type MessageTimingIdentity, type MessageTimingInput, type MessageTimingReport } from "./message-timing.js";
 import { WorkspaceMessageTimingStore } from "./message-timing-store.js";
 import { connectionForObjective } from "./connection-effort.js";
+import { queryConnectionCatalog, type ConnectionCatalogQuery } from "./connection-catalog.js";
 import { WorkspaceMcpOwnerReview, type McpOwnerContext } from "./extension-owner-review.js";
 import { McpOwnerReviewError } from "./extension-review-store.js";
 import { readHostWorkspaceMcpLaunch, type WorkspaceMcpLaunchProvider } from "./extension-candidate.js";
@@ -385,6 +386,9 @@ export class LocalWorkspaceHost {
     const control = this.commandAuthority(transport, workspaceId); control.initialize(transport!);
     if (this.options.boundaryLifecycleControl) control.initializeLifecycle(transport!);
     this.kickLifecycleObserver(); return control.inspect(transport!, agentId);
+  }
+  agentCommandReceiptLookup(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string, commandId: string) {
+    return this.commandAuthority(transport, workspaceId).lookupReceipt(transport!, agentId, commandId);
   }
   agentCommandReceipt(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string, commandId: string) {
     return this.commandAuthority(transport, workspaceId).readReceipt(transport!, agentId, commandId);
@@ -1142,6 +1146,26 @@ export class LocalWorkspaceHost {
       throw new Error("Connection changed; refresh model list");
     return { connectionId, revision: view.revision, source: catalog.source, selectedModelId: row.defaultModel,
       selectedEffort: connection.defaultReasoning ?? null, models: catalog.models };
+  }
+  async connectionCatalog(workspaceId: string, expectedGeneration: unknown, query?: ConnectionCatalogQuery) {
+    if (this.options.mode !== "workspace") throw new Error("Connection catalog requires Workspace mode");
+    const found = this.contexts.get(workspaceId);
+    // Reading the offline catalog must never initialize an unopened workspace or trigger legacy pre-fill.
+    if (!found) {
+      this.catalog.resolve(workspaceId);
+      throw new Error("Workspace must be opened before reading connection catalog");
+    }
+    const assertOpenGeneration = () => {
+      if (this.closing || this.contexts.get(workspaceId) !== found) throw new Error("Workspace catalog view changed; refresh");
+      const current = found.storage.run(() => currentWorkspaceResourceBinding()!.generation);
+      if (typeof expectedGeneration !== "string" || expectedGeneration !== current) {
+        throw new Error("Workspace resource generation changed; refresh before acting");
+      }
+    };
+    assertOpenGeneration();
+    const result = await queryConnectionCatalog(query);
+    assertOpenGeneration();
+    return result;
   }
   selectConnection(workspaceId: string, id: string, expected: number, modelId?: string, effort?: string | null) {
     const store = this.context(workspaceId).connections;

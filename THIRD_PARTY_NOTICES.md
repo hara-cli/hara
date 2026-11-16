@@ -162,3 +162,13 @@ and the reproducible generator are retained with the source.
 - Upstream: https://github.com/BYVoid/OpenCC
 - Copyright: OpenCC contributors (BYVoid / Carbo Kuo and contributors)
 - License: Apache-2.0; the full Apache License, Version 2.0 is in this repository's `LICENSE`.
+
+## Windows credential worker
+
+The prebuilt Windows credential worker includes the Rust 1.92.0 standard library,
+Copyright (c) The Rust Project Contributors, used under Apache-2.0. The full Apache License,
+Version 2.0 is included in this repository's `LICENSE`.
+
+- Source and attribution: https://github.com/rust-lang/rust/blob/1.92.0/COPYRIGHT
+- License: https://github.com/rust-lang/rust/blob/1.92.0/LICENSE-APACHE
+- Hara uses Windows system DPAPI for encryption; no external cryptography library is bundled.

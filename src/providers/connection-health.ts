@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { classifyError, type ErrKind } from "../agent/failover.js";
+import { classifyError, providerObservationErrorKind, type ErrKind, type ProviderErrorKind } from "../agent/failover.js";
 import { contextWindow } from "../statusbar.js";
 import { classifyVision } from "../vision.js";
 import { providerAccounting, type ProviderAccountingDescriptor } from "./accounting.js";
@@ -47,7 +47,7 @@ export interface ProviderConnectionHealthSnapshot {
   lastCheckedAt?: string;
   lastSuccessAt?: string;
   lastFailureAt?: string;
-  lastFailureKind?: ErrKind;
+  lastFailureKind?: ProviderErrorKind;
   retryAt?: string;
 }
 
@@ -58,7 +58,7 @@ interface MutableHealth {
   lastCheckedAt?: number;
   lastSuccessAt?: number;
   lastFailureAt?: number;
-  lastFailureKind?: ErrKind;
+  lastFailureKind?: ProviderErrorKind;
   retryAt?: number;
   probeInFlight: boolean;
 }
@@ -251,7 +251,7 @@ export class ProviderConnectionCircuitRegistry {
       consecutiveFailures: failures,
       lastCheckedAt: now,
       lastFailureAt: now,
-      lastFailureKind: kind,
+      lastFailureKind: providerObservationErrorKind(kind),
       ...(previous?.lastSuccessAt !== undefined ? { lastSuccessAt: previous.lastSuccessAt } : {}),
       ...(opened ? { retryAt: now + openDurationMs(kind, failures, retryAfterMs) } : {}),
       probeInFlight: false,

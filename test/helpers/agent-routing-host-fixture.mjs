@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { untilObserved } from "./observable-wait.mjs";
 import fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,11 +28,7 @@ export async function routingConnect(handle) {
     pending.set(id, { resolve, reject, timer }); socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
   }); }, async close() { if (socket.readyState === WebSocket.CLOSED) return; const closed = once(socket, "close"); socket.close(); await closed; } };
 }
-export async function routingUntil(read) {
-  const end = Date.now() + 30000;
-  while (Date.now() < end) { const value = await read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 50)); }
-  throw new Error("C6 observable state deadline");
-}
+export const routingUntil = (read, progress) => untilObserved(read, { label: "C6", progress, intervalMs: 50 });
 /** Actual WS/Host/C1/C2/C3/C4. Only providers and initial personal setup are synthetic. */
 export async function routingHostFixture(t, input = {}) {
   const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-c6-host-"))), ownerCredential = randomBytes(32).toString("hex");

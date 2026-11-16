@@ -3,7 +3,10 @@
 // overflow once with a tighter bounded snapshot; this module then decides whether a remaining error may
 // advance to another authorized connection.
 
-export type ErrKind =
+import { isRuntimeFailureKind, runtimeFailureKind, type RuntimeFailureKind } from "../agent-runtime/failure-envelope.js";
+
+/** Existing content-free observation vocabulary; keep session/runtime-item DTOs unchanged. */
+export type ProviderErrorKind =
   | "runtime_proxy"
   | "context_overflow"
   | "quota_exhausted"
@@ -17,6 +20,18 @@ export type ErrKind =
   | "interrupted"
   | "unknown";
 
+// Local Runtime categories never enter provider retry/failover sets. Native timeout has a
+// separate internal tag so it cannot inherit the HTTP/network timeout replay policy.
+export type ErrKind = ProviderErrorKind | Exclude<RuntimeFailureKind, "timeout"> | "runtime_timeout";
+
+/** A legacy event can observe a generic error without granting its internal recovery policy.
+ * Detailed native kinds remain in the unchanged Runtime diagnostic/stage DTOs. */
+export function providerObservationErrorKind(kind: ErrKind): ProviderErrorKind {
+  if (kind === "runtime_timeout") return "unknown";
+  if (isRuntimeFailureKind(kind)) return kind === "runtime_proxy" || kind === "timeout" ? kind : "unknown";
+  return kind;
+}
+
 function requestWindowQuota(message: string): boolean {
   return /\b(?:requests?|tokens?).{0,50}\b(?:per|minute|hour|day|second|quota|limit)\b|\b(?:rpm|tpm|rpd|tpd)\b|(?:每.{0,8}(?:秒|分钟|分鐘|小时|小時|天)|请求速率|請求速率)/.test(message);
 }
@@ -29,9 +44,11 @@ function explicitQuotaExhaustion(message: string): boolean {
   return /insufficient\s+(?:account\s+)?(?:quota|allowance)|(?:quota|allowance).{0,20}(?:exhausted|depleted|used up|run out)|(?:exhausted|depleted).{0,20}(?:quota|allowance)|(?:额度|額度|配额|配額).{0,12}(?:不足|耗尽|耗盡|用尽|用盡)/.test(message);
 }
 
-/** Classify a provider error from its message (+ HTTP status if known). Message patterns include the
- *  Chinese strings DashScope/GLM/Qwen return, since hara targets those endpoints. */
+/** Prefer Hara Runtime diagnostics over provider status/prose. Legacy provider message patterns
+ * include the Chinese strings DashScope/GLM/Qwen return, since hara targets those endpoints. */
 export function classifyError(msg: string, status?: number, code?: string): ErrKind {
+  const nativeKind = runtimeFailureKind(msg);
+  if (nativeKind !== undefined) return nativeKind === "timeout" ? "runtime_timeout" : nativeKind;
   const m = (msg || "").toLowerCase();
   const normalizedCode = (code || "").toUpperCase();
   if (/\bruntime_proxy_(?:invalid|unreachable|failed)\b/u.test(m)) return "runtime_proxy";
@@ -101,7 +118,8 @@ export function failoverAction(kind: ErrKind, s: FailoverState): "fallback" | "f
 }
 
 /** A short actionable hint appended to the surfaced error message. */
-export function errorHint(kind: ErrKind): string {
+export function errorHint(kind: ErrKind, message?: string): string {
+  if (runtimeFailureKind(message) !== undefined) return "";
   switch (kind) {
     case "runtime_proxy":
       return " — check the Workspace runtime proxy and retry explicitly; no direct connection or provider fallback was selected";

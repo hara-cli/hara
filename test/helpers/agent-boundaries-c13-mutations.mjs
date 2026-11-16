@@ -17,15 +17,15 @@ const run = (args, env = {}, timeout = 180000) => {
 };
 const baseArgs = ["--import", "./test/setup-isolated-home.mjs", "--test", "--test-timeout=120000"];
 console.log("C13 MUTATION BASELINE");
-const baseline = run([...baseArgs, "--test-concurrency=4", ...["agent-boundaries-c13-routing", "agent-boundaries-c13-lifecycle", "agent-boundaries-c13-joint", "agent-boundary-execution", "agent-command-control"].map(name => `test/${name}.test.mjs`)], {}, 240000);
+const baseline = run([...baseArgs, "--test-concurrency=4", ...["agent-boundaries-c13-routing", "agent-boundaries-c13-lifecycle", "agent-boundaries-c13-joint", "agent-boundary-execution", "agent-command-control", "agent-command-control-b", "agent-command-control-c"].map(name => `test/${name}.test.mjs`)], {}, 240000);
 assert.equal(baseline.error, null); assert.equal(baseline.status, 0); assert.equal(counts(baseline.output).fail, 0); assert.equal(counts(baseline.output).skipped, 0);
 const oldCases = [
   ["deny", "agent-boundary-execution", "C3 isolated C2 explicit-deny"],
   ["inode", "agent-boundary-execution", "C3 isolated C2 root inode"],
   ["scoped", "agent-boundary-execution", "C3 scope adapter identity"],
-  ["drainOwner", "agent-command-control", "C3 drain owner alone"],
-  ["unknown", "agent-command-control", "C3 transition independently"],
-  ["unknownState", "agent-command-control", "C3 persisted unknown run"],
+  ["drainOwner", "agent-command-control-c", "C3 drain owner alone"],
+  ["unknown", "agent-command-control-c", "C3 transition independently"],
+  ["unknownState", "agent-command-control-c", "C3 persisted unknown run"],
 ];
 const cases = [
   ["bodyConflict", "agent-boundaries-c13-routing", "C13 F1 real WS"],

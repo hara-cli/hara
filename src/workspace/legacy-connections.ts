@@ -22,6 +22,13 @@ function read(path: string): { value: any; revision: string } | null {
 const clean = (value: unknown, max = 256) => redactSensitiveText(String(value ?? "")).text.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, max).trim();
 const baseFor = (provider: unknown) => isProviderId(provider) ? providerDefaultBaseURL(provider)
   ?? (provider === "anthropic" ? "https://api.anthropic.com" : provider === "openai" ? "https://api.openai.com/v1" : undefined) : undefined;
+function readLegacyCredential(row: { apiKey?: unknown; keyRef?: unknown }, vault: CredentialVault): string | undefined {
+  const ref = row.keyRef;
+  // Validate independently of the backend, before reading even an inline key or calling the vault.
+  if (ref !== undefined && (typeof ref !== "string" || !/^[a-zA-Z0-9_.:-]{1,240}$/.test(ref)
+    || ref.startsWith("vault.") && !ref.includes(":"))) throw new Error("Old credential unavailable; original preserved");
+  return typeof row.apiKey === "string" ? row.apiKey : ref === undefined ? undefined : vault.get(ref);
+}
 /** Known private Hara locations only; never uses loadConfig()/env, migrates, or changes old source. */
 export class LegacyConnectionCatalog {
   private sources: Source[] = [];
@@ -46,7 +53,7 @@ export class LegacyConnectionCatalog {
       const id = createHash("sha256").update(`${identityPath}\0${row.id ?? fallbackLabel}\0${revision}`).digest("hex");
       sources.push({ id, label, provider, baseURL: url.href.replace(/\/$/, ""), defaultModel, keySaved, source: path, isDefault,
         legacyId: clean(row.id ?? fallbackLabel), purpose,
-        read: () => typeof row.apiKey === "string" ? row.apiKey : this.vault.get(String(row.keyRef)) });
+        read: () => readLegacyCredential(row, this.vault) });
     };
     const configPath = join(this.home, ".hara/config.json"), config = read(configPath);
     const profilesPath = join(this.home, ".hara/profiles.json"), profiles = read(profilesPath);

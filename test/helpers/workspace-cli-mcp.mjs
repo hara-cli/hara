@@ -73,9 +73,20 @@ export async function cliMcpFixture(t, mode = "list", settings = {}) {
     send: message => request("workspace.session.send", { ...scope, agentId: main.agentId, message, requestId: randomUUID(), source: "ui" }),
     mode(value) { fs.writeFileSync(command + ".mode.json", JSON.stringify(typeof value === "string" ? { mode: value } : value)); } };
 }
-export async function until(operation, accept, timeoutMs = 20000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) { const value = await operation(); if (accept(value)) return value; await new Promise(resolve => setTimeout(resolve, 60)); }
+/** Without progressOf: the original fixed window. With progressOf(value): the window counts from the last
+ * change of that signature (no extra request), bounded by 100 s, so a run that keeps progressing under host
+ * load is not cut off while a stalled one still fails after timeoutMs (see observable-wait.mjs). */
+export async function until(operation, accept, timeoutMs = 20000, progressOf) {
+  const start = Date.now(); let lastChange = start, last;
+  for (;;) {
+    const value = await operation(); if (accept(value)) return value;
+    const now = Date.now();
+    if (progressOf) {
+      const signature = progressOf(value); if (signature !== last) { last = signature; lastChange = now; }
+      if (now - lastChange >= timeoutMs || now - start >= 100000) break;
+    } else if (now - start >= timeoutMs) break;
+    await new Promise(resolve => setTimeout(resolve, 60));
+  }
   throw new Error("bounded MCP fixture condition was not observed");
 }
 

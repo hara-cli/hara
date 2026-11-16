@@ -25,6 +25,8 @@ namespace. Host Home for discovery/import is separate from the private runtime/S
   space with a deduplicated source revision; unsafe/unsupported sources remain untouched.
 - Persist retired keyRefs before cleanup. Denial/crash leaves explicit retryable cleanup via
   `workspace.connection.cleanup`; listing never automatically removes Keychain data.
+- Offline reference model catalogs are exposed read-only via `workspace.connection.catalog`
+  (`workspace.connection-catalog.v1`); see `docs/workspace-connection-catalog.md`.
 - Stable `home/.hara/ui-preferences-v1.json` schema 2 owns appearance. Bounded known WebKit locations
   are queried read-only for exactly `hara.theme`; absence means system. localStorage is only a cache.
 

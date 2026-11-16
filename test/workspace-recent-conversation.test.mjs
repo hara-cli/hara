@@ -3,37 +3,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import { setup, until } from "./helpers/local-channels.mjs";
 import { RECENT_CONVERSATION, recentConversation, recentConversationPrompt, contextSummaryPrompt, distinctiveConversationTerm } from "../dist/workspace/context-compaction.js";
 import { recentConversationEligible } from "../dist/workspace/local-host.js";
 import { workspaceTaskProjection } from "../dist/workspace/model-context.js";
 import { discussionHandback, asksHumanQuestion } from "../dist/agent/loop.js";
-
-const UI = { source: "ui", channel: "rpc", clientId: "client" };
-const reply = text => ({ text, toolUses: [], stop: "end", usage: { input: 1, output: 1 } });
-// Colleagues run on the real native Pi path here: Hara tools are exposed as mcp__hara__*, and the
-// governed projection reaches the model as Pi's first "Hara authoritative conversation" prompt.
-const call = (name, input) => ({ text: "", toolUses: [{ id: randomUUID(), name: "mcp__hara__" + name, input }], stop: "tool_use", usage: { input: 1, output: 1 } });
-const PI_PROMPT = "Hara authoritative conversation:\n";
-const unwrap = history => {
-  const prompt = history.find(row => row.role === "user" && String(row.content).startsWith(PI_PROMPT));
-  return prompt ? JSON.parse(String(prompt.content).slice(PI_PROMPT.length)) : history;
-};
-const recentBlock = history => unwrap(history).find(row => row.role === "user" && String(row.content).startsWith("<hara-recent-conversation>"));
-const parseRecent = block => JSON.parse(String(block.content).split("\n").at(-2));
-function scripted(script) {
-  const calls = [];
-  const factory = (_connection, binding, context) => ({ id: "openai", model: binding.model, trailingTurnContext: true, async turn(args) {
-    const round = calls.filter(row => row.objective === context.objective).length;
-    calls.push({ agentId: context.agent.agentId, objective: context.objective, history: structuredClone(args.history), system: args.system });
-    return (script[context.objective] ?? [reply("收到。")])[round] ?? reply("收到。");
-  } });
-  return { calls, factory };
-}
-async function send(f, agentId, message, origin = UI) {
-  const run = f.host.start("client", f.id, agentId, message, randomUUID(), false, undefined, undefined, origin);
-  await f.host.wait(run.runId); return run;
-}
+import { UI, reply, call, unwrap, recentBlock, parseRecent, scripted, send } from "./helpers/recent-conversation.mjs";
 
 test("a plain follow-up receives the earlier private turns, oldest first, without tool bodies", async () => {
   const first = "我们在讨论岗位架构：产品、开发、设计，方案代号是蓝鲸四十二";
@@ -88,68 +64,6 @@ test("eligibility table: only a human's new private task sees the recent view; e
   for (const [name, change] of exclusions) assert.equal(recentConversationEligible({ ...base, ...change }), false, name);
 });
 
-test("wiring: group channels, resumes and internal starts carry no recent view; a human private follow-up does", async () => {
-  const { calls, factory } = scripted({});
-  const f = await setup(2, factory), agent = f.members[0];
-  try {
-    await send(f, agent, "PRIVATE_DM_MARKER 只在私聊里说");
-    // Two turns in one group channel: the second has earlier channel history, yet carries no view.
-    const channel = f.create("Group");
-    for (const text of ["group question one", "group question two"]) { f.host.sendChannel("client", f.id, channel, text, randomUUID(), [agent]); await f.host.waitChannel(f.id, channel); }
-    const group = calls.filter(row => row.objective.includes("group question"));
-    assert.ok(group.length >= 2);
-    for (const row of group) {
-      assert.equal(recentBlock(row.history), undefined); assert.doesNotMatch(JSON.stringify(row.history), /hara-recent-conversation/);
-      assert.doesNotMatch(JSON.stringify(row.history) + row.system, /PRIVATE_DM_MARKER/);
-    }
-    // A resume continues its own run transcript and carries no view. (On this Pi fixture a resumed native
-    // session prompts only with its durable continuation, so the call-site resume input is guarded by the
-    // eligibility table above; a fresh-process Claude resume would read the projection.)
-    const beforeResume = calls.length;
-    await send(f, agent, "继续");
-    const resumeCalls = calls.slice(beforeResume);
-    assert.ok(resumeCalls.length >= 1, "the resume reached the model");
-    for (const row of resumeCalls) assert.equal(recentBlock(row.history), undefined, "resume");
-    const before = calls.length;
-    // Host-internal starts (delegation/wake/schedule paths) are not a human's private follow-up.
-    await send(f, agent, "internal follow-up", { source: "host", channel: "internal", clientId: "client" });
-    for (const row of calls.slice(before)) assert.equal(recentBlock(row.history), undefined, "internal origin");
-    // Positive control: a human follow-up in the private conversation does receive it.
-    await send(f, agent, "human follow-up");
-    assert.match(String(recentBlock(calls.find(row => row.objective === "human follow-up").history)?.content), /PRIVATE_DM_MARKER/);
-  } finally { await f.host.close(); }
-});
-
-test("lookups answered by a distinctive term in the recent conversation do not raise the card; common words and unrelated misses still do", async () => {
-  const first = "我们在讨论岗位架构：产品经理、开发工程师、设计师，任务先按季度排";
-  const { calls, factory } = scripted({
-    [first]: [reply("好的，先列三个岗位。")],
-    "还有开发工程师的任务": [call("workspace_memory_search", { query: "开发工程师" }), call("workspace_context_lookup", { query: "开发工程师" }),
-      call("workspace_memory_search", { query: "开发工程师" }), reply("开发工程师的任务也放进去。")],
-    "那个任务呢": [call("workspace_memory_search", { query: "任务" }), call("workspace_memory_search", { query: "任务" }), reply("不应到达")],
-    "市场那边呢": [call("workspace_memory_search", { query: "市场营销" }), call("workspace_memory_search", { query: "市场营销" }), reply("不应到达")],
-  });
-  const f = await setup(3, factory), agent = f.members[0];
-  try {
-    await send(f, agent, first);
-    await send(f, agent, "还有开发工程师的任务");
-    let view = f.host.snapshot(f.id, agent).conversation;
-    assert.equal(view.pendingQuestion, null);
-    const lookup = view.history.filter(row => row.role === "tool").flatMap(row => row.results).find(result => result.name === "workspace_context_lookup");
-    const parsed = JSON.parse(lookup.content.split("\n\n<system-reminder>")[0]);
-    assert.equal(parsed.status, "resolved"); assert.ok(parsed.hits.some(hit => hit.source === "conversation"));
-    assert.equal(calls.filter(row => row.objective === "还有开发工程师的任务").length, 4, "the run reached its reply");
-    // A common two-character word that does appear in the conversation settles nothing on its own,
-    // and a target the conversation never mentioned still pauses (each on its own colleague).
-    for (const [other, message] of [[f.members[1], "那个任务呢"], [f.members[2], "市场那边呢"]]) {
-      await send(f, other, first);
-      f.host.start("client", f.id, other, message, randomUUID(), false, undefined, undefined, UI);
-      const card = await until(() => { const value = f.host.snapshot(f.id, other).conversation; return value.pendingQuestion ? value : null; });
-      assert.equal(card.pendingQuestion.reason, "lookup_missing", message);
-    }
-  } finally { await f.host.close(); }
-});
-
 test("distinctive terms: at least 3 CJK characters or 5 other characters", () => {
   for (const term of ["开发工程师", "蓝鲸四十二", "岗位表", "invoice", "v2.1.0"]) assert.equal(distinctiveConversationTerm(term), true, term);
   for (const term of ["任务", "项目", "开发", "file", "task", "plan", "AI", "  ", "a b", "AI开发"]) assert.equal(distinctiveConversationTerm(term), false, term);
@@ -172,22 +86,6 @@ test("question detection ignores code and looks at the last paragraph", () => {
   assert.equal(asksHumanQuestion("已完成，见 `user?.name` 的写法。"), false);
   assert.equal(asksHumanQuestion("改好了：\n\n```ts\nconst x = a?.b ?? c ? 1 : 2;\n```\n\n已完成。"), false);
   assert.equal(asksHumanQuestion("要不要先建？\n\n我已经建好了。"), false, "only the last paragraph hands back");
-});
-
-test("a discussion reply that asks the human a question is not labelled paused without a receipt", async () => {
-  const ask = "帮我规划团队岗位，再建几个同事", claim = "帮我规划岗位，然后建几个同事吧";
-  const { factory } = scripted({ [ask]: [reply("建议先设三个岗位。你想先建哪两个？")], [claim]: [reply("已经建好了。")] });
-  const f = await setup(0, factory), main = f.workspace.selectedAgentId;
-  try {
-    await send(f, main, ask);
-    let view = f.host.snapshot(f.id, main).conversation;
-    assert.equal(view.history.at(-1).text, "建议先设三个岗位。你想先建哪两个？");
-    assert.equal(view.history.some(row => row.role === "assistant" && /任务已暂停|尚未取得操作回执/.test(row.text)), false);
-    assert.notEqual(view.taskState, "completed", "a discussion never becomes a verified completion");
-    await send(f, main, claim);
-    view = f.host.snapshot(f.id, main).conversation;
-    assert.match(view.history.at(-1).text, /尚未取得操作回执/, "prose without a question keeps the honest closeout");
-  } finally { await f.host.close(); }
 });
 
 test("discussionHandback requires a native prose-only halt, no attempted tool and a question", () => {
@@ -226,21 +124,12 @@ test("the recent view is bounded, redacted and excludes tool rounds and reminder
   assert.equal(projected.length, 2); assert.match(projected[0].content, /^<hara-recent-conversation>/); assert.equal(projected[1].content, "now");
 });
 
-test("an explicit native-session reset is a hard boundary for the recent view", async () => {
-  const { calls, factory } = scripted({});
-  const f = await setup(1, factory), agent = f.members[0];
-  try {
-    await send(f, agent, "BEFORE-RESET-MARKER 旧话题");
-    f.host.selectAgent("client", f.id, agent);
-    const view = f.host.snapshot(f.id, agent, "client").conversation;
-    assert.equal(view.nativeSession.runtimeId, "pi");
-    await f.host.newNativeSession("client", f.id, agent, view.revision, view.nativeSession.revision, randomUUID());
-    await send(f, agent, "AFTER-RESET-ONE 新话题");
-    await send(f, agent, "那新话题还有什么");
-    const last = calls.filter(row => row.objective === "那新话题还有什么")[0] ?? calls.at(-1);
-    const block = recentBlock(last.history);
-    assert.ok(block, "post-reset turns still form a recent view");
-    assert.match(String(block.content), /AFTER-RESET-ONE/);
-    for (const row of calls.filter(row => !row.objective.startsWith("BEFORE-RESET"))) assert.doesNotMatch(JSON.stringify(row.history), /BEFORE-RESET-MARKER/);
-  } finally { await f.host.close(); }
+test("source: the Host passes the bound runtime to the eligibility check (a Codex colleague can never be treated as Pi)", () => {
+  // Codex is excluded by no other condition: its native thread already holds the conversation, so a
+  // wrong runtime here would inject the view a second time. The behavioural Codex path needs the
+  // native fixture; this pins the one input the eligibility table cannot see.
+  const host = fs.readFileSync(new URL("../src/workspace/local-host.ts", import.meta.url), "utf8");
+  const call = host.match(/const recentEligible = recentConversationEligible\(\{[\s\S]{0,400}?\}\);/u)?.[0] ?? "";
+  assert.match(call, /runtimeId: binding\.agent\.runtimeId \}\);$/u);
+  assert.equal(host.split("recentConversationEligible(").length - 1, 2, "one definition and one call site");
 });

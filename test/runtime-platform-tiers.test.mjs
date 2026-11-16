@@ -33,12 +33,16 @@ test("tier availability and defaults follow the Host platform's OS write protect
 });
 
 test("off macOS the full tier is refused explicitly before any native process or temporary state exists", t => {
-  const f = fixture(t), before = fs.readdirSync(tmpdir()).filter(name => name.startsWith("hara-native-")).length;
+  // A private TMPDIR: the shared temp folder is written concurrently by other test files' native
+  // processes (npm test runs four files at once), so a before/after count there is not this test's evidence.
+  const f = fixture(t), privateTmp = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "hara-tier-tmp-"))), previous = process.env.TMPDIR;
+  t.after(() => { if (previous === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previous; fs.rmSync(privateTmp, { recursive: true, force: true }); });
+  process.env.TMPDIR = privateTmp; assert.equal(fs.realpathSync(tmpdir()), privateTmp);
   for (const platform of ["linux", "win32"]) {
     assert.throws(() => createRuntimeExecutionPolicy(f.input("full-protected"), { platform }),
       error => error.code === RUNTIME_TIER_UNAVAILABLE && /controlled tier/u.test(error.message), platform);
   }
-  assert.equal(fs.readdirSync(tmpdir()).filter(name => name.startsWith("hara-native-")).length, before, "no policy temporary directory was created");
+  assert.deepEqual(fs.readdirSync(privateTmp), [], "no policy temporary directory was created");
 });
 
 test("Linux controlled runs through the POSIX process guard without sandbox-exec and keeps launch hygiene", async t => {
