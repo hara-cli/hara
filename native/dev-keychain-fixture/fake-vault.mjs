@@ -6,6 +6,9 @@ export const DEV_SERVICE = "tech.nanhara.hara.workspace.credentials.dev.v1";
 export const GROUP_LIMIT = 8 * 1024 * 1024;
 const fail = code => { throw new FixtureError(code); };
 const account = ref => `vault.${ref.split(":")[0]}`;
+// A bare vault.* ref aliases the group account of another scope. The legacy
+// schema has no type discriminator, so do not read/write/delete through it.
+const unambiguousRef = ref => validRef(ref) && !(ref.startsWith("vault.") && !ref.includes(":"));
 export function helperEnvironment() { return { LANG: "en_US.UTF-8", PATH: "/usr/bin:/bin:/usr/sbin:/sbin" }; }
 export function validateHelperContext({ identity, env }) {
   if (!identity || !Number.isInteger(identity.uid) || identity.uid <= 0 || identity.euid !== identity.uid
@@ -81,7 +84,7 @@ export class FakeDevVault {
       const record = JSON.parse(item.data);
       if (!record || Object.keys(record).some(key => !["schemaVersion", "values"].includes(key)) || record.schemaVersion !== 1 || !record.values || typeof record.values !== "object" || Array.isArray(record.values)) throw new Error();
       for (const [key, value] of Object.entries(record.values)) {
-        if (!validRef(key) || account(key) !== name || !validKey(value)) throw new Error();
+        if (!unambiguousRef(key) || account(key) !== name || !validKey(value)) throw new Error();
       }
       return { name, item, values: Object.assign(Object.create(null), record.values) };
     } catch { fail("credential_unreadable"); }
@@ -122,6 +125,7 @@ export class FakeDevVault {
   }
   async execute(request) {
     validateRequest(request);
+    if (request.entries.some(({ ref }) => !unambiguousRef(ref))) fail("credential_unreadable");
     const { lockRoot } = validateHelperContext(this.context);
     if ((request.flags & NO_UI) === 0) fail("access_denied"); // No interactive path in slice 1.
     const name = account(request.entries[0].ref), key = path.posix.join(lockRoot, createHash("sha256").update(name).digest("hex"));

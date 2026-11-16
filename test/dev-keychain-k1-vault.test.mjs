@@ -109,3 +109,16 @@ for (const mode of [0, 0o600, 0o750, 0o777]) test("fake context requires exactly
   const context = fixtureContext(); context.identity.devDirectory.mode = mode;
   const s = new FakeSecurity(); await assert.rejects(new FakeDevVault(s, { context }).execute(req(OP.GET)), isCode("unavailable")); assert.equal(s.calls.length, 0);
 });
+
+for (const op of [OP.GET, OP.SET_MANY, OP.REMOVE]) test("a bare group-account ref is ambiguous before any item operation", async () => {
+  const original = group({ [ref]: "synthetic-neighbor" }), s = new FakeSecurity([original]);
+  const before = structuredClone(s.items);
+  await assert.rejects(new FakeDevVault(s).execute(req(op, [{ ref: "vault.scope", key: op === OP.SET_MANY ? "synthetic" : "" }])), isCode("credential_unreadable"));
+  assert.deepEqual(s.items, before); assert.equal(s.calls.length, 0);
+});
+test("qualified refs can use a scope beginning with vault dot", async () => {
+  const s = new FakeSecurity(), vault = new FakeDevVault(s), qualified = "vault.scope:c1:g1";
+  await vault.execute(set([{ ref: qualified, key: "synthetic-qualified" }]));
+  assert.equal(await vault.execute(req(OP.GET, [{ ref: qualified, key: "" }])), "synthetic-qualified");
+  await vault.execute(req(OP.REMOVE, [{ ref: qualified, key: "" }])); assert.equal(s.items.length, 0);
+});

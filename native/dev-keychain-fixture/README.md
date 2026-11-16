@@ -12,6 +12,11 @@ The formal vault/default Host expressions and installed Dev entry are unchanged.
 - `fake-vault.mjs`: memory-only Security model, fixed Dev namespace, group and
   legacy semantics, synthetic identity/directory provider, NO_UI save/restore,
   failures and shared asynchronous group locks. Operation records omit values.
+  A bare ref starting with `vault.` overlaps another scope's group account; the
+  fake rejects it as `credential_unreadable` before any item operation. Qualified
+  refs such as `vault.scope:connection:g1` remain usable. This is a fail-closed
+  clarification of the group/legacy ambiguity; it does not alter the wire ref
+  grammar or the production vault. Review this rule before real helper wiring.
 - `k1_codec.{h,m}` / `codec-probe.m`: Foundation-only, fake-build-only native
   codec probe. It validates and canonically re-encodes one frame after stdin EOF.
   It is not a helper; it has no storage backend, Security imports, credentials,
