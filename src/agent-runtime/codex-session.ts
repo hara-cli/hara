@@ -10,6 +10,7 @@ import { classifyRuntimeFailure, type RuntimeFailureKind, type RuntimeRpcDiagnos
 import { createRuntimeExecutionPolicy, type RuntimeExecutionPolicy } from "./execution-policy.js";
 import { beginWorkspaceNativePolicy, endWorkspaceNativePolicy, observeWorkspaceNativeItem, workspaceRuntimePolicyInput, workspaceRuntimeProcessKey } from "./workspace-native-policy.js";
 import { codexHostToolOverrides } from "./codex-host-config.js";
+import { HARA_RUNTIME_VERSION } from "../version.js";
 import { workspaceRunRuntimeStages } from "../workspace/execution.js";
 // Native protocol facts may persist. Tool capabilities always belong to one immutable attempt.
 // A loaded handle is not an authority grant; current policy preparation and Host fences remain mandatory.
@@ -464,7 +465,8 @@ export class GovernedCodexSession {
         },
       });
       this.client = client; this.exit = client.waitForClose(); void this.exit.catch(() => {});
-      await client.call("initialize", { clientInfo: { name: "hara", version: "1.2.0" }, capabilities: { experimentalApi: true } });
+      // clientInfo.version must follow package.json so Codex app-server sees the actual release.
+      await client.call("initialize", { clientInfo: { name: "hara", version: HARA_RUNTIME_VERSION }, capabilities: { experimentalApi: true } });
       client.notify("initialized");
       try { endCold?.("completed"); } catch { /* Diagnostic only. */ }
       return client;
