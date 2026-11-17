@@ -56,7 +56,7 @@ const DATA_AVATAR_TEXT_LIMIT = Math.ceil(DATA_AVATAR_LIMIT * 4 / 3) + 128;
  * rejected on write so a stray hex cannot reach a client as a "theme".
  */
 export const AGENT_ACCENT_PALETTE = Object.freeze([
-  "#ff695f", "#4f9c8f", "#d99a32", "#6e88c8", "#a67bc2", "#d1667b", "#438db3", "#7f9a45",
+  "#ff695f", "#4f9c8f", "#d99a32", "#6e88c8", "#c68a72", "#d1667b", "#438db3", "#7f9a45",
 ] as const);
 export type AgentAccent = (typeof AGENT_ACCENT_PALETTE)[number];
 
@@ -221,6 +221,8 @@ export interface IdentityNormalizeMode {
    * out-of-palette accent is preserved verbatim instead of making the catalog invalid.
    */
   presentation?: "strict" | "compat";
+  /** Existing accent on a persisted colleague being edited; allowed verbatim when unchanged. */
+  preservedAccent?: string;
 }
 
 export function normalizeAgentPublicIdentityInput(
@@ -245,10 +247,13 @@ export function normalizeAgentPublicIdentityInput(
   if (input.traits !== undefined && (!Array.isArray(input.traits) || input.traits.some((trait) => typeof trait !== "string"))) {
     throw new Error("agent profile traits must be a string array");
   }
-  // Reject a non-palette colour up front in strict mode: `agentIdentityFromMetadata` accepts any
-  // six-digit hex for imported role files, so checking after it would let `#123456` through as if
-  // it were a designed colour.
-  if (strict && typeof input.accent === "string" && input.accent.trim() && !isAgentAccent(input.accent.trim())) {
+  // Reject a non-palette colour up front in strict mode unless keeping the existing stored
+  // accent unchanged: `agentIdentityFromMetadata` accepts any six-digit hex for imported role
+  // files, so checking after it would let an arbitrary `#123456` through on an active colour change.
+  const requestedAccent = typeof input.accent === "string" ? input.accent.trim().toLowerCase() : "";
+  const preservedAccent = typeof mode.preservedAccent === "string" ? mode.preservedAccent.trim().toLowerCase() : "";
+  const accentUnchanged = !!requestedAccent && !!preservedAccent && requestedAccent === preservedAccent;
+  if (strict && requestedAccent && !accentUnchanged && !isAgentAccent(requestedAccent)) {
     throw new Error(`agent accent must be one of ${AGENT_ACCENT_PALETTE.join(", ")}`);
   }
   if (strict && typeof input.avatarStyle === "string" && input.avatarStyle.trim() && !isAgentAvatarStyle(input.avatarStyle.trim())) {

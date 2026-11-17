@@ -3,6 +3,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { LocalWorkspaceCatalog } from "../dist/workspace/local-catalog.js";
+import { LocalWorkspaceHost } from "../dist/workspace/local-host.js";
+import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
+import { openLocalWorkspaceDevRoot } from "../dist/workspace/local-dev-root.js";
 import { WorkspaceResources } from "../dist/workspace/resources.js";
 import { workspaceResourceScopeKey } from "../dist/workspace/resource-context.js";
 import {
@@ -25,7 +29,7 @@ function create(r, username, profile = {}) {
 }
 
 test("the designed palette and avatar styles are exactly the client's closed sets", () => {
-  assert.deepEqual([...AGENT_ACCENT_PALETTE], ["#ff695f", "#4f9c8f", "#d99a32", "#6e88c8", "#a67bc2", "#d1667b", "#438db3", "#7f9a45"]);
+  assert.deepEqual([...AGENT_ACCENT_PALETTE], ["#ff695f", "#4f9c8f", "#d99a32", "#6e88c8", "#c68a72", "#d1667b", "#438db3", "#7f9a45"]);
   assert.deepEqual([...AGENT_AVATAR_STYLES], ["circle", "squircle", "hex", "portrait"]);
   assert.equal(AGENT_ACCENT_PALETTE.length, 8);
   assert.equal(new Set(AGENT_ACCENT_PALETTE).size, 8, "palette entries must be unique");
@@ -57,8 +61,8 @@ test("a client may set one of the eight colours, and the initial colour is fixed
 
   // Recolouring later moves `accent` but must NOT move `initialAccent`.
   const recoloured = r.agents.updatePersona(agent.agentId,
-    { profile: { ...profileOf(r, agent.agentId), accent: "#a67bc2" } }, agent.configRevision, agent.agentEpoch);
-  assert.equal(recoloured.identity.accent, "#a67bc2");
+    { profile: { ...profileOf(r, agent.agentId), accent: "#c68a72" } }, agent.configRevision, agent.agentEpoch);
+  assert.equal(recoloured.identity.accent, "#c68a72");
   assert.equal(recoloured.initialAccent, "#4f9c8f", "restore-initial target must not drift");
 
   // Restoring is an ordinary write of the initial value, not a special RPC.
@@ -146,4 +150,98 @@ test("appearance writes keep the private instructions and the configuration hist
   assert.equal(edited.identity.accent, "#7f9a45");
   assert.equal(edited.initialAccent, "#d1667b");
   assert.equal(edited.configRevision, agent.configRevision + 1);
+});
+
+test("real Host preserves a historical out-of-palette accent on non-colour edits and rejects active out-of-palette colour writes", async () => {
+  const root = dir();
+  const hostInit = new LocalWorkspaceHost(root, {
+    mode: "workspace",
+    credentialVault: new MemoryCredentialVault(),
+  });
+  let wsId;
+  try {
+    const ws = hostInit.createWorkspace("Compat Space", hostInit.list().revision);
+    wsId = ws.workspaceId;
+  } finally {
+    await hostInit.close();
+  }
+
+  // Seed one modern palette colleague and one colleague with historical `#a67bc2` accent + `initialAccent: "#a67bc2"`.
+  const opened = openLocalWorkspaceDevRoot(root, "workspace");
+  const wsScope = new LocalWorkspaceCatalog(opened.home).resolve(wsId).scope;
+  const resources = new WorkspaceResources(opened.home, wsScope);
+  resources.initialize();
+  const normal = create(resources, "palette-peer", { accent: "#4f9c8f" });
+  const normalColleagueId = normal.agentId;
+  const imported = resources.agents.importLegacy([{
+    username: "legacy-lilac",
+    state: "active",
+    importId: "1".repeat(64),
+    sourceHash: "2".repeat(64),
+    toolPolicy: { allow: null, deny: [], readOnly: false, owns: [] },
+    profile: { displayName: "Legacy Lilac", title: "Advisor", accent: "#a67bc2" },
+    description: "Pre-swap colleague",
+    instructions: "Keep historical instructions",
+  }], resources.agents.list().revision);
+  const legacyId = imported.agents[0].agentId;
+
+  const file = catalogFile(opened.home, wsScope);
+  const rawCatalog = JSON.parse(fs.readFileSync(file, "utf8"));
+  const legacyRow = rawCatalog.agents.find(entry => entry.agentId === legacyId);
+  legacyRow.initialAccent = "#a67bc2";
+  fs.writeFileSync(file, JSON.stringify(rawCatalog), { mode: 0o600 });
+
+  const host = new LocalWorkspaceHost(root, {
+    mode: "workspace",
+    credentialVault: new MemoryCredentialVault(),
+  });
+  try {
+    const initialSnap = host.snapshot(wsId, legacyId, "client-compat");
+    const legacyBefore = initialSnap.agents.find(entry => entry.agentId === legacyId);
+    assert.equal(legacyBefore.identity.accent, "#a67bc2");
+    assert.equal(legacyBefore.initialAccent, "#a67bc2");
+
+    // 1. Editing non-colour fields (displayName/title) and avatarStyle omits `accent`; Host preserves `#a67bc2`.
+    const afterStyle = host.updateAgentPersona(wsId, legacyId, {
+      profile: { displayName: "Updated Lilac", title: "Senior Advisor", avatarStyle: "hex" },
+    }, legacyBefore.configRevision, legacyBefore.agentEpoch);
+    assert.equal(afterStyle.identity.displayName, "Updated Lilac");
+    assert.equal(afterStyle.identity.avatarStyle, "hex");
+    assert.equal(afterStyle.identity.accent, "#a67bc2");
+
+    // 2. Echoing the unchanged stored `#a67bc2` while changing another field also succeeds.
+    const afterEcho = host.updateAgentPersona(wsId, legacyId, {
+      profile: { displayName: "Updated Lilac Two", accent: "#a67bc2", avatarStyle: "squircle" },
+    }, afterStyle.configRevision, afterStyle.agentEpoch);
+    assert.equal(afterEcho.identity.displayName, "Updated Lilac Two");
+    assert.equal(afterEcho.identity.avatarStyle, "squircle");
+    assert.equal(afterEcho.identity.accent, "#a67bc2");
+
+    // 3. Actively changing `accent` to an arbitrary off-palette hex must still be rejected.
+    assert.throws(
+      () => host.updateAgentPersona(wsId, legacyId, {
+        profile: { displayName: "Should Reject", accent: "#123456" },
+      }, afterEcho.configRevision, afterEcho.agentEpoch),
+      /agent accent must be one of/i,
+    );
+    assert.equal(host.snapshot(wsId, legacyId, "client-compat").agents.find(entry => entry.agentId === legacyId).configRevision, afterEcho.configRevision);
+
+    // 4. Actively switching another colleague's colour to the removed `#a67bc2` must be rejected.
+    const normalBefore = host.snapshot(wsId, normalColleagueId, "client-compat").agents.find(entry => entry.agentId === normalColleagueId);
+    assert.throws(
+      () => host.updateAgentPersona(wsId, normalColleagueId, {
+        profile: { displayName: "Palette Peer", accent: "#a67bc2" },
+      }, normalBefore.configRevision, normalBefore.agentEpoch),
+      /agent accent must be one of/i,
+    );
+    assert.equal(host.snapshot(wsId, normalColleagueId, "client-compat").agents.find(entry => entry.agentId === normalColleagueId).configRevision, normalBefore.configRevision);
+
+    // 5. Actively switching the historical colleague to `#c68a72` (new whitelist) succeeds.
+    const recoloured = host.updateAgentPersona(wsId, legacyId, {
+      profile: { displayName: "Migrated Terracotta", accent: "#c68a72" },
+    }, afterEcho.configRevision, afterEcho.agentEpoch);
+    assert.equal(recoloured.identity.accent, "#c68a72");
+  } finally {
+    await host.close();
+  }
 });
