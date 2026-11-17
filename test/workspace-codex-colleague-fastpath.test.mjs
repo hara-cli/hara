@@ -2,14 +2,15 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {cliMcpFixture,until} from "./helpers/workspace-cli-mcp.mjs";
 const done = view => ["completed", "blocked", "paused", "cancelled"].includes(view.conversation.state);
+const viewProgress = view => JSON.stringify([view.conversation.state, view.conversation.revision, view.conversation.history.length, view.approvals.length]);
 test("native Codex confirmed colleague fastpath consumes one card and admits the following message without resetting unknown work", async t => {
   const f = await cliMcpFixture(t, "create");
   await f.send("Create one test colleague after confirmation.");
-  const pending = await until(f.read, view => view.approvals.length === 1);
+  const pending = await until(f.read, view => view.approvals.length === 1, 20000, viewProgress);
   assert.equal(pending.agents.length, 1);
   const card = pending.approvals[0];
   await f.request("workspace.approval.respond", {...f.scope, approvalId:card.id, approved:true});
-  const completed = await until(f.read, done);
+  const completed = await until(f.read, done, 20000, viewProgress);
   assert.equal(completed.conversation.state, "completed", completed.conversation.blockReason);
   assert.equal(completed.conversation.completion.state, "verified");
   assert.equal(completed.agents.length, 2);
@@ -23,7 +24,7 @@ test("native Codex confirmed colleague fastpath consumes one card and admits the
   await assert.rejects(f.request("workspace.approval.respond", {...f.scope, approvalId:card.id, approved:true}));
   f.mode("list");
   await f.send("List the current colleagues after the confirmed creation.");
-  const next = await until(f.read, done);
+  const next = await until(f.read, done, 20000, viewProgress);
   assert.equal(next.conversation.state, "completed", next.conversation.blockReason);
   assert.equal(next.agents.length, 2);
   assert.equal(next.approvals.length, 0);

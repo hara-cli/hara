@@ -10,6 +10,7 @@ import { LocalWorkspaceCatalog } from "../../dist/workspace/local-catalog.js";
 import { WorkspaceResourceStorage } from "../../dist/workspace/resource-context.js";
 
 const done = view => ["completed", "blocked", "paused", "cancelled"].includes(view.conversation.state);
+const viewProgress = view => JSON.stringify([view.conversation.state, view.conversation.revision, view.conversation.history.length, view.approvals.length]);
 const sample = (input, cached, output, lastInput = input, lastCached = cached) => ({
   total: { inputTokens: input, cachedInputTokens: cached, outputTokens: output },
   last: { inputTokens: lastInput, cachedInputTokens: lastCached, outputTokens: 20 }, modelContextWindow: 128000,
@@ -19,7 +20,7 @@ const nativeState = f => {
   assert.equal(relative.length, 1); const file = join(f.root, relative[0]);
   return { file, value: JSON.parse(fs.readFileSync(file, "utf8")) };
 };
-async function exchange(f, text = "List current colleagues?") { await f.send(text); return until(f.read, done); }
+async function exchange(f, text = "List current colleagues?") { await f.send(text); return until(f.read, done, 20000, viewProgress); }
 const resetParams = (f, view, requestId = randomUUID()) => ({ ...f.scope, agentId: f.main.agentId, requestId,
   approved: true, expectedRevision: view.conversation.revision, expectedNativeRevision: view.conversation.nativeSession.revision });
 

@@ -24,6 +24,7 @@ import { createAgentBoundaryExecutionGate } from "../dist/workspace/agent-bounda
 import { createWorkspaceRunPermit, bindWorkspaceRunOptions, beginWorkspaceGovernedRun, closeWorkspaceRunPermit, workspaceRunDrainProof, executeWorkspaceTool, assertWorkspaceRunContextCurrent } from "../dist/workspace/execution.js";
 
 import { fixture, code, fixtureDocs } from "./helpers/agent-command-control-fixture.mjs";
+import { awaitProgressSignal } from "./helpers/observable-wait.mjs";
 
 test("C3 capacity refuses new work before effects and retains reserved slots for an authorized stop", async t => {
   const f = fixture(t), d = f.dispatch(); d.accept(); const runtime = d.runtime(), state = f.snapshot();
@@ -69,19 +70,24 @@ function commandCompetitor(t, f, label, { controlled = false, fault } = {}) {
       else if (failure || terminal) waiter.finish(diagnostic(waiter.phase, failure ?? `exit code=${terminal.code} signal=${terminal.signal}`));
     }
   };
-  child.stderr.on("data", data => { stderr = (stderr + redact(data)).slice(-2048); });
+  child.stderr.on("data", data => {
+    stderr = (stderr + redact(data)).slice(-2048);
+    for (const waiter of waiters) waiter.noteProgress?.();
+  });
   child.on("message", value => {
     if (value?.error) { failure = `helper ${value.error.phase}/${value.error.code}`; trace.push("helper-error"); }
     else { messages.push(value); trace.push(value?.phase ?? (value?.ready ? "ready" : "receipt")); }
+    for (const waiter of waiters) waiter.noteProgress?.();
     flush();
   });
   child.on("error", error => { failure = `process error ${error.code ?? "unknown"}`; trace.push("process-error"); flush(); });
   child.once("close", (code, signal) => { terminal = { code, signal }; trace.push("closed"); flush(); });
-  const next = phase => new Promise((resolve, reject) => {
-    const waiter = { phase, finish(error, value) { clearTimeout(timer); waiters.delete(waiter); if (error) reject(error); else resolve(value); } };
-    const timer = setTimeout(() => waiter.finish(diagnostic(phase, "10000ms IPC deadline")), 10000);
-    waiters.add(waiter); flush();
-  });
+  const next = phase => awaitProgressSignal(({ resolve, reject, noteProgress }) => {
+    const waiter = { phase, noteProgress, finish(error, value) { waiters.delete(waiter); if (error) reject(error); else resolve(value); } };
+    waiters.add(waiter);
+    flush();
+    return () => { waiters.delete(waiter); };
+  }, { idleMs: 10000, maxMs: 45000, onTimeout: () => diagnostic(phase, "10000ms IPC deadline") });
   child.stdin.on("error", error => { failure = `input error ${error.code ?? "unknown"}`; flush(); });
   child.stdin.end(JSON.stringify({ home: f.home, project: f.project, workspaceId: f.row.scope.workspaceId, credential: f.credential,
     agentId: f.agent.agentId, names: ["workspace_read", "workspace_write", "workspace_verify", "task_intake", "task_checkpoint", "todo_write", "ask_user"], release, fault }));

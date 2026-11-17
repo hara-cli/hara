@@ -1,5 +1,5 @@
 import test from "node:test";
-import { untilObserved } from "./observable-wait.mjs";
+import { createJsonRpcRequester, untilObserved } from "./observable-wait.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,17 +16,12 @@ const docs = JSON.parse(fs.readFileSync(new URL("../fixtures/agent-boundaries-v1
 const copy = name => structuredClone(docs.valid.find(row => row.name === name).document);
 const boundaryCode = code => error => error.data?.boundary?.code === code;
 async function connect(handle) {
-  const socket = new WebSocket(`ws://127.0.0.1:${handle.port}`), pending = new Map(); let serial = 0;
+  const socket = new WebSocket(`ws://127.0.0.1:${handle.port}`);
   socket.on("error", () => {});
-  socket.on("message", raw => { const value = JSON.parse(raw.toString()), waiter = pending.get(value.id); if (!waiter) return;
-    pending.delete(value.id); clearTimeout(waiter.timer);
-    value.error ? waiter.reject(Object.assign(new Error(value.error.message), { data: value.error.data })) : waiter.resolve(value.result);
-  });
   await once(socket, "open");
-  return { request(method, params = {}) { return new Promise((resolve, reject) => { const id = ++serial;
-    const timer = setTimeout(() => { pending.delete(id); reject(new Error("C3 RPC deadline")); }, 15000);
-    pending.set(id, { resolve, reject, timer }); socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-  }); }, async close() { if (socket.readyState === WebSocket.CLOSED) return; const closed = once(socket, "close"); socket.close(); await closed; } };
+  const request = createJsonRpcRequester(socket, { idleMs: 15000, maxMs: 60000, errorText: "C3 RPC deadline",
+    mapError: err => Object.assign(new Error(err.message), { data: err.data }) });
+  return { request, async close() { if (socket.readyState === WebSocket.CLOSED) return; const closed = once(socket, "close"); socket.close(); await closed; } };
 }
 // Actual governed IO completes around 20s with four concurrent security suites on this host. The
 // observation window (see observable-wait.mjs) never changes command/runtime budgets or assertions.
