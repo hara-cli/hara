@@ -36,8 +36,9 @@ references or paths. Permission, generation and revision errors keep their exist
 All provider vault operations share a serialized lane for the Host's namespace. The caller
 has a 30 second credential budget. Each native operation has a separate 15 second limit.
 The v2 private worker message can report that opening the exclusive store lock failed before
-any credential entry was accessed. The adapter retries only this result, up to three attempts
-within the shorter backoff window. It preserves all other failed or unknown outcomes. Requests
+any credential entry was accessed. The adapter retries only this result, starting up to three
+attempts within a one second backoff window. Once an attempt starts, it uses the normal worker
+and caller deadlines. The adapter preserves all other failed or unknown outcomes. Requests
 and replies use bounded private pipes. Every launch checks the packaged executable against its digest.
 
 The store records an intent for each new generation before sending any write. The intent

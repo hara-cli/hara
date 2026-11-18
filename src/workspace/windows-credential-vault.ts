@@ -256,13 +256,14 @@ export class AsyncWindowsDpapiCredentialVault implements AsyncCredentialVault {
     const backoffUntil = performance.now() + 1000;
     for (let attempt = 0; attempt < 3; attempt++) {
       if (signal.aborted) throw new CredentialVaultError("unavailable", undefined, true);
-      const attemptSignal = attempt === 0 ? signal : AbortSignal.any([signal, AbortSignal.timeout(Math.max(1, Math.floor(backoffUntil - performance.now())))]);
-      try { await beforeAbort(verifyWorker(bundle), attemptSignal); }
+      try { await beforeAbort(verifyWorker(bundle), signal); }
       catch (error) { throw new CredentialVaultError("unavailable", error instanceof CredentialVaultError ? error.reason : undefined, true); }
       assertCredentialCall(call);
+      // Check the retry budget before dispatch. An exchange may acquire the lock and write.
+      if (attempt > 0 && performance.now() >= backoffUntil) break;
       const nonce = randomBytes(16);
       let value: string | undefined | typeof LOCK_BUSY;
-      try { value = await exchange(bundle, requestFrame(op, entries, namespace, nonce, 2), nonce, op, attemptSignal, call); }
+      try { value = await exchange(bundle, requestFrame(op, entries, namespace, nonce, 2), nonce, op, signal, call); }
       finally { nonce.fill(0); }
       if (value !== LOCK_BUSY) return value;
       const wait = 60 * (attempt + 1);

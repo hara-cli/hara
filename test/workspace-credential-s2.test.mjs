@@ -254,7 +254,7 @@ test("RPC strictly negotiates a metadata-only credential descriptor and preserve
 
 // Exercise the real async framing and child-process close path with a local executable
 // that returns only synthetic protocol frames. The separate Windows canary uses DPAPI itself.
-function fakeWorker(t, startupStatus, afterBusy = 0) {
+function fakeWorker(t, responseStatuses, successDelayMs = 0) {
   const home = directory(t), helper = join(home, "hara-credential-worker.exe"), counter = helper + ".calls";
   const script = "#!" + process.execPath + "\n" + [
     'const fs = require("node:fs");',
@@ -265,8 +265,11 @@ function fakeWorker(t, startupStatus, afterBusy = 0) {
     'if (frame.toString("ascii", 4, 8) !== "HVQ2" || frame[8] !== 2) process.exit(65);',
     'const reply = Buffer.alloc(27); reply.writeUInt32LE(23); reply.write("HVR2", 4);',
     'frame.copy(reply, 8, 9, 25); frame.fill(0);',
-    'reply[24] = calls <= 2 ? ' + startupStatus + ' : ' + afterBusy + ';',
-    'process.stdout.write(reply);',
+    'const status = ' + JSON.stringify(responseStatuses) + '[calls - 1];',
+    'if (status === undefined) process.exit(65);',
+    'reply[24] = status;',
+    'if (status === 0) setTimeout(() => process.stdout.write(reply), ' + successDelayMs + ');',
+    'else process.stdout.write(reply);',
     '// ' + 'f'.repeat(1024),
   ].join("\n") + "\n";
   fs.writeFileSync(helper, script, { mode: 0o700 });
@@ -282,14 +285,20 @@ function fakeWorker(t, startupStatus, afterBusy = 0) {
 }
 
 test("async Windows framing retries only confirmed failure before store.lock", { skip: process.platform === "win32" }, async t => {
-  const busy = fakeWorker(t, 7);
+  const busy = fakeWorker(t, [7, 7, 0]);
   const children = [];
   await busy.vault.set("fixture:connection:gen", keyA, { recordWorker(pid) { assert.ok(pid > 0); children.push(pid); } });
   assert.equal(busy.calls(), 3);
   assert.equal(new Set(children).size, 3);
   for (const [status, code] of [[2, "unavailable"], [5, "write_unconfirmed"]]) {
-    const failed = fakeWorker(t, status);
+    const failed = fakeWorker(t, [status]);
     await assert.rejects(failed.vault.set("fixture:connection:gen", keyA), error => error.code === code);
     assert.equal(failed.calls(), 1);
   }
+});
+
+test("async Windows retry allows a successful write to finish beyond the backoff window", { skip: process.platform === "win32" }, async t => {
+  const worker = fakeWorker(t, [7, 0], 1250);
+  await worker.vault.set("fixture:connection:gen", keyA);
+  assert.equal(worker.calls(), 2);
 });
