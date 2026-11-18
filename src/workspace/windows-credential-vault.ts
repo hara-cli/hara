@@ -55,8 +55,9 @@ function bindWorker(home: string, bundle?: WindowsCredentialWorkerBundle) {
   let namespace: Buffer;
   try {
     if (!path.isAbsolute(home)) throw new Error();
-    const canonical = fs.realpathSync.native(home).replaceAll("/", "\\");
-    if (!fs.statSync(canonical).isDirectory()) throw new Error();
+    const physical = fs.realpathSync.native(home);
+    if (!fs.statSync(physical).isDirectory()) throw new Error();
+    const canonical = physical.replaceAll("/", "\\");
     namespace = createHash("sha256").update("hara-host-home-v1\0").update(canonical, "utf8").digest();
   } catch { throw new CredentialVaultError("unavailable", "host_binding_unavailable"); }
   bundle ??= bundledWindowsCredentialWorker();

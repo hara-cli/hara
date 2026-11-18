@@ -454,7 +454,7 @@ export class LocalWorkspaceHost {
     this.changed(workspaceId);
     return router.get(transport!, input.channelId, input.workItemId);
   }
-  submitAgentBoundaryCommand(clientId: string, transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string,
+  async submitAgentBoundaryCommand(clientId: string, transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string,
     command: unknown, input: { message?: string; proposal?: unknown }) {
     const control = this.commandAuthority(transport, workspaceId);
     return this.submitAgentCommandIntake(clientId, transport!, workspaceId, agentId, control, control.begin(transport!, command, input), input);
@@ -473,7 +473,7 @@ export class LocalWorkspaceHost {
     input: Parameters<WorkspaceAgentCommandControl["draftRecovery"]>[2]) {
     return this.lifecycleAuthority(transport, workspaceId).draftRecovery(transport!, agentId, input);
   }
-  submitAgentLifecycleRecovery(clientId: string, transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string,
+  async submitAgentLifecycleRecovery(clientId: string, transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string,
     recovery: unknown, command: unknown, input: { message: string }) {
     const control = this.commandAuthority(transport, workspaceId);
     if (!this.options.boundaryLifecycleControl) throw new AgentBoundaryContractError("RUNTIME_UNSUPPORTED", "lifecycle.bootstrap");

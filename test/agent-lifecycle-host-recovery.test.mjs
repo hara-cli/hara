@@ -34,14 +34,14 @@ test("C4 actual Host repairs a post-projection N5, keeps accepted journal and on
     return actual;
   };
   try {
-    const command = await h.draft(), accepted = h.submit(command); assert.equal(accepted.status, "accepted"); assert.equal(h.calls(), 0); assert.equal(interrupted, true);
+    const command = await h.draft(), accepted = await h.submit(command); assert.equal(accepted.status, "accepted"); assert.equal(h.calls(), 0); assert.equal(interrupted, true);
     const first = context.boundaryAuthority.commandControlState(), run = first.control.runs.find(row => row.commandId === command.commandId), execution = first.lifecycle.executions.find(row => row.runId === run.runId);
     assert.equal(execution.phase, "aborted_before_execution"); assert.equal(execution.leaseReleased, true);
     const journal = new WorkspaceRequestJournal(context.storage, f.params.agentId); assert.equal(journal.find(run.requestId).state, "accepted");
     const original = store.read(); assert.equal(original.attempt.state, "blocked"); assert.equal(original.task.status, "blocked");
     const ordinary = peer.draftAgentBoundaryCommand(transport, f.params.workspaceId, f.params.agentId,
       { commandId: randomUUID(), rootRequestId: randomUUID(), lifetimeMs: 30000, operation: command.operation });
-    assert.equal(h.submit(ordinary).status, "rejected"); assert.equal(h.calls(), 0);
+    assert.equal((await h.submit(ordinary)).status, "rejected"); assert.equal(h.calls(), 0);
     WorkspaceConversationStore.prototype.save = save;
     const recovery = peer.draftAgentLifecycleRecovery(transport, f.params.workspaceId, f.params.agentId,
       { operationId: randomUUID(), previousRunId: run.runId, expectedClaimRevision: 1, commandId: randomUUID(), rootRequestId: randomUUID(), message: "hello", lifetimeMs: 30000 });
@@ -60,12 +60,12 @@ test("C4 actual Host preserves post-issuance UNKNOWN and does not acquire anothe
   const h = await peerFixture(t), { f, peer, context, transport } = h, capture = context.boundaryAuthority.captureExecutionPolicy.bind(context.boundaryAuthority);
   context.boundaryAuthority.captureExecutionPolicy = grant => { capture(grant); throw new Error("synthetic failure after durable issuance"); };
   try {
-    const command = await h.draft(), receipt = h.submit(command); assert.equal(receipt.status, "unknown"); assert.equal(h.calls(), 0);
+    const command = await h.draft(), receipt = await h.submit(command); assert.equal(receipt.status, "unknown"); assert.equal(h.calls(), 0);
     const snapshot = context.boundaryAuthority.commandControlState(), run = snapshot.control.runs.find(row => row.commandId === command.commandId), execution = snapshot.lifecycle.executions.find(row => row.runId === run.runId);
     assert.equal(run.effect, "unknown"); assert.ok(run.hold); assert.equal(execution.phase, "issued"); assert.equal(execution.terminal, null); assert.equal(execution.leaseReleased, false);
     assert.equal(new WorkspaceRequestJournal(context.storage, f.params.agentId).find(run.requestId).state, "accepted");
     assert.throws(() => WorkspaceSessionLease.acquire(context.storage, run.binding.sessionId));
-    const next = await h.draft(); assert.equal(h.submit(next).status, "rejected"); assert.equal(h.calls(), 0);
+    const next = await h.draft(); assert.equal((await h.submit(next)).status, "rejected"); assert.equal(h.calls(), 0);
     assert.throws(() => peer.draftAgentLifecycleRecovery(transport, f.params.workspaceId, f.params.agentId,
       { operationId: randomUUID(), previousRunId: run.runId, expectedClaimRevision: 1, commandId: randomUUID(), rootRequestId: randomUUID(), message: "hello", lifetimeMs: 30000 }));
     assert.equal(new WorkspaceConversationStore(context.storage, f.params.agentId).read().attempt.state, "draining");
