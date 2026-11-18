@@ -69,9 +69,34 @@ fn namespace() -> [u8;32] { let mut n=[0;32]; assert!(unsafe{BCryptGenRandom(nul
 #[test] fn ancestor_handles_block_directory_replacement_during_actual_io() {
     assert!(std::env::var("GITHUB_ACTIONS").ok().as_deref()==Some("true"),"ephemeral Windows CI only");
     let store=Store::new(namespace()).unwrap_or_else(|_|panic!("pinned store"));
-    let replacement=store.path.with_extension("renamed");
-    assert!(unsafe{MoveFileExW(wide(store.path.as_os_str()).as_ptr(),wide(replacement.as_os_str()).as_ptr(),0)}==0,"open parent must block replacement");
+    for dir in store.path.ancestors().take(3) {
+        let original=wide(dir.as_os_str()); let replacement=wide(dir.with_extension("renamed").as_os_str());
+        let renamed=unsafe{MoveFileExW(original.as_ptr(),replacement.as_ptr(),0)}!=0;
+        if renamed {
+            let restored=unsafe{MoveFileExW(replacement.as_ptr(),original.as_ptr(),0)}!=0;
+            assert!(restored,"restore renamed ephemeral fixture");
+        }
+        assert!(!renamed,"the namespace, v1 and credential-vault handles must each block replacement");
+    }
     let key=Secret(b"p\0i\0n\0".to_vec());assert!(store.write(b"pinned:original",&key.0).is_ok(),"IO remains on original pinned directory");
     assert!(store.remove(b"pinned:original").is_ok(),"targeted cleanup");let private=store.path.clone();drop(store);
+    assert!(std::fs::remove_dir_all(private).is_ok(),"remove exact native fixture namespace");
+}
+
+#[test] fn pre_lock_busy_and_pending_quota_preserve_the_committed_credential() {
+    assert!(std::env::var("GITHUB_ACTIONS").ok().as_deref()==Some("true"),"ephemeral Windows CI only");
+    let ns=namespace();
+    let store=Store::new(ns).unwrap_or_else(|_|panic!("private store"));
+    assert!(matches!(Store::new(ns),Err(LOCK_BUSY)),"the competing opener fails at the exact exclusive lock");
+    let key=b"a\0b\0c\0"; let other=b"x\0y\0z\0";
+    assert!(store.write_key(b"quota:published",key,true).is_ok());
+    assert!(matches!(store.write_key(b"quota:published",other,true),Err(REF_EXISTS)));
+    for i in 0..MAX_PENDING_TEMPS {
+        std::fs::write(store.path.join(format!("{i:032x}.tmp")),b"opaque synthetic unfinished ciphertext").unwrap();
+    }
+    assert!(matches!(store.check_pending_quota(),Err(UNAVAILABLE)));
+    assert_eq!(std::fs::read_dir(&store.path).unwrap().count(),MAX_PENDING_TEMPS+2);
+    assert!(store.read(b"quota:published").unwrap().unwrap().0==key);
+    let private=store.path.clone(); drop(store);
     assert!(std::fs::remove_dir_all(private).is_ok(),"remove exact native fixture namespace");
 }

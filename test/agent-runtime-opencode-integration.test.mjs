@@ -106,7 +106,7 @@ for (const permissionTier of ["full-protected", "controlled"]) for (const kind o
   selected = resources.agents.setPermissionTier(agent.agentId, permissionTier, selected.configRevision, selected.agentEpoch);
   const task = resources.agents.bindTask(createTaskExecution("List colleagues", randomUUID()), selected.agentId, selected.configRevision, selected.agentEpoch);
   const connections = new WorkspaceSecureConnections(storage, new MemoryCredentialVault());
-  connections.add({ label: "Fixture", provider: "openai", baseURL: "http://127.0.0.1:1/v1", apiKey: "fixture", defaultModel: "fixture" }, 0);
+  await connections.add({ label: "Fixture", provider: "openai", baseURL: "http://127.0.0.1:1/v1", apiKey: "fixture", defaultModel: "fixture" }, 0);
   const binding = freezeWorkspaceRunBinding({ schemaVersion: 1, scope: row.scope, agent: task.workspaceAgentBinding,
     agentBindingHash: workspaceAgentBindingHash(task.workspaceAgentBinding), connection: connections.capture(), runtimeContract: "hara-governed-runtime-v1",
     project: captureWorkspaceProjectIdentity(project), sessionId: randomUUID(), runId: randomUUID(),

@@ -181,11 +181,11 @@ export function registerCases(file) {
       await peer.initialize();
       const status = peer.agentCommandStatus(transport, f.params.workspaceId, f.params.agentId);
       assert.equal(status.runs[0].controlledHere, false); assert.ok(status.runs[0].recovery.includes("query_original"));
-      const receipt = peer.submitAgentBoundaryCommand("other-host", transport, f.params.workspaceId, f.params.agentId, d.command, { message: d.message });
+      const receipt = await peer.submitAgentBoundaryCommand("other-host", transport, f.params.workspaceId, f.params.agentId, d.command, { message: d.message });
       assert.equal(receipt.status, "unknown"); assert.equal(receipt.error.code, "AUTHORITY_UNVERIFIED");
       const other = peer.draftAgentBoundaryCommand(transport, f.params.workspaceId, f.params.agentId, { commandId: randomUUID(), rootRequestId: randomUUID(), lifetimeMs: 30000,
         operation: { action: "task.dispatch", taskId: randomUUID(), conversationId: f.params.agentId.slice(3), messageDigest: agentCommandMessageDigest(f.params.agentId.slice(3), "hello") } });
-      assert.throws(() => peer.submitAgentBoundaryCommand("other-host", transport, f.params.workspaceId, f.params.agentId, other, { message: "hello" }), /busy|owner death/);
+      await assert.rejects(() => peer.submitAgentBoundaryCommand("other-host", transport, f.params.workspaceId, f.params.agentId, other, { message: "hello" }), /busy|owner death/);
       assert.equal(f.calls(), 1); release(); await until(async () => (await f.receipt(d.command)).execution.drain === "observed");
     } finally { release(); await peer.close(); transports.close(); }
   });

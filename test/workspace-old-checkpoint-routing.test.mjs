@@ -13,7 +13,7 @@ const ui = { source: "ui", channel: "rpc", clientId: "client" };
 async function oldBlocked(t) {
   const f = hostFixture(t, n => n === 1 ? { text: "", toolUses: [], stop: "error", errorMsg: priorFailure }
     : tools(["agent_create", { username: "video-helper", displayName: "Video helper", title: "Video", instructions: "Manage video work." }]));
-  const w = f.workspace, run = f.host.start("client", w.workspaceId, w.selectedAgentId, "hello OLD-OBJECTIVE", randomUUID());
+  const w = f.workspace, run = await f.host.start("client", w.workspaceId, w.selectedAgentId, "hello OLD-OBJECTIVE", randomUUID());
   await f.host.wait(run.runId);
   const store = new WorkspaceConversationStore(f.storage, w.selectedAgentId), value = store.read();
   assert.equal(value.task.workspaceRunBinding.budget.mode, undefined);
@@ -28,7 +28,7 @@ async function oldBlocked(t) {
 test("new send after long legacy history archives old checkpoint and failure counts and reaches one fresh version-locked creation card", async t => {
   const f = await oldBlocked(t), w = f.workspace;
   const tree = new WorkspaceTreeBudget(f.storage, f.run.runId, f.before.task.workspaceRunBinding.budget).read();
-  const run = f.host.start("client", w.workspaceId, w.selectedAgentId, "Create a colleague for the video project", randomUUID(), false, undefined, undefined, ui);
+  const run = await f.host.start("client", w.workspaceId, w.selectedAgentId, "Create a colleague for the video project", randomUUID(), false, undefined, undefined, ui);
   let card;
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
@@ -65,7 +65,7 @@ test("explicit continue keeps the frozen legacy run, cumulative usage and histor
   f.options.providerFactory = (_connection, binding) => ({ id: "openai", model: binding.model, async turn() {
     return { text: "", toolUses: [], stop: "error", errorMsg: "synthetic continuation failed", usage: { input: 5, output: 1 } };
   } });
-  const run = f.host.start("client", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true, undefined, undefined, ui);
+  const run = await f.host.start("client", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true, undefined, undefined, ui);
   await f.host.wait(run.runId);
   const value = f.store.read();
   assert.equal(run.runId, f.run.runId); assert.equal(value.task.id, f.before.task.id);
@@ -79,15 +79,15 @@ test("explicit continue keeps the frozen legacy run, cumulative usage and histor
 test("a question-card answer that sounds like a new creation stays in its original legacy task and requires the current question ID", async t => {
   const f = hostFixture(t, n => n === 1 ? tools(["ask_user", { question: "Which project should I report on?", options: ["Video", "Design"] }])
     : { text: "The selected project is video.", toolUses: [], stop: "end" });
-  const w = f.workspace, first = f.host.start("client", w.workspaceId, w.selectedAgentId, "Help choose the report project", randomUUID());
+  const w = f.workspace, first = await f.host.start("client", w.workspaceId, w.selectedAgentId, "Help choose the report project", randomUUID());
   await f.host.wait(first.runId);
   const store = new WorkspaceConversationStore(f.storage, w.selectedAgentId), before = store.read();
   const question = f.host.snapshot(w.workspaceId).conversation.pendingQuestion; assert(question);
   const answer = "Create a colleague for the video project";
-  assert.throws(() => f.host.start("client", w.workspaceId, w.selectedAgentId, answer, randomUUID(), false), /specific answer/);
-  assert.throws(() => f.host.start("client", w.workspaceId, w.selectedAgentId, answer, randomUUID(), true, undefined, undefined, ui, undefined, randomUUID()), /specific answer|changed/);
+  await assert.rejects(() => f.host.start("client", w.workspaceId, w.selectedAgentId, answer, randomUUID(), false), /specific answer/);
+  await assert.rejects(() => f.host.start("client", w.workspaceId, w.selectedAgentId, answer, randomUUID(), true, undefined, undefined, ui, undefined, randomUUID()), /specific answer|changed/);
   assert.equal(f.turns.length, 1);
-  const replied = f.host.start("client", w.workspaceId, w.selectedAgentId, answer, randomUUID(), true, undefined, undefined, ui, undefined, question.id);
+  const replied = await f.host.start("client", w.workspaceId, w.selectedAgentId, answer, randomUUID(), true, undefined, undefined, ui, undefined, question.id);
   await f.host.wait(replied.runId);
   const after = store.read();
   assert.equal(replied.runId, first.runId); assert.equal(after.task.id, before.task.id);

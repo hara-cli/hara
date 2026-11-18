@@ -85,7 +85,7 @@ test("settings scope selection does not move foreground/catalog workspace; updat
     const a = host.createWorkspace("A", host.list().revision), b = host.createWorkspace("B", host.list().revision);
     host.select("chat", a.workspaceId, host.list().revision); const before = host.list();
     host.select("settings", b.workspaceId, before.revision, true); assert.equal(host.list().activeWorkspaceId, a.workspaceId); assert.equal(host.list().revision, before.revision);
-    const lease = host.prepareUpdate("chat"); assert.throws(() => host.start("chat", a.workspaceId, a.selectedAgentId, "hello", randomUUID()), /updating/);
+    const lease = host.prepareUpdate("chat"); await assert.rejects(() => host.start("chat", a.workspaceId, a.selectedAgentId, "hello", randomUUID()), /updating/);
     assert.throws(() => host.releaseUpdate("other", lease.id)); host.disconnect("chat"); assert.doesNotThrow(() => host.prepareUpdate("new-chat"));
   } finally { await host.close(); }
 });

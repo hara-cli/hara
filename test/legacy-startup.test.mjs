@@ -21,7 +21,7 @@ test("formal Host automatically inherits 17 colleagues and 99 tasks, dependencie
 test("cold Host reopen uses frozen encrypted source, does not duplicate, and does not overwrite later source or target edits",async t=>{
   const f=fixture(t),a=f.open();let id,roster;
   try{await a.initialize();id=a.list().workspaces[0].workspaceId;roster=a.snapshot(id).agents.map(row=>row.agentId);
-    const value=a.workspaceFeatures(id);a.updateFeature(id,"schedule","legacy-0",false,value.revision);
+    const value=a.workspaceFeatures(id);await a.updateFeature(id,"schedule","legacy-0",false,value.revision);
   }finally{await a.close();}
   f.write(".hara/roles/later.md","---\nname: later\n---\nDo not silently import a later colleague.\n");
   const b=f.open();try{assert.equal((await b.initialize()).state,"verified");assert.deepEqual(b.snapshot(id).agents.map(row=>row.agentId),roster);

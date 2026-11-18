@@ -72,7 +72,7 @@ test("long instructions keep a stable governance hash while fresh receipt refere
   const before = agents.get(f.workspace.selectedAgentId), persona = agents.currentPersona(before.agentId);
   agents.updatePersona(before.agentId, { ...persona, instructions: "Retain this fixed instruction. ".repeat(100) }, before.configRevision, before.agentEpoch);
   for (const message of ["你好", "谢谢"]) {
-    const run = f.host.start("client", f.workspace.workspaceId, f.workspace.selectedAgentId, message, randomUUID());
+    const run = await f.host.start("client", f.workspace.workspaceId, f.workspace.selectedAgentId, message, randomUUID());
     await f.host.wait(run.runId);
   }
   assert.equal(f.turns.length, 2);

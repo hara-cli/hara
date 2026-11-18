@@ -20,13 +20,13 @@ test("C4 actual Host closes the stopped job's genuine pending approval and keeps
     const duty = structuredClone(template.duty), boundary = structuredClone(template.boundary);
     for (const doc of [duty, boundary]) { doc.agentId = a2; doc.context = view.context; } boundary.resources = [{ resourceId: view.resources[0].resourceId, access: ["read", "write"] }];
     peer.configureAgentBoundary(transport, w2, a2, { expectedRevision: view.revision, duty, boundary, rights: { manage: true, invoke: true, privateRead: true, nodeUse: true } }); peer.initializeAgentCommandControl(transport, w2, a2);
-    const dispatch = (workspaceId, agentId, clientId) => {
+    const dispatch = async (workspaceId, agentId, clientId) => {
       peer.select(clientId, workspaceId, peer.catalog.read().revision, true);
       const message = "hello", command = peer.draftAgentBoundaryCommand(transport, workspaceId, agentId, { commandId: randomUUID(), rootRequestId: randomUUID(), lifetimeMs: 30000,
         operation: { action: "task.dispatch", taskId: randomUUID(), conversationId: agentId.slice(3), messageDigest: agentCommandMessageDigest(agentId.slice(3), message) } });
-      peer.submitAgentBoundaryCommand(clientId, transport, workspaceId, agentId, command, { message }); return command;
+      await peer.submitAgentBoundaryCommand(clientId, transport, workspaceId, agentId, command, { message }); return command;
     };
-    const d1 = dispatch(f.params.workspaceId, f.params.agentId, "view_one"), d2 = dispatch(w2, a2, "view_two");
+    const d1 = await dispatch(f.params.workspaceId, f.params.agentId, "view_one"), d2 = await dispatch(w2, a2, "view_two");
     const j1 = [...peer.jobs.values()].find(row => row.workspaceId === f.params.workspaceId), j2 = [...peer.jobs.values()].find(row => row.workspaceId === w2); assert.ok(j1?.permit); assert.ok(j2?.permit);
     await until(() => entered.has(f.params.agentId) && entered.has(a2));
     // Real Host approval factory and genuine owned jobs. No fabricated approval or permission object.
@@ -34,7 +34,7 @@ test("C4 actual Host closes the stopped job's genuine pending approval and keeps
     assert.equal(peer.pending.size, 2); const other = [...peer.pending.values()].find(row => row.job === j2).card;
     const status = peer.agentCommandStatus(transport, f.params.workspaceId, f.params.agentId).runs[0], stop = peer.draftAgentBoundaryCommand(transport, f.params.workspaceId, f.params.agentId,
       { commandId: randomUUID(), rootRequestId: randomUUID(), lifetimeMs: 30000, operation: { action: "task.stop", taskId: status.taskId, runId: status.runId, claimRevision: 1 } });
-    peer.submitAgentBoundaryCommand("view_one", transport, f.params.workspaceId, f.params.agentId, stop, {});
+    await peer.submitAgentBoundaryCommand("view_one", transport, f.params.workspaceId, f.params.agentId, stop, {});
     assert.deepEqual(await p1, { approved: false, state: "aborted" }); assert.equal(j1.signal.aborted, true);
     assert.equal(j2.signal.aborted, false); assert.equal(peer.pending.size, 1); assert.equal(peer.pending.has(other.id), true);
     assert.throws(() => peer.answerApproval("view_one", f.params.workspaceId, other.id, true)); assert.equal(peer.pending.has(other.id), true);

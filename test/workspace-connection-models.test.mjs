@@ -67,7 +67,7 @@ test("Workspace authority lists one connection for main and colleague without re
   try {
     const workspace = host.createWorkspace("Personal", host.list().revision), workspaceId = workspace.workspaceId;
     host.select("client", workspaceId, host.list().revision);
-    host.configureConnection(workspaceId, { label: "Fixture", provider: "openai",
+    await host.configureConnection(workspaceId, { label: "Fixture", provider: "openai",
       baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: key, defaultModel: "gpt-5.6-sol" }, 0);
     const view = host.snapshot(workspaceId, workspace.selectedAgentId), connectionId = view.connections.connections[0].id;
     const main = await host.listConnectionModels(workspaceId, workspace.selectedAgentId, connectionId);
@@ -80,7 +80,7 @@ test("Workspace authority lists one connection for main and colleague without re
     const colleagueModels = await host.listConnectionModels(workspaceId, colleague.agentId, connectionId);
     assert.deepEqual(colleagueModels.models, main.models);
     const frozen = host.context(workspaceId).connections.capture();
-    host.selectConnection(workspaceId, connectionId, main.revision, "gpt-5.6-sol", "high");
+    await host.selectConnection(workspaceId, connectionId, main.revision, "gpt-5.6-sol", "high");
     const selected = host.snapshot(workspaceId, colleague.agentId).connections;
     assert.equal(selected.connections[0].defaultModel, "gpt-5.6-sol");
     assert.equal(selected.connections[0].defaultReasoning, "high");
@@ -88,7 +88,7 @@ test("Workspace authority lists one connection for main and colleague without re
     assert.equal(frozen.reasoning, null, "a new connection remains automatic; existing frozen provenance is unchanged");
     assert.equal(host.context(workspaceId).connections.resolve(frozen).apiKey, key, "model selection leaves the credential generation usable");
     await assert.rejects(host.listConnectionModels(workspaceId, "ag_00000000-0000-4000-8000-000000000000", connectionId), /Agent unavailable/);
-    assert.throws(() => host.selectConnection(workspaceId, connectionId, selected.revision, "gpt-5.6-sol", "ultra"), /reasoning effort/);
+    await assert.rejects(() => host.selectConnection(workspaceId, connectionId, selected.revision, "gpt-5.6-sol", "ultra"), /reasoning effort/);
     assert(!JSON.stringify(host.snapshot(workspaceId, colleague.agentId)).includes(key));
   } finally { await host.close(); server.close(); await once(server, "close"); }
 });

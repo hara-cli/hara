@@ -100,7 +100,7 @@ test("C4 a second genuine Host persists exact stop and the owning Host actually 
     const run = (await f.inspect()).runs[0];
     const stop = peer.draftAgentBoundaryCommand(transport, f.params.workspaceId, f.params.agentId, { commandId: randomUUID(), rootRequestId: randomUUID(), lifetimeMs: 30000,
       operation: { action: "task.stop", taskId: run.taskId, runId: run.runId, claimRevision: run.claimRevision } });
-    const accepted = peer.submitAgentBoundaryCommand("second_real_host", transport, f.params.workspaceId, f.params.agentId, stop, {});
+    const accepted = await peer.submitAgentBoundaryCommand("second_real_host", transport, f.params.workspaceId, f.params.agentId, stop, {});
     assert.equal(accepted.execution.drain, "pending");
     await Promise.race([aborted, new Promise((_, reject) => setTimeout(() => reject(new Error("owning Host did not receive persisted stop")), 10000))]);
     assert.notEqual((await f.receipt(stop)).execution.drain, "observed"); assert.equal(f.calls(), 1);

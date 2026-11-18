@@ -31,7 +31,7 @@ test("actual process death after writing recovers the frozen task, closes protoc
   const restored=new LocalWorkspaceHost(root);try{
    const pending=restored.snapshot(workspace.workspaceId);assert.equal(pending.conversation.state,"needs_recovery");
    for(let i=0;i<pending.conversation.history.length;i++){const row=pending.conversation.history[i];if(row.role==="assistant"&&row.tools.length)assert.equal(pending.conversation.history[i+1]?.role,"tool");}
-   const resumed=restored.start("resumed",workspace.workspaceId,workspace.selectedAgentId,"/continue",randomUUID(),true);await restored.wait(resumed.runId);
+   const resumed=await restored.start("resumed",workspace.workspaceId,workspace.selectedAgentId,"/continue",randomUUID(),true);await restored.wait(resumed.runId);
    const done=restored.snapshot(workspace.workspaceId);assert.equal(done.conversation.taskState,"completed");assert.equal(done.conversation.completion.state,"verified");
    assert.equal(fs.statSync(file).ino,before.ino,"resume must read/verify existing bytes instead of repeating the write");
    assert.equal(createHash("sha256").update(fs.readFileSync(file)).digest("hex"),hash);

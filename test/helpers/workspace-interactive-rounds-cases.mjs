@@ -60,7 +60,7 @@ test("twenty colleagues with long public bios fit a compact directory and reach 
   assert.equal(packet.total, 21); assert.equal(packet.agents.length, 21); assert.equal(packet.truncated, false);
   assert.ok(JSON.stringify(packet).length < 2000); assert.equal(JSON.stringify(packet).includes("biography"), false);
   assert.equal(JSON.stringify(packet).includes("Private instructions"), false);
-  const run = start(a, "Create a new colleague Video New to work on the video project");
+  const run = await start(a, "Create a new colleague Video New to work on the video project");
   const card = await until(() => snapshot(a).approvals[0]);
   assert.ok(a.turns.length <= 4); assert.equal(a.turns.length, 2); assert.equal(snapshot(a).agents.length, 21);
   assert.match(a.turns[0].system, /catalog_only/); assert.match(a.turns[0].system, /peer|Peer/);
@@ -80,7 +80,7 @@ test("interactive chat passes twelve rounds and aggregate token/tool sizing with
   const project = a.host.context(a.workspace.workspaceId).project;
   for (let n = 1; n <= 14; n++) for (const part of [1, 2, 3]) fs.writeFileSync(join(project, `report-${n}-${part}.txt`),
     `Report ${n}: ${Array.from({ length: 100 }, () => randomBytes(5).toString("hex")).join(" ")}`);
-  const run = start(a, "What do the numbered reports say?"); await a.host.wait(run.runId);
+  const run = await start(a, "What do the numbered reports say?"); await a.host.wait(run.runId);
   assert.ok(a.turns.length >= 15 && a.turns.length <= 16, snapshot(a).conversation.blockReason); assert.equal(snapshot(a).conversation.pendingQuestion, null);
   assert.equal(snapshot(a).conversation.runUsage.toolCalls, 43);
   assert.equal(snapshot(a).conversation.runUsage.modelCalls, a.turns.length); assert.ok(snapshot(a).conversation.runUsage.inputTokens > 128000);
@@ -90,7 +90,7 @@ test("interactive chat passes twelve rounds and aggregate token/tool sizing with
 
 for (const source of ["host", "delegation", "cli", "legacy_rpc", "automatic_retry"]) test(`${source} requests keep the original budget`, async t => {
   const a = hostFixture(t, () => ({ text: "Hello", toolUses: [], stop: "end" }));
-  const run = start(a, "Hello", { source, channel: source === "host" || source === "delegation" ? "internal" : "rpc", clientId: "client" }); await a.host.wait(run.runId);
+  const run = await start(a, "Hello", { source, channel: source === "host" || source === "delegation" ? "internal" : "rpc", clientId: "client" }); await a.host.wait(run.runId);
   assert.deepEqual(store(a).read().task.workspaceRunBinding.budget, DEFAULT_WORKSPACE_RUN_BUDGET);
 });
 
@@ -109,7 +109,7 @@ test("interactive fuse is durable, has explicit choices, and a human continuatio
 for (const decision of ["Continue", "Stop"]) test(`recovered fuse ${decision} keeps usage and never charges a model to stop`, async t => {
   const a = hostFixture(t, n => n === 1 ? tools(["ask_user", { question: "Choose the next step", options: ["Continue", "Stop"] }])
     : { text: "Continued from the preserved progress.", toolUses: [], stop: "end" });
-  const first = start(a, "Inspect the current progress"); await a.host.wait(first.runId);
+  const first = await start(a, "Inspect the current progress"); await a.host.wait(first.runId);
   let value = store(a).read(); const binding = value.task.workspaceRunBinding;
   // Simulate a persisted 100-round boundary without spending 100 real model calls.
   const interactionFile = a.storage.run(() => join(workspaceStateHome(), ".hara", `interaction-${first.runId}.json`));
@@ -120,7 +120,7 @@ for (const decision of ["Continue", "Stop"]) test(`recovered fuse ${decision} ke
   value.runUsage.modelCalls = 100; value.usage.modelCalls = 100; value.task.roundsUsed = 100;
   store(a).save(value.revision, value);
   const before = snapshot(a).conversation;
-  const result = a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, decision, randomUUID(), true, undefined, undefined, ui, undefined, before.pendingQuestion.id);
+  const result = await a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, decision, randomUUID(), true, undefined, undefined, ui, undefined, before.pendingQuestion.id);
   await a.host.wait(result.runId);
   assert.equal(a.turns.length, decision === "Stop" ? 1 : 2);
   assert.equal(snapshot(a).conversation.runUsage.modelCalls, decision === "Stop" ? 100 : 101);
@@ -158,12 +158,12 @@ test("full receipt pages are read once and stay intact in the fresh model projec
 test("scheduled dispatch and interactive colleague chats receive distinct frozen policies", async t => {
   const a = hostFixture(t, () => ({ text: "Hello", toolUses: [], stop: "end" }));
   const context = a.host.context(a.workspace.workspaceId);
-  const scheduled = a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "Hello on a schedule", randomUUID(), false,
+  const scheduled = await a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "Hello on a schedule", randomUUID(), false,
     undefined, undefined, ui, undefined, undefined, context.connections.capture());
   await a.host.wait(scheduled.runId); assert.deepEqual(store(a).read().task.workspaceRunBinding.budget, DEFAULT_WORKSPACE_RUN_BUDGET);
   const colleague = context.resources.agents.create({ username: "interactive-peer", profile: { displayName: "Interactive Peer" }, instructions: "Reply to the user" }, context.resources.agents.list().revision);
   context.resources.agents.setPermissionTier(colleague.agentId, "controlled", colleague.configRevision, colleague.agentEpoch);
-  const direct = a.host.start("client", a.workspace.workspaceId, colleague.agentId, "Hello", randomUUID(), false, undefined, undefined, ui);
+  const direct = await a.host.start("client", a.workspace.workspaceId, colleague.agentId, "Hello", randomUUID(), false, undefined, undefined, ui);
   await a.host.wait(direct.runId);
   const binding = new WorkspaceConversationStore(a.storage, colleague.agentId).read().task.workspaceRunBinding;
   assert.equal(binding.budget.mode, "interactive");

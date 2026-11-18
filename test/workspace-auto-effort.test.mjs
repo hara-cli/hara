@@ -49,29 +49,29 @@ test("Host freezes Pi's per-turn choice for main and colleague, preserving an ex
   } });
   try {
     const workspace = host.createWorkspace("Auto effort", host.list().revision), workspaceId = workspace.workspaceId;
-    host.configureConnection(workspaceId, { label: "Fixture", provider: "openai", baseURL: "http://127.0.0.1:1/v1",
+    await host.configureConnection(workspaceId, { label: "Fixture", provider: "openai", baseURL: "http://127.0.0.1:1/v1",
       apiKey: "synthetic-not-a-real-key", defaultModel: "gpt-5.6-sol" }, 0);
     const resources = host.context(workspaceId).resources;
     const colleague = resources.agents.create({ username: "tester", profile: { displayName: "Tester" }, permissionTier: "controlled" }, resources.agents.list().revision);
     let main = resources.agents.get(workspace.selectedAgentId);
     main = host.setAgentPermissionTier(workspaceId, main.agentId, "controlled", main.configRevision, main.agentEpoch);
     for (const [agentId, message, effort] of [[main.agentId, "hello", "low"], [colleague.agentId, "Investigate failing tests", "medium"]]) {
-      const run = host.start("client", workspaceId, agentId, message, randomUUID()); await host.wait(run.runId);
+      const run = await host.start("client", workspaceId, agentId, message, randomUUID()); await host.wait(run.runId);
       assert.equal(choices.at(-1).effort, effort);
       assert.equal(host.snapshot(workspaceId, agentId).conversation.runtimeStages.at(-1).runtime.effort, effort);
     }
     let connections = host.snapshot(workspaceId).connections;
     assert.equal(connections.connections[0].defaultReasoning, null);
-    host.selectConnection(workspaceId, connections.connections[0].id, connections.revision, "gpt-5.6-sol", "high");
+    await host.selectConnection(workspaceId, connections.connections[0].id, connections.revision, "gpt-5.6-sol", "high");
     // The full tier exists only with Seatbelt; elsewhere the colleague keeps the controlled tier (decision B).
     if (SEATBELT) host.setAgentPermissionTier(workspaceId, colleague.agentId, "full-protected", colleague.configRevision, colleague.agentEpoch);
-    const run = host.start("client", workspaceId, colleague.agentId, "hello", randomUUID()); await host.wait(run.runId);
+    const run = await host.start("client", workspaceId, colleague.agentId, "hello", randomUUID()); await host.wait(run.runId);
     assert.deepEqual(choices.at(-1), { effort: "high", agent: colleague.agentId });
     assert.equal(host.snapshot(workspaceId, colleague.agentId).conversation.runtimeStages.at(-1).runtime.effort, "high");
     assert.equal(host.snapshot(workspaceId).connections.connections[0].defaultReasoning, "high");
     connections = host.snapshot(workspaceId).connections;
-    host.selectConnection(workspaceId, connections.connections[0].id, connections.revision, "gpt-5.6-sol", "auto");
-    const autoRun = host.start("client", workspaceId, colleague.agentId, "hello", randomUUID()); await host.wait(autoRun.runId);
+    await host.selectConnection(workspaceId, connections.connections[0].id, connections.revision, "gpt-5.6-sol", "auto");
+    const autoRun = await host.start("client", workspaceId, colleague.agentId, "hello", randomUUID()); await host.wait(autoRun.runId);
     assert.equal(choices.at(-1).effort, "low");
     assert.equal(host.snapshot(workspaceId, colleague.agentId).conversation.runtimeStages.at(-1).runtime.effort, "low", "protected Pi preserves the Host's effective effort");
     assert.equal(host.snapshot(workspaceId).connections.connections[0].defaultReasoning, "auto");

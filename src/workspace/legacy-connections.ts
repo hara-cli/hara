@@ -6,11 +6,11 @@ import { redactSensitiveText } from "../security/secrets.js";
 import { readLegacyBackupBytes } from "./legacy-backup.js";
 import { decodeUtf8Strict } from "../fs-read.js";
 import { plain } from "./local-state.js";
-import type { CredentialVault } from "./credential-vault.js";
+import { assertCredentialCall, type CredentialVault, type AsyncCredentialVault, type CredentialCall } from "./credential-vault.js";
 import type { ScopedConnectionInput } from "./scoped-connections.js";
 
 interface Source { id: string; label: string; provider: "openai" | "anthropic"; baseURL: string; defaultModel: string; keySaved: boolean; source: string; isDefault: boolean;
-  legacyId: string; purpose: "chat" | "decision"; read(): string | undefined }
+  legacyId: string; purpose: "chat" | "decision"; credential(): { key?: string; ref?: string } }
 function read(path: string): { value: any; revision: string } | null {
   try { const info = lstatSync(path); if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || realpathSync.native(path) !== path || info.size > 4 * 1024 * 1024
       || process.platform !== "win32" && (info.uid !== process.getuid?.() || (info.mode & 0o022) !== 0)) return null;
@@ -22,17 +22,17 @@ function read(path: string): { value: any; revision: string } | null {
 const clean = (value: unknown, max = 256) => redactSensitiveText(String(value ?? "")).text.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, max).trim();
 const baseFor = (provider: unknown) => isProviderId(provider) ? providerDefaultBaseURL(provider)
   ?? (provider === "anthropic" ? "https://api.anthropic.com" : provider === "openai" ? "https://api.openai.com/v1" : undefined) : undefined;
-function readLegacyCredential(row: { apiKey?: unknown; keyRef?: unknown }, vault: CredentialVault): string | undefined {
+function legacyCredential(row: { apiKey?: unknown; keyRef?: unknown }): { key?: string; ref?: string } {
   const ref = row.keyRef;
   // Validate independently of the backend, before reading even an inline key or calling the vault.
   if (ref !== undefined && (typeof ref !== "string" || !/^[a-zA-Z0-9_.:-]{1,240}$/.test(ref)
     || ref.startsWith("vault.") && !ref.includes(":"))) throw new Error("Old credential unavailable; original preserved");
-  return typeof row.apiKey === "string" ? row.apiKey : ref === undefined ? undefined : vault.get(ref);
+  return typeof row.apiKey === "string" ? { key: row.apiKey } : { ref };
 }
 /** Known private Hara locations only; never uses loadConfig()/env, migrates, or changes old source. */
 export class LegacyConnectionCatalog {
   private sources: Source[] = [];
-  constructor(private readonly home: string, private readonly vault: CredentialVault, private readonly identityHome = home) {
+  constructor(private readonly home: string, private readonly vault?: Pick<CredentialVault, "get">, private readonly identityHome = home) {
     if (!isAbsolute(home) || !isAbsolute(identityHome)) throw new Error("Legacy source requires explicit absolute owner roots");
   }
   list(excludeSource?: string, includeWorkspaceSources = true, includeDecision = false) {
@@ -53,7 +53,7 @@ export class LegacyConnectionCatalog {
       const id = createHash("sha256").update(`${identityPath}\0${row.id ?? fallbackLabel}\0${revision}`).digest("hex");
       sources.push({ id, label, provider, baseURL: url.href.replace(/\/$/, ""), defaultModel, keySaved, source: path, isDefault,
         legacyId: clean(row.id ?? fallbackLabel), purpose,
-        read: () => readLegacyCredential(row, this.vault) });
+        credential: () => legacyCredential(row) });
     };
     const configPath = join(this.home, ".hara/config.json"), config = read(configPath);
     const profilesPath = join(this.home, ".hara/profiles.json"), profiles = read(profilesPath);
@@ -99,19 +99,35 @@ export class LegacyConnectionCatalog {
       for (const row of file.value.connections.slice(0, 256)) if (row.status === "active") add(row, path, file.revision, row.label ?? row.id);
     }
     this.sources = sources;
-    return sources.map(({ read: _read, legacyId: _legacy, purpose: _purpose, ...safe }) => safe);
+    return sources.map(({ credential: _credential, legacyId: _legacy, purpose: _purpose, ...safe }) => safe);
   }
   personalSeeds(excludeSource?: string) {
     return this.list(excludeSource, false);
   }
   /** Owner inheritance only, after backup/dry-run. Does not broaden settings previews or workspace
    * discovery; explicit purpose mapping keeps the decision credential out of the active chat route. */
-  inheritanceSeeds(excludeSource?: string) { this.list(excludeSource, false, true); return this.sources.map(({ read: _read, ...row }) => row); }
-  resolve(id: string, excludeSource?: string, personalOnly = false, includeDecision = false): { input: ScopedConnectionInput; importId: string } {
-    // Refresh source revision immediately before a confirmed import; a changed preview is rejected.
-    this.list(excludeSource, !personalOnly, includeDecision); const row = this.sources.find(row => row.id === id);
+  inheritanceSeeds(excludeSource?: string) { this.list(excludeSource, false, true); return this.sources.map(({ credential: _credential, ...row }) => row); }
+  private source(id: string, excludeSource?: string, personalOnly = false, includeDecision = false): Source {
+    // Source IDs bind the exact original bytes, not an index in a mutable preview list.
+    this.list(excludeSource, !personalOnly, includeDecision);
+    const row = this.sources.find(row => row.id === id);
     if (!row) throw new Error("Old connection changed or is unavailable; refresh the preview");
-    const apiKey = row.read(); if (!apiKey) throw new Error("Old credential unavailable; original preserved");
-    return { input: { label: row.label, provider: row.provider, baseURL: row.baseURL, defaultModel: row.defaultModel, apiKey }, importId: id };
+    return row;
+  }
+  private resolved(row: Source, apiKey: string | undefined): { input: ScopedConnectionInput; importId: string } {
+    if (!apiKey) throw new Error("Old credential unavailable; original preserved");
+    return { input: { label: row.label, provider: row.provider, baseURL: row.baseURL, defaultModel: row.defaultModel, apiKey }, importId: row.id };
+  }
+  resolve(id: string, excludeSource?: string, personalOnly = false, includeDecision = false) {
+    const row = this.source(id, excludeSource, personalOnly, includeDecision), { key, ref } = row.credential();
+    return this.resolved(row, key ?? (ref === undefined ? undefined : this.vault?.get(ref)));
+  }
+  async resolveAsync(id: string, vault: AsyncCredentialVault, call: CredentialCall, excludeSource?: string, personalOnly = false, includeDecision = false) {
+    assertCredentialCall(call);
+    const row = this.source(id, excludeSource, personalOnly, includeDecision), { key, ref } = row.credential();
+    if (key !== undefined || ref === undefined) return this.resolved(row, key);
+    const apiKey = await vault.get(ref, call);
+    assertCredentialCall(call);
+    return this.resolved(this.source(id, excludeSource, personalOnly, includeDecision), apiKey);
   }
 }

@@ -123,12 +123,12 @@ if (selected.includes(6)) test("synthetic six-step flow uses per-task context, a
   try {
     const workspace = host.createWorkspace("Context synthetic", host.list().revision), id = workspace.workspaceId, main = workspace.selectedAgentId;
     assert.equal(workspace.agents.length, 1); host.configureSynthetic(id, 0); host.select("native", id, host.list().revision);
-    let run = host.start("native", id, main, "OLD_CHAT_MARKER", randomUUID()); await host.wait(run.runId);
+    let run = await host.start("native", id, main, "OLD_CHAT_MARKER", randomUUID()); await host.wait(run.runId);
     const old = host.snapshot(id).conversation.history;
-    run = host.start("native", id, main, "建立同事 Coder\n只建立一次，等卡片確認", randomUUID());
+    run = await host.start("native", id, main, "建立同事 Coder\n只建立一次，等卡片確認", randomUUID());
     const card = await until(() => host.snapshot(id, main, "native").approvals[0]); host.answerApproval("native", id, card.id, true); await host.wait(run.runId);
     assert.equal(host.snapshot(id).agents.length, 2); assert.equal(host.snapshot(id).conversation.taskState, "completed");
-    run = host.start("native", id, main, "委派 Coder 生成 hello.md\n核驗後結案", randomUUID()); await host.wait(run.runId);
+    run = await host.start("native", id, main, "委派 Coder 生成 hello.md\n核驗後結案", randomUUID()); await host.wait(run.runId);
     const mainState = host.snapshot(id).conversation, colleague = host.snapshot(id).agents.find(a => a.kind === "colleague"), child = host.snapshot(id, colleague.agentId).conversation;
     assert.equal(mainState.taskState, "completed"); assert.equal(mainState.completion.state, "verified");
     assert.equal(child.taskState, "completed"); assert.equal(colleague.runtime.id, "pi");
@@ -165,9 +165,9 @@ if (selected.includes(7)) test("a verbose colleague completion returns at most2k
   } });
   try {
     const ws = host.createWorkspace("Handoff", host.list().revision); host.configureSynthetic(ws.workspaceId, 0); host.select("test", ws.workspaceId, host.list().revision);
-    let run = host.start("test", ws.workspaceId, ws.selectedAgentId, "建立同事 Coder", randomUUID());
+    let run = await host.start("test", ws.workspaceId, ws.selectedAgentId, "建立同事 Coder", randomUUID());
     const card = await until(() => host.snapshot(ws.workspaceId, ws.selectedAgentId, "test").approvals[0]); host.answerApproval("test", ws.workspaceId, card.id, true); await host.wait(run.runId);
-    run = host.start("test", ws.workspaceId, ws.selectedAgentId, "委派 Coder 生成 hello.md 並驗證", randomUUID()); await host.wait(run.runId);
+    run = await host.start("test", ws.workspaceId, ws.selectedAgentId, "委派 Coder 生成 hello.md 並驗證", randomUUID()); await host.wait(run.runId);
     const view = host.snapshot(ws.workspaceId), response = view.conversation.history.flatMap(row => row.role === "tool" ? row.results : []).find(row => row.name === "agent_contact");
     assert.equal(view.conversation.taskState, "completed"); assert.ok(response.content.length <= 2000);
     const handoff = JSON.parse(response.content); assert.equal(handoff.completed, true); assert.equal(handoff.completion.state, "verified");
@@ -195,7 +195,7 @@ if (selected.includes(8)) test("actual governed Host compacts at72% without an e
     // Exact in-process ledger/compaction/recovery contract; full native transport has separate coverage.
     const agent = host.context(ws.workspaceId).resources.agents.get(ws.selectedAgentId);
     host.context(ws.workspaceId).resources.agents.setPermissionTier(agent.agentId,"controlled",agent.configRevision,agent.agentEpoch);
-    const run = host.start("test", ws.workspaceId, ws.selectedAgentId, "write hello.md and verify", randomUUID()); await host.wait(run.runId);
+    const run = await host.start("test", ws.workspaceId, ws.selectedAgentId, "write hello.md and verify", randomUUID()); await host.wait(run.runId);
     const view = host.snapshot(ws.workspaceId); assert.equal(view.conversation.taskState, "completed"); assert.equal(view.conversation.completion.state, "verified");
     assert.equal(calls, 4); assert.equal(view.conversation.runUsage.modelCalls, 4); assert.equal(view.conversation.runUsage.inputTokens + view.conversation.runUsage.outputTokens, 2 * burstInput + 24);
     const storage = new WorkspaceResourceStorage(host.home, host.catalog.resolve(ws.workspaceId).scope); storage.initialize();
@@ -224,7 +224,7 @@ if (selected.includes(9)) test("actual scoped80k output remains complete in loca
     const agent = host.context(ws.workspaceId).resources.agents.get(ws.selectedAgentId);
     host.context(ws.workspaceId).resources.agents.setPermissionTier(agent.agentId,"controlled",agent.configRevision,agent.agentEpoch);
     const content = "abcdefg\n".repeat(10000); fs.writeFileSync(join(path, "project", ws.workspaceId, "large.md"), content);
-    const run = host.start("test", ws.workspaceId, ws.selectedAgentId, "read large.md only", randomUUID()); await host.wait(run.runId);
+    const run = await host.start("test", ws.workspaceId, ws.selectedAgentId, "read large.md only", randomUUID()); await host.wait(run.runId);
     const view = host.snapshot(ws.workspaceId); assert.equal(view.conversation.taskState, "completed");
     const full = view.conversation.history.flatMap(m => m.role === "tool" ? m.results : []).find(r => r.id === "read-large").content;
     assert.ok(full.length > 80000); assert.equal(JSON.parse(full).text, content); assert.ok(preview.length < full.length);
@@ -248,13 +248,13 @@ if (selected.includes(10)) test("recovery projects a fresh attempt but retains f
     const agent = host.context(ws.workspaceId).resources.agents.get(ws.selectedAgentId);
     host.context(ws.workspaceId).resources.agents.setPermissionTier(agent.agentId,"controlled",agent.configRevision,agent.agentEpoch);
     const message = "ORIGINAL_BLOCKED_OBJECTIVE\nsecond line", requestId = randomUUID();
-    const run = host.start("test", ws.workspaceId, ws.selectedAgentId, message, requestId); await ready;
+    const run = await host.start("test", ws.workspaceId, ws.selectedAgentId, message, requestId); await ready;
     host.cancel(ws.workspaceId, ws.selectedAgentId, run.runId); release(); await host.wait(run.runId);
     const before = host.snapshot(ws.workspaceId).conversation;
     assert.equal(before.state, "cancelled");
-    assert.equal(host.start("test", ws.workspaceId, ws.selectedAgentId, message, requestId).duplicate, true);
-    assert.throws(() => host.start("test", ws.workspaceId, ws.selectedAgentId, message.replace("\n", "\r\n"), requestId), /another request/);
-    const resumed = host.start("test", ws.workspaceId, ws.selectedAgentId, "/continue\n只讀確認", randomUUID(), true); await host.wait(resumed.runId);
+    assert.equal((await host.start("test", ws.workspaceId, ws.selectedAgentId, message, requestId)).duplicate, true);
+    await assert.rejects(() => host.start("test", ws.workspaceId, ws.selectedAgentId, message.replace("\n", "\r\n"), requestId), /another request/);
+    const resumed = await host.start("test", ws.workspaceId, ws.selectedAgentId, "/continue\n只讀確認", randomUUID(), true); await host.wait(resumed.runId);
     const afterState = host.snapshot(ws.workspaceId).conversation;
     assert.equal(afterState.runId, before.runId); assert.equal(afterState.taskId, before.taskId);
     assert.equal(afterState.runUsage.modelCalls, before.runUsage.modelCalls + 1);

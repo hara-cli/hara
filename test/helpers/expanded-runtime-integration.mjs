@@ -130,7 +130,7 @@ async function fixture(t, id, kind = "main", mode = "ok", tier = DEFAULT_TIER) {
   if (selected.permissionTier !== tier) selected = resources.agents.setPermissionTier(selected.agentId, tier, selected.configRevision, selected.agentEpoch);
   const task = resources.agents.bindTask(createTaskExecution("List colleagues", randomUUID()), selected.agentId, selected.configRevision, selected.agentEpoch);
   const connections = new WorkspaceSecureConnections(storage, new MemoryCredentialVault());
-  connections.add({ label: "Synthetic", provider: "openai", baseURL: "http://127.0.0.1:1/v1", apiKey: "fixture", defaultModel: "fixture" }, 0);
+  await connections.add({ label: "Synthetic", provider: "openai", baseURL: "http://127.0.0.1:1/v1", apiKey: "fixture", defaultModel: "fixture" }, 0);
   const binding = freezeWorkspaceRunBinding({ schemaVersion: 1, scope: row.scope, agent: task.workspaceAgentBinding,
     agentBindingHash: workspaceAgentBindingHash(task.workspaceAgentBinding), connection: connections.capture(), runtimeContract: "hara-governed-runtime-v1",
     project: captureWorkspaceProjectIdentity(project), sessionId: randomUUID(), runId: randomUUID(),

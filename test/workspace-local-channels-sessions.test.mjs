@@ -14,7 +14,7 @@ import { setup, until } from "./helpers/local-channels.mjs";
 test("DMs, two channels and another Workspace retain separate sessions; only explicit recipients run", async () => {
   const f = await setup();
   try {
-    const dm = f.host.start("client", f.id, f.members[0], "PRIVATE_DM_MARKER", randomUUID()); await f.host.wait(dm.runId);
+    const dm = await f.host.start("client", f.id, f.members[0], "PRIVATE_DM_MARKER", randomUUID()); await f.host.wait(dm.runId);
     const privateHistory = f.host.snapshot(f.id, f.members[0]).conversation;
     const a = f.create("Channel A"); f.host.sendChannel("client", f.id, a, "CHANNEL_A_MARKER", randomUUID(), [f.members[0]]); await f.host.waitChannel(f.id, a);
     const b = f.create("Channel B"); f.host.sendChannel("client", f.id, b, "CHANNEL_B_MARKER", randomUUID(), [f.members[0]]); await f.host.waitChannel(f.id, b);
@@ -85,7 +85,7 @@ test("channel membership never grants a colleague the main Hara's Agent-creation
 test("personal notes need no model; malformed identifiers and unsafe channel metadata never create files", async () => {
   const f = await setup(0);
   try {
-    const connection = f.host.snapshot(f.id).connections; f.host.revokeConnection(f.id, connection.defaultConnectionId, connection.revision);
+    const connection = f.host.snapshot(f.id).connections; await f.host.revokeConnection(f.id, connection.defaultConnectionId, connection.revision);
     assert.equal(f.host.snapshot(f.id).connections.defaultConnectionId, null);
     const channel = f.create("Notes", []), nonce = randomUUID(); f.host.sendChannel("client", f.id, channel, "just me\nlocal note", nonce, []); await f.host.waitChannel(f.id, channel);
     const view = f.host.channelSnapshot(f.id, channel, "client"); assert.equal(view.messages.length, 1); assert.equal(f.calls.length, 0);

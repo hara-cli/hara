@@ -43,7 +43,7 @@ export async function registerCases(file) {
   };
 const roots = [], dir = () => { const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "hara-chat-schedule-host-"))); roots.push(root); return root; };
 after(() => roots.forEach(root => fs.rmSync(root, { recursive: true, force: true })));
-function fixture(events, repeat) {
+async function fixture(events, repeat) {
   const host = new LocalWorkspaceHost(dir(), { mode: "workspace", credentialVault: new MemoryCredentialVault(), onChange: value => events.emit("change", value),
     providerFactory(connection, binding, context) {
       const synthetic = createWorkspaceSyntheticProvider(connection, binding, context);
@@ -58,13 +58,13 @@ function fixture(events, repeat) {
       } });
     } });
   const workspace = host.createWorkspace("Fixture", host.list().revision), workspaceId = workspace.workspaceId, agentId = workspace.selectedAgentId;
-  host.configureConnection(workspaceId, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", workspaceId, host.list().revision);
+  await host.configureConnection(workspaceId, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", workspaceId, host.list().revision);
   return { host, workspaceId, agentId };
 }
 test("one-shot chat schedule creates without a Desk approval and retains the message anchor", async () => {
-  const events = new EventEmitter(), f = fixture(events, false);
+  const events = new EventEmitter(), f = await fixture(events, false);
   try {
-    const requestId = randomUUID(), started = f.host.start("client", f.workspaceId, f.agentId, "Remind me about fixture", requestId);
+    const requestId = randomUUID(), started = await f.host.start("client", f.workspaceId, f.agentId, "Remind me about fixture", requestId);
     await f.host.wait(started.runId);
     const rows = f.host.workspaceFeatures(f.workspaceId).schedules;
     assert.equal(rows.length, 1); assert.equal(rows[0].source, "chat"); assert.equal(rows[0].anchor.messageId, requestId);
@@ -78,7 +78,7 @@ test("one-shot chat schedule creates without a Desk approval and retains the mes
   } finally { await f.host.close(); }
 });
 for (const approved of [true, false]) test(`repeating chat schedule ${approved ? "requires and consumes" : "respects rejection of"} a Desk card`, async t => {
-  const events = new EventEmitter(), f = fixture(events, true);
+  const events = new EventEmitter(), f = await fixture(events, true);
   try {
     const { job, card } = await waitForHostApproval({ events, signal: t.signal,
       start: () => f.host.start("client", f.workspaceId, f.agentId, "Repeat fixture check", randomUUID()),
@@ -104,7 +104,7 @@ test("a colleague cannot cancel another colleague's schedule; main Hara can", as
     } });
   try {
     const workspace = host.createWorkspace("Fixture", host.list().revision), workspaceId = workspace.workspaceId, main = workspace.selectedAgentId;
-    host.configureConnection(workspaceId, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", workspaceId, host.list().revision);
+    await host.configureConnection(workspaceId, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", workspaceId, host.list().revision);
     const context = host.context(workspaceId), agents = context.resources.agents;
     const make = name => agents.create({ username: name, profile: { displayName: name, title: "Fixture colleague" }, instructions: "Synthetic fixture only", runtimeId: "pi" }, agents.list().revision);
     const first = make("first"), second = make("second"), connection = context.connections.capture();
@@ -113,14 +113,14 @@ test("a colleague cannot cancel another colleague's schedule; main Hara can", as
       anchor: { workspaceId, conversationId: "fixture-session", messageId: randomUUID(), agentId: first.agentId,
         runtimeId: "pi", configRevision: first.configRevision, agentEpoch: first.agentEpoch, connection } });
     host.selectAgent("client", workspaceId, second.agentId);
-    const denied = host.start("client", workspaceId, second.agentId, "Cancel another colleague's schedule", randomUUID()); await host.wait(denied.runId);
+    const denied = await host.start("client", workspaceId, second.agentId, "Cancel another colleague's schedule", randomUUID()); await host.wait(denied.runId);
     const denial = host.snapshot(workspaceId, second.agentId, "client").conversation.history.flatMap(row => row.role === "tool" ? row.results : []).find(row => row.name === "schedule_cancel");
     const colleagueList = host.snapshot(workspaceId, second.agentId, "client").conversation.history.flatMap(row => row.role === "tool" ? row.results : []).find(row => row.name === "schedule_list");
     assert(colleagueList && !colleagueList.isError);
     assert.equal(JSON.parse(colleagueList.content).schedules.some(row => row.id === targetId), false);
     assert(denial && denial.isError); assert.equal(context.features.schedules().some(row => row.id === targetId), true);
     host.selectAgent("client", workspaceId, main);
-    const allowed = host.start("client", workspaceId, main, "Cancel the schedule in this Workspace", randomUUID()); await host.wait(allowed.runId);
+    const allowed = await host.start("client", workspaceId, main, "Cancel the schedule in this Workspace", randomUUID()); await host.wait(allowed.runId);
     const result = host.snapshot(workspaceId, main, "client").conversation.history.flatMap(row => row.role === "tool" ? row.results : []).find(row => row.name === "schedule_cancel");
     const mainList = host.snapshot(workspaceId, main, "client").conversation.history.flatMap(row => row.role === "tool" ? row.results : []).find(row => row.name === "schedule_list");
     assert(mainList && JSON.parse(mainList.content).schedules.some(row => row.id === targetId));
@@ -129,7 +129,7 @@ test("a colleague cannot cancel another colleague's schedule; main Hara can", as
 });
 
 test("restoring a colleague does not run its chat schedule; an explicit enable rebinds only the unchanged owner", async () => {
-  const f = fixture(new EventEmitter(), false);
+  const f = await fixture(new EventEmitter(), false);
   try {
     const context = f.host.context(f.workspaceId), agents = context.resources.agents;
     const agent = agents.create({ username: "scheduled", profile: { displayName: "Scheduled" }, runtimeId: "pi" }, agents.list().revision);
@@ -141,7 +141,7 @@ test("restoring a colleague does not run its chat schedule; an explicit enable r
     const restored = await f.host.setAgentArchived(f.workspaceId, agent.agentId, false, deleted.agent.configRevision, deleted.agent.agentEpoch);
     assert.equal(context.features.schedules().find(row => row.id === id).enabled, false);
     await f.host.tickSchedules(Date.now() + 70_000); assert.equal(f.host.workspaceFeatures(f.workspaceId).scheduler.runs.length, 0);
-    f.host.updateFeature(f.workspaceId, "schedule", id, true, context.features.list().revision);
+    await f.host.updateFeature(f.workspaceId, "schedule", id, true, context.features.list().revision);
     assert.equal(context.features.schedules().find(row => row.id === id).definition.anchor.agentEpoch, restored.agent.agentEpoch);
     await f.host.tickSchedules(Date.now() + 70_000);
     assert(f.host.workspaceFeatures(f.workspaceId).scheduler.runs.some(row => row.scheduleId === id && row.state !== "unknown"));
@@ -152,25 +152,25 @@ test("restoring a colleague does not run its chat schedule; an explicit enable r
     const archivedAgain = await f.host.setAgentArchived(f.workspaceId, agent.agentId, true, restored.agent.configRevision, restored.agent.agentEpoch);
     const restoredAgain = await f.host.setAgentArchived(f.workspaceId, agent.agentId, false, archivedAgain.agent.configRevision, archivedAgain.agent.agentEpoch);
     agents.rename(agent.agentId, "Changed persona", restoredAgain.agent.configRevision, restoredAgain.agent.agentEpoch);
-    assert.throws(() => f.host.updateFeature(f.workspaceId, "schedule", second, true, context.features.list().revision), /configuration changed/);
+    await assert.rejects(() => f.host.updateFeature(f.workspaceId, "schedule", second, true, context.features.list().revision), /configuration changed/);
     assert.equal(context.features.schedules().find(row => row.id === second).enabled, false);
   } finally { await f.host.close(); }
 });
 
 test("archive drains block a concurrent schedule create or enable only for that colleague", async () => {
- const f=fixture(new EventEmitter(),false);let release,pending;
+ const f=await fixture(new EventEmitter(),false);let release,pending;
  try{
   const context=f.host.context(f.workspaceId),agents=context.resources.agents;
   const target=agents.create({username:"draining",profile:{displayName:"Draining"},runtimeId:"pi"},agents.list().revision);
   const input=agentId=>({id:randomUUID(),name:"Synthetic future schedule",task:"Summarize fixture",agentId,enabled:true,schedule:{kind:"once",runAt:Date.now()+3600000,display:"Future fixture"}});
   const existing=input(target.agentId);f.host.saveSchedule(f.workspaceId,existing,context.features.list().revision,true);
   f.host.selectAgent("client",f.workspaceId,target.agentId);
-  const started=f.host.start("client",f.workspaceId,target.agentId,"Summarize fixture",randomUUID()),job=f.host.jobs.get(started.runId);assert(job);
+  const started=await f.host.start("client",f.workspaceId,target.agentId,"Summarize fixture",randomUUID()),job=f.host.jobs.get(started.runId);assert(job);
   const drained=job.promise,gate=new Promise(resolve=>release=resolve);job.promise=Promise.all([drained,gate]).then(()=>{});
   pending=f.host.setAgentArchived(f.workspaceId,target.agentId,true,target.configRevision,target.agentEpoch,[started.runId]);
   assert.equal(agents.get(target.agentId).state,"active");assert.equal(context.features.schedules().find(row=>row.id===existing.id).enabled,false);
   assert.throws(()=>f.host.saveSchedule(f.workspaceId,input(target.agentId),context.features.list().revision,true),/lifecycle/);
-  assert.throws(()=>f.host.updateFeature(f.workspaceId,"schedule",existing.id,true,context.features.list().revision),/lifecycle/);
+  await assert.rejects(()=>f.host.updateFeature(f.workspaceId,"schedule",existing.id,true,context.features.list().revision),/lifecycle/);
   const other=input(f.agentId);f.host.saveSchedule(f.workspaceId,other,context.features.list().revision,true);
   release();const deleted=await pending;await f.host.setAgentArchived(f.workspaceId,target.agentId,false,deleted.agent.configRevision,deleted.agent.agentEpoch);
   assert(context.features.schedules().filter(row=>row.definition.agentId===target.agentId).every(row=>!row.enabled));
@@ -179,20 +179,20 @@ test("archive drains block a concurrent schedule create or enable only for that 
 });
 
 test("archive drain fences runtime, permissions and persona, and failed final validation restores only its own paused schedules", async t => {
- const f=fixture(new EventEmitter(),false);let release,pending;
+ const f=await fixture(new EventEmitter(),false);let release,pending;
  try{
   const context=f.host.context(f.workspaceId),agents=context.resources.agents;
   const target=agents.create({username:"rollback",profile:{displayName:"Rollback"},runtimeId:"pi"},agents.list().revision),otherAgent=agents.create({username:"other",profile:{displayName:"Other"},runtimeId:"pi"},agents.list().revision);
   const input=(agentId,enabled=true)=>({id:randomUUID(),name:"Synthetic future schedule",task:"Summarize fixture",agentId,enabled,schedule:{kind:"once",runAt:Date.now()+3600000,display:"Future fixture"}});
   const enabled=input(target.agentId),disabled=input(target.agentId,false);for(const row of[enabled,disabled])f.host.saveSchedule(f.workspaceId,row,context.features.list().revision,true);
-  f.host.selectAgent("client",f.workspaceId,target.agentId);const started=f.host.start("client",f.workspaceId,target.agentId,"Summarize fixture",randomUUID()),job=f.host.jobs.get(started.runId),original=job.promise;job.promise=Promise.all([original,new Promise(resolve=>release=resolve)]).then(()=>{});
+  f.host.selectAgent("client",f.workspaceId,target.agentId);const started=await f.host.start("client",f.workspaceId,target.agentId,"Summarize fixture",randomUUID()),job=f.host.jobs.get(started.runId),original=job.promise;job.promise=Promise.all([original,new Promise(resolve=>release=resolve)]).then(()=>{});
   t.mock.method(f.host,"assertGeneration",()=>{throw Error("Synthetic final generation validation rejected")});
   pending=f.host.setAgentArchived(f.workspaceId,target.agentId,true,target.configRevision,target.agentEpoch,[started.runId]);
   assert.throws(()=>f.host.setAgentRuntime(f.workspaceId,target.agentId,"pi",target.configRevision,target.agentEpoch),/lifecycle/);
   assert.throws(()=>f.host.setAgentPermissionTier(f.workspaceId,target.agentId,"controlled",target.configRevision,target.agentEpoch),/lifecycle/);
   assert.throws(()=>f.host.updateAgentPersona(f.workspaceId,target.agentId,{profile:{displayName:"Must not write"}},target.configRevision,target.agentEpoch),/lifecycle/);
   await assert.rejects(f.host.applyRuntimeForm(f.workspaceId,{agentId:target.agentId,runtimeId:"pi",configRevision:target.configRevision,agentEpoch:target.agentEpoch}),/lifecycle/);
-  assert.throws(()=>f.host.updateFeature(f.workspaceId,"schedule",enabled.id,false,context.features.list().revision),/lifecycle/);
+  await assert.rejects(()=>f.host.updateFeature(f.workspaceId,"schedule",enabled.id,false,context.features.list().revision),/lifecycle/);
   assert.throws(()=>f.host.deleteSchedule(f.workspaceId,enabled.id,context.features.list().revision,true),/lifecycle/);
   f.host.updateAgentPersona(f.workspaceId,otherAgent.agentId,{profile:{displayName:"Other changed"}},otherAgent.configRevision,otherAgent.agentEpoch);
   const other=input(otherAgent.agentId);f.host.saveSchedule(f.workspaceId,other,context.features.list().revision,true);
@@ -205,11 +205,11 @@ test("archive drain fences runtime, permissions and persona, and failed final va
 });
 
 test("archive cleanup deadline releases the fence, restores schedules and never increments epoch", async t => {
- const f=fixture(new EventEmitter(),false);let release,pending;
+ const f=await fixture(new EventEmitter(),false);let release,pending;
  try{
   const context=f.host.context(f.workspaceId),agents=context.resources.agents,target=agents.create({username:"timeout",profile:{displayName:"Timeout"},runtimeId:"pi"},agents.list().revision);
   const schedule={id:randomUUID(),name:"Synthetic schedule",task:"Summarize fixture",agentId:target.agentId,enabled:true,schedule:{kind:"once",runAt:Date.now()+3600000,display:"Fixture"}};f.host.saveSchedule(f.workspaceId,schedule,context.features.list().revision,true);
-  f.host.selectAgent("client",f.workspaceId,target.agentId);const started=f.host.start("client",f.workspaceId,target.agentId,"Summarize fixture",randomUUID()),job=f.host.jobs.get(started.runId),original=job.promise;job.promise=Promise.all([original,new Promise(resolve=>release=resolve)]).then(()=>{});
+  f.host.selectAgent("client",f.workspaceId,target.agentId);const started=await f.host.start("client",f.workspaceId,target.agentId,"Summarize fixture",randomUUID()),job=f.host.jobs.get(started.runId),original=job.promise;job.promise=Promise.all([original,new Promise(resolve=>release=resolve)]).then(()=>{});
   t.mock.timers.enable({apis:["setTimeout"]});pending=f.host.setAgentArchived(f.workspaceId,target.agentId,true,target.configRevision,target.agentEpoch,[started.runId]);
   const rejected=assert.rejects(pending,error=>error.reason==="archive_drain_timeout");t.mock.timers.tick(10000);await rejected;t.mock.timers.reset();
   assert(!f.host.lifecycleChanges.has(JSON.stringify([f.workspaceId,target.agentId])));assert.equal(agents.get(target.agentId).state,"active");assert.equal(agents.get(target.agentId).agentEpoch,target.agentEpoch);assert.equal(context.features.schedules().find(row=>row.id===schedule.id).enabled,true);
@@ -218,10 +218,10 @@ test("archive cleanup deadline releases the fence, restores schedules and never 
 });
 
 test("configuration remains fenced for an aborted job after the lifecycle action releases its lock",async()=>{
- const f=fixture(new EventEmitter(),false);
+ const f=await fixture(new EventEmitter(),false);
  try{
   const context=f.host.context(f.workspaceId),agents=context.resources.agents,target=agents.create({username:"aborting",profile:{displayName:"Aborting"},runtimeId:"pi"},agents.list().revision);
-  f.host.selectAgent("client",f.workspaceId,target.agentId);const started=f.host.start("client",f.workspaceId,target.agentId,"Summarize fixture",randomUUID()),job=f.host.jobs.get(started.runId);
+  f.host.selectAgent("client",f.workspaceId,target.agentId);const started=await f.host.start("client",f.workspaceId,target.agentId,"Summarize fixture",randomUUID()),job=f.host.jobs.get(started.runId);
   f.host.cancel(f.workspaceId,target.agentId,started.runId);assert(job.signal.aborted);assert(!f.host.lifecycleChanges.has(JSON.stringify([f.workspaceId,target.agentId])));
   assert.throws(()=>f.host.setAgentRuntime(f.workspaceId,target.agentId,"pi",target.configRevision,target.agentEpoch),/draining/);
   assert.throws(()=>f.host.updateAgentPersona(f.workspaceId,target.agentId,{profile:{displayName:"Must wait"}},target.configRevision,target.agentEpoch),/draining/);
@@ -231,7 +231,7 @@ test("configuration remains fenced for an aborted job after the lifecycle action
 
 
 test("archive rollback failure keeps the exact paused IDs in reopened Workspace metadata",async t=>{
- const f=fixture(new EventEmitter(),false);
+ const f=await fixture(new EventEmitter(),false);
  try{
   const context=f.host.context(f.workspaceId),agents=context.resources.agents;
   const target=agents.create({username:"receipt",profile:{displayName:"Receipt"},runtimeId:"pi"},agents.list().revision);

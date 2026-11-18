@@ -47,7 +47,7 @@ test("Host timing correlates only the original selected client; diagnostics pers
  const root=dir(),host=new LocalWorkspaceHost(root),w=host.createWorkspace("Fixture",host.list().revision);host.configureSynthetic(w.workspaceId,0);
  host.select("owner",w.workspaceId,host.list().revision);host.selectAgent("owner",w.workspaceId,w.selectedAgentId);
  const receivedAt=performance.now(),client={hostAtMs:receivedAt-1,errorMs:0};
- try{const run=host.start("owner",w.workspaceId,w.selectedAgentId,"hello",randomUUID(),false,undefined,undefined,undefined,undefined,undefined,undefined,{receivedAt,client});await host.wait(run.runId);
+ try{const run=await host.start("owner",w.workspaceId,w.selectedAgentId,"hello",randomUUID(),false,undefined,undefined,undefined,undefined,undefined,undefined,{receivedAt,client});await host.wait(run.runId);
   const r=host.snapshot(w.workspaceId).conversation.messageTimings.at(-1);assert.equal(r.runId,run.runId);assert.ok(r.points.T2>=0);assert.ok(r.points.T9>=r.points.T2);assert.equal(r.points.T4,null);
   const args=[w.workspaceId,w.selectedAgentId,r.sessionId,r.runId,r.attemptId,{hostAtMs:performance.now(),errorMs:0}];
   assert.equal(host.recordMessagePaint("foreign",...args).recorded,false);assert.equal(host.recordMessagePaint("owner",...args).recorded,true);

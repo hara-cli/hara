@@ -14,7 +14,7 @@ test("owner rollback restores pre-inheritance state and later automatic boots do
 });
 test("rollback preflights newer task edits before deleting any imported colleague",async t=>{
   const f=fixture(t),host=f.open();try{await host.initialize();const id=host.list().workspaces[0].workspaceId,value=host.workspaceFeatures(id),before=host.snapshot(id).agents.map(row=>row.agentId);
-    host.updateFeature(id,"schedule","legacy-0",false,value.revision);await assert.rejects(host.rollbackLegacyInheritance(),/newer file edit|changed/);
+    await host.updateFeature(id,"schedule","legacy-0",false,value.revision);await assert.rejects(host.rollbackLegacyInheritance(),/newer file edit|changed/);
     assert.deepEqual(host.snapshot(id).agents.map(row=>row.agentId),before);assert.equal(host.workspaceFeatures(id).schedules.length,3);
   }finally{await host.close();}
 });

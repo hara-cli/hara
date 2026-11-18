@@ -40,7 +40,7 @@ test("file references are read-only, generation-bound, and never serialized as p
     const snapshot = host.snapshot(workspace.workspaceId);
     assert.equal(snapshot.syntheticOnly, false); assert.equal(snapshot.executionMode, "ark-real-key");
     assert.equal(JSON.stringify(snapshot).includes(a.file), false); assert.equal(JSON.stringify(snapshot).includes("fixture-another-secret-generation"), false);
-    assert.throws(() => host.configureSynthetic(workspace.workspaceId, 1)); assert.throws(() => host.configureConnection(workspace.workspaceId, {}, 1));
+    assert.throws(() => host.configureSynthetic(workspace.workspaceId, 1)); await assert.rejects(() => host.configureConnection(workspace.workspaceId, {}, 1));
     const files = fs.readdirSync(join(root, "home"), { recursive: true }).filter(p => p.endsWith("workspace-connections-v2.json"));
     assert.equal(files.length, 1); const stored = fs.readFileSync(join(root, "home", files[0]), "utf8");
     assert.equal(stored.includes("fixture-another-secret-generation"), false); assert.ok(stored.includes("credentialFile"));
@@ -151,7 +151,7 @@ test("a paused human-dependency receipt is not surfaced as a completed Workspace
     const workspace = host.createWorkspace("Paused", host.list().revision); host.configureSynthetic(workspace.workspaceId, 0);
     const fixtureAgent=host.context(workspace.workspaceId).resources.agents.get(workspace.selectedAgentId);
     host.context(workspace.workspaceId).resources.agents.setPermissionTier(fixtureAgent.agentId,"controlled",fixtureAgent.configRevision,fixtureAgent.agentEpoch);
-    const run = host.start("test", workspace.workspaceId, workspace.selectedAgentId, "wait", randomUUID()); await host.wait(run.runId);
+    const run = await host.start("test", workspace.workspaceId, workspace.selectedAgentId, "wait", randomUUID()); await host.wait(run.runId);
     const conversation = host.snapshot(workspace.workspaceId).conversation;
     assert.equal(conversation.taskState, "paused"); assert.equal(conversation.state, "blocked");
     assert.ok(conversation.blockReason); assert.equal(conversation.completion.state, "awaiting_user");

@@ -17,7 +17,8 @@ import { WorkspaceLegacyResources, planLegacyResources } from "./legacy-resource
 import { legacyScheduleRows, legacySchedulesDomain } from "./legacy-schedules.js";
 import { canonical, plain, WorkspaceJsonState } from "./local-state.js";
 import { sameWorkspaceResourceBinding, type WorkspaceResourceBinding, type WorkspaceResourceStorage } from "./resource-context.js";
-import type { CredentialVault } from "./credential-vault.js";
+import { assertCredentialCall, credentialDeadline, type AsyncCredentialVault, type CredentialCall } from "./credential-vault.js";
+import { LEGACY_CREDENTIAL_BACKUP, WorkspaceCredentialWriteIntents } from "./credential-write-intents.js";
 import type { LocalWorkspaceCatalog } from "./local-catalog.js";
 import type { WorkspaceResources } from "./resources.js";
 import type { WorkspaceFeatures } from "./features.js";
@@ -50,7 +51,7 @@ export function hasLegacyStartupSource(sourceHome: string): boolean {
   return false;
 }
 /** A bounded readonly projection, NOT a traversal of old sessions, plugins, business projects or launchd. */
-function capture(sourceHome: string, vault: CredentialVault): Material | null {
+async function capture(sourceHome: string, vault: AsyncCredentialVault, call: CredentialCall): Promise<Material | null> {
   if (!directory(sourceHome) || !directory(join(sourceHome, ".hara"))) return null;
   const captures: [string, string][] = [], knownFiles = new Map<string, string>(); let total = 0;
   const read = (relative: string, max = 512 * 1024) => {
@@ -93,8 +94,8 @@ function capture(sourceHome: string, vault: CredentialVault): Material | null {
   // availability; it still grants no new executable tools and user overrides remain authoritative.
   const skills = new WorkspaceSkillLibrary(sourceHome).candidates(join(sourceHome, ".hara/workspace")).map(row => ({ ...row, enabled: true }));
   captures.push(...skills.map(row => [`skill:${row.id}`, row.version] as [string, string]));
-  const source = new LegacyConnectionCatalog(sourceHome, vault), seeds = source.inheritanceSeeds(), credentials: Material["credentials"] = {};
-  for (const seed of seeds) if (seed.keySaved) credentials[seed.id] = source.resolve(seed.id, undefined, true, true);
+  const source = new LegacyConnectionCatalog(sourceHome), seeds = source.inheritanceSeeds(), credentials: Material["credentials"] = {};
+  for (const seed of seeds) if (seed.keySaved) credentials[seed.id] = await source.resolveAsync(seed.id, vault, call, undefined, true, true);
   for (const [path, expected] of knownFiles) if (hash(readLegacyBackupBytes(path, 512 * 1024)) !== expected) throw new Error("Legacy source changed during backup");
   if (!jobs.length && !roles.length && !memories.length && !skills.length && !seeds.length) return null;
   const sourceFingerprint = hash(captures.sort(([a], [b]) => a.localeCompare(b)));
@@ -105,9 +106,11 @@ function capture(sourceHome: string, vault: CredentialVault): Material | null {
 export class WorkspaceLegacyStartup {
   private readonly backup: WorkspaceJsonState<Backup>;
   private coordinator?: WorkspaceLegacyCoordinator;
+  private readonly intents: WorkspaceCredentialWriteIntents;
   constructor(private readonly input: { sourceHome: string; storage: WorkspaceResourceStorage; catalog: LocalWorkspaceCatalog;
-    resources: WorkspaceResources; features: WorkspaceFeatures; vault: CredentialVault }) {
-    this.backup = new WorkspaceJsonState(input.storage, "workspace-legacy-source-backup-v1.json", raw => {
+    resources: WorkspaceResources; features: WorkspaceFeatures; vault: AsyncCredentialVault; assertCurrent?: () => void }) {
+    this.intents = new WorkspaceCredentialWriteIntents(input.storage);
+    this.backup = new WorkspaceJsonState(input.storage, LEGACY_CREDENTIAL_BACKUP, raw => {
       if (!plain(raw) || !sameWorkspaceResourceBinding(raw.resourceBinding as WorkspaceResourceBinding, this.backup.binding())
         || !Number.isSafeInteger(raw.revision) || Number(raw.revision) < 1 || raw.sourceHome !== input.sourceHome
         || typeof raw.keyRef !== "string" || !new RegExp(`^${input.storage.scopeKey}:legacy-source:gen_[a-f0-9-]{36}$`).test(raw.keyRef)
@@ -117,35 +120,44 @@ export class WorkspaceLegacyStartup {
       return structuredClone(raw) as unknown as Backup;
     }, () => ({ revision: 0, resourceBinding: this.backup.binding(), keyRef: `${input.storage.scopeKey}:legacy-source:gen_${randomUUID()}`, sourceHome: input.sourceHome, ciphertext: null, iv: null, tag: null, backupHash: null }));
   }
-  private open(): Material | null {
-    let before = this.backup.read();
+  private async open(): Promise<Material | null> {
+    const call: CredentialCall = { signal: credentialDeadline(), assertCurrent: () => {
+      this.input.assertCurrent?.(); this.input.storage.run(() => {});
+    } };
+    const before = this.backup.read();
     if (before.ciphertext === null) {
-      const captured = capture(this.input.sourceHome, this.input.vault); if (!captured) return null;
-      // Reference intent precedes Vault writes. A denied/unknown Vault write never falls back to disk.
-      if (!before.revision) before = this.backup.update(0, () => before);
-      let key = this.input.vault.get(before.keyRef);
-      if (!key) { key = randomBytes(32).toString("hex"); this.input.vault.set(before.keyRef, key); }
-      if (!/^[a-f0-9]{64}$/.test(key) || this.input.vault.get(before.keyRef) !== key) throw new Error("Legacy backup Vault pending");
-      const iv = randomBytes(12), cipher = createCipheriv("aes-256-gcm", Buffer.from(key, "hex"), iv);
+      if (this.intents.pendingRefs().has("legacy-source")) throw new Error("Previous legacy backup requires explicit recovery");
+      const captured = await capture(this.input.sourceHome, this.input.vault, call); if (!captured) return null;
+      const key = randomBytes(32).toString("hex"), keyRef = this.input.storage.scopeKey + ":legacy-source:gen_" + randomUUID();
+      const iv = randomBytes(12), keyBytes = Buffer.from(key, "hex");
+      const cipher = createCipheriv("aes-256-gcm", keyBytes, iv); keyBytes.fill(0);
       cipher.setAAD(Buffer.from(canonical(before.resourceBinding)));
       const ciphertext = Buffer.concat([cipher.update(JSON.stringify(captured)), cipher.final()]).toString("base64");
-      before = this.backup.update(before.revision, old => ({ ...old, ciphertext, iv: iv.toString("hex"), tag: cipher.getAuthTag().toString("hex"), backupHash: hash(ciphertext) }));
+      await this.intents.write(this.input.vault, [{ ref: keyRef, key }], call,
+        () => this.backup.update(before.revision, old => ({ ...old, keyRef, ciphertext, iv: iv.toString("hex"),
+          tag: cipher.getAuthTag().toString("hex"), backupHash: hash(ciphertext) })),
+        { protectedRef: ref => this.backup.read().keyRef === ref });
+      return captured;
     }
-    const key = this.input.vault.get(before.keyRef); if (!key || !/^[a-f0-9]{64}$/.test(key)) throw new Error("Legacy backup Vault unavailable");
+    const key = await this.input.vault.get(before.keyRef, call);
+    assertCredentialCall(call);
+    const current = this.backup.read();
+    if (current.revision !== before.revision || current.keyRef !== before.keyRef || current.backupHash !== before.backupHash || !key || !/^[a-f0-9]{64}$/.test(key))
+      throw new Error("Legacy backup Vault unavailable");
     const cipher = createDecipheriv("aes-256-gcm", Buffer.from(key, "hex"), Buffer.from(before.iv!, "hex"));
     cipher.setAAD(Buffer.from(canonical(before.resourceBinding))); cipher.setAuthTag(Buffer.from(before.tag!, "hex"));
     const material: Material = JSON.parse(Buffer.concat([cipher.update(Buffer.from(before.ciphertext!, "base64")), cipher.final()]).toString("utf8"));
     if (material.schemaVersion !== 1 || material.sourceHome !== this.input.sourceHome || !digest(material.sourceFingerprint) || material.plan.sourceFingerprint !== material.sourceFingerprint) throw new Error("Legacy backup identity changed");
     return material;
   }
-  private prepare() {
-    const m = this.open(); if (!m) return null;
+  private async prepare() {
+    const m = await this.open(); if (!m) return null;
     const { storage, catalog, resources, features, vault } = this.input, source = {
       inheritanceSeeds: () => structuredClone(m.seeds),
       resolve: (id: string) => { const value = m.credentials[id]; if (!value) throw new Error("Frozen legacy credential unavailable"); return structuredClone(value); },
     };
     const credentials = Object.values(m.credentials).flatMap(row => row.input.apiKey ? [row.input.apiKey] : []);
-    const connections = new WorkspaceLegacyConnectionImport(storage, source, vault, m.sourceFingerprint);
+    const connections = new WorkspaceLegacyConnectionImport(storage, source, vault, m.sourceFingerprint, this.input.assertCurrent);
     const folders = new WorkspaceLegacyResources(storage), main = resources.agents.initializeMain(), roles = legacyAgentInputs(m.roles, m.plan.roles);
     const schedule = () => legacySchedulesDomain(storage, features, m.sourceFingerprint, legacyScheduleRows({ jobs: m.jobs, plan: m.plan.tasks,
       sourceFingerprint: m.sourceFingerprint, workspaceId: storage.scope.workspaceId, mainAgentId: main.agentId, resources: folders, knownCredentials: credentials }));
@@ -159,11 +171,11 @@ export class WorkspaceLegacyStartup {
     return m;
   }
   async initialize(reapply = false): Promise<LegacyStartupStatus> {
-    const m = this.prepare(); if (!m) return noLegacyStartup();
+    const m = await this.prepare(); if (!m) return noLegacyStartup();
     const before = this.coordinator!.read();
     if (before.phase !== "verified" && (before.phase !== "rolled_back" || reapply)) { await this.coordinator!.apply(); await this.coordinator!.verify(); }
     return { state: this.coordinator!.read().phase === "rolled_back" ? "rolled_back" : "verified", reason: null,
       roles: m.roles.length, schedules: m.jobs.length, skills: m.skills.length, sourceFingerprint: m.sourceFingerprint, handoff: false };
   }
-  async rollback() { if (!this.coordinator && !this.prepare()) return; await this.coordinator!.rollback(); }
+  async rollback() { if (!this.coordinator && !await this.prepare()) return; await this.coordinator!.rollback(); }
 }

@@ -16,7 +16,7 @@ test("real governed Host persists stage identity and exports only metadata witho
   if(!called){called=true;return{text:"",toolUses:[{id:randomUUID(),name:"agent_list",input:{}}],stop:"tool_use"};}
   return{text:"Listed the current colleagues.",toolUses:[],stop:"end"};
  }});}});try{
-  const run=f.host.start("client",f.w.workspaceId,f.w.selectedAgentId,"List colleagues PRIVATE_USER_PROMPT",randomUUID());await f.host.wait(run.runId);
+  const run=await f.host.start("client",f.w.workspaceId,f.w.selectedAgentId,"List colleagues PRIVATE_USER_PROMPT",randomUUID());await f.host.wait(run.runId);
   const c=f.host.snapshot(f.w.workspaceId).conversation,r=c.runtimeStages.at(-1);assert.ok(r);assert.equal(r.runId,run.runId);assert.equal(r.sessionId,c.sessionId);
   assert.equal(r.state,"completed");assert.equal(r.events.at(-1).kind,"complete");assert.ok(r.events.some(e=>e.kind==="model_roundtrip"&&e.phase==="end"));
   assert.ok(r.events.some(e=>e.kind==="tool_call"&&e.phase==="end"));
@@ -34,7 +34,7 @@ test("cancelling an actual pending model wait records cancellation and no late s
  let entered;const ready=new Promise(r=>entered=r);const f=setup({providerFactory(_connection,binding){return{id:"openai",model:binding.model,async turn(args){
   args.onText?.("PRIVATE_STREAM");entered();await new Promise((resolve,reject)=>{if(args.signal?.aborted)reject(new Error("aborted"));else args.signal.addEventListener("abort",()=>reject(new Error("aborted")),{once:true});});
   return{text:"late",toolUses:[],stop:"end"};}};}});
- try{const run=f.host.start("client",f.w.workspaceId,f.w.selectedAgentId,"hello",randomUUID());await ready;f.host.cancel(f.w.workspaceId,f.w.selectedAgentId,run.runId);await f.host.wait(run.runId);
+ try{const run=await f.host.start("client",f.w.workspaceId,f.w.selectedAgentId,"hello",randomUUID());await ready;f.host.cancel(f.w.workspaceId,f.w.selectedAgentId,run.runId);await f.host.wait(run.runId);
   const r=f.host.snapshot(f.w.workspaceId).conversation.runtimeStages.at(-1);assert.equal(r.state,"cancelled");assert.equal(r.events.at(-1).outcome,"cancelled");
   assert.ok(r.events.some(e=>e.kind==="first_token"));assert.ok(r.events.some(e=>e.kind==="model_roundtrip"&&e.outcome==="cancelled"));assert.equal(JSON.stringify(r).includes("PRIVATE_STREAM"),false);
  }finally{await f.host.close();fs.rmSync(f.root,{recursive:true,force:true});}

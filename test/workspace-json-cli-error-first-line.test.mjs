@@ -8,7 +8,7 @@ const macTest = (name, body) => test(name, { skip: process.platform !== "darwin"
 for (const runtime of ["gemini", "kimi"]) {
   for (const helpFailure of [false, true]) macTest(`${runtime}: ${helpFailure ? "help" : "protected native"} startup exposes only its redacted first line`, async t => {
     const f = await jsonCliFixture(t, runtime, { mode: "startup-stderr", helpFailure });
-    const sent = f.send(); await f.host.wait(sent.runId);
+    const sent = await f.send(); await f.host.wait(sent.runId);
     const view = f.read(); assert.equal(view.conversation.state, "blocked");
     const reason = view.conversation.blockReason, prefix = "hara_runtime_failure_v1=";
     const start = reason.indexOf(prefix); assert.ok(start >= 0, reason); const diagnostic = JSON.parse(reason.slice(start + prefix.length));
@@ -27,13 +27,13 @@ for (const runtime of ["gemini", "kimi"]) {
 
 macTest("Gemini preserves pre-existing project settings and refuses before any native model process", async t => {
   const f = await jsonCliFixture(t, "gemini"); fs.mkdirSync(join(f.project, ".gemini")); const path = join(f.project, ".gemini/settings.json"); fs.writeFileSync(path, "FAKE_EXISTING_CONFIG");
-  const sent = f.send(); await f.host.wait(sent.runId); const view = f.read();
+  const sent = await f.send(); await f.host.wait(sent.runId); const view = f.read();
   assert.equal(view.conversation.state, "blocked"); assert.match(view.conversation.blockReason, /runtime_permission_denied/); assert.match(view.conversation.blockReason, /already exist/);
   assert.equal(f.policyCalls.length, 0); assert.equal(fs.readFileSync(path, "utf8"), "FAKE_EXISTING_CONFIG"); assert.equal(fs.existsSync(f.metaPath), false);
 });
 
 for (const runtime of ["gemini", "kimi"]) macTest(`${runtime}: structured native errors reach Host through the safe first-line boundary`, async t => {
-  const f = await jsonCliFixture(t, runtime, { mode: "error" }); const sent = f.send(); await f.host.wait(sent.runId); const view = f.read();
+  const f = await jsonCliFixture(t, runtime, { mode: "error" }); const sent = await f.send(); await f.host.wait(sent.runId); const view = f.read();
   assert.equal(view.conversation.state, "blocked"); const marker = "hara_runtime_failure_v1=", reason = view.conversation.blockReason;
   const diagnostic = JSON.parse(reason.slice(reason.indexOf(marker) + marker.length));
   assert.equal(diagnostic.kind, "runtime_auth_rejected"); assert.match(diagnostic.errorFirstLine, /401 authentication failed/); assert.doesNotMatch(JSON.stringify(view.conversation), /fixture-private/);

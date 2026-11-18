@@ -47,7 +47,7 @@ for(const lookups of [1,2]) test(`unknown reference pauses after ${lookups} look
   });
   try{
     writeFileSync(join(a.root,"project",a.workspaceId,"DO-NOT-READ.txt"),"SYNTHETIC_FILE_MUST_NOT_BE_READ");
-    const run=a.host.start("client",a.workspaceId,a.main,"Resolve the colleague reference in the current request",randomUUID());await a.host.wait(run.runId);
+    const run=await a.host.start("client",a.workspaceId,a.main,"Resolve the colleague reference in the current request",randomUUID());await a.host.wait(run.runId);
     const snapshot=a.host.snapshot(a.workspaceId,a.main,"client"),conversation=snapshot.conversation;
     assert.equal(requests,lookups+1);assert.equal(conversation.taskState,"paused");assert.equal(conversation.completion.state,"awaiting_user");assert.equal(conversation.blockReason,question);
     const results=conversation.history.flatMap(row=>row.role==="tool"?row.results:[]);
@@ -66,7 +66,7 @@ test("a model-provided default cannot answer its own Workspace clarification or 
   let requests=0;const question="请确认你指的是哪位同事。";
   const a=fixture(async()=>{requests++;assert.equal(requests,1);return call("ask_user",{question,default:"INVENTED_ANSWER_MUST_NOT_BE_USED"});});
   try{
-    const run=a.host.start("client",a.workspaceId,a.main,"那位同事是谁？",randomUUID());await a.host.wait(run.runId);
+    const run=await a.host.start("client",a.workspaceId,a.main,"那位同事是谁？",randomUUID());await a.host.wait(run.runId);
     const conversation=a.host.snapshot(a.workspaceId,a.main).conversation;
     assert.equal(requests,1);assert.equal(conversation.taskState,"paused");assert.equal(conversation.completion.state,"awaiting_user");assert.equal(conversation.blockReason,question);
     const result=conversation.history.flatMap(row=>row.role==="tool"?row.results:[]).find(row=>row.name==="ask_user");
@@ -79,7 +79,7 @@ test("two evidenced colleagues sharing a display name cause startup clarificatio
   try{
     const resources=new WorkspaceResources(a.host.home,a.scope);resources.initialize();const agents=resources.agents;
     for(const username of ["synthetic-a","synthetic-b"])agents.create({username,profile:{displayName:"Alpha",title:username},instructions:"Synthetic colleague",runtimeId:"pi"},agents.list().revision);
-    const run=a.host.start("client",a.workspaceId,a.main,"Alpha 同事是哪位？",randomUUID());await a.host.wait(run.runId);
+    const run=await a.host.start("client",a.workspaceId,a.main,"Alpha 同事是哪位？",randomUUID());await a.host.wait(run.runId);
     const conversation=a.host.snapshot(a.workspaceId,a.main).conversation;
     assert.equal(requests,0);assert.equal(conversation.completion.state,"awaiting_user");assert.equal(conversation.pendingQuestion.reason,"lookup_ambiguous");
     assert.deepEqual(conversation.pendingQuestion.options,["Alpha (synthetic-a)","Alpha (synthetic-b)"]);
@@ -95,7 +95,7 @@ test("new ordinary tasks can finish five bounded model rounds above the old 32k 
   });
   try{
     for(let i=0;i<4;i++)writeFileSync(join(a.root,"project",a.workspaceId,`synthetic-${i}.txt`),`Synthetic note ${i}`);
-    const run=a.host.start("client",a.workspaceId,a.main,"What is in the four synthetic notes?",randomUUID());await a.host.wait(run.runId);
+    const run=await a.host.start("client",a.workspaceId,a.main,"What is in the four synthetic notes?",randomUUID());await a.host.wait(run.runId);
     const conversation=a.host.snapshot(a.workspaceId,a.main).conversation;
     assert.equal(requests,5);assert.equal(conversation.taskState,"completed");assert.equal(conversation.runUsage.inputTokens+conversation.runUsage.outputTokens,40000);
     const files=readdirSync(join(a.stateHome,".hara"));

@@ -117,7 +117,7 @@ managed("actual discovery → code confirmation → tool catalog → CAS review 
   assert.equal(fs.statSync(libraryFile).mode & 0o777, 0o600); assert.equal(library.records.length, 1); assert.equal(library.records[0].binaryDigest, code.binaryDigest);
   assert.equal(f.host.workspaceExtensions(f.id).sources[0].callable, false);
   const source = await f.grants(); assert.equal(f.host.agentExtensions(f.id, f.main.agentId, f.main.agentEpoch).sources[0].callable, true);
-  const started = f.host.start("owner", f.id, f.main.agentId, "Write the synthetic fixture using the reviewed MCP tool.", randomUUID());
+  const started = await f.host.start("owner", f.id, f.main.agentId, "Write the synthetic fixture using the reviewed MCP tool.", randomUUID());
   const card = await until(() => f.read().approvals.find(item => item.kind === "extension_call")); assert.equal(f.allCalls().length, 0); assert.equal(card.draft.action, "exec");
   assert.throws(() => f.host.answerApproval("another-owner-view", f.id, card.id, true), /approval/);
   f.host.answerApproval("owner", f.id, card.id, true); await f.host.wait(started.runId);
@@ -201,7 +201,7 @@ test("MCP-only launch projection never materializes credential/header values or 
 
 managed("upstream catalog-change notification persists invalidation and cannot be cleared by reload", async t => {
   const f = await fixture(t, { callKey: "notify" }); f.approve(await f.prepare()); const source = await f.grants();
-  const started = f.host.start("owner", f.id, f.main.agentId, "Write the synthetic fixture using the reviewed MCP tool.", randomUUID());
+  const started = await f.host.start("owner", f.id, f.main.agentId, "Write the synthetic fixture using the reviewed MCP tool.", randomUUID());
   const card = await until(() => f.read().approvals.find(row => row.kind === "extension_call")); f.host.answerApproval("owner", f.id, card.id, true); await f.host.wait(started.runId);
   assert.equal(f.allCalls().length, 1); assert.equal(f.fixtureRow().status, "stale"); assert.equal(f.host.workspaceExtensions(f.id).sources[0].callable, false);
   const file = join(f.account, ".hara/mcp-reviewed-v1.json"), state = JSON.parse(fs.readFileSync(file)); assert.equal(state.revision, 2); assert.match(state.invalidated[source.sourceId], /^[a-f0-9]{64}$/);

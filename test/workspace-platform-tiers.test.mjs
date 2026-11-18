@@ -52,11 +52,11 @@ test("a full-tier colleague moved to a platform without Seatbelt is surfaced and
   const f = fixture();
   try {
     const stored = on("darwin", () => create(f.agents, "migrated", { permissionTier: "full-protected" }));
-    on("linux", () => {
+    on("linux", async () => {
       const view = f.agents.get(stored.agentId);
       assert.equal(view.permissionTier, "full-protected", "the stored choice is shown, not silently rewritten");
       assert.equal(view.permissionTierUnavailable, true);
-      assert.throws(() => f.host.start("client", f.workspaceId, stored.agentId, "Run without protection?", randomUUID()), unavailable);
+      await assert.rejects(() => f.host.start("client", f.workspaceId, stored.agentId, "Run without protection?", randomUUID()), unavailable);
       const switched = f.host.setAgentPermissionTier(f.workspaceId, stored.agentId, "controlled", view.configRevision, view.agentEpoch);
       assert.equal(switched.permissionTier, "controlled"); assert.equal(switched.permissionTierUnavailable, undefined);
     });

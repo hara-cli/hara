@@ -40,13 +40,13 @@ test("reopen and repeated apply preserve connection IDs and credential generatio
  const f=fixture(t),a=f.open(),r=await a.apply(),map=a.connectionMap();const state=a.connections.list();const again=f.open();assert.deepEqual(await again.apply(),r);assert.deepEqual(again.connectionMap(),map);assert.deepEqual(again.connections.list(),state);assert.equal(await again.verify(r),true);
 });
 test("rollback revokes only owned refs, keeps an existing connection and supports re-upgrade",async t=>{
- const f=fixture(t),domain=f.open(),existing=domain.connections.add({label:"Existing",provider:"openai",baseURL:"https://existing.example.invalid/v1",defaultModel:"existing",apiKey:"fake-existing-key"},0);
- const old=domain.connections.capture(existing.id),oldKey=domain.connections.resolve(old).apiKey;await domain.apply();const owned=domain.connections.inheritanceMetadata().filter(row=>row.id!==existing.id).map(r=>r.keyRef);
- await f.open().rollback();const restored=f.open();assert.equal(restored.connections.list().connections.length,1);assert.equal(restored.connections.resolve(old).apiKey,oldKey);assert.ok(owned.every(ref=>f.vault.get(ref)===undefined));
+ const f=fixture(t),domain=f.open(),existing=await domain.connections.add({label:"Existing",provider:"openai",baseURL:"https://existing.example.invalid/v1",defaultModel:"existing",apiKey:"fake-existing-key"},0);
+ const old=domain.connections.capture(existing.id),oldKey=(await domain.connections.resolve(old)).apiKey;await domain.apply();const owned=domain.connections.inheritanceMetadata().filter(row=>row.id!==existing.id).map(r=>r.keyRef);
+ await f.open().rollback();const restored=f.open();assert.equal(restored.connections.list().connections.length,1);assert.equal((await restored.connections.resolve(old)).apiKey,oldKey);assert.ok(owned.every(ref=>f.vault.get(ref)===undefined));
  await restored.apply();assert.equal(restored.connections.list().connections.length,5);assert.equal(restored.connections.list().defaultConnectionId,existing.id);
 });
 test("a denied vault batch can be cancelled without another vault write or locking the old store",async t=>{
- const f=fixture(t);let writes=0;f.vault.setMany=()=>{writes++;throw Error("synthetic OS permission denied");};const domain=f.open();await assert.rejects(domain.apply(),/Credential authorization pending/);assert.equal(writes,1);assert.equal(domain.connections.list().migrationPending,true);
+ const f=fixture(t);let writes=0;f.vault.setMany=()=>{writes++;throw Error("synthetic OS permission denied");};const domain=f.open();await assert.rejects(domain.apply(),/synthetic OS permission denied/);assert.equal(writes,1);assert.equal(domain.connections.list().migrationPending,true);
  await f.open().rollback();assert.equal(f.open().connections.list().connections.length,0);assert.equal(writes,1);
 });
 test("cleanup after metadata rollback remains resumable across a fake OS cleanup failure",async t=>{
@@ -55,15 +55,20 @@ test("cleanup after metadata rollback remains resumable across a fake OS cleanup
  assert.equal(f.open().connections.list().connections.length,0);
 });
 test("a user edit after import blocks rollback before metadata or credentials are removed",async t=>{
- const f=fixture(t),domain=f.open();await domain.apply();const a=domain.connections.list().connections.find(r=>r.keySaved);domain.connections.edit(a.id,{...a,label:"User edited",apiKey:""},domain.connections.list().revision);const before=domain.connections.list();
- await assert.rejects(domain.rollback(),/newer file edit/);assert.deepEqual(domain.connections.list(),before);assert.equal(domain.connections.resolve(domain.connections.capture(a.id)).apiKey.length>0,true);
+ const f=fixture(t),domain=f.open();await domain.apply();const a=domain.connections.list().connections.find(r=>r.keySaved);await domain.connections.edit(a.id,{...a,label:"User edited",apiKey:""},domain.connections.list().revision);const before=domain.connections.list();
+ await assert.rejects(domain.rollback(),/newer file edit/);assert.deepEqual(domain.connections.list(),before);assert.equal((await domain.connections.resolve(domain.connections.capture(a.id))).apiKey.length>0,true);
 });
 test("decision extends an already pending preview without duplicating or replacing its chat connections",async t=>{
  const f=fixture(t),domain=f.open();domain.connections.stageLegacyImport(f.catalog.personalSeeds());const before=domain.connections.inheritanceMetadata();
- await domain.apply();const after=domain.connections.inheritanceMetadata();assert.equal(after.length,4);for(const row of before)assert.equal(after.find(next=>next.id===row.id).keyRef,row.keyRef);
+ await domain.apply();const after=domain.connections.inheritanceMetadata();assert.equal(after.length,4);for (const row of before) {
+  const preserved = after.find(next => next.id === row.id);
+  assert.equal(preserved.importId, row.importId);
+  if (row.keyRequired) assert.equal(preserved.keyRef, row.keyRef);
+  else assert.notEqual(preserved.keyRef, row.keyRef, "an unpublished prefill ref is never used for the new save");
+ }
 });
 test("preexisting user-rotated imported credentials are preserved rather than replaced from the old source",async t=>{
  const f=fixture(t),domain=f.open(),seed=f.catalog.personalSeeds().find(r=>r.legacyId===undefined); // Public previews intentionally omit private legacy IDs.
- const resolved=f.catalog.resolve(seed.id),existing=domain.connections.importConnection({...resolved.input,apiKey:"fake-user-rotated"},0,resolved.importId);
- const r=await domain.apply();assert.equal(await domain.verify(r),true);assert.equal(domain.connections.resolve(domain.connections.capture(existing.id)).apiKey,"fake-user-rotated");
+ const resolved=f.catalog.resolve(seed.id),existing=await domain.connections.importConnection({...resolved.input,apiKey:"fake-user-rotated"},0,resolved.importId);
+ const r=await domain.apply();assert.equal(await domain.verify(r),true);assert.equal((await domain.connections.resolve(domain.connections.capture(existing.id))).apiKey,"fake-user-rotated");
 });

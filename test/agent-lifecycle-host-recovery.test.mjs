@@ -45,14 +45,14 @@ test("C4 actual Host repairs a post-projection N5, keeps accepted journal and on
     WorkspaceConversationStore.prototype.save = save;
     const recovery = peer.draftAgentLifecycleRecovery(transport, f.params.workspaceId, f.params.agentId,
       { operationId: randomUUID(), previousRunId: run.runId, expectedClaimRevision: 1, commandId: randomUUID(), rootRequestId: randomUUID(), message: "hello", lifetimeMs: 30000 });
-    const next = peer.submitAgentLifecycleRecovery("recovery_owner", transport, f.params.workspaceId, f.params.agentId, recovery.recovery, recovery.command, { message: "hello" });
+    const next = await peer.submitAgentLifecycleRecovery("recovery_owner", transport, f.params.workspaceId, f.params.agentId, recovery.recovery, recovery.command, { message: "hello" });
     assert.equal(next.status, "accepted");
     const nextRun = context.boundaryAuthority.commandControlState().control.runs.find(row => row.commandId === recovery.command.commandId); assert.equal(nextRun.claimRevision, 2);
     await peer.wait(nextRun.runId); assert.equal(h.calls(), 1);
     const after = store.read(); assert.equal(after.task.id, original.task.id); assert.equal(after.task.workspaceRunBinding.runId, nextRun.runId);
     assert.deepEqual(after.pastTasks[0].task, original.task); assert.deepEqual(after.requests.slice(0, 1), original.requests);
     assert.equal(journal.find(run.requestId).state, "accepted");
-    peer.submitAgentLifecycleRecovery("recovery_owner", transport, f.params.workspaceId, f.params.agentId, recovery.recovery, recovery.command, { message: "hello" }); assert.equal(h.calls(), 1);
+    await peer.submitAgentLifecycleRecovery("recovery_owner", transport, f.params.workspaceId, f.params.agentId, recovery.recovery, recovery.command, { message: "hello" }); assert.equal(h.calls(), 1);
   } finally { WorkspaceConversationStore.prototype.save = save; await peer.close(); h.transports.close(); }
 });
 

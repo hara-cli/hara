@@ -13,7 +13,7 @@ const version = JSON.parse(await Bun.file("package.json").text()).version as str
 const thirdPartyNotices = await Bun.file("THIRD_PARTY_NOTICES.md").text();
 const pi = JSON.parse(await Bun.file("node_modules/@earendil-works/pi-coding-agent/package.json").text());
 if (pi.name !== "@earendil-works/pi-coding-agent" || pi.version !== "1.5.0") throw new Error("Bundled Pi SDK must be exactly 1.5.0");
-// S1: include only an explicitly prebuilt/verified Windows worker. Host activation is separate.
+// Include only an explicitly prebuilt worker that matches the Host protocol and package digest.
 let windowsVaultSha: string | undefined;
 const windowsTarget = target?.startsWith("bun-windows-") || (!target && process.platform === "win32");
 const vaultRoot = "dist/native/win32-x64";
@@ -22,7 +22,7 @@ if (windowsTarget && fs.existsSync(`${vaultRoot}/manifest.json`)) {
   const manifest = JSON.parse(fs.readFileSync(`${vaultRoot}/manifest.json`, "utf8"));
   const binary = fs.readFileSync(`${vaultRoot}/hara-credential-worker.exe`);
   const digest = createHash("sha256").update(binary).digest("hex");
-  if (manifest.protocolVersion !== 1 || manifest.target !== "x86_64-pc-windows-msvc" || manifest.sha256 !== digest) throw new Error("Invalid Windows credential worker bundle");
+  if (manifest.protocolVersion !== 2 || manifest.target !== "x86_64-pc-windows-msvc" || manifest.sha256 !== digest) throw new Error("Invalid Windows credential worker bundle");
   windowsVaultSha = digest;
   fs.mkdirSync(path.dirname(outfile), { recursive: true });
   fs.copyFileSync(`${vaultRoot}/hara-credential-worker.exe`, path.join(path.dirname(outfile), "hara-credential-worker.exe"));

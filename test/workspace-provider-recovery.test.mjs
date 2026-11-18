@@ -50,8 +50,8 @@ for (const refusal of [
     const w = host.createWorkspace("HTTP quota fixture", host.list().revision);
     const fixtureAgent=host.context(w.workspaceId).resources.agents.get(w.selectedAgentId);
     host.context(w.workspaceId).resources.agents.setPermissionTier(fixtureAgent.agentId,"controlled",fixtureAgent.configRevision,fixtureAgent.agentEpoch);
-    host.configureConnection(w.workspaceId, { label: "Loopback fixture", provider: "openai", baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: "local-fixture-credential", defaultModel: "fixture-model" }, 0);
-    const first = host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
+    await host.configureConnection(w.workspaceId, { label: "Loopback fixture", provider: "openai", baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: "local-fixture-credential", defaultModel: "fixture-model" }, 0);
+    const first = await host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
     assert.equal(requests.length, 1, "no automatic Workspace resend");
     const paths = files(host, w), bytes = fs.readFileSync(paths.conversation);
     await host.close();host = new LocalWorkspaceHost(root, options);
@@ -59,11 +59,11 @@ for (const refusal of [
     assert.equal(fs.readFileSync(paths.conversation).equals(bytes), true);
     if (refusal.terminal) {
       assert.equal(host.snapshot(w.workspaceId).conversation.resumeAdmission.reason, "connection_quota_exhausted");
-      assert.throws(() => host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true), /no new model call/);
+      await assert.rejects(() => host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true), /no new model call/);
       assert.equal(requests.length, 1);
     } else {
       assert.equal(fs.existsSync(paths.failure), false);
-      const resumed = host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true);await host.wait(resumed.runId);
+      const resumed = await host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true);await host.wait(resumed.runId);
       assert.equal(resumed.runId, first.runId);assert.equal(requests.length, 2);
     }
   } finally { await host.close();server.closeAllConnections();await new Promise(done => server.close(done));fs.rmSync(root, { recursive: true, force: true }); }
@@ -92,12 +92,12 @@ test("unverifiable or foreign recovery evidence refuses continuation without tre
   } }; } });
   try {
     const w = host.createWorkspace("Unverifiable evidence", host.list().revision);host.configureSynthetic(w.workspaceId, 0);
-    const first = host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
+    const first = await host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
     const paths = files(host, w), bytes = fs.readFileSync(paths.conversation);
     fs.writeFileSync(paths.failure, JSON.stringify({ schemaVersion: 1, revision: 1, resourceBinding: {}, agentId: w.selectedAgentId,
       runId: first.runId, reason: "connection_model_unavailable" }), { mode: 0o600 });
     assert.equal(host.snapshot(w.workspaceId).conversation.resumeAdmission.reason, "connection_recovery_unavailable");
-    assert.throws(() => host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true), /connection_recovery_unavailable/);
+    await assert.rejects(() => host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true), /connection_recovery_unavailable/);
     assert.equal(calls, 1);assert.equal(fs.readFileSync(paths.conversation).equals(bytes), true);
   } finally { await host.close();fs.rmSync(root, { recursive: true, force: true }); }
 });
@@ -109,7 +109,7 @@ for (const status of [404, 401, 403, 402]) test(`${status} refuses every continu
   let host = new LocalWorkspaceHost(root, options);
   try {
     const w = host.createWorkspace("Local recovery fixture", host.list().revision);host.configureSynthetic(w.workspaceId, 0);
-    const first = host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
+    const first = await host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
     const before = host.snapshot(w.workspaceId), paths = files(host, w), bytes = fs.readFileSync(paths.conversation);
     assert.equal(before.conversation.resumeAdmission.allowed, false);assert.equal(factories, 1);assert.equal(calls, 1);
     const reason = before.conversation.resumeAdmission.reason;
@@ -117,14 +117,14 @@ for (const status of [404, 401, 403, 402]) test(`${status} refuses every continu
     assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(paths.failure))), ["schemaVersion", "revision", "resourceBinding", "agentId", "runId", "reason"]);
     for (const source of ["ui", "cli", "automatic_retry"]) {
       const nonce = randomUUID();
-      assert.throws(() => host.start(source, w.workspaceId, w.selectedAgentId, "/continue", nonce, false, undefined, undefined,
+      await assert.rejects(() => host.start(source, w.workspaceId, w.selectedAgentId, "/continue", nonce, false, undefined, undefined,
         { source, channel: source === "cli" ? "cli" : "rpc", clientId: source }), /continuation refused/);
       assert.equal(host.requestReceipt(w.workspaceId, w.selectedAgentId, nonce).reason, reason);
       assert.equal(fs.readFileSync(paths.conversation).equals(bytes), true);
     }
     await host.close();host = new LocalWorkspaceHost(root, options);
     assert.equal(host.snapshot(w.workspaceId).conversation.resumeAdmission.reason, reason);
-    assert.throws(() => host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true), /no new model call/);
+    await assert.rejects(() => host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true), /no new model call/);
     assert.equal(factories, 1);assert.equal(calls, 1);assert.equal(fs.readFileSync(paths.conversation).equals(bytes), true);
     assert.deepEqual(host.snapshot(w.workspaceId).conversation.runUsage, before.conversation.runUsage);
     if (status === 404) {
@@ -132,7 +132,7 @@ for (const status of [404, 401, 403, 402]) test(`${status} refuses every continu
       const old = JSON.parse(fs.readFileSync(paths.conversation));old.task.checkpoint.blockReason = "[openai error] 404 The requested model does not support the agent plan feature";
       fs.writeFileSync(paths.conversation, JSON.stringify(old), { mode: 0o600 });
       assert.equal(host.snapshot(w.workspaceId).conversation.resumeAdmission.reason, reason, "old conversation checkpoints also stop the loop");
-      assert.throws(() => host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true), /continuation refused/);
+      await assert.rejects(() => host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true), /continuation refused/);
     }
   } finally { await host.close();fs.rmSync(root, { recursive: true, force: true }); }
 });
@@ -145,9 +145,9 @@ test("a transient error still permits explicit continuation on the original froz
     const w = host.createWorkspace("Transient fixture", host.list().revision);host.configureSynthetic(w.workspaceId, 0);
     const fixtureAgent=host.context(w.workspaceId).resources.agents.get(w.selectedAgentId);
     host.context(w.workspaceId).resources.agents.setPermissionTier(fixtureAgent.agentId,"controlled",fixtureAgent.configRevision,fixtureAgent.agentEpoch);
-    const first = host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
+    const first = await host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
     assert.equal(host.snapshot(w.workspaceId).conversation.resumeAdmission.allowed, true);assert.equal(calls, 1);
-    const resumed = host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true);await host.wait(resumed.runId);
+    const resumed = await host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true);await host.wait(resumed.runId);
     assert.equal(resumed.runId, first.runId);assert.equal(calls, 2);
   } finally { await host.close();fs.rmSync(root, { recursive: true, force: true }); }
 });
@@ -158,14 +158,14 @@ test("repairing the selected connection does not rebind or replay the old run; a
   } }; } });
   try {
     const w = host.createWorkspace("Repair fixture", host.list().revision);host.configureSynthetic(w.workspaceId, 0);
-    const first = host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
+    const first = await host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
     const old = host.snapshot(w.workspaceId), paths = files(host, w), originalBinding = JSON.parse(fs.readFileSync(paths.conversation)).task.workspaceRunBinding;
-    host.configureConnection(w.workspaceId, { label: "New fixture", provider: "openai", baseURL: "http://127.0.0.1:1/v1", apiKey: "synthetic-new-key", defaultModel: "explicit-new-model" }, old.connections.revision);
+    await host.configureConnection(w.workspaceId, { label: "New fixture", provider: "openai", baseURL: "http://127.0.0.1:1/v1", apiKey: "synthetic-new-key", defaultModel: "explicit-new-model" }, old.connections.revision);
     let connections = host.snapshot(w.workspaceId).connections;
-    host.selectConnection(w.workspaceId, connections.connections.find(item => item.defaultModel === "explicit-new-model").id, connections.revision);
-    assert.throws(() => host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true), /continuation refused/);
+    await host.selectConnection(w.workspaceId, connections.connections.find(item => item.defaultModel === "explicit-new-model").id, connections.revision);
+    await assert.rejects(() => host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true), /continuation refused/);
     assert.deepEqual(models, [originalBinding.connection.model]);assert.deepEqual(JSON.parse(fs.readFileSync(paths.conversation)).task.workspaceRunBinding, originalBinding);
-    const next = host.start("ui", w.workspaceId, w.selectedAgentId, "Start a new diagnostic task; do not repeat any previous actions", randomUUID());await host.wait(next.runId);
+    const next = await host.start("ui", w.workspaceId, w.selectedAgentId, "Start a new diagnostic task; do not repeat any previous actions", randomUUID());await host.wait(next.runId);
     assert.notEqual(next.runId, first.runId);assert.deepEqual(models, [originalBinding.connection.model, "explicit-new-model"]);
     const saved = JSON.parse(fs.readFileSync(paths.conversation));assert.deepEqual(saved.pastTasks.at(-1).task.workspaceRunBinding, originalBinding);
     assert.equal(saved.pastTasks.at(-1).usage.modelCalls, old.conversation.runUsage.modelCalls);
@@ -183,12 +183,12 @@ test("429 metadata without a numeric message prefix stays resumable through the 
       const w = host.createWorkspace("Rate-window checkpoint", host.list().revision);host.configureSynthetic(w.workspaceId, 0);
     const fixtureAgent=host.context(w.workspaceId).resources.agents.get(w.selectedAgentId);
     host.context(w.workspaceId).resources.agents.setPermissionTier(fixtureAgent.agentId,"controlled",fixtureAgent.configRevision,fixtureAgent.agentEpoch);
-      const first = host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
+      const first = await host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
       assert.equal(host.snapshot(w.workspaceId).conversation.resumeAdmission.allowed, true);assert.equal(calls, 1);
       assert.equal(legacyWorkspaceProviderFailure(`[openai error] ${message}`), null);
       await host.close();host = new LocalWorkspaceHost(root, options);
       assert.equal(host.snapshot(w.workspaceId).conversation.resumeAdmission.allowed, true);
-      const resumed = host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true);await host.wait(resumed.runId);
+      const resumed = await host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true);await host.wait(resumed.runId);
       assert.equal(resumed.runId, first.runId);assert.equal(calls, 2);
     } finally { await host.close();fs.rmSync(root, { recursive: true, force: true }); }
   }
@@ -203,10 +203,10 @@ test("a real loopback provider 404 makes one request; continuation refuses witho
   const host = new LocalWorkspaceHost(root, { mode: "workspace", credentialVault: new MemoryCredentialVault(), legacySourceHome: root, hostHome: root });
   try {
     const w = host.createWorkspace("HTTP refusal", host.list().revision);
-    host.configureConnection(w.workspaceId, { label: "Loopback fixture", provider: "openai", baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: "local-fixture-credential", defaultModel: "fixture-model" }, 0);
-    const first = host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
+    await host.configureConnection(w.workspaceId, { label: "Loopback fixture", provider: "openai", baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: "local-fixture-credential", defaultModel: "fixture-model" }, 0);
+    const first = await host.start("ui", w.workspaceId, w.selectedAgentId, "hello", randomUUID());await host.wait(first.runId);
     assert.equal(host.snapshot(w.workspaceId).conversation.resumeAdmission.reason, "connection_model_unavailable");
-    assert.throws(() => host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true), /no new model call/);
+    await assert.rejects(() => host.start("ui", w.workspaceId, w.selectedAgentId, "/continue", randomUUID(), true), /no new model call/);
     assert.deepEqual(requests, [{ path: "/v1/chat/completions", model: "fixture-model" }]);
   } finally { await host.close();server.closeAllConnections();await new Promise(done => server.close(done));fs.rmSync(root, { recursive: true, force: true }); }
 });

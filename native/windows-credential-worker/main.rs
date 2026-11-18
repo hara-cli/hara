@@ -5,12 +5,16 @@
 fn main() { std::process::exit(70); }
 #[cfg(windows)]
 mod windows {
-    use std::{ffi::c_void, io::{Read, Write}, mem::{size_of, zeroed}, os::windows::ffi::OsStrExt,
+    use std::{ffi::c_void, io::{Read, Write}, mem::{size_of, zeroed}, os::windows::{ffi::OsStrExt, fs::MetadataExt},
         path::{Path, PathBuf}, ptr::{null, null_mut}, sync::atomic::{compiler_fence, Ordering}};
     type Handle = *mut c_void;
     type Result<T> = std::result::Result<T, u8>;
     const INVALID: u8 = 1; const UNAVAILABLE: u8 = 2; const ACCESS: u8 = 3;
     const UNREADABLE: u8 = 4; const WRITE_UNKNOWN: u8 = 5; const CLEANUP_UNKNOWN: u8 = 6;
+    const LOCK_BUSY: u8 = 7; const HOST_BINDING: u8 = 8; const REF_EXISTS: u8 = 9;
+    const MAX_PENDING_TEMPS: usize = 64;
+    const MAX_NAMESPACE_ENTRIES: usize = 65_536;
+    const MAX_PENDING_BYTES: u64 = 4 * 1024 * 1024;
     const MAX_FRAME: usize = 8_500_000;
     const MAX_CIPHER: usize = 131_072;
     const SERVICE: &[u8] = b"tech.nanhara.hara.workspace.credentials.v1\0DPAPI-CurrentUser-v1\0";
@@ -124,7 +128,8 @@ mod windows {
     fn info(h: Handle, directory: bool) -> Result<Info> { unsafe {
         let mut value: Info=zeroed();
         if GetFileInformationByHandle(h,&mut value)==0 { return Err(os_error()); }
-        if value.attrs&0x400!=0 || (value.attrs&0x10!=0)!=directory || (!directory && value.links!=1) { return Err(ACCESS); }
+        if value.attrs&0x400!=0 { return Err(if directory { HOST_BINDING } else { ACCESS }); }
+        if (value.attrs&0x10!=0)!=directory || (!directory && value.links!=1) { return Err(ACCESS); }
         Ok(value)
     } }
     fn open(path: &Path, access: u32, share: u32, creation: u32, directory: bool, security: Option<&Security>) -> Result<Owned> {
@@ -136,11 +141,11 @@ mod windows {
     }
     fn local_app_data() -> Result<PathBuf> { unsafe {
         let id=Guid{a:0xf1b32785,b:0x6fba,c:0x4fcf,d:[0x9d,0x55,0x7b,0x8e,0x7f,0x15,0x70,0x91]}; let mut p=null_mut();
-        if SHGetKnownFolderPath(&id,0,null_mut(),&mut p)<0 { return Err(UNAVAILABLE); }
+        if SHGetKnownFolderPath(&id,0,null_mut(),&mut p)<0 { return Err(HOST_BINDING); }
         let mut n=0; while *p.add(n)!=0 && n<32760 { n+=1; }
         let value=String::from_utf16(std::slice::from_raw_parts(p,n)); CoTaskMemFree(p.cast());
-        let s=value.map_err(|_|UNAVAILABLE)?;
-        if n>=32760 || s.as_bytes().get(1)!=Some(&b':') || s.as_bytes().get(2)!=Some(&b'\\') { return Err(UNAVAILABLE); }
+        let s=value.map_err(|_|HOST_BINDING)?;
+        if n>=32760 || s.as_bytes().get(1)!=Some(&b':') || s.as_bytes().get(2)!=Some(&b'\\') { return Err(HOST_BINDING); }
         Ok(PathBuf::from(s))
     } }
     struct Store { path: PathBuf, _parents: Vec<Owned>, _lock: Owned, sec: Security, namespace: [u8;32] }
@@ -158,7 +163,14 @@ mod windows {
                 if made==0 && unsafe{GetLastError()}!=183 { return Err(os_error()); }
                 parents.push(open(&path,0x80,3,3,true,if private{Some(&sec)}else{None})?);
             }
-            let lock=open(&path.join("store.lock"),GENERIC_READ|GENERIC_WRITE,0,4,false,Some(&sec))?;
+            let lock_name=wide(path.join("store.lock").as_os_str()); let sa=sec.sa();
+            let raw=unsafe{CreateFileW(lock_name.as_ptr(),GENERIC_READ|GENERIC_WRITE|READ_CONTROL,0,&sa,4,OPEN_REPARSE,null_mut())};
+            if raw as isize == -1 {
+                // Only this exact CreateFileW failure is a retryable pre-lock outcome. No
+                // credential entry has been accessed, even for a batch.
+                return Err(if unsafe{GetLastError()}==32 {LOCK_BUSY} else {os_error()});
+            }
+            let lock=Owned(raw); info(lock.0,false)?; sec.check(lock.0)?;
             Ok(Self{path,_parents:parents,_lock:lock,sec,namespace})
         }
         fn name(&self, reference:&[u8]) -> Result<PathBuf> { Ok(self.path.join(format!("{}.bin",hex(&hash(reference)?)))) }
@@ -184,9 +196,31 @@ mod windows {
             if cursor.offset!=plain.0.len() || !valid_key(&key.0) { return Err(UNREADABLE); }
             Ok(Some(key))
         }
-        fn write(&self, reference:&[u8], key:&[u8]) -> Result<()> {
+        fn check_pending_quota(&self) -> Result<()> {
+            // The older opaque random names do not bind a pending ciphertext to a committed ref.
+            // Without that proof, even an old or truncated temporary is retained.
+            let mut count=0; let mut bytes=0u64;
+            for (i, entry) in std::fs::read_dir(&self.path).map_err(|_|UNAVAILABLE)?.enumerate() {
+                if i>=MAX_NAMESPACE_ENTRIES { return Err(UNAVAILABLE); }
+                let entry=entry.map_err(|_|UNAVAILABLE)?;
+                let name=entry.file_name();
+                if let Some(stem)=name.to_str().and_then(|s|s.strip_suffix(".tmp")) {
+                    if stem.len()==32 && stem.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+                        count+=1;
+                        let meta=std::fs::symlink_metadata(entry.path()).map_err(|_|UNAVAILABLE)?;
+                        if !meta.is_file() || meta.file_attributes()&0x400!=0 { return Err(UNAVAILABLE); }
+                        bytes=bytes.checked_add(meta.len()).ok_or(UNAVAILABLE)?;
+                        if count>=MAX_PENDING_TEMPS || bytes > MAX_PENDING_BYTES-MAX_CIPHER as u64 { return Err(UNAVAILABLE); }
+                    }
+                }
+            }
+            Ok(())
+        }
+        #[cfg(test)]
+        fn write(&self, reference:&[u8], key:&[u8]) -> Result<()> { self.write_key(reference,key,false) }
+        fn write_key(&self, reference:&[u8], key:&[u8], fresh:bool) -> Result<()> {
             // Do not replace an unsafe existing file (including unreadable ciphertext).
-            self.read(reference)?;
+            if self.read(reference)?.is_some() && fresh { return Err(REF_EXISTS); }
             let mut plain=Secret(self.entropy(reference)); plain.0.extend_from_slice(&((key.len()/2) as u32).to_le_bytes()); plain.0.extend_from_slice(key);
             let cipher=dpapi(&plain.0,&self.entropy(reference),true)?;
             let mut random=[0u8;16];
@@ -200,7 +234,7 @@ mod windows {
                 // FILE_RENAME_INFO x64: DWORD union, padding, HANDLE, DWORD byte length, WCHAR[].
                 let bytes=20+file_name.len()*2; let mut rename=vec![0usize;(bytes+7)/8]; let p=rename.as_mut_ptr().cast::<u8>();
                 unsafe {
-                    *p=1; std::ptr::write_unaligned(p.add(8).cast::<Handle>(),null_mut());
+                    *p=u8::from(!fresh); std::ptr::write_unaligned(p.add(8).cast::<Handle>(),null_mut());
                     std::ptr::write_unaligned(p.add(16).cast::<u32>(),(file_name.len()*2) as u32);
                     std::ptr::copy_nonoverlapping(file_name.as_ptr().cast::<u8>(),p.add(20),file_name.len()*2);
                     if SetFileInformationByHandle(h.0,3,p.cast(),bytes as u32)==0 { return Err(WRITE_UNKNOWN); }
@@ -241,7 +275,8 @@ mod windows {
         k.chunks_exact(2).all(|b|{let u=u16::from_le_bytes([b[0],b[1]]); !matches!(u,0..=0x20|0x7f|0xa0|0x1680|0x2000..=0x200a|0x2028|0x2029|0x202f|0x205f|0x3000|0xfeff)})
     }
     fn execute(frame:&[u8], nonce:&mut [u8;16])->Result<Vec<Option<Secret>>> {
-        let mut c=Cursor{bytes:frame,offset:0}; if c.take(4)?!=b"HVQ1" {return Err(INVALID);}
+        let mut c=Cursor{bytes:frame,offset:0}; let magic=c.take(4)?; let fresh=magic==b"HVQ2";
+        if !fresh && magic!=b"HVQ1" {return Err(INVALID);}
         let op=c.take(1)?[0]; nonce.copy_from_slice(c.take(16)?); let namespace:[u8;32]=c.take(32)?.try_into().map_err(|_|INVALID)?; let n=c.u16()? as usize;
         if op>4 || (op==0 && n!=0) || (matches!(op,1|2|4) && n!=1) || (op==3 && (n==0 || n>256)) {return Err(INVALID);}
         let mut entries=Vec::new();
@@ -258,7 +293,15 @@ mod windows {
         match op {
             0=>{let cipher=dpapi(nonce,&store.entropy(b"probe"),true)?; let clear=dpapi(&cipher.0,&store.entropy(b"probe"),false)?; if clear.0.as_slice()!=nonce.as_slice() {return Err(UNAVAILABLE);} Ok(vec![])},
             1=>Ok(vec![store.read(entries[0].0)?]),
-            2|3=>{for (i,(r,k)) in entries.into_iter().enumerate() {if let Err(code)=store.write(r,k) {return Err(if i>0{WRITE_UNKNOWN}else{code});}} Ok(vec![])},
+            2|3=>{
+                store.check_pending_quota()?;
+                // A fresh batch refuses an existing entry before writing any of its members.
+                if fresh { for (reference,_) in &entries { if store.read(reference)?.is_some() { return Err(REF_EXISTS); } } }
+                for (i,(r,k)) in entries.into_iter().enumerate() {
+                    if let Err(code)=store.write_key(r,k,fresh) {return Err(if i>0{WRITE_UNKNOWN}else{code});}
+                }
+                Ok(vec![])
+            },
             4=>{store.remove(entries[0].0)?; Ok(vec![])},
             _=>Err(INVALID)
         }
@@ -274,10 +317,11 @@ mod windows {
         let mut frame=Secret(vec![0;n]); let mut trailing=[0u8;1];
         if stdin.read_exact(&mut frame.0).is_err() || stdin.read(&mut trailing).ok()!=Some(0) {std::process::exit(65);}
         let mut nonce=[0;16]; let result=execute(&frame.0,&mut nonce);
-        let mut response=Secret(b"HVR1".to_vec()); response.0.extend_from_slice(&nonce);
+        let v2=frame.0.starts_with(b"HVQ2");
+        let mut response=Secret(if v2 {b"HVR2"} else {b"HVR1"}.to_vec()); response.0.extend_from_slice(&nonce);
         match result {
             Ok(values)=>{response.0.push(0);response.0.extend_from_slice(&(values.len() as u16).to_le_bytes());for v in values {match v {None=>response.0.push(0),Some(key)=>{response.0.push(1);response.0.extend_from_slice(&((key.0.len()/2) as u32).to_le_bytes());response.0.extend_from_slice(&key.0);}}}},
-            Err(code)=>{response.0.push(code);response.0.extend_from_slice(&0u16.to_le_bytes());}
+            Err(code)=>{response.0.push(if !v2 && code>=LOCK_BUSY {UNAVAILABLE} else {code});response.0.extend_from_slice(&0u16.to_le_bytes());}
         }
         let mut stdout=std::io::stdout().lock();
         if stdout.write_all(&(response.0.len() as u32).to_le_bytes()).and_then(|_|stdout.write_all(&response.0)).and_then(|_|stdout.flush()).is_err() {std::process::exit(74);}

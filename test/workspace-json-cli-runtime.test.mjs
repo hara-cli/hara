@@ -12,7 +12,7 @@ for (const runtime of ["gemini"]) {
     assert.equal(inventory.source, "documented"); assert.ok(inventory.sourceURL.startsWith("https://"));
     assert.ok(inventory.models.some(row => row.id === "default")); assert.ok(inventory.models.every(row => !row.supportedReasoningEfforts?.length));
     await assert.rejects(f.host.selectRuntimeModel(f.workspaceId, runtime, "default", 0, "high"), /does not report reasoning effort/);
-    const sent = f.send(); await f.host.wait(sent.runId); const view = f.read(), meta = f.meta();
+    const sent = await f.send(); await f.host.wait(sent.runId); const view = f.read(), meta = f.meta();
     assert.equal(view.conversation.state, "completed", JSON.stringify(view.conversation));
     assert.equal(meta.home, f.account); assert.equal(meta.yolo, true); assert.equal(meta.wrapped, true); assert.equal(meta.tokenInArgv, false); assert.deepEqual(meta.mcpNames, ["hara"]);
     const listed = governedToolResult(meta.listed.content[0].text); assert.deepEqual(compactRosterIds(listed), [f.main]);
@@ -24,31 +24,31 @@ for (const runtime of ["gemini"]) {
     await assert.rejects(fetch(meta.url));
   });
   test(`${runtime}: missing public protection denies the physical model process without fallback`, { skip: GEMINI_SKIP }, async t => {
-    const f = await jsonCliFixture(t, runtime, { protectedFactory: false }), sent = f.send(); await f.host.wait(sent.runId);
+    const f = await jsonCliFixture(t, runtime, { protectedFactory: false }), sent = await f.send(); await f.host.wait(sent.runId);
     const view = f.read(); assert.equal(view.conversation.state, "blocked"); assert.equal(fs.existsSync(f.metaPath), false);
     assert.ok(view.conversation.blockReason.includes('"kind":"runtime_permission_denied"'));
     assert.equal(view.runtimes.options.find(row => row.runtimeId === runtime).versionStatus.lastSuccessfulVersion, null);
   });
   test(`${runtime}: error frames are diagnosed without raw payloads or version success`, { skip: GEMINI_SKIP }, async t => {
-    const f = await jsonCliFixture(t, runtime, { mode: "error" }), sent = f.send(); await f.host.wait(sent.runId); const view = f.read();
+    const f = await jsonCliFixture(t, runtime, { mode: "error" }), sent = await f.send(); await f.host.wait(sent.runId); const view = f.read();
     assert.equal(view.conversation.state, "blocked"); assert.ok(view.conversation.blockReason.includes('"kind":"runtime_auth_rejected"'));
     assert.ok(!JSON.stringify(view).includes("fixture-private")); assert.equal(view.runtimes.options.find(row => row.runtimeId === runtime).versionStatus.lastSuccessfulVersion, null);
     await assert.rejects(fetch(f.meta().url));
   });
   test(`${runtime}: cancellation drains the native process before policy close and closes MCP`, { skip: GEMINI_SKIP }, async t => {
-    const f = await jsonCliFixture(t, runtime, { mode: "cancel" }), sent = f.send();
+    const f = await jsonCliFixture(t, runtime, { mode: "cancel" }), sent = await f.send();
     await until(() => fs.existsSync(f.metaPath)); const url = f.meta().url;
     f.host.cancel(f.workspaceId, f.main, sent.runId); await f.host.wait(sent.runId);
     assert.equal(f.policyCalls.at(-1).kind, "close"); assert.notEqual(f.read().conversation.state, "running"); await assert.rejects(fetch(url));
   });
 }
 test("Gemini off macOS is refused explicitly before any native model process", { skip: OFF_MACOS_ONLY }, async t => {
-  const f = await jsonCliFixture(t, "gemini", { tier: "controlled" }), sent = f.send(); await f.host.wait(sent.runId); const view = f.read();
+  const f = await jsonCliFixture(t, "gemini", { tier: "controlled" }), sent = await f.send(); await f.host.wait(sent.runId); const view = f.read();
   assert.equal(view.conversation.state, "blocked"); assert.match(view.conversation.blockReason, /"kind":"runtime_permission_denied"/);
   assert.match(view.conversation.blockReason, /require macOS/); assert.equal(fs.existsSync(f.metaPath), false, "no native Gemini process ran");
 });
 test("Gemini controlled adds plan, omits yolo and retains the outer policy before its MCP read", { skip: GEMINI_SKIP }, async t => {
-  const f = await jsonCliFixture(t, "gemini", { tier: "controlled" }), sent = f.send(); await f.host.wait(sent.runId);
+  const f = await jsonCliFixture(t, "gemini", { tier: "controlled" }), sent = await f.send(); await f.host.wait(sent.runId);
   assert.equal(f.read().conversation.state, "completed"); assert.equal(f.meta().yolo, false); assert.ok(f.policyCalls.some(row => row.kind === "wrap"));
 });
 test("Kimi host registration enables binding and advertises inherited extensions", async t => {
@@ -67,13 +67,13 @@ test("Gemini refuses an unreachable explicit Workspace proxy before physical lau
   const server = createServer(); await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   const endpoint = `http://127.0.0.1:${server.address().port}`; await new Promise(resolve => server.close(resolve));
   const f = await jsonCliFixture(t, "gemini"); f.host.setRuntimeProxy(f.workspaceId, endpoint, 0);
-  const sent = f.send(); await f.host.wait(sent.runId); const view = f.read();
+  const sent = await f.send(); await f.host.wait(sent.runId); const view = f.read();
   assert.equal(view.conversation.state, "blocked"); assert.ok(view.conversation.blockReason.includes('"kind":"runtime_proxy"'));
   assert.equal(fs.existsSync(f.metaPath), false); assert.equal(f.policyCalls.length, 0);
 });
 
 test("Gemini default factory runs the fake CLI under real Seatbelt with its frozen controlled tier", { skip: process.platform !== "darwin" }, async t => {
-  const f = await jsonCliFixture(t, "gemini", { productionPolicy: true, recordReceipt: false, tier: "controlled" }), sent = f.send();
+  const f = await jsonCliFixture(t, "gemini", { productionPolicy: true, recordReceipt: false, tier: "controlled" }), sent = await f.send();
   await f.host.wait(sent.runId); const view = f.read();
   assert.equal(view.conversation.state, "completed", JSON.stringify(view.conversation));
   assert.ok(view.conversation.history.some(row => row.role === "tool" && row.results.some(result => result.name === "agent_list")));

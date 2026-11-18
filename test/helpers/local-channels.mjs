@@ -22,7 +22,7 @@ export async function setup(count = 3, providerFactory, permissionTier = DEFAULT
     },
   })) }, host = new LocalWorkspaceHost(root, options);
   await host.initialize(); const workspace = host.createWorkspace("Local personal", host.list().revision), id = workspace.workspaceId;
-  host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
+  await host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
   const resources = new WorkspaceResources(host.home, host.catalog.resolve(id).scope); resources.initialize();
   const members = [];
   if (!["controlled", "full-protected"].includes(permissionTier)) throw new Error("Invalid fixture permission tier");

@@ -72,12 +72,12 @@ before(async () => {
   const jobTools = host.jobTools.bind(host);
   host.jobTools = (...args) => { const tools = jobTools(...args); if (args[1].kind === "main") mainToolImplementations = tools; return tools; };
   const workspace = host.createWorkspace("Operations", host.list().revision), id = workspace.workspaceId;
-  host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("cards-client", id, host.list().revision);
+  await host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("cards-client", id, host.list().revision);
   const resources = new WorkspaceResources(host.home, host.catalog.resolve(id).scope); resources.initialize();
   const colleague = resources.agents.create({ username: "reviewer", profile: { displayName: "Reviewer" } }, resources.agents.list().revision);
-  const mainRun = host.start("cards-client", id, workspace.selectedAgentId, "你好", randomUUID()); await host.wait(mainRun.runId);
+  const mainRun = await host.start("cards-client", id, workspace.selectedAgentId, "你好", randomUUID()); await host.wait(mainRun.runId);
   assert.equal(captures.length, 1); mainTools = captures[0].tools; mainPrompt = captures[0].system;
-  const dmRun = host.start("cards-client", id, colleague.agentId, "你好", randomUUID()); await host.wait(dmRun.runId);
+  const dmRun = await host.start("cards-client", id, colleague.agentId, "你好", randomUUID()); await host.wait(dmRun.runId);
   assert.equal(captures.length, 2); colleagueTools = captures[1].tools;
   const channelId = randomUUID(); host.createChannel("cards-client", id, channelId, "Review", [colleague.agentId], 0); host.selectChannel("cards-client", id, channelId);
   host.sendChannel("cards-client", id, channelId, "@Reviewer 你好", randomUUID(), [colleague.agentId]); await host.waitChannel(id, channelId);
@@ -161,7 +161,7 @@ test("creation card binds main-only tool schemas and a fresh, view-bound, single
   try {
     const workspace = synthetic.createWorkspace("Confirmation", synthetic.list().revision), id = workspace.workspaceId;
     synthetic.configureSynthetic(id, 0); synthetic.select("owner", id, synthetic.list().revision);
-    const receipt = synthetic.start("owner", id, workspace.selectedAgentId, "建立 Pi 同事 Coder", randomUUID());
+    const receipt = await synthetic.start("owner", id, workspace.selectedAgentId, "建立 Pi 同事 Coder", randomUUID());
     let approval;
     for (let count = 0; count < 250 && !approval; count++) {
       approval = synthetic.snapshot(id, workspace.selectedAgentId, "owner").approvals[0];
@@ -267,22 +267,22 @@ test("an ordinary formal Host can load just one built-in card through its govern
   });
   try {
     const workspace = governed.createWorkspace("Read instructions", governed.list().revision), id = workspace.workspaceId;
-    governed.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0);
+    await governed.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0);
     // The help-card proof tests the governed tool ledger, including its two-round explicit completion.
     const agent = governed.context(id).resources.agents.get(workspace.selectedAgentId);
     governed.context(id).resources.agents.setPermissionTier(agent.agentId,"controlled",agent.configRevision,agent.agentEpoch);
     const requestId = randomUUID(), message = "如何选择运行时模型？";
-    const run = governed.start("reader", id, workspace.selectedAgentId, message, requestId); await governed.wait(run.runId);
+    const run = await governed.start("reader", id, workspace.selectedAgentId, message, requestId); await governed.wait(run.runId);
     assert.equal(calls, 2, "one fake tool-use turn and one fake answer; zero external model calls");
     assert.equal(governed.snapshot(id).conversation.state, "completed");
     assert.equal(governed.workspaceFeatures(id).skills.length, 0, "built-in help neither imports nor enables user skill files");
-    const duplicate = governed.start("reader", id, workspace.selectedAgentId, message, requestId);
+    const duplicate = await governed.start("reader", id, workspace.selectedAgentId, message, requestId);
     assert.equal(duplicate.runId, run.runId); assert.equal(duplicate.duplicate, true); assert.equal(calls, 2);
-    assert.throws(() => governed.start("reader", id, workspace.selectedAgentId, "different message", requestId), /already belongs to another request/);
+    await assert.rejects(() => governed.start("reader", id, workspace.selectedAgentId, "different message", requestId), /already belongs to another request/);
     const storage = new WorkspaceResourceStorage(governed.home, governed.catalog.resolve(id).scope), unknownId = randomUUID();
     storage.initialize();
     new WorkspaceRequestJournal(storage, workspace.selectedAgentId).receive({ requestId: unknownId, digest: createHash("sha256").update(canonical([message, false])).digest("hex"), operation: "send" }, { source: "host", channel: "internal", clientId: "reader" });
-    assert.throws(() => governed.start("reader", id, workspace.selectedAgentId, message, unknownId), /outcome is unknown; inspect its receipt, do not resend/);
+    await assert.rejects(() => governed.start("reader", id, workspace.selectedAgentId, message, unknownId), /outcome is unknown; inspect its receipt, do not resend/);
     assert.equal(calls, 2, "duplicate and outcome-unknown requests cannot dispatch another model turn");
   } finally { await governed.close(); }
 });

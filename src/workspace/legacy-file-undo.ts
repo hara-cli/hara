@@ -58,7 +58,7 @@ export class LegacyScopedFileUndo {
   }
   /** Every domain write must use the CAS private writer. The expected chain is captured from OUR
    * write payloads, not a late filesystem scan that could accidentally adopt a concurrent user edit. */
-  async runImport<T>(action: () => T | Promise<T>): Promise<T> {
+  async runImport<T>(action: () => T | Promise<T>, independentJournals: readonly string[] = []): Promise<T> {
     let before = this.read(); if (before.status !== "open") throw new Error("An open inheritance intent is required");
     for (const row of before.files) if (row.pendingAfterHash) {
       const actual = this.image(row.path).hash, previous = row.written ? row.afterHash : row.beforeHash;
@@ -69,6 +69,10 @@ export class LegacyScopedFileUndo {
     const home = this.storage.run(() => workspaceStateHome()), journal = join(home, ".hara", this.filename);
     const paths = new Map(before.files.map(row => [join(home, row.path), row.path]));
     const expected = new Map(before.files.map(row => [join(home, row.path), row.written ? row.afterHash : row.beforeHash]));
+    // An independently durable write intent must survive importer rollback. Only fixed,
+    // same-scope journal paths from trusted composition can bypass the undo image chain.
+    if (independentJournals.some(path => !validPath(path) || paths.has(join(home, path)))) throw new Error("Invalid independent inheritance journal");
+    const independent = new Set(independentJournals.map(path => join(home, path)));
     for (const row of before.files) if (this.image(row.path).hash !== expected.get(join(home, row.path))) throw new Error("A newer edit appeared before import; source and user data preserved");
     const update = (path: string, change: (row: Image) => Image) => {
       const current = this.read(); this.state.update(current.revision, old => ({ ...old, files: old.files.map(row => row.path === paths.get(path) ? change(row) : row) }));
@@ -76,13 +80,13 @@ export class LegacyScopedFileUndo {
     let active = true, result: T;
     try {
       result = await observePrivateStateWrites({
-        checkPath(path) { if (!active || path !== journal && !paths.has(path)) throw new Error("Unplanned inheritance write refused before mutation"); },
+        checkPath(path) { if (!active || path !== journal && !paths.has(path) && !independent.has(path)) throw new Error("Unplanned inheritance write refused before mutation"); },
         before(path, previousHash, nextHash) {
-          if (path === journal) return;
+          if (path === journal || independent.has(path)) return;
           if (previousHash !== expected.get(path)) throw new Error("Concurrent user edit refused before inheritance write");
           update(path, row => ({ ...row, pendingAfterHash: nextHash }));
         },
-        committed(path, nextHash) { if (path === journal) return; expected.set(path, nextHash); update(path, row => ({ ...row, afterHash: nextHash, pendingAfterHash: null, written: true })); },
+        committed(path, nextHash) { if (path === journal || independent.has(path)) return; expected.set(path, nextHash); update(path, row => ({ ...row, afterHash: nextHash, pendingAfterHash: null, written: true })); },
       }, action);
     } finally { active = false; }
     for (const row of before.files) if (this.image(row.path).hash !== expected.get(join(home, row.path))) throw new Error("A concurrent edit was preserved; import cannot claim its postimage");

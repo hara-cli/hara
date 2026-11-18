@@ -154,7 +154,7 @@ async function hostFixture(t, f, { tier = "controlled", key = "one", afterIntake
 }
 
 for (const tier of ["controlled", "full-protected"]) managedTest(`actual governed Pi ${tier} tool conversion reaches real stdio after a current one-call card`, async t => {
-  const f = await fixture(t), h = await hostFixture(t, f, { tier }), started = h.host.start("client", h.id, h.main.agentId, "Read the synthetic fixture through the reviewed plugin.", randomUUID());
+  const f = await fixture(t), h = await hostFixture(t, f, { tier }), started = await h.host.start("client", h.id, h.main.agentId, "Read the synthetic fixture through the reviewed plugin.", randomUUID());
   const card = await until(() => h.read().approvals.find(row => row.kind === "extension_call"), "external call card");
   assert.equal(allCalls(h.host, h.id).length, 0); assert.equal(card.draft.sourceName, "Synthetic MCP");
   assert.throws(() => h.host.answerApproval("foreign-client", h.id, card.id, true), /approval/);
@@ -169,7 +169,7 @@ for (const tier of ["controlled", "full-protected"]) managedTest(`actual governe
 for (const runtime of ["codex", "claude"]) managedTest(`registered ${runtime} adapter calls the same real stdio through its attempt token and governor`, async t => {
   const revoked = runtime === "codex" ? observeCodexAttempts(t) : undefined;
   const f = await fixture(t), h = await hostFixture(t, f, { runtime, tier: "full-protected" });
-  const started = h.host.start("client", h.id, h.main.agentId, "Read the synthetic plugin data.", randomUUID());
+  const started = await h.host.start("client", h.id, h.main.agentId, "Read the synthetic plugin data.", randomUUID());
   const card = await until(() => {
     const snapshot = h.read(), card = snapshot.approvals.find(row => row.kind === "extension_call");
     if (!card && ["blocked", "cancelled", "completed"].includes(snapshot.conversation.state)) throw Error("Native fixture ended before the external card");
@@ -195,7 +195,7 @@ for (const runtime of ["codex", "claude"]) managedTest(`registered ${runtime} ad
 });
 
 managedTest("revoking a Workspace switch while its external confirmation is pending dispatches zero stdio calls", async t => {
-  const f = await fixture(t), h = await hostFixture(t, f), started = h.host.start("client", h.id, h.main.agentId, "Read the synthetic plugin.", randomUUID());
+  const f = await fixture(t), h = await hostFixture(t, f), started = await h.host.start("client", h.id, h.main.agentId, "Read the synthetic plugin.", randomUUID());
   const card = await until(() => h.read().approvals.find(row => row.kind === "extension_call"));
   await h.change({ ...h.input, enabled: false }, h.host.workspaceExtensions(h.id).revision);
   h.host.answerApproval("client", h.id, card.id, true); await h.host.wait(started.runId);
@@ -244,7 +244,7 @@ test("off switches, unreviewed metadata, unsupported clients and foreign Workspa
   assert.throws(() => other.attempt({ snapshot, extensions: m.extensions }), /cancelled/);
   const unreviewed = managerFixture(t, f, { reviewed: false }); unreviewed.enable(); const denied = unreviewed.attempt(); assert.equal(denied.tools.length, 0); await denied.close();
   const h = await hostFixture(t, f); h.host.setExtensionClientCapability("client", false);
-  const run = h.host.start("client", h.id, h.main.agentId, "Read synthetic data", randomUUID()); await h.host.wait(run.runId);
+  const run = await h.host.start("client", h.id, h.main.agentId, "Read synthetic data", randomUUID()); await h.host.wait(run.runId);
   assert.equal(allCalls(h.host, h.id).length, 0); assert.equal(h.read().approvals.length, 0);
   assert.equal(m.spawns().length, 0); assert.equal(unreviewed.spawns().length, 0);
 });
@@ -334,7 +334,7 @@ managedTest("revocation during an in-flight call suppresses its late response an
 
 test("failed optional catalog removes every extension tool while the ordinary governed core remains usable", { skip: process.platform === "win32" }, async t => {
   const f = await fixture(t), h = await hostFixture(t, f); f.catalogFailure = true; f.greetingOnly = true;
-  const started = h.host.start("client", h.id, h.main.agentId, "hello", randomUUID()); await h.host.wait(started.runId);
+  const started = await h.host.start("client", h.id, h.main.agentId, "hello", randomUUID()); await h.host.wait(started.runId);
   assert.equal(h.read().conversation.state, "completed"); assert.equal(h.read().conversation.usage.modelCalls, 1);
   assert.equal(h.read().approvals.length, 0); assert.equal(allCalls(h.host, h.id).length, 0);
   assert.deepEqual(h.host.context(h.id).extensions.snapshot(h.main.agentId, h.main.agentEpoch).tools, []);
@@ -348,7 +348,7 @@ managedTest("Codex rejects a proxy changed during asynchronous MCP preparation b
   t.mock.method(ResidentWorkspaceMcp, "create", async function (...args) {
     const resident = await create.apply(this, args); enter(); await released; return resident;
   });
-  const started = h.host.start("client", h.id, h.main.agentId, "Read the synthetic plugin data.", randomUUID());
+  const started = await h.host.start("client", h.id, h.main.agentId, "Read the synthetic plugin data.", randomUUID());
   try {
     await Promise.race([entered, sleep(10000).then(() => { throw Error("owned preparation was not entered"); })]);
     const proxy = h.host.context(h.id).runtimes.proxy, current = proxy.read();

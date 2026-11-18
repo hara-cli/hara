@@ -35,7 +35,7 @@ async function fixture(t, count = 20, proposal = {
   return { host, id, main, calls: () => calls, systems: () => systems };
 }
 async function cardFor(f) {
-  const run = f.host.start("client", f.id, f.main, "建一个负责 video 项目的同事", randomUUID());
+  const run = await f.host.start("client", f.id, f.main, "建一个负责 video 项目的同事", randomUUID());
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
     const card = f.host.snapshot(f.id, f.main, "client").approvals[0];

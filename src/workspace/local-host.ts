@@ -47,7 +47,7 @@ import { isWorkspaceScopedFileTool, WORKSPACE_SCOPED_FILE_TOOLS } from "./scoped
 import { WorkspaceAgentCommandControl, agentCommandIntakeFacts, type AgentCommandIntake, type AgentCommandRunPreparation } from "./agent-command-control.js";
 import type { AgentHubDirectory } from "../agent-hub/contracts.js";
 import { WorkspaceResources } from "./resources.js";
-import { currentWorkspaceResourceBinding, workspaceStateHome, WorkspaceResourceStorage } from "./resource-context.js";
+import { currentWorkspaceResourceBinding, sameWorkspaceResourceBinding, workspaceStateHome, WorkspaceResourceStorage } from "./resource-context.js";
 import { WorkspaceConnectionStoreV2, type ScopedConnection, type ScopedRunConnection } from "./scoped-connections.js";
 import { closedWorkspaceHistory, WorkspaceConversationStore, type WorkspaceConversation, type WorkspaceUsage } from "./conversations.js";
 import { WorkspaceSessionLease } from "./session-lease.js";
@@ -78,7 +78,9 @@ import { WorkspaceRuntimeModels } from "./runtime-models.js";
 import { WorkspaceSecureConnections } from "./secure-connections.js";
 import { connectionModelEfforts, connectionModels } from "./connection-models.js";
 import { resolveWorkspaceFileCredential } from "./file-credential.js";
-import { MacKeychainCredentialVault, type CredentialVault } from "./credential-vault.js";
+import { assertCredentialCall, credentialDeadline, type AsyncCredentialVault, type CredentialCall, type CredentialVault,
+  type CredentialStorageDescriptor } from "./credential-vault.js";
+import { adaptCredentialVault, createHostCredentialStorage } from "./credential-vault-host.js";
 import { LegacyConnectionCatalog } from "./legacy-connections.js";
 import { WorkspacePreferences } from "./preferences.js";
 import { WorkspaceOnboarding } from "./onboarding.js";
@@ -137,9 +139,10 @@ export interface AgentRoutingHostOptions {
   businessOwners?(workspaceId: string, reference: string): AgentRoutingBusinessBinding | null;
   classifier?(workspaceId: string): AgentRoutingClassifierConfig | undefined;
 }
-interface WorkspaceHostContext { routing?: WorkspaceAgentRouting; defaultRuntime: WorkspaceDefaultRuntime; onboarding: WorkspaceOnboarding; commandControl?: WorkspaceAgentCommandControl; boundaryAuthority?: WorkspaceAgentBoundaryAuthority; media?: WorkspaceMediaRegistry; resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2; project: string; homes: WorkspaceColleagueHomes; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; extensions: WorkspaceExtensions; mcp: WorkspaceMcpManager; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
+interface WorkspaceHostContext { routing?: WorkspaceAgentRouting; defaultRuntime: WorkspaceDefaultRuntime; onboarding: WorkspaceOnboarding; commandControl?: WorkspaceAgentCommandControl; boundaryAuthority?: WorkspaceAgentBoundaryAuthority; media?: WorkspaceMediaRegistry; resources: WorkspaceResources; storage: WorkspaceResourceStorage; connections: WorkspaceConnectionStoreV2 | WorkspaceSecureConnections; project: string; homes: WorkspaceColleagueHomes; runtimes: WorkspaceRuntimeInstaller; runtimeModels: WorkspaceRuntimeModels; features: WorkspaceFeatures; extensions: WorkspaceExtensions; mcp: WorkspaceMcpManager; scheduler?: WorkspaceScheduler; legacyBusiness?: WorkspaceLegacyBusiness; nextAuditCleanupAt?: number }
+type CredentialRequest = { assertCurrent(): void; clientId?: string };
 type WorkspaceConnectionSnapshot = ReturnType<WorkspaceConnectionStoreV2["list"]> & {
-  readOnly?: boolean; recovered?: boolean; migrationPending?: boolean; unavailable?: boolean; activeConnectionId?: string | null;
+  readOnly?: boolean; recovered?: boolean; migrationPending?: boolean; cleanupPending?: boolean; unavailable?: boolean; activeConnectionId?: string | null;
 };
 export interface LocalWorkspaceApproval {
   id: string; workspaceId: string; agentId: string; runId: string; expiresAt: string;
@@ -215,7 +218,7 @@ export class LocalWorkspaceHost {
   private readonly usageCache: WorkspaceRuntimeUsageCache;
   private schedulerTicking = false;
   private readonly realKey?: WorkspaceRealKeyLane;
-  private readonly vault: CredentialVault;
+  private readonly credentialStorage: ReturnType<typeof createHostCredentialStorage>;
   private readonly legacy?: LegacyConnectionCatalog;
   private readonly preferences: WorkspacePreferences;
   private initialization?: Promise<LegacyStartupStatus>;
@@ -228,6 +231,8 @@ export class LocalWorkspaceHost {
     discoveryHome?: string;
     legacySourceHome?: string;
     credentialVault?: CredentialVault;
+    asyncCredentialVault?: AsyncCredentialVault;
+    credentialStorageDescriptor?: CredentialStorageDescriptor;
     /** Trusted Host restriction only. No renderer/config role, human identity or execution grant. */
     defaultRuntimeRole?: WorkspaceDefaultRuntimeRole;
     runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1];
@@ -281,9 +286,11 @@ export class LocalWorkspaceHost {
     this.mcpOwnerReview = new WorkspaceMcpOwnerReview({ home: reviewHome, sources: () => this.extensionCandidates(),
       launch: options.mcpLaunchCandidate ?? (source => readHostWorkspaceMcpLaunch(reviewHome, this.catalog.read().hostId, source)),
       changed: () => { for (const workspaceId of this.contexts.keys()) { try { this.refreshExtensions(workspaceId); } catch { /* fail-closed catalog already invalidated */ } this.changed(workspaceId); } } });
-    const unavailable = () => { throw new Error("Host OS credential vault is unavailable; no plaintext fallback"); };
-    this.vault = options.credentialVault ?? (options.hostHome ? new MacKeychainCredentialVault(options.hostHome) : { get: unavailable, set: unavailable, remove: unavailable });
-    if (options.mode === "workspace" && (options.legacySourceHome ?? options.hostHome)) this.legacy = new LegacyConnectionCatalog((options.legacySourceHome ?? options.hostHome)!, this.vault);
+    this.credentialStorage = createHostCredentialStorage({ home: options.hostHome,
+      vault: options.asyncCredentialVault ?? (options.credentialVault ? adaptCredentialVault(options.credentialVault) : undefined),
+      descriptor: options.credentialStorageDescriptor });
+    if (options.mode === "workspace" && (options.legacySourceHome ?? options.hostHome))
+      this.legacy = new LegacyConnectionCatalog((options.legacySourceHome ?? options.hostHome)!);
     this.preferences = new WorkspacePreferences(this.home, options.mode === "workspace" ? options.hostHome : undefined);
     if (options.realKeyFile) {
       if (options.providerFactory) throw new Error("Real-key acceptance cannot replace its trusted Provider factory");
@@ -309,7 +316,8 @@ export class LocalWorkspaceHost {
       const record = this.catalog.resolvePersonalWorkspace(); this.inheritanceWorkspaceId = record.scope.workspaceId;
       const context = this.context(record.scope.workspaceId);
       this.inheritance = new WorkspaceLegacyStartup({ sourceHome, storage: context.storage, catalog: this.catalog,
-        resources: context.resources, features: context.features, vault: this.vault });
+        resources: context.resources, features: context.features, vault: this.credentialStorage.vault,
+        assertCurrent: this.credentialCall(record.scope.workspaceId, context).assertCurrent });
       this.inheritanceState = await this.inheritance.initialize();
     } catch {
       this.inheritanceState = { ...noLegacyStartup(), state: "pending", reason: "legacy_inheritance_requires_review" };
@@ -435,7 +443,7 @@ export class LocalWorkspaceHost {
     const control = this.commandAuthority(transport, workspaceId);
     try {
       const dispatch = router.prepareDispatch(transport!, input);
-      this.submitAgentCommandIntake(clientId, transport!, workspaceId, dispatch.command.agentId, control,
+      await this.submitAgentCommandIntake(clientId, transport!, workspaceId, dispatch.command.agentId, control,
         control.begin(transport!, dispatch.command, { message: input.message, routing: dispatch.routing }), { message: input.message });
     } catch (error) {
       // Only an original genuine claim permits readback after a competing admission.
@@ -474,7 +482,7 @@ export class LocalWorkspaceHost {
   reconcileAgentLifecycle(transport: AgentBoundaryTransport | undefined, workspaceId: string, agentId: string) {
     const result = this.lifecycleAuthority(transport, workspaceId).reconcileLifecycleObservations(transport!, agentId); this.kickLifecycleObserver(); return result;
   }
-  private submitAgentCommandIntake(clientId: string, transport: AgentBoundaryTransport, workspaceId: string, agentId: string,
+  private async submitAgentCommandIntake(clientId: string, transport: AgentBoundaryTransport, workspaceId: string, agentId: string,
     control: WorkspaceAgentCommandControl, begun: ReturnType<WorkspaceAgentCommandControl["begin"]>, input: { message?: string; proposal?: unknown }) {
     if ("receipt" in begun) return begun.receipt;
     const intake = begun.intake, facts = agentCommandIntakeFacts(intake, control);
@@ -484,7 +492,7 @@ export class LocalWorkspaceHost {
       // Stable mapping is diagnostic only. C0 identity and the single aggregate remain authority.
       const digest = createHash("sha256").update(canonical([facts.command.context.scope, facts.command.commandId])).digest("hex");
       const requestId = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-8${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
-      try { this.start(clientId, workspaceId, agentId, input.message!, requestId, false, undefined, undefined,
+      try { await this.start(clientId, workspaceId, agentId, input.message!, requestId, false, undefined, undefined,
         { source: "ui", channel: "rpc", clientId }, facts.routingChannelId ? { id: facts.routingChannelId, context: "" } : undefined, undefined, undefined, undefined, { control, intake }); }
       catch (error) {
         if (!control.runForIntake(intake)) throw error; // Accepted intent is queried, never resubmitted after a projection/start failure.
@@ -566,9 +574,13 @@ export class LocalWorkspaceHost {
     // Opening a workspace is the start of its imports here: no import can be in flight, so leftovers are crash debris.
     storage.run(() => sweepImportLeftovers(join(project, "attachments")));
     const source = storage.run(() => join(workspaceStateHome(), ".hara/workspace-connections-v2.json"));
-    const connections = this.options.mode === "workspace" ? new WorkspaceSecureConnections(storage, this.vault, id => {
-      if (!this.legacy) throw new Error("Legacy source unavailable"); return this.legacy.resolve(id, source, true);
+    const connections = this.options.mode === "workspace" ? new WorkspaceSecureConnections(storage, this.credentialStorage.vault, (id, call) => {
+      if (!this.legacy) throw new Error("Legacy source unavailable");
+      return this.legacy.resolveAsync(id, this.credentialStorage.vault, call, source, true);
     }) : new WorkspaceConnectionStoreV2(storage);
+    if (connections instanceof WorkspaceSecureConnections) {
+      try { connections.intents.reconcile(); } catch { /* Preserve damaged intents and unrelated Workspace reads. */ }
+    }
     if (connections instanceof WorkspaceSecureConnections && this.legacy && this.inheritanceState === undefined && this.catalog.read().workspaces[0]?.scope.workspaceId === workspaceId) {
       try { connections.stageLegacyImport(this.legacy.personalSeeds(source)); }
       catch { /* Snapshot isolates unavailable connections; history/roster must remain usable. */ }
@@ -585,7 +597,7 @@ export class LocalWorkspaceHost {
     context.legacyBusiness = this.options.legacyBusinessFactory?.({ storage, features: context.features, resources: folders })
       ?? new WorkspaceLegacyBusiness(storage, context.features, folders, { commands: { authorize: () => undefined,
         async launch() { throw new Error("Explicit legacy Host authority required"); } }, notifications: { authorize: () => undefined } });
-    const chatAnchorReason = (row: WorkspaceSchedule): string | null => {
+    const chatAnchorReason = async (row: WorkspaceSchedule): Promise<string | null> => {
       if (row.source !== "chat") return null;
       const anchor = row.definition.anchor;
       if (!plain(anchor) || anchor.workspaceId !== workspaceId || anchor.agentId !== row.definition.agentId || typeof anchor.conversationId !== "string"
@@ -598,7 +610,7 @@ export class LocalWorkspaceHost {
         if (channelId && !this.localChannels(workspaceId).get(channelId).memberIds.includes(agent.agentId)) return "chat_conversation_missing";
         const store = new WorkspaceConversationStore(storage, agent.agentId, channelId);
         if (store.sessionId !== anchor.conversationId || !store.read().requests.some(request => request.requestId === anchor.messageId)) return "chat_conversation_missing";
-        context.connections.resolve(anchor.connection as ScopedRunConnection);
+        await this.resolveConnection(workspaceId, context, anchor.connection as ScopedRunConnection);
       } catch { return "chat_conversation_missing"; }
       return null;
     };
@@ -607,10 +619,10 @@ export class LocalWorkspaceHost {
       available: agentId => !this.closing && !this.updateLease && !this.lifecycleChanges.has(JSON.stringify([workspaceId, agentId])) && Boolean(resources.agents.get(agentId)?.state === "active")
         && ![...this.jobs.values()].some(job => !job.closed && job.workspaceId === workspaceId && job.agentId === agentId),
       execute: async (agentId, task, requestId, row) => {
-        if (chatAnchorReason(row)) return { runId: "", completed: false };
+        if (await chatAnchorReason(row)) return { runId: "", completed: false };
         const anchor = row.source === "chat" && plain(row.definition.anchor) ? row.definition.anchor : null;
         const channelId = anchor && typeof anchor.channelId === "string" ? anchor.channelId : undefined;
-        const accepted = this.start(`schedule:${workspaceId}`, workspaceId, agentId, task, requestId, false, undefined, undefined,
+        const accepted = await this.start(`schedule:${workspaceId}`, workspaceId, agentId, task, requestId, false, undefined, undefined,
           { source: "host", channel: "internal", clientId: `schedule:${workspaceId}` }, channelId ? { id: channelId, context: "Scheduled continuation of this conversation." } : undefined,
           undefined, anchor ? anchor.connection as ScopedRunConnection : undefined);
         await this.wait(accepted.runId); const conversation = new WorkspaceConversationStore(storage, agentId, channelId).read();
@@ -1094,18 +1106,45 @@ export class LocalWorkspaceHost {
     const { defaultRuntimeId: _legacyDefaultRuntimeId, ...appearance } = this.preferences.read(); return appearance;
   }
   setPreferences(theme: unknown, expected: number, extra = {}) { this.preferences.save(theme, expected, extra); return this.getPreferences(); }
+  credentialStorageSnapshot(): CredentialStorageDescriptor { return this.credentialStorage.descriptor(); }
+  private credentialCall(workspaceId: string, context: WorkspaceHostContext, request?: CredentialRequest, write = false): CredentialCall {
+    const binding = context.storage.run(() => currentWorkspaceResourceBinding()!);
+    const assertCurrent = () => {
+      if (this.closing || this.updateLease || this.contexts.get(workspaceId) !== context)
+        throw new Error("Workspace credential view changed; refresh before acting");
+      request?.assertCurrent();
+      context.storage.run(() => {
+        if (!sameWorkspaceResourceBinding(binding, currentWorkspaceResourceBinding()!)) throw new Error("Workspace credential binding changed");
+        if (!write) return;
+        if (this.agentCommandProtectionActive(workspaceId)) throw new AgentBoundaryContractError("RUNTIME_UNSUPPORTED", "control.legacyEntry");
+        const view = request?.clientId ? this.clients.get(request.clientId) : undefined;
+        if (view && (view.workspaceId !== workspaceId || view.channelId || view.agentId !== context.resources.agents.list().mainAgentId))
+          throw new Error("Workspace credential view changed; select the main view before writing");
+      });
+    };
+    const call = { signal: credentialDeadline(), assertCurrent };
+    assertCredentialCall(call);
+    return call;
+  }
+  private resolveConnection(workspaceId: string, context: WorkspaceHostContext, binding: ScopedRunConnection, call?: CredentialCall) {
+    return context.connections instanceof WorkspaceSecureConnections
+      ? context.connections.resolve(binding, call ?? this.credentialCall(workspaceId, context)) : context.connections.resolve(binding);
+  }
   private connectionSource(workspaceId: string) { return this.context(workspaceId).storage.run(() => join(workspaceStateHome(), ".hara/workspace-connections-v2.json")); }
   legacyConnections(workspaceId: string) { return this.legacy?.list(this.connectionSource(workspaceId)) ?? []; }
-  importConnection(workspaceId: string, id: string, expected: number, approved: boolean): void {
+  async importConnection(workspaceId: string, id: string, expected: number, approved: boolean, request?: CredentialRequest): Promise<void> {
     if (!approved || !this.legacy) throw new Error("Explicit old connection import approval required");
-    const store = this.context(workspaceId).connections;
+    const context = this.context(workspaceId), store = context.connections;
     if (!(store instanceof WorkspaceSecureConnections)) throw new Error("Import requires formal Workspace mode");
-    const source = this.legacy.resolve(id, this.connectionSource(workspaceId)); store.importConnection(source.input, expected, source.importId); this.changed(workspaceId);
+    const call = this.credentialCall(workspaceId, context, request, true);
+    const source = await this.legacy.resolveAsync(id, this.credentialStorage.vault, call, this.connectionSource(workspaceId));
+    await store.importConnection(source.input, expected, source.importId, call);
+    this.changed(workspaceId);
   }
-  editConnection(workspaceId: string, id: string, input: unknown, expected: number): void {
-    const store = this.context(workspaceId).connections;
+  async editConnection(workspaceId: string, id: string, input: unknown, expected: number, request?: CredentialRequest): Promise<void> {
+    const context = this.context(workspaceId), store = context.connections;
     if (!(store instanceof WorkspaceSecureConnections)) throw new Error("Secure connection editing requires Workspace mode");
-    try { store.edit(id, input, expected); }
+    try { await store.edit(id, input, expected, this.credentialCall(workspaceId, context, request, true)); }
     finally { this.abortObsoleteConnectionRuns(workspaceId, id); this.changed(workspaceId); }
   }
   private abortObsoleteConnectionRuns(workspaceId: string, id: string) {
@@ -1113,17 +1152,20 @@ export class LocalWorkspaceHost {
     for (const job of this.jobs.values()) if (!job.closed && job.workspaceId === workspaceId && job.binding.connection.connectionId === id
       && (!row || row.status !== "active" || row.revision !== job.binding.connection.connectionRevision || row.credentialGeneration !== job.binding.connection.credentialGeneration)) job.controller.abort();
   }
-  cleanupCredentials(workspaceId: string, id: string, expected: number) {
-    const store = this.context(workspaceId).connections;
+  async cleanupCredentials(workspaceId: string, id: string | undefined, expected: number, request?: CredentialRequest) {
+    const context = this.context(workspaceId), store = context.connections;
     if (!(store instanceof WorkspaceSecureConnections)) throw new Error("Secure credential cleanup requires Workspace mode");
-    store.cleanupCredentials(id, expected); this.changed(workspaceId);
+    await store.cleanupCredentials(id, expected, this.credentialCall(workspaceId, context, request, true));
+    this.changed(workspaceId);
   }
-  retryConnectionMigration(workspaceId: string, expected: number, approved: boolean) {
-    const store = this.context(workspaceId).connections;
+  async retryConnectionMigration(workspaceId: string, expected: number, approved: boolean, request?: CredentialRequest) {
+    const context = this.context(workspaceId), store = context.connections;
     if (!approved || !(store instanceof WorkspaceSecureConnections)) throw new Error("Explicit secure migration retry approval required");
-    const value = store.retryMigration(expected); this.changed(workspaceId); return value;
+    const value = await store.retryMigration(expected, this.credentialCall(workspaceId, context, request, true));
+    this.changed(workspaceId);
+    return value;
   }
-  async listConnectionModels(workspaceId: string, agentId: string, connectionId: string) {
+  async listConnectionModels(workspaceId: string, agentId: string, connectionId: string, request?: { assertCurrent(): void }) {
     const context = this.context(workspaceId);
     const agent = context.resources.agents.list().agents.find(row => row.agentId === agentId);
     // A form may query Pi's Workspace connection while its saved engine is still a CLI.
@@ -1132,18 +1174,25 @@ export class LocalWorkspaceHost {
     const agentRevision = agent.configRevision, agentEpoch = agent.agentEpoch, runtimeId = agent.runtime.id;
     const view = context.connections.list(), row = view.connections.find(item => item.id === connectionId && item.status === "active");
     if (!row) throw new Error("Connection unavailable in this workspace");
-    const binding = context.connections.capture(connectionId), connection = context.connections.resolve(binding);
+    const call = this.credentialCall(workspaceId, context, request);
+    const assertView = () => {
+      assertCredentialCall(call);
+      if (this.context(workspaceId) !== context) throw new Error("Workspace model view changed; refresh");
+      const currentAgent = context.resources.agents.list().agents.find(item => item.agentId === agentId);
+      if (!currentAgent || currentAgent.state !== "active"
+        || currentAgent.configRevision !== agentRevision || currentAgent.agentEpoch !== agentEpoch || currentAgent.runtime.id !== runtimeId)
+        throw new Error("Workspace model view changed; refresh");
+      const latest = context.connections.list();
+      if (latest.revision !== view.revision || !latest.connections.some(item => item.id === connectionId && item.status === "active" && item.revision === row.revision))
+        throw new Error("Connection changed; refresh model list");
+    };
+    const binding = context.connections.capture(connectionId);
+    const connection = await this.resolveConnection(workspaceId, context, binding, call);
+    assertView();
     const key = connection.credentialFile ? resolveWorkspaceFileCredential(connection.credentialFile) : connection.apiKey;
     if (!key) throw new Error("Connection credential unavailable");
     const catalog = await connectionModels(connection, key);
-    if (this.context(workspaceId) !== context) throw new Error("Workspace model view changed; refresh");
-    const currentAgent = context.resources.agents.list().agents.find(item => item.agentId === agentId);
-    if (!currentAgent || currentAgent.state !== "active"
-      || currentAgent.configRevision !== agentRevision || currentAgent.agentEpoch !== agentEpoch || currentAgent.runtime.id !== runtimeId)
-      throw new Error("Workspace model view changed; refresh");
-    const latest = context.connections.list();
-    if (latest.revision !== view.revision || !latest.connections.some(item => item.id === connectionId && item.status === "active" && item.revision === row.revision))
-      throw new Error("Connection changed; refresh model list");
+    assertView();
     return { connectionId, revision: view.revision, source: catalog.source, selectedModelId: row.defaultModel,
       selectedEffort: connection.defaultReasoning ?? null, models: catalog.models };
   }
@@ -1167,14 +1216,17 @@ export class LocalWorkspaceHost {
     assertOpenGeneration();
     return result;
   }
-  selectConnection(workspaceId: string, id: string, expected: number, modelId?: string, effort?: string | null) {
-    const store = this.context(workspaceId).connections;
+  async selectConnection(workspaceId: string, id: string, expected: number, modelId?: string, effort?: string | null, request?: CredentialRequest) {
+    const context = this.context(workspaceId), store = context.connections;
+    const call = store instanceof WorkspaceSecureConnections ? this.credentialCall(workspaceId, context, request, true) : undefined;
     if (modelId !== undefined) {
-      const binding = store.capture(id), connection = store.resolve(binding);
+      const binding = store.capture(id), connection = await this.resolveConnection(workspaceId, context, binding, call);
       const supported = connectionModelEfforts(connection, modelId);
       if (!text(modelId, 200) || effort !== undefined && effort !== null && effort !== "auto" && !supported.includes(effort)) throw new Error("Invalid connection model or reasoning effort");
     } else if (effort !== undefined) throw new Error("Model is required when selecting reasoning effort");
-    store.select(id, expected, modelId, effort as ScopedConnection["defaultReasoning"]);
+    assertCredentialCall(call);
+    if (store instanceof WorkspaceSecureConnections) store.select(id, expected, modelId, effort as ScopedConnection["defaultReasoning"], call?.assertCurrent);
+    else store.select(id, expected, modelId, effort as ScopedConnection["defaultReasoning"]);
     this.queueUsageRefresh(workspaceId); this.changed(workspaceId);
   }
   workspaceFeatures(workspaceId: string) { const context = this.context(workspaceId); return { ...context.features.list(), scheduler: context.scheduler!.list(),
@@ -1221,7 +1273,7 @@ export class LocalWorkspaceHost {
       catch { /* Broken scoped state cannot route to another Workspace or old scheduler. */ }
     } } finally { this.schedulerTicking = false; }
   }
-  updateFeature(workspaceId: string, kind: unknown, id: unknown, enabled: unknown, expected: number, version?: unknown) {
+  async updateFeature(workspaceId: string, kind: unknown, id: unknown, enabled: unknown, expected: number, version?: unknown) {
     if (typeof id !== "string" || typeof enabled !== "boolean" || !["schedule", "skill"].includes(String(kind))) throw new Error("Invalid scoped feature change");
     const context = this.context(workspaceId), features = context.features;
     if (kind === "schedule") { const owner = features.schedules().find(row => row.id === id)?.definition.agentId;
@@ -1237,7 +1289,11 @@ export class LocalWorkspaceHost {
       if (owner && anchor && anchor.agentEpoch !== owner.agentEpoch) {
         if (anchor.configRevision !== owner.configRevision || anchor.runtimeId !== owner.runtime.id)
           throw new Error("Scheduled colleague configuration changed; review and save the task before enabling");
-        context.connections.resolve(anchor.connection as ScopedRunConnection); restoredAgentEpoch = owner.agentEpoch;
+        await this.resolveConnection(workspaceId, context, anchor.connection as ScopedRunConnection);
+        const current = context.resources.agents.get(owner.agentId);
+        if (!current || current.state !== "active" || current.agentEpoch !== owner.agentEpoch || current.configRevision !== owner.configRevision
+          || this.lifecycleChanges.has(JSON.stringify([workspaceId, owner.agentId]))) throw new Error("Scheduled colleague changed; refresh before enabling");
+        restoredAgentEpoch = owner.agentEpoch;
       }
     }
     if (version !== undefined && (typeof version !== "string" || !/^[a-f0-9]{64}$/.test(version))) throw new Error("Invalid skill version");
@@ -1250,21 +1306,30 @@ export class LocalWorkspaceHost {
   }
   configureSynthetic(workspaceId: string, expectedRevision: number): void {
     if (this.realKey || this.options.mode === "workspace") throw new Error("Synthetic connections require the explicit isolated Lab");
-    this.context(workspaceId).connections.add({ ...SYNTHETIC_CONNECTION }, expectedRevision); this.queueUsageRefresh(workspaceId); this.changed(workspaceId);
+    const store = this.context(workspaceId).connections;
+    if (!(store instanceof WorkspaceConnectionStoreV2)) throw new Error("Synthetic connection requires the Lab");
+    store.add({ ...SYNTHETIC_CONNECTION }, expectedRevision); this.queueUsageRefresh(workspaceId); this.changed(workspaceId);
   }
   configureApprovedConnection(workspaceId: string, expectedRevision: number): void {
     if (!this.realKey) throw new Error("Real-key acceptance was not explicitly enabled");
-    this.context(workspaceId).connections.add(this.realKey.connectionInput(), expectedRevision); this.queueUsageRefresh(workspaceId); this.changed(workspaceId);
+    const store = this.context(workspaceId).connections;
+    if (!(store instanceof WorkspaceConnectionStoreV2)) throw new Error("Acceptance connection requires its isolated lane");
+    store.add(this.realKey.connectionInput(), expectedRevision); this.queueUsageRefresh(workspaceId); this.changed(workspaceId);
   }
-  configureConnection(workspaceId: string, input: unknown, expectedRevision: number): void {
+  async configureConnection(workspaceId: string, input: unknown, expectedRevision: number, request?: CredentialRequest): Promise<void> {
     if (this.realKey) throw new Error("This acceptance lane only permits its approved file-reference connection");
     if (!plain(input)) throw new Error("invalid connection input");
-    this.context(workspaceId).connections.add(input as unknown as Parameters<WorkspaceConnectionStoreV2["add"]>[0], expectedRevision);
+    const context = this.context(workspaceId), store = context.connections, value = input as unknown as Parameters<WorkspaceConnectionStoreV2["add"]>[0];
+    if (store instanceof WorkspaceSecureConnections) await store.add(value, expectedRevision, this.credentialCall(workspaceId, context, request, true));
+    else store.add(value, expectedRevision);
     this.queueUsageRefresh(workspaceId); this.changed(workspaceId);
   }
-  revokeConnection(workspaceId: string, connectionId: string, expectedRevision: number): void {
-    try { this.context(workspaceId).connections.revoke(connectionId, expectedRevision); }
-    finally { this.abortObsoleteConnectionRuns(workspaceId, connectionId); this.queueUsageRefresh(workspaceId); this.changed(workspaceId); }
+  async revokeConnection(workspaceId: string, connectionId: string, expectedRevision: number, request?: CredentialRequest): Promise<void> {
+    const context = this.context(workspaceId), store = context.connections;
+    try {
+      if (store instanceof WorkspaceSecureConnections) await store.revoke(connectionId, expectedRevision, this.credentialCall(workspaceId, context, request, true));
+      else store.revoke(connectionId, expectedRevision);
+    } finally { this.abortObsoleteConnectionRuns(workspaceId, connectionId); this.queueUsageRefresh(workspaceId); this.changed(workspaceId); }
   }
   private queueUsageRefresh(workspaceId: string): void {
     if (this.options.usageCollector) void this.refreshRuntimeUsage(workspaceId, this.context(workspaceId));
@@ -1870,7 +1935,7 @@ export class LocalWorkspaceHost {
           return handoff({ completed: true, agentId: target.agentId, taskId: prior.task.id,
             runId: prior.task.workspaceRunBinding!.runId, completion: prior.task.checkpoint.completion, retainedReceipt: true });
         }
-        const receipt = host.start(job.clientId, job.workspaceId, target.agentId, input.task, randomUUID(), sameDelegation, job, toolContext.signal,
+        const receipt = await host.start(job.clientId, job.workspaceId, target.agentId, input.task, randomUUID(), sameDelegation, job, toolContext.signal,
           { source: "delegation", channel: "internal", clientId: job.clientId }, job.channelId ? { id: job.channelId, context: "Same local channel; delegated by a channel participant." } : undefined);
         const child = host.jobs.get(receipt.runId)!;
         await child.promise; assertCurrent();
@@ -1882,10 +1947,10 @@ export class LocalWorkspaceHost {
       } });
     return withWorkspaceToolReceipts(tools);
   }
-  start(clientId: string, workspaceId: string, agentId: string, message: string, requestId: string, resume = false, parent?: LocalJob, parentSignal?: AbortSignal,
+  async start(clientId: string, workspaceId: string, agentId: string, message: string, requestId: string, resume = false, parent?: LocalJob, parentSignal?: AbortSignal,
     origin: WorkspaceRequestOrigin = { source: "host", channel: "internal", clientId }, channel?: { id: string; context: string }, questionId?: string,
     scheduledConnection?: ScopedRunConnection, timing?: { receivedAt: number; client?: MessageTimingInput },
-    commandExecution?: { control: WorkspaceAgentCommandControl; intake: AgentCommandIntake }) {
+    commandExecution?: { control: WorkspaceAgentCommandControl; intake: AgentCommandIntake }, assertTransport?: () => void) {
     if (this.closing || this.updateLease || !messageBody(message) || !UUID.test(requestId)) throw new Error("invalid Workspace message or closing/updating Host");
     if (this.lifecycleChanges.has(JSON.stringify([workspaceId, agentId]))) throw new Error("Colleague lifecycle is changing; no new attempt admitted");
     if (this.options.boundaryCommandControl && !commandExecution) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "control.commandRequired");
@@ -1986,7 +2051,7 @@ export class LocalWorkspaceHost {
         const continued = continueTaskExecution(value.task, { kind: "steer", expectedTurnId: value.task.turnId, turnId: randomUUID() });
         if (!continued.ok) throw new Error(continued.reason); task = continued.task;
         if (previousTask?.brief) completionRecovery = { previousTask, currentTask: task, ...(questionId ? { answeredQuestionId: questionId } : {}) };
-        context.resources.agents.resolveTask(task.workspaceRunBinding!.agent); context.connections.resolve(task.workspaceRunBinding!.connection);
+        context.resources.agents.resolveTask(task.workspaceRunBinding!.agent);
       } else {
         if (value.task) value.pastTasks.push({ task: value.task, usage: value.runUsage, endedAt: new Date().toISOString() });
         const createdTask = createTaskExecution(message, randomUUID());
@@ -2042,7 +2107,24 @@ export class LocalWorkspaceHost {
         }
       };
       if (commandFacts?.routingChannelId) acceptCommand();
-      const connection = context.connections.resolve(binding.connection);
+      const checkAdmission = () => {
+        assertTransport?.();
+        if (this.closing || this.updateLease || parentSignal?.aborted || parent?.closed
+          || this.lifecycleChanges.has(JSON.stringify([workspaceId, agentId]))) throw new Error("Workspace run admission changed");
+        lease!.assertCurrent();
+        context.resources.agents.resolveTask(binding.agent);
+        if (channel && !this.localChannels(workspaceId).get(channel.id).memberIds.includes(agentId)) throw new Error("Workspace channel membership changed");
+        if (commandExecution && this.options.boundaryLifecycleControl) {
+          if (commandPreparation) commandExecution.control.assertPreparedStart(commandExecution.intake);
+          else commandExecution.control.assertConversationStart(commandExecution.intake);
+        } else if (!commandExecution && this.agentCommandProtectionActive(workspaceId)) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "control.commandRequired");
+      };
+      // The legacy Lab path stays synchronous through publication. Workspace credentials are
+      // resolved under the frozen lease and re-fenced before even constructing a provider.
+      const connection = context.connections instanceof WorkspaceSecureConnections
+        ? await context.connections.resolve(binding.connection, this.credentialCall(workspaceId, context, { assertCurrent: checkAdmission }))
+        : context.connections.resolve(binding.connection);
+      if (context.connections instanceof WorkspaceSecureConnections) checkAdmission();
       const providerConnection = connectionForObjective(connection, binding.connection, task.objective);
       const selectedProvider = this.realKey ? this.realKey.createProvider(connection, providerConnection)
         : (this.options.providerFactory ?? (this.options.mode === "workspace" ? createWorkspaceProvider : createWorkspaceSyntheticProvider))(connection, providerConnection,
@@ -2370,6 +2452,7 @@ export class LocalWorkspaceHost {
     if (this.usageTimer) clearInterval(this.usageTimer);
     this.extensionProposals.clear();
     this.closing = true;
+    await this.credentialStorage.vault.close();
     for (const context of this.contexts.values()) context.routing?.close();
     for (const pending of [...this.pending.values()]) pending.finish({ approved: false, state: "aborted" });
     for (const job of this.jobs.values()) if (!job.closed) job.controller.abort();

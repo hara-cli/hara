@@ -22,9 +22,9 @@ test("real personal mode sends matched personal-global and Workspace memory whil
   const w = host.createWorkspace("Synthetic", host.list().revision);
   const resources = new WorkspaceResources(host.home, host.catalog.resolve(w.workspaceId).scope); resources.initialize();
   await resources.memory.append("project", "memory", "ScopedAnchor: retain this Workspace's reporting period.", join(source, "project", w.workspaceId));
-  host.configureConnection(w.workspaceId, { label: "Synthetic", provider: "openai", baseURL: "https://example.invalid/v1", defaultModel: "synthetic", apiKey: "fixture-only-key" }, 0);
+  await host.configureConnection(w.workspaceId, { label: "Synthetic", provider: "openai", baseURL: "https://example.invalid/v1", defaultModel: "synthetic", apiKey: "fixture-only-key" }, 0);
   for (const objective of ["Hello", "What is known about PersonalAnchor and ScopedAnchor?"]) {
-    const run = host.start("client", w.workspaceId, w.selectedAgentId, objective, randomUUID()); await host.wait(run.runId);
+    const run = await host.start("client", w.workspaceId, w.selectedAgentId, objective, randomUUID()); await host.wait(run.runId);
   }
   assert.equal(observed.length, 2);
   assert.equal(observed[0].system.includes("PersonalAnchor"), false);
@@ -49,10 +49,10 @@ test("an explicit question resumes after the saved write instead of repeating it
     return tools(["task_checkpoint", { completion: { state: "verified", checks: [{ acceptance_index: 0, evidence: "The current read-only verification succeeded", tool_call_ids: [result.id] }], final_answer: "Verified" } }]);
   });
   const file = join(a.root, "project", a.workspace.workspaceId, "plan.txt"); fs.writeFileSync(file, "before\n");
-  const run = a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "Update plan.txt, confirm the target and verify it", randomUUID()); await a.host.wait(run.runId);
+  const run = await a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "Update plan.txt, confirm the target and verify it", randomUUID()); await a.host.wait(run.runId);
   const before = a.host.snapshot(a.workspace.workspaceId).conversation, saved = fs.statSync(file);
   assert(before.pendingQuestion); assert.equal(before.pendingQuestion.reason, "explicit"); assert.equal(fs.readFileSync(file, "utf8"), "after\n");
-  const resumed = a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "Beta", randomUUID(), true, undefined, undefined, undefined, undefined, before.pendingQuestion.id);
+  const resumed = await a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "Beta", randomUUID(), true, undefined, undefined, undefined, undefined, before.pendingQuestion.id);
   await a.host.wait(resumed.runId);
   const after = a.host.snapshot(a.workspace.workspaceId).conversation;
   assert.equal(after.taskId, before.taskId); assert.equal(after.runId, before.runId); assert.equal(after.taskState, "completed");
@@ -65,9 +65,9 @@ test("an explicit question resumes after the saved write instead of repeating it
 
 test("answering a startup reference question does not ask the original noun again or create a new run", async t => {
   const a = hostFixture(t, () => ({ text: "Resolved using the user's answer", toolUses: [], stop: "end" }));
-  const run = a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "Where is UnknownColleague", randomUUID()); await a.host.wait(run.runId);
+  const run = await a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "Where is UnknownColleague", randomUUID()); await a.host.wait(run.runId);
   const before = a.host.snapshot(a.workspace.workspaceId).conversation; assert.equal(a.turns.length, 0);
-  const reply = a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "I mean Beta in the current roster.", randomUUID(), true, undefined, undefined, undefined, undefined, before.pendingQuestion.id);
+  const reply = await a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "I mean Beta in the current roster.", randomUUID(), true, undefined, undefined, undefined, undefined, before.pendingQuestion.id);
   await a.host.wait(reply.runId);
   const after = a.host.snapshot(a.workspace.workspaceId).conversation;
   assert.equal(a.turns.length, 1); assert.equal(after.taskId, before.taskId); assert.equal(after.runId, before.runId); assert.equal(after.pendingQuestion, null);
@@ -75,9 +75,9 @@ test("answering a startup reference question does not ask the original noun agai
 
 test("continuing a kept-paused task reopens the original question before any model work", async t => {
   const a = hostFixture(t, () => tools(["ask_user", { question: "Which target?" }]));
-  const run = a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "Clarify target", randomUUID()); await a.host.wait(run.runId);
+  const run = await a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "Clarify target", randomUUID()); await a.host.wait(run.runId);
   const q = a.host.snapshot(a.workspace.workspaceId).conversation.pendingQuestion;
   a.host.pauseUserQuestion("client", a.workspace.workspaceId, a.workspace.selectedAgentId, q.id);
-  const next = a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "继续", randomUUID(), true); await a.host.wait(next.runId);
+  const next = await a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "继续", randomUUID(), true); await a.host.wait(next.runId);
   assert.equal(a.turns.length, 1); assert.equal(a.host.snapshot(a.workspace.workspaceId).conversation.pendingQuestion.id, q.id);
 });

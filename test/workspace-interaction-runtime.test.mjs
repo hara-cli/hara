@@ -113,7 +113,7 @@ test("an ambiguous rename target becomes a rename choice card; a true double mis
 test("Host: a sync ask_user enters the unified channel with its header and stops dispatch", async t => {
   const a = hostFixture(t, () => tools(["ask_user", { question: "Which format?", header: "Format", options: ["PDF", "Markdown"] }],
     ["workspace_write", { path: "never.txt", content: "must not run" }]));
-  const run = a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "Prepare the report", randomUUID()); await a.host.wait(run.runId);
+  const run = await a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "Prepare the report", randomUUID()); await a.host.wait(run.runId);
   const view = a.host.snapshot(a.workspace.workspaceId).conversation;
   assert.equal(a.turns.length, 1); assert.equal(view.state, "awaiting_user");
   assert.equal(view.pendingQuestion.reason, "explicit"); assert.equal(view.pendingQuestion.header, "Format");
@@ -137,7 +137,7 @@ test("Host: an async ask lets a sibling read run, and a mid-run answer reaches t
   });
   // An existing file: two absent reads would (correctly) trip the unrelated lookup_missing gate.
   fs.writeFileSync(join(a.root, "project", a.workspace.workspaceId, "notes.txt"), "synthetic notes\n");
-  const run = a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "Prepare the report", randomUUID()); await a.host.wait(run.runId);
+  const run = await a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "Prepare the report", randomUUID()); await a.host.wait(run.runId);
   assert.equal(seen.receipt.status, "pending"); assert.equal(seen.receipt.delivery, "async");
   assert.equal(seen.ask.isError ?? false, false); assert(seen.read, "the sibling non-interactive tool executed");
   assert.equal(seen.view.pendingQuestion, null); assert.equal(seen.view.state, "running");
@@ -154,7 +154,7 @@ test("Host: an unanswered async ask is dismissed when the run ends and cannot be
     questionId = JSON.parse(args.history.flatMap(message => message.role === "tool" ? message.results : []).find(row => row.name === "ask_user").content).questionId;
     return { text: "Proceeding without it.", toolUses: [], stop: "end" };
   });
-  const run = a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "Prepare the report", randomUUID()); await a.host.wait(run.runId);
+  const run = await a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "Prepare the report", randomUUID()); await a.host.wait(run.runId);
   const view = a.host.snapshot(a.workspace.workspaceId).conversation;
   assert.equal(view.pendingQuestion, null); assert.deepEqual(view.pendingInteractions, []); assert.notEqual(view.state, "awaiting_user");
   assert.throws(() => a.host.answerAsyncQuestion("client", a.workspace.workspaceId, a.workspace.selectedAgentId, questionId, "late"), /expired/);
