@@ -16,7 +16,7 @@ import { channelRoleUnrelated } from "../dist/workspace/channel-prefilter.js";
 // provider, LocalWorkspaceHost, credential vault, real CLI runtime or model run. Attempt-state
 // validation remains in the existing conversation/host suites; here an absent attempt settles a
 // dispatched reply as failed while still allowing the room to advance.
-function fixture(t, { auto = false, profiles = true } = {}) {
+function fixture(t, { auto = false, profiles = true, acknowledgeStart = accepted => accepted } = {}) {
   const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-channel-interjection-")));
   const catalog = new LocalWorkspaceCatalog(root), owners = [], engines = [];
   const agentIds = Array.from({ length: 3 }, () => "ag_" + randomUUID());
@@ -55,7 +55,7 @@ function fixture(t, { auto = false, profiles = true } = {}) {
         maximum.set(channelId, Math.max(maximum.get(channelId) ?? 0, live));
         if (f.failStartOn === calls.length) throw new Error("mock accepted the request before losing its start response");
         if (auto) queueMicrotask(() => f.finish(runId));
-        return { runId };
+        return acknowledgeStart({ runId });
       },
       wait(runId) { const record = records.get(runId); assert.ok(record, "wait has an accepted run"); return record.done; },
       cancel(agentId, runId) { assert.equal(records.get(runId)?.agentId, agentId); cancelled.push(runId); f.finish(runId, false); },
@@ -189,6 +189,25 @@ test("busy sends drain FIFO with original clients, a cap of five and digest idem
   assert.deepEqual(f.calls.map(call => call.clientId), ["first-client", "client-0", "client-1", "client-2", "client-3", "client-4"]);
   assert.equal(f.maximum.get(channelId), 1); assert.equal(f.rooms.snapshot(channelId).pendingCount, 0);
   assert.equal(f.rooms.receipt(channelId, requests[4]).queued, false);
+});
+
+test("cancel during asynchronous admission drains the accepted reply and holds the queue", async t => {
+  let acknowledge;
+  const admission = new Promise(resolve => { acknowledge = resolve; });
+  const f = fixture(t, { acknowledgeStart: async accepted => { await admission; return accepted; } });
+  const channelId = f.create();
+  try {
+    send(f, channelId, "first reply");
+    send(f, channelId, "queued reply");
+    f.rooms.cancel(channelId);
+    assert.equal(f.calls.length, 1);
+    assert.deepEqual(f.cancelled, []);
+  } finally { acknowledge(); }
+  await f.rooms.wait(channelId);
+  assert.deepEqual(f.cancelled, [f.calls[0].runId]);
+  assert.equal(f.liveCount(), 0);
+  assert.equal(f.calls.length, 1);
+  assert.deepEqual(f.rooms.snapshot(channelId).turns.map(turn => turn.state), ["cancelled", "queued"]);
 });
 
 test("cancel preserves and holds the queue; explicit resume reauthorizes; clear only cancels unstarted turns", async t => {
