@@ -305,6 +305,10 @@ export class WorkspaceSecureConnections {
       || row.revision !== binding.connectionRevision) throw new Error("Original connection generation unavailable");
     return row;
   }
+  /** Synchronous run fences inspect only the published generation and provider route. */
+  providerForBinding(binding: ScopedRunConnection): ScopedConnection["provider"] {
+    return this.boundRow(binding).provider;
+  }
   async resolve(binding: ScopedRunConnection, call: CredentialCall = { signal: credentialDeadline() }): Promise<Readonly<ScopedConnection>> {
     assertCredentialCall(call);
     const row = this.boundRow(binding);

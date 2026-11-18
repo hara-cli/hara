@@ -184,9 +184,11 @@ test("a resolve that overlapped rotation cannot use the original readback or sil
   const reader = new WorkspaceSecureConnections(f.storage, { ...backend.vault, async get(ref) {
     const key = await backend.vault.get(ref); got.resolve(); await release.promise; return key;
   } });
+  assert.equal(reader.providerForBinding(binding), "openai");
   const blocked = assert.rejects(reader.resolve(binding), /generation unavailable/);
   await got.promise; await store.edit(row.id, input(keyB), store.list().revision);
   release.resolve(); await blocked;
+  assert.throws(() => reader.providerForBinding(binding), /generation unavailable/);
   assert.equal((await store.resolve(store.capture())).apiKey, keyB);
 });
 
