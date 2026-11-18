@@ -1,0 +1,1437 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hara:agent-hub-native:v1",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/request"
+    },
+    {
+      "$ref": "#/$defs/attachProof"
+    },
+    {
+      "$ref": "#/$defs/attached"
+    },
+    {
+      "$ref": "#/$defs/prepared"
+    },
+    {
+      "$ref": "#/$defs/operationResult"
+    },
+    {
+      "$ref": "#/$defs/handoff"
+    }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^(?:[a-f0-9]{64})$(?![\\s\\S])"
+    },
+    "uuid": {
+      "type": "string",
+      "maxLength": 36,
+      "pattern": "^(?:[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$(?![\\s\\S])"
+    },
+    "agentId": {
+      "type": "string",
+      "maxLength": 40,
+      "pattern": "^(?:ext_(codex|claude|opencode|runtime)_[a-f0-9]{24})$(?![\\s\\S])"
+    },
+    "label": {
+      "type": "string",
+      "maxLength": 160,
+      "pattern": "^(?:[^\\x00-\\x1f\\x7f-\\x9f\\u202a-\\u202e\\u2066-\\u2069\\ud800-\\udfff]+)$(?![\\s\\S])"
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "scopeKey",
+        "generation"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "scopeKey": {
+          "$ref": "#/$defs/digest"
+        },
+        "generation": {
+          "$ref": "#/$defs/uuid"
+        }
+      }
+    },
+    "view": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workspaceId",
+        "viewEpoch"
+      ],
+      "properties": {
+        "workspaceId": {
+          "type": "string",
+          "maxLength": 39,
+          "pattern": "^(?:ws_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$(?![\\s\\S])"
+        },
+        "viewEpoch": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "attachHello": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "installId",
+        "hostInstanceId",
+        "port",
+        "clientNonce"
+      ],
+      "properties": {
+        "installId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "hostInstanceId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "clientNonce": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "attachFinish": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "installId",
+        "hostInstanceId",
+        "port",
+        "clientNonce",
+        "serverNonce",
+        "clientProof"
+      ],
+      "properties": {
+        "installId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "hostInstanceId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "clientNonce": {
+          "$ref": "#/$defs/digest"
+        },
+        "serverNonce": {
+          "$ref": "#/$defs/digest"
+        },
+        "clientProof": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "attachProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "serverNonce",
+        "serverProof"
+      ],
+      "properties": {
+        "serverNonce": {
+          "$ref": "#/$defs/digest"
+        },
+        "serverProof": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "attached": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionToken"
+      ],
+      "properties": {
+        "sessionToken": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "target": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "engine",
+            "resourceId",
+            "label"
+          ],
+          "properties": {
+            "kind": {
+              "const": "launch"
+            },
+            "engine": {
+              "anyOf": [
+                {
+                  "const": "codex"
+                },
+                {
+                  "const": "claude"
+                },
+                {
+                  "const": "opencode"
+                }
+              ]
+            },
+            "resourceId": {
+              "type": "string",
+              "maxLength": 160,
+              "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_.:-]{0,159})$(?![\\s\\S])"
+            },
+            "label": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/label"
+                },
+                {
+                  "const": null
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "engine",
+            "resourceId"
+          ],
+          "properties": {
+            "kind": {
+              "const": "launch"
+            },
+            "engine": {
+              "anyOf": [
+                {
+                  "const": "codex"
+                },
+                {
+                  "const": "claude"
+                },
+                {
+                  "const": "opencode"
+                }
+              ]
+            },
+            "resourceId": {
+              "type": "string",
+              "maxLength": 160,
+              "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_.:-]{0,159})$(?![\\s\\S])"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "agentId",
+            "instanceId"
+          ],
+          "properties": {
+            "kind": {
+              "const": "grant"
+            },
+            "agentId": {
+              "$ref": "#/$defs/agentId"
+            },
+            "instanceId": {
+              "$ref": "#/$defs/uuid"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "connectionId"
+          ],
+          "properties": {
+            "kind": {
+              "const": "rotate"
+            },
+            "connectionId": {
+              "$ref": "#/$defs/uuid"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "connectionId"
+          ],
+          "properties": {
+            "kind": {
+              "const": "revoke"
+            },
+            "connectionId": {
+              "$ref": "#/$defs/uuid"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "targetBytes"
+          ],
+          "properties": {
+            "kind": {
+              "const": "cleanup"
+            },
+            "targetBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 134217728
+            }
+          }
+        }
+      ]
+    },
+    "request": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "method": {
+              "const": "attach.hello"
+            },
+            "params": {
+              "$ref": "#/$defs/attachHello"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "method": {
+              "const": "attach.finish"
+            },
+            "params": {
+              "$ref": "#/$defs/attachFinish"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "method": {
+              "const": "detach"
+            },
+            "params": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [],
+              "properties": {}
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "method": {
+              "const": "describe"
+            },
+            "params": {
+              "$ref": "#/$defs/view"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "method": {
+              "const": "registry.list"
+            },
+            "params": {
+              "$ref": "#/$defs/view"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "method": {
+              "const": "messages.list"
+            },
+            "params": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "workspaceId",
+                "viewEpoch",
+                "connectionId",
+                "afterSeq",
+                "limit"
+              ],
+              "properties": {
+                "workspaceId": {
+                  "type": "string",
+                  "maxLength": 39,
+                  "pattern": "^(?:ws_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$(?![\\s\\S])"
+                },
+                "viewEpoch": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "connectionId": {
+                  "$ref": "#/$defs/uuid"
+                },
+                "afterSeq": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "limit": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "method": {
+              "const": "message.read"
+            },
+            "params": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "workspaceId",
+                "viewEpoch",
+                "connectionId",
+                "messageId"
+              ],
+              "properties": {
+                "workspaceId": {
+                  "type": "string",
+                  "maxLength": 39,
+                  "pattern": "^(?:ws_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$(?![\\s\\S])"
+                },
+                "viewEpoch": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "connectionId": {
+                  "$ref": "#/$defs/uuid"
+                },
+                "messageId": {
+                  "$ref": "#/$defs/uuid"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "method": {
+              "const": "attachment.read"
+            },
+            "params": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "workspaceId",
+                "viewEpoch",
+                "connectionId",
+                "messageId",
+                "attachmentId"
+              ],
+              "properties": {
+                "workspaceId": {
+                  "type": "string",
+                  "maxLength": 39,
+                  "pattern": "^(?:ws_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$(?![\\s\\S])"
+                },
+                "viewEpoch": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "connectionId": {
+                  "$ref": "#/$defs/uuid"
+                },
+                "messageId": {
+                  "$ref": "#/$defs/uuid"
+                },
+                "attachmentId": {
+                  "$ref": "#/$defs/uuid"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "method": {
+              "const": "read.mark"
+            },
+            "params": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "workspaceId",
+                "viewEpoch",
+                "connectionId",
+                "throughSeq"
+              ],
+              "properties": {
+                "workspaceId": {
+                  "type": "string",
+                  "maxLength": 39,
+                  "pattern": "^(?:ws_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$(?![\\s\\S])"
+                },
+                "viewEpoch": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "connectionId": {
+                  "$ref": "#/$defs/uuid"
+                },
+                "throughSeq": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "method": {
+              "const": "control.prepare"
+            },
+            "params": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "workspaceId",
+                "viewEpoch",
+                "target"
+              ],
+              "properties": {
+                "workspaceId": {
+                  "type": "string",
+                  "maxLength": 39,
+                  "pattern": "^(?:ws_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$(?![\\s\\S])"
+                },
+                "viewEpoch": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "target": {
+                  "$ref": "#/$defs/target"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "method": {
+              "const": "control.cancel"
+            },
+            "params": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "operationId",
+                "intentDigest"
+              ],
+              "properties": {
+                "operationId": {
+                  "$ref": "#/$defs/uuid"
+                },
+                "intentDigest": {
+                  "$ref": "#/$defs/digest"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "method": {
+              "const": "control.status"
+            },
+            "params": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "operationId",
+                "intentDigest"
+              ],
+              "properties": {
+                "operationId": {
+                  "$ref": "#/$defs/uuid"
+                },
+                "intentDigest": {
+                  "$ref": "#/$defs/digest"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "method": {
+              "const": "control.commit"
+            },
+            "params": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "operationId",
+                "intentDigest",
+                "challenge"
+              ],
+              "properties": {
+                "operationId": {
+                  "$ref": "#/$defs/uuid"
+                },
+                "intentDigest": {
+                  "$ref": "#/$defs/digest"
+                },
+                "challenge": {
+                  "$ref": "#/$defs/digest"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "facts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "registryRevision",
+        "grantEpoch",
+        "catalogDigest",
+        "policyDigest",
+        "selectionDigest",
+        "subject",
+        "launch",
+        "cleanup",
+        "summary"
+      ],
+      "properties": {
+        "registryRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "grantEpoch": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            {
+              "const": null
+            }
+          ]
+        },
+        "catalogDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "policyDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "selectionDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "subject": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "agentId",
+                "instanceId"
+              ],
+              "properties": {
+                "agentId": {
+                  "$ref": "#/$defs/agentId"
+                },
+                "instanceId": {
+                  "$ref": "#/$defs/uuid"
+                }
+              }
+            },
+            {
+              "const": null
+            }
+          ]
+        },
+        "launch": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "launchRef",
+                "handoffLocationDigest",
+                "materialRootIdentityDigest"
+              ],
+              "properties": {
+                "launchRef": {
+                  "$ref": "#/$defs/uuid"
+                },
+                "handoffLocationDigest": {
+                  "$ref": "#/$defs/digest"
+                },
+                "materialRootIdentityDigest": {
+                  "$ref": "#/$defs/digest"
+                }
+              }
+            },
+            {
+              "const": null
+            }
+          ]
+        },
+        "cleanup": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "planId",
+                "planDigest"
+              ],
+              "properties": {
+                "planId": {
+                  "$ref": "#/$defs/uuid"
+                },
+                "planDigest": {
+                  "$ref": "#/$defs/digest"
+                }
+              }
+            },
+            {
+              "const": null
+            }
+          ]
+        },
+        "summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "label",
+            "details",
+            "count",
+            "bytes"
+          ],
+          "properties": {
+            "label": {
+              "$ref": "#/$defs/label"
+            },
+            "details": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/label"
+              },
+              "maxItems": 32
+            },
+            "count": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4096
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 134217728
+            }
+          }
+        }
+      }
+    },
+    "intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "operationId",
+        "hostInstanceId",
+        "nativeSessionId",
+        "workspaceId",
+        "viewEpoch",
+        "binding",
+        "admissionEpoch",
+        "target",
+        "facts"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "operationId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "hostInstanceId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "nativeSessionId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "workspaceId": {
+          "type": "string",
+          "maxLength": 39,
+          "pattern": "^(?:ws_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$(?![\\s\\S])"
+        },
+        "viewEpoch": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "binding": {
+          "$ref": "#/$defs/binding"
+        },
+        "admissionEpoch": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "facts": {
+          "$ref": "#/$defs/facts"
+        }
+      }
+    },
+    "prepared": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "intent",
+        "intentDigest",
+        "challenge",
+        "expiresInMs"
+      ],
+      "properties": {
+        "intent": {
+          "$ref": "#/$defs/intent"
+        },
+        "intentDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "challenge": {
+          "$ref": "#/$defs/digest"
+        },
+        "expiresInMs": {
+          "const": 30000
+        }
+      }
+    },
+    "effect": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "agentId",
+            "instanceId"
+          ],
+          "properties": {
+            "kind": {
+              "const": "launch"
+            },
+            "agentId": {
+              "$ref": "#/$defs/agentId"
+            },
+            "instanceId": {
+              "$ref": "#/$defs/uuid"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "connectionId",
+            "grantEpoch"
+          ],
+          "properties": {
+            "kind": {
+              "const": "grant"
+            },
+            "connectionId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "grantEpoch": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "connectionId",
+            "grantEpoch"
+          ],
+          "properties": {
+            "kind": {
+              "const": "rotate"
+            },
+            "connectionId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "grantEpoch": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "connectionId",
+            "handoff"
+          ],
+          "properties": {
+            "kind": {
+              "const": "revoke"
+            },
+            "connectionId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "handoff": {
+              "anyOf": [
+                {
+                  "const": "removed"
+                },
+                {
+                  "const": "unknown"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "planId",
+            "complete",
+            "removedBytes"
+          ],
+          "properties": {
+            "kind": {
+              "const": "cleanup"
+            },
+            "planId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "complete": {
+              "anyOf": [
+                {
+                  "const": "complete"
+                },
+                {
+                  "const": "partial"
+                }
+              ]
+            },
+            "removedBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 134217728
+            }
+          }
+        }
+      ]
+    },
+    "operationResult": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operationId",
+            "intentDigest",
+            "status",
+            "effect",
+            "error"
+          ],
+          "properties": {
+            "operationId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "intentDigest": {
+              "$ref": "#/$defs/digest"
+            },
+            "status": {
+              "const": "applied"
+            },
+            "effect": {
+              "$ref": "#/$defs/effect"
+            },
+            "error": {
+              "const": null
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operationId",
+            "intentDigest",
+            "status",
+            "effect",
+            "error"
+          ],
+          "properties": {
+            "operationId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "intentDigest": {
+              "$ref": "#/$defs/digest"
+            },
+            "status": {
+              "const": "pending"
+            },
+            "effect": {
+              "const": null
+            },
+            "error": {
+              "const": null
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operationId",
+            "intentDigest",
+            "status",
+            "effect",
+            "error"
+          ],
+          "properties": {
+            "operationId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "intentDigest": {
+              "$ref": "#/$defs/digest"
+            },
+            "status": {
+              "const": "rejected"
+            },
+            "effect": {
+              "const": null
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "const": "invalid_request"
+                },
+                {
+                  "const": "unauthorized"
+                },
+                {
+                  "const": "scope_changed"
+                },
+                {
+                  "const": "stale_intent"
+                },
+                {
+                  "const": "unsupported"
+                },
+                {
+                  "const": "busy"
+                },
+                {
+                  "const": "quota_exceeded"
+                },
+                {
+                  "const": "conflict"
+                },
+                {
+                  "const": "store_unavailable"
+                },
+                {
+                  "const": "outcome_unknown"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operationId",
+            "intentDigest",
+            "status",
+            "effect",
+            "error"
+          ],
+          "properties": {
+            "operationId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "intentDigest": {
+              "$ref": "#/$defs/digest"
+            },
+            "status": {
+              "const": "unknown"
+            },
+            "effect": {
+              "const": null
+            },
+            "error": {
+              "const": "outcome_unknown"
+            }
+          }
+        }
+      ]
+    },
+    "fileIdentity": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "platform",
+            "device",
+            "inode"
+          ],
+          "properties": {
+            "platform": {
+              "const": "posix"
+            },
+            "device": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^(?:0|[1-9][0-9]{0,19})$(?![\\s\\S])"
+            },
+            "inode": {
+              "type": "string",
+              "maxLength": 20,
+              "pattern": "^(?:[1-9][0-9]{0,19})$(?![\\s\\S])"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "platform",
+            "volume",
+            "fileId"
+          ],
+          "properties": {
+            "platform": {
+              "const": "win32"
+            },
+            "volume": {
+              "type": "string",
+              "maxLength": 16,
+              "pattern": "^(?:[a-f0-9]{16})$(?![\\s\\S])"
+            },
+            "fileId": {
+              "type": "string",
+              "maxLength": 32,
+              "pattern": "^(?:[a-f0-9]{32})$(?![\\s\\S])"
+            }
+          }
+        }
+      ]
+    },
+    "handoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "endpoint",
+        "scopeKey",
+        "generation",
+        "hostInstanceId",
+        "agentId",
+        "instanceId",
+        "launchRef",
+        "policyDigest",
+        "connectionId",
+        "from",
+        "grantEpoch",
+        "materialRoot",
+        "recoveryRoot",
+        "token"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 2
+        },
+        "endpoint": {
+          "type": "string",
+          "maxLength": 24,
+          "pattern": "^(?:http://127\\.0\\.0\\.1:[1-9][0-9]{0,4})$(?![\\s\\S])"
+        },
+        "scopeKey": {
+          "$ref": "#/$defs/digest"
+        },
+        "generation": {
+          "$ref": "#/$defs/uuid"
+        },
+        "hostInstanceId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "agentId": {
+          "$ref": "#/$defs/agentId"
+        },
+        "instanceId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "launchRef": {
+          "$ref": "#/$defs/uuid"
+        },
+        "policyDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "connectionId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "from": {
+          "type": "string",
+          "maxLength": 46,
+          "pattern": "^(?:agent-ext_(codex|claude|opencode|runtime)_[a-f0-9]{24})$(?![\\s\\S])"
+        },
+        "grantEpoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "materialRoot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "resourceId",
+            "revision",
+            "path",
+            "fileIdentity"
+          ],
+          "properties": {
+            "resourceId": {
+              "type": "string",
+              "maxLength": 160,
+              "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9_.:-]{0,159})$(?![\\s\\S])"
+            },
+            "revision": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "path": {
+              "type": "string",
+              "maxLength": 4096,
+              "pattern": "^(?:[^\\x00-\\x1f\\x7f-\\x9f\\ud800-\\udfff]+)$(?![\\s\\S])"
+            },
+            "fileIdentity": {
+              "$ref": "#/$defs/fileIdentity"
+            }
+          }
+        },
+        "recoveryRoot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "fileIdentity"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "maxLength": 4096,
+              "pattern": "^(?:[^\\x00-\\x1f\\x7f-\\x9f\\ud800-\\udfff]+)$(?![\\s\\S])"
+            },
+            "fileIdentity": {
+              "$ref": "#/$defs/fileIdentity"
+            }
+          }
+        },
+        "token": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    }
+  }
+}
