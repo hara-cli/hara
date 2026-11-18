@@ -252,15 +252,13 @@ export class WorkspaceAgentStore {
         || value.titleSource !== "default" || value.titleKey !== "core.name.orchestrator"
         || !DEFAULT_ORCHESTRATOR_TITLES.includes(configurations.at(-1)!.identity.title ?? ""))) return invalid();
       ids.add(value.agentId); usernames.add(value.username);
-      // Older catalogs have no `initialAccent`. Derive a deterministic stand-in from the agent id and
-      // character using the same hash Desk uses, so "restore initial colour" is stable and
-      // reproducible rather than whatever value a client happened to observe first. It is derived,
-      // not invented: the same inputs always produce the same palette slot.
+      // Older catalogs can recover the creation colour from their first configuration.
+      // If it is missing or no longer selectable, use the hash slot without palette usage.
       const stored = typeof value.initialAccent === "string" ? value.initialAccent.trim().toLowerCase() : undefined;
-      const legacy = configurations.at(-1)?.identity;
-      const derived = stored ?? assignAgentAccent(value.agentId, legacy?.character,
-        legacy && isAgentAccent(legacy.accent) ? [legacy.accent] : []);
-      return { ...value, ...(stored ? { initialAccent: stored } : { initialAccent: derived }), configurations } as unknown as AgentRecord;
+      const creationAccent = configurations[0]!.identity.accent;
+      const initialAccent = stored ?? (isAgentAccent(creationAccent) ? creationAccent
+        : assignAgentAccent(value.agentId, configurations.at(-1)!.identity.character));
+      return { ...value, initialAccent, configurations } as unknown as AgentRecord;
     });
     if (rows.filter(row => row.kind === "main").length !== 1) return invalid();
     return { ...owner, revision, agents: rows } as Manifest;
