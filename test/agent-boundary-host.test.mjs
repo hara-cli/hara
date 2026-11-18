@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { once } from "node:events";
 import { randomBytes, randomUUID, createHash } from "node:crypto";
 import { WebSocket } from "ws";
+import { createJsonRpcRequester } from "./helpers/observable-wait.mjs";
 import { startLocalWorkspaceServe } from "../dist/serve/local-workspace.js";
 import { LocalWorkspaceCatalog } from "../dist/workspace/local-catalog.js";
 import { WorkspaceResources } from "../dist/workspace/resources.js";
@@ -21,18 +22,12 @@ const secret = () => randomBytes(32).toString("hex");
 const allRights = { manage: true, invoke: true, privateRead: true, nodeUse: true };
 const denied = promise => assert.rejects(promise, error => error.data?.boundary?.code === "AUTHORITY_UNVERIFIED");
 async function connect(handle) {
-  const socket = new WebSocket(`ws://127.0.0.1:${handle.port}`), pending = new Map(); let serial = 0;
+  const socket = new WebSocket(`ws://127.0.0.1:${handle.port}`);
   socket.on("error", () => {});
-  socket.on("message", raw => {
-    const value = JSON.parse(raw.toString()), waiter = pending.get(value.id); if (!waiter) return;
-    pending.delete(value.id); clearTimeout(waiter.timer);
-    if (value.error) waiter.reject(Object.assign(new Error(value.error.message), { data: value.error.data, rpcCode: value.error.code })); else waiter.resolve(value.result);
-  });
   await once(socket, "open");
-  return { request(method, params = {}) { return new Promise((resolve, reject) => {
-    const id = ++serial, timer = setTimeout(() => { pending.delete(id); reject(new Error("C1 RPC deadline")); }, 15_000);
-    pending.set(id, { resolve, reject, timer }); socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-  }); }, async close() { if (socket.readyState === WebSocket.CLOSED) return; const closed = once(socket, "close"); socket.close(); await closed; } };
+  const request = createJsonRpcRequester(socket, { idleMs: 15_000, maxMs: 60_000, errorText: "C1 RPC deadline",
+    mapError: err => Object.assign(new Error(err.message), { data: err.data, rpcCode: err.code }) });
+  return { request, async close() { if (socket.readyState === WebSocket.CLOSED) return; const closed = once(socket, "close"); socket.close(); await closed; } };
 }
 async function fixture(t, enabled = true) {
   const root = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "hara-c1-host-"))), ownerCredential = secret(); let activations = 0;

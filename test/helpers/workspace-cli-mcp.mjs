@@ -9,6 +9,7 @@ import { MemoryCredentialVault } from "../../dist/workspace/credential-vault.js"
 import { SYNTHETIC_CONNECTION } from "../../dist/workspace/synthetic-provider.js";
 
 import { fakeCodexMain } from "./fake-codex-app-server.mjs";
+import { createJsonRpcRequester } from "./observable-wait.mjs";
 
 export function writeFakeCodex(command, settings = { mode: "list" }) {
   fs.mkdirSync(dirname(command), { recursive: true });
@@ -36,17 +37,12 @@ export async function cliMcpFixture(t, mode = "list", settings = {}) {
   let handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port: 0 }, serveOptions);
   let socket = new WebSocket("ws://127.0.0.1:" + handle.port); await once(socket, "open");
   const previews = [];
-  socket.on("message", raw => { const value = JSON.parse(String(raw)); if (value.method === "workspace.assistant.preview") previews.push(value.params); });
-  let serial = 0;
-  const request = (method, params = {}) => new Promise((resolve, reject) => {
-    const id = ++serial, timeout = setTimeout(() => { socket.off("message", receive); reject(new Error("bounded fixture RPC wait: " + method)); }, 10000);
-    function receive(raw) {
-      const response = JSON.parse(String(raw)); if (response.id !== id) return;
-      clearTimeout(timeout); socket.off("message", receive);
-      if (response.error) reject(new Error(response.error.message)); else resolve(response.result);
-    }
-    socket.on("message", receive); socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-  });
+  const attachSocket = ws => {
+    ws.on("message", raw => { const value = JSON.parse(String(raw)); if (value.method === "workspace.assistant.preview") previews.push(value.params); });
+    return createJsonRpcRequester(ws, { idleMs: 10000, maxMs: 45000, errorText: method => "bounded fixture RPC wait: " + method });
+  };
+  let requester = attachSocket(socket);
+  const request = (method, params = {}) => requester(method, params);
   t.after(async () => { socket.terminate(); await handle.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const init = await request("initialize", { token: handle.token, ...(settings.previewOptIn ? { clientCapabilities: ["workspace.assistant-preview.v1"] } : {}) });
   const workspace = await request("workspace.create", { label: "MCP fixture", expectedRevision: init.workspace.revision });
@@ -67,6 +63,7 @@ export async function cliMcpFixture(t, mode = "list", settings = {}) {
       socket.terminate(); await handle.close();
       handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port: 0 }, serveOptions);
       socket = new WebSocket("ws://127.0.0.1:" + handle.port); await once(socket, "open");
+      requester = attachSocket(socket);
       await request("initialize", { token: handle.token });
       const current = await request("workspace.list"); await request("workspace.select", { workspaceId: scope.workspaceId, expectedRevision: current.revision });
     },
