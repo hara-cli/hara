@@ -128,15 +128,23 @@ export class WorkspaceLegacyStartup {
     if (before.ciphertext === null) {
       if (this.intents.pendingRefs().has("legacy-source")) throw new Error("Previous legacy backup requires explicit recovery");
       const captured = await capture(this.input.sourceHome, this.input.vault, call); if (!captured) return null;
-      const key = randomBytes(32).toString("hex"), keyRef = this.input.storage.scopeKey + ":legacy-source:gen_" + randomUUID();
+      // An older startup may have reserved a wrapping key before publishing its backup.
+      // Retain that reference. Reuse only a readable existing key after an exact readback.
+      const oldRef = before.revision ? before.keyRef : undefined;
+      const key = oldRef ? await this.input.vault.get(oldRef, call) : randomBytes(32).toString("hex");
+      if (!key || !/^[a-f0-9]{64}$/.test(key)) throw new Error("Legacy backup Vault unavailable");
+      const keyRef = oldRef ?? this.input.storage.scopeKey + ":legacy-source:gen_" + randomUUID();
       const iv = randomBytes(12), keyBytes = Buffer.from(key, "hex");
       const cipher = createCipheriv("aes-256-gcm", keyBytes, iv); keyBytes.fill(0);
       cipher.setAAD(Buffer.from(canonical(before.resourceBinding)));
       const ciphertext = Buffer.concat([cipher.update(JSON.stringify(captured)), cipher.final()]).toString("base64");
-      await this.intents.write(this.input.vault, [{ ref: keyRef, key }], call,
-        () => this.backup.update(before.revision, old => ({ ...old, keyRef, ciphertext, iv: iv.toString("hex"),
-          tag: cipher.getAuthTag().toString("hex"), backupHash: hash(ciphertext) })),
-        { protectedRef: ref => this.backup.read().keyRef === ref });
+      const tag = cipher.getAuthTag().toString("hex"), backupHash = hash(ciphertext);
+      const publish = () => {
+        assertCredentialCall(call);
+        return this.backup.update(before.revision, old => ({ ...old, keyRef, ciphertext, iv: iv.toString("hex"), tag, backupHash }));
+      };
+      if (oldRef) publish();
+      else await this.intents.write(this.input.vault, [{ ref: keyRef, key }], call, publish, { protectedRef: ref => this.backup.read().keyRef === ref });
       return captured;
     }
     const key = await this.input.vault.get(before.keyRef, call);

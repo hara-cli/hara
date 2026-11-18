@@ -152,7 +152,9 @@ test("blocked migration leaves Workspace roster/history/features available with 
     const before = fs.readFileSync(path(resource)), view = host.snapshot(id);
     assert.equal(view.connections.migrationPending, true); assert.equal(view.connections.readOnly, true); assert.equal(view.agents.length, 1); assert.deepEqual(view.runtimes.options.map(row=>row.runtimeId), ["opencode","codex","claude","agy","gemini","kimi","copilot","cursor","grok"]);
     assert.equal(view.conversation.history[0].content, "Retained fixture history"); assert.equal(view.conversation.usage.modelCalls, 0); assert.equal(host.workspaceFeatures(id).workspaceId, id);
-    host.snapshot(id); assert.equal(writes, 1); assert.equal(fs.readFileSync(path(resource)).equals(before), true);
+    host.snapshot(id); assert.equal(writes, 0);
+    await assert.rejects(() => host.retryConnectionMigration(id, view.connections.revision, true), error => error.code === "write_unconfirmed");
+    assert.equal(writes, 1); assert.equal(fs.readFileSync(path(resource)).equals(before), true);
   } finally { await host.close(); }
 });
 
@@ -183,11 +185,13 @@ test("formal RPC stays available during blocked migration; retries require auth,
     const catalog = new LocalWorkspaceCatalog(join(root, "home")), resource = storage(join(root, "home"), catalog.resolve(created.workspaceId).scope);
     new WorkspaceConnectionStoreV2(resource).add(input(), 0);
     const selection = { workspaceId: created.workspaceId, agentId: created.selectedAgentId }, pending = await request("workspace.snapshot", selection);
-    assert.equal(pending.connections.migrationPending, true); assert.equal(pending.agents.length, 1); assert.equal(writes, 1);
+    assert.equal(pending.connections.migrationPending, true); assert.equal(pending.agents.length, 1); assert.equal(writes, 0);
     const retry = { workspaceId: created.workspaceId, expectedGeneration: created.resourceGeneration, expectedRevision: pending.connections.revision, approved: true };
     await assert.rejects(request("workspace.connection.migration.retry", { ...retry, approved: false }), /approval/);
     await assert.rejects(request("workspace.connection.migration.retry", { ...retry, expectedGeneration: "stale" }), /generation/);
-    await assert.rejects(request("workspace.connection.migration.retry", { ...retry, apiKey: "not-used" }), /unsupported/); assert.equal(writes, 1);
+    await assert.rejects(request("workspace.connection.migration.retry", { ...retry, apiKey: "not-used" }), /unsupported/); assert.equal(writes, 0);
+    await assert.rejects(request("workspace.connection.migration.retry", retry), /write_unconfirmed/);
+    assert.equal(writes, 1);
     denied = false; const migrated = await request("workspace.connection.migration.retry", retry); assert.equal(migrated.migrationPending, false); assert.equal(migrated.connections.length, 1);
     const view = await request("workspace.snapshot", selection); assert.equal(view.connections.readOnly, false); assert.equal(view.conversation.usage.modelCalls, 0);
     assert.equal(JSON.stringify(view).includes(fakeKey), false); assert.equal(writes, 2);

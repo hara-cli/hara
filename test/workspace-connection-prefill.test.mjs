@@ -42,7 +42,7 @@ test("personal connection prefill is metadata-only, retains old active provider 
 test("denial remains pending through polling/restart, stale revisions cannot retry, no connection is half-enabled", async () => {
   const f = fixture(); let host = new LocalWorkspaceHost(f.root, f.options);
   const created = host.createWorkspace("Personal", host.list().revision); f.deny(true);
-  await assert.rejects(() => host.retryConnectionMigration(created.workspaceId, created.connections.revision, true), /entire batch/);
+  await assert.rejects(() => host.retryConnectionMigration(created.workspaceId, created.connections.revision, true), error => error.code === "write_unconfirmed" && error.retry === "readback_only");
   for (let i = 0; i < 3; i++) assert.equal(host.snapshot(created.workspaceId).connections.defaultConnectionId, null);
   assert.equal(f.writes(), 1); await host.close(); host = new LocalWorkspaceHost(f.root, f.options);
   try {
