@@ -24,8 +24,8 @@ export function connectionModelEfforts(connection: Pick<ScopedConnection, "provi
   return [];
 }
 
-export async function connectionModels(connection: ScopedConnection, apiKey: string) {
-  const result = await listModelsWithSource(connection.baseURL, apiKey, undefined, connection.defaultModel);
+export async function connectionModels(connection: ScopedConnection, apiKey: string, signal?: AbortSignal) {
+  const result = await listModelsWithSource(connection.baseURL, apiKey, undefined, connection.defaultModel, signal);
   const safe = result.models.filter(id => id.length <= 200 && /^[^\s\x00-\x1f\x7f]+$/.test(id) && !id.includes(apiKey));
   if (!safe.length) throw new Error("Model list unavailable; this endpoint has no documented model catalog");
   return { source: result.source, models: safe.map(id => ({ id, label: id, supportedReasoningEfforts: connectionModelEfforts(connection, id) })) };

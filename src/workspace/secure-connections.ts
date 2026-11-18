@@ -29,7 +29,8 @@ export class WorkspaceSecureConnections {
   readonly intents: WorkspaceCredentialWriteIntents;
   private readonly parse: (raw: unknown) => Document;
   constructor(private readonly storage: WorkspaceResourceStorage, private readonly vault: AsyncCredentialVault,
-    private readonly resolveLegacy?: (id: string, call: CredentialCall) => LegacyResolution | Promise<LegacyResolution>) {
+    private readonly resolveLegacy?: (id: string, call: CredentialCall) => LegacyResolution | Promise<LegacyResolution>,
+    private readonly onGenerationChanged?: (connectionId: string) => void) {
     this.intents = new WorkspaceCredentialWriteIntents(storage);
     // These callbacks run only inside this document's VersionedSettings storage boundary.
     // Reading its immutable provenance is structural work; the enclosing read/update performs
@@ -98,14 +99,14 @@ export class WorkspaceSecureConnections {
   }
   private readonly protectedRef = (ref: string): boolean => this.references().has(ref);
 
-  private confirmPublished(commit: () => Document, refs: readonly string[]): Document {
+  private confirmPublished(commit: () => Document, isPublished: (document: Document) => boolean): Document {
     try { return commit(); }
     catch (error) {
       // A recovery-copy failure after publication does not undo the primary. Use only a
       // verified current primary and an exact ref match. Unknown outcomes retain the intent.
       try {
         const current = this.document.read();
-        if (!current.readOnly && refs.length && refs.every(ref => current.value.connections.some(row => row.keyRef === ref))) return current.value;
+        if (!current.readOnly && isPublished(current.value)) return current.value;
       } catch { /* Original failure remains authoritative. */ }
       throw error;
     }
@@ -114,7 +115,8 @@ export class WorkspaceSecureConnections {
     beforeWrite?: (refs: readonly string[]) => void, batch = false): Promise<Document> {
     const existing = this.references();
     const refs = entries.map(entry => entry.ref);
-    return this.intents.write(this.vault, entries, call, () => this.confirmPublished(publish, refs),
+    return this.intents.write(this.vault, entries, call, () => this.confirmPublished(publish, document =>
+      refs.length > 0 && refs.every(ref => document.connections.some(row => row.keyRef === ref))),
       { protectedRef: this.protectedRef, existingRefs: existing, beforeWrite, batch });
   }
   list(): ReturnType<WorkspaceConnectionStoreV2["list"]> & { activeConnectionId: string | null; readOnly: boolean; recovered: boolean; migrationPending: boolean; cleanupPending: boolean } {
@@ -228,6 +230,7 @@ export class WorkspaceSecureConnections {
     const saved = await this.writeNew([{ ref, key }], call, () => this.document.update(expected, current => ({ ...current,
       connections: current.connections.map(item => item.id === id ? next : item),
     }), () => assertCredentialCall(call)));
+    this.onGenerationChanged?.(id);
     try { await this.cleanupRetired(id, saved.revision, call); }
     catch { /* The new generation is published. Existing cleanupPending flags the old refs. */ }
   }
@@ -237,14 +240,17 @@ export class WorkspaceSecureConnections {
     const state = this.document.read(), row = state.value.connections.find(item => item.id === id);
     this.requireWritable(state, expected);
     if (!row) throw new Error("Connection changed; refresh before removal");
-    const revoked = row.status === "revoked" ? state.value : this.document.update(expected, current => {
+    const generation = "gen_" + randomUUID();
+    const revoked = row.status === "revoked" ? state.value : this.confirmPublished(() => this.document.update(expected, current => {
       const item = current.connections.find(r => r.id === id)!;
-      item.status = "revoked"; item.revision++; item.credentialGeneration = "gen_" + randomUUID();
+      item.status = "revoked"; item.revision++; item.credentialGeneration = generation;
       item.retiredKeyRefs = [...new Set([...(item.retiredKeyRefs ?? []), ...(item.credentialMissing ? [] : [item.keyRef])])];
       if (current.activeConnectionId === id) current.activeConnectionId = current.connections.filter(r => r.status === "active")
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))[0]?.id ?? null;
       return current;
-    }, () => assertCredentialCall(call));
+    }, () => assertCredentialCall(call)), document => document.connections.some(item =>
+      item.id === id && item.status === "revoked" && item.credentialGeneration === generation));
+    this.onGenerationChanged?.(id);
     try { await this.cleanupRetired(id, revoked.revision, call); }
     catch { /* Revocation is already durable and still fails closed. */ }
   }
@@ -261,11 +267,13 @@ export class WorkspaceSecureConnections {
     if (!row || state.readOnly || state.value.revision !== expected) throw new Error("Credential cleanup changed; refresh before retrying");
     const refs = row.retiredKeyRefs ?? [];
     if (!refs.length) return;
-    const active = this.references(true);
-    if (refs.some(ref => active.has(ref))) throw new CredentialVaultError("cleanup_unconfirmed");
     for (const ref of refs) {
-      assertCredentialCall(call);
-      await this.vault.remove(ref, call);
+      const fence = () => {
+        assertCredentialCall(call);
+        if (this.references(true).has(ref)) throw new CredentialVaultError("cleanup_unconfirmed");
+      };
+      fence();
+      await this.vault.remove(ref, { ...call, assertCurrent: fence });
     }
     this.document.update(expected, current => ({ ...current, connections: current.connections.map(item => item.id === id ? { ...item, retiredKeyRefs: [] } : item) }),
       () => assertCredentialCall(call));
@@ -309,7 +317,6 @@ export class WorkspaceSecureConnections {
     const { keyRef: _ref, ...metadata } = current;
     return deepFreeze({ ...metadata, apiKey });
   }
-  assertBinding(binding: ScopedRunConnection): void { this.boundRow(binding); }
   markCredentialInvalid(binding: ScopedRunConnection) {
     const state = this.document.read(), row = state.value.connections.find(item => item.id === binding.connectionId);
     if (state.readOnly || !row || row.credentialInvalid || row.credentialGeneration !== binding.credentialGeneration || row.revision !== binding.connectionRevision) return;

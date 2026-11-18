@@ -493,7 +493,7 @@ export class LocalWorkspaceHost {
       const digest = createHash("sha256").update(canonical([facts.command.context.scope, facts.command.commandId])).digest("hex");
       const requestId = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-8${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
       try { await this.start(clientId, workspaceId, agentId, input.message!, requestId, false, undefined, undefined,
-        { source: "ui", channel: "rpc", clientId }, facts.routingChannelId ? { id: facts.routingChannelId, context: "" } : undefined, undefined, undefined, undefined, { control, intake }); }
+        { source: "ui", channel: "rpc", clientId }, facts.routingChannelId ? { id: facts.routingChannelId, context: "" } : undefined, undefined, undefined, undefined, { control, intake }, () => this.assertBoundaryTransport(transport)); }
       catch (error) {
         if (!control.runForIntake(intake)) throw error; // Accepted intent is queried, never resubmitted after a projection/start failure.
       }
@@ -577,7 +577,7 @@ export class LocalWorkspaceHost {
     const connections = this.options.mode === "workspace" ? new WorkspaceSecureConnections(storage, this.credentialStorage.vault, (id, call) => {
       if (!this.legacy) throw new Error("Legacy source unavailable");
       return this.legacy.resolveAsync(id, this.credentialStorage.vault, call, source, true);
-    }) : new WorkspaceConnectionStoreV2(storage);
+    }, id => this.abortObsoleteConnectionRuns(workspaceId, id)) : new WorkspaceConnectionStoreV2(storage);
     if (connections instanceof WorkspaceSecureConnections) {
       try { connections.intents.reconcile(); } catch { /* Preserve damaged intents and unrelated Workspace reads. */ }
     }
@@ -752,8 +752,8 @@ export class LocalWorkspaceHost {
         prefilterProfiles: () => context.resources.agents.channelPrefilterProfiles(),
         accepting: () => !this.closing && !this.updateLease,
         changed: () => this.changed(workspaceId),
-        start: (agentId, body, requestId, channelId, shared, clientId, questionId) => this.start(clientId, workspaceId, agentId, body, requestId, Boolean(questionId), undefined, undefined,
-          { source: "ui", channel: "rpc", clientId }, { id: channelId, context: shared }, questionId),
+        start: (agentId, body, requestId, channelId, shared, clientId, questionId, assertTurnCurrent) => this.start(clientId, workspaceId, agentId, body, requestId, Boolean(questionId), undefined, undefined,
+          { source: "ui", channel: "rpc", clientId }, { id: channelId, context: shared }, questionId, undefined, undefined, undefined, assertTurnCurrent),
         wait: runId => this.wait(runId), cancel: (agentId, runId) => this.cancel(workspaceId, agentId, runId),
       });
       this.channels.set(workspaceId, rooms);
@@ -1191,7 +1191,7 @@ export class LocalWorkspaceHost {
     assertView();
     const key = connection.credentialFile ? resolveWorkspaceFileCredential(connection.credentialFile) : connection.apiKey;
     if (!key) throw new Error("Connection credential unavailable");
-    const catalog = await connectionModels(connection, key);
+    const catalog = await connectionModels(connection, key, call.signal);
     assertView();
     return { connectionId, revision: view.revision, source: catalog.source, selectedModelId: row.defaultModel,
       selectedEffort: connection.defaultReasoning ?? null, models: catalog.models };

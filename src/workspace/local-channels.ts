@@ -38,7 +38,7 @@ interface ChannelHost {
   agents(): WorkspaceAgentView[];
   /** Host-private persona projection; never sent to the renderer or written into PASS reasons. */
   prefilterProfiles?(): ChannelPrefilterProfile[];
-  start(agentId: string, body: string, requestId: string, channelId: string, context: string, clientId: string, questionId?: string): { runId: string } | Promise<{ runId: string }>;
+  start(agentId: string, body: string, requestId: string, channelId: string, context: string, clientId: string, questionId?: string, assertTurnCurrent?: () => void): { runId: string } | Promise<{ runId: string }>;
   wait(runId: string): Promise<void>;
   cancel(agentId: string, runId: string): void;
   changed(): void;
@@ -384,7 +384,10 @@ export class WorkspaceLocalChannels {
         this.changeReply(channelId, turnId, reply.requestId, row => { row.startIndex = startIndex; row.state = "running"; });
         attempted = true;
         const accepted = await this.host.start(reply.agentId, turn.body, reply.requestId, channelId,
-          this.context(channelId, reply.wokenBy ? { by: reply.wokenBy, note: reply.wakeNote } : undefined), clientId, reply.questionId);
+          this.context(channelId, reply.wokenBy ? { by: reply.wokenBy, note: reply.wakeNote } : undefined), clientId, reply.questionId, () => {
+            if (active.cancelled || !this.accepting()) throw new Error("Workspace channel is no longer admitting this turn");
+            active.lease.assertCurrent(); this.assertUserTurnDispatch(turn);
+          });
         active.runId = accepted.runId; active.agentId = reply.agentId; active.lease.setDraining(true);
         this.changeReply(channelId, turnId, reply.requestId, row => { row.runId = accepted.runId; });
         admitted = true;
