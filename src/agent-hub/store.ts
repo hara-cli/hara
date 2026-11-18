@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { performance } from "node:perf_hooks";
 import { AgentHubPrivateStore } from "./private-store.js";
 import { AgentHubError, exact, hubAssert, plain } from "./errors.js";
 import { HUB_LIMITS, parseHubAttachments, sha256 } from "./attachments.js";
@@ -44,8 +45,16 @@ export class AgentHubStore<S, R> {
     this.quota = options.quotaBytes ?? HUB_LIMITS.quotaBytes;
     hubAssert(Number.isSafeInteger(this.quota) && this.quota >= 4096 && this.quota <= HUB_LIMITS.quotaBytes);
   }
-  /** Cold/expired census belongs to listener startup, before any request deadline starts. */
+  /** Prepare the persistent accounting cache before listening. */
   async prepare(): Promise<void> { this.assertCurrent(); await this.options.globalQuota.prepare(); this.assertCurrent(); }
+  /** Authenticate before expensive reconciliation and again after every asynchronous boundary. */
+  async prepareReceive(token: unknown, options: { timeoutMs: number; signal?: AbortSignal }): Promise<void> {
+    const deadline = performance.now() + options.timeoutMs;
+    this.authorize(token);
+    try { await this.options.globalQuota.prepareWrite({ ...options, timeoutMs: deadline - performance.now() }); }
+    catch { throw new AgentHubError("store_unavailable"); }
+    this.authorize(token);
+  }
   private assertCurrent(): void {
     try { hubAssert(this.options.assertCurrent() === undefined, "unauthorized"); }
     catch { throw new AgentHubError("unauthorized"); }
@@ -53,9 +62,11 @@ export class AgentHubStore<S, R> {
   private transaction<T>(fn: () => T): T {
     return this.disk.transaction(() => { this.assertCurrent(); return fn(); });
   }
-  private catalog(): { value: Catalog<R>; text: string | null } {
+  private catalog(mustExist = false): { value: Catalog<R>; text: string | null } {
     const text = this.disk.read("catalog.json");
     if (text === null) {
+      // A credential snapshot without a catalog cannot authenticate; do not enter locked usage/repair.
+      hubAssert(!mustExist, "unauthorized");
       hubAssert(this.disk.usage().messages === 0, "store_unavailable");
       return { text, value: { schema: 2, nextSeq: 1, grants: [], entries: [], read: {} } };
     }
@@ -138,7 +149,9 @@ export class AgentHubStore<S, R> {
     });
   }
   /** Admission before streaming a body; receive() rechecks after streaming and under the write lock. */
-  authorize(token: unknown): void { this.transaction(() => { this.authorized(this.catalog().value, token); }); }
+  authorize(token: unknown): void {
+    this.disk.transaction(() => { this.assertCurrent(); this.authorized(this.catalog(true).value, token); }, true);
+  }
   receive(token: unknown, input: unknown): R {
     return this.transaction(() => {
       const { value, text: previous } = this.catalog(), grant = this.authorized(value, token);

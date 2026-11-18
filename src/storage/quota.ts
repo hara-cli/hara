@@ -1,5 +1,6 @@
 import { lstatSync, readdirSync, realpathSync, promises as fs } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { assertPrivateStateDirectory, bindPrivateHaraStateFile, readPrivateStateFileSnapshotSync,
   withPrivateStateLockSync, writePrivateStateFileSync, type PrivateStateDirectoryIdentity } from "../security/private-state.js";
@@ -152,6 +153,36 @@ export class HaraStorageQuota {
     const state = this.ensure();
     const recovery = state.reservations.some(row => !active(row));
     if ((recovery || this.now() - state.sampledAt >= REFRESH_MS) && !await this.refreshUsage()) throw new StorageQuotaError("unavailable");
+  }
+  /** Validate an already prepared policy without census, scheduling or accounting mutation. */
+  assertPrepared(): void { if (!this.read().state) return unavailable(); }
+  /** Request admission, before a synchronous mutation. Only stale/uncertain accounting waits;
+   * a shared census stays outside all transaction locks. A timed-out/aborted waiter never writes
+   * payloads or cancels another waiter's census. Call prepare() before accepting requests. */
+  async prepareWrite(options: { timeoutMs: number; signal?: AbortSignal }): Promise<void> {
+    if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) return unavailable();
+    const deadline = performance.now() + Math.min(options.timeoutMs, 7000);
+    for (let attempt = 0; ; attempt++) {
+      if (options.signal?.aborted || performance.now() >= deadline) return unavailable();
+      const state = this.read().state; if (!state) return unavailable(); // No cold synchronous census on a request.
+      if (state.sampledAt !== 0 && this.now() - state.sampledAt < MAX_AGE_MS
+        && !state.reservations.some(row => !active(row))) return;
+      if (attempt === 2) return unavailable();
+      const refresh = this.refreshUsage(); // Single-flight, including a census already scheduled by a reader.
+      await new Promise<void>((resolve, reject) => {
+        const finish = (error?: unknown) => {
+          clearTimeout(timer); options.signal?.removeEventListener("abort", aborted);
+          if (error !== undefined) reject(error); else resolve();
+        };
+        const aborted = () => finish(new StorageQuotaError("unavailable"));
+        const timer = setTimeout(aborted, Math.max(0, deadline - performance.now()));
+        options.signal?.addEventListener("abort", aborted, { once: true });
+        void refresh.then(() => finish(), finish);
+        if (options.signal?.aborted) aborted();
+      });
+      // Re-read even after a false CAS result: a peer may have refreshed it. At most two censuses,
+      // in the original deadline, and never a retry of the caller's mutation/receive operation.
+    }
   }
   /** Explicit/background reconciliation, metadata only, with optimistic revision fencing. A busy
    * census is discarded; no scan ever holds the global lock or overwrites a newer reservation. */
