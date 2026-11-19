@@ -102,27 +102,74 @@ test("writes outside the designed palette or the known avatar styles are rejecte
   assert.equal(after.configRevision, agent.configRevision, "a refused write must not bump the configuration");
 });
 
-test("older catalogs without initialAccent or avatarStyle stay readable and get a stable derived colour", () => {
+test("an older catalog restores the first configured colour after the colleague was recoloured", () => {
   const home = dir(), r = open(home);
   r.agents.initializeMain();
   const agent = create(r, "legacy", { accent: "#d99a32" });
+  r.agents.updatePersona(agent.agentId,
+    withProfile("legacy", { accent: "#c68a72" }), agent.configRevision, agent.agentEpoch);
+
+  const file = catalogFile(home);
+  const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+  delete raw.agents.find(entry => entry.agentId === agent.agentId).initialAccent;
+  const legacyCatalog = JSON.stringify(raw);
+  fs.writeFileSync(file, legacyCatalog, { mode: 0o600 });
+
+  const listed = open(home).agents.list().agents.find(entry => entry.agentId === agent.agentId);
+  assert.equal(listed.identity.avatarStyle, undefined);
+  assert.equal(listed.identity.accent, "#c68a72");
+  assert.equal(listed.initialAccent, "#d99a32");
+  assert.equal(fs.readFileSync(file, "utf8"), legacyCatalog, "reading must not persist the derived colour");
+});
+
+for (const [label, creationAccent] of [
+  ["retired violet", "#a67bc2"], ["another non-palette colour", "#123456"], ["no creation colour", undefined],
+]) {
+  test(`an older catalog with ${label} uses the hash slot even if it is the current colour`, () => {
+    const home = dir(), r = open(home);
+    r.agents.initializeMain();
+    const { agents: [agent] } = r.agents.importLegacy([{
+      username: "legacy",
+      state: "active",
+      importId: "1".repeat(64),
+      sourceHash: "2".repeat(64),
+      toolPolicy: { allow: null, deny: [], readOnly: false, owns: [] },
+      profile: { displayName: "Legacy", character: "coder", ...(creationAccent ? { accent: creationAccent } : {}) },
+    }], r.agents.list().revision);
+    const hashSlot = assignAgentAccent(agent.agentId, "coder");
+    r.agents.updatePersona(agent.agentId,
+      withProfile("Legacy", { accent: hashSlot, character: "coder" }), agent.configRevision, agent.agentEpoch);
+
+    const file = catalogFile(home);
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    const row = raw.agents.find(entry => entry.agentId === agent.agentId);
+    assert.equal(row.configurations[0].identity.accent, creationAccent);
+    delete row.initialAccent;
+    fs.writeFileSync(file, JSON.stringify(raw), { mode: 0o600 });
+
+    const reopened = open(home);
+    const listed = reopened.agents.list().agents.find(entry => entry.agentId === agent.agentId);
+    assert.equal(listed.identity.accent, hashSlot);
+    assert.equal(listed.initialAccent, hashSlot);
+    assert.equal(open(home).agents.list().agents.find(entry => entry.agentId === agent.agentId).initialAccent, hashSlot);
+  });
+}
+
+test("a catalog with no configuration history is rejected without rewriting it", () => {
+  const home = dir(), r = open(home);
+  r.agents.initializeMain();
+  const agent = create(r, "legacy");
   const file = catalogFile(home);
   const raw = JSON.parse(fs.readFileSync(file, "utf8"));
   const row = raw.agents.find(entry => entry.agentId === agent.agentId);
-  // Simulate a pre-1.3.0 catalog: no initialAccent anywhere, no avatarStyle in the profile.
   delete row.initialAccent;
-  for (const config of row.configurations) delete config.identity.avatarStyle;
-  fs.writeFileSync(file, JSON.stringify(raw), { mode: 0o600 });
-
-  const reopened = open(home);
-  const listed = reopened.agents.list().agents.find(entry => entry.agentId === agent.agentId);
-  assert.ok(listed, "a catalog without the new fields must still load");
-  assert.equal(listed.identity.avatarStyle, undefined, "no avatar style is invented for old data");
-  assert.ok(isAgentAccent(listed.initialAccent), "a derived initial colour is provided");
-  // The derivation must be stable across reads, not a fresh random colour each time.
-  assert.equal(open(home).agents.list().agents.find(entry => entry.agentId === agent.agentId).initialAccent, listed.initialAccent);
-  // And it must be the creation colour that was actually stored, since that is what a user saw.
-  assert.equal(listed.initialAccent, assignAgentAccent(agent.agentId, listed.identity.character, ["#d99a32"]));
+  for (const configurations of [[], undefined]) {
+    row.configurations = configurations;
+    const corruptCatalog = JSON.stringify(raw);
+    fs.writeFileSync(file, corruptCatalog, { mode: 0o600 });
+    assert.throws(() => open(home).agents.list(), /invalid or unsupported Workspace Agent state/);
+    assert.equal(fs.readFileSync(file, "utf8"), corruptCatalog);
+  }
 });
 
 test("an imported role hex outside the palette is preserved, but a client cannot write one", () => {
@@ -243,5 +290,59 @@ test("real Host preserves a historical out-of-palette accent on non-colour edits
     assert.equal(recoloured.identity.accent, "#c68a72");
   } finally {
     await host.close();
+  }
+});
+
+test("the Host persists a legacy restore colour and restores it through an ordinary persona update", async () => {
+  const root = dir();
+  const options = { mode: "workspace", credentialVault: new MemoryCredentialVault() };
+  const initialHost = new LocalWorkspaceHost(root, options);
+  let workspaceId;
+  try {
+    workspaceId = initialHost.createWorkspace("Restore Space", initialHost.list().revision).workspaceId;
+  } finally {
+    await initialHost.close();
+  }
+
+  const { home } = openLocalWorkspaceDevRoot(root, "workspace");
+  const wsScope = new LocalWorkspaceCatalog(home).resolve(workspaceId).scope;
+  const resources = new WorkspaceResources(home, wsScope);
+  resources.initialize();
+  const agent = create(resources, "legacy", { accent: "#c68a72" });
+  resources.agents.updatePersona(agent.agentId, withProfile("legacy", { accent: "#4f9c8f", avatarStyle: "hex" }),
+    agent.configRevision, agent.agentEpoch);
+  const file = catalogFile(home, wsScope);
+  const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+  delete raw.agents.find(entry => entry.agentId === agent.agentId).initialAccent;
+  fs.writeFileSync(file, JSON.stringify(raw), { mode: 0o600 });
+
+  const host = new LocalWorkspaceHost(root, options);
+  const snapshot = h => h.snapshot(workspaceId, agent.agentId, "client-restore").agents.find(entry => entry.agentId === agent.agentId);
+  try {
+    const before = snapshot(host);
+    assert.equal(before.identity.accent, "#4f9c8f");
+    assert.equal(before.initialAccent, "#c68a72");
+    const edited = host.updateAgentPersona(workspaceId, agent.agentId,
+      withProfile("Legacy Name", { accent: "#438db3" }), before.configRevision, before.agentEpoch);
+    assert.equal(edited.identity.accent, "#438db3");
+    assert.equal(edited.initialAccent, "#c68a72");
+    const persisted = JSON.parse(fs.readFileSync(file, "utf8")).agents.find(entry => entry.agentId === agent.agentId);
+    assert.equal(persisted.initialAccent, "#c68a72");
+    assert.deepEqual(persisted.configurations.slice(0, 2), raw.agents.find(entry => entry.agentId === agent.agentId).configurations);
+  } finally {
+    await host.close();
+  }
+
+  const reopened = new LocalWorkspaceHost(root, options);
+  try {
+    const before = snapshot(reopened);
+    const restored = reopened.updateAgentPersona(workspaceId, agent.agentId,
+      withProfile(before.identity.displayName, { accent: before.initialAccent }), before.configRevision, before.agentEpoch);
+    assert.equal(restored.identity.accent, "#c68a72");
+    assert.equal(restored.initialAccent, "#c68a72");
+    assert.equal(restored.identity.displayName, "Legacy Name");
+    assert.equal(restored.identity.avatarStyle, "hex");
+  } finally {
+    await reopened.close();
   }
 });
