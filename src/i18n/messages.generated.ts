@@ -445,6 +445,12 @@ export const CORE_MESSAGES: Record<string, Record<string, readonly unknown[]>> =
         "Other (type an answer)"
       ]
     ],
+    "core.credentialStorage.windowsDesktopRequired": [
+      [
+        "text",
+        "On Windows, use Hara Desktop to securely save Workspace model keys."
+      ]
+    ],
     "core.error.request_failed": [
       [
         "text",
@@ -1503,6 +1509,12 @@ export const CORE_MESSAGES: Record<string, Record<string, readonly unknown[]>> =
         "其它（输入）"
       ]
     ],
+    "core.credentialStorage.windowsDesktopRequired": [
+      [
+        "text",
+        "在 Windows 上，请使用 Hara Desktop 安全保存工作区模型密钥。"
+      ]
+    ],
     "core.error.request_failed": [
       [
         "text",
@@ -2146,6 +2158,12 @@ export const CORE_MESSAGES: Record<string, Record<string, readonly unknown[]>> =
         "text",
         "其它（輸入）"
       ]
+    ],
+    "core.credentialStorage.windowsDesktopRequired": [
+      [
+        "text",
+        "在 Windows 上，請使用 Hara Desktop 安全儲存工作區模型金鑰。"
+      ]
     ]
   }
 };
@@ -2226,6 +2244,7 @@ export const CORE_MESSAGE_PARAMS = {
   "core.location.current": [],
   "core.location.recent": [],
   "core.location.other": [],
+  "core.credentialStorage.windowsDesktopRequired": [],
   "core.error.request_failed": [],
   "core.error.unauthorized": [],
   "core.error.locale_invalid": [],

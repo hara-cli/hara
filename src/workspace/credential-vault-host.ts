@@ -1,7 +1,7 @@
 import { MacKeychainCredentialVault, CredentialVaultError, assertCredentialCall, credentialDeadline,
   type CredentialVault, type AsyncCredentialVault, type CredentialCall, type CredentialEntry, type CredentialStorageDescriptor,
   type CredentialVaultErrorCode } from "./credential-vault.js";
-import { AsyncWindowsDpapiCredentialVault } from "./windows-credential-vault.js";
+import { AsyncWindowsDpapiCredentialVault, isWindowsDesktopSidecarBuild } from "./windows-credential-vault.js";
 
 /** Bridge the legacy synchronous SPI. Native Windows is composed through its async adapter only. */
 export function adaptCredentialVault(vault: CredentialVault): AsyncCredentialVault {
@@ -77,6 +77,8 @@ interface VaultSelection {
   vault?: AsyncCredentialVault;
   descriptor?: CredentialStorageDescriptor;
   windows?: (home: string) => AsyncCredentialVault;
+  /** In-process composition seam. RPC callers cannot supply launch evidence. */
+  windowsLaunch?: { source?: string; desktopSidecar: boolean };
 }
 
 export function createHostCredentialStorage(options: VaultSelection) {
@@ -87,7 +89,16 @@ export function createHostCredentialStorage(options: VaultSelection) {
   };
   let backend = options.vault;
   if (!backend) {
-    if (hostPlatform === "darwin" || (hostPlatform === "win32" && arch === "x64")) {
+    const windowsX64 = hostPlatform === "win32" && arch === "x64";
+    const launch = options.windowsLaunch ?? {
+      source: process.env.HARA_WORKSPACE_LAUNCH_SOURCE,
+      desktopSidecar: isWindowsDesktopSidecarBuild(),
+    };
+    // The same sidecar binary may be copied to a managed CLI location. Its build
+    // provenance alone does not opt a direct CLI invocation into the Desktop vault.
+    if (windowsX64 && (!launch.desktopSidecar || launch.source !== "desktop-windows-v1")) {
+      Object.assign(descriptor, { backend: "none", supported: false, state: "unsupported", reason: "windows_desktop_required" });
+    } else if (hostPlatform === "darwin" || windowsX64) {
       Object.assign(descriptor, { backend: hostPlatform === "darwin" ? "macos-keychain" : "windows-dpapi",
         supported: true, state: "not_checked", reason: null });
       try {

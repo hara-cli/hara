@@ -32,7 +32,8 @@ const result = await Bun.build({
   // @ts-expect-error Bun's native compile API is ahead of the bundled TypeScript declarations.
   compile: { outfile, ...(target ? { target } : {}), autoloadBunfig: false, autoloadDotenv: false,
     autoloadPackageJson: false, autoloadTsconfig: false },
-  define: { "__HARA_WINDOWS_VAULT_SHA256__": windowsVaultSha ? JSON.stringify(windowsVaultSha) : "undefined",
+  define: { "__HARA_WINDOWS_DESKTOP_SIDECAR__": JSON.stringify(windowsTarget && mode === "desktop-sidecar"),
+    "__HARA_WINDOWS_VAULT_SHA256__": windowsVaultSha ? JSON.stringify(windowsVaultSha) : "undefined",
     "process.env.HARA_BUILD_VERSION": JSON.stringify(version),
     "__HARA_BUNDLED_PI_SDK_VERSION__": JSON.stringify(pi.version),
     "__HARA_BUNDLED_THIRD_PARTY_NOTICES__": JSON.stringify(thirdPartyNotices) },

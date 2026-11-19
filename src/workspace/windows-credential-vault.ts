@@ -10,6 +10,12 @@ import { CredentialVaultError, assertCredentialCall, validCredentialKey, type Cr
 export { CredentialVaultError, type CredentialVaultErrorCode } from "./credential-vault.js";
 
 declare const __HARA_WINDOWS_VAULT_SHA256__: string | undefined;
+declare const __HARA_WINDOWS_DESKTOP_SIDECAR__: boolean | undefined;
+
+/** Compilation mode is independent of whether the adjacent worker is present and valid. */
+export function isWindowsDesktopSidecarBuild(): boolean {
+  return typeof __HARA_WINDOWS_DESKTOP_SIDECAR__ !== "undefined" && __HARA_WINDOWS_DESKTOP_SIDECAR__;
+}
 const MAX_FRAME = 8_500_000;
 const MAX_REPLY = 65_600;
 const DEADLINE_MS = 15_000;

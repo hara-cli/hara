@@ -64,5 +64,6 @@
   "core.location.root": "Resource root",
   "core.location.current": "Current Workspace directory",
   "core.location.recent": "Recent directory",
-  "core.location.other": "Other (type an answer)"
+  "core.location.other": "Other (type an answer)",
+  "core.credentialStorage.windowsDesktopRequired": "On Windows, use Hara Desktop to securely save Workspace model keys."
 }

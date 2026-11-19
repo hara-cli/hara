@@ -45,7 +45,8 @@ function fake() {
 test("Host factory chooses the async Windows backend and starts with a side effect free snapshot", async t => {
   const home = directory(t), backend = fake();
   let factories = 0, reads = 0;
-  const binding = createHostCredentialStorage({ home, hostPlatform: "win32", arch: "x64", windows: supplied => {
+  const binding = createHostCredentialStorage({ home, hostPlatform: "win32", arch: "x64",
+    windowsLaunch: { source: "desktop-windows-v1", desktopSidecar: true }, windows: supplied => {
     assert.equal(supplied, home); factories++;
     return { ...backend.vault, async get() { reads++; return undefined; } };
   } });
@@ -68,6 +69,48 @@ for (const [platform, arch, reason] of [
   t.after(() => selected.vault.close());
   assert.deepEqual(selected.descriptor(), { schemaVersion: 1, hostPlatform: platform, arch, backend: "none", supported: false, state: "unsupported", reason });
   await assert.rejects(selected.vault.set("fixture", keyA), error => error.code === "unsupported" && error.retry === "none" && !error.message.includes(keyA));
+});
+
+const unsupportedWindowsCli = {
+  schemaVersion: 1, hostPlatform: "win32", arch: "x64", backend: "none",
+  supported: false, state: "unsupported", reason: "windows_desktop_required",
+};
+const windowsLaunchVariants = [
+  ["normal npm", { desktopSidecar: false }],
+  ["npm with the Desktop marker", { desktopSidecar: false, source: "desktop-windows-v1" }],
+  ["copied managed CLI", { desktopSidecar: true }],
+  ["nonexact launch marker", { desktopSidecar: true, source: "DESKTOP-WINDOWS-V1" }],
+];
+for (const [label, windowsLaunch] of windowsLaunchVariants) {
+  test(label + " cannot open the Windows Workspace credential backend", async t => {
+    const binding = createHostCredentialStorage({
+      hostPlatform: "win32", arch: "x64", home: directory(t), windowsLaunch,
+      windows: () => assert.fail("the unsupported channel must not bind a vault"),
+    });
+    t.after(() => binding.vault.close());
+    assert.deepEqual(binding.descriptor(), unsupportedWindowsCli);
+    for (const operation of [() => binding.vault.get("fixture"), () => binding.vault.set("fixture", keyA),
+      () => binding.vault.setMany([{ ref: "fixture", key: keyA }]), () => binding.vault.remove("fixture")]) {
+      await assert.rejects(operation, error => error.code === "unsupported" && error.retry === "none"
+        && error.definitelyUnwritten && /Hara Desktop/.test(error.message) && !error.message.includes(keyA));
+    }
+    assert.deepEqual(binding.descriptor(), unsupportedWindowsCli);
+  });
+}
+
+test("admitted Windows Desktop keeps distinct missing and invalid worker reasons", async t => {
+  for (const reason of ["helper_missing", "helper_invalid"]) {
+    const binding = createHostCredentialStorage({
+      hostPlatform: "win32", arch: "x64", home: directory(t),
+      windowsLaunch: { desktopSidecar: true, source: "desktop-windows-v1" },
+      windows() { throw new CredentialVaultError("unavailable", reason, true); },
+    });
+    t.after(() => binding.vault.close());
+    assert.deepEqual(binding.descriptor(), {
+      ...unsupportedWindowsCli, backend: "windows-dpapi", supported: true, state: "unavailable", reason,
+    });
+    await assert.rejects(() => binding.vault.set("fixture", keyA), error => error.code === "unavailable" && error.reason === reason);
+  }
 });
 
 test("namespace queue serializes get, set, setMany and remove, and drops an expired waiter", async t => {
@@ -211,13 +254,9 @@ test("Host refuses provider admission when the resource fence fails during vault
   assert.equal(started, 0);
 });
 
-test("RPC strictly negotiates a metadata-only credential descriptor and preserves the numeric error shell", async t => {
-  const root = directory(t), keyCalls = [];
-  const descriptor = { schemaVersion: 1, hostPlatform: "win32", arch: "x64", backend: "windows-dpapi", supported: true, state: "not_checked", reason: null };
-  const fail = async () => { keyCalls.push("attempt"); throw new CredentialVaultError("access_denied", "access_denied", true); };
+async function credentialRpc(t, root, descriptor, vault) {
   const handle = await startLocalWorkspaceServe({ host: "127.0.0.1", port: 0, cwd: root }, {
-    root, mode: "workspace", version: "fixture", credentialStorageDescriptor: descriptor,
-    asyncCredentialVault: { get: fail, set: fail, setMany: fail, remove: fail },
+    root, mode: "workspace", version: "fixture", credentialStorageDescriptor: descriptor, asyncCredentialVault: vault,
   });
   const ws = new WebSocket("ws://127.0.0.1:" + handle.port);
   t.after(async () => { ws.terminate(); await handle.close(); });
@@ -233,8 +272,16 @@ test("RPC strictly negotiates a metadata-only credential descriptor and preserve
     const timer = setTimeout(() => { ws.off("message", onMessage); reject(new Error("RPC fixture failed to reply")); }, 3000);
     ws.on("message", onMessage); ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
   });
+  return { rpc, token: handle.token };
+}
+
+test("RPC strictly negotiates a metadata-only credential descriptor and preserves the numeric error shell", async t => {
+  const root = directory(t), keyCalls = [];
+  const descriptor = { schemaVersion: 1, hostPlatform: "win32", arch: "x64", backend: "windows-dpapi", supported: true, state: "not_checked", reason: null };
+  const fail = async () => { keyCalls.push("attempt"); throw new CredentialVaultError("access_denied", "access_denied", true); };
+  const { rpc, token } = await credentialRpc(t, root, descriptor, { get: fail, set: fail, setMany: fail, remove: fail });
   assert.equal((await rpc("workspace.credentialStorage.get", {})).error.code, -32001);
-  const initialized = (await rpc("initialize", { token: handle.token })).result;
+  const initialized = (await rpc("initialize", { token })).result;
   assert.ok(initialized.capabilities.includes("workspace.credential-storage.v1"));
   assert.deepEqual(initialized.credentialStorage, descriptor);
   assert.deepEqual((await rpc("workspace.credentialStorage.get", {})).result, descriptor);
@@ -250,6 +297,31 @@ test("RPC strictly negotiates a metadata-only credential descriptor and preserve
   assert.equal(JSON.stringify(result).includes(keyA), false);
   assert.deepEqual(keyCalls, ["attempt"]);
   assert.equal((await rpc("workspace.credentialStorage.get", {})).result.reason, "access_denied");
+});
+
+test("Windows CLI RPC rejects a save before its vault or write journal and names Desktop", async t => {
+  const root = directory(t);
+  const unexpected = () => assert.fail("an unsupported save must never reach the worker");
+  const { rpc, token } = await credentialRpc(t, root, unsupportedWindowsCli,
+    { get: unexpected, set: unexpected, setMany: unexpected, remove: unexpected });
+  const initialized = (await rpc("initialize", { token })).result;
+  assert.deepEqual(initialized.credentialStorage, unsupportedWindowsCli);
+  const created = (await rpc("workspace.create", { label: "Fixture", expectedRevision: initialized.workspace.revision })).result;
+  const request = { workspaceId: created.workspaceId, expectedGeneration: created.resourceGeneration,
+    expectedRevision: created.connections.revision, input: input(keyA) };
+  const response = await rpc("workspace.connection.add", { ...request, clientLocale: { tag: "zh-Hans", fallback: ["en"] } });
+  assert.equal(Object.hasOwn(response, "result"), false);
+  assert.equal(response.error.code, -32602);
+  assert.equal(response.error.data.domain, "credential-vault");
+  assert.equal(response.error.data.code, "unsupported");
+  assert.equal(response.error.data.retry, "none");
+  assert.equal(response.error.message, "在 Windows 上，请使用 Hara Desktop 安全保存工作区模型密钥。");
+  assert.equal(JSON.stringify(response).includes(keyA), false);
+  assert.deepEqual((await rpc("workspace.credentialStorage.get", {})).result, unsupportedWindowsCli);
+  const snap = (await rpc("workspace.snapshot", { workspaceId: created.workspaceId, agentId: null })).result;
+  assert.deepEqual(snap.connections, created.connections);
+  const files = fs.readdirSync(join(root, "home", ".hara", "workspace-data", "v1"), { recursive: true });
+  assert.ok(!files.some(file => /workspace-(credential-intents-v1|connections-v2)(-backup)?\.json$/.test(file)));
 });
 
 // Exercise the real async framing and child-process close path with a local executable

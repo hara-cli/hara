@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { withPrivateStateLockSync } from "../security/private-state.js";
+import { coreText } from "../i18n/messages.js";
 
 export const WORKSPACE_CREDENTIAL_SERVICE = "tech.nanhara.hara.workspace.credentials.v1";
 export interface CredentialVault { get(ref: string): string | undefined; set(ref: string, value: string): void; remove(ref: string): void;
@@ -85,7 +86,7 @@ export class MacKeychainCredentialVault implements CredentialVault {
 
 export const CREDENTIAL_STORAGE_CAPABILITY = "workspace.credential-storage.v1";
 export type CredentialStorageReason = "platform_unsupported" | "architecture_unsupported" | "host_binding_unavailable"
-  | "helper_missing" | "helper_invalid" | "access_denied" | "backend_unavailable";
+  | "helper_missing" | "helper_invalid" | "access_denied" | "backend_unavailable" | "windows_desktop_required";
 export type CredentialVaultErrorCode = "unsupported" | "unavailable" | "access_denied" | "credential_unreadable"
   | "write_unconfirmed" | "cleanup_unconfirmed" | "invalid_request";
 
@@ -93,7 +94,9 @@ export class CredentialVaultError extends Error {
   readonly domain = "credential-vault";
   readonly retry: "none" | "explicit_user_only" | "readback_only";
   constructor(readonly code: CredentialVaultErrorCode, readonly reason?: CredentialStorageReason, readonly definitelyUnwritten = false) {
-    super(`Secure credential storage: ${code}`);
+    super(code === "unsupported" && reason === "windows_desktop_required"
+      ? coreText("core.credentialStorage.windowsDesktopRequired")
+      : `Secure credential storage: ${code}`);
     this.name = "CredentialVaultError";
     this.retry = code === "unsupported" || code === "invalid_request" ? "none"
       : code === "write_unconfirmed" ? "readback_only" : "explicit_user_only";

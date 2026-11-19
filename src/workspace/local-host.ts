@@ -78,7 +78,7 @@ import { WorkspaceRuntimeModels } from "./runtime-models.js";
 import { WorkspaceSecureConnections } from "./secure-connections.js";
 import { connectionModelEfforts, connectionModels } from "./connection-models.js";
 import { resolveWorkspaceFileCredential } from "./file-credential.js";
-import { assertCredentialCall, credentialDeadline, type AsyncCredentialVault, type CredentialCall, type CredentialVault,
+import { assertCredentialCall, credentialDeadline, CredentialVaultError, type AsyncCredentialVault, type CredentialCall, type CredentialVault,
   type CredentialStorageDescriptor } from "./credential-vault.js";
 import { adaptCredentialVault, createHostCredentialStorage } from "./credential-vault-host.js";
 import { LegacyConnectionCatalog } from "./legacy-connections.js";
@@ -1124,6 +1124,9 @@ export class LocalWorkspaceHost {
     };
     const call = { signal: credentialDeadline(), assertCurrent };
     assertCredentialCall(call);
+    if (write && this.credentialStorage.descriptor().reason === "windows_desktop_required") {
+      throw new CredentialVaultError("unsupported", "windows_desktop_required", true);
+    }
     return call;
   }
   private resolveConnection(workspaceId: string, context: WorkspaceHostContext, binding: ScopedRunConnection, call?: CredentialCall) {

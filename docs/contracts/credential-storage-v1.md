@@ -13,13 +13,23 @@ the request. The getter accepts no workspace, generation, backend, file or ident
 | `backend` | `macos-keychain`, `windows-dpapi`, `none` |
 | `supported` | Whether Hara has a secure backend for this platform and architecture |
 | `state` | `not_checked`, `ready`, `unavailable`, `unsupported` |
-| `reason` | `null` for `not_checked` or `ready`. Otherwise `platform_unsupported`, `architecture_unsupported`, `host_binding_unavailable`, `helper_missing`, `helper_invalid`, `access_denied` or `backend_unavailable` |
+| `reason` | `null` for `not_checked` or `ready`. Otherwise `platform_unsupported`, `architecture_unsupported`, `host_binding_unavailable`, `helper_missing`, `helper_invalid`, `access_denied`, `backend_unavailable` or `windows_desktop_required` |
 
-Windows x64 uses the packaged CurrentUser DPAPI worker. macOS uses the existing Keychain
-records. Linux, other platforms and unsupported Windows architectures return `unsupported`.
-A missing Windows helper leaves the backend supported and the state unavailable. A descriptor
-read does not launch a worker, unlock a Keychain or probe a model endpoint. A successful vault
-operation updates the snapshot to ready. The connection view's `keySaved` is a metadata fact.
+On Windows x64, Hara 1.3.0 supports Workspace credential storage through the bundled
+Desktop sidecar with its CurrentUser DPAPI worker. The binary must be compiled in Windows
+Desktop sidecar mode and receive `HARA_WORKSPACE_LAUNCH_SOURCE=desktop-windows-v1` from
+Desktop when it starts the bundled process. This is a launch convention. Worker integrity
+and the existing Host authorization checks still apply.
+
+An ordinary npm entry or a direct invocation of the copied managed CLI reports
+`backend: "none"`, `supported: false`, `state: "unsupported"` and
+`reason: "windows_desktop_required"`. Workspace credential writes fail before opening
+the vault or staging a write intent. macOS uses the existing Keychain records. Linux,
+other platforms and unsupported Windows architectures return `unsupported`. A missing
+or invalid worker on the admitted Desktop path reports `unavailable` with its helper
+reason. Descriptor reads do not launch a worker, unlock a Keychain or probe a model
+endpoint. A successful operation updates the descriptor to ready. The connection view's
+`keySaved` is a metadata fact.
 
 Credential failures keep the numeric JSON-RPC error. Its `data` has `domain: "credential-vault"`
 and the following code and retry values. Credential errors contain no raw worker output, keys,
