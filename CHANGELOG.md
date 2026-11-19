@@ -5,6 +5,22 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 1.3.0 — Colleague appearance and local workspace improvements
+
+- Choose a colour and avatar shape for each colleague. Reset to the initial colour. For older
+  profiles, Hara uses the original colour when it is still in the palette and keeps the derived
+  starting colour stable after saving.
+- Add local Host support for importing pasted images and carrying recent private conversation
+  context into follow-ups. Access to recent context follows the conversation audience.
+- Let clients list saved model connection metadata and previously known models without making
+  a provider request. Keep new-colleague engine defaults on the workspace and persist setup
+  progress and per-colleague results for batch creation.
+- Distinguish local engine startup and session failures from provider overload or rate limits.
+  Local runtime diagnostics no longer trigger automatic model fallback or open a provider circuit.
+- Harden credential reference handling, command deduplication and lifecycle recovery. Add
+  owner-scoped policy, routing and external-agent metadata contracts for trusted Host integrations.
+  These integrations require their corresponding capability and authority to be enabled.
+
 ## 1.2.0 — 2026-11-08 — Local workspace, more engines and two interface languages
 
 Version 1.1.0 was never published; 1.2.0 is the first release after 1.0.2 and carries the work planned
