@@ -22,6 +22,9 @@ mod windows {
     const TOKEN_IMPERSONATE: u32 = 0x0004;
     const TOKEN_DUPLICATE: u32 = 0x0002;
     const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
+    const MAX_FOLDER_UNITS: usize = 32_760;
+    const PATH_SEPARATOR: u16 = b'\\' as u16;
     const READ_CONTROL: u32 = 0x20000; const DELETE: u32 = 0x10000;
     const GENERIC_READ: u32 = 0x80000000; const GENERIC_WRITE: u32 = 0x40000000;
     const OPEN_REPARSE: u32 = 0x00200000; const BACKUP: u32 = 0x02000000;
@@ -35,6 +38,8 @@ mod windows {
     extern "system" {
         fn GetLastError() -> u32;
         fn GetCurrentProcess() -> Handle;
+        fn GetFullPathNameW(input: *const u16, capacity: u32, output: *mut u16, file_part: *mut *mut u16) -> u32;
+        fn CompareStringOrdinal(left: *const u16, left_len: i32, right: *const u16, right_len: i32, ignore_case: i32) -> i32;
         fn CloseHandle(h: Handle) -> i32;
         fn LocalFree(p: *mut c_void) -> *mut c_void;
         fn CreateFileW(path: *const u16, access: u32, share: u32, sa: *const Sa, creation: u32, flags: u32, template: Handle) -> Handle;
@@ -62,6 +67,10 @@ mod windows {
         fn CryptProtectData(input: *const Blob, description: *const u16, entropy: *const Blob, reserved: *mut c_void, prompt: *mut c_void, flags: u32, output: *mut Blob) -> i32;
         fn CryptUnprotectData(input: *const Blob, description: *mut *mut u16, entropy: *const Blob, reserved: *mut c_void, prompt: *mut c_void, flags: u32, output: *mut Blob) -> i32;
     }
+    #[link(name="userenv")]
+    extern "system" {
+        fn GetUserProfileDirectoryW(token: Handle, path: *mut u16, size: *mut u32) -> i32;
+    }
     #[link(name="shell32")]
     extern "system" { fn SHGetKnownFolderPath(id: *const Guid, flags: u32, token: Handle, out: *mut *mut u16) -> i32; }
     #[link(name="ole32")]
@@ -84,11 +93,22 @@ mod windows {
     impl Drop for Owned { fn drop(&mut self) { unsafe { CloseHandle(self.0); } } }
     struct Local(*mut c_void);
     impl Drop for Local { fn drop(&mut self) { unsafe { LocalFree(self.0); } } }
+    #[derive(Debug, PartialEq, Eq)]
+    enum FolderBindingError {
+        ComInitFailed,
+        LookupFailed,
+        InvalidPath,
+        TokenProfileUnavailable,
+        EnvironmentInfluenced,
+    }
+    type FolderResult<T> = std::result::Result<T, FolderBindingError>;
+
     struct ComApartment;
     impl ComApartment {
-        fn initialize() -> Result<Self> {
-            if unsafe { CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED) } < 0 {
-                return Err(HOST_BINDING);
+        fn initialize() -> FolderResult<Self> {
+            let mode = COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE;
+            if unsafe { CoInitializeEx(null_mut(), mode) } < 0 {
+                return Err(FolderBindingError::ComInitFailed);
             }
             // Both S_OK and S_FALSE need a matching CoUninitialize on this thread.
             Ok(Self)
@@ -162,27 +182,91 @@ mod windows {
         let h=Owned(h); info(h.0,directory)?;
         if let Some(sec)=security { sec.check(h.0)?; } Ok(h)
     }
-    fn local_app_data(process_token: &Owned) -> Result<PathBuf> {
+    fn query_local_app_data(token: Handle) -> FolderResult<PathBuf> {
         let _apartment = ComApartment::initialize()?;
         let id = Guid { a: 0xf1b32785, b: 0x6fba, c: 0x4fcf, d: [0x9d, 0x55, 0x7b, 0x8e, 0x7f, 0x15, 0x70, 0x91] };
         let mut raw = ShellPath(null_mut());
-        // Use the same process identity as the private store ACL and CurrentUser DPAPI.
-        let status = unsafe { SHGetKnownFolderPath(&id, 0, process_token.0, &mut raw.0) };
-        if status < 0 || raw.0.is_null() { return Err(HOST_BINDING); }
+        let status = unsafe { SHGetKnownFolderPath(&id, 0, token, &mut raw.0) };
+        if status < 0 { return Err(FolderBindingError::LookupFailed); }
+        if raw.0.is_null() { return Err(FolderBindingError::InvalidPath); }
         let mut length = 0;
-        while length < 32_760 && unsafe { *raw.0.add(length) } != 0 { length += 1; }
-        if length == 32_760 { return Err(HOST_BINDING); }
+        while length < MAX_FOLDER_UNITS && unsafe { *raw.0.add(length) } != 0 { length += 1; }
+        if length == MAX_FOLDER_UNITS { return Err(FolderBindingError::InvalidPath); }
         let path = String::from_utf16(unsafe { std::slice::from_raw_parts(raw.0, length) })
-            .map_err(|_| HOST_BINDING)?;
+            .map_err(|_| FolderBindingError::InvalidPath)?;
         if path.as_bytes().get(1) != Some(&b':') || path.as_bytes().get(2) != Some(&b'\\') {
-            return Err(HOST_BINDING);
+            return Err(FolderBindingError::InvalidPath);
         }
         Ok(PathBuf::from(path))
+    }
+    fn token_profile_directory(token: &Owned) -> FolderResult<PathBuf> {
+        let mut length = 0;
+        unsafe { GetUserProfileDirectoryW(token.0, null_mut(), &mut length); }
+        if length < 4 || length as usize > MAX_FOLDER_UNITS {
+            return Err(FolderBindingError::TokenProfileUnavailable);
+        }
+        let mut buffer = vec![0; length as usize];
+        if unsafe { GetUserProfileDirectoryW(token.0, buffer.as_mut_ptr(), &mut length) } == 0
+            || length < 4 || length as usize > buffer.len() || buffer[length as usize - 1] != 0
+        {
+            return Err(FolderBindingError::TokenProfileUnavailable);
+        }
+        let path = String::from_utf16(&buffer[..length as usize - 1])
+            .map_err(|_| FolderBindingError::TokenProfileUnavailable)?;
+        Ok(PathBuf::from(path))
+    }
+    fn comparison_path(path: &Path) -> FolderResult<Vec<u16>> {
+        // Lexical normalization only. The ambient path is never opened to choose the store.
+        let mut input = wide(path.as_os_str());
+        if matches!(path.components().next(), Some(std::path::Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_)))
+        {
+            input.drain(..4);
+        }
+        if !path.is_absolute() || input.len() > MAX_FOLDER_UNITS || input[..input.len() - 1].contains(&0) {
+            return Err(FolderBindingError::InvalidPath);
+        }
+        let length = unsafe { GetFullPathNameW(input.as_ptr(), 0, null_mut(), null_mut()) };
+        if length < 4 || length as usize > MAX_FOLDER_UNITS { return Err(FolderBindingError::InvalidPath); }
+        let mut buffer = vec![0; length as usize];
+        let written = unsafe { GetFullPathNameW(input.as_ptr(), length, buffer.as_mut_ptr(), null_mut()) };
+        if written < 3 || written >= length { return Err(FolderBindingError::InvalidPath); }
+        buffer.truncate(written as usize);
+        while buffer.len() > 3 && buffer.last() == Some(&PATH_SEPARATOR) { buffer.pop(); }
+        Ok(buffer)
+    }
+    fn equal_windows_paths(left: &[u16], right: &[u16]) -> FolderResult<bool> {
+        let comparison = unsafe {
+            CompareStringOrdinal(left.as_ptr(), left.len() as i32, right.as_ptr(), right.len() as i32, 1)
+        };
+        if comparison == 0 { return Err(FolderBindingError::InvalidPath); }
+        Ok(comparison == 2)
+    }
+    fn guard_folder_environment(folder: &Path, profile: &Path, ambient_profile: &Path) -> FolderResult<()> {
+        let ambient = comparison_path(ambient_profile)?;
+        if equal_windows_paths(&ambient, &comparison_path(profile)?)? { return Ok(()); }
+        let folder = comparison_path(folder)?;
+        let prefix_len = ambient.len();
+        let on_boundary = folder.len() == prefix_len || ambient.last() == Some(&PATH_SEPARATOR)
+            || folder.get(prefix_len) == Some(&PATH_SEPARATOR);
+        if on_boundary && folder.len() >= prefix_len && equal_windows_paths(&folder[..prefix_len], &ambient)? {
+            return Err(FolderBindingError::EnvironmentInfluenced);
+        }
+        Ok(())
+    }
+    fn local_app_data(process_token: &Owned) -> FolderResult<PathBuf> {
+        // Use the same process identity as the private store ACL and CurrentUser DPAPI.
+        let folder = query_local_app_data(process_token.0)?;
+        if let Some(ambient) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+            let profile = token_profile_directory(process_token)?;
+            guard_folder_environment(&folder, &profile, Path::new(&ambient))?;
+        }
+        Ok(folder)
     }
     struct Store { path: PathBuf, _parents: Vec<Owned>, _lock: Owned, sec: Security, namespace: [u8;32] }
     impl Store {
         fn new(namespace:[u8;32]) -> Result<Self> {
-            let sec=Security::new()?; let root=local_app_data(&sec.process_token)?;
+            let sec=Security::new()?; let root=local_app_data(&sec.process_token).map_err(|_| HOST_BINDING)?;
             let mut parents=Vec::new();
             // Pin every existing ancestor, refusing junctions/reparse points and delete sharing.
             let mut ancestors:Vec<_>=root.ancestors().collect(); ancestors.reverse();

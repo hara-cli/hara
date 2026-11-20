@@ -121,6 +121,8 @@ function replyFrame(op: number, stdout: Buffer, nonce: Buffer, version: 1 | 2): 
   return key;
 }
 function workerOptions() {
+  // These are the explicit spawn options. Windows libuv also fills required
+  // process variables from Core, including PATH and USERPROFILE when present.
   const env: NodeJS.ProcessEnv = {};
   for (const name of ["SystemRoot", "WINDIR"]) if (process.env[name]) env[name] = process.env[name];
   return { shell: false, windowsHide: true, env, stdio: ["pipe", "pipe", "pipe"] as ["pipe", "pipe", "pipe"] };

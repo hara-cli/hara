@@ -14,6 +14,11 @@ presence byte and, if present, u32 code units + key bytes. No stderr diagnostics
 Malformed framing exits without printing input. No environment-supplied storage path.
 
 Ciphertext lives under system KnownFolder LocalAppData/Hara/credential-vault/v1/<namespace>.
+The worker resolves LocalAppData using the current process token. If a conflicting process
+USERPROFILE contains the resolved location, the worker rejects the binding before opening the store.
+Core supplies SystemRoot and WINDIR explicitly when present. On Windows, the runtime may also fill
+required child variables from Core, including PATH and USERPROFILE. Those values do not select
+the vault root. A LocalAppData ancestor that is a junction or another reparse point is unsupported.
 Private subtree/files have a protected current-SID-only DACL and owner. Ancestor handles deny
 delete sharing; actual file handles reject reparse points and hardlinks and verify the DACL.
 The exclusive namespace lock spans reads/writes/readback. Per-ref writes encrypt before creating
