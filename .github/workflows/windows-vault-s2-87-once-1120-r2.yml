@@ -1,0 +1,2117 @@
+name: windows-vault-s2-87-once-1120-r2
+on:
+  push:
+    branches:
+      - probe/windows-vault-s2-87-once-1120-r2
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-vault-s2-87-once-1120-r2
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  S2_SOURCE_SHA: '1c2e7e94905f2d336a7846a00c411022b9c63bea'
+  S2_SOURCE_TREE: '29e6cfd1ec9a7a371eb35d5e929aaea62dca8351'
+  S2_LOCK_SHA256: '8f2a126d1cf3c7458d3c156c2eb3365195f914ba95d98c0d0183848da805bc07'
+  S2_WORKER_SOURCE_SHA256: '063fa83cceb3bca3f82973ed5e5b454bde066011fd22470d8859d967de0b7dc0'
+  S2_FIXTURE_DRIVE_SHA256: '60ff6c827c8fe60a2eb4a9d17978a1626c6e844a00dd1ec21209a91f54bb17ce'
+  S2_FIXTURE_VERIFY_SHA256: '31c87727cc3f289d22577ee51adf6c4ad24392eb4e1c37c47a8fc69dd1d357f2'
+  S2_FIXTURE_OBSERVE_SHA256: '30807eb02265d034ad014a3a623e5d342976d24757a5a033d1447e502e799df1'
+  S2_FIXTURE_NATIVE_SHA256: 'b7ae64656312f470aa89af470dd912bf81ce00c2b70f3f0b43aeb43a4b36b3ad'
+
+jobs:
+  native-s2:
+    if: >-
+      github.repository == 'hara-cli/hara' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/probe/windows-vault-s2-87-once-1120-r2' &&
+      github.event.created == true && github.event.deleted == false &&
+      github.run_attempt == '1'
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - name: Check out the admitted probe commit
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Bind runner and both immutable trees
+        id: admit
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or
+              $env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ARCH -cne 'X64' -or
+              $env:GITHUB_WORKFLOW_SHA -cne $env:GITHUB_SHA) {
+            throw 'Runner or workflow identity mismatch'
+          }
+          $head = @(& git rev-list --parents -n 1 HEAD 2>$null)
+          if ($LASTEXITCODE -ne 0 -or $head.Count -ne 1 -or
+              $head[0] -cne "$env:GITHUB_SHA $env:S2_SOURCE_SHA") {
+            throw 'Expected probe commit with the single pinned Core parent'
+          }
+          $tree = @(& git rev-parse "$($env:S2_SOURCE_SHA)^{tree}" 2>$null)
+          if ($LASTEXITCODE -ne 0 -or $tree.Count -ne 1 -or $tree[0] -cne $env:S2_SOURCE_TREE) {
+            throw 'Pinned Core tree mismatch'
+          }
+          $actual = @(& git diff --name-status --no-renames $env:S2_SOURCE_SHA HEAD 2>$null)
+          if ($LASTEXITCODE -ne 0 -or $actual.Count -ne 1 -or
+              $actual[0] -cne ("A" + [char]9 + '.github/workflows/windows-vault-s2-87-once-1120-r2.yml')) {
+            throw 'Probe child must add exactly its workflow file'
+          }
+          $nonce = [Guid]::NewGuid().ToString("N").Substring(0, 16)
+          $root = Join-Path $env:RUNNER_TEMP "hara-s2-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$nonce"
+          if (Test-Path -LiteralPath $root) { throw 'Fixture root already exists' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          foreach ($name in @('core', 'pack', 'evidence', 'fixtures', 'cases', 'control', 'tools')) {
+            New-Item -ItemType Directory -Path (Join-Path $root $name) | Out-Null
+          }
+          "S2_ROOT=$root" >> $env:GITHUB_ENV
+          "S2_CORE=$(Join-Path $root 'core')" >> $env:GITHUB_ENV
+          "S2_EVIDENCE=$(Join-Path $root 'evidence')" >> $env:GITHUB_ENV
+          "S2_FIXTURES=$(Join-Path $root 'fixtures')" >> $env:GITHUB_ENV
+
+      - name: Assemble drive.ps1 part 1
+        run: |
+          $source = @'
+          param(
+            [Parameter(Mandatory)][ValidateSet('Prepare','Case1','Case2','Case3','Case4','Case5','Finalize')][string]$Phase,
+            [Parameter(Mandatory)][string]$Root,
+            [Parameter(Mandatory)][string]$Core,
+            [Parameter(Mandatory)][string]$Evidence
+          )
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          Set-StrictMode -Version Latest
+          $Root = [IO.Path]::GetFullPath($Root)
+          $Core = [IO.Path]::GetFullPath($Core)
+          $Evidence = [IO.Path]::GetFullPath($Evidence)
+          $parent = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          $leaf = [IO.Path]::GetFileName($Root)
+          $runPrefix = "hara-s2-$env:GITHUB_RUN_ID-1-"
+          if ($env:GITHUB_ACTIONS -cne 'true' -or $env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or
+              $env:GITHUB_REPOSITORY -cne 'hara-cli/hara' -or $env:GITHUB_RUN_ATTEMPT -cne '1' -or
+              $env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ARCH -cne 'X64' -or
+              [IO.Path]::GetDirectoryName($Root) -ine $parent -or
+              $leaf -cnotmatch ('^' + [regex]::Escape($runPrefix) + '[a-f0-9]{16}$') -or
+              $Core -ine (Join-Path $Root 'core') -or $Evidence -ine (Join-Path $Root 'evidence') -or
+              (Get-Item -LiteralPath $Root -Force).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { exit 90 }
+
+          $fixture = Join-Path $Root 'fixtures/s2-fixture.exe'
+          $control = Join-Path $Root 'control'
+          $ledger = Join-Path $control 'firewall.json'
+          $phaseNames = @('round-node','round-bun','queue','crash','native','handshake-node',
+                          'handshake-bun','calibrate-node','calibrate-bun')
+          $allowedPoints = @('identity','round-node','round-bun','queue','retry','uncertain','live-drain',
+            'crash','post-write-crash','live-crash','native','junction','acl','pending-quota',
+            'handshake-node','handshake-bun','calibrate-node','calibrate-bun')
+          $worker = Join-Path $Core 'dist/native/win32-x64/hara-credential-worker.exe'
+          $npmWorker = Join-Path $Core 'npm-entry/package/dist/native/win32-x64/hara-credential-worker.exe'
+          $bunWorker = Join-Path $Core 'dist/bin/hara-credential-worker.exe'
+          $bunSidecar = Join-Path $Core 'dist/bin/hara.exe'
+          $programs = @((Join-Path $Root 'tools/node.exe'), $bunSidecar, $npmWorker, $bunWorker,
+            $fixture, (Join-Path $Root 'fixtures/vault-native-tests.exe'))
+          $programs = @($programs | ForEach-Object { [IO.Path]::GetFullPath($_) })
+          $addresses = @('0.0.0.0-127.0.0.0', '127.0.0.2-255.255.255.255', '::/0')
+          $utf8 = [Text.UTF8Encoding]::new($false, $true)
+
+          function Write-Json([string]$File, $Value) {
+            [IO.File]::WriteAllText($File, ($Value | ConvertTo-Json -Depth 10 -Compress) + [char]10, $utf8)
+          }
+          function Read-Json([string]$File, [int]$Limit = 16384) {
+            $item = Get-Item -LiteralPath $File -Force
+            if ($item.PSIsContainer -or $item.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) -or $item.Length -gt $Limit) {
+              throw 'Invalid fixed receipt file'
+            }
+            $text = [IO.File]::ReadAllText($item.FullName, $utf8)
+            if ($text.Length -gt $Limit) { throw 'Fixed receipt grew' }
+            return (ConvertFrom-Json -InputObject $text -AsHashtable -ErrorAction Stop)
+          }
+          function Hash-IfFile([string]$File) {
+            if (Test-Path -LiteralPath $File -PathType Leaf) {
+              return (Get-FileHash -LiteralPath $File -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+            return $null
+          }
+          # Public input slots admit only the pinned digest or null, including pre-build failures.
+          function Hash-PinnedInput([string]$File, [string]$Expected) {
+            try {
+              $digest = Hash-IfFile $File
+              if ($digest -ceq $Expected) { return $digest }
+            } catch {
+              # An unreadable input contributes no verified digest.
+            }
+            return $null
+          }
+          function Valid-Count($Value, [int]$Maximum) {
+            return (($Value -is [int] -or $Value -is [long]) -and $Value -ge 0 -and $Value -le $Maximum)
+          }
+          function Names-ForNetwork {
+            for ($i = 0; $i -lt $programs.Count; $i++) { "$leaf-out-$i" }
+          }
+          function Check-Network {
+            if (@(Get-NetFirewallProfile -PolicyStore ActiveStore | Where-Object Enabled -ne 'True').Count -ne 0) {
+              throw 'Firewall profile disabled'
+            }
+            $names = @(Names-ForNetwork)
+            for ($i = 0; $i -lt $programs.Count; $i++) {
+              $rule = Get-NetFirewallRule -Name $names[$i] -PolicyStore ActiveStore -ErrorAction Stop
+              $program = $rule | Get-NetFirewallApplicationFilter
+              $range = $rule | Get-NetFirewallAddressFilter
+              if ($rule.Group -cne $leaf -or $rule.Enabled -ne 'True' -or $rule.Direction -ne 'Outbound' -or
+                  $rule.Action -ne 'Block' -or $program.Program -ine $programs[$i] -or
+                  @(Compare-Object ($addresses | Sort-Object) ($range.RemoteAddress | Sort-Object)).Count -ne 0) {
+                throw 'Effective fixture firewall rule differs'
+              }
+            }
+          }
+          function Enable-NetworkGuard {
+            $names = @(Names-ForNetwork)
+            foreach ($program in $programs) {
+              $file = Get-Item -LiteralPath $program -Force
+              if ($file.PSIsContainer -or $file.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { throw 'Invalid owned fixture program' }
+            }
+            # Record exact rule identities before any firewall change.
+            Write-Json $ledger $names
+            for ($i = 0; $i -lt $programs.Count; $i++) {
+              $parameters = @{
+                Name = $names[$i]; DisplayName = $names[$i]; Group = $leaf; Enabled = 'True'
+                Direction = 'Outbound'; Action = 'Block'; Program = $programs[$i]; RemoteAddress = $addresses; Profile = 'Any'
+              }
+              New-NetFirewallRule @parameters | Out-Null
+            }
+            Check-Network
+          }
+          function Remove-NetworkGuard {
+            if (!(Test-Path -LiteralPath $ledger)) { return }
+            $expected = @(Names-ForNetwork)
+            $recorded = @(Read-Json $ledger)
+            if (($expected -join ',') -cne ($recorded -join ',')) { throw 'Firewall ledger identity differs' }
+            foreach ($name in $expected) {
+              $rule = Get-NetFirewallRule -Name $name -PolicyStore PersistentStore -ErrorAction SilentlyContinue
+              if ($null -ne $rule) {
+                if ($rule.Group -cne $leaf) { throw 'Firewall rule identity differs' }
+                Remove-NetFirewallRule -Name $name -PolicyStore PersistentStore -ErrorAction Stop
+              }
+              if (Get-NetFirewallRule -Name $name -PolicyStore ActiveStore -ErrorAction SilentlyContinue) {
+                throw 'Active fixture firewall rule retained'
+              }
+            }
+          }
+
+          function Read-Phase([string]$Name) {
+            $candidate = Join-Path $control "$Name/outcome.json"
+            $private = Join-Path $Root "cases/$Name/verdict.json"
+            $status = 'skipped'
+            $outcome = $null
+            $verdict = $null
+            if (Test-Path -LiteralPath (Join-Path $control $Name)) {
+              $status = 'hold'
+              if (Test-Path -LiteralPath $candidate) { $outcome = Read-Json $candidate }
+              if (Test-Path -LiteralPath $private) { $verdict = Read-Json $private }
+              if ($null -ne $outcome -and $null -ne $verdict -and
+                  $outcome.clean -is [bool] -and $outcome.clean -and
+                  $outcome.drained -is [bool] -and $outcome.drained -and
+                  (Valid-Count $outcome.code 255) -and (Valid-Count $outcome.total 10000) -and $outcome.total -ge 1 -and
+                  $verdict.point -cin $allowedPoints -and $verdict.scrubbed -is [bool] -and
+                  $verdict.removed -is [bool] -and $verdict.result -cin @('pass','fail')) {
+                $status = 'fail'
+                if ($outcome.code -eq 0 -and $verdict.result -ceq 'pass' -and $verdict.scrubbed -and
+                    $verdict.removed -and (Valid-Count $verdict.providerCalls 1000) -and
+                    (Valid-Count $verdict.modelCalls 1000) -and $verdict.providerCalls -eq 0 -and $verdict.modelCalls -eq 0) {
+                  $status = 'pass'
+                }
+              }
+            }
+            return @{ status = $status; outcome = $outcome; verdict = $verdict }
+          }
+          function Run-Phase([string]$Name, [int]$Milliseconds) {
+            Check-Network
+            & $fixture 'supervise' $Root $Name $Milliseconds *> $null
+            if ($LASTEXITCODE -ne 0) { return $false }
+            return ((Read-Phase $Name).status -ceq 'pass')
+          }
+          function Combine-Status($Values) {
+            if ('fail' -cin $Values) { return 'fail' }
+            if ('hold' -cin $Values) { return 'hold' }
+            if ('skipped' -cin $Values) {
+              if (@($Values | Where-Object { $_ -cne 'skipped' }).Count -gt 0) { return 'hold' }
+              return 'skipped'
+            }
+            return 'pass'
+          }
+          function Worker-Count($PhaseResult) {
+            # Verifier Node, production Host and two native identity checks are expected.
+            # Miscellaneous or concealed launches fail the threshold as well.
+            if ($PhaseResult.status -ceq 'pass' -and $PhaseResult.outcome.total -ge 4) {
+              return ($PhaseResult.outcome.total - 4)
+            }
+            return $null
+          }
+          function Seal-Receipt {
+            $data = @{}
+            foreach ($name in $phaseNames) { $data[$name] = Read-Phase $name }
+            $isolation = $null
+            $nodeTrial = $data['round-node']
+            if ($null -ne $nodeTrial.outcome -and $nodeTrial.outcome.isolation -is [bool]) {
+              $isolation = $nodeTrial.outcome.isolation
+            }
+            $normalizedStatus = $nodeTrial.status
+            if ($normalizedStatus -ceq 'pass' -and $isolation -ne $true) { $normalizedStatus = 'fail' }
+            $case1 = [ordered]@{
+              status = (Combine-Status @($normalizedStatus, $data['round-bun'].status))
+              nodeNpm = $normalizedStatus
+              bunSidecar = $data['round-bun'].status
+              currentUserIsolation = $isolation
+            }
+            $case5 = Combine-Status @($data['handshake-node'].status, $data['handshake-bun'].status,
+              $data['calibrate-node'].status, $data['calibrate-bun'].status)
+            $workers = [ordered]@{ nodeReadOnly = (Worker-Count $data['handshake-node']); bunReadOnly = (Worker-Count $data['handshake-bun'])
+              nodeSave = (Worker-Count $data['calibrate-node']); bunSave = (Worker-Count $data['calibrate-bun']) }
+            if ($case5 -ceq 'pass' -and ($null -eq $workers.nodeReadOnly -or $workers.nodeReadOnly -ne 0 -or
+                $null -eq $workers.bunReadOnly -or $workers.bunReadOnly -ne 0 -or
+                $workers.nodeSave -ne 1 -or $workers.bunSave -ne 1)) { $case5 = 'fail' }
+            $cases = [ordered]@{
+              case1 = $case1; case2 = $data['queue'].status; case3 = $data['crash'].status
+              case4 = $data['native'].status; case5 = $case5
+            }
+            $models = 0
+            $providers = 0
+            $allMeasured = $true
+            $allOwnedClean = $true
+            foreach ($name in $phaseNames) {
+              $pair = $data[$name]
+              if ($null -eq $pair.verdict -or !(Valid-Count $pair.verdict.modelCalls 1000) -or
+                  !(Valid-Count $pair.verdict.providerCalls 1000)) {
+                $allMeasured = $false
+              } else {
+                $models += $pair.verdict.modelCalls
+                $providers += $pair.verdict.providerCalls
+              }
+              if ($pair.status -cne 'skipped' -and ($null -eq $pair.outcome -or $pair.outcome.clean -ne $true -or
+                  $pair.outcome.drained -ne $true -or $null -eq $pair.verdict -or $pair.verdict.removed -ne $true)) {
+                $allOwnedClean = $false
+              }
+            }
+            $image = $env:ImageVersion
+            if ($image -cnotmatch '^\d{8}(?:\.\d+){1,4}$') { $image = $null }
+            $nodeVersion = $null
+            $bunVersion = $null
+            $rustVersion = $null
+            if ($env:S2_BUILT -ceq 'true') { $nodeVersion = 'v22.23.1'; $bunVersion = '1.3.9'; $rustVersion = '1.92.0' }
+            $receipt = [ordered]@{
+              schemaVersion = 1
+              sourceSha = $env:S2_SOURCE_SHA
+              sourceTree = $env:S2_SOURCE_TREE
+              probeSha = $env:GITHUB_SHA
+              runId = $env:GITHUB_RUN_ID
+              runAttempt = 1
+              runnerImage = 'windows-2025'
+              runnerImageVersion = $image
+              arch = 'x64'
+              node = $nodeVersion; bun = $bunVersion; rust = $rustVersion
+              lockSha256 = (Hash-PinnedInput (Join-Path $Core 'package-lock.json') $env:S2_LOCK_SHA256)
+              workerSourceSha256 = (Hash-PinnedInput (Join-Path $Core 'native/windows-credential-worker/main.rs') $env:S2_WORKER_SOURCE_SHA256)
+              workerSha256 = (Hash-IfFile $worker)
+              npmWorkerSha256 = (Hash-IfFile $npmWorker)
+              sidecarWorkerSha256 = (Hash-IfFile $bunWorker)
+              bunSidecarSha256 = (Hash-IfFile $bunSidecar)
+              cases = $cases
+              handshakeExtraProcesses = $workers
+              modelCalls = $(if ($allMeasured) { $models } else { $null })
+              providerCalls = $(if ($allMeasured) { $providers } else { $null })
+              cleanup = 'unconfirmed'
+              qualification = 'hold'
+            }
+            try {
+              Remove-NetworkGuard
+              if ($allOwnedClean) {
+                # Work only on the exact, newly allocated job tree. The public receipt is outside this set.
+                foreach ($subdir in @('cases','core','pack','tools','npm-cache','fixtures')) {
+                  $target = Join-Path $Root $subdir
+                  if (Test-Path -LiteralPath $target) {
+                    if ((Get-Item -LiteralPath $target -Force).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) {
+                      throw 'Unexpected cleanup link'
+                    }
+                    Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
+                    if (Test-Path -LiteralPath $target) { throw 'Fixture cleanup incomplete' }
+                  }
+                }
+                $archive = Join-Path $Root 'core.tar'
+                if (Test-Path -LiteralPath $archive -PathType Leaf) { Remove-Item -LiteralPath $archive -Force }
+                $receipt.cleanup = 'confirmed'
+              }
+            } catch {
+              # Preserve the failure classification. The ephemeral hosted VM retires as a fallback.
+            }
+            $workflowCases = @($env:S2_CASE1_OUTCOME, $env:S2_CASE2_OUTCOME, $env:S2_CASE3_OUTCOME,
+              $env:S2_CASE4_OUTCOME, $env:S2_CASE5_OUTCOME)
+            $status = Combine-Status @($case1.status, $cases.case2, $cases.case3, $cases.case4, $cases.case5)
+            if ($env:S2_MATERIALIZE_OUTCOME -ceq 'failure' -or $status -ceq 'fail' -or 'failure' -cin $workflowCases -or
+                ($allMeasured -and ($models -ne 0 -or $providers -ne 0))) {
+              $receipt.qualification = 'fail'
+            } elseif ($env:S2_MATERIALIZE_OUTCOME -ceq 'success' -and $env:S2_BUILT -ceq 'true' -and
+                $receipt.lockSha256 -ceq $env:S2_LOCK_SHA256 -and $receipt.workerSourceSha256 -ceq $env:S2_WORKER_SOURCE_SHA256 -and
+                $allMeasured -and $status -ceq 'pass' -and
+                @($workflowCases | Where-Object { $_ -ceq 'success' }).Count -eq 5 -and
+                $receipt.cleanup -ceq 'confirmed' -and $null -ne $image -and
+                $null -ne $receipt.workerSha256 -and $receipt.workerSha256 -ceq $receipt.npmWorkerSha256 -and
+                $receipt.workerSha256 -ceq $receipt.sidecarWorkerSha256 -and $null -ne $receipt.bunSidecarSha256) {
+              $receipt.qualification = 'pass'
+            }
+            Write-Json (Join-Path $Evidence 'receipt.json') $receipt
+          }
+
+          try {
+            switch ($Phase) {
+              'Prepare' { Enable-NetworkGuard }
+              'Case1' {
+                $nodePassed = Run-Phase 'round-node' 105000
+                $bunPassed = Run-Phase 'round-bun' 105000
+                if (!$nodePassed -or !$bunPassed -or (Read-Phase 'round-node').outcome.isolation -ne $true) { exit 1 }
+              }
+              'Case2' { if (!(Run-Phase 'queue' 155000)) { exit 1 } }
+              'Case3' { if (!(Run-Phase 'crash' 150000)) { exit 1 } }
+              'Case4' { if (!(Run-Phase 'native' 135000)) { exit 1 } }
+              'Case5' {
+                foreach ($name in @('handshake-node','handshake-bun','calibrate-node','calibrate-bun')) {
+                  if (!(Run-Phase $name 28000)) { exit 1 }
+                }
+                if ((Worker-Count (Read-Phase 'handshake-node')) -ne 0 -or (Worker-Count (Read-Phase 'handshake-bun')) -ne 0 -or
+          '@
+          $utf8 = [Text.UTF8Encoding]::new($false, $true)
+          $expressionStart = [string]::Concat([char]36, '{{')
+          if ($source.Contains($expressionStart) -or $source -match "(?m)^'@") { throw 'Invalid fixture delimiter' }
+          $source = ($source -replace '\r\n?', [string][char]10) + [char]10
+          $file = Join-Path $env:S2_FIXTURES 'drive.ps1'
+          if (Test-Path -LiteralPath $file) { throw 'Fixture target already exists' }
+          [IO.File]::WriteAllText($file, $source, $utf8)
+
+      - name: Assemble drive.ps1 part 2
+        run: |
+          $source = @'
+                    (Worker-Count (Read-Phase 'calibrate-node')) -ne 1 -or (Worker-Count (Read-Phase 'calibrate-bun')) -ne 1) { exit 1 }
+              }
+              'Finalize' { Seal-Receipt }
+            }
+            exit 0
+          } catch {
+            # No dynamic value may reach workflow logs. A missing verdict is reported as unconfirmed.
+            exit 91
+          }
+          '@
+          $utf8 = [Text.UTF8Encoding]::new($false, $true)
+          $expressionStart = [string]::Concat([char]36, '{{')
+          if ($source.Contains($expressionStart) -or $source -match "(?m)^'@") { throw 'Invalid fixture delimiter' }
+          $source = ($source -replace '\r\n?', [string][char]10) + [char]10
+          $file = Join-Path $env:S2_FIXTURES 'drive.ps1'
+          if ((Get-Item -LiteralPath $file).Length -ne 14494) { throw 'Fixture chunk offset differs' }
+          [IO.File]::AppendAllText($file, $source, $utf8)
+
+      - name: Assemble verify.mjs part 1
+        run: |
+          $source = @'
+          // Runs as the ordinary disposable Windows account. Its only durable output is a fixed form verdict.
+          import { spawn, spawnSync } from "node:child_process";
+          import { createDecipheriv, createHash, randomBytes } from "node:crypto";
+          import { once } from "node:events";
+          import fs from "node:fs";
+          import { createServer } from "node:http";
+          import { createRequire } from "node:module";
+          import path from "node:path";
+          import { setTimeout as sleep } from "node:timers/promises";
+          import { pathToFileURL } from "node:url";
+
+          process.on("uncaughtException", () => process.exit(93));
+          process.on("unhandledRejection", () => process.exit(93));
+
+          function prove(value, label) {
+            if (!value) throw new Error(label);
+          }
+          const [root, scratch, phase] = process.argv.slice(2);
+          const phases = ["round-node", "round-bun", "queue", "crash", "native",
+            "handshake-node", "handshake-bun", "calibrate-node", "calibrate-bun"];
+          prove(process.platform === "win32" && process.arch === "x64" && phases.includes(phase), "fixture platform");
+          prove(path.resolve(scratch) === path.resolve(root, "cases", phase), "fixture root");
+          const core = path.join(root, "core");
+          const fixtures = path.join(root, "fixtures");
+          const native = path.join(fixtures, "s2-fixture.exe");
+          const npmRoot = path.join(core, "npm-entry", "package");
+          const npmWorker = path.join(npmRoot, "dist", "native", "win32-x64", "hara-credential-worker.exe");
+          const bun = path.join(core, "dist", "bin", "hara.exe");
+          const bunWorker = path.join(path.dirname(bun), "hara-credential-worker.exe");
+          const wsRequire = createRequire(path.join(core, "package.json"));
+          const { WebSocket } = wsRequire("ws");
+          const load = relative => import(pathToFileURL(path.join(core, "dist", "workspace", relative)).href);
+          const { AsyncWindowsDpapiCredentialVault } = await load("windows-credential-vault.js");
+          const { canonical } = await load("local-state.js");
+          const hostProgram = process.execPath;
+          const baseEnv = Object.fromEntries(["SystemRoot", "WINDIR", "LOCALAPPDATA", "APPDATA",
+            "USERPROFILE", "TEMP", "TMP", "PATH"].map(name => [name, process.env[name]]));
+          const sensitive = new Set([scratch, process.env.USERPROFILE, process.env.S2_EXPECT_SID]);
+          const output = [];
+          const ownChildren = new Set();
+          let observedBytes = 0;
+          let localData;
+          let sink;
+          let providerCalls = 0;
+          let listening = false;
+          let point = "identity";
+          let result = "fail";
+
+          function sha(bytes) { return createHash("sha256").update(bytes).digest("hex"); }
+          function read(file, limit) {
+            const info = fs.lstatSync(file);
+            prove(info.isFile() && info.size <= limit, "bounded file");
+            const bytes = fs.readFileSync(file);
+            prove(bytes.length <= limit, "bounded growth");
+            return bytes;
+          }
+          const json = file => JSON.parse(read(file, 4 * 1024 * 1024).toString("utf8"));
+          function capture(bytes) {
+            observedBytes += bytes.length;
+            prove(observedBytes <= 2 * 1024 * 1024, "bounded output");
+            output.push(Buffer.from(bytes));
+          }
+          function hasSensitive(bytes) {
+            for (const value of sensitive) {
+              if (!value) continue;
+              const variants = [value, value.replaceAll("\\", "/"), JSON.stringify(value).slice(1, -1)];
+              for (const part of new Set(variants)) {
+                if (bytes.includes(Buffer.from(part)) || bytes.includes(Buffer.from(part, "utf16le"))) return true;
+                if (/^[A-Za-z]:[\\/]/.test(part) && bytes.toString("utf8").toLowerCase().includes(part.toLowerCase())) return true;
+              }
+            }
+            return false;
+          }
+          function launch(program, args, env = baseEnv) {
+            const child = spawn(program, args, { cwd: scratch, env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+            const done = new Promise(resolve => child.once("close", (code, signal) => {
+              ownChildren.delete(child);
+              resolve({ code, signal });
+            }));
+            ownChildren.add(child);
+            child.on("error", () => {});
+            child.stdin.on("error", () => {});
+            child.stderr.on("data", chunk => capture(chunk));
+            child.stdout.on("data", chunk => capture(chunk));
+            return { child, done, async stop() {
+              if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+              return deadline(done, 8_000);
+            } };
+          }
+          function run(program, args, env = baseEnv) {
+            const outcome = spawnSync(program, args, { cwd: scratch, env, windowsHide: true,
+              timeout: 22_000, maxBuffer: 131_072, encoding: "utf8" });
+            if (outcome.stderr) capture(Buffer.from(outcome.stderr));
+            prove(outcome.status === 0 && !outcome.error, "owned helper failed");
+            return outcome.stdout;
+          }
+          const nativeEnv = { ...baseEnv, S2_EXPECT_SID: process.env.S2_EXPECT_SID, GITHUB_ACTIONS: "true" };
+          async function deadline(promise, ms) {
+            let timer;
+            try {
+              const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("fixture deadline")), ms); });
+              return await Promise.race([promise, timeout]);
+            } finally { clearTimeout(timer); }
+          }
+          async function until(fn, ms = 9_000) {
+            const end = performance.now() + ms;
+            while (performance.now() < end) {
+              const value = fn();
+              if (value) return value;
+              await sleep(12);
+            }
+            throw new Error("fixture event not observed");
+          }
+          function alive(pid) {
+            try { process.kill(pid, 0); return true; }
+            catch (error) { prove(error.code === "ESRCH", "process liveness unavailable"); return false; }
+          }
+          function mint() {
+            const value = "s2-synthetic-" + randomBytes(24).toString("hex");
+            sensitive.add(value);
+            return value;
+          }
+          const methods = new Set(["initialize", "workspace.credentialStorage.get", "workspace.create", "workspace.list",
+            "workspace.snapshot", "workspace.connection.add", "workspace.connection.edit", "workspace.connection.revoke",
+            "workspace.connection.cleanup"]);
+          async function rpc(port) {
+            const socket = new WebSocket("ws://127.0.0.1:" + port, { maxPayload: 131_072, handshakeTimeout: 8_000 });
+            const pending = new Map();
+            let id = 0;
+            socket.on("error", () => {});
+            socket.on("close", () => { for (const row of pending.values()) row.reject(new Error("fixture Host closed")); });
+            socket.on("message", bytes => {
+              const frame = JSON.parse(bytes.toString("utf8"));
+              if (frame.error) capture(Buffer.from(JSON.stringify(frame.error)));
+              pending.get(frame.id)?.resolve(frame);
+            });
+            try { await deadline(once(socket, "open"), 8_500); } catch (error) { socket.terminate(); throw error; }
+            const call = async (method, params) => {
+              prove(methods.has(method), "RPC allowlist");
+              const requestId = ++id;
+              const response = new Promise((resolve, reject) => pending.set(requestId, { resolve, reject }));
+              try {
+                socket.send(JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params }));
+                return await deadline(response, 34_000);
+              } finally { pending.delete(requestId); }
+            };
+            return { call, close() { socket.terminate(); }, async ok(method, params = {}) {
+              const packet = await call(method, params);
+              prove(!packet.error && Object.hasOwn(packet, "result"), "expected RPC success");
+              return packet.result;
+            } };
+          }
+          function prefix(dir, filename) { return path.join(dir, ...filename.split("/")); }
+          function makeLane(name, legacy = false) {
+            const parent = path.join(scratch, name);
+            fs.mkdirSync(parent);
+            const subdir = dir => {
+              const candidate = path.join(parent, dir);
+              fs.mkdirSync(candidate);
+              return fs.realpathSync.native(candidate);
+            };
+            const lane = {
+              root: subdir("workspace"), home: subdir("host-home"), discovery: subdir("discovery"),
+              legacy: subdir("legacy"), observe: subdir("observer"),
+            };
+            if (legacy) {
+              fs.mkdirSync(prefix(lane.legacy, ".hara/memory"), { recursive: true });
+              fs.writeFileSync(prefix(lane.legacy, ".hara/memory/s2-probe.md"), "Synthetic Windows vault backup control\n");
+            }
+            lane.namespace = sha("hara-host-home-v1\0" + lane.home.replaceAll("/", "\\"));
+            lane.vaultDir = path.join(localData, "Hara", "credential-vault", "v1", lane.namespace);
+            lane.cipher = ref => path.join(lane.vaultDir, sha(ref) + ".bin");
+            return lane;
+          }
+          async function start(lane, launchBun = false, observe = false) {
+            const args = launchBun ? [] : [path.join(npmRoot, "runtime-bootstrap.cjs")];
+            const env = {
+              ...baseEnv, HARA_WORKSPACE_HOST_HOME: lane.home, HOME: baseEnv.USERPROFILE,
+              HARA_WORKSPACE_DISCOVERY_HOME: lane.discovery, HARA_WORKSPACE_LEGACY_SOURCE_HOME: lane.legacy,
+              CI: "true", NO_COLOR: "1",
+            };
+            if (observe) {
+              prove(!launchBun, "observer Node only");
+              args.unshift("--import", path.join(fixtures, "observe-node.mjs"));
+              env.S2_OBSERVE = lane.observe;
+              env.S2_EXPECT_WORKER = npmWorker;
+              mode(lane, "baseline", "normal");
+            }
+            const proc = launch(launchBun ? bun : hostProgram, [...args, "workspace", "serve", "--root", lane.root, "--port", "0"], env);
+            const receipt = prefix(lane.root, "home/.hara/workspace-runtime/serve-v2.json");
+            const ready = await until(() => {
+              prove(proc.child.exitCode === null, "Host exit before readiness");
+              if (!fs.existsSync(receipt)) return false;
+              const result = json(receipt);
+              return result.pid === proc.child.pid && result;
+            }, 22_000);
+            prove(ready.capability === "workspace.v1" && Number.isSafeInteger(ready.port) &&
+              ready.port > 0 && ready.port <= 65_535 && /^[a-f0-9]{64}$/.test(ready.token), "Host receipt");
+            sensitive.add(ready.token);
+            const conn = await rpc(ready.port);
+            return { ...conn, pid: proc.child.pid, async stop() { conn.close(); return proc.stop(); },
+              async init() { return conn.ok("initialize", { token: ready.token }); } };
+          }
+          const descriptor = host => host.ok("workspace.credentialStorage.get");
+          function selectFields(snapshot) {
+            return { workspaceId: snapshot.workspaceId, expectedGeneration: snapshot.resourceGeneration,
+              expectedRevision: snapshot.connections.revision };
+          }
+          const snapshot = (host, workspaceId) => host.ok("workspace.snapshot", { workspaceId, agentId: null });
+          async function create(host) {
+            const index = await host.ok("workspace.list");
+            return (await host.ok("workspace.create", { label: "S2 synthetic", expectedRevision: index.revision })).workspaceId;
+          }
+          function input(key) {
+            return { label: "S2 synthetic", provider: "openai", baseURL: "http://127.0.0.1:" + sink.address().port + "/v1",
+              defaultModel: "s2-offline-fixture", ...(key === undefined ? {} : { apiKey: key }) };
+          }
+          const add = (host, snap, key) => host.ok("workspace.connection.add", { ...selectFields(snap), input: input(key) });
+          const edit = (host, snap, connectionId, key) => host.ok("workspace.connection.edit",
+            { ...selectFields(snap), connectionId, input: input(key) });
+          const rawAdd = (host, snap, key) => host.call("workspace.connection.add", { ...selectFields(snap), input: input(key) });
+          const cleanup = (host, snap) => host.call("workspace.connection.cleanup", { ...selectFields(snap), approved: true });
+          function expectError(packet, code, retry = "explicit_user_only") {
+            const error = packet.error;
+            prove(error?.code === -32602 && error.data?.domain === "credential-vault"
+              && error.data.code === code && error.data.retry === retry, "credential error contract");
+          }
+          function state(lane, id) {
+            const base = prefix(lane.root, "home/.hara/workspace-data/v1");
+            const dirs = fs.readdirSync(base).filter(x => /^[a-z0-9_-]{1,96}$/.test(x));
+            const entries = dirs.filter(x => json(path.join(base, x, "scope.json")).scope.workspaceId === id);
+            prove(entries.length === 1, "exact workspace binding");
+            return path.join(base, entries[0], "state", ".hara");
+          }
+          function config(lane, id) { return json(path.join(state(lane, id), "workspace-connections-v2.json")); }
+          function row(lane, id, connectionId) {
+            const record = config(lane, id).connections.find(item => item.id === connectionId);
+            prove(record && typeof record.keyRef === "string", "stored referent");
+            sensitive.add(record.keyRef);
+            for (const ref of record.retiredKeyRefs ?? []) sensitive.add(ref);
+            return record;
+          }
+          function intent(lane, id) {
+            const journal = json(path.join(state(lane, id), "workspace-credential-intents-v1.json"));
+            prove(journal.intents.length === 1 && journal.intents[0].refs.length === 1, "exact write intent");
+            sensitive.add(journal.intents[0].refs[0]);
+            return journal.intents[0];
+          }
+          function vault(lane) {
+            return new AsyncWindowsDpapiCredentialVault(lane.home, {
+              path: npmWorker, sha256: sha(read(npmWorker, 16 * 1024 * 1024)), protocolVersion: 2,
+            });
+          }
+          function ciphertext(lane, ref) {
+            const raw = read(lane.cipher(ref), 65_536);
+            prove(raw.length > 0 && !hasSensitive(raw), "no plaintext in ciphertext file");
+            return sha(raw);
+          }
+          function metadataBytes(lane, id) {
+            const folder = state(lane, id);
+            for (const name of fs.readdirSync(folder).filter(x => /^workspace-(connections|credential-intents|legacy-source-backup).*\.json$/.test(x))) {
+              const contents = read(path.join(folder, name), 4 * 1024 * 1024);
+              for (const key of sensitive) if (key?.startsWith("s2-synthetic-")) prove(!contents.includes(Buffer.from(key)), "Key on disk");
+            }
+          }
+          function mode(lane, ticket, action) { fs.writeFileSync(path.join(lane.observe, "mode.json"), JSON.stringify({ ticket, action })); }
+          function events(lane, ticket) {
+            const file = path.join(lane.observe, "events.jsonl");
+            if (!fs.existsSync(file)) return [];
+            const contents = read(file, 262_144).toString("utf8");
+            const rows = contents.split("\n");
+            rows.pop();
+            return rows.filter(Boolean).map(line => JSON.parse(line)).filter(x => x.ticket === ticket);
+          }
+          function release(lane, ticket, gate) { fs.writeFileSync(path.join(lane.observe, ticket + "-" + gate), "", { flag: "wx" }); }
+          const findEvent = (lane, ticket, stage, op, status) => until(() => events(lane, ticket).find(e =>
+            e.stage === stage && e.op === op && (status === undefined || e.status === status)));
+          async function companion(command, ...args) {
+            const held = launch(native, [command, ...args], nativeEnv);
+            let ready = "";
+            held.child.stdout.on("data", chunk => { ready += chunk.toString("utf8"); prove(ready.length <= 6, "companion frame"); });
+            await until(() => {
+              prove(held.child.exitCode === null, "companion premature exit");
+              return ready === "ready\n";
+            });
+            return async () => {
+          '@
+          $utf8 = [Text.UTF8Encoding]::new($false, $true)
+          $expressionStart = [string]::Concat([char]36, '{{')
+          if ($source.Contains($expressionStart) -or $source -match "(?m)^'@") { throw 'Invalid fixture delimiter' }
+          $source = ($source -replace '\r\n?', [string][char]10) + [char]10
+          $file = Join-Path $env:S2_FIXTURES 'verify.mjs'
+          if (Test-Path -LiteralPath $file) { throw 'Fixture target already exists' }
+          [IO.File]::WriteAllText($file, $source, $utf8)
+
+      - name: Assemble verify.mjs part 2
+        run: |
+          $source = @'
+              held.child.stdin.end(Buffer.from([1]));
+              prove((await deadline(held.done, 9_000)).code === 0, "companion released");
+            };
+          }
+
+          async function roundtrip(asBun) {
+            const lane = makeLane("roundtrip");
+            let host = await start(lane, asBun);
+            const opened = await host.init();
+            prove(opened.credentialStorage.state === "not_checked", "initial vault descriptor");
+            const workspace = await create(host), first = await snapshot(host, workspace);
+            const key = mint();
+            await add(host, first, key);
+            let before = await snapshot(host, workspace);
+            const connectionId = before.connections.connections[0].id;
+            const refA = row(lane, workspace, connectionId).keyRef;
+            prove(before.connections.revision > first.connections.revision && before.connections.connections[0].keySaved, "published snapshot");
+            prove((await descriptor(host)).state === "ready", "ready after save");
+            ciphertext(lane, refA);
+            const check = vault(lane);
+            prove(await check.get(refA) === key, "initial real vault read");
+            metadataBytes(lane, workspace);
+            await host.stop();
+
+            host = await start(lane, asBun);
+            await host.init();
+            const preserved = await snapshot(host, workspace);
+            prove(preserved.connections.revision === before.connections.revision, "durable revision");
+            await edit(host, preserved, connectionId);
+            before = await snapshot(host, workspace);
+            const refB = row(lane, workspace, connectionId).keyRef;
+            prove(refB !== refA && await check.get(refB) === key && await check.get(refA) === undefined, "restart readback and retire");
+            const replacement = mint();
+            await edit(host, before, connectionId, replacement);
+            const rotated = await snapshot(host, workspace);
+            const refC = row(lane, workspace, connectionId).keyRef;
+            prove(refC !== refB && refC !== refA && await check.get(refC) === replacement && await check.get(refB) === undefined,
+              "rotation uses a fresh ref");
+            prove(rotated.connections.revision > before.connections.revision, "rotation revision");
+            await host.ok("workspace.connection.revoke", { ...selectFields(rotated), connectionId });
+            const revoked = await snapshot(host, workspace);
+            prove(revoked.connections.revision > rotated.connections.revision &&
+              revoked.connections.connections[0].status === "revoked" && !revoked.connections.connections[0].keySaved &&
+              await check.get(refC) === undefined, "revocation retained and cleaned");
+            metadataBytes(lane, workspace);
+            await host.stop();
+            if (!asBun) run(native, ["identity", scratch], nativeEnv);
+          }
+
+          async function queued() {
+            const lane = makeLane("queue");
+            const host = await start(lane, false, true);
+            await host.init();
+            const first = await create(host), second = await create(host);
+            await add(host, await snapshot(host, first), mint());
+            const firstSnap = await snapshot(host, first);
+            const secondSnap = await snapshot(host, second);
+            const oldId = firstSnap.connections.connections[0].id;
+            point = "queue";
+            mode(lane, "read-gate", "hold-read");
+            const readEdit = edit(host, firstSnap, oldId);
+            readEdit.catch(() => {});
+            const heldRead = await findEvent(lane, "read-gate", "held-input", 1);
+            const write = add(host, secondSnap, mint());
+            write.catch(() => {});
+            await sleep(180);
+            prove(alive(heldRead.pid) && events(lane, "read-gate").filter(e => e.stage === "spawn").length === 1,
+              "only the first worker while its read is pending");
+            release(lane, "read-gate", "input");
+            await Promise.all([readEdit, write]);
+            const queueTrace = events(lane, "read-gate");
+            const readClose = queueTrace.findIndex(e => e.id === heldRead.id && e.stage === "close-delivered");
+            const secondSpawn = queueTrace.findIndex(e => e.id !== heldRead.id && e.stage === "spawn");
+            prove(readClose >= 0 && secondSpawn > readClose, "second dispatch follows first drain");
+
+            point = "retry";
+            const retrySnap = await snapshot(host, second);
+            mode(lane, "retry", "retry-slow");
+            const unlock = await companion("lock", path.join(lane.vaultDir, "store.lock"));
+            const retried = add(host, retrySnap, mint());
+            retried.catch(() => {});
+            await findEvent(lane, "retry", "native-close", 2, 7);
+            await unlock();
+            release(lane, "retry", "busy");
+            await retried;
+            const rr = events(lane, "retry");
+            const busy = rr.find(e => e.stage === "native-close" && e.status === 7);
+            const slow = rr.find(e => e.stage === "native-close" && e.status === 0);
+            const settled = rr.find(e => e.stage === "close-delivered" && e.id === slow?.id);
+            const sent = rr.filter(e => e.stage === "frame");
+            prove(busy && slow && settled && sent.length === 2 && sent[1].time - sent[0].time < 1_000 &&
+              settled.time - slow.time >= 1_250, "pre-lock retry with slow confirmation");
+
+            const blocked = await snapshot(host, second);
+            mode(lane, "bounded-busy", "normal");
+            const releaseBusy = await companion("lock", path.join(lane.vaultDir, "store.lock"));
+            const started = performance.now();
+            try {
+              expectError(await rawAdd(host, blocked, mint()), "unavailable");
+              const tries = events(lane, "bounded-busy").filter(e => e.stage === "native-close");
+              prove(tries.length >= 1 && tries.length <= 3 && tries.every(e => e.status === 7) &&
+                performance.now() - started < 5_000, "bounded pre-lock rejection");
+            } finally { await releaseBusy(); }
+            prove((await snapshot(host, second)).connections.revision === blocked.connections.revision, "busy did not publish");
+
+            point = "uncertain";
+            mode(lane, "unknown", "lose-ack");
+            const lost = mint();
+            expectError(await rawAdd(host, blocked, lost), "write_unconfirmed", "readback_only");
+            const original = intent(lane, second);
+            const uncertainEvents = events(lane, "unknown").filter(e => e.stage === "frame");
+            prove(uncertainEvents.length === 1 && uncertainEvents[0].op === 2 && original.state === "cleanupPending" &&
+              (await snapshot(host, second)).connections.revision === blocked.connections.revision, "unknown write not replayed or published");
+            prove(await vault(lane).get(original.refs[0]) === lost, "read back only the uncertain ref");
+            prove((await cleanup(host, blocked)).result?.cleaned === true, "cleanup uncertain test ref");
+            prove(await vault(lane).get(original.refs[0]) === undefined, "uncertain ref retired");
+
+            point = "live-drain";
+            mode(lane, "alive", "hold-live");
+            const waiting = rawAdd(host, blocked, mint());
+            waiting.catch(() => {});
+            const held = await findEvent(lane, "alive", "held-input", 2);
+            const resume = await companion("pause", String(held.pid), npmWorker);
+            try {
+              expectError(await waiting, "write_unconfirmed", "readback_only");
+              prove(alive(held.pid), "actual worker persisted");
+              const follow = rawAdd(host, blocked, mint());
+              expectError(await follow, "unavailable");
+              const trace = events(lane, "alive");
+              prove(alive(held.pid) && trace.filter(e => e.stage === "spawn").length === 1 &&
+                !trace.some(e => e.stage === "frame"), "later request wrote no frame");
+              prove((await descriptor(host)).state === "unavailable", "unavailable during actual drain");
+            } finally { await resume(); }
+            prove((await cleanup(host, blocked)).result?.cleaned === true, "released live ref recovered");
+            metadataBytes(lane, second);
+            await host.stop();
+          }
+
+          async function crashRecovery() {
+            const lane = makeLane("recovery", true);
+            let host = await start(lane, false, true);
+            const initialized = await host.init();
+            prove(initialized.workspace.inheritance.state === "verified" && initialized.workspace.workspaces.length === 1,
+              "synthetic source inherited");
+            const workspace = initialized.workspace.workspaces[0].workspaceId;
+            const key = mint();
+            await add(host, await snapshot(host, workspace), key);
+            const baseline = await snapshot(host, workspace);
+            const first = row(lane, workspace, baseline.connections.connections[0].id);
+            const beforeCipher = ciphertext(lane, first.keyRef);
+            const backupFile = path.join(state(lane, workspace), "workspace-legacy-source-backup-v1.json");
+            const backupBytes = read(backupFile, 4 * 1024 * 1024);
+            const backup = JSON.parse(backupBytes);
+            sensitive.add(backup.keyRef);
+            const backupCipher = ciphertext(lane, backup.keyRef);
+            const check = vault(lane);
+
+            async function checkPreserved() {
+              const current = await snapshot(host, workspace);
+              prove(current.connections.revision === baseline.connections.revision && current.connections.connections[0].keySaved &&
+                row(lane, workspace, first.id).keyRef === first.keyRef, "published metadata preserved");
+              prove(ciphertext(lane, first.keyRef) === beforeCipher && await check.get(first.keyRef) === key, "published Key preserved");
+              const raw = read(backupFile, 4 * 1024 * 1024);
+              prove(raw.equals(backupBytes) && ciphertext(lane, backup.keyRef) === backupCipher, "backup bytes preserved");
+              const wrapping = await check.get(backup.keyRef);
+              prove(typeof wrapping === "string" && /^[a-f0-9]{64}$/.test(wrapping), "real backup wrapping Key");
+              sensitive.add(wrapping);
+              prove(!raw.includes(Buffer.from(wrapping)), "wrapping Key absent from backup");
+              const secret = Buffer.from(wrapping, "hex");
+              const decipher = createDecipheriv("aes-256-gcm", secret, Buffer.from(backup.iv, "hex"));
+              secret.fill(0);
+              decipher.setAAD(Buffer.from(canonical(backup.resourceBinding)));
+              decipher.setAuthTag(Buffer.from(backup.tag, "hex"));
+              const decoded = Buffer.concat([decipher.update(Buffer.from(backup.ciphertext, "base64")), decipher.final()]);
+              try {
+                const value = JSON.parse(decoded);
+                prove(value.memories.some(item => item.content === "Synthetic Windows vault backup control\n"), "actual backup opens");
+              } finally { decoded.fill(0); }
+              return current;
+            }
+            await checkPreserved();
+            point = "post-write-crash";
+            mode(lane, "publish-gap", "hold-ack");
+            const orphanKey = mint();
+            const interrupted = rawAdd(host, baseline, orphanKey);
+            interrupted.catch(() => {});
+            const ack = await findEvent(lane, "publish-gap", "native-close", 2, 0);
+            const staged = intent(lane, workspace);
+            const ref = staged.refs[0];
+            const spawned = events(lane, "publish-gap").find(e => e.stage === "spawn" && e.id === ack.id);
+            prove(staged.state === "pending" && staged.ownerPid === host.pid && staged.workerPid === spawned?.pid &&
+              !staged.writeSettled && ref !== first.keyRef && ref !== backup.keyRef, "durable intent before publication");
+            ciphertext(lane, ref);
+            prove(await check.get(ref) === orphanKey && !alive(staged.workerPid), "real acknowledged write without publication");
+            prove((await snapshot(host, workspace)).connections.revision === baseline.connections.revision &&
+              !events(lane, "publish-gap").some(e => e.stage === "close-delivered"), "metadata stayed old before termination");
+            await host.stop();
+            await interrupted.catch(() => {});
+            host = await start(lane, false, true);
+            await host.init();
+            let reopened = await snapshot(host, workspace);
+            prove(reopened.connections.cleanupPending && intent(lane, workspace).state === "cleanupPending", "recovered orphan intent");
+            prove((await cleanup(host, reopened)).result?.cleaned === true && await check.get(ref) === undefined, "removed only committed orphan");
+            await checkPreserved();
+
+            point = "live-crash";
+            mode(lane, "live-gap", "hold-live");
+            const inFlight = rawAdd(host, reopened, mint());
+            inFlight.catch(() => {});
+            const held = await findEvent(lane, "live-gap", "held-input", 2);
+            const liveIntent = intent(lane, workspace);
+            prove(liveIntent.workerPid === held.pid && liveIntent.ownerPid === host.pid && liveIntent.state === "pending", "live writer durable");
+            const resume = await companion("pause", String(held.pid), npmWorker);
+            try {
+              // The intentionally suspended worker retains inherited pipes after the Host exits.
+              const killed = host.stop();
+              killed.catch(() => {});
+              await until(() => !alive(liveIntent.ownerPid));
+              await inFlight.catch(() => {});
+              prove(alive(held.pid), "owner gone while worker lives");
+              host = await start(lane, false, true);
+              await host.init();
+              reopened = await snapshot(host, workspace);
+              prove(reopened.connections.cleanupPending, "live orphan detected");
+              expectError(await cleanup(host, reopened), "cleanup_unconfirmed");
+              const saved = intent(lane, workspace);
+              prove(saved.id === liveIntent.id && saved.workerPid === held.pid && alive(held.pid), "live intent retained");
+            } finally { await resume(); }
+            prove((await cleanup(host, reopened)).result?.cleaned === true, "exact cleanup after proven exit");
+            prove(await check.get(liveIntent.refs[0]) === undefined && !alive(held.pid), "released uncommitted ref absent");
+            await checkPreserved();
+            metadataBytes(lane, workspace);
+            await host.stop();
+          }
+
+          async function nativeNegatives() {
+            for (const name of ["ancestor_handles_block_directory_replacement_during_actual_io",
+              "pre_lock_busy_and_pending_quota_preserve_the_committed_credential"]) {
+              const result = run(path.join(fixtures, "vault-native-tests.exe"),
+                ["--exact", "windows::tests::" + name, "--test-threads=1"], nativeEnv);
+              prove(result.includes("running 1 test") && /test result: ok\. 1 passed; 0 failed/.test(result), "exact native case");
+              capture(Buffer.from(result));
+            }
+            const lane = makeLane("native");
+            const host = await start(lane);
+            await host.init();
+            const workspace = await create(host);
+            const key = mint();
+            await add(host, await snapshot(host, workspace), key);
+            const saved = await snapshot(host, workspace);
+            const { keyRef } = row(lane, workspace, saved.connections.connections[0].id);
+            const encrypted = ciphertext(lane, keyRef);
+            const unchanged = async () => {
+              prove((await snapshot(host, workspace)).connections.revision === saved.connections.revision &&
+                ciphertext(lane, keyRef) === encrypted && await vault(lane).get(keyRef) === key, "protected control preserved");
+            };
+
+            point = "junction";
+            const junction = path.join(scratch, "junction");
+            fs.symlinkSync(localData, junction, "junction");
+            try {
+              run(native, ["folder", scratch, "junction"], nativeEnv);
+          '@
+          $utf8 = [Text.UTF8Encoding]::new($false, $true)
+          $expressionStart = [string]::Concat([char]36, '{{')
+          if ($source.Contains($expressionStart) -or $source -match "(?m)^'@") { throw 'Invalid fixture delimiter' }
+          $source = ($source -replace '\r\n?', [string][char]10) + [char]10
+          $file = Join-Path $env:S2_FIXTURES 'verify.mjs'
+          if ((Get-Item -LiteralPath $file).Length -ne 13990) { throw 'Fixture chunk offset differs' }
+          [IO.File]::AppendAllText($file, $source, $utf8)
+
+      - name: Assemble verify.mjs part 3
+        run: |
+          $source = @'
+              expectError(await rawAdd(host, saved, mint()), "unavailable");
+              prove((await descriptor(host)).reason === "host_binding_unavailable", "known-folder boundary");
+            } finally {
+              run(native, ["folder", scratch, "restore"], nativeEnv);
+              prove(fs.lstatSync(junction).isSymbolicLink(), "remove junction itself");
+              fs.unlinkSync(junction);
+            }
+            await unchanged();
+
+            point = "acl";
+            const icacls = path.join(baseEnv.SystemRoot, "System32", "icacls.exe");
+            // Dynamic path stays in the private helper. This well-known group exists on localized images.
+            const file = lane.cipher(keyRef);
+            run(icacls, [file, "/grant", "*S-1-5-32-545:(R)"]);
+            try {
+              const editNoKey = await host.call("workspace.connection.edit", { ...selectFields(saved),
+                connectionId: saved.connections.connections[0].id, input: input() });
+              expectError(editNoKey, "access_denied");
+              prove((await descriptor(host)).reason === "access_denied", "descriptor after ACL rejection");
+            } finally { run(icacls, [file, "/remove:g", "*S-1-5-32-545"]); }
+            await unchanged();
+
+            point = "pending-quota";
+            async function pending(count, size) {
+              const files = [];
+              try {
+                for (let i = 0; i < count; i++) {
+                  const name = path.join(lane.vaultDir, randomBytes(16).toString("hex") + ".tmp");
+                  fs.writeFileSync(name, Buffer.alloc(size, 0xa5), { flag: "wx" });
+                  files.push(name);
+                }
+                const before = fs.readdirSync(lane.vaultDir).sort().join("\n");
+                expectError(await rawAdd(host, saved, mint()), "unavailable");
+                prove(fs.readdirSync(lane.vaultDir).sort().join("\n") === before, "credential and pending files unchanged");
+                await unchanged();
+              } finally { for (const name of files) fs.unlinkSync(name); }
+            }
+            await pending(64, 8);
+            await pending(1, 4 * 1024 * 1024);
+            metadataBytes(lane, workspace);
+            await host.stop();
+          }
+
+          async function handshake(asBun, positiveControl) {
+            const lane = makeLane("handshake");
+            prove(!fs.existsSync(lane.vaultDir), "fresh credential namespace");
+            const host = await start(lane, asBun);
+            const unauthorized = await host.call("workspace.credentialStorage.get", {});
+            prove(unauthorized.error?.code === -32001, "unauthenticated getter refused");
+            const initialized = await host.init();
+            const summary = await descriptor(host);
+            prove(JSON.stringify(initialized.credentialStorage) === JSON.stringify(summary) &&
+              summary.state === "not_checked" && summary.supported === true && summary.backend === "windows-dpapi" &&
+              summary.hostPlatform === "win32" && summary.arch === "x64" && summary.reason === null, "same read-only metadata descriptor");
+            prove(!fs.existsSync(path.join(localData, "Hara", "credential-vault")), "no native storage from handshake");
+            if (positiveControl) {
+              const workspace = await create(host);
+              await add(host, await snapshot(host, workspace), mint());
+              prove((await descriptor(host)).state === "ready" &&
+                fs.readdirSync(lane.vaultDir).filter(name => /^[a-f0-9]{64}\.bin$/.test(name)).length === 1, "positive worker control");
+            }
+            await host.stop();
+            if (!positiveControl) prove(!fs.existsSync(lane.vaultDir), "no post-handshake vault files");
+            // The supervisor checks the Windows Job process totals, including short-lived children.
+          }
+
+          let scrubbed = false;
+          let removed = false;
+          try {
+            // SHGetKnownFolderPath and the Windows token must match the actual redirected disposable profile.
+            localData = fs.realpathSync.native(path.join(scratch, "profile", "AppData", "Local"));
+            run(native, ["check", scratch], nativeEnv);
+            sensitive.add(localData);
+            sink = createServer((_request, response) => {
+              providerCalls++;
+              response.writeHead(503, { Connection: "close" });
+              response.end();
+            });
+            const up = once(sink, "listening");
+            sink.listen(0, "127.0.0.1");
+            await deadline(up, 5_000);
+            listening = true;
+            point = phase;
+            switch (phase) {
+              case "round-node": await roundtrip(false); break;
+              case "round-bun": await roundtrip(true); break;
+              case "queue": await queued(); break;
+              case "crash": await crashRecovery(); break;
+              case "native": await nativeNegatives(); break;
+              case "handshake-node": await handshake(false, false); break;
+              case "handshake-bun": await handshake(true, false); break;
+              case "calibrate-node": await handshake(false, true); break;
+              case "calibrate-bun": await handshake(true, true); break;
+            }
+            prove(providerCalls === 0, "zero provider attempts");
+            result = "pass";
+          } catch {
+            // Raw failures and keys stay in this process's bounded memory.
+          } finally {
+            try {
+              for (const child of ownChildren) {
+                if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+              }
+              await until(() => ownChildren.size === 0, 8_000);
+              if (listening) {
+                const closed = once(sink, "close");
+                sink.closeAllConnections();
+                sink.close();
+                await deadline(closed, 3_000);
+              }
+              const raw = Buffer.concat(output);
+              try { scrubbed = !hasSensitive(raw); } finally {
+                raw.fill(0);
+                for (const block of output) block.fill(0);
+              }
+              if (localData) {
+                run(native, ["check", scratch], nativeEnv);
+                if (phase === "native") prove(!fs.existsSync(path.join(scratch, "junction")), "junction removed");
+                const syntheticVault = path.join(localData, "Hara");
+                if (fs.existsSync(syntheticVault)) {
+                  const info = fs.lstatSync(syntheticVault);
+                  prove(info.isDirectory() && !info.isSymbolicLink(), "owned vault root");
+                  fs.rmSync(syntheticVault, { recursive: true, force: false, maxRetries: 3, retryDelay: 150 });
+                }
+                removed = !fs.existsSync(syntheticVault);
+              }
+            } catch { result = "fail"; }
+            if (!scrubbed || !removed || !listening || providerCalls !== 0) result = "fail";
+            const outputFile = path.join(scratch, "verdict.json");
+            fs.writeFileSync(outputFile, JSON.stringify({
+              result, point, providerCalls: listening ? providerCalls : null,
+              modelCalls: listening ? providerCalls : null, scrubbed, removed,
+            }), { flag: "wx" });
+            process.exitCode = result === "pass" ? 0 : 1;
+          }
+          '@
+          $utf8 = [Text.UTF8Encoding]::new($false, $true)
+          $expressionStart = [string]::Concat([char]36, '{{')
+          if ($source.Contains($expressionStart) -or $source -match "(?m)^'@") { throw 'Invalid fixture delimiter' }
+          $source = ($source -replace '\r\n?', [string][char]10) + [char]10
+          $file = Join-Path $env:S2_FIXTURES 'verify.mjs'
+          if ((Get-Item -LiteralPath $file).Length -ne 27971) { throw 'Fixture chunk offset differs' }
+          [IO.File]::AppendAllText($file, $source, $utf8)
+
+      - name: Assemble observe-node.mjs part 1
+        run: |
+          $source = @'
+          // This preload only wraps the pinned, real v2 worker spawned by a fixture Node Host.
+          import childProcess from "node:child_process";
+          import { syncBuiltinESMExports } from "node:module";
+          import fs from "node:fs";
+          import path from "node:path";
+
+          const dir = process.env.S2_OBSERVE;
+          const worker = process.env.S2_EXPECT_WORKER;
+          if (process.platform !== "win32" || !dir || !worker || !path.isAbsolute(dir) || !path.isAbsolute(worker)) {
+            throw new Error("S2 observer requires the isolated Windows test Host");
+          }
+          const expected = fs.realpathSync.native(worker).toLowerCase();
+          const originalSpawn = childProcess.spawn;
+          const list = ["normal", "hold-read", "retry-slow", "lose-ack", "hold-ack", "hold-live"];
+          let sequence = 0;
+          const used = new Set();
+          const modePath = path.join(dir, "mode.json");
+          const events = path.join(dir, "events.jsonl");
+
+          function mode() {
+            const stat = fs.lstatSync(modePath);
+            if (!stat.isFile() || stat.size > 256) throw new Error("Invalid S2 observer control");
+            const value = JSON.parse(fs.readFileSync(modePath, "utf8"));
+            if (!/^[a-z0-9-]{1,32}$/.test(value.ticket) || !list.includes(value.action)) {
+              throw new Error("Invalid S2 observer control");
+            }
+            return value;
+          }
+
+          function gate(file, perform) {
+            const deadline = performance.now() + 60_000;
+            const handle = setInterval(() => {
+              if (fs.existsSync(file)) {
+                clearInterval(handle);
+                perform();
+              } else if (performance.now() >= deadline) {
+                clearInterval(handle);
+                process.exit(91);
+              }
+            }, 10);
+          }
+
+          childProcess.spawn = function (program, ...args) {
+            if (typeof program !== "string" || path.basename(program).toLowerCase() !== "hara-credential-worker.exe") {
+              return originalSpawn.call(this, program, ...args);
+            }
+            if (fs.realpathSync.native(program).toLowerCase() !== expected) throw new Error("Unexpected S2 worker");
+            const control = mode();
+            const id = ++sequence;
+            const child = originalSpawn.call(this, program, ...args);
+            const write = (stage, data = {}) => fs.appendFileSync(events, JSON.stringify({
+              ticket: control.ticket, id, stage, time: performance.now(), ...data,
+            }) + "\n");
+            const release = name => path.join(dir, control.ticket + "-" + name);
+            const end = child.stdin.end.bind(child.stdin);
+            const emit = child.emit.bind(child);
+            const kill = child.kill.bind(child);
+            let held = false;
+            let op;
+            let sent = false;
+            let amount = 0;
+            const header = Buffer.alloc(27);
+            let nonce;
+            child.once("spawn", () => write("spawn", { pid: child.pid }));
+            child.stdin.end = (frame, complete) => {
+              if (!Buffer.isBuffer(frame) || frame.length < 59 || frame.toString("ascii", 4, 8) !== "HVQ2") {
+                throw new Error("Unexpected S2 request frame");
+              }
+              op = frame[8];
+              nonce = Buffer.from(frame.subarray(9, 25));
+              const run = () => {
+                if (child.stdin.destroyed) return;
+                sent = true;
+                write("frame", { op });
+                end(frame, complete);
+              };
+              const hold = (control.action === "hold-read" && op === 1) || (control.action === "hold-live" && op === 2);
+              if (hold && !used.has(control.ticket)) {
+                used.add(control.ticket);
+                held = true;
+                write("held-input", { op, pid: child.pid });
+                if (control.action === "hold-read") gate(release("input"), run);
+                return child.stdin;
+              }
+              run();
+              return child.stdin;
+            };
+            child.kill = signal => {
+              if (held && control.action === "hold-live") {
+                write("stop-requested");
+                return false;
+              }
+              return kill(signal);
+            };
+            child.stdout.on("data", chunk => {
+              if (amount < header.length) chunk.copy(header, amount, 0, Math.min(chunk.length, header.length - amount));
+              amount += chunk.length;
+            });
+            child.emit = (event, ...values) => {
+              if (event !== "close") return emit(event, ...values);
+              const [exitCode, exitSignal] = values;
+              const valid = sent && nonce && !exitSignal && exitCode === 0 && amount >= 27 && amount <= 65_600
+                && header.readUInt32LE(0) === amount - 4 && header.toString("ascii", 4, 8) === "HVR2"
+                && header.subarray(8, 24).equals(nonce);
+              const status = valid ? header[24] : null;
+              header.fill(0);
+              nonce?.fill(0);
+              write("native-close", { op: op ?? null, status });
+              const deliver = (code = exitCode) => {
+                write("close-delivered", { op: op ?? null, status });
+                emit("close", code, exitSignal);
+              };
+              if (control.action === "retry-slow" && op === 2) {
+                if (status === 7 && !used.has(control.ticket + "-busy")) {
+                  used.add(control.ticket + "-busy");
+                  gate(release("busy"), deliver);
+                  return true;
+                }
+                if (status === 0 && used.has(control.ticket + "-busy") && !used.has(control.ticket)) {
+                  used.add(control.ticket);
+                  setTimeout(deliver, 1_350);
+                  return true;
+                }
+              }
+              if (op === 2 && status === 0 && !used.has(control.ticket)) {
+                if (control.action === "lose-ack") {
+                  used.add(control.ticket);
+                  deliver(71);
+                  return true;
+                }
+                if (control.action === "hold-ack") {
+                  used.add(control.ticket);
+                  gate(release("ack"), deliver);
+                  return true;
+                }
+              }
+              deliver();
+              return true;
+            };
+            return child;
+          };
+          syncBuiltinESMExports();
+          '@
+          $utf8 = [Text.UTF8Encoding]::new($false, $true)
+          $expressionStart = [string]::Concat([char]36, '{{')
+          if ($source.Contains($expressionStart) -or $source -match "(?m)^'@") { throw 'Invalid fixture delimiter' }
+          $source = ($source -replace '\r\n?', [string][char]10) + [char]10
+          $file = Join-Path $env:S2_FIXTURES 'observe-node.mjs'
+          if (Test-Path -LiteralPath $file) { throw 'Fixture target already exists' }
+          [IO.File]::WriteAllText($file, $source, $utf8)
+
+      - name: Assemble native-fixture.rs part 1
+        run: |
+          $source = @'
+          // Test-only supervisor for a first-attempt GitHub-hosted Windows job.
+          use std::env;
+          use std::ffi::{c_void, OsStr};
+          use std::fs;
+          use std::io::{self, Read, Write};
+          use std::mem::{size_of, zeroed};
+          use std::os::windows::{ffi::{OsStrExt, OsStringExt}, fs::MetadataExt, process::CommandExt};
+          use std::path::{Path, PathBuf};
+          use std::process::{Command, Stdio};
+          use std::ptr::{null, null_mut};
+          use std::time::{Duration, Instant};
+
+          type Handle = *mut c_void;
+          const NO_WINDOW: u32 = 0x08000000;
+          const REPARSE: u32 = 0x400;
+          const JOB_KILL_ON_CLOSE: u32 = 0x2000;
+          const TOKEN_QUERY: u32 = 8;
+          const LOCAL_APP_DATA: Guid = Guid { a: 0xf1b32785, b: 0x6fba, c: 0x4fcf, d: [0x9d, 0x55, 0x7b, 0x8e, 0x7f, 0x15, 0x70, 0x91] };
+          const PHASES: &[&str] = &["round-node", "round-bun", "queue", "crash", "native",
+              "handshake-node", "handshake-bun", "calibrate-node", "calibrate-bun"];
+          #[repr(C)]
+          struct Guid { a: u32, b: u16, c: u16, d: [u8; 8] }
+          #[repr(C)]
+          struct UserInfo {
+              name: *const u16, password: *const u16, age: u32, privilege: u32, home: *const u16,
+              comment: *const u16, flags: u32, script: *const u16,
+          }
+          #[repr(C)]
+          struct Startup {
+              cb: u32, reserved: *mut u16, desktop: *mut u16, title: *mut u16,
+              x: u32, y: u32, x_size: u32, y_size: u32, x_chars: u32, y_chars: u32,
+              fill: u32, flags: u32, show: u16, reserved_len: u16, reserved_bytes: *mut u8,
+              input: Handle, output: Handle, error: Handle,
+          }
+          #[repr(C)]
+          struct ProcessInfo { process: Handle, thread: Handle, pid: u32, tid: u32 }
+          #[repr(C)]
+          struct JobBasicLimit {
+              process_time: i64, job_time: i64, flags: u32, minimum_working_set: usize, maximum_working_set: usize,
+              active_process_limit: u32, affinity: usize, priority_class: u32, scheduling_class: u32,
+          }
+          #[repr(C)]
+          struct JobLimits {
+              basic: JobBasicLimit, io: [u64; 6], process_memory: usize, job_memory: usize, peak_process: usize, peak_job: usize,
+          }
+          #[repr(C)]
+          struct JobAccounting {
+              user_time: i64, kernel_time: i64, period_user: i64, period_kernel: i64,
+              faults: u32, total: u32, active: u32, terminated: u32,
+          }
+          #[repr(C)]
+          struct Blob { size: u32, data: *mut u8 }
+          #[repr(C)]
+          struct ThreadEntry {
+              size: u32, usage: u32, id: u32, owner: u32, priority: i32, delta: i32, flags: u32,
+          }
+
+          #[link(name = "netapi32")]
+          extern "system" {
+              fn NetUserAdd(server: *const u16, level: u32, data: *const c_void, parameter: *mut u32) -> u32;
+              fn NetUserDel(server: *const u16, name: *const u16) -> u32;
+          }
+          #[link(name = "advapi32")]
+          extern "system" {
+              fn LookupAccountNameW(system: *const u16, account: *const u16, sid: *mut c_void, sid_len: *mut u32,
+                  domain: *mut u16, domain_len: *mut u32, use_kind: *mut u32) -> i32;
+              fn ConvertSidToStringSidW(sid: *const c_void, text: *mut *mut u16) -> i32;
+              fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
+              fn GetTokenInformation(token: Handle, class: u32, info: *mut c_void, len: u32, needed: *mut u32) -> i32;
+              fn RegOpenKeyExW(key: Handle, subkey: *const u16, options: u32, desired: u32, result: *mut Handle) -> i32;
+              fn RegCloseKey(key: Handle) -> i32;
+              fn CreateProcessWithLogonW(name: *const u16, domain: *const u16, password: *const u16, logon_flags: u32,
+                  app: *const u16, args: *mut u16, creation_flags: u32, environment: *const c_void, cwd: *const u16,
+                  startup: *const Startup, process: *mut ProcessInfo) -> i32;
+          }
+          #[link(name = "kernel32")]
+          extern "system" {
+              fn GetCurrentProcess() -> Handle;
+              fn GetLastError() -> u32;
+              fn CloseHandle(handle: Handle) -> i32;
+              fn LocalFree(memory: Handle) -> Handle;
+              fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> Handle;
+              fn SetInformationJobObject(job: Handle, class: u32, info: *const c_void, size: u32) -> i32;
+              fn QueryInformationJobObject(job: Handle, class: u32, info: *mut c_void, size: u32, bytes: *mut u32) -> i32;
+              fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+              fn TerminateJobObject(job: Handle, code: u32) -> i32;
+              fn TerminateProcess(process: Handle, code: u32) -> i32;
+              fn ResumeThread(thread: Handle) -> u32;
+              fn WaitForSingleObject(handle: Handle, duration: u32) -> u32;
+              fn GetExitCodeProcess(process: Handle, code: *mut u32) -> i32;
+              fn CreateFileW(file: *const u16, access: u32, share: u32, attributes: *const c_void, mode: u32,
+                  flags: u32, template: Handle) -> Handle;
+              fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+              fn QueryFullProcessImageNameW(process: Handle, flags: u32, path: *mut u16, len: *mut u32) -> i32;
+              fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> Handle;
+              fn Thread32First(snapshot: Handle, entry: *mut ThreadEntry) -> i32;
+              fn Thread32Next(snapshot: Handle, entry: *mut ThreadEntry) -> i32;
+              fn OpenThread(access: u32, inherit: i32, id: u32) -> Handle;
+              fn GetProcessIdOfThread(thread: Handle) -> u32;
+              fn SuspendThread(thread: Handle) -> u32;
+          }
+          #[link(name = "userenv")]
+          extern "system" {
+              fn CreateProfile(sid: *const u16, user: *const u16, profile: *mut u16, len: u32) -> i32;
+              fn DeleteProfileW(sid: *const u16, path: *const u16, computer: *const u16) -> i32;
+              fn GetProfilesDirectoryW(path: *mut u16, len: *mut u32) -> i32;
+              fn GetUserProfileDirectoryW(token: Handle, path: *mut u16, len: *mut u32) -> i32;
+          }
+          #[link(name = "shell32")]
+          extern "system" {
+              fn SHGetKnownFolderPath(id: *const Guid, flags: u32, token: Handle, path: *mut *mut u16) -> i32;
+              fn SHSetKnownFolderPath(id: *const Guid, flags: u32, token: Handle, path: *const u16) -> i32;
+              fn IsUserAnAdmin() -> i32;
+          }
+          #[link(name = "ole32")]
+          extern "system" { fn CoTaskMemFree(p: Handle); }
+          #[link(name = "bcrypt")]
+          extern "system" { fn BCryptGenRandom(algorithm: Handle, bytes: *mut u8, len: u32, flags: u32) -> i32; }
+          #[link(name = "crypt32")]
+          extern "system" {
+              fn CryptProtectData(data: *const Blob, description: *const u16, entropy: *const Blob, reserved: Handle,
+                  prompt: Handle, flags: u32, output: *mut Blob) -> i32;
+              fn CryptUnprotectData(data: *const Blob, description: *mut *mut u16, entropy: *const Blob, reserved: Handle,
+                  prompt: Handle, flags: u32, output: *mut Blob) -> i32;
+          }
+
+          struct Owned(Handle);
+          impl Drop for Owned { fn drop(&mut self) { unsafe { CloseHandle(self.0); } } }
+          struct Password(Vec<u16>);
+          impl Drop for Password {
+              fn drop(&mut self) {
+                  for ch in &mut self.0 { unsafe { std::ptr::write_volatile(ch, 0) }; }
+              }
+          }
+          fn wide(s: impl AsRef<OsStr>) -> Vec<u16> { s.as_ref().encode_wide().chain([0]).collect() }
+          fn wide_path(buf: &[u16]) -> PathBuf {
+              std::ffi::OsString::from_wide(&buf[..buf.iter().position(|&c| c == 0).unwrap()]).into()
+          }
+          fn random<const N: usize>() -> [u8; N] {
+              let mut bytes = [0; N];
+              assert!(unsafe { BCryptGenRandom(null_mut(), bytes.as_mut_ptr(), N as u32, 2) } >= 0);
+              bytes
+          }
+          fn password() -> Password {
+              let mut rng = random::<32>();
+              let mut result = Vec::with_capacity(69);
+              result.extend("Aa1!".encode_utf16());
+              for byte in &rng {
+                  let hex = b"0123456789abcdef";
+                  result.push(hex[(byte >> 4) as usize] as u16);
+                  result.push(hex[(byte & 15) as usize] as u16);
+              }
+              for byte in &mut rng { unsafe { std::ptr::write_volatile(byte, 0) }; }
+              result.push(0);
+              Password(result)
+          }
+          fn token(process: Handle) -> Owned {
+              let mut token = null_mut();
+              assert!(unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } != 0);
+              Owned(token)
+          }
+          fn sid_text(sid: *const c_void) -> String {
+              let mut p = null_mut();
+              assert!(unsafe { ConvertSidToStringSidW(sid, &mut p) } != 0);
+              let length = (0..200).find(|&i| unsafe { *p.add(i) == 0 }).unwrap();
+              let text = String::from_utf16(unsafe { std::slice::from_raw_parts(p, length) }).unwrap();
+              unsafe { LocalFree(p.cast()); }
+              assert!(text.starts_with("S-1-") && text[4..].chars().all(|c| c.is_ascii_digit() || c == '-'));
+              text
+          }
+          fn process_sid(process: Handle) -> String {
+              let token = token(process);
+              let mut data = [0usize; 128];
+              let mut size = 0;
+              assert!(unsafe { GetTokenInformation(token.0, 1, data.as_mut_ptr().cast(), size_of_val(&data) as u32, &mut size) } != 0);
+              sid_text(data[0] as *const c_void)
+          }
+          fn account_sid(name: &str) -> String {
+              let mut sid = [0usize; 32];
+              let mut domain = [0u16; 256];
+              let mut sid_len = size_of_val(&sid) as u32;
+              let mut domain_len = domain.len() as u32;
+              let mut kind = 0;
+              let local = env::var("COMPUTERNAME").unwrap();
+              assert!(unsafe { LookupAccountNameW(null(), wide(format!("{local}\\{name}")).as_ptr(), sid.as_mut_ptr().cast(),
+                  &mut sid_len, domain.as_mut_ptr(), &mut domain_len, &mut kind) } != 0 && kind == 1);
+              sid_text(sid.as_ptr().cast())
+          }
+          fn profile_path(process: Handle) -> PathBuf {
+              let token = token(process);
+              let mut buf = [0u16; 1024];
+              let mut len = buf.len() as u32;
+              assert!(unsafe { GetUserProfileDirectoryW(token.0, buf.as_mut_ptr(), &mut len) } != 0);
+              wide_path(&buf)
+          }
+          fn system_tool(name: &str) -> Command {
+              let mut command = Command::new(PathBuf::from(env::var_os("SystemRoot").unwrap()).join("System32").join(name));
+              command.creation_flags(NO_WINDOW).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+              command
+          }
+          fn checked_tool(program: &str, args: &[&OsStr]) {
+              assert!(system_tool(program).args(args).status().unwrap().success());
+          }
+          fn ordinary(path: &Path) {
+              let meta = fs::symlink_metadata(path).unwrap();
+              assert!(meta.is_dir() && meta.file_attributes() & REPARSE == 0);
+          }
+          fn grant(path: &Path, sid: &str, access: &str) {
+              checked_tool("icacls.exe", &[path.as_os_str(), OsStr::new("/grant"), OsStr::new(&format!("*{sid}:{access}"))]);
+          }
+          fn guarded_root(root: &Path) {
+              assert_eq!(env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
+              assert_eq!(env::var("RUNNER_ENVIRONMENT").as_deref(), Ok("github-hosted"));
+              assert_eq!(env::var("RUNNER_ARCH").as_deref(), Ok("X64"));
+              assert_eq!(env::var("GITHUB_REPOSITORY").as_deref(), Ok("hara-cli/hara"));
+              assert_eq!(env::var("GITHUB_RUN_ATTEMPT").as_deref(), Ok("1"));
+              let parent = PathBuf::from(env::var_os("RUNNER_TEMP").unwrap());
+              let name = root.file_name().unwrap().to_str().unwrap();
+              let prefix = format!("hara-s2-{}-1-", env::var("GITHUB_RUN_ID").unwrap());
+              let suffix = name.strip_prefix(&prefix).unwrap();
+              assert!(suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit()));
+              assert_eq!(fs::canonicalize(root.parent().unwrap()).unwrap(), fs::canonicalize(parent).unwrap());
+              ordinary(root);
+          }
+          struct Account {
+              name: String, sid: Option<String>, stock: Option<PathBuf>, profile: PathBuf, created_profile: bool, relocated: bool, live: bool,
+          }
+          impl Account {
+              fn cleanup(&mut self) -> bool {
+                  if !self.live { return true; }
+                  let Some(sid) = &self.sid else { return false; };
+                  if account_sid(&self.name) != *sid { return false; }
+                  if self.created_profile && self.stock.is_none() { return false; }
+                  if let Some(stock) = &self.stock {
+                      let active = if self.relocated { &self.profile } else { stock };
+                      let mut deleted = false;
+                      for _ in 0..20 {
+                          let rc = unsafe { DeleteProfileW(wide(sid).as_ptr(), wide(active).as_ptr(), null()) };
+                          if rc != 0 { deleted = true; break; }
+                          std::thread::sleep(Duration::from_millis(150));
+                      }
+                      if !deleted { return false; }
+                      if self.relocated && stock.exists() {
+                          ordinary(stock);
+                          if fs::remove_dir_all(stock).is_err() { return false; }
+                      }
+                  }
+                  self.live = unsafe { NetUserDel(null(), wide(&self.name).as_ptr()) } != 0;
+                  !self.live
+              }
+          }
+          fn create_profile(account: &mut Account) {
+              let sid = account.sid.as_ref().unwrap();
+              let mut original = [0u16; 1024];
+              assert_eq!(unsafe { CreateProfile(wide(sid).as_ptr(), wide(&account.name).as_ptr(), original.as_mut_ptr(), original.len() as u32) }, 0);
+              account.created_profile = true;
+              let old = wide_path(&original);
+              let mut profiles = [0u16; 1024];
+              let mut len = profiles.len() as u32;
+              assert!(unsafe { GetProfilesDirectoryW(profiles.as_mut_ptr(), &mut len) } != 0);
+              assert_eq!(old.parent(), Some(wide_path(&profiles).as_path()));
+              assert_eq!(old.file_name(), Some(OsStr::new(&account.name)));
+              ordinary(&old);
+              account.stock = Some(old.clone());
+              assert!(!account.profile.exists());
+              fs::create_dir(&account.profile).unwrap();
+              // Use only the freshly created skeleton. Skip stock compatibility junctions.
+              let rc = system_tool("robocopy.exe").arg(&old).arg(&account.profile)
+                  .args(["/E", "/XJ", "/R:0", "/W:0", "/COPY:DAT", "/DCOPY:DAT"])
+                  .status().unwrap().code().unwrap();
+              assert!((0..8).contains(&rc));
+              ordinary(&account.profile);
+              let hive = fs::symlink_metadata(account.profile.join("NTUSER.DAT")).unwrap();
+              assert!(hive.is_file() && hive.file_attributes() & REPARSE == 0);
+              grant(&account.profile, sid, "(OI)(CI)F");
+              // Address this SID's newly registered profile only. Never change ProfilesDirectory.
+              let key = format!(r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{sid}");
+              checked_tool("reg.exe", &[OsStr::new("add"), OsStr::new(&key), OsStr::new("/v"), OsStr::new("ProfileImagePath"),
+                  OsStr::new("/t"), OsStr::new("REG_EXPAND_SZ"), OsStr::new("/d"), account.profile.as_os_str(), OsStr::new("/f")]);
+              account.relocated = true;
+          }
+          fn quoted(value: &Path) -> String {
+              let text = value.to_str().unwrap();
+              assert!(!text.contains(['"', '\r', '\n']) && !text.ends_with('\\'));
+              format!("\"{text}\"")
+          }
+          fn job_counts(job: Handle) -> JobAccounting {
+              let mut stats: JobAccounting = unsafe { zeroed() };
+              assert!(unsafe { QueryInformationJobObject(job, 1, (&mut stats as *mut JobAccounting).cast(),
+                  size_of::<JobAccounting>() as u32, null_mut()) } != 0);
+              stats
+          }
+          fn job_drain(job: Handle) -> bool {
+          '@
+          $utf8 = [Text.UTF8Encoding]::new($false, $true)
+          $expressionStart = [string]::Concat([char]36, '{{')
+          if ($source.Contains($expressionStart) -or $source -match "(?m)^'@") { throw 'Invalid fixture delimiter' }
+          $source = ($source -replace '\r\n?', [string][char]10) + [char]10
+          $file = Join-Path $env:S2_FIXTURES 'native-fixture.rs'
+          if (Test-Path -LiteralPath $file) { throw 'Fixture target already exists' }
+          [IO.File]::WriteAllText($file, $source, $utf8)
+
+      - name: Assemble native-fixture.rs part 2
+        run: |
+          $source = @'
+              let until = Instant::now() + Duration::from_secs(8);
+              while Instant::now() < until {
+                  if job_counts(job).active == 0 { return true; }
+                  std::thread::sleep(Duration::from_millis(40));
+              }
+              false
+          }
+          fn launch(root: &Path, data: &Path, phase: &str, account: &Account, password: Password, budget: u32) -> (u32, u32, bool) {
+              let sid = account.sid.as_deref().unwrap();
+              let runner_sid = process_sid(unsafe { GetCurrentProcess() });
+              assert_ne!(sid, runner_sid);
+              let node = root.join("tools/node.exe");
+              let verify = root.join("fixtures/verify.mjs");
+              let shell_root = env::var("SystemRoot").unwrap();
+              let mut envs = vec![
+                  ("APPDATA", account.profile.join("AppData/Roaming").to_str().unwrap().to_owned()),
+                  ("GITHUB_ACTIONS", "true".into()), ("LOCALAPPDATA", account.profile.join("AppData/Local").to_str().unwrap().to_owned()),
+                  ("PATH", format!("{shell_root}\\System32")), ("S2_EXPECT_SID", sid.to_owned()),
+                  ("SystemRoot", shell_root.clone()), ("TEMP", data.join("tmp").to_str().unwrap().to_owned()),
+                  ("TMP", data.join("tmp").to_str().unwrap().to_owned()), ("USERPROFILE", account.profile.to_str().unwrap().to_owned()),
+                  ("WINDIR", shell_root),
+              ];
+              envs.sort_by_key(|(name, _)| name.to_ascii_uppercase());
+              let environment: Vec<u16> = envs.into_iter().flat_map(|(k, v)| wide(format!("{k}={v}"))).chain([0]).collect();
+              let mut command = wide(format!("{} {} {} {} {phase}", quoted(&node), quoted(&verify), quoted(root), quoted(data)));
+              let mut startup: Startup = unsafe { zeroed() };
+              startup.cb = size_of::<Startup>() as u32;
+              let raw_job = unsafe { CreateJobObjectW(null(), null()) };
+              assert!(!raw_job.is_null());
+              let job = Owned(raw_job);
+              let mut limits: JobLimits = unsafe { zeroed() };
+              limits.basic.flags = JOB_KILL_ON_CLOSE;
+              assert!(unsafe { SetInformationJobObject(job.0, 9, (&limits as *const JobLimits).cast(), size_of::<JobLimits>() as u32) } != 0);
+              let mut info: ProcessInfo = unsafe { zeroed() };
+              let rc = unsafe { CreateProcessWithLogonW(wide(&account.name).as_ptr(), wide(".").as_ptr(), password.0.as_ptr(), 1,
+                  wide(&node).as_ptr(), command.as_mut_ptr(), NO_WINDOW | 4 | 0x400, environment.as_ptr().cast(), wide(data).as_ptr(), &startup, &mut info) };
+              drop(password);
+              assert!(rc != 0);
+              let process = Owned(info.process);
+              let thread = Owned(info.thread);
+              if unsafe { AssignProcessToJobObject(job.0, process.0) } == 0 {
+                  unsafe { TerminateProcess(process.0, 1); WaitForSingleObject(process.0, 5_000); }
+                  panic!("own job admission failed");
+              }
+              assert_eq!(process_sid(process.0), sid);
+              assert_eq!(fs::canonicalize(profile_path(process.0)).unwrap(), fs::canonicalize(&account.profile).unwrap());
+              assert!(unsafe { ResumeThread(thread.0) } != u32::MAX);
+              let ended = unsafe { WaitForSingleObject(process.0, budget) } == 0;
+              let mut code = 90;
+              if ended { assert!(unsafe { GetExitCodeProcess(process.0, &mut code) } != 0); }
+              let clean_exit = ended && job_drain(job.0);
+              if !clean_exit {
+                  unsafe { TerminateJobObject(job.0, 90); }
+                  assert!(job_drain(job.0));
+              }
+              (code, job_counts(job.0).total, clean_exit)
+          }
+          fn crypt(bytes: &mut [u8], protect: bool) -> Result<Vec<u8>, u32> {
+              let blob = Blob { size: bytes.len() as u32, data: bytes.as_mut_ptr() };
+              let mut output = Blob { size: 0, data: null_mut() };
+              let rc = unsafe {
+                  if protect { CryptProtectData(&blob, null(), null(), null_mut(), null_mut(), 1, &mut output) }
+                  else { CryptUnprotectData(&blob, null_mut(), null(), null_mut(), null_mut(), 1, &mut output) }
+              };
+              if rc == 0 { return Err(unsafe { GetLastError() }); }
+              assert!(!output.data.is_null() && output.size <= 4096);
+              let slice = unsafe { std::slice::from_raw_parts_mut(output.data, output.size as usize) };
+              let result = slice.to_vec();
+              slice.fill(0);
+              unsafe { LocalFree(output.data.cast()); }
+              Ok(result)
+          }
+          fn prove_inner_identity(path: &Path) {
+              let mut canary = random::<32>();
+              let mut sealed = crypt(&mut canary, true).unwrap();
+              let mut reloaded = crypt(&mut sealed, false).unwrap();
+              assert_eq!(reloaded, canary);
+              canary.fill(0);
+              reloaded.fill(0);
+              fs::OpenOptions::new().write(true).create_new(true).open(path).unwrap().write_all(&sealed).unwrap();
+              sealed.fill(0);
+          }
+          fn reject_inner_ciphertext(path: &Path) -> bool {
+              let meta = fs::symlink_metadata(path).unwrap();
+              assert!(meta.is_file() && meta.file_attributes() & REPARSE == 0 && meta.len() <= 4096);
+              let mut bytes = Vec::new();
+              fs::File::open(path).unwrap().take(4097).read_to_end(&mut bytes).unwrap();
+              assert!(!bytes.is_empty() && bytes.len() <= 4096);
+              let mut control = random::<32>();
+              let mut own_cipher = crypt(&mut control, true).unwrap();
+              let mut own_plain = crypt(&mut own_cipher, false).unwrap();
+              assert_eq!(own_plain, control);
+              control.fill(0);
+              own_plain.fill(0);
+              own_cipher.fill(0);
+              let rejected = match crypt(&mut bytes, false) {
+                  // Both accounts must first pass their own round trip. The same protocol and
+                  // ephemeral blob are then tested using the other process token.
+                  Err(_) => true,
+                  Ok(mut secret) => { secret.fill(0); false }
+              };
+              bytes.fill(0);
+              fs::remove_file(path).unwrap();
+              rejected
+          }
+          fn supervise(root: &Path, phase: &str, budget: u32) {
+              guarded_root(root);
+              assert!(unsafe { IsUserAnAdmin() } != 0 && PHASES.contains(&phase) && (10_000..=160_000).contains(&budget));
+              let data = root.join("cases").join(phase);
+              let control = root.join("control").join(phase);
+              // The production worker opens some Win32 paths directly. Avoid depending on a
+              // runner-wide LongPathsEnabled setting for the prospective ciphertext path.
+              let longest = data.join("profile/AppData/Local/Hara/credential-vault/v1")
+                  .join("a".repeat(64)).join(format!("{}.bin", "a".repeat(64)));
+              assert!(longest.as_os_str().encode_wide().count() < 260);
+              fs::create_dir(&data).unwrap();
+              fs::create_dir(data.join("tmp")).unwrap();
+              fs::create_dir(&control).unwrap();
+              let nonce = random::<8>().iter().map(|b| format!("{b:02x}")).collect::<String>();
+              let mut account = Account { name: format!("hv{nonce}"), sid: None, stock: None, profile: data.join("profile"),
+                  created_profile: false, relocated: false, live: false };
+              // A killed supervisor leaves a private ledger and no positive cleanup receipt.
+              fs::write(control.join("owner"), format!("{}\n", account.name)).unwrap();
+              let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                  let pass = password();
+                  let user = wide(&account.name);
+                  let comment = wide("Hara S2 ephemeral Windows acceptance");
+                  let data_info = UserInfo { name: user.as_ptr(), password: pass.0.as_ptr(), age: 0, privilege: 1,
+                      home: null(), comment: comment.as_ptr(), flags: 0x10201, script: null() };
+                  assert_eq!(unsafe { NetUserAdd(null(), 1, (&data_info as *const UserInfo).cast(), null_mut()) }, 0);
+                  account.live = true;
+                  let sid = account_sid(&account.name);
+                  account.sid = Some(sid.clone());
+                  fs::write(control.join("sid"), &sid).unwrap();
+                  grant(root, &sid, "(RX)");
+                  for name in ["tools", "core", "fixtures"] { grant(&root.join(name), &sid, "(OI)(CI)RX"); }
+                  grant(&data, &sid, "(OI)(CI)M");
+                  create_profile(&mut account);
+                  let (code, total, drained) = launch(root, &data, phase, &account, pass, budget);
+                  let isolation = if phase == "round-node" && code == 0 && drained {
+                      Some(reject_inner_ciphertext(&data.join("identity.sealed")))
+                  } else { None };
+                  (code, total, drained, isolation)
+              }));
+              let clean = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| account.cleanup())).unwrap_or(false);
+              let (code, total, drained, isolation) = result.unwrap_or((91, 0, false, None));
+              let isolation = isolation.map(|value| value.to_string()).unwrap_or("null".into());
+              fs::write(control.join("outcome.json"), format!(
+                  r#"{{"code":{code},"total":{total},"drained":{drained},"clean":{clean},"isolation":{isolation}}}"#)).unwrap();
+          }
+          fn folder() -> PathBuf {
+              let mut path = null_mut();
+              assert!(unsafe { SHGetKnownFolderPath(&LOCAL_APP_DATA, 0, null_mut(), &mut path) } >= 0 && !path.is_null());
+              let size = (0..32_760).find(|&i| unsafe { *path.add(i) == 0 }).unwrap();
+              let result = wide_path(unsafe { std::slice::from_raw_parts(path, size + 1) });
+              unsafe { CoTaskMemFree(path.cast()); }
+              result
+          }
+          fn child_identity(data: &Path) {
+              let process = unsafe { GetCurrentProcess() };
+              let sid = process_sid(process);
+              assert_eq!(sid, env::var("S2_EXPECT_SID").unwrap());
+              assert_eq!(unsafe { IsUserAnAdmin() }, 0);
+              let profile = profile_path(process);
+              assert_eq!(fs::canonicalize(profile).unwrap(), fs::canonicalize(data.join("profile")).unwrap());
+              let users = 0x80000003u32 as i32 as isize as Handle;
+              let mut hive = null_mut();
+              assert_eq!(unsafe { RegOpenKeyExW(users, wide(sid).as_ptr(), 0, 1, &mut hive) }, 0);
+              unsafe { RegCloseKey(hive); }
+          }
+          struct Paused(Owned);
+          impl Drop for Paused {
+              fn drop(&mut self) { unsafe { ResumeThread(self.0.0); } }
+          }
+          fn pause_worker(pid: u32, worker: &Path) {
+              assert_eq!(worker.file_name(), Some(OsStr::new("hara-credential-worker.exe")));
+              let raw = unsafe { OpenProcess(0x101000, 0, pid) };
+              assert!(!raw.is_null());
+              let process = Owned(raw);
+              assert_eq!(process_sid(process.0), env::var("S2_EXPECT_SID").unwrap());
+              let mut exe = [0u16; 1024];
+              let mut len = exe.len() as u32;
+              assert!(unsafe { QueryFullProcessImageNameW(process.0, 0, exe.as_mut_ptr(), &mut len) } != 0);
+              assert_eq!(fs::canonicalize(wide_path(&exe)).unwrap(), fs::canonicalize(worker).unwrap());
+              let snap = unsafe { CreateToolhelp32Snapshot(4, 0) };
+              assert_ne!(snap as isize, -1);
+              let snap = Owned(snap);
+              let mut entry: ThreadEntry = unsafe { zeroed() };
+              let mut paused = Vec::new();
+              entry.size = size_of::<ThreadEntry>() as u32;
+              let mut next = unsafe { Thread32First(snap.0, &mut entry) };
+              while next != 0 {
+                  if entry.owner == pid {
+                      let thread = unsafe { OpenThread(0x802, 0, entry.id) };
+                      assert!(!thread.is_null());
+                      let thread = Owned(thread);
+                      assert_eq!(unsafe { GetProcessIdOfThread(thread.0) }, pid);
+                      assert_ne!(unsafe { SuspendThread(thread.0) }, u32::MAX);
+                      paused.push(Paused(thread));
+                  }
+                  entry.size = size_of::<ThreadEntry>() as u32;
+                  next = unsafe { Thread32Next(snap.0, &mut entry) };
+              }
+              assert!(!paused.is_empty() && unsafe { WaitForSingleObject(process.0, 0) } == 258);
+              io::stdout().write_all(b"ready\n").unwrap();
+              io::stdout().flush().unwrap();
+              let mut byte = [0];
+              io::stdin().read_exact(&mut byte).unwrap();
+              assert_eq!(byte, [1]);
+              drop(paused);
+              assert!(unsafe { WaitForSingleObject(process.0, 8_000) } == 0);
+          }
+          fn main() {
+              std::panic::set_hook(Box::new(|_| {}));
+              let args: Vec<_> = env::args().skip(1).collect();
+              match args.as_slice() {
+                  [command, root, phase, budget] if command == "supervise" => supervise(Path::new(root), phase, budget.parse().unwrap()),
+                  [command, data] if command == "check" => {
+                      let data = Path::new(data);
+                      child_identity(data);
+                      assert_eq!(fs::canonicalize(folder()).unwrap(),
+                          fs::canonicalize(data.join("profile/AppData/Local")).unwrap());
+                  }
+                  [command, data] if command == "identity" => {
+                      let data = Path::new(data);
+                      child_identity(data);
+                      prove_inner_identity(&data.join("identity.sealed"));
+                  }
+                  [command, data, relative] if command == "folder" => {
+                      let data = Path::new(data);
+                      child_identity(data);
+                      let path = match relative.as_str() {
+                          "junction" => data.join("junction"),
+                          "restore" => data.join("profile/AppData/Local"),
+                          _ => panic!("unknown fixture folder"),
+                      };
+                      assert!(unsafe { SHSetKnownFolderPath(&LOCAL_APP_DATA, 0, null_mut(), wide(&path).as_ptr()) } >= 0);
+                      assert_eq!(folder(), path);
+                  }
+                  [command, file] if command == "lock" => {
+                      assert_eq!(Path::new(file).file_name(), Some(OsStr::new("store.lock")));
+                      let lock = unsafe { CreateFileW(wide(file).as_ptr(), 0xc0000000, 0, null(), 3, 0x00200000, null_mut()) };
+                      assert_ne!(lock as isize, -1);
+                      let _lock = Owned(lock);
+                      io::stdout().write_all(b"ready\n").unwrap();
+                      io::stdout().flush().unwrap();
+                      let mut byte = [0];
+                      io::stdin().read_exact(&mut byte).unwrap();
+                      assert_eq!(byte, [1]);
+                  }
+                  [command, pid, file] if command == "pause" => pause_worker(pid.parse().unwrap(), Path::new(file)),
+                  _ => panic!("unknown fixture phase"),
+              }
+          }
+          '@
+          $utf8 = [Text.UTF8Encoding]::new($false, $true)
+          $expressionStart = [string]::Concat([char]36, '{{')
+          if ($source.Contains($expressionStart) -or $source -match "(?m)^'@") { throw 'Invalid fixture delimiter' }
+          $source = ($source -replace '\r\n?', [string][char]10) + [char]10
+          $file = Join-Path $env:S2_FIXTURES 'native-fixture.rs'
+          if ((Get-Item -LiteralPath $file).Length -ne 13989) { throw 'Fixture chunk offset differs' }
+          [IO.File]::AppendAllText($file, $source, $utf8)
+
+      - name: Verify all four fixture digests before build
+        id: embed
+        run: |
+          $expected = @{
+            'drive.ps1' = $env:S2_FIXTURE_DRIVE_SHA256
+            'verify.mjs' = $env:S2_FIXTURE_VERIFY_SHA256
+            'observe-node.mjs' = $env:S2_FIXTURE_OBSERVE_SHA256
+            'native-fixture.rs' = $env:S2_FIXTURE_NATIVE_SHA256
+          }
+
+          foreach ($name in $expected.Keys) {
+            $file = Join-Path $env:S2_FIXTURES $name
+            $item = Get-Item -LiteralPath $file
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
+            if ($item.PSIsContainer -or $item.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) -or
+                $expected[$name] -cnotmatch '^[a-f0-9]{64}$' -or $actual -cne $expected[$name]) {
+              throw 'Expanded fixture digest mismatch'
+            }
+          }
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '22.23.1'
+          architecture: x64
+          package-manager-cache: false
+          token: ''
+
+      - name: Materialize only the pinned Core source
+        id: materialize
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $archive = Join-Path $env:S2_ROOT 'core.tar'
+          # git archive applies working-tree conversion; keep the pinned LF bytes.
+          & git -c core.autocrlf=false -c core.eol=lf archive --format=tar -o $archive $env:S2_SOURCE_SHA *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Core archive failed' }
+          & tar.exe -xf $archive -C $env:S2_CORE *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Core extraction failed' }
+          $lock = Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $env:S2_CORE 'package-lock.json')
+          $worker = Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $env:S2_CORE 'native/windows-credential-worker/main.rs')
+          if ($lock.Hash.ToLowerInvariant() -cne $env:S2_LOCK_SHA256 -or
+              $worker.Hash.ToLowerInvariant() -cne $env:S2_WORKER_SOURCE_SHA256) {
+            throw 'Pinned input integrity mismatch'
+          }
+
+      - uses: oven-sh/setup-bun@ecf28ddc73e819eb6fa29df6b34ef8921c743461
+        with:
+          bun-version: '1.3.9'
+          bun-download-url: 'https://github.com/oven-sh/bun/releases/download/bun-v1.3.9/bun-windows-x64-baseline.zip'
+          no-cache: 'true'
+          token: ''
+
+      - name: Build isolated npm, native worker and desktop sidecar
+        working-directory: ${{ env.S2_CORE }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          # This public build stage precedes test accounts, keys and namespaces.
+          # Retain actual exit codes and bounded compiler/package error identifiers.
+          function Invoke-Build([string]$Command, [string[]]$Arguments, [string]$Label) {
+            $codes = [Collections.Generic.HashSet[string]]::new()
+            & $Command @Arguments 2>&1 | ForEach-Object {
+              foreach ($match in [regex]::Matches([string]$_, '\b(?:TS[0-9]{4}|E[0-9]{4}|ENOTCACHED|EINTEGRITY|ENOENT|ERESOLVE|EBADPLATFORM|ELIFECYCLE)\b')) {
+                if ($codes.Count -lt 16) { $null = $codes.Add($match.Value) }
+              }
+            }
+            $code = $LASTEXITCODE
+            Write-Host ("{0} exit={1} codes={2}" -f $Label, $code, (($codes | Sort-Object) -join ','))
+            if ($code -ne 0) { throw "Failed fixed stage $Label" }
+          }
+          if ((& node --version) -cne 'v22.23.1' -or (& bun --version) -cne '1.3.9' -or
+              (& node -p 'process.platform + "/" + process.arch') -cne 'win32/x64') {
+            throw 'Unexpected runtime versions or architecture'
+          }
+          $env:NPM_CONFIG_USERCONFIG = Join-Path $env:S2_ROOT 'empty-user.npmrc'
+          $env:NPM_CONFIG_GLOBALCONFIG = Join-Path $env:S2_ROOT 'empty-global.npmrc'
+          $env:NPM_CONFIG_UPDATE_NOTIFIER = 'false'
+          Invoke-Build 'rustup' @('toolchain','install','1.92.0','--profile','minimal','--target','x86_64-pc-windows-msvc') 'rustup'
+          Invoke-Build 'npm.cmd' @('ci','--ignore-scripts','--no-audit','--no-fund',
+            '--registry=https://registry.npmjs.org/', '--cache',(Join-Path $env:S2_ROOT 'npm-cache')) 'npm-ci'
+          Invoke-Build 'node' @('--input-type=module','-e','import {transformSync} from "esbuild"; if (!transformSync("let n: number = 1",{loader:"ts"}).code) process.exit(1)') 'esbuild'
+          Invoke-Build 'npm.cmd' @('run','build') 'core-build'
+          Invoke-Build 'node' @('scripts/build-windows-vault-worker.mjs') 'dpapi-worker'
+          Invoke-Build 'rustc' @('+1.92.0','--edition=2021','--target=x86_64-pc-windows-msvc','--test',
+            'native/windows-credential-worker/main.rs','-o',(Join-Path $env:S2_FIXTURES 'vault-native-tests.exe')) 'native-suite'
+          Invoke-Build 'rustc' @('+1.92.0','--edition=2021','--target=x86_64-pc-windows-msvc',
+            (Join-Path $env:S2_FIXTURES 'native-fixture.rs'),
+            '-o',(Join-Path $env:S2_FIXTURES 's2-fixture.exe')) 'fixture'
+          Invoke-Build 'npm.cmd' @('pack','--ignore-scripts','--pack-destination',(Join-Path $env:S2_ROOT 'pack')) 'npm-pack'
+          $archives = @(Get-ChildItem -LiteralPath (Join-Path $env:S2_ROOT 'pack') -Filter '*.tgz' -File)
+          if ($archives.Count -ne 1) { throw 'Expected a single npm tarball' }
+          $npmEntry = Join-Path $env:S2_CORE 'npm-entry'
+          New-Item -ItemType Directory -Path $npmEntry | Out-Null
+          Invoke-Build 'tar.exe' @('-xf',$archives[0].FullName,'-C',$npmEntry) 'npm-extract'
+          Invoke-Build 'bun' @('scripts/build-binary.ts','dist/bin/hara.exe','bun-windows-x64-baseline',
+            'dist/cli.js','desktop-sidecar') 'bun-sidecar'
+          $built = Join-Path $env:S2_CORE 'dist/native/win32-x64/hara-credential-worker.exe'
+          $packed = Join-Path $npmEntry 'package/dist/native/win32-x64/hara-credential-worker.exe'
+          $bundled = Join-Path $env:S2_CORE 'dist/bin/hara-credential-worker.exe'
+          $expected = (Get-FileHash -LiteralPath $built).Hash
+          if ((Get-FileHash -LiteralPath $packed).Hash -cne $expected -or
+              (Get-FileHash -LiteralPath $bundled).Hash -cne $expected -or
+              !(Test-Path -LiteralPath (Join-Path $env:S2_CORE 'dist/bin/hara.exe') -PathType Leaf)) {
+            throw 'The npm and sidecar workers must match the pinned build'
+          }
+          $node = (Get-Command node.exe -CommandType Application).Source
+          Copy-Item -LiteralPath $node -Destination (Join-Path $env:S2_ROOT 'tools/node.exe')
+          'S2_BUILT=true' >> $env:GITHUB_ENV
+
+      - name: Enforce the isolated fixture firewall rules
+        id: private_network
+        timeout-minutes: 2
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $driver = Join-Path $env:S2_FIXTURES 'drive.ps1'
+          & pwsh -NoProfile -NonInteractive -File $driver -Phase Prepare -Root $env:S2_ROOT -Core $env:S2_CORE -Evidence $env:S2_EVIDENCE *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Owned loopback-only network guard held' }
+
+      - name: 1. save-restart-rotate-revoke in Node npm and Bun
+        id: case1
+        timeout-minutes: 5
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $driver = Join-Path $env:S2_FIXTURES 'drive.ps1'
+          & pwsh -NoProfile -NonInteractive -File $driver -Phase Case1 -Root $env:S2_ROOT -Core $env:S2_CORE -Evidence $env:S2_EVIDENCE *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Node or Bun credential roundtrip held; see sanitized receipt' }
+
+      - name: 2. same-Host queue and external store.lock
+        id: case2
+        timeout-minutes: 4
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $driver = Join-Path $env:S2_FIXTURES 'drive.ps1'
+          & pwsh -NoProfile -NonInteractive -File $driver -Phase Case2 -Root $env:S2_ROOT -Core $env:S2_CORE -Evidence $env:S2_EVIDENCE *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Queue or retry acceptance held; see sanitized receipt' }
+
+      - name: 3. post-write pre-publish crash and recovery
+        id: case3
+        timeout-minutes: 4
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $driver = Join-Path $env:S2_FIXTURES 'drive.ps1'
+          & pwsh -NoProfile -NonInteractive -File $driver -Phase Case3 -Root $env:S2_ROOT -Core $env:S2_CORE -Evidence $env:S2_EVIDENCE *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Crash recovery acceptance held; see sanitized receipt' }
+
+      - name: 4. native namespace, junction, ACL and temporary quota
+        id: case4
+        timeout-minutes: 4
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $driver = Join-Path $env:S2_FIXTURES 'drive.ps1'
+          & pwsh -NoProfile -NonInteractive -File $driver -Phase Case4 -Root $env:S2_ROOT -Core $env:S2_CORE -Evidence $env:S2_EVIDENCE *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Native negative acceptance held; see sanitized receipt' }
+
+      - name: 5. read-only handshake and public log safety
+        id: case5
+        timeout-minutes: 3
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $driver = Join-Path $env:S2_FIXTURES 'drive.ps1'
+          & pwsh -NoProfile -NonInteractive -File $driver -Phase Case5 -Root $env:S2_ROOT -Core $env:S2_CORE -Evidence $env:S2_EVIDENCE *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Handshake or disclosure acceptance held; see sanitized receipt' }
+
+      - name: Clean owned fixtures and seal public receipt
+        id: seal
+        if: ${{ always() && steps.embed.outcome == 'success' }}
+        timeout-minutes: 4
+        env:
+          S2_MATERIALIZE_OUTCOME: ${{ steps.materialize.outcome }}
+          S2_CASE1_OUTCOME: ${{ steps.case1.outcome }}
+          S2_CASE2_OUTCOME: ${{ steps.case2.outcome }}
+          S2_CASE3_OUTCOME: ${{ steps.case3.outcome }}
+          S2_CASE4_OUTCOME: ${{ steps.case4.outcome }}
+          S2_CASE5_OUTCOME: ${{ steps.case5.outcome }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $driver = Join-Path $env:S2_FIXTURES 'drive.ps1'
+          & pwsh -NoProfile -NonInteractive -File $driver -Phase Finalize -Root $env:S2_ROOT -Core $env:S2_CORE -Evidence $env:S2_EVIDENCE *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Public receipt could not be sealed' }
+
+      - name: Validate the public receipt before upload
+        id: public_receipt
+        if: ${{ always() && steps.seal.outcome == 'success' }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $receiptPath = Join-Path $env:S2_EVIDENCE 'receipt.json'
+          $validator = @'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const file = process.argv[2];
+          const stat = fs.lstatSync(file);
+          assert(stat.isFile() && stat.size <= 16384);
+          const r = JSON.parse(fs.readFileSync(file, 'utf8'));
+          const exactKeys = (object, keys) => assert.deepEqual(Object.keys(object).sort(), keys.split(' ').sort());
+          const equalOrNull = (value, expected) => assert(value === null || value === expected);
+          const sha256 = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+          const status = value => ['pass', 'fail', 'hold', 'skipped'].includes(value);
+          const count = value => value === null || Number.isSafeInteger(value) && value >= 0 && value <= 10000;
+          exactKeys(r, 'schemaVersion sourceSha sourceTree probeSha runId runAttempt runnerImage runnerImageVersion arch node bun rust lockSha256 workerSourceSha256 workerSha256 npmWorkerSha256 sidecarWorkerSha256 bunSidecarSha256 cases handshakeExtraProcesses modelCalls providerCalls cleanup qualification');
+          assert.equal(r.schemaVersion, 1);
+          assert.equal(r.sourceSha, process.env.S2_SOURCE_SHA);
+          assert.equal(r.sourceTree, process.env.S2_SOURCE_TREE);
+          assert.equal(r.probeSha, process.env.GITHUB_SHA);
+          assert.equal(r.runId, process.env.GITHUB_RUN_ID);
+          assert.equal(r.runAttempt, 1);
+          assert.equal(r.runnerImage, 'windows-2025');
+          assert.equal(r.arch, 'x64');
+          assert(r.runnerImageVersion === null || typeof r.runnerImageVersion === 'string' && /^\d{8}(?:\.\d+){1,4}$/.test(r.runnerImageVersion));
+          equalOrNull(r.node, 'v22.23.1');
+          equalOrNull(r.bun, '1.3.9');
+          equalOrNull(r.rust, '1.92.0');
+          equalOrNull(r.lockSha256, process.env.S2_LOCK_SHA256);
+          equalOrNull(r.workerSourceSha256, process.env.S2_WORKER_SOURCE_SHA256);
+          for (const digest of [r.workerSha256, r.npmWorkerSha256, r.sidecarWorkerSha256, r.bunSidecarSha256]) {
+            assert(digest === null || sha256(digest));
+          }
+          exactKeys(r.cases, 'case1 case2 case3 case4 case5');
+          const { case1, case2, case3, case4, case5 } = r.cases;
+          exactKeys(case1, 'status nodeNpm bunSidecar currentUserIsolation');
+          const cases = [case1.status, case1.nodeNpm, case1.bunSidecar, case2, case3, case4, case5];
+          for (const state of cases) {
+            assert(status(state));
+          }
+          assert(case1.currentUserIsolation === null || typeof case1.currentUserIsolation === 'boolean');
+          assert(count(r.modelCalls) && count(r.providerCalls));
+          exactKeys(r.handshakeExtraProcesses, 'nodeReadOnly bunReadOnly nodeSave bunSave');
+          for (const value of Object.values(r.handshakeExtraProcesses)) assert(count(value));
+          assert(['confirmed', 'unconfirmed', 'skipped'].includes(r.cleanup));
+          assert(['pass', 'fail', 'hold'].includes(r.qualification));
+          if (r.qualification === 'pass') {
+            assert.equal(r.lockSha256, process.env.S2_LOCK_SHA256);
+            assert.equal(r.workerSourceSha256, process.env.S2_WORKER_SOURCE_SHA256);
+            assert(cases.every(state => state === 'pass') && case1.currentUserIsolation === true);
+            assert(r.modelCalls === 0 && r.providerCalls === 0 && r.cleanup === 'confirmed');
+            assert.deepEqual(r.handshakeExtraProcesses, { nodeReadOnly: 0, bunReadOnly: 0, nodeSave: 1, bunSave: 1 });
+            assert(sha256(r.workerSha256) && r.workerSha256 === r.npmWorkerSha256 && r.workerSha256 === r.sidecarWorkerSha256);
+            assert(sha256(r.bunSidecarSha256) && r.runnerImageVersion !== null && r.node && r.bun && r.rust);
+          }
+          '@
+          $validator | & node - $receiptPath *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Public receipt failed allowlist validation' }
+
+      - name: Retain only sanitized evidence
+        if: ${{ always() && steps.public_receipt.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-vault-s2-87-r2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.S2_EVIDENCE }}/receipt.json
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Require complete acceptance and cleanup
+        if: ${{ always() && steps.public_receipt.outcome == 'success' }}
+        run: |
+          $receiptPath = Join-Path $env:S2_EVIDENCE 'receipt.json'
+          try { $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json -ErrorAction Stop }
+          catch { throw 'Invalid public receipt' }
+          if ($receipt.qualification -cne 'pass') { throw 'Windows acceptance or cleanup incomplete' }
