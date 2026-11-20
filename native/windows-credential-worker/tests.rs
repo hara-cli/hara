@@ -1,4 +1,31 @@
 use super::*;
+
+#[test]
+fn known_folder_com_scope_balances_first_and_nested_initialization() {
+    let first = ComApartment::initialize().unwrap();
+    let nested = ComApartment::initialize().unwrap();
+    drop(nested);
+    drop(first);
+
+    // S_OK proves this thread has no unmatched initializer left.
+    let status = unsafe { CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED) };
+    if status >= 0 { unsafe { CoUninitialize(); } }
+    assert_eq!(status, 0);
+}
+
+#[test]
+fn incompatible_com_apartment_refuses_known_folder_binding() {
+    let status = unsafe { CoInitializeEx(null_mut(), 0) }; // COINIT_MULTITHREADED
+    assert!(status >= 0, "test thread must admit MTA");
+    let _test_apartment = ComApartment;
+    let security = Security::new().unwrap_or_else(|_| panic!("test process token"));
+    assert_eq!(local_app_data(&security.process_token), Err(HOST_BINDING));
+
+    // The rejected STA initialization must not uninitialize the existing MTA.
+    let status = unsafe { CoInitializeEx(null_mut(), 0) };
+    if status >= 0 { unsafe { CoUninitialize(); } }
+    assert_eq!(status, 1);
+}
 #[repr(C)] struct UserInfo { name:*const u16,password:*const u16,age:u32,privilege:u32,home:*const u16,comment:*const u16,flags:u32,script:*const u16 }
 #[repr(C)] struct Profile { size:u32,flags:u32,name:*const u16,path:*const u16,default_path:*const u16,server:*const u16,policy:*const u16,handle:Handle }
 #[repr(C)] struct Luid { low:u32,high:i32 }

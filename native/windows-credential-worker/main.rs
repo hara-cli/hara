@@ -18,6 +18,10 @@ mod windows {
     const MAX_FRAME: usize = 8_500_000;
     const MAX_CIPHER: usize = 131_072;
     const SERVICE: &[u8] = b"tech.nanhara.hara.workspace.credentials.v1\0DPAPI-CurrentUser-v1\0";
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_IMPERSONATE: u32 = 0x0004;
+    const TOKEN_DUPLICATE: u32 = 0x0002;
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
     const READ_CONTROL: u32 = 0x20000; const DELETE: u32 = 0x10000;
     const GENERIC_READ: u32 = 0x80000000; const GENERIC_WRITE: u32 = 0x40000000;
     const OPEN_REPARSE: u32 = 0x00200000; const BACKUP: u32 = 0x02000000;
@@ -61,7 +65,11 @@ mod windows {
     #[link(name="shell32")]
     extern "system" { fn SHGetKnownFolderPath(id: *const Guid, flags: u32, token: Handle, out: *mut *mut u16) -> i32; }
     #[link(name="ole32")]
-    extern "system" { fn CoTaskMemFree(p: *mut c_void); }
+    extern "system" {
+        fn CoInitializeEx(reserved: *mut c_void, mode: u32) -> i32;
+        fn CoUninitialize();
+        fn CoTaskMemFree(p: *mut c_void);
+    }
     #[link(name="bcrypt")]
     extern "system" {
         fn BCryptOpenAlgorithmProvider(h: *mut Handle, name: *const u16, provider: *const u16, flags: u32) -> i32;
@@ -76,6 +84,19 @@ mod windows {
     impl Drop for Owned { fn drop(&mut self) { unsafe { CloseHandle(self.0); } } }
     struct Local(*mut c_void);
     impl Drop for Local { fn drop(&mut self) { unsafe { LocalFree(self.0); } } }
+    struct ComApartment;
+    impl ComApartment {
+        fn initialize() -> Result<Self> {
+            if unsafe { CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED) } < 0 {
+                return Err(HOST_BINDING);
+            }
+            // Both S_OK and S_FALSE need a matching CoUninitialize on this thread.
+            Ok(Self)
+        }
+    }
+    impl Drop for ComApartment { fn drop(&mut self) { unsafe { CoUninitialize(); } } }
+    struct ShellPath(*mut u16);
+    impl Drop for ShellPath { fn drop(&mut self) { unsafe { CoTaskMemFree(self.0.cast()); } } }
     fn wide(s: &std::ffi::OsStr) -> Vec<u16> { s.encode_wide().chain(Some(0)).collect() }
     fn wstr(s: &str) -> Vec<u16> { s.encode_utf16().chain(Some(0)).collect() }
     fn os_error() -> u8 { if unsafe { GetLastError() } == 5 { ACCESS } else { UNAVAILABLE } }
@@ -88,11 +109,13 @@ mod windows {
             BCryptCloseAlgorithmProvider(h,0); if rc < 0 { return Err(UNAVAILABLE); }
         } Ok(out)
     }
-    struct Security { _token: Owned, _token_bytes: Vec<usize>, sid: *const c_void, _sd: Local }
+    struct Security { process_token: Owned, _token_bytes: Vec<usize>, sid: *const c_void, _sd: Local }
     impl Security {
         fn new() -> Result<Self> { unsafe {
             let mut token=null_mut();
-            if OpenProcessToken(GetCurrentProcess(),8,&mut token)==0 { return Err(os_error()); }
+            // The Known Folder API can duplicate the token to resolve the user's profile.
+            let access = TOKEN_QUERY | TOKEN_IMPERSONATE | TOKEN_DUPLICATE;
+            if OpenProcessToken(GetCurrentProcess(), access, &mut token) == 0 { return Err(os_error()); }
             let token=Owned(token); let mut needed=0;
             GetTokenInformation(token.0,1,null_mut(),0,&mut needed);
             if needed==0 || needed>65536 { return Err(UNAVAILABLE); }
@@ -105,7 +128,7 @@ mod windows {
             let sid_text=String::from_utf16(std::slice::from_raw_parts(text,n)).map_err(|_|UNAVAILABLE)?;
             let sddl=wstr(&format!("O:{sid_text}D:P(A;OICI;FA;;;{sid_text})")); let mut sd=null_mut();
             if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(),1,&mut sd,null_mut())==0 { return Err(os_error()); }
-            drop(text_mem); Ok(Self{_token:token,_token_bytes:bytes,sid,_sd:Local(sd)})
+            drop(text_mem); Ok(Self{process_token:token,_token_bytes:bytes,sid,_sd:Local(sd)})
         } }
         fn sa(&self) -> Sa { Sa{len:size_of::<Sa>() as u32,sd:self._sd.0,inherit:0} }
         fn check(&self, h: Handle) -> Result<()> { unsafe {
@@ -139,19 +162,27 @@ mod windows {
         let h=Owned(h); info(h.0,directory)?;
         if let Some(sec)=security { sec.check(h.0)?; } Ok(h)
     }
-    fn local_app_data() -> Result<PathBuf> { unsafe {
-        let id=Guid{a:0xf1b32785,b:0x6fba,c:0x4fcf,d:[0x9d,0x55,0x7b,0x8e,0x7f,0x15,0x70,0x91]}; let mut p=null_mut();
-        if SHGetKnownFolderPath(&id,0,null_mut(),&mut p)<0 { return Err(HOST_BINDING); }
-        let mut n=0; while *p.add(n)!=0 && n<32760 { n+=1; }
-        let value=String::from_utf16(std::slice::from_raw_parts(p,n)); CoTaskMemFree(p.cast());
-        let s=value.map_err(|_|HOST_BINDING)?;
-        if n>=32760 || s.as_bytes().get(1)!=Some(&b':') || s.as_bytes().get(2)!=Some(&b'\\') { return Err(HOST_BINDING); }
-        Ok(PathBuf::from(s))
-    } }
+    fn local_app_data(process_token: &Owned) -> Result<PathBuf> {
+        let _apartment = ComApartment::initialize()?;
+        let id = Guid { a: 0xf1b32785, b: 0x6fba, c: 0x4fcf, d: [0x9d, 0x55, 0x7b, 0x8e, 0x7f, 0x15, 0x70, 0x91] };
+        let mut raw = ShellPath(null_mut());
+        // Use the same process identity as the private store ACL and CurrentUser DPAPI.
+        let status = unsafe { SHGetKnownFolderPath(&id, 0, process_token.0, &mut raw.0) };
+        if status < 0 || raw.0.is_null() { return Err(HOST_BINDING); }
+        let mut length = 0;
+        while length < 32_760 && unsafe { *raw.0.add(length) } != 0 { length += 1; }
+        if length == 32_760 { return Err(HOST_BINDING); }
+        let path = String::from_utf16(unsafe { std::slice::from_raw_parts(raw.0, length) })
+            .map_err(|_| HOST_BINDING)?;
+        if path.as_bytes().get(1) != Some(&b':') || path.as_bytes().get(2) != Some(&b'\\') {
+            return Err(HOST_BINDING);
+        }
+        Ok(PathBuf::from(path))
+    }
     struct Store { path: PathBuf, _parents: Vec<Owned>, _lock: Owned, sec: Security, namespace: [u8;32] }
     impl Store {
         fn new(namespace:[u8;32]) -> Result<Self> {
-            let sec=Security::new()?; let root=local_app_data()?;
+            let sec=Security::new()?; let root=local_app_data(&sec.process_token)?;
             let mut parents=Vec::new();
             // Pin every existing ancestor, refusing junctions/reparse points and delete sharing.
             let mut ancestors:Vec<_>=root.ancestors().collect(); ancestors.reverse();
