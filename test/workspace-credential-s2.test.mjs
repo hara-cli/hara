@@ -98,6 +98,29 @@ for (const [label, windowsLaunch] of windowsLaunchVariants) {
   });
 }
 
+test("Host consumes the Desktop launch marker before it can be inherited or reused", t => {
+  const launchKey = "HARA_WORKSPACE_LAUNCH_SOURCE", buildFlag = "__HARA_WINDOWS_DESKTOP_SIDECAR__";
+  const previousSource = process.env[launchKey], previousBuild = Object.getOwnPropertyDescriptor(globalThis, buildFlag);
+  t.after(() => {
+    if (previousSource === undefined) delete process.env[launchKey];
+    else process.env[launchKey] = previousSource;
+    if (previousBuild) Object.defineProperty(globalThis, buildFlag, previousBuild);
+    else delete globalThis[buildFlag];
+  });
+  process.env[launchKey] = "desktop-windows-v1";
+  globalThis[buildFlag] = true; // Model the Bun build's define while exercising the default source lookup.
+  const options = { hostPlatform: "win32", arch: "x64", home: directory(t) };
+  const desktop = createHostCredentialStorage({ ...options, windows: () => fake().vault });
+  t.after(() => desktop.vault.close());
+  assert.equal(desktop.descriptor().backend, "windows-dpapi");
+  assert.equal(process.env[launchKey], undefined);
+  const second = createHostCredentialStorage({
+    ...options, windows: () => assert.fail("the launch marker must be consumed once"),
+  });
+  t.after(() => second.vault.close());
+  assert.deepEqual(second.descriptor(), unsupportedWindowsCli);
+});
+
 test("admitted Windows Desktop keeps distinct missing and invalid worker reasons", async t => {
   for (const reason of ["helper_missing", "helper_invalid"]) {
     const binding = createHostCredentialStorage({

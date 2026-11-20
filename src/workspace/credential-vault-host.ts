@@ -82,6 +82,9 @@ interface VaultSelection {
 }
 
 export function createHostCredentialStorage(options: VaultSelection) {
+  // The launch source belongs to this Host. Children may inherit process.env.
+  const launchSource = process.env.HARA_WORKSPACE_LAUNCH_SOURCE;
+  delete process.env.HARA_WORKSPACE_LAUNCH_SOURCE;
   const platform = options.hostPlatform ?? process.platform, arch = options.arch ?? process.arch;
   const hostPlatform = platform === "darwin" || platform === "win32" || platform === "linux" ? platform : "other";
   const descriptor: CredentialStorageDescriptor = options.descriptor ? { ...options.descriptor } : {
@@ -91,7 +94,7 @@ export function createHostCredentialStorage(options: VaultSelection) {
   if (!backend) {
     const windowsX64 = hostPlatform === "win32" && arch === "x64";
     const launch = options.windowsLaunch ?? {
-      source: process.env.HARA_WORKSPACE_LAUNCH_SOURCE,
+      source: launchSource,
       desktopSidecar: isWindowsDesktopSidecarBuild(),
     };
     // The same sidecar binary may be copied to a managed CLI location. Its build
