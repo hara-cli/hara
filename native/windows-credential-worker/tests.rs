@@ -1,4 +1,105 @@
 use super::*;
+
+#[test]
+fn known_folder_com_scope_balances_first_and_nested_initialization() {
+    let first = ComApartment::initialize().unwrap();
+    let nested = ComApartment::initialize().unwrap();
+    drop(nested);
+    drop(first);
+
+    // S_OK proves this thread has no unmatched initializer left.
+    let status = unsafe { CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED) };
+    if status >= 0 { unsafe { CoUninitialize(); } }
+    assert_eq!(status, 0);
+}
+
+#[test]
+fn incompatible_com_apartment_refuses_known_folder_binding() {
+    let status = unsafe { CoInitializeEx(null_mut(), 0) }; // COINIT_MULTITHREADED
+    assert!(status >= 0, "test thread must admit MTA");
+    let _test_apartment = ComApartment;
+    let security = Security::new().unwrap_or_else(|_| panic!("test process token"));
+    assert_eq!(local_app_data(&security.process_token), Err(FolderBindingError::ComInitFailed));
+
+    // The rejected STA initialization must not uninitialize the existing MTA.
+    let status = unsafe { CoInitializeEx(null_mut(), 0) };
+    if status >= 0 { unsafe { CoUninitialize(); } }
+    assert_eq!(status, 1);
+}
+
+#[test]
+fn known_folder_guard_rejects_a_redirect_into_the_ambient_home() {
+    let profile = Path::new(r"C:\Users\Owner");
+    let ambient = Path::new(r"\\?\C:\Work\old\..\SDK\");
+    assert_eq!(
+        guard_folder_environment(Path::new(r"c:\work\sdk\AppData\Local"), profile, ambient),
+        Err(FolderBindingError::EnvironmentInfluenced),
+    );
+    assert!(guard_folder_environment(Path::new(r"C:\Work\SdkSibling\Local"), profile, ambient).is_ok());
+    assert!(guard_folder_environment(Path::new(r"D:\Redirected\Local"), profile, ambient).is_ok());
+    assert!(guard_folder_environment(
+        Path::new(r"D:\Redirected\Local"), Path::new(r"\\server\profiles\Owner"), ambient,
+    ).is_ok());
+    assert!(guard_folder_environment(Path::new(r"C:\users\OWNER\AppData\Local"), profile, Path::new(r"c:/users/owner")).is_ok());
+}
+
+#[test]
+fn known_folder_process_token_is_stable_across_profile_environments() {
+    use std::process::Command;
+
+    const QUERY: &str = "HARA_TEST_WINDOWS_VAULT_FOLDER_QUERY";
+    const BASELINE: &str = "HARA_TEST_WINDOWS_VAULT_FOLDER_BASELINE";
+    const CHILD_TEST: &str = "windows::tests::known_folder_process_token_is_stable_across_profile_environments";
+    let security = Security::new().expect("test process token");
+    if let Some(query) = std::env::var_os(QUERY) {
+        let baseline = PathBuf::from(std::env::var_os(BASELINE).expect("test baseline"));
+        if query == "process" {
+            let actual = local_app_data(&security.process_token).expect("explicit token binding");
+            assert!(equal_windows_paths(&comparison_path(&actual).unwrap(), &comparison_path(&baseline).unwrap()).unwrap());
+        } else {
+            assert_eq!(query, "null");
+            let result = match query_local_app_data(null_mut()) {
+                Ok(actual) if equal_windows_paths(&comparison_path(&actual).unwrap(), &comparison_path(&baseline).unwrap()).unwrap() => "baseline",
+                Ok(_) => "different",
+                Err(_) => "unavailable",
+            };
+            println!("HARA_NULL_TOKEN_RESULT={result}");
+        }
+        return;
+    }
+
+    let baseline = local_app_data(&security.process_token).expect("original LocalAppData");
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+    let root = std::env::temp_dir().join(format!("hara-vault-folder-{}", hex(&namespace()[..8])));
+    std::fs::create_dir(&root).expect("new synthetic profile test root");
+    let scratch = Scratch(root);
+    let existing = scratch.0.join("existing");
+    std::fs::create_dir_all(existing.join("AppData").join("Local")).expect("synthetic LocalAppData");
+    let missing = scratch.0.join("missing");
+
+    // Fresh copies of this test process leave the parent environment and Shell
+    // caches alone. Each copy runs exactly one lookup under the same OS user.
+    for (scenario, profile) in [("original", None), ("existing", Some(existing)), ("missing", Some(missing))] {
+        for query in ["null", "process"] {
+            let mut child = Command::new(std::env::current_exe().expect("native test executable"));
+            child.args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"]).env(QUERY, query).env(BASELINE, &baseline);
+            if let Some(profile) = &profile { child.env("USERPROFILE", profile).env_remove("LOCALAPPDATA"); }
+            let output = child.output().expect("one fresh Known Folder query process");
+            assert!(output.status.success(), "Known Folder test failed for {scenario}/{query}");
+            if query == "null" {
+                let text = std::str::from_utf8(&output.stdout).expect("test result text");
+                let result = ["baseline", "different", "unavailable"].into_iter()
+                    .find(|value| text.lines().any(|line| line == format!("HARA_NULL_TOKEN_RESULT={value}")))
+                    .expect("one fixed NULL token result");
+                println!("HARA_NULL_TOKEN_{scenario}={result}");
+            }
+        }
+    }
+}
+
 #[repr(C)] struct UserInfo { name:*const u16,password:*const u16,age:u32,privilege:u32,home:*const u16,comment:*const u16,flags:u32,script:*const u16 }
 #[repr(C)] struct Profile { size:u32,flags:u32,name:*const u16,path:*const u16,default_path:*const u16,server:*const u16,policy:*const u16,handle:Handle }
 #[repr(C)] struct Luid { low:u32,high:i32 }
