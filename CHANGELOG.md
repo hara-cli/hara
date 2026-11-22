@@ -5,7 +5,7 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## 1.3.0 — release date pending — Hara Desktop on Windows can now save keys securely
+## 1.3.0 — 2026-11-24 — Hara Desktop on Windows can now save keys securely
 
 - Hara Desktop protects model connection keys with Windows current-user data protection (DPAPI).
   On Windows, the managed CLI and the npm CLI report key saving as unsupported.
