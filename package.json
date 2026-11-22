@@ -83,7 +83,7 @@
     "ink": "^6.8.0",
     "openai": "^6.44.0",
     "react": "^19.2.7",
-    "undici": "^7.30.0",
+    "undici": "^7.30.1",
     "ws": "^8.19.0"
   },
   "devDependencies": {
