@@ -168,7 +168,7 @@ else {
   });
   if (defaultLayout) await host.initialize();
   const workspace = host.createWorkspace("Native CLI fixture", host.list().revision), workspaceId = workspace.workspaceId;
-  host.configureConnection(workspaceId, { ...SYNTHETIC_CONNECTION }, 0); host.select("fixture", workspaceId, host.list().revision);
+  await host.configureConnection(workspaceId, { ...SYNTHETIC_CONNECTION }, 0); host.select("fixture", workspaceId, host.list().revision);
   await host.detectRuntimes(workspaceId);
   const row = host.snapshot(workspaceId).runtimes.options.find(row => row.runtimeId === id);
   host.registerLocalRuntime(workspaceId, id, row.fingerprint, "host");

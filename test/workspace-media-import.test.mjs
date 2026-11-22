@@ -156,7 +156,7 @@ test("disconnecting drops the staged import; another connection cannot continue 
   socket.terminate(); await once(socket, "close");
   const other = await second();
   await assert.rejects(other.rpc("workspace.media.import", chunk(big, "image/png", id, 1)), /import_aborted: chunk out of order/);
-  assert.match(sources(), /ws\.on\("close", \(\) => \{ mediaImports\.discard\(client\.id\);/);
+  assert.match(sources(), /ws\.on\("close", \(\) => \{[^}]*mediaImports\.discard\(client\.id\);/);
   const sessions = new MediaImportSessions(60_000), staged = parseMediaImportChunk(chunk(big, "image/png", id, 0));
   sessions.accept("c", staged); sessions.discard("c");
   assert.equal(sessions.has("c"), false); assert.ok(staged.chunk.every(byte => byte === 0), "dropped bytes are wiped");

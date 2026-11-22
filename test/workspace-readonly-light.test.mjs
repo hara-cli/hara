@@ -30,7 +30,7 @@ test("a user-owned colleague-list answer closes in two model rounds with an engi
     const agent = host.context(ws.workspaceId).resources.agents.get(ws.selectedAgentId);
     host.context(ws.workspaceId).resources.agents.setPermissionTier(agent.agentId, "controlled", agent.configRevision, agent.agentEpoch);
     host.select("tester", ws.workspaceId, host.list().revision);
-    const run = host.start("tester", ws.workspaceId, ws.selectedAgentId, "列出同事", randomUUID());
+    const run = await host.start("tester", ws.workspaceId, ws.selectedAgentId, "列出同事", randomUUID());
     await host.wait(run.runId);
     const view = host.snapshot(ws.workspaceId, ws.selectedAgentId, "tester").conversation;
     assert.equal(rounds, 2); assert.equal(view.taskState, "completed"); assert.equal(view.completion.state, "verified");
@@ -60,7 +60,7 @@ test("engine read-only decision rejects forged answer intent for a change reques
     const agent = host.context(ws.workspaceId).resources.agents.get(ws.selectedAgentId);
     host.context(ws.workspaceId).resources.agents.setPermissionTier(agent.agentId, "controlled", agent.configRevision, agent.agentEpoch);
     host.select("tester", ws.workspaceId, host.list().revision);
-    const run = host.start("tester", ws.workspaceId, ws.selectedAgentId, "创建同事并列出同事", randomUUID());
+    const run = await host.start("tester", ws.workspaceId, ws.selectedAgentId, "创建同事并列出同事", randomUUID());
     await host.wait(run.runId);
     const view = host.snapshot(ws.workspaceId, ws.selectedAgentId, "tester").conversation;
     assert.equal(view.taskState, "paused"); assert.equal(view.completion, null);
@@ -83,7 +83,7 @@ test("a read-only answer that attempts a later write returns to the full intent 
     const agent = host.context(ws.workspaceId).resources.agents.get(ws.selectedAgentId);
     host.context(ws.workspaceId).resources.agents.setPermissionTier(agent.agentId, "controlled", agent.configRevision, agent.agentEpoch);
     host.select("tester", ws.workspaceId, host.list().revision);
-    const run = host.start("tester", ws.workspaceId, ws.selectedAgentId, "列出同事", randomUUID());
+    const run = await host.start("tester", ws.workspaceId, ws.selectedAgentId, "列出同事", randomUUID());
     await host.wait(run.runId);
     const view = host.snapshot(ws.workspaceId, ws.selectedAgentId, "tester").conversation;
     assert.equal(view.taskState, "paused"); assert.equal(view.completion, null);

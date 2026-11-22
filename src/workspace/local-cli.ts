@@ -53,7 +53,7 @@ export async function mainLocalWorkspaceCli(args: string[], mode?: "workspace"):
     if (command === "init" || command === "status") { console.log(JSON.stringify(host.list())); return; }
     const workspaceId = values.get("--workspace"), agentId = values.get("--agent"), message = values.get("--message");
     if (!text(workspaceId) || !text(agentId) || !messageBody(message)) throw new Error("run requires explicit --workspace, --agent and --message");
-    const started = host.start("headless-cli", workspaceId, agentId, message, values.get("--request-id") ?? randomUUID(), resume, undefined, undefined,
+    const started = await host.start("headless-cli", workspaceId, agentId, message, values.get("--request-id") ?? randomUUID(), resume, undefined, undefined,
       { source: "cli", channel: "cli", clientId: "headless-cli" });
     await host.wait(started.runId); const snapshot = host.snapshot(workspaceId, agentId);
     console.log(JSON.stringify(snapshot)); if (snapshot.conversation.state !== "completed") process.exitCode = 2;

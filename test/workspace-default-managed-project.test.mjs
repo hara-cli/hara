@@ -97,11 +97,11 @@ test("actual full Pi greeting and verified file task work in the native App defa
   t.after(async () => { await host.close(); fs.rmSync(owned, { recursive: true, force: true }); });
   await host.initialize();
   const workspace = host.createWorkspace("Default path synthetic fixture", host.list().revision);
-  host.configureConnection(workspace.workspaceId, { ...SYNTHETIC_CONNECTION }, 0);
+  await host.configureConnection(workspace.workspaceId, { ...SYNTHETIC_CONNECTION }, 0);
   const project = join(root, "project", workspace.workspaceId);
   assert.ok(project.startsWith(join(account, ".hara") + "/"));
   for (const message of ["你好，请用一句话介绍你自己", "生成 hello.md 並驗證"]) {
-    const started = host.start("native-default-layout-fixture", workspace.workspaceId, workspace.selectedAgentId, message, randomUUID());
+    const started = await host.start("native-default-layout-fixture", workspace.workspaceId, workspace.selectedAgentId, message, randomUUID());
     await host.wait(started.runId);
     const view = host.snapshot(workspace.workspaceId).conversation;
     assert.equal(view.taskState, "completed", view.blockReason);

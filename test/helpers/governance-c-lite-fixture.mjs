@@ -26,7 +26,7 @@ export async function run(message, turns, tier = "controlled") {
     const agent = host.context(ws.workspaceId).resources.agents.get(ws.selectedAgentId);
     if (agent.permissionTier !== tier) host.context(ws.workspaceId).resources.agents.setPermissionTier(agent.agentId, tier, agent.configRevision, agent.agentEpoch);
     host.select("tester", ws.workspaceId, host.list().revision);
-    const receipt = host.start("tester", ws.workspaceId, ws.selectedAgentId, message, randomUUID());
+    const receipt = await host.start("tester", ws.workspaceId, ws.selectedAgentId, message, randomUUID());
     await host.wait(receipt.runId);
     return { rounds, view: host.snapshot(ws.workspaceId, ws.selectedAgentId, "tester").conversation,
       project: join(path, "project", ws.workspaceId) };

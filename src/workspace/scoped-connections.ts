@@ -138,6 +138,9 @@ export class WorkspaceConnectionStoreV2 {
     return deepFreeze({ connectionId: row.id, credentialGeneration: row.credentialGeneration,
       connectionRevision: row.revision, model: model ?? row.defaultModel, reasoning: row.defaultReasoning ?? null });
   }
+  providerForBinding(binding: ScopedRunConnection): ScopedConnection["provider"] {
+    return this.resolve(binding).provider;
+  }
   /** Host-private; never serialize this result into renderer/history/event DTOs. */
   resolve(binding: ScopedRunConnection): Readonly<ScopedConnection> {
     if (!isScopedRunConnection(binding)) return fail();

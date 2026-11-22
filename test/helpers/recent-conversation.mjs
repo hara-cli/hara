@@ -24,6 +24,6 @@ export function scripted(script) {
   return { calls, factory };
 }
 export async function send(f, agentId, message, origin = UI) {
-  const run = f.host.start("client", f.id, agentId, message, randomUUID(), false, undefined, undefined, origin);
+  const run = await f.host.start("client", f.id, agentId, message, randomUUID(), false, undefined, undefined, origin);
   await f.host.wait(run.runId); return run;
 }

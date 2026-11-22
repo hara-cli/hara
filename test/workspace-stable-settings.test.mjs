@@ -18,36 +18,37 @@ const roots=[];function dir(){const p=fs.realpathSync(fs.mkdtempSync(join(tmpdir
 function resource(home=dir()){const value=new WorkspaceResourceStorage(home,{schemaVersion:1,workspaceId:`ws_${randomUUID()}`,authority:{kind:"local",localAuthorityId:randomUUID()}});value.initialize();return value;}
 const fakeKey="fixture-private-model-key", input=(label="Mock")=>({label,provider:"openai",baseURL:"https://example.invalid/v1",defaultModel:"fixture-model",apiKey:fakeKey});
 const file=(s,name="workspace-connections-v2.json")=>s.run(()=>join(workspaceStateHome(),".hara",name));
-test("multi-connection add/select/edit-blank/delete fallbacks use scoped Keychain refs, never plaintext JSON/DTO",()=>{
+test("multi-connection add/select/edit-blank/delete fallbacks use scoped Keychain refs, never plaintext JSON/DTO",async ()=>{
  const storage=resource(),vault=new MemoryCredentialVault(),store=new WorkspaceSecureConnections(storage,vault);
- const a=store.add(input("A"),0),b=store.add(input("B"),1);assert.equal(store.list().defaultConnectionId,a.id);const old=store.capture();
- store.select(b.id,2);assert.equal(store.capture().connectionId,b.id);assert.doesNotThrow(()=>store.resolve(old));
- store.edit(b.id,{...input("B edited"),apiKey:""},3);assert.equal(store.resolve(store.capture()).apiKey,fakeKey);
+ const a=await store.add(input("A"),0),b=await store.add(input("B"),1);assert.equal(store.list().defaultConnectionId,a.id);const old=store.capture();
+ store.select(b.id,2);assert.equal(store.capture().connectionId,b.id);await assert.doesNotReject(()=>store.resolve(old));
+ await store.edit(b.id,{...input("B edited"),apiKey:""},3);assert.equal((await store.resolve(store.capture())).apiKey,fakeKey);
  const before=JSON.parse(fs.readFileSync(file(storage))),ref=before.connections.find(r=>r.id===b.id).keyRef;
- store.revoke(b.id,store.list().revision);assert.equal(store.list().defaultConnectionId,a.id);assert.equal(vault.get(ref),undefined);
- store.revoke(a.id,store.list().revision);assert.equal(store.list().defaultConnectionId,null);assert.throws(()=>store.resolve(old));
+ await store.revoke(b.id,store.list().revision);assert.equal(store.list().defaultConnectionId,a.id);assert.equal(vault.get(ref),undefined);
+ await store.revoke(a.id,store.list().revision);assert.equal(store.list().defaultConnectionId,null);await assert.rejects(()=>store.resolve(old));
  for(const p of [file(storage),file(storage,"workspace-connections-v2-backup.json")])assert(!fs.readFileSync(p,"utf8").includes(fakeKey));
  assert(!JSON.stringify(store.list()).includes(fakeKey));assert(!JSON.stringify(store.list()).includes("keyRef"));
 });
-test("same-space v1→v2→v3 migration backs up recoverable keyRef metadata and is idempotent",()=>{
+test("same-space v1→v2→v3 migration backs up recoverable keyRef metadata and is idempotent",async ()=>{
  const storage=resource(),legacy=new WorkspaceConnectionStoreV2(storage),row=legacy.add(input(),0);const raw=JSON.parse(fs.readFileSync(file(storage)));raw.schemaVersion=1;fs.writeFileSync(file(storage),JSON.stringify(raw));
- const vault=new MemoryCredentialVault(),store=new WorkspaceSecureConnections(storage,vault);assert.equal(store.list().connections[0].id,row.id);
+ const vault=new MemoryCredentialVault(),store=new WorkspaceSecureConnections(storage,vault);assert.equal(store.list().migrationPending,true);
+ const newView=await store.retryMigration(store.list().revision);assert.equal(newView.connections[0].id,row.id);
  const migrated=fs.readFileSync(file(storage),"utf8"),backup=fs.readFileSync(file(storage,"workspace-connections-v2-backup.json"),"utf8");assert(!migrated.includes(fakeKey));assert(!backup.includes(fakeKey));
- assert.equal(JSON.parse(migrated).schemaVersion,3);assert.equal(store.resolve(store.capture()).apiKey,fakeKey);store.list();assert.equal(fs.readFileSync(file(storage),"utf8"),migrated);
+ assert.equal(JSON.parse(migrated).schemaVersion,3);assert.equal((await store.resolve(store.capture())).apiKey,fakeKey);store.list();assert.equal(fs.readFileSync(file(storage),"utf8"),migrated);
 });
-test("unknown higher connection schema is read-only and cannot overwrite its original bytes",()=>{
- const storage=resource(),store=new WorkspaceSecureConnections(storage,new MemoryCredentialVault());store.add(input(),0);
+test("unknown higher connection schema is read-only and cannot overwrite its original bytes",async ()=>{
+ const storage=resource(),store=new WorkspaceSecureConnections(storage,new MemoryCredentialVault());await store.add(input(),0);
  const raw=JSON.parse(fs.readFileSync(file(storage)));raw.schemaVersion=99;raw.futureField="keep";const text=JSON.stringify(raw);fs.writeFileSync(file(storage),text);
  assert.equal(store.list().readOnly,true);assert.throws(()=>store.select(store.list().connections[0].id,1));assert.equal(fs.readFileSync(file(storage),"utf8"),text);
 });
-test("corrupt connection file recovers last committed backup read-only, with a usable credential",()=>{
- const storage=resource(),store=new WorkspaceSecureConnections(storage,new MemoryCredentialVault());store.add(input(),0);fs.writeFileSync(file(storage),"{");
- assert.equal(store.list().recovered,true);assert.equal(store.resolve(store.capture()).apiKey,fakeKey);assert.throws(()=>store.add(input(),1));assert.equal(fs.readFileSync(file(storage),"utf8"),"{");
+test("corrupt connection file recovers last committed backup read-only, with a usable credential",async ()=>{
+ const storage=resource(),store=new WorkspaceSecureConnections(storage,new MemoryCredentialVault());await store.add(input(),0);fs.writeFileSync(file(storage),"{");
+ assert.equal(store.list().recovered,true);assert.equal((await store.resolve(store.capture())).apiKey,fakeKey);await assert.rejects(()=>store.add(input(),1));assert.equal(fs.readFileSync(file(storage),"utf8"),"{");
 });
-test("legacy import is confirmation-ready metadata only, repeated import idempotent, broken sources ignored",()=>{
+test("legacy import is confirmation-ready metadata only, repeated import idempotent, broken sources ignored",async ()=>{
  const home=dir();fs.mkdirSync(join(home,".hara"),{mode:0o700});fs.writeFileSync(join(home,".hara/config.json"),JSON.stringify({...input("Old"),model:"fixture-model"}),{mode:0o600});
  const vault=new MemoryCredentialVault(),catalog=new LegacyConnectionCatalog(home,vault),preview=catalog.list();assert.equal(preview.length,1);assert(!JSON.stringify(preview).includes(fakeKey));
- const storage=resource(),store=new WorkspaceSecureConnections(storage,vault),resolved=catalog.resolve(preview[0].id);store.importConnection(resolved.input,0,resolved.importId);store.importConnection(resolved.input,1,resolved.importId);
+ const storage=resource(),store=new WorkspaceSecureConnections(storage,vault),resolved=catalog.resolve(preview[0].id);await store.importConnection(resolved.input,0,resolved.importId);await store.importConnection(resolved.input,1,resolved.importId);
  assert.equal(store.list().connections.length,1);fs.writeFileSync(join(home,".hara/config.json"),"broken");assert.deepEqual(catalog.list(),[]);assert.throws(()=>catalog.resolve(preview[0].id));
 });
 test("Keychain secret is stdin-only, fixed service, and diagnostics never surface credential values",()=>withProcessPlatform("darwin",()=>{
@@ -70,26 +71,26 @@ test("platform fixture restores the exact descriptor even when a synchronous ass
  assert.throws(()=>withProcessPlatform("darwin",()=>{assert.equal(process.platform,"darwin");throw failure;}),error=>error===failure);
  assert.deepEqual(Object.getOwnPropertyDescriptor(process,"platform"),original);
 });
-test("denied old-Key cleanup is persisted, revoked immediately and explicitly retryable after restart",()=>{
+test("denied old-Key cleanup is persisted, revoked immediately and explicitly retryable after restart",async ()=>{
  const storage=resource(),memory=new MemoryCredentialVault();let deny=true;
  const vault={get:ref=>memory.get(ref),set:(ref,key)=>memory.set(ref,key),remove(ref){if(deny)throw new Error("fixture Keychain denied");memory.remove(ref);}};
- const store=new WorkspaceSecureConnections(storage,vault),row=store.add(input(),0),binding=store.capture();
- assert.throws(()=>store.edit(row.id,{...input(),apiKey:""},1),/denied/);assert.throws(()=>store.resolve(binding),/generation unavailable/);
+ const store=new WorkspaceSecureConnections(storage,vault),row=await store.add(input(),0),binding=store.capture();
+ await store.edit(row.id,{...input(),apiKey:""},1);await assert.rejects(()=>store.resolve(binding),/generation unavailable/);
  const resumed=new WorkspaceSecureConnections(storage,vault);assert.equal(resumed.list().connections[0].cleanupPending,true);
- deny=false;resumed.cleanupCredentials(row.id,resumed.list().revision);assert.equal(resumed.list().connections[0].cleanupPending,false);assert.equal(resumed.resolve(resumed.capture()).apiKey,fakeKey);
- deny=true;assert.throws(()=>resumed.revoke(row.id,resumed.list().revision),/denied/);assert.throws(()=>resumed.capture());assert.equal(resumed.list().connections[0].cleanupPending,true);
- deny=false;resumed.cleanupCredentials(row.id,resumed.list().revision);assert.equal(resumed.list().connections[0].cleanupPending,false);
+ deny=false;await resumed.cleanupCredentials(row.id,resumed.list().revision);assert.equal(resumed.list().connections[0].cleanupPending,false);assert.equal((await resumed.resolve(resumed.capture())).apiKey,fakeKey);
+ deny=true;await resumed.revoke(row.id,resumed.list().revision);assert.throws(()=>resumed.capture());assert.equal(resumed.list().connections[0].cleanupPending,true);
+ deny=false;await resumed.cleanupCredentials(row.id,resumed.list().revision);assert.equal(resumed.list().connections[0].cleanupPending,false);
 });
-test("post-commit backup failure never deletes a new credential referenced by durable metadata",()=>{
+test("post-commit backup failure never deletes a new credential referenced by durable metadata",async ()=>{
  const storage=resource(),vault=new MemoryCredentialVault(),store=new WorkspaceSecureConnections(storage,vault),backup=file(storage,"workspace-connections-v2-backup.json"),original=fs.linkSync;let backups=0;
  fs.linkSync=function(from,to){if(to===backup&&++backups===2)throw new Error("fixture backup commit denied");return original.apply(this,arguments);};syncBuiltinESMExports();
- try {assert.throws(()=>store.add(input(),0),/denied/);}finally{fs.linkSync=original;syncBuiltinESMExports();}
- assert.equal(store.list().connections.length,1);assert.equal(store.resolve(store.capture()).apiKey,fakeKey);
+ try {await store.add(input(),0);}finally{fs.linkSync=original;syncBuiltinESMExports();}
+ assert.equal(store.list().connections.length,1);assert.equal((await store.resolve(store.capture())).apiKey,fakeKey);
  // Rotate under the same uncertain post-commit boundary; neither the new key nor the pending old
  // cleanup may be lost. A later explicit action can clean the retired generation.
  backups=0;fs.linkSync=function(from,to){if(to===backup&&++backups===2)throw new Error("fixture backup commit denied");return original.apply(this,arguments);};syncBuiltinESMExports();
- try {assert.throws(()=>store.edit(store.list().connections[0].id,{...input(),apiKey:""},store.list().revision),/denied/);}finally{fs.linkSync=original;syncBuiltinESMExports();}
- assert.equal(store.resolve(store.capture()).apiKey,fakeKey);assert.equal(store.list().connections[0].cleanupPending,true);
+ try {await store.edit(store.list().connections[0].id,{...input(),apiKey:""},store.list().revision);}finally{fs.linkSync=original;syncBuiltinESMExports();}
+ assert.equal((await store.resolve(store.capture())).apiKey,fakeKey);assert.equal(store.list().connections[0].cleanupPending,true);
 });
 test("legacy source preview accepts readonly public config, rejects writable/hard-linked config and excludes the current workspace source",()=>{
  const home=dir(),path=join(home,".hara/config.json");fs.mkdirSync(dirname(path),{recursive:true,mode:0o700});fs.writeFileSync(path,JSON.stringify(input()),{mode:0o600});const catalog=new LegacyConnectionCatalog(home,new MemoryCredentialVault());

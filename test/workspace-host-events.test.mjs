@@ -16,6 +16,22 @@ test("Host approval listener precedes synchronous start notification and defers 
   const result = await waitForHostApproval(f.options);
   assert.equal(result.job.runId, "sync-run"); assert.equal(result.card.id, "card"); assert.equal(f.events.listenerCount("change"), 0);
 });
+test("Host approval waits for async admission before attaching to the run", async () => {
+  const f = fixture(), admission = deferred();
+  let waitedFor;
+  f.options.start = () => { f.publish({ id: "early-card" }); return admission.promise; };
+  f.options.wait = runId => { waitedFor = runId; return f.completion.promise; };
+  const pending = waitForHostApproval(f.options);
+  await Promise.resolve();
+  assert.equal(f.reads, 0, "notifications cannot complete the wait before admission returns");
+  admission.resolve({ runId: "async-run" });
+  const result = await pending;
+  assert.equal(waitedFor, "async-run");
+  assert.deepEqual(result, { job: { runId: "async-run" }, card: { id: "early-card" } });
+  assert.equal(f.events.listenerCount("change"), 0);
+  f.completion.resolve();
+});
+
 test("deferred Host work waits for events without clock polling or resubmission", async () => {
   const f = fixture(), pending = waitForHostApproval(f.options);
   await Promise.resolve(); const initial = f.reads;

@@ -64,5 +64,6 @@
   "core.location.root": "资源根",
   "core.location.current": "当前空间目录",
   "core.location.recent": "最近目录",
-  "core.location.other": "其它（输入）"
+  "core.location.other": "其它（输入）",
+  "core.credentialStorage.windowsDesktopRequired": "在 Windows 上，请使用 Hara Desktop 安全保存工作区模型密钥。"
 }

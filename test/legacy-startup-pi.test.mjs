@@ -14,7 +14,7 @@ test("an inherited Pi colleague performs an actual synthetic file task and remai
   const began=Date.now(),phase=phases(t,began),f=fixture(t),host=f.open();let watchdog;try{
     await host.initialize();const id=host.list().workspaces[0].workspaceId,a=host.snapshot(id).agents.find(row=>row.kind==="colleague"&&row.state==="active");
     phase("fixture initialized");
-    const accepted=host.start("test",id,a.agentId,"生成 hello.md 並驗證",randomUUID());
+    const accepted=await host.start("test",id,a.agentId,"生成 hello.md 並驗證",randomUUID());
     phase("task accepted");
     // Observation only: never fails or extends the test; reports the live task state while draining.
     watchdog=setInterval(()=>{try{const c=host.snapshot(id,a.agentId).conversation;phase(`task still draining (taskState=${c.taskState}, messages=${c.messages?.length??"?"})`);}catch(error){phase(`task still draining (snapshot failed: ${error.message})`);}},15000);watchdog.unref();

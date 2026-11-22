@@ -140,7 +140,7 @@ export function createWorkspaceRunPermit(input: {
   catalog: LocalWorkspaceCatalog;
   resources: WorkspaceResources;
   storage: WorkspaceResourceStorage;
-  connections: WorkspaceConnectionStoreV2;
+  connections: Pick<WorkspaceConnectionStoreV2, "providerForBinding">;
   lease: WorkspaceSessionLease;
   provider: Provider;
   cwd: string;
@@ -209,8 +209,8 @@ export function createWorkspaceRunPermit(input: {
       || row.actorId !== binding.host.actorId || row.policyRevision !== binding.host.policyRevision
       || row.grantId !== binding.host.grantId || row.grantRevision !== binding.host.grantRevision) throw new Error("Workspace Host authority was revoked");
     input.resources.agents.resolveTask(binding.agent);
-    const connection = input.connections.resolve(binding.connection);
-    if (input.provider.id !== connection.provider || input.provider.model !== binding.connection.model) throw new Error("Workspace Provider route mismatch");
+    const providerId = input.connections.providerForBinding(binding.connection);
+    if (input.provider.id !== providerId || input.provider.model !== binding.connection.model) throw new Error("Workspace Provider route mismatch");
     if (state?.options) {
       const opts = state.options, initial = opts.taskIntake?.task, current = opts.taskIntake?.current?.() ?? initial;
       if (!initial || !current || !workspaceRunMatchesTask(initial.workspaceRunBinding, initial)

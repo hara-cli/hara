@@ -9,7 +9,7 @@ export function waitForHostApproval({ events, read, start, wait, signal }) {
       error ? reject(error) : resolve({ job, card });
     };
     const check = () => {
-      if (settled) return false;
+      if (!job || settled) return false;
       try { const card = read(); if (card) { finish(null, card); return true; } }
       catch (error) { finish(error); }
       return false;
@@ -21,11 +21,16 @@ export function waitForHostApproval({ events, read, start, wait, signal }) {
     const abort = () => finish(signal.reason ?? new Error("Host approval wait aborted"));
     if (signal?.aborted) { abort(); return; }
     events.on("change", changed); signal?.addEventListener("abort", abort, { once: true });
+    const observe = async started => {
+      if (settled) return;
+      job = started; changed();
+      await wait(job.runId);
+      if (!check() && !settled) finish(new Error("Host run ended before publishing an approval card"));
+    };
     try {
-      job = start(); changed();
-      Promise.resolve(wait(job.runId)).then(() => {
-        if (!check() && !settled) finish(new Error("Host run ended before publishing an approval card"));
-      }, error => finish(error));
+      const started = start();
+      const observation = typeof started?.then === "function" ? Promise.resolve(started).then(observe) : observe(started);
+      observation.catch(error => finish(error));
     } catch (error) { finish(error); }
   });
 }

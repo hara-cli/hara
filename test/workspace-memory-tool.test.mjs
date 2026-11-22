@@ -21,9 +21,9 @@ test("actual Pi Host receives only matching inherited memory; greetings and anot
  try{const a=host.createWorkspace("A",host.list().revision),b=host.createWorkspace("B",host.list().revision),content="Always confirm the reporting period. "+"Context. ".repeat(1000),source={sourceRef:"legacy",sourceHash:createHash("sha256").update(content).digest("hex"),content};
   const storage=new WorkspaceResourceStorage(host.home,host.catalog.resolve(a.workspaceId).scope);storage.initialize();await new WorkspaceLegacyMemoryImport(storage,"a".repeat(64),[source]).apply();
   for(const view of[a,b]){
-   host.configureConnection(view.workspaceId,{label:"Fake",provider:"openai",baseURL:"https://example.invalid/v1",defaultModel:"fake",apiKey:"fixture-only-key"},0);
+   await host.configureConnection(view.workspaceId,{label:"Fake",provider:"openai",baseURL:"https://example.invalid/v1",defaultModel:"fake",apiKey:"fixture-only-key"},0);
    for(const objective of["Hello","What is known about the reporting period?"]){
-    const run=host.start("fixture",view.workspaceId,view.selectedAgentId,objective,randomUUID());await host.wait(run.runId);
+    const run=await host.start("fixture",view.workspaceId,view.selectedAgentId,objective,randomUUID());await host.wait(run.runId);
    }
   }
   assert.equal(turns.length,4);

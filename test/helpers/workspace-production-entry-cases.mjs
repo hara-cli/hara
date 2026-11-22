@@ -29,9 +29,9 @@ if (selected.includes(0)) test("formal six-step Host flow uses an explicit mock 
     assert.equal(host.list().executionMode, "workspace"); assert.equal(host.list().syntheticOnly, false);
     const workspace = host.createWorkspace("Personal", host.list().revision), id = workspace.workspaceId, main = workspace.selectedAgentId;
     assert.throws(() => host.configureSynthetic(id, 0), /explicit isolated Lab/);
-    assert.throws(() => host.start("client", id, main, "hello", randomUUID()), /connection/); assert.equal(host.snapshot(id).conversation.usage.modelCalls, 0);
-    host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
-    const hello = host.start("client", id, main, "hello", randomUUID()); await host.wait(hello.runId); assert.equal(host.snapshot(id).conversation.state, "completed");assert.equal(host.snapshot(id).conversation.completion.state,"verified");
+    await assert.rejects(() => host.start("client", id, main, "hello", randomUUID()), /connection/); assert.equal(host.snapshot(id).conversation.usage.modelCalls, 0);
+    await host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
+    const hello = await host.start("client", id, main, "hello", randomUUID()); await host.wait(hello.runId); assert.equal(host.snapshot(id).conversation.state, "completed");assert.equal(host.snapshot(id).conversation.completion.state,"verified");
     const approvalStarted = Date.now();
     const { job: create, card } = await waitForHostApproval({ events, signal: t.signal,
       start: () => host.start("client", id, main, "建立 Pi 同事 Coder", randomUUID()),
@@ -44,7 +44,7 @@ if (selected.includes(0)) test("formal six-step Host flow uses an explicit mock 
     assert.equal(receipts.length, 1); assert.equal(receipts[0].isError, false);
     assert.equal(JSON.parse(receipts[0].content).approvalState, "consumed");
     assert.throws(() => host.answerApproval("client", id, card.id, true), /approval/);
-    const task = host.start("client", id, main, "委派 Coder 生成 hello.md 並驗證", randomUUID()); await host.wait(task.runId);
+    const task = await host.start("client", id, main, "委派 Coder 生成 hello.md 並驗證", randomUUID()); await host.wait(task.runId);
     const before = host.snapshot(id, main, "client"); assert.equal(before.conversation.completion.state, "verified");
     const colleague=before.agents.find(agent=>agent.kind==="colleague"),child=host.snapshot(id,colleague.agentId),primary=join(root,"project",id,"colleagues",colleague.agentId);
     assert.equal(child.colleagueHome.path,primary);assert.equal(child.colleagueHome.available,true);assert.equal(child.conversation.completion.state,"verified");
@@ -74,7 +74,7 @@ if (selected.includes(1)) test("confirmed colleague creation finishes the LocalJ
     } });
   try {
     const workspace = host.createWorkspace("Personal", host.list().revision), id = workspace.workspaceId, main = workspace.selectedAgentId;
-    host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
+    await host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
     const { job, card } = await waitForHostApproval({ events, signal: t.signal,
       start: () => host.start("client", id, main, "建立同事 Coder", randomUUID()),
       read: () => host.snapshot(id, main, "client").approvals[0], wait: runId => host.wait(runId) });
@@ -94,7 +94,7 @@ if (selected.includes(2)) test("agent_create soft-returns declined when the huma
     providerFactory: createWorkspaceSyntheticProvider, onChange: event => events.emit("change", event) });
   try {
     const workspace = host.createWorkspace("Personal", host.list().revision), id = workspace.workspaceId, main = workspace.selectedAgentId;
-    host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
+    await host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
     const { job, card } = await waitForHostApproval({ events, signal: t.signal,
       start: () => host.start("client", id, main, "建立同事 Declined", randomUUID()),
       read: () => host.snapshot(id, main, "client").approvals[0], wait: runId => host.wait(runId) });
@@ -115,7 +115,7 @@ if (selected.includes(3)) test("agent_create soft-returns expired when the confi
     approvalTimeoutMs: 40, providerFactory: createWorkspaceSyntheticProvider, onChange: event => events.emit("change", event) });
   try {
     const workspace = host.createWorkspace("Personal", host.list().revision), id = workspace.workspaceId, main = workspace.selectedAgentId;
-    host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
+    await host.configureConnection(id, { ...SYNTHETIC_CONNECTION }, 0); host.select("client", id, host.list().revision);
     const { job, card } = await waitForHostApproval({ events, signal: t.signal,
       start: () => host.start("client", id, main, "建立同事 Expired", randomUUID()),
       read: () => host.snapshot(id, main, "client").approvals[0], wait: runId => host.wait(runId) });
@@ -138,7 +138,7 @@ if (selected.includes(4)) test("formal protocol advertises Workspace capabilitie
     const message = raw => { const value = JSON.parse(String(raw)); if (value.id === id) { clearTimeout(timer); socket.off("message", message); value.error ? reject(new Error(value.error.message)) : resolve(value.result); } };
     socket.on("message", message); socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params })); });
   try {
-    const init = await request("initialize", { token: handle.token }); assert.deepEqual(init.capabilities, ["workspace.v1", "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1","workspace.channel-pass.v1","workspace.channel-queue.v1","workspace.channel-autonomy.v1","workspace.colleague-schedules.v1","workspace.runtime-login-effort.v1","workspace.runtime-form.v1","workspace.default-runtime.v1","workspace.onboarding.v1","workspace.agents.create-batch.v1","workspace.media.v1","workspace.media.states.v1","workspace.media.import.v1","workspace.i18n.v1","workspace.agents.archive.v1","workspace.agents.appearance.v1","workspace.runtime-proxy.v1","workspace.runtime-stage-events.v1","workspace.message-timing.v1","workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1","workspace.connection-models.v1","workspace.connection-catalog.v1"]); assert.equal(init.executionMode, "workspace");
+    const init = await request("initialize", { token: handle.token }); assert.deepEqual(init.capabilities, ["workspace.v1", "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1","workspace.channel-pass.v1","workspace.channel-queue.v1","workspace.channel-autonomy.v1","workspace.colleague-schedules.v1","workspace.runtime-login-effort.v1","workspace.runtime-form.v1","workspace.default-runtime.v1","workspace.onboarding.v1","workspace.agents.create-batch.v1","workspace.media.v1","workspace.media.states.v1","workspace.media.import.v1","workspace.i18n.v1","workspace.agents.archive.v1","workspace.agents.appearance.v1","workspace.runtime-proxy.v1","workspace.runtime-stage-events.v1","workspace.message-timing.v1","workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1","workspace.connection-models.v1", "workspace.connection-catalog.v1","workspace.credential-storage.v1"]); assert.equal(init.executionMode, "workspace");
     const workspace = await request("workspace.create", { label: "P", expectedRevision: init.workspace.revision }), scope = { workspaceId: workspace.workspaceId, expectedGeneration: workspace.resourceGeneration };
     await assert.rejects(request("workspace.connection.synthetic", { ...scope, expectedRevision: 0 }), /Lab/);
     await assert.rejects(request("workspace.runtime.propose", { ...scope, runtimeId: "codex", url: "http://127.0.0.1:9/tool" }), /unsupported/);
@@ -194,8 +194,8 @@ if (selected.includes(7)) test("formal default factory sends exactly the scoped 
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve)); const root = dir(), host = new LocalWorkspaceHost(root, { mode: "workspace", credentialVault: new MemoryCredentialVault() });
   try {
     const workspace = host.createWorkspace("Mock", host.list().revision);
-    host.configureConnection(workspace.workspaceId, { label: "Mock only", provider: "openai", baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: "local-fake-workspace-credential", defaultModel: "local-mock-model" }, 0);
-    const run = host.start("client", workspace.workspaceId, workspace.selectedAgentId, "hello", randomUUID()); await host.wait(run.runId);
+    await host.configureConnection(workspace.workspaceId, { label: "Mock only", provider: "openai", baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: "local-fake-workspace-credential", defaultModel: "local-mock-model" }, 0);
+    const run = await host.start("client", workspace.workspaceId, workspace.selectedAgentId, "hello", randomUUID()); await host.wait(run.runId);
     assert.equal(host.snapshot(workspace.workspaceId).conversation.state, "completed");assert.equal(host.snapshot(workspace.workspaceId).conversation.completion.state,"verified"); assert.equal(received.length, 1); assert.equal(received[0].auth, "Bearer local-fake-workspace-credential"); assert.equal(received[0].body.model, "local-mock-model");
     assert.equal(JSON.stringify(host.snapshot(workspace.workspaceId)).includes("local-fake-workspace-credential"), false);
   } finally { await host.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }

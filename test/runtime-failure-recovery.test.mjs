@@ -157,8 +157,8 @@ for (const elapsed of [429, 503, 529]) test(`Host persists an intact blockReason
   const workspace = host.createWorkspace("Runtime failure fixture", host.list().revision), context = host.context(workspace.workspaceId);
   const agent = context.resources.agents.get(workspace.selectedAgentId);
   context.resources.agents.setPermissionTier(agent.agentId, "controlled", agent.configRevision, agent.agentEpoch);
-  host.configureConnection(workspace.workspaceId, { ...SYNTHETIC_CONNECTION }, 0);
-  const sent = host.start("ui", workspace.workspaceId, agent.agentId, "hello", randomUUID()); await host.wait(sent.runId);
+  await host.configureConnection(workspace.workspaceId, { ...SYNTHETIC_CONNECTION }, 0);
+  const sent = await host.start("ui", workspace.workspaceId, agent.agentId, "hello", randomUUID()); await host.wait(sent.runId);
   const conversation = host.snapshot(workspace.workspaceId).conversation;
   assert.equal(conversation.state, "blocked"); assert.equal(calls, 1);
   assert.equal(conversation.blockReason, `[openai error] ${message}`);

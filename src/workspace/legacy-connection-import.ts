@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { writePrivateStateFileSync } from "../security/private-state.js";
 import { canonical, plain } from "./local-state.js";
 import { inspectWorkspaceResourceFile, workspaceStateHome, type WorkspaceResourceStorage } from "./resource-context.js";
-import type { CredentialVault } from "./credential-vault.js";
+import { assertCredentialCall, credentialDeadline, type AsyncCredentialVault, type CredentialCall } from "./credential-vault.js";
+import { CREDENTIAL_INTENTS_FILE } from "./credential-write-intents.js";
 import { WorkspaceSecureConnections } from "./secure-connections.js";
 import { LegacyScopedFileUndo } from "./legacy-file-undo.js";
 import type { LegacyConnectionCatalog } from "./legacy-connections.js";
@@ -19,7 +20,7 @@ export class WorkspaceLegacyConnectionImport implements LegacyDomainAdapter {
   readonly connections: WorkspaceSecureConnections;
   private readonly undo: LegacyScopedFileUndo;
   constructor(private readonly storage: WorkspaceResourceStorage, private readonly source: Pick<LegacyConnectionCatalog, "inheritanceSeeds" | "resolve">,
-    private readonly vault: CredentialVault, private readonly sourceFingerprint: string) {
+    private readonly vault: AsyncCredentialVault, private readonly sourceFingerprint: string, private readonly assertCurrent?: () => void) {
     this.undo = new LegacyScopedFileUndo(storage, this.id, sourceFingerprint);
     this.connections = new WorkspaceSecureConnections(storage, vault, id => source.resolve(id, undefined, true, true));
   }
@@ -52,22 +53,23 @@ export class WorkspaceLegacyConnectionImport implements LegacyDomainAdapter {
   async apply(): Promise<LegacyDomainReceipt> {
     if (this.undo.read().status === "applied") { this.undo.preflightRollback(); return this.receipt(); }
     this.undo.begin([FILE, BACKUP, AUDIT], [AUDIT]);
-    await this.undo.runImport(() => {
+    const call: CredentialCall = { signal: credentialDeadline(), assertCurrent: this.assertCurrent };
+    await this.undo.runImport(async () => {
+      assertCredentialCall(call);
       const seeds = this.source.inheritanceSeeds(); this.connections.stageLegacyImport(seeds, true);
-      const previous = this.beforeRefs(), refs = this.connections.inheritanceMetadata().filter(row => !previous.has(row.keyRef) && !row.keyRequired).map(row => row.keyRef).sort();
-      this.storage.run(() => {
-        const file = inspectWorkspaceResourceFile(join(workspaceStateHome(), AUDIT), 128 * 1024), audit = this.readAudit(file.snapshot?.text ?? null), round = this.undo.read().round;
-        const old = audit.rounds.find(row => row.round === round);
-        if (old && canonical(old.refs) !== canonical(refs)) throw new Error("Credential import intent changed; originals preserved");
-        if (!old) audit.rounds.push({ round, refs });
-        // References are durable BEFORE the first vault write, so a refused/unknown batch can be
-        // cancelled after restart without guessing which credential entries belong to this import.
-        writePrivateStateFileSync(file, JSON.stringify(audit) + "\n", file.snapshot ? { expectedText: file.snapshot.text } : { expectedMissing: true });
-      });
       const state = this.connections.list();
-      if (state.migrationPending) this.connections.retryMigration(state.revision);
+      if (state.migrationPending) {
+        const recordRefs = (refs: readonly string[]) => this.storage.run(() => {
+          const file = inspectWorkspaceResourceFile(join(workspaceStateHome(), AUDIT), 128 * 1024);
+          const audit = this.readAudit(file.snapshot?.text ?? null), round = this.undo.read().round;
+          if (audit.rounds.some(row => row.round === round)) throw new Error("Previous credential import requires explicit recovery");
+          audit.rounds.push({ round, refs: [...refs].sort() });
+          writePrivateStateFileSync(file, JSON.stringify(audit) + "\n", file.snapshot ? { expectedText: file.snapshot.text } : { expectedMissing: true });
+        });
+        await this.connections.retryMigration(state.revision, call, recordRefs);
+      }
       this.connectionMap();
-    });
+    }, [".hara/" + CREDENTIAL_INTENTS_FILE, ".hara/" + CREDENTIAL_INTENTS_FILE.replace(/\.json$/, "-backup.json")]);
     return this.receipt();
   }
   async verify(receipt: LegacyDomainReceipt): Promise<boolean> {
@@ -77,7 +79,8 @@ export class WorkspaceLegacyConnectionImport implements LegacyDomainAdapter {
       const map = this.connectionMap(), metadata = this.connections.inheritanceMetadata(), previous = this.beforeRefs();
       for (const seed of this.source.inheritanceSeeds()) if (seed.keySaved) {
         const row = map.find(row => row.sourceId === seed.id)!;
-        const stored = this.connections.resolve(this.connections.capture(row.connectionId));
+        const stored = await this.connections.resolve(this.connections.capture(row.connectionId),
+          { signal: credentialDeadline(), assertCurrent: this.assertCurrent });
         // Material equality only; not a network/paid connectivity test.
         const existing = metadata.find(item => item.id === row.connectionId)!;
         if (!stored.apiKey || !previous.has(existing.keyRef) && stored.apiKey !== this.source.resolve(seed.id, undefined, true, true).input.apiKey) return false;
@@ -90,7 +93,7 @@ export class WorkspaceLegacyConnectionImport implements LegacyDomainAdapter {
     // Seal only the write-chain proven by the durable next-image intents; this runs NO importer or
     // vault write. Unknown/concurrent images still refuse rather than guessing a rollback snapshot.
     if (this.undo.read().status === "open") await this.undo.runImport(() => {});
-    this.undo.preflightRollback(); this.cleanupRefs();
+    this.undo.preflightRollback(); this.connections.intents.assertCleanupReady(this.cleanupRefs());
   }
   private cleanupRefs(): string[] {
     const state = this.undo.read(); if (!state.revision) return [];
@@ -104,6 +107,8 @@ export class WorkspaceLegacyConnectionImport implements LegacyDomainAdapter {
     await this.preflightRollback(); const refs = this.cleanupRefs(); this.undo.rollback();
     // Metadata is revoked/restored first. The immutable reference-only audit remains for retries if
     // the OS refuses cleanup. Never remove an original or another Workspace's credential.
-    for (const ref of refs) this.vault.remove(ref);
+    const call: CredentialCall = { signal: credentialDeadline(), assertCurrent: this.assertCurrent };
+    for (const ref of refs) await this.vault.remove(ref, call);
+    this.connections.intents.retireRemovedRefs(refs, call);
   }
 }

@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { WorkspaceResourceStorage, workspaceStateHome } from "../dist/workspace/resource-context.js";
 import { WorkspaceConnectionStoreV2 } from "../dist/workspace/scoped-connections.js";
 import { WorkspaceSecureConnections } from "../dist/workspace/secure-connections.js";
+import { adaptCredentialVault } from "../dist/workspace/credential-vault-host.js";
 import { MemoryCredentialVault } from "../dist/workspace/credential-vault.js";
 import { WorkspacePreferences } from "../dist/workspace/preferences.js";
 import { LegacyConnectionCatalog } from "../dist/workspace/legacy-connections.js";
@@ -47,18 +48,20 @@ test("npm prefix discovery is offline/no-notifier and cannot create the host npm
   } finally { globalThis.fetch = previousFetch; }
 });
 
-for (const reason of ["denied", "timeout", "non-darwin unavailable"]) test(`v2 migration ${reason} is pending/read-only, preserves source and never silently retries`, () => {
+for (const reason of ["denied", "timeout", "non-darwin unavailable"]) test(`v2 migration ${reason} is pending/read-only, preserves source and never silently retries`, async () => {
   const resource = storage(); new WorkspaceConnectionStoreV2(resource).add(input(), 0);
   const before = fs.readFileSync(path(resource)), memory = new MemoryCredentialVault(); let denied = true, writes = 0;
   const vault = { get: ref => memory.get(ref), remove: ref => memory.remove(ref), set(ref, key) { writes++; if (denied) throw new Error(`${reason} ${fakeKey}`); memory.set(ref, key); } };
-  const store = new WorkspaceSecureConnections(resource, vault), value = store.list();
+  const store = new WorkspaceSecureConnections(resource, adaptCredentialVault(vault)), value = store.list();
   assert.equal(value.readOnly, true); assert.equal(value.migrationPending, true); assert.equal(value.recovered, false); assert.deepEqual(value.connections, []); assert.equal(value.defaultConnectionId, null);
   assert.equal(JSON.stringify(value).includes(fakeKey), false); assert.equal(fs.readFileSync(path(resource)).equals(before), true); assert.equal(fs.existsSync(path(resource, true)), false);
+  store.list(); assert.equal(writes, 0, "snapshot reads must not try migration");
+  await assert.rejects(() => store.retryMigration(value.revision), error => error.code === "write_unconfirmed" && !error.message.includes(fakeKey));
   store.list(); assert.equal(writes, 1, "normal snapshot reads must not re-prompt a blocked migration");
-  assert.throws(() => store.add(input(), value.revision)); assert.throws(() => store.select("missing", value.revision)); assert.throws(() => store.capture()); assert.equal(writes, 1);
-  denied = false; const migrated = store.retryMigration(value.revision);
+  await assert.rejects(() => store.add(input(), value.revision)); assert.throws(() => store.select("missing", value.revision)); assert.throws(() => store.capture()); assert.equal(writes, 1);
+  denied = false; const migrated = await store.retryMigration(value.revision);
   assert.equal(migrated.readOnly, false); assert.equal(migrated.migrationPending, false); assert.equal(migrated.connections.length, 1);
-  assert.equal(store.resolve(store.capture()).apiKey === fakeKey, true); assert.equal(fs.readFileSync(path(resource), "utf8").includes(fakeKey), false);
+  assert.equal((await store.resolve(store.capture())).apiKey === fakeKey, true); assert.equal(fs.readFileSync(path(resource), "utf8").includes(fakeKey), false);
   store.list(); assert.equal(writes, 2);
 });
 
@@ -68,24 +71,33 @@ test("invalid later v2 rows are validated before any migration credential side e
   let writes = 0; const store = new WorkspaceSecureConnections(resource, { get() {}, remove() {}, set() { writes++; } });
   assert.throws(() => store.list(), /damaged/); assert.equal(writes, 0); assert.equal(fs.existsSync(path(resource, true)), false);
 });
-test("blocked migration does not silently select an older backup or duplicate partially stored credentials", () => {
+test("blocked migration does not silently select an older backup or duplicate partially stored credentials", async () => {
   const resource = storage(), old = new WorkspaceConnectionStoreV2(resource); old.add(input("One"), 0); old.add(input("Two"), 1);
   const legacy = fs.readFileSync(path(resource)), memory = new MemoryCredentialVault();
-  new WorkspaceSecureConnections(resource, memory).list(); const backup = fs.readFileSync(path(resource, true)); fs.writeFileSync(path(resource), legacy);
+  const initial = new WorkspaceSecureConnections(resource, memory);
+  await initial.retryMigration(initial.list().revision);
+  const backup = fs.readFileSync(path(resource, true)); fs.writeFileSync(path(resource), legacy);
   let fail = true, writes = 0; const refs = new Set();
   const vault = { get: ref => memory.get(ref), remove: ref => memory.remove(ref), set(ref, key) { writes++; refs.add(ref); if (fail && writes === 2) throw new Error("fixture timeout"); memory.set(ref, key); } };
-  const store = new WorkspaceSecureConnections(resource, vault), pending = store.list();
+  const store = new WorkspaceSecureConnections(resource, adaptCredentialVault(vault)), pending = store.list();
   assert.equal(pending.migrationPending, true); assert.equal(pending.recovered, false); assert.deepEqual(pending.connections, []);
   assert.equal(fs.readFileSync(path(resource)).equals(legacy), true); assert.equal(fs.readFileSync(path(resource, true)).equals(backup), true);
-  store.list(); assert.equal(writes, 2); fail = false; assert.equal(store.retryMigration(pending.revision).connections.length, 2); assert.equal(refs.size, 2); assert.equal(writes, 4);
+  store.list(); assert.equal(writes, 0);
+  await assert.rejects(() => store.retryMigration(pending.revision), error => error.code === "write_unconfirmed");
+  assert.equal(fs.readFileSync(path(resource)).equals(legacy), true);
+  assert.equal(fs.readFileSync(path(resource, true)).equals(backup), true);
+  store.list(); assert.equal(writes, 2);
+  fail = false; assert.equal((await store.retryMigration(pending.revision)).connections.length, 2);
+  assert.equal(refs.size, 4, "explicit retries reserve new refs instead of overwriting an unconfirmed batch");
+  assert.equal(writes, 4);
 });
 
-test("missing connection primary recovers its only good backup read-only without replacing it", () => {
-  const resource = storage(), vault = new MemoryCredentialVault(), store = new WorkspaceSecureConnections(resource, vault);
-  store.add(input(), 0); const before = fs.readFileSync(path(resource, true)); fs.unlinkSync(path(resource));
-  const reopened = new WorkspaceSecureConnections(resource, vault), value = reopened.list();
+test("missing connection primary recovers its only good backup read-only without replacing it", async () => {
+  const resource = storage(), vault = new MemoryCredentialVault(), store = new WorkspaceSecureConnections(resource, adaptCredentialVault(vault));
+  await store.add(input(), 0); const before = fs.readFileSync(path(resource, true)); fs.unlinkSync(path(resource));
+  const reopened = new WorkspaceSecureConnections(resource, adaptCredentialVault(vault)), value = reopened.list();
   assert.equal(value.recovered, true); assert.equal(value.readOnly, true); assert.equal(value.connections.length, 1);
-  assert.throws(() => reopened.add(input("New"), value.revision)); assert.throws(() => reopened.select(value.connections[0].id, value.revision));
+  await assert.rejects(() => reopened.add(input("New"), value.revision)); assert.throws(() => reopened.select(value.connections[0].id, value.revision));
   assert.equal(fs.existsSync(path(resource)), false); assert.equal(fs.readFileSync(path(resource, true)).equals(before), true);
 });
 
@@ -110,22 +122,22 @@ test("an older pure-schema appearance backup is projected read-only without rewr
   assert.equal(value.theme, "dark"); assert.equal(value.schemaVersion, 2); assert.equal(value.readOnly, true); assert.equal(value.recovered, true);
   assert.equal(fs.existsSync(primary), false); assert.equal(fs.readFileSync(backup).equals(before), true);
 });
-test("a sole legacy credential backup is pending/read-only and never triggers vault migration side effects", () => {
+test("a sole legacy credential backup is pending/read-only and never triggers vault migration side effects", async () => {
   const resource = storage(); new WorkspaceConnectionStoreV2(resource).add(input(), 0);
   const original = fs.readFileSync(path(resource)); fs.writeFileSync(path(resource, true), original, { mode: 0o600 }); fs.unlinkSync(path(resource));
   let writes = 0; const store = new WorkspaceSecureConnections(resource, { get() {}, remove() {}, set() { writes++; } }), value = store.list();
   assert.equal(value.readOnly, true); assert.equal(value.recovered, true); assert.equal(value.migrationPending, true); assert.deepEqual(value.connections, []);
-  assert.throws(() => store.retryMigration(value.revision)); assert.throws(() => store.add(input("New"), value.revision)); assert.equal(writes, 0);
+  await assert.rejects(() => store.retryMigration(value.revision)); await assert.rejects(() => store.add(input("New"), value.revision)); assert.equal(writes, 0);
   assert.equal(fs.existsSync(path(resource)), false); assert.equal(fs.readFileSync(path(resource, true)).equals(original), true);
 });
 
-test("legacy preview labels fit the 80-character import contract without truncating model IDs", () => {
+test("legacy preview labels fit the 80-character import contract without truncating model IDs", async () => {
   const home = dir(), keychain = new MemoryCredentialVault(), resource = storage(), store = new WorkspaceSecureConnections(resource, keychain);
   const config = join(home, ".hara/config.json"); fs.mkdirSync(dirname(config), { recursive: true, mode: 0o700 });
   const model = "m".repeat(100); fs.writeFileSync(config, JSON.stringify({ ...input("旧".repeat(180)), defaultModel: model }), { mode: 0o600 });
   const original = fs.readFileSync(config), catalog = new LegacyConnectionCatalog(home, keychain), preview = catalog.list();
   assert.equal(preview.length, 1); assert.equal(preview[0].label.length, 80); assert.equal(preview[0].defaultModel, model);
-  const selected = catalog.resolve(preview[0].id); store.importConnection(selected.input, 0, selected.importId);
+  const selected = catalog.resolve(preview[0].id); await store.importConnection(selected.input, 0, selected.importId);
   assert.equal(store.list().connections[0].label.length, 80); assert.equal(fs.readFileSync(config).equals(original), true);
 });
 
@@ -140,7 +152,9 @@ test("blocked migration leaves Workspace roster/history/features available with 
     const before = fs.readFileSync(path(resource)), view = host.snapshot(id);
     assert.equal(view.connections.migrationPending, true); assert.equal(view.connections.readOnly, true); assert.equal(view.agents.length, 1); assert.deepEqual(view.runtimes.options.map(row=>row.runtimeId), ["opencode","codex","claude","agy","gemini","kimi","copilot","cursor","grok"]);
     assert.equal(view.conversation.history[0].content, "Retained fixture history"); assert.equal(view.conversation.usage.modelCalls, 0); assert.equal(host.workspaceFeatures(id).workspaceId, id);
-    host.snapshot(id); assert.equal(writes, 1); assert.equal(fs.readFileSync(path(resource)).equals(before), true);
+    host.snapshot(id); assert.equal(writes, 0);
+    await assert.rejects(() => host.retryConnectionMigration(id, view.connections.revision, true), error => error.code === "write_unconfirmed");
+    assert.equal(writes, 1); assert.equal(fs.readFileSync(path(resource)).equals(before), true);
   } finally { await host.close(); }
 });
 
@@ -171,11 +185,13 @@ test("formal RPC stays available during blocked migration; retries require auth,
     const catalog = new LocalWorkspaceCatalog(join(root, "home")), resource = storage(join(root, "home"), catalog.resolve(created.workspaceId).scope);
     new WorkspaceConnectionStoreV2(resource).add(input(), 0);
     const selection = { workspaceId: created.workspaceId, agentId: created.selectedAgentId }, pending = await request("workspace.snapshot", selection);
-    assert.equal(pending.connections.migrationPending, true); assert.equal(pending.agents.length, 1); assert.equal(writes, 1);
+    assert.equal(pending.connections.migrationPending, true); assert.equal(pending.agents.length, 1); assert.equal(writes, 0);
     const retry = { workspaceId: created.workspaceId, expectedGeneration: created.resourceGeneration, expectedRevision: pending.connections.revision, approved: true };
     await assert.rejects(request("workspace.connection.migration.retry", { ...retry, approved: false }), /approval/);
     await assert.rejects(request("workspace.connection.migration.retry", { ...retry, expectedGeneration: "stale" }), /generation/);
-    await assert.rejects(request("workspace.connection.migration.retry", { ...retry, apiKey: "not-used" }), /unsupported/); assert.equal(writes, 1);
+    await assert.rejects(request("workspace.connection.migration.retry", { ...retry, apiKey: "not-used" }), /unsupported/); assert.equal(writes, 0);
+    await assert.rejects(request("workspace.connection.migration.retry", retry), /write_unconfirmed/);
+    assert.equal(writes, 1);
     denied = false; const migrated = await request("workspace.connection.migration.retry", retry); assert.equal(migrated.migrationPending, false); assert.equal(migrated.connections.length, 1);
     const view = await request("workspace.snapshot", selection); assert.equal(view.connections.readOnly, false); assert.equal(view.conversation.usage.modelCalls, 0);
     assert.equal(JSON.stringify(view).includes(fakeKey), false); assert.equal(writes, 2);

@@ -20,7 +20,7 @@ export async function executeLegacyPrint(host: LocalWorkspaceHost, storage: Work
   const cached = outcomes.completed(requestId, scheduleId, definitionHash); if (cached) return { ...cached, duplicate: true };
   outcomes.preflight({ workspaceId: row.workspaceId, resourceBinding: binding, scheduleId, requestId, definitionHash,
     sourceHash: String(row.definition.legacy.sourceHash), resourceId: String(row.definition.legacy.resourceId), originalPath: String(row.definition.cwd) });
-  const accepted = host.start(`legacy-schedule:${row.workspaceId}`, row.workspaceId, agentId, row.definition.task, requestId);
+  const accepted = await host.start(`legacy-schedule:${row.workspaceId}`, row.workspaceId, agentId, row.definition.task, requestId);
   await host.wait(accepted.runId); host.assertGeneration(row.workspaceId, binding.generation);
   const current = features.schedules().find(item => item.id === scheduleId);
   if (!current || createHash("sha256").update(canonical(current)).digest("hex") !== definitionHash) throw new Error("Print definition changed; inspect confirmed Host run without replay");

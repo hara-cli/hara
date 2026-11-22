@@ -8,7 +8,7 @@ interface ScheduleRun { id: string; scheduleId: string; definitionHash: string; 
   state: "running" | "completed" | "blocked" | "unknown"; reason: string | null }
 interface State { revision: number; resourceBinding: WorkspaceResourceBinding; enabled: boolean; migratedEnabled: boolean; runs: ScheduleRun[] }
 interface Executor { available(agentId: string): boolean; execute(agentId: string, task: string, requestId: string, row: WorkspaceSchedule): Promise<{ runId: string; completed: boolean }>;
-  validateAnchor?(row: WorkspaceSchedule): string | null;
+  validateAnchor?(row: WorkspaceSchedule): string | null | Promise<string | null>;
   executeLegacy?(row: WorkspaceSchedule, requestId: string): Promise<{ runId: string; completed: boolean; unknown?: boolean }> }
 /** Durable claim precedes execution. Unknown/crashed claims never auto-replay; no global cron fallback. */
 export class WorkspaceScheduler {
@@ -59,7 +59,7 @@ export class WorkspaceScheduler {
         const legacy = row.source !== "workspace" && row.source !== "chat", hasLegacyExecutor = legacy && Boolean(this.executor.executeLegacy);
         const unsupported = !hasLegacyExecutor && (row.definition.mode !== undefined && row.definition.mode !== "print" || Boolean(row.definition.deliver));
         const agentId = typeof row.definition.agentId === "string" ? row.definition.agentId : mainAgentId;
-        const anchorReason = row.source === "chat" ? this.executor.validateAnchor ? this.executor.validateAnchor(row) : "chat_anchor_unavailable" : null;
+        const anchorReason = row.source === "chat" ? this.executor.validateAnchor ? await this.executor.validateAnchor(row) : "chat_anchor_unavailable" : null;
         if (!anchorReason && !this.executor.available(agentId)) continue;
         const task = row.definition.task;
         const run: ScheduleRun = { id: randomUUID(), scheduleId: row.id, definitionHash: timing.hash, requestId: randomUUID(), occurredAt: now, runId: null,

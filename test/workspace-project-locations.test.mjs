@@ -89,13 +89,13 @@ for (const useOptions of [false, true]) {
     host.configureSynthetic(ws.workspaceId, 0); const agent = context.resources.agents.get(ws.selectedAgentId);
     context.resources.agents.setPermissionTier(agent.agentId, "controlled", agent.configRevision, agent.agentEpoch);
     await seed(context.storage); host.select("tester", ws.workspaceId, host.list().revision);
-    const run = host.start("tester", ws.workspaceId, ws.selectedAgentId, "可以建一個bot了嗎…負責video項目", randomUUID()); await host.wait(run.runId);
+    const run = await host.start("tester", ws.workspaceId, ws.selectedAgentId, "可以建一個bot了嗎…負責video項目", randomUUID()); await host.wait(run.runId);
     const before = host.snapshot(ws.workspaceId, ws.selectedAgentId, "tester").conversation;
     assert.equal(before.state, "awaiting_user"); assert(before.pendingQuestion); assert.equal(rounds, 1);
     assert.deepEqual(before.pendingQuestion.options, useOptions ? menu.options : []);
-    assert.throws(() => host.start("tester", ws.workspaceId, ws.selectedAgentId, "/known/video", randomUUID(), true, undefined, undefined, undefined, undefined, randomUUID()), /question/);
+    await assert.rejects(() => host.start("tester", ws.workspaceId, ws.selectedAgentId, "/known/video", randomUUID(), true, undefined, undefined, undefined, undefined, randomUUID()), /question/);
     const response = useOptions ? menu.options.find(option => option.endsWith(": /known/video")) : "/known/video";
-    const resumed = host.start("tester", ws.workspaceId, ws.selectedAgentId, response, randomUUID(), true, undefined, undefined, undefined, undefined, before.pendingQuestion.id);
+    const resumed = await host.start("tester", ws.workspaceId, ws.selectedAgentId, response, randomUUID(), true, undefined, undefined, undefined, undefined, before.pendingQuestion.id);
     let pending;
     try { pending = await waitFor(() => host.snapshot(ws.workspaceId, ws.selectedAgentId, "tester"), view => view.approvals.length === 1); }
     catch (error) {

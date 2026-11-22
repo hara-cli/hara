@@ -77,23 +77,23 @@ test("terminal provider recovery stays isolated between two channels and a DM, i
     const beforeA = read(a), beforeB = read(b);
     const resume = (host, channel) => host.start("client", f.id, f.members[0], "/continue", randomUUID(), false,
       undefined, undefined, { source: "ui", channel: "rpc", clientId: "client" }, { id: channel, context: "same local channel" });
-    assert.throws(() => resume(f.host, a), /connection_model_unavailable/);
-    assert.throws(() => resume(f.host, b), /connection_auth_required/);
+    await assert.rejects(() => resume(f.host, a), /connection_model_unavailable/);
+    await assert.rejects(() => resume(f.host, b), /connection_auth_required/);
     f.host.selectChannel("client", f.id, a); f.host.sendChannel("client", f.id, a, "channel-a", nonce, f.members);
     assert.equal(calls, 2, "denied continuations and duplicate channel delivery never call a model");
-    const dm = f.host.start("client", f.id, f.members[0], "private task", randomUUID()); await f.host.wait(dm.runId);
+    const dm = await f.host.start("client", f.id, f.members[0], "private task", randomUUID()); await f.host.wait(dm.runId);
     assert.equal(f.host.snapshot(f.id, f.members[0]).conversation.state, "blocked");
     assert.equal(f.host.snapshot(f.id, f.members[0]).conversation.taskState, "paused", JSON.stringify({ blockReason: f.host.snapshot(f.id, f.members[0]).conversation.blockReason, completion: f.host.snapshot(f.id, f.members[0]).conversation.completion }));
     assert.deepEqual(read(a), beforeA); assert.deepEqual(read(b), beforeB);
     await f.host.close(); restored = new LocalWorkspaceHost(f.root, f.options); await restored.initialize();
-    assert.throws(() => resume(restored, a), /connection_model_unavailable/);
-    assert.throws(() => resume(restored, b), /connection_auth_required/);
+    await assert.rejects(() => resume(restored, a), /connection_model_unavailable/);
+    await assert.rejects(() => resume(restored, b), /connection_auth_required/);
     assert.deepEqual(read(a), beforeA); assert.deepEqual(read(b), beforeB);
     const folder = storage.run(() => join(workspaceStateHome(), ".hara"));
     const source = join(folder, `provider-recovery-${channelSessionId(a, f.members[0])}.json`);
     const destination = join(folder, `provider-recovery-${channelSessionId(b, f.members[0])}.json`);
     fs.copyFileSync(source, destination); const foreign = fs.readFileSync(destination);
-    assert.throws(() => resume(restored, b), /connection_recovery_unavailable/);
+    await assert.rejects(() => resume(restored, b), /connection_recovery_unavailable/);
     assert.equal(fs.readFileSync(destination).equals(foreign), true, "foreign evidence is retained, never silently repaired");
     assert.equal(factories, 3); assert.equal(calls, 3);
   } finally { await restored?.close(); await f.host.close(); }

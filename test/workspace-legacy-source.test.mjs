@@ -29,8 +29,8 @@ test("keyless legacy copy lists every provider without vault reads, writes, auto
  try {const a=host.createWorkspace("Personal",host.list().revision);assert.equal(a.connections.connections.length,2);assert.equal(a.connections.readOnly,false);assert.equal(a.connections.migrationPending,false);
    assert.equal(a.connections.defaultConnectionId,null);const selected=a.connections.connections.find(row=>row.id===a.connections.activeConnectionId);assert.equal(selected.defaultModel,"fixture-two");
    assert(selected.credentialRequired);assert(a.connections.connections.every(row=>!row.keySaved));assert.equal(reads,0);assert.equal(writes,0);
-   assert.throws(()=>host.start("fixture",a.workspaceId,a.agents[0].agentId,"hello","missing-key-request"));assert.equal(reads,0);
-   host.editConnection(a.workspaceId,selected.id,{...selected,apiKey:"fake:user-supplied"},a.connections.revision);
+   await assert.rejects(()=>host.start("fixture",a.workspaceId,a.agents[0].agentId,"hello","missing-key-request"));assert.equal(reads,0);
+   await host.editConnection(a.workspaceId,selected.id,{...selected,apiKey:"fake:user-supplied"},a.connections.revision);
    assert.equal(writes,1);assert.equal(host.snapshot(a.workspaceId).connections.defaultConnectionId,selected.id);
    const b=host.createWorkspace("B",host.list().revision);assert.equal(b.connections.connections.length,0);assert(fs.readFileSync(join(source,".hara/profiles.json")).equals(original));
    assert.equal(fs.statSync(join(source,".hara/profiles.json")).mode&0o777,0o400,"read-only source permissions are never repaired by a preview/import reader");

@@ -112,6 +112,7 @@ export async function listModelsWithSource(
   apiKey: string,
   fetchImpl: typeof fetch = userModelFetch,
   keep?: string,
+  requestSignal?: AbortSignal,
 ): Promise<{ models: string[]; source: "live" | "documented" }> {
   if (!baseURL) return { models: [], source: "documented" }; // no custom endpoint to enumerate
   const fallback = [
@@ -125,7 +126,9 @@ export async function listModelsWithSource(
     const url = baseURL.replace(/\/+$/, "") + "/models";
     const headers: Record<string, string> = {};
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-    const r = await fetchImpl(url, { headers, signal: AbortSignal.timeout(5_000) });
+    const deadline = AbortSignal.timeout(5_000);
+    const signal = requestSignal ? AbortSignal.any([requestSignal, deadline]) : deadline;
+    const r = await fetchImpl(url, { headers, signal });
     if (!r.ok) return { models: fallback, source: "documented" };
     const j = (await r.json()) as { data?: { id?: unknown }[] };
     const ids = (j?.data ?? []).map((m) => m?.id).filter((x): x is string => typeof x === "string" && x.length > 0);

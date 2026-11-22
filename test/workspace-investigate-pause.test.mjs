@@ -28,7 +28,7 @@ async function fixture(t, objective, turns) {
   // Exercise the real Host/governor/tool receipts with an in-process synthetic provider.
   host.context(ws.workspaceId).resources.agents.setPermissionTier(agent.agentId, "controlled", agent.configRevision, agent.agentEpoch);
   host.select("tester", ws.workspaceId, host.list().revision);
-  const accepted = host.start("tester", ws.workspaceId, ws.selectedAgentId, objective, randomUUID());
+  const accepted = await host.start("tester", ws.workspaceId, ws.selectedAgentId, objective, randomUUID());
   return { host, ws, root, project: join(root, "project", ws.workspaceId), rounds: () => rounds,
     read: () => host.snapshot(ws.workspaceId, ws.selectedAgentId, "tester"),
     wait: () => host.wait(accepted.runId) };

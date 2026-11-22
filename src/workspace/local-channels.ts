@@ -38,7 +38,7 @@ interface ChannelHost {
   agents(): WorkspaceAgentView[];
   /** Host-private persona projection; never sent to the renderer or written into PASS reasons. */
   prefilterProfiles?(): ChannelPrefilterProfile[];
-  start(agentId: string, body: string, requestId: string, channelId: string, context: string, clientId: string, questionId?: string): { runId: string };
+  start(agentId: string, body: string, requestId: string, channelId: string, context: string, clientId: string, questionId?: string, assertTurnCurrent?: () => void): { runId: string } | Promise<{ runId: string }>;
   wait(runId: string): Promise<void>;
   cancel(agentId: string, runId: string): void;
   changed(): void;
@@ -383,9 +383,17 @@ export class WorkspaceLocalChannels {
         const store = new WorkspaceConversationStore(this.storage, reply.agentId, channelId), startIndex = store.read().history.length;
         this.changeReply(channelId, turnId, reply.requestId, row => { row.startIndex = startIndex; row.state = "running"; });
         attempted = true;
-        const accepted = this.host.start(reply.agentId, turn.body, reply.requestId, channelId,
-          this.context(channelId, reply.wokenBy ? { by: reply.wokenBy, note: reply.wakeNote } : undefined), clientId, reply.questionId);
+        const started = this.host.start(reply.agentId, turn.body, reply.requestId, channelId,
+          this.context(channelId, reply.wokenBy ? { by: reply.wokenBy, note: reply.wakeNote } : undefined), clientId, reply.questionId, () => {
+            if (active.cancelled || !this.accepting()) throw new Error("Workspace channel is no longer admitting this turn");
+            active.lease.assertCurrent(); this.assertUserTurnDispatch(turn);
+          });
+        const accepted = "runId" in started ? started : await started;
         active.runId = accepted.runId; active.agentId = reply.agentId; active.lease.setDraining(true);
+        // A cancellation during asynchronous admission could not cancel an unknown runId.
+        if (active.cancelled) {
+          try { this.host.cancel(reply.agentId, accepted.runId); } catch { /* Already settled. */ }
+        }
         this.changeReply(channelId, turnId, reply.requestId, row => { row.runId = accepted.runId; });
         admitted = true;
         await this.host.wait(accepted.runId); active.lease.setDraining(false);

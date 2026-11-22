@@ -119,7 +119,7 @@ test("Host keeps expired diagnostics while an accepted job owns the Workspace, t
   t.after(async () => { await host.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const workspace = host.createWorkspace("Synthetic", host.list().revision);
   host.configureSynthetic(workspace.workspaceId, 0); host.select("client", workspace.workspaceId, host.list().revision);
-  host.start("client", workspace.workspaceId, workspace.selectedAgentId, "hello", randomUUID());
+  await host.start("client", workspace.workspaceId, workspace.selectedAgentId, "hello", randomUUID());
   const storage = new WorkspaceResourceStorage(host.home, host.catalog.resolve(workspace.workspaceId).scope); storage.initialize();
   const runId = randomUUID(), audit = new WorkspaceExecutionAudit(storage, runId, workspace.selectedAgentId);
   audit.finish(audit.start("tool", 1, "workspace_read"), 0, "completed", null);

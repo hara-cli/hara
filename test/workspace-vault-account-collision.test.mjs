@@ -123,7 +123,7 @@ test("Host confirmed old-connection import refuses the ambiguous credential with
     const created = host.createWorkspace("Fixture", host.list().revision);
     const file = legacySources.personal(f), bytes = fs.readFileSync(file), before = snapshot(f.items), state = host.snapshot(created.workspaceId).connections;
     const [source] = host.legacyConnections(created.workspaceId); assert.ok(source?.keySaved);
-    assert.throws(() => host.importConnection(created.workspaceId, source.id, state.revision, true), { message: "Old credential unavailable; original preserved" });
+    await assert.rejects(() => host.importConnection(created.workspaceId, source.id, state.revision, true), { message: "Old credential unavailable; original preserved" });
     assert.deepEqual(host.snapshot(created.workspaceId).connections, state); assert.equal(f.calls.length, 0);
     unchanged(f, before); assert.deepEqual(fs.readFileSync(file), bytes);
   } finally { await host.close(); }
@@ -133,7 +133,7 @@ test("Host old-connection migration retry stays pending without reading or copyi
   try {
     const created = host.createWorkspace("Fixture", host.list().revision), state = created.connections;
     assert.equal(state.migrationPending, true); assert.equal(f.calls.length, 0);
-    assert.throws(() => host.retryConnectionMigration(created.workspaceId, state.revision, true), { message: "Old credential unavailable; original preserved" });
+    await assert.rejects(() => host.retryConnectionMigration(created.workspaceId, state.revision, true), { message: "Old credential unavailable; original preserved" });
     assert.deepEqual(host.snapshot(created.workspaceId).connections, state); assert.equal(f.calls.length, 0);
     unchanged(f, before); assert.deepEqual(fs.readFileSync(file), bytes);
   } finally { await host.close(); }
@@ -153,23 +153,23 @@ function originalSource(f) {
   const file = f.write(".hara/config.json", { ...connection, keyRef: originalRef });
   return { file, bytes: fs.readFileSync(file), items: snapshot(f.items), catalog: new LegacyConnectionCatalog(f.source, f.vault) };
 }
-test("secure cleanup deletes only its generated ref and retains the original legacy source", t => {
+test("secure cleanup deletes only its generated ref and retains the original legacy source", async t => {
   const f = fixture(t), original = originalSource(f), storage = f.storage(), store = new WorkspaceSecureConnections(storage, f.vault);
-  const [source] = original.catalog.personalSeeds(), resolved = original.catalog.resolve(source.id), added = store.importConnection(resolved.input, 0, resolved.importId);
-  f.calls.length = 0; store.revoke(added.id, store.list().revision);
+  const [source] = original.catalog.personalSeeds(), resolved = original.catalog.resolve(source.id), added = await store.importConnection(resolved.input, 0, resolved.importId);
+  f.calls.length = 0; await store.revoke(added.id, store.list().revision);
   const deletes = f.calls.filter(call => call.args[0] === "delete-generic-password"); assert.equal(deletes.length, 1);
   assert.equal(deletes.every(call => call.args[call.args.indexOf("-a") + 1].startsWith(`${storage.scopeKey}:`)), true);
   assert.equal(f.vault.get(originalRef), fakeKey); assert.equal(f.items.get(ambiguous), f.victim);
   for (const [account, value] of original.items) assert.equal(f.items.get(account), value);
   assert.deepEqual(fs.readFileSync(original.file), original.bytes);
 });
-test("secure cleanup refuses a corrupted bare retired ref without touching either group", t => {
+test("secure cleanup refuses a corrupted bare retired ref without touching either group", async t => {
   const f = fixture(t), original = originalSource(f), storage = f.storage(), store = new WorkspaceSecureConnections(storage, f.vault);
-  const added = store.add({ label: "Fixture", provider: "openai", baseURL: connection.baseURL, defaultModel: connection.model, apiKey: fakeKey }, 0);
+  const added = await store.add({ label: "Fixture", provider: "openai", baseURL: connection.baseURL, defaultModel: connection.model, apiKey: fakeKey }, 0);
   const file = storage.run(() => join(workspaceStateHome(), ".hara/workspace-connections-v2.json"));
   const state = JSON.parse(fs.readFileSync(file)); state.connections[0].retiredKeyRefs = [ambiguous]; fs.writeFileSync(file, JSON.stringify(state), { mode: 0o600 });
   const before = snapshot(f.items), bytes = fs.readFileSync(file); f.calls.length = 0;
-  assert.throws(() => store.cleanupCredentials(added.id, state.revision)); assert.equal(f.calls.length, 0); unchanged(f, before);
+  await assert.rejects(() => store.cleanupCredentials(added.id, state.revision)); assert.equal(f.calls.length, 0); unchanged(f, before);
   assert.deepEqual(fs.readFileSync(file), bytes); assert.deepEqual(fs.readFileSync(original.file), original.bytes);
 });
 test("inheritance rollback removes only generated refs and preserves original source credentials", async t => {
@@ -258,10 +258,10 @@ for (const entry of ["import", "migration", "inheritance"]) for (const inline of
         const created = host.createWorkspace("Fixture", host.list().revision); workspaceId = created.workspaceId;
         if (entry === "import") {
           file = f.write(".hara/config.json", row); const [source] = host.legacyConnections(workspaceId);
-          try { host.importConnection(workspaceId, source.id, created.connections.revision, true); } catch (error) { failure = error; }
+          try { await host.importConnection(workspaceId, source.id, created.connections.revision, true); } catch (error) { failure = error; }
         } else {
           file = join(f.source, ".hara/config.json"); assert.equal(created.connections.migrationPending, true);
-          try { host.retryConnectionMigration(workspaceId, created.connections.revision, true); } catch (error) { failure = error; }
+          try { await host.retryConnectionMigration(workspaceId, created.connections.revision, true); } catch (error) { failure = error; }
         }
       }
       // Exercise the real model-list sink after the attempted operation. Without the reader guard,
@@ -282,7 +282,7 @@ test("old-endpoint positive control accepts a qualified legacy ref and reaches o
     const created = host.createWorkspace("Fixture", host.list().revision);
     f.write(".hara/config.json", { ...connection, baseURL: endpoint.baseURL, keyRef: originalRef });
     const [source] = host.legacyConnections(created.workspaceId);
-    host.importConnection(created.workspaceId, source.id, created.connections.revision, true);
+    await host.importConnection(created.workspaceId, source.id, created.connections.revision, true);
     assert.equal((await probeOldConnection(host, created.workspaceId))?.source, "live"); assert.equal(endpoint.requests(), 1);
   } finally { await host.close(); }
 });

@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { withPrivateStateLockSync } from "../security/private-state.js";
+import { coreText } from "../i18n/messages.js";
 
 export const WORKSPACE_CREDENTIAL_SERVICE = "tech.nanhara.hara.workspace.credentials.v1";
 export interface CredentialVault { get(ref: string): string | undefined; set(ref: string, value: string): void; remove(ref: string): void;
@@ -82,3 +83,55 @@ export class MacKeychainCredentialVault implements CredentialVault {
     });
   }
 }
+
+export const CREDENTIAL_STORAGE_CAPABILITY = "workspace.credential-storage.v1";
+export type CredentialStorageReason = "platform_unsupported" | "architecture_unsupported" | "host_binding_unavailable"
+  | "helper_missing" | "helper_invalid" | "access_denied" | "backend_unavailable" | "windows_desktop_required";
+export type CredentialVaultErrorCode = "unsupported" | "unavailable" | "access_denied" | "credential_unreadable"
+  | "write_unconfirmed" | "cleanup_unconfirmed" | "invalid_request";
+
+export class CredentialVaultError extends Error {
+  readonly domain = "credential-vault";
+  readonly retry: "none" | "explicit_user_only" | "readback_only";
+  constructor(readonly code: CredentialVaultErrorCode, readonly reason?: CredentialStorageReason, readonly definitelyUnwritten = false) {
+    super(code === "unsupported" && reason === "windows_desktop_required"
+      ? coreText("core.credentialStorage.windowsDesktopRequired")
+      : `Secure credential storage: ${code}`);
+    this.name = "CredentialVaultError";
+    this.retry = code === "unsupported" || code === "invalid_request" ? "none"
+      : code === "write_unconfirmed" ? "readback_only" : "explicit_user_only";
+  }
+}
+
+export interface CredentialStorageDescriptor {
+  schemaVersion: 1;
+  hostPlatform: "darwin" | "win32" | "linux" | "other";
+  arch: string;
+  backend: "macos-keychain" | "windows-dpapi" | "none";
+  supported: boolean;
+  state: "not_checked" | "ready" | "unavailable" | "unsupported";
+  reason: CredentialStorageReason | null;
+}
+export interface CredentialEntry { readonly ref: string; readonly key: string }
+export interface CredentialCall {
+  signal?: AbortSignal;
+  assertCurrent?: () => void;
+  /** Record the worker identity before its private stdin is allowed to carry a write. */
+  recordWorker?: (pid: number) => void;
+  /** The namespace lane stays occupied until its worker and streams have closed. */
+  retainUntilDrained?: (done: Promise<void>) => void;
+}
+export interface AsyncCredentialVault {
+  get(ref: string, call?: CredentialCall): Promise<string | undefined>;
+  set(ref: string, key: string, call?: CredentialCall): Promise<void>;
+  setMany(entries: readonly CredentialEntry[], call?: CredentialCall): Promise<void>;
+  remove(ref: string, call?: CredentialCall): Promise<void>;
+}
+
+export const credentialDeadline = () => AbortSignal.timeout(30_000);
+export function assertCredentialCall(call?: CredentialCall): void {
+  if (call?.signal?.aborted) throw new CredentialVaultError("unavailable", undefined, true);
+  call?.assertCurrent?.();
+}
+export const validCredentialKey = (key: unknown): key is string => typeof key === "string" && key.length > 0
+  && key.length <= 16384 && !/[\s\u0000-\u001f\u007f]/u.test(key);

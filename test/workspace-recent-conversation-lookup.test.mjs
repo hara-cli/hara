@@ -43,7 +43,7 @@ test("a common word found in the conversation, or a target it never mentioned, s
     // Each case on its own colleague: a pending card holds that colleague's conversation.
     for (const [other, message] of [[f.members[0], "那个任务呢"], [f.members[1], "市场那边呢"]]) {
       await send(f, other, first);
-      f.host.start("client", f.id, other, message, randomUUID(), false, undefined, undefined, UI);
+      await f.host.start("client", f.id, other, message, randomUUID(), false, undefined, undefined, UI);
       const card = await until(() => { const value = f.host.snapshot(f.id, other).conversation; return value.pendingQuestion ? value : null; });
       assert.equal(card.pendingQuestion.reason, "lookup_missing", message);
     }

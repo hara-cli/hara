@@ -118,7 +118,7 @@ test("G1: the actual proposal card honors an available preference, falls back fr
   for (const [workspaceId, agentId, preferred, expected] of [[f.id, f.snapshot.selectedAgentId, "codex", "codex"], [second.workspaceId, second.selectedAgentId, "agy", "pi"]]) {
     f.host.select("client", workspaceId, f.host.list().revision);
     const pref = f.host.getDefaultRuntime(workspaceId); f.host.setDefaultRuntime("client", workspaceId, preferred, pref.revision);
-    const run = f.host.start("client", workspaceId, agentId, "建立一位测试同事", randomUUID());
+    const run = await f.host.start("client", workspaceId, agentId, "建立一位测试同事", randomUUID());
     const deadline = Date.now() + 10000; let card;
     while (!(card = f.host.snapshot(workspaceId, agentId, "client").approvals[0]) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
     assert.ok(card); assert.equal(card.draft.runtimeId, expected);

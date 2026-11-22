@@ -17,7 +17,8 @@ import { bindPrivateHaraStateFile, readPrivateStateFileSnapshotSync, removePriva
 import type { ServeHandle, ServeOpts } from "./server.js";
 import { workspaceRequestSource } from "../workspace/request-journal.js";
 import type { RuntimeLoginSource, WorkspaceRuntimeInstaller } from "../workspace/runtime-install.js";
-import type { CredentialVault } from "../workspace/credential-vault.js";
+import { CREDENTIAL_STORAGE_CAPABILITY, CredentialVaultError, type AsyncCredentialVault, type CredentialStorageDescriptor,
+  type CredentialVault } from "../workspace/credential-vault.js";
 import { isAgentRuntimeId } from "../agent-runtime/bindings.js";
 import type { ExtensionCatalogProvider } from "../workspace/extension-catalog.js";
 import type { WorkspaceAgentPersonaInput } from "../workspace/agents.js";
@@ -28,7 +29,7 @@ function tokenMatches(actual: unknown, expected: string): boolean {
   if (typeof actual !== "string" || !/^[a-f0-9]{64}$/.test(actual) || actual.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
 }
-export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; hostHome?: string; discoveryHome?: string; legacySourceHome?: string; credentialVault?: CredentialVault; defaultRuntimeRole?: WorkspaceDefaultRuntimeRole; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; extensionCatalog?: ExtensionCatalogProvider; reviewedMcpSources?: () => readonly ReviewedMcpSource[]; mcpReviewHome?: string; mcpLaunchCandidate?: WorkspaceMcpLaunchProvider; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1]; backgroundRuntimeDetectionMs?: number; mediaImportIdleMs?: number; agentBoundaries?: { commandControl?: boolean; lifecycleControl?: boolean; routing?: AgentRoutingHostOptions; ownerCredential: string; maxCommandLifetimeMs?: number; externalDirectory?: AgentHubDirectory } }): Promise<ServeHandle> {
+export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: string; version: string; mode?: "workspace"; hostHome?: string; discoveryHome?: string; legacySourceHome?: string; credentialVault?: CredentialVault; asyncCredentialVault?: AsyncCredentialVault; credentialStorageDescriptor?: CredentialStorageDescriptor; defaultRuntimeRole?: WorkspaceDefaultRuntimeRole; realKeyFile?: string; realKeySlice?: ArkAcceptanceSlice; allowedOrigins?: readonly string[]; providerFactory?: LocalWorkspaceProviderFactory; extensionCatalog?: ExtensionCatalogProvider; reviewedMcpSources?: () => readonly ReviewedMcpSource[]; mcpReviewHome?: string; mcpLaunchCandidate?: WorkspaceMcpLaunchProvider; runtimeInstallerOptions?: ConstructorParameters<typeof WorkspaceRuntimeInstaller>[1]; backgroundRuntimeDetectionMs?: number; mediaImportIdleMs?: number; agentBoundaries?: { commandControl?: boolean; lifecycleControl?: boolean; routing?: AgentRoutingHostOptions; ownerCredential: string; maxCommandLifetimeMs?: number; externalDirectory?: AgentHubDirectory } }): Promise<ServeHandle> {
   if (opts.host !== "127.0.0.1" || !Number.isSafeInteger(opts.port) || opts.port < 0 || opts.port > 65535) throw new Error("Workspace Dev listens only on explicit IPv4 loopback");
   if (input.agentBoundaries?.lifecycleControl && !input.agentBoundaries.commandControl) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "lifecycle.bootstrap");
   if (input.agentBoundaries?.routing && !input.agentBoundaries.lifecycleControl) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "routing.bootstrap");
@@ -38,7 +39,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
   // in the generic transport discovery receipt or returned ServeHandle. CLI defaults stay closed.
   if (input.agentBoundaries?.ownerCredential === token) throw new AgentBoundaryContractError("AUTHORITY_UNVERIFIED", "authority.bootstrap");
   const boundaryTransports = input.agentBoundaries ? new AgentBoundaryTransports(input.agentBoundaries.ownerCredential) : undefined;
-  type Client = { id: string; initialized: boolean; boundaryTransport?: AgentBoundaryTransport };
+  type Client = { id: string; initialized: boolean; credentialEpoch: number; boundaryTransport?: AgentBoundaryTransport };
   const origins = new Set(["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost", ...(input.allowedOrigins ?? [])]);
   const dispatch: typeof dispatchMethod = (client, method, params, rpcId, receivedAt) => {
     if (!plain(params)) return Promise.reject(new Error("invalid Workspace RPC parameters"));
@@ -48,7 +49,8 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
   const clients = new Map<WebSocket, Client>();
   let closing = false;
   const capability = input.mode === "workspace" ? "workspace.v1" : CAPABILITY;
-  const host = new LocalWorkspaceHost(input.root, { boundaryCommandControl: input.agentBoundaries?.commandControl, boundaryLifecycleControl: input.agentBoundaries?.lifecycleControl, boundaryTransports, boundaryRouting: input.agentBoundaries?.routing, boundaryMaxCommandLifetimeMs: input.agentBoundaries?.maxCommandLifetimeMs, boundaryExternalDirectory: input.agentBoundaries?.externalDirectory, mode: input.mode, hostHome: input.hostHome, discoveryHome: input.discoveryHome, legacySourceHome: input.legacySourceHome, credentialVault: input.credentialVault, defaultRuntimeRole: input.defaultRuntimeRole, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, extensionCatalog: input.extensionCatalog, reviewedMcpSources: input.reviewedMcpSources, mcpReviewHome: input.mcpReviewHome, mcpLaunchCandidate: input.mcpLaunchCandidate, runtimeInstallerOptions: input.runtimeInstallerOptions, backgroundRuntimeDetectionMs: input.backgroundRuntimeDetectionMs, onChange(event) {
+  const host = new LocalWorkspaceHost(input.root, { boundaryCommandControl: input.agentBoundaries?.commandControl, boundaryLifecycleControl: input.agentBoundaries?.lifecycleControl, boundaryTransports, boundaryRouting: input.agentBoundaries?.routing, boundaryMaxCommandLifetimeMs: input.agentBoundaries?.maxCommandLifetimeMs, boundaryExternalDirectory: input.agentBoundaries?.externalDirectory, mode: input.mode, hostHome: input.hostHome, discoveryHome: input.discoveryHome, legacySourceHome: input.legacySourceHome, credentialVault: input.credentialVault,
+    asyncCredentialVault: input.asyncCredentialVault, credentialStorageDescriptor: input.credentialStorageDescriptor, defaultRuntimeRole: input.defaultRuntimeRole, realKeyFile: input.realKeyFile, realKeySlice: input.realKeySlice, providerFactory: input.providerFactory, extensionCatalog: input.extensionCatalog, reviewedMcpSources: input.reviewedMcpSources, mcpReviewHome: input.mcpReviewHome, mcpLaunchCandidate: input.mcpLaunchCandidate, runtimeInstallerOptions: input.runtimeInstallerOptions, backgroundRuntimeDetectionMs: input.backgroundRuntimeDetectionMs, onChange(event) {
     for (const [client, state] of clients) if (state.initialized && client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ jsonrpc: "2.0", method: "workspace.changed", params: event }));
   }, onAssistantPreview(clientId, frame) {
     for (const [client, state] of clients) if (state.id === clientId && state.initialized && client.readyState === WebSocket.OPEN) {
@@ -101,7 +103,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     if (!plain(params)) throw new Error("invalid Workspace RPC parameters");
     if (method === "initialize") {
       // Every reauthentication first retires the old connection authority, including failures.
-      boundaryTransports?.disconnect(client.boundaryTransport); client.boundaryTransport = undefined; client.initialized = false;
+      boundaryTransports?.disconnect(client.boundaryTransport); client.boundaryTransport = undefined; client.initialized = false; client.credentialEpoch++;
       if (!tokenMatches(params.token, token)) throw new Error("unauthorized");
       if (params.clientCapabilities !== undefined && (!Array.isArray(params.clientCapabilities) || params.clientCapabilities.length > 32
         || !params.clientCapabilities.every(value => typeof value === "string" && value.length <= 100))) throw new Error("invalid client capabilities");
@@ -114,7 +116,9 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       const mode = host.modelMode();
       return { name: "hara", version: input.version, protocol: 1, provider: input.mode === "workspace" ? "workspace" : mode.syntheticOnly ? "synthetic" : "openai",
         model: mode.budget?.model ?? (input.mode === "workspace" ? "workspace-selected" : "hara-synthetic-v1"), cwd: host.project,
-        instanceId: receipt.instanceId, runtimePlatform: { writeProtection: runtimeWriteProtection(), permissionTiers: availableRuntimePermissionTiers() }, capabilities: [capability, ...(boundaryTransports ? ["workspace.agent-boundaries.authority.v1"] : []), ...(input.agentBoundaries?.commandControl ? ["workspace.agent-command-control.v1", "workspace.agent-command-receipt-lookup.v1"] : []), ...(input.agentBoundaries?.lifecycleControl ? ["workspace.agent-lifecycle.v1"] : []), ...(input.agentBoundaries?.routing ? ["workspace.agent-routing.v1"] : []), "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.default-runtime.v1", "workspace.onboarding.v1", "workspace.agents.create-batch.v1", "workspace.media.v1", "workspace.media.states.v1", "workspace.media.import.v1", "workspace.i18n.v1", "workspace.agents.archive.v1", "workspace.agents.appearance.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1", "workspace.connection-catalog.v1"] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
+        instanceId: receipt.instanceId,
+        ...(input.mode === "workspace" ? { credentialStorage: host.credentialStorageSnapshot() } : {}),
+        runtimePlatform: { writeProtection: runtimeWriteProtection(), permissionTiers: availableRuntimePermissionTiers() }, capabilities: [capability, ...(boundaryTransports ? ["workspace.agent-boundaries.authority.v1"] : []), ...(input.agentBoundaries?.commandControl ? ["workspace.agent-command-control.v1", "workspace.agent-command-receipt-lookup.v1"] : []), ...(input.agentBoundaries?.lifecycleControl ? ["workspace.agent-lifecycle.v1"] : []), ...(input.agentBoundaries?.routing ? ["workspace.agent-routing.v1"] : []), "workspace.extensions.v1", "workspace.extensions.manager.v1", "workspace.extensions.owner-review.v1", "workspace.user-interaction.v1", "workspace.interaction.v2", "workspace.local-channels.v1", "workspace.local-channels.peer.v1", "workspace.channel-pass.v1", "workspace.channel-queue.v1", "workspace.channel-autonomy.v1", "workspace.colleague-schedules.v1", "workspace.runtime-login-effort.v1", "workspace.runtime-form.v1", "workspace.default-runtime.v1", "workspace.onboarding.v1", "workspace.agents.create-batch.v1", "workspace.media.v1", "workspace.media.states.v1", "workspace.media.import.v1", "workspace.i18n.v1", "workspace.agents.archive.v1", "workspace.agents.appearance.v1", "workspace.runtime-proxy.v1", "workspace.runtime-stage-events.v1", "workspace.message-timing.v1", "workspace.assistant-preview.v1","workspace.native-session.v1","workspace.runtime-permissions.v1", ...(input.mode === "workspace" ? ["workspace.connection-models.v1", "workspace.connection-catalog.v1", CREDENTIAL_STORAGE_CAPABILITY] : []), ...(input.realKeyFile ? ["workspace.real-key-slice.v1"] : [])], workspace: host.list(), ...mode };
     }
     if (!client.initialized) throw new Error("unauthorized");
     if (input.agentBoundaries?.commandControl || host.hasProtectedAgentCommands()) {
@@ -122,6 +126,16 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       if (method.startsWith("workspace.update.")) throw new AgentBoundaryContractError("RUNTIME_UNSUPPORTED", "control.maintenance");
     }
     const fields = (allowed: readonly string[]) => { if (!exact(params, allowed)) throw new Error("unsupported Workspace RPC fields"); };
+    const credentialEpoch = client.credentialEpoch;
+    const credentialRequest = { clientId: client.id, assertCurrent() {
+      if (closing || !client.initialized || client.credentialEpoch !== credentialEpoch) throw new Error("unauthorized");
+      if (input.agentBoundaries?.commandControl || host.hasProtectedAgentCommands()) host.assertBoundaryTransport(client.boundaryTransport);
+    } };
+    if (method === "workspace.credentialStorage.get") {
+      fields([]);
+      if (input.mode !== "workspace") throw new Error("Credential storage requires Workspace mode");
+      return host.credentialStorageSnapshot();
+    }
     if (method === "workspace.message-timing.clock") { fields([]); return { hostAtMs: performance.now() }; }
     if (method === "workspace.list") { fields([]); return host.list(); }
     if (method === "workspace.create") { fields(["label", "expectedRevision"]); if (!text(params.label, 80) || !positive(params.expectedRevision)) throw new Error("invalid Workspace creation"); return host.createWorkspace(params.label, params.expectedRevision); }
@@ -486,16 +500,21 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     }
     if (method === "workspace.connection.synthetic") { fields(["workspaceId", "expectedGeneration", "expectedRevision"]); if (!Number.isSafeInteger(params.expectedRevision) || Number(params.expectedRevision) < 0) throw new Error("invalid connection revision"); host.configureSynthetic(workspaceId, params.expectedRevision as number); return host.snapshot(workspaceId, undefined, client.id); }
     if (method === "workspace.connection.approved") { fields(["workspaceId", "expectedGeneration", "expectedRevision"]); if (!Number.isSafeInteger(params.expectedRevision) || Number(params.expectedRevision) < 0) throw new Error("invalid connection revision"); host.configureApprovedConnection(workspaceId, params.expectedRevision as number); return host.snapshot(workspaceId, undefined, client.id); }
-    if (method === "workspace.connection.add") { fields(["workspaceId", "expectedGeneration", "input", "expectedRevision"]); host.configureConnection(workspaceId, params.input, params.expectedRevision as number); return { configured: true }; }
-    if (method === "workspace.connection.listModels") { fields(["workspaceId", "expectedGeneration", "agentId", "connectionId"]); if (input.mode !== "workspace" || !text(params.agentId) || !text(params.connectionId)) throw new Error("Invalid connection model request"); return host.listConnectionModels(workspaceId, params.agentId as string, params.connectionId as string); }
+    if (method === "workspace.connection.add") { fields(["workspaceId", "expectedGeneration", "input", "expectedRevision"]); await host.configureConnection(workspaceId, params.input, params.expectedRevision as number, credentialRequest); return { configured: true }; }
+    if (method === "workspace.connection.listModels") { fields(["workspaceId", "expectedGeneration", "agentId", "connectionId"]); if (input.mode !== "workspace" || !text(params.agentId) || !text(params.connectionId)) throw new Error("Invalid connection model request"); return host.listConnectionModels(workspaceId, params.agentId as string, params.connectionId as string, credentialRequest); }
     if (method === "workspace.connection.legacy") { fields(["workspaceId", "expectedGeneration"]); return host.legacyConnections(workspaceId); }
-    if (method === "workspace.connection.import") { fields(["workspaceId", "expectedGeneration", "sourceId", "approved", "expectedRevision"]); if (typeof params.sourceId !== "string" || typeof params.approved !== "boolean") throw new Error("Invalid import approval"); host.importConnection(workspaceId, params.sourceId, params.expectedRevision as number, params.approved); return { imported: true }; }
-    if (method === "workspace.connection.edit") { fields(["workspaceId", "expectedGeneration", "connectionId", "input", "expectedRevision"]); if (typeof params.connectionId !== "string") throw new Error("Invalid connection"); host.editConnection(workspaceId, params.connectionId, params.input, params.expectedRevision as number); return { edited: true }; }
-    if (method === "workspace.connection.select") { fields(["workspaceId", "expectedGeneration", "connectionId", "expectedRevision", ...(Object.hasOwn(params, "modelId") ? ["modelId"] : []), ...(Object.hasOwn(params, "effort") ? ["effort"] : [])]); if (typeof params.connectionId !== "string" || params.modelId !== undefined && typeof params.modelId !== "string" || params.effort !== undefined && params.effort !== null && typeof params.effort !== "string") throw new Error("Invalid connection selection"); host.selectConnection(workspaceId, params.connectionId, params.expectedRevision as number, params.modelId as string | undefined, params.effort as string | null | undefined); return { selected: true }; }
-    if (method === "workspace.connection.delete") { fields(["workspaceId", "expectedGeneration", "connectionId", "expectedRevision", "approved"]); if (params.approved !== true || typeof params.connectionId !== "string") throw new Error("Explicit connection deletion approval required"); host.revokeConnection(workspaceId, params.connectionId, params.expectedRevision as number); return { deleted: true }; }
-    if (method === "workspace.connection.cleanup") { fields(["workspaceId", "expectedGeneration", "connectionId", "expectedRevision", "approved"]); if (params.approved !== true || typeof params.connectionId !== "string") throw new Error("Explicit credential cleanup approval required"); host.cleanupCredentials(workspaceId, params.connectionId, params.expectedRevision as number); return { cleaned: true }; }
-    if (method === "workspace.connection.migration.retry") { fields(["workspaceId", "expectedGeneration", "expectedRevision", "approved"]); if (params.approved !== true) throw new Error("Explicit migration retry approval required"); return host.retryConnectionMigration(workspaceId, params.expectedRevision as number, true); }
-    if (method === "workspace.connection.revoke") { fields(["workspaceId", "expectedGeneration", "connectionId", "expectedRevision"]); if (!text(params.connectionId)) throw new Error("invalid connection"); host.revokeConnection(workspaceId, params.connectionId, params.expectedRevision as number); return { revoked: true }; }
+    if (method === "workspace.connection.import") { fields(["workspaceId", "expectedGeneration", "sourceId", "approved", "expectedRevision"]); if (typeof params.sourceId !== "string" || typeof params.approved !== "boolean") throw new Error("Invalid import approval"); await host.importConnection(workspaceId, params.sourceId, params.expectedRevision as number, params.approved, credentialRequest); return { imported: true }; }
+    if (method === "workspace.connection.edit") { fields(["workspaceId", "expectedGeneration", "connectionId", "input", "expectedRevision"]); if (typeof params.connectionId !== "string") throw new Error("Invalid connection"); await host.editConnection(workspaceId, params.connectionId, params.input, params.expectedRevision as number, credentialRequest); return { edited: true }; }
+    if (method === "workspace.connection.select") { fields(["workspaceId", "expectedGeneration", "connectionId", "expectedRevision", ...(Object.hasOwn(params, "modelId") ? ["modelId"] : []), ...(Object.hasOwn(params, "effort") ? ["effort"] : [])]); if (typeof params.connectionId !== "string" || params.modelId !== undefined && typeof params.modelId !== "string" || params.effort !== undefined && params.effort !== null && typeof params.effort !== "string") throw new Error("Invalid connection selection"); await host.selectConnection(workspaceId, params.connectionId, params.expectedRevision as number, params.modelId as string | undefined, params.effort as string | null | undefined, credentialRequest); return { selected: true }; }
+    if (method === "workspace.connection.delete") { fields(["workspaceId", "expectedGeneration", "connectionId", "expectedRevision", "approved"]); if (params.approved !== true || typeof params.connectionId !== "string") throw new Error("Explicit connection deletion approval required"); await host.revokeConnection(workspaceId, params.connectionId, params.expectedRevision as number, credentialRequest); return { deleted: true }; }
+    if (method === "workspace.connection.cleanup") {
+      fields(["workspaceId", "expectedGeneration", "expectedRevision", "approved", ...(Object.hasOwn(params, "connectionId") ? ["connectionId"] : [])]);
+      if (params.approved !== true || params.connectionId !== undefined && typeof params.connectionId !== "string") throw new Error("Explicit credential cleanup approval required");
+      await host.cleanupCredentials(workspaceId, params.connectionId as string | undefined, params.expectedRevision as number, credentialRequest);
+      return { cleaned: true };
+    }
+    if (method === "workspace.connection.migration.retry") { fields(["workspaceId", "expectedGeneration", "expectedRevision", "approved"]); if (params.approved !== true) throw new Error("Explicit migration retry approval required"); return host.retryConnectionMigration(workspaceId, params.expectedRevision as number, true, credentialRequest); }
+    if (method === "workspace.connection.revoke") { fields(["workspaceId", "expectedGeneration", "connectionId", "expectedRevision"]); if (!text(params.connectionId)) throw new Error("invalid connection"); await host.revokeConnection(workspaceId, params.connectionId, params.expectedRevision as number, credentialRequest); return { revoked: true }; }
     if (method === "workspace.approval.respond") { fields(["workspaceId", "expectedGeneration", "approvalId", "approved", ...(Object.hasOwn(params, "draft") ? ["draft"] : [])]); if (!text(params.approvalId) || typeof params.approved !== "boolean") throw new Error("invalid approval"); host.answerApproval(client.id, workspaceId, params.approvalId, params.approved, params.draft); return { accepted: true }; }
     if (method === "workspace.session.answer") {
       const clientTiming = Object.hasOwn(params, "timing") ? parseMessageTimingInput(params.timing) : undefined;
@@ -504,7 +523,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       if (!text(params.agentId) || !messageBody(params.message) || typeof params.requestId !== "string" || !UUID.test(params.requestId)
         || typeof params.questionId !== "string" || !UUID.test(params.questionId)) throw new Error("invalid Workspace user answer");
       return host.start(client.id, workspaceId, params.agentId, params.message, params.requestId, true, undefined, undefined,
-        { source: "ui", channel: "rpc", clientId: client.id, rpcIdHash: createHash("sha256").update(JSON.stringify(rpcId)).digest("hex") }, undefined, params.questionId, undefined, { receivedAt, client: clientTiming });
+        { source: "ui", channel: "rpc", clientId: client.id, rpcIdHash: createHash("sha256").update(JSON.stringify(rpcId)).digest("hex") }, undefined, params.questionId, undefined, { receivedAt, client: clientTiming }, undefined, credentialRequest.assertCurrent);
     }
     if (method === "workspace.session.send" || method === "workspace.session.resume") {
       const clientTiming = Object.hasOwn(params, "timing") ? parseMessageTimingInput(params.timing) : undefined;
@@ -513,7 +532,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
       if (!text(params.agentId) || !messageBody(params.message) || typeof params.requestId !== "string" || !UUID.test(params.requestId)) throw new Error("invalid Workspace message");
       if (params.source !== undefined && (!workspaceRequestSource(params.source) || !["ui", "cli", "automatic_retry"].includes(params.source))) throw new Error("invalid Workspace request source");
       return host.start(client.id, workspaceId, params.agentId, params.message, params.requestId, method.endsWith(".resume"), undefined, undefined,
-        { source: params.source ?? "legacy_rpc", channel: "rpc", clientId: client.id, rpcIdHash: createHash("sha256").update(JSON.stringify(rpcId)).digest("hex") }, undefined, undefined, undefined, { receivedAt, client: clientTiming });
+        { source: params.source ?? "legacy_rpc", channel: "rpc", clientId: client.id, rpcIdHash: createHash("sha256").update(JSON.stringify(rpcId)).digest("hex") }, undefined, undefined, undefined, { receivedAt, client: clientTiming }, undefined, credentialRequest.assertCurrent);
     }
     if (method === "workspace.session.receipt") {
       fields(["workspaceId", "expectedGeneration", "agentId", "requestId"]);
@@ -531,9 +550,9 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
     throw new Error("unsupported Workspace method; no legacy route or authority fallback");
   };
   wss.on("connection", ws => {
-    const client: Client = { id: randomUUID(), initialized: false }; clients.set(ws, client);
+    const client: Client = { id: randomUUID(), initialized: false, credentialEpoch: 0 }; clients.set(ws, client);
     ws.on("error", () => {});
-    ws.on("close", () => { mediaImports.discard(client.id); boundaryTransports?.disconnect(client.boundaryTransport); host.disconnect(client.id); clients.delete(ws); });
+    ws.on("close", () => { client.initialized = false; client.credentialEpoch++; mediaImports.discard(client.id); boundaryTransports?.disconnect(client.boundaryTransport); host.disconnect(client.id); clients.delete(ws); });
     ws.on("message", raw => {
       const receivedAt = performance.now();
       void (async () => {
@@ -549,7 +568,7 @@ export async function startLocalWorkspaceServe(opts: ServeOpts, input: { root: s
           // Fixed classification, not arbitrary provider errors/paths/credentials.
           const safe = message === "unauthorized" ? "unauthorized" : message.includes("真實模型") ? message
             : message.replaceAll(token, "[transport credential]").replaceAll(input.agentBoundaries?.ownerCredential ?? token, "[owner credential]").replaceAll(host.root, "[Dev state]").slice(0, 500);
-          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: "2.0", id, error: { code: message === "unauthorized" ? -32001 : -32602, message: safe, data: { ...publicErrorData(error, [token, host.root, ...(input.agentBoundaries ? [input.agentBoundaries.ownerCredential] : [])]), ...(error instanceof AgentBoundaryContractError ? { boundary: { contract: AGENT_BOUNDARIES_CONTRACT, code: error.code, retry: AGENT_BOUNDARY_ERRORS[error.code] } } : {}), ...(error instanceof WorkspaceArchiveError ? { archiveReason: error.reason, retryable: true } : {}), ...(error instanceof RuntimeTierUnavailableError || error instanceof NativeEngineUnsupportedError ? { platformReason: error.code } : {}) } } }));
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: "2.0", id, error: { code: message === "unauthorized" ? -32001 : -32602, message: safe, data: { ...publicErrorData(error, [token, host.root, ...(input.agentBoundaries ? [input.agentBoundaries.ownerCredential] : [])]), ...(error instanceof AgentBoundaryContractError ? { boundary: { contract: AGENT_BOUNDARIES_CONTRACT, code: error.code, retry: AGENT_BOUNDARY_ERRORS[error.code] } } : {}), ...(error instanceof CredentialVaultError ? { domain: error.domain, code: error.code, retry: error.retry } : {}), ...(error instanceof WorkspaceArchiveError ? { archiveReason: error.reason, retryable: true } : {}), ...(error instanceof RuntimeTierUnavailableError || error instanceof NativeEngineUnsupportedError ? { platformReason: error.code } : {}) } } }));
         }
       })();
     });

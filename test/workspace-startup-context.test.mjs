@@ -35,7 +35,7 @@ test("preloaded roster/card/projects reach the original approval in one model ro
     : { text: "The human declined; nothing was created.", toolUses: [], stop: "end" });
   const context = a.host.context(a.workspace.workspaceId);
   for (let n = 0; n < 20; n++) context.resources.agents.create({ username: `peer-${n}`, profile: { displayName: `Peer ${n}`, bio: "Long private bio. ".repeat(100) }, instructions: "Never include these instructions. ".repeat(100) }, context.resources.agents.list().revision);
-  const run = a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "建一個bot負責video項目", randomUUID(), false, undefined, undefined, origin);
+  const run = await a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "建一個bot負責video項目", randomUUID(), false, undefined, undefined, origin);
   const card = await until(() => a.host.snapshot(a.workspace.workspaceId, a.workspace.selectedAgentId, "client").approvals[0]);
   assert.equal(a.turns.length, 1); assert.match(a.turns[0].system, /Complete code-shipped help already loaded/);
   assert.equal((a.turns[0].system.match(/No workspace_skill prerequisite is needed for this creation proposal/g) ?? []).length, 1);
@@ -49,7 +49,7 @@ test("preloaded roster/card/projects reach the original approval in one model ro
 
 test("preparing an answer brief cannot authorize a write", async t => {
   const a = hostFixture(t, n => n === 1 ? tools(["workspace_write", { path: "forbidden.txt", content: "must not write" }]) : { text: "Hello", toolUses: [], stop: "end" });
-  const run = a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "你好", randomUUID(), false, undefined, undefined, origin); await a.host.wait(run.runId);
+  const run = await a.host.start("client", a.workspace.workspaceId, a.workspace.selectedAgentId, "你好", randomUUID(), false, undefined, undefined, origin); await a.host.wait(run.runId);
   assert.equal(fs.existsSync(join(a.host.context(a.workspace.workspaceId).project, "forbidden.txt")), false);
 });
 

@@ -103,7 +103,7 @@ test("end to end: 把负责程序的同事改名嘉夫 renames the colleague wit
     host.configureSynthetic(workspaceId, 0); host.select("client", workspaceId, host.list().revision);
     const resources = new WorkspaceResources(host.home, host.catalog.resolve(workspaceId).scope); resources.initialize();
     resources.agents.create({ username: "coder", profile: { displayName: "Coder", title: "负责程序开发" } }, resources.agents.list().revision);
-    const run = host.start("client", workspaceId, workspace.selectedAgentId, RENAME, randomUUID()); await host.wait(run.runId);
+    const run = await host.start("client", workspaceId, workspace.selectedAgentId, RENAME, randomUUID()); await host.wait(run.runId);
     const conversation = host.snapshot(workspaceId, workspace.selectedAgentId, "client").conversation;
     assert.equal(conversation.pendingQuestion ?? null, null, "no lookup_missing card");
     assert.equal(JSON.stringify(conversation).includes("两次查找仍未确认目标"), false);

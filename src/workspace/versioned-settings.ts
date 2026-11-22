@@ -101,7 +101,42 @@ export class VersionedSettings<T extends State> {
       const { value, readOnly, recovered, migrationPending } = this.load(); return { value: structuredClone(value), readOnly, recovered, migrationPending };
     });
   }); }
-  retryMigration() { this.blockedSource = undefined; }
+  /** Returns owned source images under the same writer lock. The callback must be synchronous. */
+  inspect<R>(visit: (primary: unknown, backup: unknown, fingerprint: string | null) => R): R {
+    return this.run(() => withPrivateStateLockSync(this.home(), [], this.filename.slice(0, -5), () => {
+      const primary = this.file(), backup = this.file(this.backupName());
+      const text = primary.snapshot?.text;
+      const decode = (value: string | undefined): unknown => {
+        try { return value === undefined ? null : JSON.parse(value); }
+        catch { throw new Error("Settings are damaged; original and backup preserved; no empty overwrite"); }
+      };
+      const result = visit(decode(text), decode(backup.snapshot?.text),
+        text === undefined ? null : createHash("sha256").update(text).digest("hex"));
+      primary.assertCurrent(); backup.assertCurrent();
+      return result;
+    }));
+  }
+
+  /** Commit a separately prepared migration after external IO. Never copy the old plaintext
+   * image to a backup. The source fingerprint is private and bound to the exact primary. */
+  commitDeferredMigration(fingerprint: string, next: T, assertWriteCurrent?: () => void): T {
+    return this.run(() => withPrivateStateLockSync(this.home(), [], this.filename.slice(0, -5), () => {
+      const assertResource = workspaceResourceCommitGuard();
+      const assertCurrent = () => { assertResource?.(); assertWriteCurrent?.(); };
+      assertCurrent();
+      const file = this.file(), text = file.snapshot?.text;
+      if (text === undefined || createHash("sha256").update(text).digest("hex") !== fingerprint)
+        throw new Error("Settings changed; refresh before migrating");
+      const raw: unknown = JSON.parse(text);
+      if (!plain(raw) || !Number.isSafeInteger(raw.schemaVersion) || Number(raw.schemaVersion) < 1 || Number(raw.schemaVersion) >= this.version)
+        throw new Error("Settings migration source unavailable");
+      const value = this.parse(next);
+      writePrivateStateFileSync(file, JSON.stringify(value) + "\n", { expectedText: text, assertCurrent });
+      this.blockedSource = undefined;
+      this.backup(value, assertCurrent);
+      return structuredClone(value);
+    }));
+  }
   update(expected: number, change: (value: T) => T, assertWriteCurrent?: () => void): T {
     return this.run(() => withPrivateStateLockSync(this.home(), [], this.filename.slice(0, -5), () => {
       const assertResource = workspaceResourceCommitGuard();
