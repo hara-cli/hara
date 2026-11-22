@@ -4,7 +4,10 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { plain } from "../workspace/local-state.js";
-import { WORKSPACE_MCP_TOKEN_ENV, type WorkspaceMcpEndpoint, type WorkspaceMcpAttemptInput } from "./registered-cli-mcp.js";
+import {
+  WORKSPACE_MCP_MAX_REQUEST_BYTES, WORKSPACE_MCP_TOKEN_ENV, workspaceMcpArgumentLimitError,
+  type WorkspaceMcpEndpoint, type WorkspaceMcpAttemptInput,
+} from "./registered-cli-mcp.js";
 export const WORKSPACE_ATTEMPT_MARKER = "__hara_attempt";
 interface Attempt { readonly input: WorkspaceMcpAttemptInput; readonly marker: string; readonly pending: Set<object>; ended: boolean; abort(): void }
 /** Schema wrapping is optional. Unknown schemas keep the immutable one-attempt transport. */
@@ -29,7 +32,7 @@ export class ResidentWorkspaceMcp {
   private closing?: Promise<void>;
   private constructor(private readonly bearer: string) {
     this.expected = Buffer.from("Bearer " + bearer);
-    this.transport = new StreamableHTTPServerTransport({sessionIdGenerator:()=>randomUUID(),enableJsonResponse:true,maxRequestBodySize:256*1024});
+    this.transport = new StreamableHTTPServerTransport({sessionIdGenerator:()=>randomUUID(),enableJsonResponse:true,maxRequestBodySize:WORKSPACE_MCP_MAX_REQUEST_BYTES});
     this.server = new Server({name:"hara",version:"1.0.0"},{capabilities:{tools:{listChanged:true}},
       instructions:"Hara governs every tool call and confirmation. Every call must include the __hara_attempt from the current Host turn reminder. A transport connection or attempt marker never grants approval. Never reuse a marker from an earlier turn."});
     const unavailable = () => new McpError(ErrorCode.InvalidRequest,"Workspace MCP attempt unavailable");
@@ -48,8 +51,10 @@ export class ResidentWorkspaceMcp {
         const parameters=request.params.arguments??{};
         binding=this.capture();
         if(parameters[WORKSPACE_ATTEMPT_MARKER]!==binding.marker||binding.pending.size>=16)throw unavailable();
-        const { [WORKSPACE_ATTEMPT_MARKER]:_marker,...args }=parameters;
         if(!binding.input.tools().some(tool=>tool.name===request.params.name))throw unavailable();
+        const limitError = workspaceMcpArgumentLimitError(parameters);
+        if (limitError) return limitError;
+        const { [WORKSPACE_ATTEMPT_MARKER]:_marker,...args }=parameters;
         flight={};binding.pending.add(flight);this.pending++;
         const result=await binding.input.call(request.params.name,args);
         this.assert(binding); // Same captured binding after every async boundary, never retarget.

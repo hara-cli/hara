@@ -11,6 +11,30 @@ import type { ExternalCommandCaptureResult } from "../external-sessions/process.
 import { CLI_TOOL_GUIDANCE } from "./tool-guidance.js";
 
 export const WORKSPACE_MCP_TOKEN_ENV = "HARA_WORKSPACE_MCP_TOKEN";
+export const WORKSPACE_MCP_MAX_REQUEST_BYTES = 256 * 1024;
+export const WORKSPACE_MCP_MAX_ARGUMENT_ELEMENTS = 32_768;
+
+/** Count JSON object keys and array elements across one call before passing arguments to a tool. */
+export function workspaceMcpArgumentLimitError(parameters: Record<string, unknown>) {
+  const pending = [parameters];
+  let count = 0;
+  while (pending.length > 0) {
+    const container = pending.pop()!;
+    for (const key in container) {
+      if (!Object.hasOwn(container, key)) continue;
+      if (++count > WORKSPACE_MCP_MAX_ARGUMENT_ELEMENTS) {
+        return {
+          content: [{ type: "text" as const, text: "Workspace MCP tool arguments exceed the element limit" }],
+          isError: true as const,
+        };
+      }
+      const value = container[key];
+      if (value !== null && typeof value === "object") pending.push(value as Record<string, unknown>);
+    }
+  }
+  return undefined;
+}
+
 export interface WorkspaceMcpEndpoint {
   readonly url: string;
   readonly env: NodeJS.ProcessEnv;
@@ -40,7 +64,7 @@ export async function createWorkspaceMcpEndpoint(input: WorkspaceMcpAttemptInput
   const env: NodeJS.ProcessEnv = { [WORKSPACE_MCP_TOKEN_ENV]: token };
   const expected = Buffer.from("Bearer " + token);
   const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(), enableJsonResponse: true, maxRequestBodySize: 256 * 1024,
+    sessionIdGenerator: () => randomUUID(), enableJsonResponse: true, maxRequestBodySize: WORKSPACE_MCP_MAX_REQUEST_BYTES,
   });
   const server = new Server({ name: "hara", version: "1.0.0" }, { capabilities: { tools: { listChanged: true } },
     instructions: "These are the frozen tools of this Hara Workspace attempt. Hara governs every call, including task understanding, budgets, evidence and Desk confirmation. Never infer approval from MCP connectivity. " + CLI_TOOL_GUIDANCE });
@@ -61,7 +85,10 @@ export async function createWorkspaceMcpEndpoint(input: WorkspaceMcpAttemptInput
     if (!input.tools().some(tool => tool.name === request.params.name)) {
       return { content: [{ type: "text" as const, text: "Error: tool is outside this Workspace attempt" }], isError: true };
     }
-    const result = await input.call(request.params.name, request.params.arguments ?? {});
+    const parameters = request.params.arguments ?? {};
+    const limitError = workspaceMcpArgumentLimitError(parameters);
+    if (limitError) return limitError;
+    const result = await input.call(request.params.name, parameters);
     assertLive();
     return { content: [{ type: "text" as const, text: result.content }], ...(result.isError ? { isError: true } : {}) };
   }));
