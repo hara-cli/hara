@@ -4,27 +4,34 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import { setup, until } from "./helpers/local-channels.mjs";
+import { taskObjectiveIntent } from "../dist/agent/governance-c-lite.js";
 import { RECENT_CONVERSATION, recentConversation, recentConversationPrompt, contextSummaryPrompt, distinctiveConversationTerm } from "../dist/workspace/context-compaction.js";
 import { recentConversationEligible } from "../dist/workspace/local-host.js";
 import { workspaceTaskProjection } from "../dist/workspace/model-context.js";
 import { discussionHandback, asksHumanQuestion } from "../dist/agent/loop.js";
-import { UI, reply, call, unwrap, recentBlock, parseRecent, scripted, send } from "./helpers/recent-conversation.mjs";
+import { UI, reply, call, unwrap, recentBlock, parseRecent, scripted, send, setup, recentConversationTier } from "./helpers/recent-conversation.mjs";
 
 test("a plain follow-up receives the earlier private turns, oldest first, without tool bodies", async () => {
-  const first = "我们在讨论岗位架构：产品、开发、设计，方案代号是蓝鲸四十二";
+  const controlled = recentConversationTier === "controlled";
+  const first = controlled ? "岗位架构包括产品、平台工程、设计，方案代号是蓝鲸四十二。目前有哪些岗位？"
+    : "我们在讨论岗位架构：产品、开发、设计，方案代号是蓝鲸四十二";
+  const followup = controlled ? "平台工程师的任务是什么？" : "还有开发的任务";
+  if (controlled) {
+    assert.equal(taskObjectiveIntent(first), "answer");
+    assert.equal(taskObjectiveIntent(followup), "answer");
+  }
   const { calls, factory } = scripted({
     [first]: [call("workspace_context_lookup", { query: "蓝鲸四十二" }), reply("好的，岗位架构先按蓝鲸四十二方案来。你现在团队有几个人？")],
-    "还有开发的任务": [reply("开发的任务也放进岗位表。")],
+    [followup]: [reply("工程师的任务在岗位表里。")],
   });
   const f = await setup(1, factory), agent = f.members[0];
   try {
     await send(f, agent, first);
-    await send(f, agent, "还有开发的任务");
-    const second = calls.filter(row => row.objective === "还有开发的任务")[0];
+    await send(f, agent, followup);
+    const second = calls.filter(row => row.objective === followup)[0];
     const block = recentBlock(second.history);
     assert.ok(block, "the second request carries the recent private conversation");
-    const projected = unwrap(second.history), current = projected.findIndex(row => row.role === "user" && row.content === "还有开发的任务");
+    const projected = unwrap(second.history), current = projected.findIndex(row => row.role === "user" && row.content === followup);
     assert.equal(projected[0].content, block.content); assert.ok(current > 0, "the current message follows the recent view");
     const recent = parseRecent(block);
     // The first turn only consulted a read-only lookup before asking a question, so it carries no

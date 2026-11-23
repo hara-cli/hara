@@ -2,12 +2,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { setup, until } from "./helpers/local-channels.mjs";
 import { RECENT_CONVERSATION, recentConversation, recentConversationPrompt, contextSummaryPrompt, distinctiveConversationTerm } from "../dist/workspace/context-compaction.js";
 import { recentConversationEligible } from "../dist/workspace/local-host.js";
 import { workspaceTaskProjection } from "../dist/workspace/model-context.js";
 import { discussionHandback, asksHumanQuestion } from "../dist/agent/loop.js";
-import { UI, reply, call, unwrap, recentBlock, parseRecent, scripted, send } from "./helpers/recent-conversation.mjs";
+import { UI, reply, call, unwrap, recentBlock, parseRecent, scripted, send, setup } from "./helpers/recent-conversation.mjs";
 
 test("wiring: group channels, resumes and internal starts carry no recent view; a human private follow-up does", async () => {
   const { calls, factory } = scripted({});
@@ -23,7 +22,7 @@ test("wiring: group channels, resumes and internal starts carry no recent view; 
       assert.equal(recentBlock(row.history), undefined); assert.doesNotMatch(JSON.stringify(row.history), /hara-recent-conversation/);
       assert.doesNotMatch(JSON.stringify(row.history) + row.system, /PRIVATE_DM_MARKER/);
     }
-    // A resume continues its own run transcript and carries no view. (On this Pi fixture a resumed native
+    // A resume continues its own run transcript and carries no view. (On the native Pi tier a resumed
     // session prompts only with its durable continuation, so the call-site resume input is guarded by the
     // eligibility table above; a fresh-process Claude resume would read the projection.)
     const beforeResume = calls.length;

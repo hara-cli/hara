@@ -2,14 +2,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { setup, until } from "./helpers/local-channels.mjs";
+import { FULL_TIER_SKIP } from "./helpers/platform-tier.mjs";
 import { RECENT_CONVERSATION, recentConversation, recentConversationPrompt, contextSummaryPrompt, distinctiveConversationTerm } from "../dist/workspace/context-compaction.js";
 import { recentConversationEligible } from "../dist/workspace/local-host.js";
 import { workspaceTaskProjection } from "../dist/workspace/model-context.js";
 import { discussionHandback, asksHumanQuestion } from "../dist/agent/loop.js";
-import { UI, reply, call, unwrap, recentBlock, parseRecent, scripted, send } from "./helpers/recent-conversation.mjs";
+import { UI, reply, call, unwrap, recentBlock, parseRecent, scripted, send, setup, recentConversationTier } from "./helpers/recent-conversation.mjs";
 
-test("a discussion reply that asks the human a question is not labelled paused without a receipt", async () => {
+test("a discussion reply that asks the human a question is not labelled paused without a receipt", {
+  skip: FULL_TIER_SKIP || (recentConversationTier === "controlled" && "this case checks native prose handback"),
+}, async () => {
   const ask = "帮我规划团队岗位，再建几个同事", claim = "帮我规划岗位，然后建几个同事吧";
   const { factory } = scripted({ [ask]: [reply("建议先设三个岗位。你想先建哪两个？")], [claim]: [reply("已经建好了。")] });
   const f = await setup(0, factory), main = f.workspace.selectedAgentId;
@@ -22,6 +24,29 @@ test("a discussion reply that asks the human a question is not labelled paused w
     await send(f, main, claim);
     view = f.host.snapshot(f.id, main).conversation;
     assert.match(view.history.at(-1).text, /尚未取得操作回执/, "prose without a question keeps the honest closeout");
+  } finally { await f.host.close(); }
+});
+
+test("a controlled discussion uses an explicit question and cannot claim an unreceipted change", async () => {
+  const claim = "帮我规划岗位，然后建几个同事吧";
+  const ask = "帮我规划团队岗位，再建几个同事";
+  const question = "你想先建哪两个？";
+  const { factory } = scripted({
+    [claim]: [reply("已经建好了。")],
+    [ask]: [call("ask_user", { question, delivery: "sync" })],
+  });
+  const f = await setup(0, factory, "controlled"), main = f.workspace.selectedAgentId;
+  try {
+    await send(f, main, claim);
+    const blocked = f.host.snapshot(f.id, main).conversation;
+    assert.equal(blocked.taskState, "blocked");
+    assert.equal(blocked.pendingQuestion, null);
+    await send(f, main, ask);
+    const pending = f.host.snapshot(f.id, main).conversation;
+    assert.equal(pending.state, "awaiting_user");
+    assert.equal(pending.pendingQuestion?.reason, "explicit");
+    assert.equal(pending.pendingQuestion.question, question);
+    assert.notEqual(pending.taskState, "completed");
   } finally { await f.host.close(); }
 });
 
