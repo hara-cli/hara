@@ -184,7 +184,7 @@ jobs:
   standalone-runtime:
     # Intel's full durable-I/O suite is required; heavy fixtures run serially, not skipped.
     # Intel took 39m58s of 40m on 7702281 (suite, compile and smokes in one job), so it keeps 55m.
-    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 55 || 30 }}
+    timeout-minutes: ${{ startsWith(matrix.os, 'macos-') && 55 || 30 }}
     strategy:
       matrix:
         include:
