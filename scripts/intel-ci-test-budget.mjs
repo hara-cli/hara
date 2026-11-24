@@ -28,6 +28,7 @@ export const INTEL_SLOW_FILES = Object.freeze([
 // These fixtures compete for the hosted Mac's durable disk, browser or process-start capacity.
 // Isolate them without increasing their original 120s file deadline or any product/case deadline.
 export const NATIVE_CONTENTION_FILES = Object.freeze([
+  "agent-command-control-b.test.mjs",
   "jobs.test.mjs", "presentations.test.mjs", "provider-connections-cli.test.mjs",
   "workspace-local-channels.test.mjs", "workspace-local-channels-sessions.test.mjs",
   "workspace-local-channels-recovery.test.mjs", "workspace-provider-recovery.test.mjs",
