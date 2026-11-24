@@ -64,7 +64,7 @@ jobs:
           retention-days: 1
 
   darwin-binaries:
-    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 35 || 30 }}
+    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 70 || 45 }}
     strategy:
       fail-fast: false
       matrix:
