@@ -5,6 +5,12 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 1.3.1 — Standalone and container packaging
+
+- Pin the Node.js runtime in the standalone release workflow to match CI. The
+  Linux tests can now verify the MCP fixture executable with the expected file
+  permissions before building the standalone assets and container image.
+
 ## 1.3.0 — 2026-11-24 — Hara Desktop on Windows can now save keys securely
 
 - Hara Desktop protects model connection keys with Windows current-user data protection (DPAPI).

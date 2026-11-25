@@ -5,14 +5,14 @@ import { INTEL_SLOW_FILES, NATIVE_CONTENTION_FILES, usesIntelBudget, intelCaseTi
 import { nativeTestBatches, strictNativeTestBatches, runNativeTestGroups } from "../scripts/native-ci-tests.mjs";
 
 test("temporary slow budgets require the exact Intel CI platform, matching flag and reviewed release", () => {
-  for (const release of ["1.0.1", "1.0.2", "1.2.0", "1.3.0"]) {
+  for (const release of ["1.0.1", "1.0.2", "1.2.0", "1.3.0", "1.3.1"]) {
     const allowed = { platform: "darwin", arch: "x64", release, env: { GITHUB_ACTIONS: "true", HARA_INTEL_TEST_BUDGET: release } };
     assert.equal(usesIntelBudget(allowed), true, `${release} is an explicitly reviewed Intel budget release`);
     assert.equal(intelCaseTimeout(5000, 30000, allowed), 30000);
   }
   const approved = { platform: "darwin", arch: "x64", release: "1.3.0", env: { GITHUB_ACTIONS: "true", HARA_INTEL_TEST_BUDGET: "1.3.0" } };
   assert.equal(intelCaseTimeout(5000, 30000, approved), 30000);
-  for (const changed of [{ platform: "linux" }, { arch: "arm64" }, { release: "1.0.3" }, { release: "1.0.1" }, { env: {} }, { env: { ...approved.env, GITHUB_ACTIONS: "false" } }]) {
+  for (const changed of [{ platform: "linux" }, { arch: "arm64" }, { release: "1.0.3" }, { release: "1.0.1" }, { release: "1.3.2" }, { env: {} }, { env: { ...approved.env, GITHUB_ACTIONS: "false" } }]) {
     assert.equal(usesIntelBudget({ ...approved, ...changed }), false);
     assert.equal(intelCaseTimeout(5000, 30000, { ...approved, ...changed }), 5000);
   }
