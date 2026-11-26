@@ -122,7 +122,7 @@ jobs:
       matrix:
         os: [macos-15-intel]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 55
+    timeout-minutes: 70
     permissions:
       contents: read
     env:
@@ -183,8 +183,8 @@ jobs:
 
   standalone-runtime:
     # Intel's full durable-I/O suite is required; heavy fixtures run serially, not skipped.
-    # Intel took 39m58s of 40m on 7702281 (suite, compile and smokes in one job), so it keeps 55m.
-    timeout-minutes: ${{ startsWith(matrix.os, 'macos-') && 55 || 30 }}
+    # Intel hit 55m before completing the full suite and npm smoke on runs/45661697995.
+    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 75 || (startsWith(matrix.os, 'macos-') && 55 || 30) }}
     strategy:
       matrix:
         include:
