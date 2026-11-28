@@ -11487,3 +11487,12 @@ Fix: a Host-approved new task in a human (ui/cli) private conversation prefixes 
 An explicit Pi/Claude native-session reset is a hard boundary for this view (first full run caught the leak in the existing reset RPC tests; a new test covers turns on both sides of a reset).
 
 Review of #71 (hara:4.2): eligibility moved into `recentConversationEligible` with a table test so each audience/duplication exclusion is guarded on its own (several are also implied by the wiring: routed runs carry a channel, question answers arrive as resumes, schedules and delegation have non-human origins); tagged reference blocks (recent conversation and context summary) escape `<`, `>` and `&` as JSON \u escapes so quoted text cannot close the frame; a conversation match settles a lookup only for a distinctive term (>=3 CJK or >=5 other characters); question detection ignores code and inline code and reads only the last paragraph.
+
+
+## ERR-20261111-HUB-IDLE-FIRST-WRITE (N3, W0)
+- Startup prepared the quota, but a five-minute-old snapshot was rejected by the synchronous reservation guard before an activity-triggered background census could finish. A six-minute fake-clock HTTP regression returned 503 on its first POST.
+- Fix request admission by awaiting stale/uncertain reconciliation outside transactions with a shared flight, caller deadline/cancellation and two attempts. Recheck current Host/grant after waiting; never catch/replay receive.
+- Intermediate focused runs exposed credential preflight side effects: quota.run scheduled census before invalid-token rejection, while a read-only scope lock still rebound/tightened directories and invalidated a concurrent census. Preflight now reads a verified atomic catalog snapshot, checks the already-prepared quota policy without scheduling, and grants no publication authority. Actual receive retains scope locking and full authentication/publication fences.
+- Test instrumentation first counted both lstat calls around a directory as two censuses; count root realpath once instead. The realistic fixture's failed cleanup left only an externally created .DS_Store; await outstanding calibration and use bounded fixture-only ENOTEMPTY retries. Preserve failed logs rather than relabeling those runs as pass.
+
+- The cross-scope regression caught a missing-catalog path that previously assumed a held mutation lock for usage recovery. Preliminary authentication now rejects a missing catalog directly, preserving unauthorized semantics without entering locked usage/repair; mutation catalog recovery is unchanged.

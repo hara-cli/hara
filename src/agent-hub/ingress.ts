@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
+import { performance } from "node:perf_hooks";
 import { AgentHubError, exact, hubAssert, plain, type AgentHubErrorCode } from "./errors.js";
 import { HUB_BODY_BYTES } from "./attachments.js";
 import type { AgentHubStore } from "./store.js";
@@ -25,6 +26,8 @@ export async function startAgentHubIngress<S, R>(options: {
   }
   async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     let reading = false;
+    const deadline = performance.now() + 10000, controller = new AbortController();
+    const disconnected = () => controller.abort(); response.once("close", disconnected);
     try {
       hubAssert(!closing, "store_unavailable");
       hubAssert(request.method === "POST" && ["/v1/agent-hub/messages", "/v1/agent-hub/receipts"].includes(request.url ?? ""));
@@ -50,11 +53,15 @@ export async function startAgentHubIngress<S, R>(options: {
       if (request.url === "/v1/agent-hub/receipts") {
         hubAssert(plain(input) && exact(input, ["requestId"]) && typeof input.requestId === "string");
         send(response, 200, options.store.receipt(token, input.requestId));
-      } else send(response, 200, options.store.receive(token, input));
+      } else {
+        await options.store.prepareReceive(token, { timeoutMs: Math.min(7000, deadline - performance.now()), signal: controller.signal });
+        hubAssert(!closing && !response.destroyed && !controller.signal.aborted && performance.now() < deadline, "store_unavailable");
+        send(response, 200, options.store.receive(token, input));
+      }
     } catch (error) {
       const code = error instanceof AgentHubError ? error.code : "store_unavailable";
-      send(response, HTTP_STATUS[code], options.errorBody(code));
-    } finally { if (reading) activeBodies--; }
+      if (!response.destroyed) send(response, HTTP_STATUS[code], options.errorBody(code));
+    } finally { response.off("close", disconnected); if (reading) activeBodies--; }
   }
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); }); });
   const address = server.address(); hubAssert(address && typeof address === "object", "store_unavailable");
