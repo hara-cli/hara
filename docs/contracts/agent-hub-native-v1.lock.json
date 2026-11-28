@@ -1,0 +1,7 @@
+{
+  "contract": "hara.agent-hub-native.v1",
+  "schemaVersion": 1,
+  "sourceSha256": "8c0db5685844b229d6a7f375a7add67bd5763cc0c672d766454c10fd8eb1cdd4",
+  "schemaSha256": "1821848eefa4efff35114834c1286f1119cc07c441c5a606fc4d55c1f1c2c74d",
+  "fixturesSha256": "f8ddc19f6a3c00c3fd07bc6f540bad9d82d5feef2c28370a0c8f5fbe4647ca52"
+}

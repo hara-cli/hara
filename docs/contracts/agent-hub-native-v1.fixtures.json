@@ -1,0 +1,574 @@
+{
+  "contract": "hara.agent-hub-native.v1",
+  "synthetic": true,
+  "handshake": {
+    "ownerCredential": "7777777777777777777777777777777777777777777777777777777777777777",
+    "workspaceToken": "6666666666666666666666666666666666666666666666666666666666666666",
+    "hello": {
+      "installId": "01234567-0123-4567-8abc-000000000002",
+      "hostInstanceId": "01234567-0123-4567-8abc-000000000003",
+      "port": 19436,
+      "clientNonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "serverNonce": "8888888888888888888888888888888888888888888888888888888888888888",
+    "serverProof": "74c13fe8e6177e1145d9e4ffd383da12ca1993c72553923b880d721e7ff5bc60",
+    "clientProof": "88334689e61e22d586dc9712c4531512c09172ab6c852ef34f15d03d97b2da02"
+  },
+  "prepared": {
+    "intent": {
+      "schemaVersion": 1,
+      "operationId": "01234567-0123-4567-8abc-000000000005",
+      "hostInstanceId": "01234567-0123-4567-8abc-000000000003",
+      "nativeSessionId": "01234567-0123-4567-8abc-000000000006",
+      "workspaceId": "ws_01234567-0123-4567-8abc-000000000001",
+      "viewEpoch": 3,
+      "binding": {
+        "schemaVersion": 1,
+        "scopeKey": "9999999999999999999999999999999999999999999999999999999999999999",
+        "generation": "01234567-0123-4567-8abc-000000000004"
+      },
+      "admissionEpoch": 1,
+      "target": {
+        "kind": "grant",
+        "agentId": "ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+        "instanceId": "01234567-0123-4567-8abc-000000000007"
+      },
+      "facts": {
+        "registryRevision": 8,
+        "grantEpoch": null,
+        "catalogDigest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "policyDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+        "selectionDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+        "subject": {
+          "agentId": "ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+          "instanceId": "01234567-0123-4567-8abc-000000000007"
+        },
+        "launch": {
+          "launchRef": "01234567-0123-4567-8abc-000000000008",
+          "handoffLocationDigest": "3333333333333333333333333333333333333333333333333333333333333333",
+          "materialRootIdentityDigest": "4444444444444444444444444444444444444444444444444444444444444444"
+        },
+        "cleanup": null,
+        "summary": {
+          "label": "Synthetic 中文 😀",
+          "details": [
+            "Explicit fixture"
+          ],
+          "count": 1,
+          "bytes": 256
+        }
+      }
+    },
+    "intentDigest": "5e4f73b79418c4249b9d03c2f32a13d70882402181869e3617144962afc2fbc7",
+    "challenge": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expiresInMs": 30000
+  },
+  "result": {
+    "operationId": "01234567-0123-4567-8abc-000000000005",
+    "intentDigest": "5e4f73b79418c4249b9d03c2f32a13d70882402181869e3617144962afc2fbc7",
+    "status": "applied",
+    "effect": {
+      "kind": "grant",
+      "connectionId": "01234567-0123-4567-8abc-000000000009",
+      "grantEpoch": 1
+    },
+    "error": null
+  },
+  "requests": [
+    {
+      "schemaVersion": 1,
+      "method": "attach.hello",
+      "params": {
+        "installId": "01234567-0123-4567-8abc-000000000002",
+        "hostInstanceId": "01234567-0123-4567-8abc-000000000003",
+        "port": 19436,
+        "clientNonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "method": "attach.finish",
+      "params": {
+        "installId": "01234567-0123-4567-8abc-000000000002",
+        "hostInstanceId": "01234567-0123-4567-8abc-000000000003",
+        "port": 19436,
+        "clientNonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "serverNonce": "8888888888888888888888888888888888888888888888888888888888888888",
+        "clientProof": "88334689e61e22d586dc9712c4531512c09172ab6c852ef34f15d03d97b2da02"
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "method": "detach",
+      "params": {}
+    },
+    {
+      "schemaVersion": 1,
+      "method": "describe",
+      "params": {
+        "workspaceId": "ws_01234567-0123-4567-8abc-000000000001",
+        "viewEpoch": 3
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "method": "registry.list",
+      "params": {
+        "workspaceId": "ws_01234567-0123-4567-8abc-000000000001",
+        "viewEpoch": 3
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "method": "messages.list",
+      "params": {
+        "workspaceId": "ws_01234567-0123-4567-8abc-000000000001",
+        "viewEpoch": 3,
+        "connectionId": "01234567-0123-4567-8abc-000000000009",
+        "afterSeq": 2,
+        "limit": 50
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "method": "message.read",
+      "params": {
+        "workspaceId": "ws_01234567-0123-4567-8abc-000000000001",
+        "viewEpoch": 3,
+        "connectionId": "01234567-0123-4567-8abc-000000000009",
+        "messageId": "01234567-0123-4567-8abc-00000000000a"
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "method": "attachment.read",
+      "params": {
+        "workspaceId": "ws_01234567-0123-4567-8abc-000000000001",
+        "viewEpoch": 3,
+        "connectionId": "01234567-0123-4567-8abc-000000000009",
+        "messageId": "01234567-0123-4567-8abc-00000000000a",
+        "attachmentId": "01234567-0123-4567-8abc-00000000000b"
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "method": "read.mark",
+      "params": {
+        "workspaceId": "ws_01234567-0123-4567-8abc-000000000001",
+        "viewEpoch": 3,
+        "connectionId": "01234567-0123-4567-8abc-000000000009",
+        "throughSeq": 3
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "method": "control.prepare",
+      "params": {
+        "workspaceId": "ws_01234567-0123-4567-8abc-000000000001",
+        "viewEpoch": 3,
+        "target": {
+          "kind": "grant",
+          "agentId": "ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+          "instanceId": "01234567-0123-4567-8abc-000000000007"
+        }
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "method": "control.cancel",
+      "params": {
+        "operationId": "01234567-0123-4567-8abc-000000000005",
+        "intentDigest": "5e4f73b79418c4249b9d03c2f32a13d70882402181869e3617144962afc2fbc7"
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "method": "control.status",
+      "params": {
+        "operationId": "01234567-0123-4567-8abc-000000000005",
+        "intentDigest": "5e4f73b79418c4249b9d03c2f32a13d70882402181869e3617144962afc2fbc7"
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "method": "control.commit",
+      "params": {
+        "operationId": "01234567-0123-4567-8abc-000000000005",
+        "intentDigest": "5e4f73b79418c4249b9d03c2f32a13d70882402181869e3617144962afc2fbc7",
+        "challenge": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      }
+    }
+  ],
+  "handoffs": [
+    {
+      "schemaVersion": 2,
+      "endpoint": "http://127.0.0.1:19436",
+      "scopeKey": "9999999999999999999999999999999999999999999999999999999999999999",
+      "generation": "01234567-0123-4567-8abc-000000000004",
+      "hostInstanceId": "01234567-0123-4567-8abc-000000000003",
+      "agentId": "ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "instanceId": "01234567-0123-4567-8abc-000000000007",
+      "launchRef": "01234567-0123-4567-8abc-000000000008",
+      "policyDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "connectionId": "01234567-0123-4567-8abc-000000000009",
+      "from": "agent-ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "grantEpoch": 1,
+      "materialRoot": {
+        "resourceId": "fixture_project",
+        "revision": 2,
+        "path": "/fixture/project",
+        "fileIdentity": {
+          "platform": "posix",
+          "device": "34",
+          "inode": "100"
+        }
+      },
+      "recoveryRoot": {
+        "path": "/fixture/recovery",
+        "fileIdentity": {
+          "platform": "posix",
+          "device": "34",
+          "inode": "101"
+        }
+      },
+      "token": "5555555555555555555555555555555555555555555555555555555555555555"
+    },
+    {
+      "schemaVersion": 2,
+      "endpoint": "http://127.0.0.1:19436",
+      "scopeKey": "9999999999999999999999999999999999999999999999999999999999999999",
+      "generation": "01234567-0123-4567-8abc-000000000004",
+      "hostInstanceId": "01234567-0123-4567-8abc-000000000003",
+      "agentId": "ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "instanceId": "01234567-0123-4567-8abc-000000000007",
+      "launchRef": "01234567-0123-4567-8abc-000000000008",
+      "policyDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "connectionId": "01234567-0123-4567-8abc-000000000009",
+      "from": "agent-ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "grantEpoch": 1,
+      "materialRoot": {
+        "resourceId": "fixture_project",
+        "revision": 2,
+        "path": "C:\\fixture\\project",
+        "fileIdentity": {
+          "platform": "win32",
+          "volume": "1234567890abcdef",
+          "fileId": "11111111111111111111111111111111"
+        }
+      },
+      "recoveryRoot": {
+        "path": "C:\\fixture\\recovery",
+        "fileIdentity": {
+          "platform": "win32",
+          "volume": "1234567890abcdef",
+          "fileId": "22222222222222222222222222222222"
+        }
+      },
+      "token": "5555555555555555555555555555555555555555555555555555555555555555"
+    }
+  ],
+  "rejectedRequests": [
+    {
+      "schemaVersion": 1,
+      "method": "control.commit",
+      "params": {
+        "operationId": "01234567-0123-4567-8abc-000000000005",
+        "intentDigest": "5e4f73b79418c4249b9d03c2f32a13d70882402181869e3617144962afc2fbc7",
+        "challenge": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "approved": true
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "method": "control.prepare",
+      "params": {
+        "workspaceId": "ws_01234567-0123-4567-8abc-000000000001",
+        "viewEpoch": 3,
+        "target": {
+          "kind": "launch",
+          "engine": "codex",
+          "resourceId": "fixture_project",
+          "root": "/claimed"
+        }
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "method": "messages.list",
+      "params": {
+        "workspaceId": "ws_01234567-0123-4567-8abc-000000000001",
+        "viewEpoch": 3,
+        "connectionId": "01234567-0123-4567-8abc-000000000009",
+        "afterSeq": 2,
+        "limit": 51
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "method": "read.mark",
+      "params": {
+        "workspaceId": "ws_01234567-0123-4567-8abc-000000000001",
+        "viewEpoch": 3,
+        "connectionId": "01234567-0123-4567-8abc-000000000009",
+        "throughSeq": 9007199254740992
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "method": "control.prepare",
+      "params": {
+        "workspaceId": "ws_01234567-0123-4567-8abc-000000000001",
+        "viewEpoch": 3,
+        "target": {
+          "kind": "launch",
+          "engine": "codex",
+          "resourceId": "fixture_project",
+          "label": "\ud800"
+        }
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "method": "attach.hello",
+      "params": {
+        "installId": "01234567-0123-4567-8abc-000000000002",
+        "hostInstanceId": "01234567-0123-4567-8abc-000000000003",
+        "port": 0,
+        "clientNonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  ],
+  "rejectedHandoffs": [
+    {
+      "schemaVersion": 2,
+      "endpoint": "http://127.0.0.1:65536",
+      "scopeKey": "9999999999999999999999999999999999999999999999999999999999999999",
+      "generation": "01234567-0123-4567-8abc-000000000004",
+      "hostInstanceId": "01234567-0123-4567-8abc-000000000003",
+      "agentId": "ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "instanceId": "01234567-0123-4567-8abc-000000000007",
+      "launchRef": "01234567-0123-4567-8abc-000000000008",
+      "policyDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "connectionId": "01234567-0123-4567-8abc-000000000009",
+      "from": "agent-ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "grantEpoch": 1,
+      "materialRoot": {
+        "resourceId": "fixture_project",
+        "revision": 2,
+        "path": "/fixture/project",
+        "fileIdentity": {
+          "platform": "posix",
+          "device": "34",
+          "inode": "100"
+        }
+      },
+      "recoveryRoot": {
+        "path": "/fixture/recovery",
+        "fileIdentity": {
+          "platform": "posix",
+          "device": "34",
+          "inode": "101"
+        }
+      },
+      "token": "5555555555555555555555555555555555555555555555555555555555555555"
+    },
+    {
+      "schemaVersion": 2,
+      "endpoint": "http://localhost:19436",
+      "scopeKey": "9999999999999999999999999999999999999999999999999999999999999999",
+      "generation": "01234567-0123-4567-8abc-000000000004",
+      "hostInstanceId": "01234567-0123-4567-8abc-000000000003",
+      "agentId": "ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "instanceId": "01234567-0123-4567-8abc-000000000007",
+      "launchRef": "01234567-0123-4567-8abc-000000000008",
+      "policyDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "connectionId": "01234567-0123-4567-8abc-000000000009",
+      "from": "agent-ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "grantEpoch": 1,
+      "materialRoot": {
+        "resourceId": "fixture_project",
+        "revision": 2,
+        "path": "/fixture/project",
+        "fileIdentity": {
+          "platform": "posix",
+          "device": "34",
+          "inode": "100"
+        }
+      },
+      "recoveryRoot": {
+        "path": "/fixture/recovery",
+        "fileIdentity": {
+          "platform": "posix",
+          "device": "34",
+          "inode": "101"
+        }
+      },
+      "token": "5555555555555555555555555555555555555555555555555555555555555555"
+    },
+    {
+      "schemaVersion": 2,
+      "endpoint": "http://127.0.0.1:19436/",
+      "scopeKey": "9999999999999999999999999999999999999999999999999999999999999999",
+      "generation": "01234567-0123-4567-8abc-000000000004",
+      "hostInstanceId": "01234567-0123-4567-8abc-000000000003",
+      "agentId": "ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "instanceId": "01234567-0123-4567-8abc-000000000007",
+      "launchRef": "01234567-0123-4567-8abc-000000000008",
+      "policyDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "connectionId": "01234567-0123-4567-8abc-000000000009",
+      "from": "agent-ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "grantEpoch": 1,
+      "materialRoot": {
+        "resourceId": "fixture_project",
+        "revision": 2,
+        "path": "/fixture/project",
+        "fileIdentity": {
+          "platform": "posix",
+          "device": "34",
+          "inode": "100"
+        }
+      },
+      "recoveryRoot": {
+        "path": "/fixture/recovery",
+        "fileIdentity": {
+          "platform": "posix",
+          "device": "34",
+          "inode": "101"
+        }
+      },
+      "token": "5555555555555555555555555555555555555555555555555555555555555555"
+    },
+    {
+      "schemaVersion": 2,
+      "endpoint": "http://127.0.0.1:19436",
+      "scopeKey": "9999999999999999999999999999999999999999999999999999999999999999",
+      "generation": "01234567-0123-4567-8abc-000000000004",
+      "hostInstanceId": "01234567-0123-4567-8abc-000000000003",
+      "agentId": "ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "instanceId": "01234567-0123-4567-8abc-000000000007",
+      "launchRef": "01234567-0123-4567-8abc-000000000008",
+      "policyDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "connectionId": "01234567-0123-4567-8abc-000000000009",
+      "from": "agent-ext_claude_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "grantEpoch": 1,
+      "materialRoot": {
+        "resourceId": "fixture_project",
+        "revision": 2,
+        "path": "/fixture/project",
+        "fileIdentity": {
+          "platform": "posix",
+          "device": "34",
+          "inode": "100"
+        }
+      },
+      "recoveryRoot": {
+        "path": "/fixture/recovery",
+        "fileIdentity": {
+          "platform": "posix",
+          "device": "34",
+          "inode": "101"
+        }
+      },
+      "token": "5555555555555555555555555555555555555555555555555555555555555555"
+    },
+    {
+      "schemaVersion": 2,
+      "endpoint": "http://127.0.0.1:19436",
+      "scopeKey": "9999999999999999999999999999999999999999999999999999999999999999",
+      "generation": "01234567-0123-4567-8abc-000000000004",
+      "hostInstanceId": "01234567-0123-4567-8abc-000000000003",
+      "agentId": "ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "instanceId": "01234567-0123-4567-8abc-000000000007",
+      "launchRef": "01234567-0123-4567-8abc-000000000008",
+      "policyDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "connectionId": "01234567-0123-4567-8abc-000000000009",
+      "from": "agent-ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "grantEpoch": 1,
+      "materialRoot": {
+        "resourceId": "fixture_project",
+        "revision": 2,
+        "path": "/fixture/../project",
+        "fileIdentity": {
+          "platform": "posix",
+          "device": "34",
+          "inode": "100"
+        }
+      },
+      "recoveryRoot": {
+        "path": "/fixture/recovery",
+        "fileIdentity": {
+          "platform": "posix",
+          "device": "34",
+          "inode": "101"
+        }
+      },
+      "token": "5555555555555555555555555555555555555555555555555555555555555555"
+    },
+    {
+      "schemaVersion": 2,
+      "endpoint": "http://127.0.0.1:19436",
+      "scopeKey": "9999999999999999999999999999999999999999999999999999999999999999",
+      "generation": "01234567-0123-4567-8abc-000000000004",
+      "hostInstanceId": "01234567-0123-4567-8abc-000000000003",
+      "agentId": "ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "instanceId": "01234567-0123-4567-8abc-000000000007",
+      "launchRef": "01234567-0123-4567-8abc-000000000008",
+      "policyDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "connectionId": "01234567-0123-4567-8abc-000000000009",
+      "from": "agent-ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "grantEpoch": 1,
+      "materialRoot": {
+        "resourceId": "fixture_project",
+        "revision": 2,
+        "path": "C:\\fixture\\project",
+        "fileIdentity": {
+          "platform": "win32",
+          "volume": "1234567890abcdef",
+          "fileId": "11111111111111111111111111111111"
+        }
+      },
+      "recoveryRoot": {
+        "path": "C:\\fixture\\recovery:stream",
+        "fileIdentity": {
+          "platform": "win32",
+          "volume": "1234567890abcdef",
+          "fileId": "22222222222222222222222222222222"
+        }
+      },
+      "token": "5555555555555555555555555555555555555555555555555555555555555555"
+    },
+    {
+      "schemaVersion": 1,
+      "endpoint": "http://127.0.0.1:19436",
+      "scopeKey": "9999999999999999999999999999999999999999999999999999999999999999",
+      "generation": "01234567-0123-4567-8abc-000000000004",
+      "hostInstanceId": "01234567-0123-4567-8abc-000000000003",
+      "agentId": "ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "instanceId": "01234567-0123-4567-8abc-000000000007",
+      "launchRef": "01234567-0123-4567-8abc-000000000008",
+      "policyDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "connectionId": "01234567-0123-4567-8abc-000000000009",
+      "from": "agent-ext_codex_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "grantEpoch": 1,
+      "materialRoot": {
+        "resourceId": "fixture_project",
+        "revision": 2,
+        "path": "/fixture/project",
+        "fileIdentity": {
+          "platform": "posix",
+          "device": "34",
+          "inode": "100"
+        }
+      },
+      "recoveryRoot": {
+        "path": "/fixture/recovery",
+        "fileIdentity": {
+          "platform": "posix",
+          "device": "34",
+          "inode": "101"
+        }
+      },
+      "token": "5555555555555555555555555555555555555555555555555555555555555555"
+    }
+  ]
+}
